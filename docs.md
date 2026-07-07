@@ -69,9 +69,9 @@ disk:
 ```
 
 FuseQuota uses a helper that's bundled into the binary. When
-`disk.mode: fuse_quota` is configured, `dbev --setup` checks that `/dev/fuse`
-is usable and enables `user_allow_other` in `/etc/fuse.conf`. The host still
-needs kernel FUSE support.
+`disk.mode: fuse_quota` is configured, `dbev` checks that `/dev/fuse` is
+usable and enables `user_allow_other` in `/etc/fuse.conf` on startup. The host
+still needs kernel FUSE support.
 
 Recommended paths:
 

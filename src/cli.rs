@@ -171,7 +171,12 @@ fn ensure_fuse_quota_host_config(config: &Config) -> anyhow::Result<()> {
         FuseConfUpdate::Updated(updated) => contents = updated,
     }
 
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    fs::write(path, contents).with_context(|| {
+        format!(
+            "failed to write {}; for Docker installs, do not mount this file read-only, or add user_allow_other on the host before starting dbev",
+            path.display()
+        )
+    })?;
     set_mode(path, 0o644)?;
     println!("enabled fuse allow_other support in /etc/fuse.conf");
     Ok(())
@@ -1065,6 +1070,8 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         "DatabasesEverywhere daemon starting"
     );
     log_boot_configuration(&config, &config_path);
+    ensure_fuse_quota_host_config(&config)
+        .context("failed to prepare fuse quota host configuration")?;
     tracing::info!("runtime preflight starting");
     validate_runtime_support(&config).await?;
     tracing::info!(
