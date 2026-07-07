@@ -52,17 +52,20 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build dbev-${{ matrix.asset }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
-          - armv7-unknown-linux-gnueabihf
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: x86_64-linux
+          - target: aarch64-unknown-linux-gnu
+            asset: aarch64-linux
+          - target: powerpc64le-unknown-linux-gnu
+            asset: ppc64le-linux
+          - target: riscv64gc-unknown-linux-gnu
+            asset: riscv64-linux
 
     steps:
       - name: Checkout
@@ -97,17 +100,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/dbev" "dbev-${{ matrix.target }}"
-          chmod 0755 "dbev-${{ matrix.target }}"
-          sha256sum "dbev-${{ matrix.target }}" > "dbev-${{ matrix.target }}.sha256"
+          cp "target/${{ matrix.target }}/release/dbev" "dbev-${{ matrix.asset }}"
+          chmod 0755 "dbev-${{ matrix.asset }}"
+          checksum="$(sha256sum "dbev-${{ matrix.asset }}" | awk '{print $1}')"
+          printf '| `%s` | `%s` |\n' "dbev-${{ matrix.asset }}" "$checksum" > "checksum-${{ matrix.asset }}.md"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbev-${{ matrix.target }}
+          name: dbev-${{ matrix.asset }}
           path: |
-            dbev-${{ matrix.target }}
-            dbev-${{ matrix.target }}.sha256
+            dbev-${{ matrix.asset }}
+            checksum-${{ matrix.asset }}.md
           if-no-files-found: error
 
   github-release:
@@ -122,6 +126,22 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Build release body
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          {
+            if [ -n "$RELEASE_NOTES" ]; then
+              printf '%s\n\n' "$RELEASE_NOTES"
+            fi
+            echo "## Checksums"
+            echo
+            echo "| Asset | SHA256 |"
+            echo "| --- | --- |"
+            cat dist/checksum-*.md | sort
+          } > release-body.md
+
       - name: Create release
         id: create_release
         uses: softprops/action-gh-release@v2
@@ -129,14 +149,13 @@ jobs:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
           name: DatabasesEverywhere ${{ inputs.version }}
-          body: ${{ inputs.release_notes }}
+          body_path: release-body.md
           draft: ${{ inputs.draft }}
           prerelease: ${{ inputs.prerelease }}
           make_latest: ${{ inputs.prerelease && 'false' || 'true' }}
           fail_on_unmatched_files: true
           files: |
             dist/dbev-*
-            dist/*.sha256
 
       - name: Print release URL
         run: |
@@ -170,15 +189,19 @@ jobs:
             case "$platform" in
               linux/amd64)
                 docker_dir=".docker/amd64"
-                target="x86_64-unknown-linux-musl"
+                asset="x86_64-linux"
                 ;;
               linux/arm64)
                 docker_dir=".docker/arm64"
-                target="aarch64-unknown-linux-musl"
+                asset="aarch64-linux"
                 ;;
-              linux/arm/v7)
-                docker_dir=".docker/arm/v7"
-                target="armv7-unknown-linux-gnueabihf"
+              linux/ppc64le)
+                docker_dir=".docker/ppc64le"
+                asset="ppc64le-linux"
+                ;;
+              linux/riscv64)
+                docker_dir=".docker/riscv64"
+                asset="riscv64-linux"
                 ;;
               *)
                 echo "unsupported Docker platform: $platform" >&2
@@ -186,12 +209,8 @@ jobs:
                 ;;
             esac
 
-            (
-              cd dist
-              sha256sum -c "dbev-${target}.sha256"
-            )
             mkdir -p "$docker_dir"
-            install -m 0755 "dist/dbev-${target}" "${docker_dir}/dbev"
+            install -m 0755 "dist/dbev-${asset}" "${docker_dir}/dbev"
           }
 
           IFS=',' read -ra platform_list <<< "$PLATFORMS"

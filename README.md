@@ -41,19 +41,20 @@ Download the latest release for your architecture and install it to `/usr/local/
 
 ```bash
 case "$(uname -m)" in
-  x86_64)  TARGET=x86_64-unknown-linux-musl ;;
-  aarch64) TARGET=aarch64-unknown-linux-musl ;;
-  armv7l)  TARGET=armv7-unknown-linux-gnueabihf ;;
+  x86_64) TARGET=x86_64-linux ;;
+  aarch64|arm64) TARGET=aarch64-linux ;;
+  ppc64le|powerpc64le) TARGET=ppc64le-linux ;;
+  riscv64) TARGET=riscv64-linux ;;
   *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
 esac
 VERSION=$(curl -s https://api.github.com/repos/Tomaxikz/DatabasesEverywhere/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
 curl -L -o /tmp/dbev \
   "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}"
-curl -L -o /tmp/dbev.sha256 \
-  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}.sha256"
-(cd /tmp && sha256sum -c dbev.sha256)
+sha256sum /tmp/dbev
 sudo install -m 0755 /tmp/dbev /usr/local/bin/dbev
 ```
+
+Compare the printed SHA256 with the checksum table in the GitHub release notes.
 
 Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
 
@@ -81,6 +82,10 @@ Runtime data lives in:
 /var/log/dbev
 /run/dbev
 ```
+
+On daemon boot these runtime directories and their subdirectories are created
+automatically if missing. Compose installs still need
+`/etc/databases-everywhere/config.yml` in place before startup.
 
 ## Docs
 
