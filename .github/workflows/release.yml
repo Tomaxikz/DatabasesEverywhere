@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+      create_github_release:
+        description: "Create a GitHub release and upload binaries"
+        required: true
+        default: true
+        type: boolean
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: false
+        type: boolean
+      release_notes:
+        description: "Release notes shown on GitHub"
+        required: false
+        default: ""
+        type: string
+      publish_docker:
+        description: "Build and push the Docker image to GitHub Container Registry"
+        required: true
+        default: true
+        type: boolean
+      docker_latest:
+        description: "Also tag the Docker image as latest for non-prerelease releases"
+        required: true
+        default: true
+        type: boolean
+      docker_platforms:
+        description: "Comma-separated Docker platforms to build"
+        required: true
+        default: "linux/amd64,linux/arm64"
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version input
+        run: |
+          if ! printf '%s' "${{ inputs.version }}" | grep -Eq '^v[0-9]+(\.[0-9]+){1,2}([-.][0-9A-Za-z.-]+)?$'; then
+            echo "version must look like v0.1.0" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cross build --workspace --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/dbev" "dbev-${{ matrix.target }}"
+          chmod 0755 "dbev-${{ matrix.target }}"
+          sha256sum "dbev-${{ matrix.target }}" > "dbev-${{ matrix.target }}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbev-${{ matrix.target }}
+          path: |
+            dbev-${{ matrix.target }}
+            dbev-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ inputs.create_github_release }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: DatabasesEverywhere ${{ inputs.version }}
+          body: ${{ inputs.release_notes }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: ${{ inputs.prerelease && 'false' || 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/dbev-*
+            dist/*.sha256
+
+      - name: Print release URL
+        run: |
+          echo "Release URL: ${{ steps.create_release.outputs.url }}"
+
+  docker-image:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - github-release
+    if: ${{ always() && needs.build.result == 'success' && (inputs.create_github_release == false || needs.github-release.result == 'success') && inputs.publish_docker && !inputs.draft }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare Docker binaries
+        env:
+          PLATFORMS: ${{ inputs.docker_platforms }}
+        run: |
+          set -euo pipefail
+
+          prepare_binary() {
+            platform="$1"
+            case "$platform" in
+              linux/amd64)
+                docker_dir=".docker/amd64"
+                target="x86_64-unknown-linux-musl"
+                ;;
+              linux/arm64)
+                docker_dir=".docker/arm64"
+                target="aarch64-unknown-linux-musl"
+                ;;
+              linux/arm/v7)
+                docker_dir=".docker/arm/v7"
+                target="armv7-unknown-linux-gnueabihf"
+                ;;
+              *)
+                echo "unsupported Docker platform: $platform" >&2
+                exit 1
+                ;;
+            esac
+
+            (
+              cd dist
+              sha256sum -c "dbev-${target}.sha256"
+            )
+            mkdir -p "$docker_dir"
+            install -m 0755 "dist/dbev-${target}" "${docker_dir}/dbev"
+          }
+
+          IFS=',' read -ra platform_list <<< "$PLATFORMS"
+          for platform in "${platform_list[@]}"; do
+            prepare_binary "$platform"
+          done
+
+      - name: Compute Docker tags
+        id: docker_tags
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          DOCKER_LATEST: ${{ inputs.docker_latest }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAME,,}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:${VERSION}"
+            if [ "$DOCKER_LATEST" = "true" ] && [ "$PRERELEASE" != "true" ]; then
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ inputs.docker_platforms }}
+          push: true
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

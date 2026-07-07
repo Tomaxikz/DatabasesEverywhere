@@ -1,0 +1,35 @@
+services:
+  dbev:
+    image: ghcr.io/tomaxikz/databaseseverywhere:latest
+    container_name: dbev
+    restart: unless-stopped
+
+    # DBE exposes raw TCP database gateways, and it must reach sibling database
+    # containers created through the host Docker socket.
+    network_mode: host
+
+    # Required for Docker API access and FuseQuota disk-limit mounts.
+    privileged: true
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/databases-everywhere:/etc/databases-everywhere
+      - type: bind
+        source: /var/lib/dbev
+        target: /var/lib/dbev
+        bind:
+          propagation: rshared
+      - /var/log/dbev:/var/log/dbev
+      - /run/dbev:/run/dbev
+      # Uncomment whichever certificate directories your config references.
+      # - /etc/letsencrypt:/etc/letsencrypt:ro
+      # - /etc/nginx/ssl:/etc/nginx/ssl:ro
+
+    environment:
+      RUST_LOG: info

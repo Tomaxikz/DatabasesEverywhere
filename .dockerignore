@@ -1,0 +1,17 @@
+.git
+.github
+.local
+.venv
+.venv-*
+!.docker
+!.docker/**
+target
+tests
+scripts
+
+*.log
+*.tmp
+
+config.local.yml
+config.yml
+docker-compose.override.yml

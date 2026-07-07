@@ -2,6 +2,8 @@
 
 Two things live in here: how to get a node running, and how to talk to it from your panel. If you just want the API, jump to [Integrating with the daemon](#integrating-with-the-daemon).
 
+Security issue? See [SECURITY.md](SECURITY.md) — report privately via GitHub Security Advisories or a [Discord](https://discord.com/invite/FJGQAbtyWN) ticket, never in public issues.
+
 ## Node setup
 
 ### Install
@@ -14,14 +16,25 @@ sudo systemctl enable --now docker
 
 For Podman instead of Docker, install and enable the Podman API socket, then set `daemon.engine: podman` in `config.yml`. Only set `daemon.socket_path` if the default socket discovery doesn't find yours.
 
-Grab the binary:
+Download the latest release for your architecture and install it:
 
 ```bash
-sudo curl -L \
-  -o /usr/local/bin/dbev \
-  https://github.com/calagopus/DatabasesEverywhere/releases/latest/download/dbev-linux-amd64
-sudo chmod 0755 /usr/local/bin/dbev
+case "$(uname -m)" in
+  x86_64)  TARGET=x86_64-unknown-linux-musl ;;
+  aarch64) TARGET=aarch64-unknown-linux-musl ;;
+  armv7l)  TARGET=armv7-unknown-linux-gnueabihf ;;
+  *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+VERSION=$(curl -s https://api.github.com/repos/Tomaxikz/DatabasesEverywhere/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
+curl -L -o /tmp/dbev \
+  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}"
+curl -L -o /tmp/dbev.sha256 \
+  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}.sha256"
+(cd /tmp && sha256sum -c dbev.sha256)
+sudo install -m 0755 /tmp/dbev /usr/local/bin/dbev
 ```
+
+The musl builds are static and run anywhere; glibc (`-gnu`) builds are also published if you prefer them. Each binary ships with a `.sha256` file so you can verify the download.
 
 ### Config
 

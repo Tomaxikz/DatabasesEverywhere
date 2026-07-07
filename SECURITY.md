@@ -1,45 +1,34 @@
-# Security
-
-Report security issues privately. Do not open a public GitHub issue for
-vulnerabilities.
+# Security Policy
 
 ## Supported Versions
 
-Security fixes are provided for the latest released version.
+Security fixes only land in the latest release — there's no backporting to older builds.
 
-## Sensitive Data
+| Version | Supported              |
+|---------|------------------------|
+| 0.1.x   | :white_check_mark: Yes |
+| < 0.1.0 | :x: No                 |
 
-Do not commit or share:
+> Before reporting, make sure your finding reproduces on the latest release. If it only exists in an older build, the fix is updating — though if something old is nasty enough, we may still put out an advisory so people know to move.
 
-- Daemon API tokens.
-- Panel tokens.
-- Database passwords.
-- TLS private keys.
-- Full connection URLs containing passwords.
-- Backup or export files containing customer data.
+## Reporting a Vulnerability
 
-## Deployment Notes
+We take the security of this project seriously. If you believe you have found a security vulnerability, **do not** report it through a public GitHub issue or in public Discord channels.
 
-- Keep backend database ports private. Public access should go through DBE
-  gateway listeners.
-- Keep `daemon.allow_public_backend_ports` disabled in production.
-- Use TLS for the API when exposing it over a network.
-- Use a firewall so only intended API and database gateway ports are reachable.
-- Use `disk.mode: fuse_quota` or a strict native quota mode for production disk
-  enforcement.
-- Keep Docker or Podman restricted to the daemon host. Do not expose the
-  container engine socket publicly.
+### How to Report
 
-## Vulnerability Reports
+Please report vulnerabilities using one of the following methods:
+- **GitHub Private Vulnerability Reporting**: Use the [Security Advisories](../../security/advisories/new) tab in this repository.
+- **Discord ticket**: Join our [Discord](https://discord.com/invite/FJGQAbtyWN) and open a private ticket.
 
-Include:
+Please include as much of the following information as possible to help us understand and reproduce the issue:
+- Type of vulnerability
+- The version you tested (reproduce on the latest release first)
+- Step-by-step instructions to reproduce the issue
+- Proof-of-concept (if available)
+- Your views on potential impact
 
-- Affected version or commit.
-- Deployment type: Docker or Podman.
-- Database protocol involved, if any.
-- Reproduction steps.
-- Logs with secrets removed.
-
-We will prioritize issues involving authentication bypass, cross-instance data
-access, path traversal, artifact download leaks, container escape risk, or quota
-enforcement bypass.
+We kindly ask that you:
+- Give us a reasonable amount of time to address the issue before public disclosure.
+- Avoid accessing or modifying data that does not belong to you.
+- Act in good faith and avoid actions that could harm the project or its users.
