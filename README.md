@@ -1,12 +1,10 @@
 # DatabasesEverywhere
 
-Ever wanted to hand out databases to people without giving them a whole VPS? That's basically what this is.
+Hand out databases without handing out whole servers.
 
-DatabasesEverywhere is a daemon that hosts database instances for you, made to be plugged into a panel. Every instance runs in its own container, fully isolated from the others, and the daemon routes the public database ports to whichever backend container should get the traffic. The panel stays in charge of the "business" side — users, customer records, generating the daemon config — and just talks to the daemon over its API.
+DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Each instance runs in its own isolated container, the daemon routes public ports to the right one, and your panel drives it all over a simple API.
 
 ## Status
-
-Where things stand runtime-wise:
 
 | Runtime | Status |
 | --- | --- |
@@ -39,29 +37,41 @@ Where things stand runtime-wise:
 
 ## Install
 
-Grab the release binary and drop it in `/usr/local/bin`:
+Download the latest release for your architecture and install it to `/usr/local/bin`:
 
 ```bash
-sudo curl -L \
-  -o /usr/local/bin/dbev \
-  https://github.com/calagopus/DatabasesEverywhere/releases/latest/download/dbev-linux-amd64
-sudo chmod 0755 /usr/local/bin/dbev
+case "$(uname -m)" in
+  x86_64)  TARGET=x86_64-unknown-linux-musl ;;
+  aarch64) TARGET=aarch64-unknown-linux-musl ;;
+  armv7l)  TARGET=armv7-unknown-linux-gnueabihf ;;
+  *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+VERSION=$(curl -s https://api.github.com/repos/Tomaxikz/DatabasesEverywhere/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
+curl -L -o /tmp/dbev.tar.gz \
+  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${VERSION}-${TARGET}.tar.gz"
+sudo tar -C /usr/local/bin -xzf /tmp/dbev.tar.gz dbev
 ```
 
-Write your config at `/etc/databases-everywhere/config.yml`, then let setup do its thing:
+Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
 
 ```bash
 sudo dbev --setup
 sudo systemctl enable --now databases-everywhere
 ```
 
-By default the daemon looks for its config here:
+By default the daemon reads its config from:
 
 ```text
 /etc/databases-everywhere/config.yml
 ```
 
-And it keeps its stuff in:
+To use a different config file, pass the `--config` flag:
+
+```bash
+sudo dbev --config /path/to/config.yml daemon
+```
+
+Runtime data lives in:
 
 ```text
 /var/lib/dbev
@@ -72,6 +82,10 @@ And it keeps its stuff in:
 ## Docs
 
 Everything else lives in [docs.md](docs.md): node setup, config fields, paths, and a full integration guide for panel developers — every REST endpoint, WebSocket events, auth, signed downloads, the lot.
+
+## Security
+
+Found a vulnerability? Don't post it publicly — report it via GitHub Security Advisories or a private ticket on our [Discord](https://discord.com/invite/FJGQAbtyWN), and make sure it reproduces on the latest release first. Details in [SECURITY.md](SECURITY.md).
 
 ## Hacking on it
 
