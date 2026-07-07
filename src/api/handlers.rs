@@ -287,6 +287,8 @@ mod tests {
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         }
     }
 }

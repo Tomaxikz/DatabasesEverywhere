@@ -218,6 +218,7 @@ async fn delete_backup_by_name(
     let path = backup_path_by_name(state, &name).await?;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
+            crate::api::artifacts::remove_checksum_sidecar(&path).await;
             tracing::info!(event = "audit backup_deleted", backup = %name);
             Ok(Json(DeleteArtifactResponse {
                 name,
@@ -508,6 +509,9 @@ async fn read_instance_backup_files(dir: &FsPath) -> Result<Vec<BackupFile>, Api
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
+        if crate::api::artifacts::is_checksum_sidecar(&path) {
+            continue;
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -527,6 +531,7 @@ async fn read_instance_backup_files(dir: &FsPath) -> Result<Vec<BackupFile>, Api
 async fn delete_pruned_backup(backup: &BackupFile) -> Result<(), ApiError> {
     match tokio::fs::remove_file(&backup.path).await {
         Ok(()) => {
+            crate::api::artifacts::remove_checksum_sidecar(&backup.path).await;
             tracing::info!(event = "audit backup_retention_deleted", backup = %backup.name);
             Ok(())
         }
@@ -597,6 +602,9 @@ async fn read_backup_dir(root: &FsPath, backups: &mut Vec<ArtifactInfo>) -> Resu
                 continue;
             }
             let path = entry.path();
+            if crate::api::artifacts::is_checksum_sidecar(&path) {
+                continue;
+            }
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())

@@ -19,21 +19,9 @@ For Podman instead of Docker, install and enable the Podman API socket, then set
 Download the latest release for your architecture and install it:
 
 ```bash
-case "$(uname -m)" in
-  x86_64) TARGET=x86_64-linux ;;
-  aarch64|arm64) TARGET=aarch64-linux ;;
-  ppc64le|powerpc64le) TARGET=ppc64le-linux ;;
-  riscv64) TARGET=riscv64-linux ;;
-  *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
-esac
-VERSION=$(curl -s https://api.github.com/repos/Tomaxikz/DatabasesEverywhere/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
-curl -L -o /tmp/dbev \
-  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}"
-sha256sum /tmp/dbev
-sudo install -m 0755 /tmp/dbev /usr/local/bin/dbev
+sudo curl -L "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-$(uname -m)-linux" -o /usr/local/bin/dbev
+sudo chmod +x /usr/local/bin/dbev
 ```
-
-Compare the printed SHA256 with the checksum table in the GitHub release notes.
 
 ### Config
 
@@ -69,6 +57,13 @@ images:
   mongodb: "mongo:8.3.4"
   clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
   qdrant: "qdrant/qdrant:v1.18.2"
+  allowed:
+    postgres: ["postgres:18.4"]
+    redis: ["redis:8.8.0"]
+    mariadb: ["mariadb:12.3.2"]
+    mongodb: ["mongo:8.3.4", "mongo:7.0.37"]
+    clickhouse: ["clickhouse/clickhouse-server:26.4.4.38"]
+    qdrant: ["qdrant/qdrant:v1.18.2"]
 ```
 
 MongoDB 8.x has a known incompatibility with Linux kernel 6.19+ / 7.x
@@ -225,12 +220,23 @@ An instance = one database container. The `InstanceMetadata` object you get back
     "cpu_cores": 1.0, "memory_mib": 2048, "disk_mib": 10240,
     "disk_enforced": true, "disk_enforcement_method": "fuse_quota"
   },
+  "image": {
+    "current": "postgres:18.4",
+    "configured": "postgres:18.4",
+    "update_available": false
+  },
+  "database_version": {
+    "current": "18.4",
+    "error": null
+  },
   "created_at": "2026-07-01T12:00:00Z",
   "updated_at": "2026-07-01T12:00:00Z"
 }
 ```
 
 `status` is one of `creating`, `running`, `stopped`, `failed`, `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
+`database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
@@ -294,6 +300,32 @@ PATCH /api/instances/{id}/image
 ```
 
 This pulls the image, deletes the old container, and recreates it on the same data volume. `password` is required for everything except Redis (the container needs it to re-provision the user). Images must be pinned — a non-`latest` tag or a `@sha256:` digest; bare `postgres` or `postgres:latest` gets a `400`.
+
+The requested image must also be allowed in `images.allowed.<protocol>`. The configured default image at `images.<protocol>` is always implicitly allowed. Keep the allowlist short and admin-controlled; do not pass arbitrary user input here.
+
+Patch/minor updates stay in-place. Major version changes are blocked unless the panel sends an explicit migration request:
+
+```json
+PATCH /api/instances/{id}/image
+{
+  "image": "mongo:8.3.4",
+  "password": "the-instance-password",
+  "major_upgrade": true
+}
+```
+
+For Postgres, MariaDB, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
+
+The response includes `strategy`:
+
+```json
+{
+  "strategy": "major_upgrade_migration",
+  "export_artifact_path": "/var/lib/dbev/artifacts/exports/...",
+  "old_volume_backup_path": "/var/lib/dbev/volumes/.dbe-major-upgrade-old-...",
+  "warnings": ["..."]
+}
+```
 
 ### Pre-pulling images
 
@@ -369,6 +401,19 @@ Export body (all optional — empty body means a full plain dump):
 ```
 
 `archive_format` is `plain`, `gzip`, or `bzip2`.
+
+Export/import formats:
+
+| Protocol | Export format | Import support |
+| --- | --- | --- |
+| PostgreSQL | `.postgres.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote PostgreSQL |
+| MariaDB | `.mariadb.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote MariaDB/MySQL |
+| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump, gzip/tar/zip-wrapped archive, remote MongoDB |
+| ClickHouse | `.clickhouse.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote ClickHouse |
+| Redis | `.redis.tar.gz` physical archive | Full physical archive only |
+| Qdrant | `.qdrant.tar.gz` physical archive | Full physical archive only |
+
+Redis and Qdrant exports are full physical volume archives. They are not selective and are not remote-credential imports.
 
 Import from a staged artifact:
 
@@ -516,11 +561,27 @@ Every message is a JSON object with a `type` field.
       "resource_error": null
     }
   ],
-  "install_progress": []
+  "install_progress": [
+    {
+      "instance_id": "cust-42-db",
+      "protocol": "postgres",
+      "action": "image_update",
+      "status": "running",
+      "stage": "pull_image",
+      "message": "Downloading",
+      "image": "postgres:18.4",
+      "layer": "sha256:…",
+      "current": 1048576,
+      "total": 8388608,
+      "percent": 12.5,
+      "updated_at": "2026-07-07T18:30:00Z"
+    }
+  ]
 }
 ```
 
-Disk usage is sampled at most every 5s per instance (it's a directory walk), everything else is fresh each tick.
+Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories.
+`install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
 
 **`/ws/logs?instance_id=…`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
 

@@ -42,6 +42,7 @@ pub async fn pull_image(
         .transpose()?
         .map(str::to_string)
         .unwrap_or_else(|| configured_image(&state, request.protocol).to_string());
+    ensure_image_allowed(&state, request.protocol, &image)?;
 
     state
         .docker
@@ -54,6 +55,22 @@ pub async fn pull_image(
         image,
         pulled: true,
     }))
+}
+
+pub(crate) fn ensure_image_allowed(
+    state: &AppState,
+    protocol: Protocol,
+    image: &str,
+) -> Result<(), ApiError> {
+    let allowed = state.config.images.allowed_for_protocol(protocol);
+    if allowed.contains(&image) {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(format!(
+        "image {image} is not allowed for {}; allowed images: {}",
+        protocol.as_str(),
+        allowed.join(", ")
+    )))
 }
 
 pub(crate) fn validate_image(image: &str) -> Result<&str, ApiError> {
@@ -75,19 +92,22 @@ pub(crate) fn validate_image(image: &str) -> Result<&str, ApiError> {
 }
 
 fn configured_image(state: &AppState, protocol: Protocol) -> &str {
-    match protocol {
-        Protocol::Postgres => &state.config.images.postgres,
-        Protocol::Redis => &state.config.images.redis,
-        Protocol::Mariadb => &state.config.images.mariadb,
-        Protocol::Mongodb => &state.config.images.mongodb,
-        Protocol::Clickhouse => &state.config.images.clickhouse,
-        Protocol::Qdrant => &state.config.images.qdrant,
-    }
+    state.config.images.configured_for_protocol(protocol)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        auth::api_token::ApiToken,
+        config::{Config, ImageAllowlistConfig},
+        instances::{manager::InstanceManager, state::InstanceStore},
+        jobs::import_export::ImportExportJobs,
+        runtime::docker::DockerRuntime,
+        storage::{repositories::InstanceRepository, sqlite},
+    };
 
     #[test]
     fn rejects_custom_latest_or_untagged_images() {
@@ -106,5 +126,79 @@ mod tests {
             "registry.example.com:5000/postgres:18.4"
         );
         assert_eq!(validate_image(&digest).unwrap(), digest);
+    }
+
+    #[tokio::test]
+    async fn image_allowlist_implicitly_allows_configured_image() {
+        let state = test_state(Config {
+            images: crate::config::ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                allowed: ImageAllowlistConfig::default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+        ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.4").unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_allowlist_allows_protocol_specific_entries() {
+        let state = test_state(Config {
+            images: crate::config::ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                allowed: ImageAllowlistConfig {
+                    postgres: vec!["postgres:18.5".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+        ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.5").unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_allowlist_rejects_unlisted_pinned_image() {
+        let state = test_state(Config {
+            images: crate::config::ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                allowed: ImageAllowlistConfig {
+                    postgres: vec!["postgres:18.5".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+        let error = ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.6").unwrap_err();
+
+        assert!(error.to_string().contains("is not allowed"));
+    }
+
+    async fn test_state(config: Config) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let store = InstanceStore::default();
+        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
+        AppState {
+            config: Arc::new(config),
+            config_path: dir.path().join("config.yml"),
+            api_token: ApiToken::new("secret"),
+            instances: store,
+            manager,
+            docker: DockerRuntime::new(&Default::default(), false).unwrap(),
+            import_export_jobs: ImportExportJobs::default(),
+            api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
+            install_progress: crate::api::progress::InstallProgressStore::default(),
+            artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+        }
     }
 }

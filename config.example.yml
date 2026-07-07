@@ -112,6 +112,22 @@ images:
   mongodb: "mongo:8.3.4"
   clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
   qdrant: "qdrant/qdrant:v1.18.2"
+  # Optional per-protocol update allowlist. The configured image above is always
+  # allowed even if it is not repeated here.
+  allowed:
+    postgres:
+      - "postgres:18.4"
+    redis:
+      - "redis:8.8.0"
+    mariadb:
+      - "mariadb:12.3.2"
+    mongodb:
+      - "mongo:8.3.4"
+      - "mongo:7.0.37"
+    clickhouse:
+      - "clickhouse/clickhouse-server:26.4.4.38"
+    qdrant:
+      - "qdrant/qdrant:v1.18.2"
 
 paths:
   data: /var/lib/dbev

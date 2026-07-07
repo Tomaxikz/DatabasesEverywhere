@@ -187,6 +187,22 @@ impl DiskLimiter {
             }),
         }
     }
+
+    pub async fn instance_usage_bytes(
+        &self,
+        data_path: &Path,
+    ) -> Result<Option<u64>, DiskLimitError> {
+        match self.config.mode {
+            DiskLimitMode::FuseQuota => {
+                fuse_quota::quota_used_with_root(data_path, self.fuse_root.as_deref())
+                    .await
+                    .map(Some)
+            }
+            DiskLimitMode::Advisory
+            | DiskLimitMode::DockerStorageOpt
+            | DiskLimitMode::ProjectQuota => Ok(None),
+        }
+    }
 }
 
 pub(super) fn privileged_command(program: &'static str) -> Command {

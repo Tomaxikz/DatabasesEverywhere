@@ -1,4 +1,12 @@
-use std::path::{Path as FsPath, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path as FsPath, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -7,6 +15,10 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use tokio::{
+    sync::Mutex,
+    time::{Instant, timeout},
+};
 
 use crate::{
     api::{
@@ -14,8 +26,50 @@ use crate::{
         routes::AppState,
     },
     auth::scopes,
-    instances::{metadata::InstanceMetadata, paths::InstancePaths},
+    config::Config,
+    disk::DiskLimiter,
+    instances::{
+        metadata::{InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
+    runtime::docker::DockerRuntime,
+    shared::protocol::Protocol,
 };
+
+use futures::{StreamExt, TryStreamExt};
+
+const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const INITIAL_DISK_SCAN_TIMEOUT: Duration = Duration::from_millis(750);
+const RESOURCE_FANOUT_LIMIT: usize = 16;
+
+#[derive(Debug, Clone, Default)]
+pub struct ResourceCache {
+    inner: Arc<Mutex<ResourceCacheInner>>,
+    active_monitors: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Default)]
+struct ResourceCacheInner {
+    stats: HashMap<String, CachedRuntimeStats>,
+    cpu_samples: HashMap<String, CpuStatsSample>,
+    disk: HashMap<String, CachedDiskUsage>,
+    disk_refreshing: HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRuntimeStats {
+    stats: Value,
+    raw: String,
+    cpu_usage_percent: Option<f64>,
+    sampled_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CachedDiskUsage {
+    pub used_bytes: u64,
+    sampled_at: Instant,
+}
 
 #[derive(Debug, Serialize)]
 pub struct ResourceReport {
@@ -62,10 +116,14 @@ pub async fn list_resources(
     uri: Uri,
 ) -> ApiResult<Vec<ResourceReport>> {
     authorize_scope(&state, &headers, &uri, scopes::RESOURCES_READ)?;
-    let mut reports = Vec::new();
-    for metadata in state.instances.list().await {
-        reports.push(resource_report(&state, metadata).await?);
-    }
+    let reports = futures::stream::iter(state.instances.list().await)
+        .map(|metadata| {
+            let state = state.clone();
+            async move { resource_report(&state, metadata).await }
+        })
+        .buffer_unordered(RESOURCE_FANOUT_LIMIT)
+        .try_collect()
+        .await?;
     Ok(Json(reports))
 }
 
@@ -98,19 +156,18 @@ pub(crate) async fn resource_report_with_docker_stats(
     metadata: InstanceMetadata,
 ) -> Result<(ResourceReport, Option<String>), ApiError> {
     let stats = state
-        .docker
-        .stats(metadata.protocol, &metadata.instance_id)
-        .await
-        .ok()
-        .map(|output| output.stdout);
-    let stats_value = stats
-        .as_ref()
-        .and_then(|stats| serde_json::from_str::<Value>(stats).ok());
+        .resource_cache
+        .runtime_stats(&state.docker, metadata.protocol, &metadata.instance_id)
+        .await;
+    let stats_value = stats.as_ref().map(|stats| &stats.stats);
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let disk_used = directory_size(paths.data)
+    let disk_used = state
+        .resource_cache
+        .disk_usage(&state.config, &metadata.instance_id, paths.data)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
+        .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?
+        .used_bytes;
 
     let report = ResourceReport {
         instance_id: metadata.instance_id,
@@ -118,11 +175,14 @@ pub(crate) async fn resource_report_with_docker_stats(
         status: metadata.status.as_str().to_string(),
         cpu: CpuReport {
             configured_cores: metadata.limits.cpu_cores,
-            usage_percent: stats_value.as_ref().and_then(cpu_percent),
+            usage_percent: stats
+                .as_ref()
+                .and_then(|stats| stats.cpu_usage_percent)
+                .or_else(|| stats_value.and_then(cpu_percent)),
         },
         memory: MemoryReport {
             configured_mib: metadata.limits.memory_mib,
-            usage_bytes: stats_value.as_ref().and_then(memory_usage_bytes),
+            usage_bytes: stats_value.and_then(memory_usage_bytes),
             limit_bytes: Some(mib_to_bytes(metadata.limits.memory_mib)),
         },
         disk: DiskReport {
@@ -133,29 +193,339 @@ pub(crate) async fn resource_report_with_docker_stats(
             enforcement_method: metadata.limits.disk_enforcement_method,
         },
         network: NetworkReport {
-            rx_bytes: stats_value.as_ref().and_then(network_rx_bytes),
-            tx_bytes: stats_value.as_ref().and_then(network_tx_bytes),
+            rx_bytes: stats_value.and_then(network_rx_bytes),
+            tx_bytes: stats_value.and_then(network_tx_bytes),
         },
     };
 
-    Ok((report, stats))
-}
-
-pub(crate) async fn instance_disk_used(
-    state: &AppState,
-    instance_id: &str,
-) -> Result<u64, ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    directory_size(paths.data)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))
+    Ok((report, stats.map(|stats| stats.raw)))
 }
 
 async fn directory_size(path: PathBuf) -> Result<u64, std::io::Error> {
     tokio::task::spawn_blocking(move || directory_size_blocking(&path))
         .await
         .map_err(std::io::Error::other)?
+}
+
+impl ResourceCache {
+    pub(crate) fn register_monitor(&self) -> ResourceMonitorGuard {
+        self.active_monitors.fetch_add(1, Ordering::Relaxed);
+        ResourceMonitorGuard {
+            active_monitors: self.active_monitors.clone(),
+        }
+    }
+
+    fn has_active_monitors(&self) -> bool {
+        self.active_monitors.load(Ordering::Relaxed) > 0
+    }
+
+    async fn runtime_stats(
+        &self,
+        docker: &DockerRuntime,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Option<CachedRuntimeStats> {
+        let cache_key = instance_id.to_string();
+        if let Some(cached) = self.fresh_stats(&cache_key).await {
+            return Some(cached);
+        }
+
+        let output = docker.stats(protocol, instance_id).await.ok()?;
+        let raw = output.stdout;
+        let stats = serde_json::from_str::<Value>(&raw).ok()?;
+        let cpu_usage_percent = self
+            .record_cpu_sample(&cache_key, &stats)
+            .await
+            .or_else(|| cpu_percent(&stats));
+        let cached = CachedRuntimeStats {
+            stats,
+            raw,
+            cpu_usage_percent,
+            sampled_at: Instant::now(),
+        };
+        let mut inner = self.inner.lock().await;
+        inner.stats.insert(cache_key, cached.clone());
+        Some(cached)
+    }
+
+    async fn fresh_stats(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
+        let inner = self.inner.lock().await;
+        inner
+            .stats
+            .get(instance_id)
+            .filter(|sample| sample.sampled_at.elapsed() < STATS_REFRESH_INTERVAL)
+            .cloned()
+    }
+
+    async fn record_cpu_sample(&self, instance_id: &str, stats: &Value) -> Option<f64> {
+        let current = current_cpu_sample(stats)?;
+        let mut inner = self.inner.lock().await;
+        let usage = inner
+            .cpu_samples
+            .get(instance_id)
+            .copied()
+            .and_then(|previous| cpu_percent_between(previous, current));
+        inner.cpu_samples.insert(instance_id.to_string(), current);
+        usage
+    }
+
+    pub(crate) async fn disk_usage(
+        &self,
+        config: &Config,
+        instance_id: &str,
+        path: PathBuf,
+    ) -> Result<CachedDiskUsage, String> {
+        if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
+            return Ok(sample);
+        }
+
+        if let Some(sample) = self.cached_disk_usage(instance_id).await {
+            if sample.sampled_at.elapsed() < DISK_REFRESH_INTERVAL {
+                return Ok(sample);
+            }
+            self.refresh_disk_usage_background(
+                Arc::new(config.clone()),
+                instance_id.to_string(),
+                path,
+            );
+            return Ok(sample);
+        }
+
+        match timeout(INITIAL_DISK_SCAN_TIMEOUT, directory_size(path.clone())).await {
+            Ok(Ok(used_bytes)) => {
+                let sample = CachedDiskUsage {
+                    used_bytes,
+                    sampled_at: Instant::now(),
+                };
+                self.store_disk_usage(instance_id.to_string(), sample).await;
+                Ok(sample)
+            }
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => {
+                self.refresh_disk_usage_background(
+                    Arc::new(config.clone()),
+                    instance_id.to_string(),
+                    path,
+                );
+                Ok(CachedDiskUsage {
+                    used_bytes: 0,
+                    sampled_at: Instant::now(),
+                })
+            }
+        }
+    }
+
+    async fn quota_disk_usage(
+        &self,
+        config: &Config,
+        instance_id: &str,
+        path: &FsPath,
+    ) -> Option<CachedDiskUsage> {
+        let disk_limiter =
+            DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
+        match disk_limiter.instance_usage_bytes(path).await {
+            Ok(Some(used_bytes)) => {
+                let sample = CachedDiskUsage {
+                    used_bytes,
+                    sampled_at: Instant::now(),
+                };
+                self.store_disk_usage(instance_id.to_string(), sample).await;
+                Some(sample)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::debug!(
+                    %instance_id,
+                    %error,
+                    "quota disk usage unavailable; falling back to cached directory usage"
+                );
+                None
+            }
+        }
+    }
+
+    async fn cached_disk_usage(&self, instance_id: &str) -> Option<CachedDiskUsage> {
+        let inner = self.inner.lock().await;
+        inner.disk.get(instance_id).copied()
+    }
+
+    async fn store_disk_usage(&self, instance_id: String, sample: CachedDiskUsage) {
+        let mut inner = self.inner.lock().await;
+        inner.disk.insert(instance_id, sample);
+    }
+
+    fn refresh_disk_usage_background(
+        &self,
+        config: Arc<Config>,
+        instance_id: String,
+        path: PathBuf,
+    ) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            {
+                let mut inner = cache.inner.lock().await;
+                if inner
+                    .disk_refreshing
+                    .get(&instance_id)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                inner.disk_refreshing.insert(instance_id.clone(), true);
+            }
+
+            let result =
+                match DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
+                    .instance_usage_bytes(&path)
+                    .await
+                {
+                    Ok(Some(used_bytes)) => Ok(used_bytes),
+                    Ok(None) => directory_size(path).await,
+                    Err(error) => {
+                        tracing::debug!(
+                            %instance_id,
+                            %error,
+                            "quota disk usage unavailable during background refresh"
+                        );
+                        directory_size(path).await
+                    }
+                };
+            let mut inner = cache.inner.lock().await;
+            inner.disk_refreshing.remove(&instance_id);
+            match result {
+                Ok(used_bytes) => {
+                    inner.disk.insert(
+                        instance_id,
+                        CachedDiskUsage {
+                            used_bytes,
+                            sampled_at: Instant::now(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %instance_id,
+                        %error,
+                        "failed to refresh resource disk usage"
+                    );
+                }
+            }
+        });
+    }
+
+    pub async fn refresh_all_disk_usage(&self, state: &AppState) {
+        let instances = state.instances.list().await;
+        futures::stream::iter(
+            instances
+                .into_iter()
+                .filter(|metadata| metadata.status == InstanceStatus::Running),
+        )
+        .map(|metadata| {
+            let cache = self.clone();
+            let config = state.config.clone();
+            async move {
+                let paths = match InstancePaths::new(&config.paths, &metadata.instance_id) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        tracing::debug!(
+                            instance_id = %metadata.instance_id,
+                            %error,
+                            "skipping resource disk sample for invalid instance path"
+                        );
+                        return;
+                    }
+                };
+                cache
+                    .refresh_disk_usage_now(config, metadata.instance_id, paths.data)
+                    .await;
+            }
+        })
+        .buffer_unordered(RESOURCE_FANOUT_LIMIT)
+        .collect::<Vec<_>>()
+        .await;
+    }
+
+    async fn refresh_disk_usage_now(
+        &self,
+        config: Arc<Config>,
+        instance_id: String,
+        path: PathBuf,
+    ) {
+        {
+            let mut inner = self.inner.lock().await;
+            if inner
+                .disk_refreshing
+                .get(&instance_id)
+                .copied()
+                .unwrap_or(false)
+            {
+                return;
+            }
+            inner.disk_refreshing.insert(instance_id.clone(), true);
+        }
+
+        let result =
+            match DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
+                .instance_usage_bytes(&path)
+                .await
+            {
+                Ok(Some(used_bytes)) => Ok(used_bytes),
+                Ok(None) => directory_size(path).await,
+                Err(error) => {
+                    tracing::debug!(
+                        %instance_id,
+                        %error,
+                        "quota disk usage unavailable during sampler refresh"
+                    );
+                    directory_size(path).await
+                }
+            };
+
+        let mut inner = self.inner.lock().await;
+        inner.disk_refreshing.remove(&instance_id);
+        match result {
+            Ok(used_bytes) => {
+                inner.disk.insert(
+                    instance_id,
+                    CachedDiskUsage {
+                        used_bytes,
+                        sampled_at: Instant::now(),
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %instance_id,
+                    %error,
+                    "failed to refresh sampled disk usage"
+                );
+            }
+        }
+    }
+}
+
+pub fn start_resource_sampler(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(DISK_REFRESH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if !state.resource_cache.has_active_monitors() {
+                continue;
+            }
+            state.resource_cache.refresh_all_disk_usage(&state).await;
+        }
+    });
+}
+
+pub(crate) struct ResourceMonitorGuard {
+    active_monitors: Arc<AtomicUsize>,
+}
+
+impl Drop for ResourceMonitorGuard {
+    fn drop(&mut self) {
+        self.active_monitors.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn directory_size_blocking(path: &FsPath) -> Result<u64, std::io::Error> {

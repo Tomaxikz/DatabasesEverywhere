@@ -131,6 +131,24 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
     ] {
         validate_image_reference(field, image)?;
     }
+    for (field, allowed) in [
+        (
+            "images.allowed.postgres",
+            images.allowed.postgres.as_slice(),
+        ),
+        ("images.allowed.redis", images.allowed.redis.as_slice()),
+        ("images.allowed.mariadb", images.allowed.mariadb.as_slice()),
+        ("images.allowed.mongodb", images.allowed.mongodb.as_slice()),
+        (
+            "images.allowed.clickhouse",
+            images.allowed.clickhouse.as_slice(),
+        ),
+        ("images.allowed.qdrant", images.allowed.qdrant.as_slice()),
+    ] {
+        for image in allowed {
+            validate_image_reference(field, image)?;
+        }
+    }
     Ok(())
 }
 
@@ -580,6 +598,22 @@ mod tests {
             error,
             ConfigValidationError::InvalidImageReference {
                 field: "images.qdrant",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_unpinned_or_latest_allowed_images() {
+        let mut config = valid_config();
+        config.images.allowed.postgres = vec!["postgres:latest".to_string()];
+
+        let error = validate_config(&config).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigValidationError::InvalidImageReference {
+                field: "images.allowed.postgres",
                 ..
             }
         ));

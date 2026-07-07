@@ -451,6 +451,7 @@ pub struct ImageConfig {
     pub mongodb: String,
     pub clickhouse: String,
     pub qdrant: String,
+    pub allowed: ImageAllowlistConfig,
 }
 
 impl Default for ImageConfig {
@@ -462,7 +463,50 @@ impl Default for ImageConfig {
             mongodb: "mongo:7.0.37".to_string(),
             clickhouse: "clickhouse/clickhouse-server:25.8.25.37".to_string(),
             qdrant: "qdrant/qdrant:v1.18.2".to_string(),
+            allowed: ImageAllowlistConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageAllowlistConfig {
+    pub postgres: Vec<String>,
+    pub redis: Vec<String>,
+    pub mariadb: Vec<String>,
+    pub mongodb: Vec<String>,
+    pub clickhouse: Vec<String>,
+    pub qdrant: Vec<String>,
+}
+
+impl ImageConfig {
+    pub fn configured_for_protocol(&self, protocol: crate::shared::protocol::Protocol) -> &str {
+        match protocol {
+            crate::shared::protocol::Protocol::Postgres => &self.postgres,
+            crate::shared::protocol::Protocol::Redis => &self.redis,
+            crate::shared::protocol::Protocol::Mariadb => &self.mariadb,
+            crate::shared::protocol::Protocol::Mongodb => &self.mongodb,
+            crate::shared::protocol::Protocol::Clickhouse => &self.clickhouse,
+            crate::shared::protocol::Protocol::Qdrant => &self.qdrant,
+        }
+    }
+
+    pub fn allowed_for_protocol(&self, protocol: crate::shared::protocol::Protocol) -> Vec<&str> {
+        let configured = self.configured_for_protocol(protocol);
+        let mut allowed = match protocol {
+            crate::shared::protocol::Protocol::Postgres => self.allowed.postgres.iter(),
+            crate::shared::protocol::Protocol::Redis => self.allowed.redis.iter(),
+            crate::shared::protocol::Protocol::Mariadb => self.allowed.mariadb.iter(),
+            crate::shared::protocol::Protocol::Mongodb => self.allowed.mongodb.iter(),
+            crate::shared::protocol::Protocol::Clickhouse => self.allowed.clickhouse.iter(),
+            crate::shared::protocol::Protocol::Qdrant => self.allowed.qdrant.iter(),
+        }
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+        if !allowed.contains(&configured) {
+            allowed.push(configured);
+        }
+        allowed
     }
 }
 

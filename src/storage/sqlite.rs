@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::{
     SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
 use super::migrations;
@@ -49,6 +49,7 @@ pub async fn connect(data_root: &Path) -> Result<SqlitePool, SqliteStorageError>
         .filename(&path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()

@@ -66,6 +66,11 @@ components:
           type: integer
           nullable: true
           example: 5434
+        image:
+          type: string
+          nullable: true
+          example: postgres:18.4
+          description: Optional pinned container image for this instance. The image must be the configured default or listed in images.allowed.<protocol>; omit this field to use the node default.
         project_id:
           type: string
           nullable: true
@@ -282,6 +287,51 @@ components:
           enum: [start, stop, restart, kill]
         instance:
           $ref: "#/components/schemas/Instance"
+    UpdateInstanceImageRequest:
+      type: object
+      required: [image]
+      properties:
+        image:
+          type: string
+          example: mongo:8.3.4
+          description: Pinned target image. Must be the configured default image or listed in images.allowed.<protocol>. Bare images and latest tags are rejected.
+        password:
+          type: string
+          format: password
+          nullable: true
+          description: Current tenant database password. Required for most protocols so DBE can recreate users after the container is rebuilt. Redis does not require it.
+        major_upgrade:
+          type: boolean
+          default: false
+          description: Set true only after an explicit admin confirmation when the image changes database major version. DBE then runs its export/import migration workflow instead of a same-volume recreate.
+    ImageUpdateStrategy:
+      type: string
+      enum: [in_place_recreate, major_upgrade_migration]
+    UpdateInstanceImageResponse:
+      type: object
+      properties:
+        instance:
+          $ref: "#/components/schemas/Instance"
+        image:
+          type: string
+          description: Target image applied to the instance.
+        recreated:
+          type: boolean
+        strategy:
+          $ref: "#/components/schemas/ImageUpdateStrategy"
+        warnings:
+          type: array
+          items:
+            type: string
+          description: Provider-style warnings the panel should show after a successful upgrade.
+        export_artifact_path:
+          type: string
+          nullable: true
+          description: Logical export artifact kept after a major upgrade for rollback/audit.
+        old_volume_backup_path:
+          type: string
+          nullable: true
+          description: Preserved old volume path kept after a major upgrade for rollback/audit.
     ConfigPatchResponse:
       type: object
       properties:
@@ -291,7 +341,7 @@ components:
           type: boolean
         config_path:
           type: string
-    UpgradeRequest:
+    DaemonUpgradeRequest:
       type: object
       required: [url, sha256, restart_command]
       properties:
@@ -314,7 +364,7 @@ components:
           type: array
           items:
             type: string
-    UpgradeResponse:
+    DaemonUpgradeResponse:
       type: object
       properties:
         accepted:
@@ -373,14 +423,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/UpgradeRequest"
+              $ref: "#/components/schemas/DaemonUpgradeRequest"
       responses:
         "200":
           description: Upgrade accepted.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UpgradeResponse"
+                $ref: "#/components/schemas/DaemonUpgradeResponse"
   /api/heartbeat:
     post:
       summary: Lightweight authenticated health check.
@@ -540,7 +590,8 @@ paths:
                 $ref: "#/components/schemas/PowerResponse"
   /api/instances/{instance_id}/image:
     patch:
-      summary: Pull and switch an instance to a new Docker image.
+      summary: Pull and switch an instance to a new database image.
+      description: Same-major updates recreate the container on the existing volume. Major version changes require major_upgrade=true and run the safer export/import migration workflow where supported.
       x-required-scope: instances:write
       parameters:
         - name: instance_id
@@ -553,15 +604,14 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [image]
-              properties:
-                image:
-                  type: string
-                  example: postgres:18.4
+              $ref: "#/components/schemas/UpdateInstanceImageRequest"
       responses:
         "200":
           description: Image update result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateInstanceImageResponse"
   /api/resources:
     get:
       summary: List resource usage for all instances.

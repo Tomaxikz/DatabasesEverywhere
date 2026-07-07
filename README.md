@@ -1,8 +1,22 @@
+This repository is still in development please do not use this in production yet
+
 # DatabasesEverywhere
 
 Hand out databases without handing out whole servers.
 
 DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Each instance runs in its own isolated container, the daemon routes public ports to the right one, and your panel drives it all over a simple API.
+
+## Features
+
+- 6+ supported databases
+- Database imports
+- Database exports
+- Database backups
+- Automatic backups
+- Live WebSocket monitoring
+- Image updating
+- Major version upgrades
+- Per-database resource limits
 
 ## Status
 
@@ -29,7 +43,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Backend containers are private and don't publish any database ports by default.
 - Per-instance CPU, memory, PID, and disk limits, so one noisy instance can't eat the whole box.
 - Disk enforcement via FuseQuota when your host doesn't have native project quotas.
-- Logical imports and exports.
+- Native logical dumps for SQL/document stores and physical archive exports for Redis/Qdrant.
 - Physical backups and restores.
 - Signed artifact downloads.
 - WebSocket monitoring for instance status and resource usage.
@@ -40,21 +54,9 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 Download the latest release for your architecture and install it to `/usr/local/bin`:
 
 ```bash
-case "$(uname -m)" in
-  x86_64) TARGET=x86_64-linux ;;
-  aarch64|arm64) TARGET=aarch64-linux ;;
-  ppc64le|powerpc64le) TARGET=ppc64le-linux ;;
-  riscv64) TARGET=riscv64-linux ;;
-  *) echo "unsupported architecture: $(uname -m)"; exit 1 ;;
-esac
-VERSION=$(curl -s https://api.github.com/repos/Tomaxikz/DatabasesEverywhere/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
-curl -L -o /tmp/dbev \
-  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${VERSION}/dbev-${TARGET}"
-sha256sum /tmp/dbev
-sudo install -m 0755 /tmp/dbev /usr/local/bin/dbev
+sudo curl -L "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-$(uname -m)-linux" -o /usr/local/bin/dbev
+sudo chmod +x /usr/local/bin/dbev
 ```
-
-Compare the printed SHA256 with the checksum table in the GitHub release notes.
 
 Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
 

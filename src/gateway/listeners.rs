@@ -1,9 +1,14 @@
-use std::{future::Future, io::ErrorKind};
+use std::{
+    future::Future,
+    io::ErrorKind,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
 };
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use super::{resolver::RouteResolver, security::GatewayConnectionLimiter, tunnel};
 use crate::{
@@ -42,9 +47,52 @@ pub enum ListenerError {
     Tunnel(#[from] tunnel::TunnelError),
 }
 
-trait GatewayStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T> GatewayStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-type BoxedGatewayStream = Box<dyn GatewayStream>;
+enum GatewayStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for GatewayStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buffer),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for GatewayStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, bytes),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, bytes),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+const TUNNEL_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn run_postgres_listener(
     bind: &str,
@@ -171,6 +219,7 @@ where
 
     loop {
         let (client, peer) = listener.accept().await?;
+        client.set_nodelay(true)?;
         if !limiter.allow(peer.ip()).await {
             tracing::warn!(%peer, protocol, "audit database_connection_rate_limited");
             continue;
@@ -242,7 +291,7 @@ async fn handle_postgres_client(
     if postgres::is_ssl_request(&packet) {
         if let Some(tls) = tls {
             client.write_all(b"S").await?;
-            let mut client = Box::new(tls.accept(client).await?) as BoxedGatewayStream;
+            let mut client = GatewayStream::Tls(Box::new(tls.accept(client).await?));
             return handle_postgres_startup(&mut client, resolver).await;
         }
         client.write_all(b"N").await?;
@@ -363,6 +412,7 @@ async fn handle_mariadb_client(
     };
 
     let mut backend = TcpStream::connect((host.as_str(), port)).await?;
+    backend.set_nodelay(true)?;
     let backend_handshake_packet = mariadb::read_packet(&mut backend).await?;
     let mut backend_handshake =
         mariadb::parse_backend_handshake(&backend_handshake_packet.payload)?;
@@ -417,7 +467,13 @@ async fn handle_mariadb_client(
     }
 
     mariadb::write_packet(&mut client, 2, &mariadb::ok_packet()).await?;
-    io::copy_bidirectional(&mut client, &mut backend).await?;
+    io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut backend,
+        TUNNEL_BUFFER_SIZE,
+        TUNNEL_BUFFER_SIZE,
+    )
+    .await?;
     Ok(())
 }
 
@@ -464,8 +520,15 @@ async fn handle_mongodb_client(
         };
 
         let mut backend = TcpStream::connect((host.as_str(), port)).await?;
+        backend.set_nodelay(true)?;
         backend.write_all(&message.raw).await?;
-        io::copy_bidirectional(&mut client, &mut backend).await?;
+        io::copy_bidirectional_with_sizes(
+            &mut client,
+            &mut backend,
+            TUNNEL_BUFFER_SIZE,
+            TUNNEL_BUFFER_SIZE,
+        )
+        .await?;
         return Ok(());
     }
 }
@@ -530,6 +593,7 @@ async fn handle_qdrant_client(
     };
 
     let backend_stream = TcpStream::connect((host.as_str(), port)).await?;
+    backend_stream.set_nodelay(true)?;
     let mut backend = qdrant::client_handshake(backend_stream).await?;
     qdrant::proxy_request(request, respond, &mut backend).await?;
 
@@ -604,15 +668,22 @@ where
 {
     let mut buffer = Vec::with_capacity(2048);
     let mut chunk = [0_u8; 1024];
+    let mut scan_from = 0;
     loop {
         let read = client.read(&mut chunk).await?;
         if read == 0 {
             return Err(clickhouse::ClickhouseParseError::IncompleteHttpRequest.into());
         }
+        let previous_len = buffer.len();
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+        scan_from = scan_from.min(previous_len.saturating_sub(3));
+        if buffer[scan_from..]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
             return Ok(buffer);
         }
+        scan_from = buffer.len().saturating_sub(3);
         if buffer.len() > 64 * 1024 {
             return Err(clickhouse::ClickhouseParseError::InvalidHttpRequest.into());
         }
@@ -622,11 +693,11 @@ where
 async fn accept_direct_tls(
     client: TcpStream,
     tls: Option<TlsAcceptor>,
-) -> Result<BoxedGatewayStream, std::io::Error> {
+) -> Result<GatewayStream, std::io::Error> {
     if let Some(tls) = tls {
-        Ok(Box::new(tls.accept(client).await?))
+        Ok(GatewayStream::Tls(Box::new(tls.accept(client).await?)))
     } else {
-        Ok(Box::new(client))
+        Ok(GatewayStream::Plain(client))
     }
 }
 

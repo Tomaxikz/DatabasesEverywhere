@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{Read, Write},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -155,6 +155,7 @@ pub async fn delete_artifact(
     let path = artifact_path(&state, &name)?;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
+            remove_checksum_sidecar(&path).await;
             tracing::info!(event = "audit artifact_deleted", artifact = %name);
             Ok(Json(DeleteArtifactResponse {
                 name,
@@ -189,7 +190,10 @@ pub async fn apply_retention(
         }
         let path = artifact_path(&state, &artifact.name)?;
         match tokio::fs::remove_file(&path).await {
-            Ok(()) => deleted.push(artifact.name),
+            Ok(()) => {
+                remove_checksum_sidecar(&path).await;
+                deleted.push(artifact.name);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ApiError::Runtime(format!(
@@ -452,6 +456,9 @@ pub(crate) async fn read_artifacts(state: &AppState) -> Result<Vec<ArtifactInfo>
             continue;
         }
         let path = entry.path();
+        if is_checksum_sidecar(&path) {
+            continue;
+        }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -564,22 +571,131 @@ fn absolute_url(headers: &HeaderMap, path: &str) -> String {
 }
 
 pub(crate) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(path)?;
-        let mut buffer = [0_u8; 64 * 1024];
-        let mut hasher = Sha256::new();
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to stat artifact: {error}")))?;
+    if let Some(hash) = cached_sha256(&path, &metadata).await? {
+        return Ok(hash);
+    }
+
+    let hash = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || {
+            let mut file = std::fs::File::open(&path)?;
+            let mut buffer = [0_u8; 64 * 1024];
+            let mut hasher = Sha256::new();
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
             }
-            hasher.update(&buffer[..read]);
+            Ok::<_, std::io::Error>(format!("{:x}", hasher.finalize()))
         }
-        Ok::<_, std::io::Error>(format!("{:x}", hasher.finalize()))
     })
     .await
     .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))
+    .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?;
+    write_checksum_sidecar(&path, &metadata, &hash).await;
+    Ok(hash)
+}
+
+fn checksum_sidecar_path(path: &FsPath) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{name}.sha256")))
+}
+
+pub(crate) fn is_checksum_sidecar(path: &FsPath) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".sha256"))
+}
+
+async fn cached_sha256(
+    path: &FsPath,
+    metadata: &std::fs::Metadata,
+) -> Result<Option<String>, ApiError> {
+    let Some(sidecar) = checksum_sidecar_path(path) else {
+        return Ok(None);
+    };
+    let content = match tokio::fs::read_to_string(sidecar).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "failed to read checksum sidecar");
+            return Ok(None);
+        }
+    };
+    let mut hash = None;
+    let mut size = None;
+    let mut modified_nanos = None;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("sha256 ") {
+            hash = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("size ") {
+            size = value.trim().parse::<u64>().ok();
+        } else if let Some(value) = line.strip_prefix("modified_unix_nanos ") {
+            modified_nanos = value.trim().parse::<u128>().ok();
+        }
+    }
+    let Some(hash) = hash.filter(|hash| is_sha256_hex(hash)) else {
+        return Ok(None);
+    };
+    if size == Some(metadata.len())
+        && modified_nanos
+            == Some(system_time_unix_nanos(
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+            ))
+    {
+        Ok(Some(hash))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn write_checksum_sidecar(path: &FsPath, metadata: &std::fs::Metadata, hash: &str) {
+    let Some(sidecar) = checksum_sidecar_path(path) else {
+        return;
+    };
+    let modified = system_time_unix_nanos(metadata.modified().unwrap_or(UNIX_EPOCH));
+    let content = format!(
+        "sha256 {hash}\nsize {}\nmodified_unix_nanos {modified}\n",
+        metadata.len()
+    );
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::create(sidecar)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|result| result)
+    {
+        tracing::debug!(%error, path = %path.display(), "failed to write checksum sidecar");
+    }
+}
+
+pub(crate) async fn remove_checksum_sidecar(path: &FsPath) {
+    if let Some(sidecar) = checksum_sidecar_path(path) {
+        match tokio::fs::remove_file(sidecar).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "failed to delete checksum sidecar")
+            }
+        }
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn system_time_unix_nanos(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 pub(crate) fn system_time_rfc3339(time: SystemTime) -> String {
@@ -745,6 +861,8 @@ mod tests {
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         }
     }
 
@@ -774,7 +892,10 @@ mod tests {
             route_key_sha256: None,
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
+            mongodb_root_password: None,
             limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }

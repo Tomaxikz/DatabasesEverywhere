@@ -366,6 +366,7 @@ impl DockerRuntime {
         let name = self.container_name(spec.protocol, &spec.instance_id)?;
         self.ensure_image_with_progress(&spec.image, progress)
             .await?;
+        ensure_bind_mount_sources(spec).await?;
         let body = self.create_body(spec)?;
         let response = self
             .docker
@@ -382,6 +383,19 @@ impl DockerRuntime {
 
     pub async fn pull_image(&self, image: &str) -> Result<CommandOutput, DockerError> {
         self.ensure_image_with_progress(image, None).await?;
+        Ok(CommandOutput {
+            stdout: image.to_string(),
+            stderr: String::new(),
+        })
+    }
+
+    pub async fn pull_image_with_progress(
+        &self,
+        image: &str,
+        progress: &(dyn Fn(DockerImagePullProgress) + Send + Sync),
+    ) -> Result<CommandOutput, DockerError> {
+        self.ensure_image_with_progress(image, Some(progress))
+            .await?;
         Ok(CommandOutput {
             stdout: image.to_string(),
             stderr: String::new(),
@@ -746,6 +760,59 @@ fn container_mounts(spec: &DockerInstanceSpec) -> Vec<bollard::models::Mount> {
     mounts
 }
 
+async fn ensure_bind_mount_sources(spec: &DockerInstanceSpec) -> Result<(), DockerError> {
+    ensure_bind_mount_dir(&spec.data_path).await?;
+    ensure_bind_mount_dir(&spec.logs_path).await?;
+    for mount in &spec.extra_mounts {
+        if mount.read_only {
+            ensure_bind_mount_file(&mount.source).await?;
+        } else {
+            ensure_bind_mount_dir(&mount.source).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_bind_mount_dir(path: &std::path::Path) -> Result<(), DockerError> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(|source| DockerError::MountSourceIo {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let metadata =
+        tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|source| DockerError::MountSourceIo {
+                path: path.display().to_string(),
+                source,
+            })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DockerError::InvalidMountSource {
+            path: path.display().to_string(),
+            reason: "expected a real directory".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_bind_mount_file(path: &std::path::Path) -> Result<(), DockerError> {
+    let metadata =
+        tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|source| DockerError::MountSourceIo {
+                path: path.display().to_string(),
+                source,
+            })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DockerError::InvalidMountSource {
+            path: path.display().to_string(),
+            reason: "expected a real file".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
     if !enforce_disk_limits || disk_mib == 0 {
         None
@@ -765,6 +832,13 @@ pub enum DockerError {
     Api(#[from] BollardError),
     #[error("docker security policy rejected spec: {0}")]
     Security(#[from] security::DockerSecurityError),
+    #[error("failed to prepare bind mount source {path}: {source}")]
+    MountSourceIo {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("invalid bind mount source {path}: {reason}")]
+    InvalidMountSource { path: String, reason: String },
     #[error("docker stats stream ended without data")]
     EmptyStatsStream,
     #[error("docker disk limit probe failed for image {image}: {source}")]

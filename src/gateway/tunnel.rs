@@ -9,6 +9,7 @@ use crate::shared::backend::BackendEndpoint;
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const TUNNEL_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {
@@ -67,6 +68,7 @@ where
                 timeout_secs: BACKEND_CONNECT_TIMEOUT.as_secs(),
             })?
             .map_err(TunnelError::Connect)?;
+            backend.set_nodelay(true).map_err(TunnelError::Connect)?;
             timeout(BACKEND_REPLAY_TIMEOUT, backend.write_all(replay))
                 .await
                 .map_err(|_| TunnelError::ReplayTimeout {
@@ -104,7 +106,7 @@ where
         .write_all(&first)
         .await
         .map_err(TunnelError::Tunnel)?;
-    io::copy_bidirectional(client, backend)
+    io::copy_bidirectional_with_sizes(client, backend, TUNNEL_BUFFER_SIZE, TUNNEL_BUFFER_SIZE)
         .await
         .map_err(TunnelError::Tunnel)?;
     Ok(())

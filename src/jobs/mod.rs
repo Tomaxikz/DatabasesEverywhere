@@ -293,7 +293,7 @@ pub mod import_export {
         })?;
         std::fs::create_dir_all(parent)?;
         let file = File::create(artifact_path)?;
-        let encoder = GzEncoder::new(file, Compression::default());
+        let encoder = GzEncoder::new(file, Compression::new(3));
         let mut builder = Builder::new(encoder);
         let root_name = data_dir
             .file_name()
@@ -310,7 +310,6 @@ pub mod import_export {
         data_parent: &Path,
         expected_root: &str,
     ) -> Result<(), ImportExportError> {
-        validate_archive_blocking(artifact_path, expected_root)?;
         let file = File::open(artifact_path)?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);

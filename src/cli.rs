@@ -1186,8 +1186,11 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         ),
         install_progress: crate::api::progress::InstallProgressStore::default(),
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+        resource_cache: crate::api::resources::ResourceCache::default(),
+        instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
     };
     crate::api::backups::start_scheduler(state.clone());
+    crate::api::resources::start_resource_sampler(state.clone());
     serve_api(&config, build_router(state)).await
 }
 

@@ -194,6 +194,15 @@ pub(super) fn mount_path_with_root(
     Ok(fuse_paths_with_root(data_path, fuse_root)?.mount_path)
 }
 
+pub(super) async fn quota_used_with_root(
+    data_path: &Path,
+    fuse_root: Option<&Path>,
+) -> Result<u64, DiskLimitError> {
+    let paths = fuse_paths_with_root(data_path, fuse_root)?;
+    let response = send_command(&paths.socket_path, "get quota_used").await?;
+    parse_quota_used_response(&response)
+}
+
 async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     let started = Instant::now();
     let mut last_error = String::new();
@@ -377,6 +386,22 @@ fn database_safe_mount_args() -> [&'static str; 3] {
     ["--nopassthrough", "--nosplice", "--clone-fd"]
 }
 
+fn parse_quota_used_response(lines: &[String]) -> Result<u64, DiskLimitError> {
+    for line in lines {
+        if let Some(value) = line.strip_prefix("quota_used =") {
+            return value
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| DiskLimitError::FuseSocket(error.to_string()));
+        }
+    }
+
+    Err(DiskLimitError::FuseSocket(format!(
+        "fuse quota socket did not return quota_used: {}",
+        lines.join("; ")
+    )))
+}
+
 fn stderr_string(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
@@ -413,5 +438,11 @@ mod tests {
         assert!(args.contains(&"--nosplice"));
         assert!(args.contains(&"--clone-fd"));
         assert!(!args.contains(&"--nocache"));
+    }
+
+    #[test]
+    fn parses_quota_used_response() {
+        let lines = vec!["quota_used = 12345".to_string(), "OK".to_string()];
+        assert_eq!(parse_quota_used_response(&lines).unwrap(), 12345);
     }
 }

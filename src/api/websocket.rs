@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::{
     extract::{
         Query, State,
@@ -10,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio::time::{Duration, Instant, interval};
+use tokio::time::{Duration, interval};
 
 use crate::{
     api::{
@@ -18,11 +16,7 @@ use crate::{
         handlers::{ApiError, authorize_websocket_jwt},
         import_export::{ImportExportJobResponse, public_job_response},
         progress::InstallProgress,
-        resources::{
-            CpuStatsSample, ResourceReport, cpu_percent, cpu_percent_between, current_cpu_sample,
-            instance_disk_used, memory_usage_bytes, mib_to_bytes, network_rx_bytes,
-            network_tx_bytes,
-        },
+        resources::{ResourceReport, resource_report_with_docker_stats},
         routes::AppState,
     },
     auth::scopes,
@@ -34,6 +28,7 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
     pub instance_id: String,
+    pub tail: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -55,11 +50,11 @@ pub async fn monitoring(
 }
 
 async fn stream_monitoring(mut socket: WebSocket, state: AppState) {
+    let _monitor = state.resource_cache.register_monitor();
     let mut ticker = interval(Duration::from_secs(1));
-    let mut cache = MonitoringCache::default();
     loop {
         ticker.tick().await;
-        let message = monitoring_snapshot(&state, &mut cache).await;
+        let message = monitoring_snapshot(&state).await;
         let Ok(payload) = serde_json::to_string(&message) else {
             tracing::warn!("failed to serialize monitoring snapshot");
             break;
@@ -70,93 +65,19 @@ async fn stream_monitoring(mut socket: WebSocket, state: AppState) {
     }
 }
 
-const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const MONITORING_FANOUT_LIMIT: usize = 16;
 
-#[derive(Debug, Default)]
-struct MonitoringCache {
-    cpu_samples: HashMap<String, CpuStatsSample>,
-    disk_samples: HashMap<String, CachedDiskUsage>,
-}
+async fn monitoring_snapshot(state: &AppState) -> MonitoringSnapshot {
+    use futures::StreamExt;
 
-#[derive(Debug, Clone, Copy)]
-struct CachedDiskUsage {
-    used_bytes: u64,
-    sampled_at: Instant,
-}
-
-async fn monitoring_snapshot(state: &AppState, cache: &mut MonitoringCache) -> MonitoringSnapshot {
-    let mut instances = Vec::new();
-    for metadata in state.instances.list().await {
-        let instance_id = metadata.instance_id.clone();
-        let stats = state
-            .docker
-            .stats(metadata.protocol, &metadata.instance_id)
-            .await
-            .ok()
-            .map(|output| output.stdout);
-        let stats_value = stats
-            .as_ref()
-            .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok());
-        let memory_usage = stats_value.as_ref().and_then(memory_usage_bytes);
-        let network_rx = stats_value.as_ref().and_then(network_rx_bytes);
-        let network_tx = stats_value.as_ref().and_then(network_tx_bytes);
-        let cpu_usage = stats_value
-            .as_ref()
-            .and_then(|stats| live_cpu_percent(&instance_id, stats, cache));
-        let disk_sample = cached_disk_usage(state, &instance_id, cache).await;
-        let disk_used = disk_sample.as_ref().ok().map(|sample| sample.used_bytes);
-        let resource_error = disk_sample.err();
-        let memory_limit = mib_to_bytes(metadata.limits.memory_mib);
-        let disk_limit = mib_to_bytes(metadata.limits.disk_mib);
-
-        let resources = ResourceReport {
-            instance_id: metadata.instance_id.clone(),
-            protocol: metadata.protocol.to_string(),
-            status: metadata.status.as_str().to_string(),
-            cpu: crate::api::resources::CpuReport {
-                configured_cores: metadata.limits.cpu_cores,
-                usage_percent: cpu_usage,
-            },
-            memory: crate::api::resources::MemoryReport {
-                configured_mib: metadata.limits.memory_mib,
-                usage_bytes: memory_usage,
-                limit_bytes: Some(memory_limit),
-            },
-            disk: crate::api::resources::DiskReport {
-                configured_mib: metadata.limits.disk_mib,
-                limit_bytes: disk_limit,
-                used_bytes: disk_used.unwrap_or(0),
-                enforced: metadata.limits.disk_enforced,
-                enforcement_method: metadata.limits.disk_enforcement_method.clone(),
-            },
-            network: crate::api::resources::NetworkReport {
-                rx_bytes: network_rx,
-                tx_bytes: network_tx,
-            },
-        };
-
-        instances.push(MonitoringInstance {
-            instance_id: metadata.instance_id,
-            protocol: metadata.protocol.to_string(),
-            status: metadata.status.as_str().to_string(),
-            runtime: metadata.runtime.kind.as_str(),
-            cpu_cores: metadata.limits.cpu_cores,
-            cpu_limit_cores: metadata.limits.cpu_cores,
-            cpu_usage_percent: cpu_usage,
-            memory_mib: metadata.limits.memory_mib,
-            memory_usage_bytes: memory_usage,
-            memory_limit_bytes: Some(memory_limit),
-            disk_mib: metadata.limits.disk_mib,
-            disk_limit_bytes: disk_limit,
-            disk_used_bytes: disk_used,
-            disk_enforced: metadata.limits.disk_enforced,
-            network_rx_bytes: network_rx,
-            network_tx_bytes: network_tx,
-            resources: Some(resources),
-            docker_stats: stats,
-            resource_error,
-        });
-    }
+    let instances = futures::stream::iter(state.instances.list().await)
+        .map(|metadata| {
+            let state = state.clone();
+            async move { monitoring_instance(&state, metadata).await }
+        })
+        .buffer_unordered(MONITORING_FANOUT_LIMIT)
+        .collect()
+        .await;
 
     MonitoringSnapshot {
         r#type: "stats",
@@ -165,58 +86,50 @@ async fn monitoring_snapshot(state: &AppState, cache: &mut MonitoringCache) -> M
     }
 }
 
-fn live_cpu_percent(
-    instance_id: &str,
-    stats: &serde_json::Value,
-    cache: &mut MonitoringCache,
-) -> Option<f64> {
-    let from_docker_precpu = cpu_percent(stats);
-    let current = current_cpu_sample(stats);
-    let from_previous_snapshot = current.and_then(|current| {
-        cache
-            .cpu_samples
-            .get(instance_id)
-            .copied()
-            .and_then(|previous| cpu_percent_between(previous, current))
-    });
-    if let Some(current) = current {
-        cache.cpu_samples.insert(instance_id.to_string(), current);
-    }
-    from_previous_snapshot.or(from_docker_precpu)
-}
-
-async fn cached_disk_usage(
-    state: &AppState,
-    instance_id: &str,
-    cache: &mut MonitoringCache,
-) -> Result<CachedDiskUsage, String> {
-    if let Some(sample) = cache.disk_samples.get(instance_id).copied()
-        && sample.sampled_at.elapsed() < DISK_REFRESH_INTERVAL
-    {
-        return Ok(sample);
-    }
-
-    match instance_disk_used(state, instance_id).await {
-        Ok(used_bytes) => {
-            let sample = CachedDiskUsage {
-                used_bytes,
-                sampled_at: Instant::now(),
-            };
-            cache.disk_samples.insert(instance_id.to_string(), sample);
-            Ok(sample)
-        }
-        Err(error) => {
-            tracing::warn!(
-                %instance_id,
-                %error,
-                "failed to collect monitoring disk usage"
-            );
-            cache
-                .disk_samples
-                .get(instance_id)
-                .copied()
-                .ok_or_else(|| error.to_string())
-        }
+async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> MonitoringInstance {
+    match resource_report_with_docker_stats(state, metadata.clone()).await {
+        Ok((resources, docker_stats)) => MonitoringInstance {
+            instance_id: metadata.instance_id,
+            protocol: metadata.protocol.to_string(),
+            status: metadata.status.as_str().to_string(),
+            runtime: metadata.runtime.kind.as_str(),
+            cpu_cores: metadata.limits.cpu_cores,
+            cpu_limit_cores: metadata.limits.cpu_cores,
+            cpu_usage_percent: resources.cpu.usage_percent,
+            memory_mib: metadata.limits.memory_mib,
+            memory_usage_bytes: resources.memory.usage_bytes,
+            memory_limit_bytes: resources.memory.limit_bytes,
+            disk_mib: metadata.limits.disk_mib,
+            disk_limit_bytes: resources.disk.limit_bytes,
+            disk_used_bytes: Some(resources.disk.used_bytes),
+            disk_enforced: metadata.limits.disk_enforced,
+            network_rx_bytes: resources.network.rx_bytes,
+            network_tx_bytes: resources.network.tx_bytes,
+            resources: Some(resources),
+            docker_stats,
+            resource_error: None,
+        },
+        Err(error) => MonitoringInstance {
+            instance_id: metadata.instance_id,
+            protocol: metadata.protocol.to_string(),
+            status: metadata.status.as_str().to_string(),
+            runtime: metadata.runtime.kind.as_str(),
+            cpu_cores: metadata.limits.cpu_cores,
+            cpu_limit_cores: metadata.limits.cpu_cores,
+            cpu_usage_percent: None,
+            memory_mib: metadata.limits.memory_mib,
+            memory_usage_bytes: None,
+            memory_limit_bytes: None,
+            disk_mib: metadata.limits.disk_mib,
+            disk_limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
+            disk_used_bytes: None,
+            disk_enforced: metadata.limits.disk_enforced,
+            network_rx_bytes: None,
+            network_tx_bytes: None,
+            resources: None,
+            docker_stats: None,
+            resource_error: Some(error.to_string()),
+        },
     }
 }
 
@@ -271,7 +184,7 @@ pub async fn logs(
         .ok_or(ApiError::NotFound)?;
     Ok(websocket
         .protocols(["dbe.jwt", "bearer"])
-        .on_upgrade(move |socket| stream_logs(socket, state, metadata)))
+        .on_upgrade(move |socket| stream_logs(socket, state, metadata, query.tail)))
 }
 
 pub async fn import_export(
@@ -294,33 +207,80 @@ pub async fn import_export(
         .on_upgrade(move |socket| stream_import_export(socket, state, query, download_headers)))
 }
 
-async fn stream_logs(mut socket: WebSocket, state: AppState, metadata: InstanceMetadata) {
-    let mut ticker = interval(Duration::from_secs(3));
-    let mut sequence = 0_u64;
-    loop {
-        ticker.tick().await;
-        sequence += 1;
-        let message = match state
-            .docker
-            .logs(metadata.protocol, &metadata.instance_id, None)
-            .await
-        {
-            Ok(output) => LogSnapshot {
+async fn stream_logs(
+    mut socket: WebSocket,
+    state: AppState,
+    metadata: InstanceMetadata,
+    tail: Option<usize>,
+) {
+    let mut logs = match state
+        .docker
+        .follow_logs(metadata.protocol, &metadata.instance_id, tail)
+    {
+        Ok(logs) => logs,
+        Err(error) => {
+            let message = LogSnapshot {
                 r#type: "logs",
-                instance_id: metadata.instance_id.clone(),
-                sequence,
-                stdout: Some(redaction::redact_connection_url(&output.stdout)),
-                stderr: Some(redaction::redact_connection_url(&output.stderr)),
-                error: None,
-            },
-            Err(error) => LogSnapshot {
-                r#type: "logs",
-                instance_id: metadata.instance_id.clone(),
-                sequence,
+                instance_id: metadata.instance_id,
+                sequence: 1,
                 stdout: None,
                 stderr: None,
                 error: Some(error.to_string()),
-            },
+            };
+            let _ = send_json(&mut socket, &message).await;
+            return;
+        }
+    };
+    let mut heartbeat = interval(Duration::from_secs(30));
+    let mut sequence = 0_u64;
+    let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
+    loop {
+        let message = tokio::select! {
+            output = logs.recv() => {
+                sequence += 1;
+                match output {
+                    Some(Ok(output)) => {
+                        append_log_buffer(&mut stdout_buffer, &output.stdout);
+                        append_log_buffer(&mut stderr_buffer, &output.stderr);
+                        LogSnapshot {
+                            r#type: "logs",
+                            instance_id: metadata.instance_id.clone(),
+                            sequence,
+                            stdout: non_empty_redacted(&stdout_buffer),
+                            stderr: non_empty_redacted(&stderr_buffer),
+                            error: None,
+                        }
+                    }
+                    Some(Err(error)) => LogSnapshot {
+                        r#type: "logs",
+                        instance_id: metadata.instance_id.clone(),
+                        sequence,
+                        stdout: None,
+                        stderr: None,
+                        error: Some(error.to_string()),
+                    },
+                    None => LogSnapshot {
+                        r#type: "logs",
+                        instance_id: metadata.instance_id.clone(),
+                        sequence,
+                        stdout: None,
+                        stderr: None,
+                        error: Some("container log stream ended".to_string()),
+                    },
+                }
+            }
+            _ = heartbeat.tick() => {
+                sequence += 1;
+                LogSnapshot {
+                    r#type: "logs",
+                    instance_id: metadata.instance_id.clone(),
+                    sequence,
+                    stdout: non_empty_redacted(&stdout_buffer),
+                    stderr: non_empty_redacted(&stderr_buffer),
+                    error: None,
+                }
+            }
         };
 
         let Ok(payload) = serde_json::to_string(&message) else {
@@ -331,6 +291,27 @@ async fn stream_logs(mut socket: WebSocket, state: AppState, metadata: InstanceM
             break;
         }
     }
+}
+
+const LOG_STREAM_BUFFER_LIMIT: usize = 128 * 1024;
+
+fn append_log_buffer(buffer: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    buffer.push_str(chunk);
+    if buffer.len() <= LOG_STREAM_BUFFER_LIMIT {
+        return;
+    }
+    let mut start = buffer.len().saturating_sub(LOG_STREAM_BUFFER_LIMIT);
+    while start < buffer.len() && !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.replace_range(..start, "");
+}
+
+fn non_empty_redacted(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| redaction::redact_connection_url(value))
 }
 
 async fn stream_import_export(

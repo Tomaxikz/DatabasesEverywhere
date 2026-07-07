@@ -119,6 +119,36 @@ fn podman_create_body_omits_docker_healthcheck() {
     assert!(body.healthcheck.is_none());
 }
 
+#[tokio::test]
+async fn create_preflight_creates_missing_managed_mount_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut spec = postgres_spec();
+    spec.data_path = temp.path().join("volumes").join("inst_abc");
+    spec.logs_path = temp.path().join("logs").join("instances").join("inst_abc");
+
+    ensure_bind_mount_sources(&spec).await.unwrap();
+
+    assert!(spec.data_path.is_dir());
+    assert!(spec.logs_path.is_dir());
+}
+
+#[tokio::test]
+async fn create_preflight_rejects_missing_read_only_file_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut spec = postgres_spec();
+    spec.data_path = temp.path().join("volumes").join("inst_abc");
+    spec.logs_path = temp.path().join("logs").join("instances").join("inst_abc");
+    spec.extra_mounts.push(DockerMount {
+        source: temp.path().join("missing-config.xml"),
+        target: "/etc/service/config.xml".to_string(),
+        read_only: true,
+    });
+
+    let error = ensure_bind_mount_sources(&spec).await.unwrap_err();
+
+    assert!(matches!(error, DockerError::MountSourceIo { .. }));
+}
+
 #[test]
 fn rootless_podman_is_detected_from_user_socket() {
     let runtime = test_runtime_with_engine(

@@ -23,9 +23,28 @@ pub struct InstanceMetadata {
     pub mariadb_native_password_sha1_stage2: Option<String>,
     #[serde(default, skip_serializing)]
     pub mariadb_root_password: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub mongodb_root_password: Option<String>,
     pub limits: InstanceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<InstanceImageStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_version: Option<InstanceDatabaseVersion>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceImageStatus {
+    pub current: Option<String>,
+    pub configured: String,
+    pub update_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceDatabaseVersion {
+    pub current: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

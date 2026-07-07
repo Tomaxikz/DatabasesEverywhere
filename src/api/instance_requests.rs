@@ -15,6 +15,7 @@ pub struct CreateInstanceRequest {
     pub public_host: String,
     pub public_port: Option<u16>,
     pub project_id: Option<String>,
+    pub image: Option<String>,
     pub limits: Option<LimitsRequest>,
 }
 

@@ -6,6 +6,7 @@ use tokio::{net::TcpListener, time::sleep};
 use crate::{
     api::{
         handlers::ApiError,
+        images::{ensure_image_allowed, validate_image},
         instance_requests::{CreateInstanceRequest, limits_from_request, validate_create_request},
         instances::docker_error,
         routes::AppState,
@@ -21,8 +22,8 @@ use crate::{
     },
     runtime::docker::{DockerImagePullProgress, DockerInstanceSpec},
     shared::{
-        backend::BackendEndpoint, logs::truncate_log_tail, protocol::Protocol, shell::sh_quote,
-        time::now_rfc3339,
+        backend::BackendEndpoint, logs::summarize_failure_logs, protocol::Protocol,
+        shell::sh_quote, time::now_rfc3339,
     },
 };
 
@@ -48,7 +49,7 @@ async fn create_instance_from_validated_request(
     state: &AppState,
     request: CreateInstanceRequest,
 ) -> Result<InstanceMetadata, ApiError> {
-    let image = image_for_protocol(state, request.protocol).to_string();
+    let image = requested_or_configured_image(state, &request)?;
     state
         .install_progress
         .begin(&request.instance_id, request.protocol, &image);
@@ -75,6 +76,8 @@ async fn create_instance_from_validated_request(
         .map_err(|error| fail_runtime(state, &request.instance_id, error))?;
     let password = SecretString::from(request.password.clone());
     let mariadb_root_password = (request.protocol == Protocol::Mariadb)
+        .then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
+    let mongodb_root_password = (request.protocol == Protocol::Mongodb)
         .then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
 
     match request.protocol {
@@ -140,7 +143,7 @@ async fn create_instance_from_validated_request(
     let mut spec = match request.protocol {
         Protocol::Postgres => databases::postgres::docker::instance_spec(
             &request.instance_id,
-            &state.config.images.postgres,
+            &image,
             &request.database,
             &request.username,
             password,
@@ -150,13 +153,13 @@ async fn create_instance_from_validated_request(
         ),
         Protocol::Redis => databases::redis::docker::instance_spec(
             &request.instance_id,
-            &state.config.images.redis,
+            &image,
             container_data_path.clone(),
             paths.logs.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::instance_spec(
             &request.instance_id,
-            &state.config.images.mariadb,
+            &image,
             &request.database,
             &request.username,
             password,
@@ -173,10 +176,21 @@ async fn create_instance_from_validated_request(
         ),
         Protocol::Mongodb => databases::mongodb::docker::instance_spec(
             &request.instance_id,
-            &state.config.images.mongodb,
+            &image,
             &request.database,
-            &request.username,
-            password,
+            databases::mongodb::docker::MongodbAuth {
+                username: request.username.clone(),
+                password,
+                root_password: SecretString::from(mongodb_root_password.clone().ok_or_else(
+                    || {
+                        fail_runtime(
+                            state,
+                            &request.instance_id,
+                            "internal mongodb root password was not generated",
+                        )
+                    },
+                )?),
+            },
             container_data_path.clone(),
             paths.logs.clone(),
         ),
@@ -187,7 +201,7 @@ async fn create_instance_from_validated_request(
                     .map_err(|error| fail_runtime(state, &request.instance_id, error))?;
             databases::clickhouse::docker::instance_spec(
                 &request.instance_id,
-                &state.config.images.clickhouse,
+                &image,
                 &request.database,
                 &request.username,
                 password,
@@ -198,7 +212,7 @@ async fn create_instance_from_validated_request(
         }
         Protocol::Qdrant => databases::qdrant::docker::instance_spec(
             &request.instance_id,
-            &state.config.images.qdrant,
+            &image,
             password,
             container_data_path,
             paths.logs.clone(),
@@ -241,6 +255,13 @@ async fn create_instance_from_validated_request(
                 &request.database,
                 &request.username,
                 &request.password,
+                mongodb_root_password.as_deref().ok_or_else(|| {
+                    fail_runtime(
+                        state,
+                        &request.instance_id,
+                        "internal mongodb root password was not generated",
+                    )
+                })?,
             )
             .await?;
         }
@@ -349,7 +370,10 @@ async fn create_instance_from_validated_request(
         mariadb_native_password_sha1_stage2: (request.protocol == Protocol::Mariadb)
             .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
         mariadb_root_password,
+        mongodb_root_password,
         limits,
+        image: None,
+        database_version: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -366,6 +390,10 @@ async fn create_instance_from_validated_request(
                 "created container but failed to persist instance metadata: {error}"
             ))
         })?;
+    state
+        .instance_runtime_cache
+        .remove(&metadata.instance_id)
+        .await;
 
     tracing::info!(
         event = "audit instance_created",
@@ -569,18 +597,18 @@ async fn wait_for_container_shell_command(
     Err(ApiError::Runtime(message))
 }
 
-async fn provision_mongodb_tenant_user(
+pub(crate) async fn provision_mongodb_tenant_user(
     state: &AppState,
     instance_id: &str,
     database: &str,
     username: &str,
     password: &str,
+    root_password: &str,
 ) -> Result<(), ApiError> {
     wait_for_mongodb_localhost(state, instance_id).await?;
     let root_username = "dbe_root";
-    let root_password = uuid::Uuid::new_v4().to_string();
     let root_script =
-        databases::mongodb::provision::create_root_user_script(root_username, &root_password)
+        databases::mongodb::provision::create_root_user_script(root_username, root_password)
             .map_err(|error| fail_bad_request(state, instance_id, error))?;
     state
         .docker
@@ -662,6 +690,21 @@ fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
         Protocol::Clickhouse => &state.config.images.clickhouse,
         Protocol::Qdrant => &state.config.images.qdrant,
     }
+}
+
+fn requested_or_configured_image(
+    state: &AppState,
+    request: &CreateInstanceRequest,
+) -> Result<String, ApiError> {
+    let image = request
+        .image
+        .as_deref()
+        .map(validate_image)
+        .transpose()?
+        .map(str::to_string)
+        .unwrap_or_else(|| image_for_protocol(state, request.protocol).to_string());
+    ensure_image_allowed(state, request.protocol, &image)?;
+    Ok(image)
 }
 
 fn fail_bad_request(
@@ -896,7 +939,7 @@ pub(crate) async fn docker_error_with_logs(
     let logs = match state.docker.logs(protocol, instance_id, None).await {
         Ok(output) => {
             let combined = format!("{}{}", output.stdout, output.stderr);
-            truncate_log_tail(combined.trim(), 4_000)
+            summarize_failure_logs(&combined, 4_000)
         }
         Err(log_error) => format!("failed to read container logs: {log_error}"),
     };
@@ -963,4 +1006,117 @@ pub(crate) async fn backend_endpoint_for_instance(
         host: backend_host,
         port: protocol.default_container_port(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        auth::api_token::ApiToken,
+        config::{Config, ImageAllowlistConfig, ImageConfig},
+        instances::{manager::InstanceManager, state::InstanceStore},
+        jobs::import_export::ImportExportJobs,
+        runtime::docker::DockerRuntime,
+        storage::{repositories::InstanceRepository, sqlite},
+    };
+
+    #[tokio::test]
+    async fn create_request_allows_configured_image_override() {
+        let state = test_state(Config {
+            images: ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let mut request = create_request(Protocol::Postgres);
+        request.image = Some("postgres:18.4".to_string());
+
+        let image = requested_or_configured_image(&state, &request).unwrap();
+
+        assert_eq!(image, "postgres:18.4");
+    }
+
+    #[tokio::test]
+    async fn create_request_allows_protocol_allowlisted_image_override() {
+        let state = test_state(Config {
+            images: ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                allowed: ImageAllowlistConfig {
+                    postgres: vec!["postgres:18.5".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let mut request = create_request(Protocol::Postgres);
+        request.image = Some("postgres:18.5".to_string());
+
+        let image = requested_or_configured_image(&state, &request).unwrap();
+
+        assert_eq!(image, "postgres:18.5");
+    }
+
+    #[tokio::test]
+    async fn create_request_rejects_unlisted_image_override_before_pull() {
+        let state = test_state(Config {
+            images: ImageConfig {
+                postgres: "postgres:18.4".to_string(),
+                allowed: ImageAllowlistConfig {
+                    postgres: vec!["postgres:18.5".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let mut request = create_request(Protocol::Postgres);
+        request.image = Some("postgres:18.6".to_string());
+
+        let error = requested_or_configured_image(&state, &request).unwrap_err();
+
+        assert!(error.to_string().contains("is not allowed"));
+    }
+
+    fn create_request(protocol: Protocol) -> CreateInstanceRequest {
+        CreateInstanceRequest {
+            instance_id: "inst_test_pg".to_string(),
+            protocol,
+            database: "test_db".to_string(),
+            username: "test_user".to_string(),
+            password: "test-password".to_string(),
+            public_host: "127.0.0.1".to_string(),
+            public_port: None,
+            project_id: None,
+            image: None,
+            limits: None,
+        }
+    }
+
+    async fn test_state(config: Config) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let store = InstanceStore::default();
+        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
+        AppState {
+            config: Arc::new(config),
+            config_path: dir.path().join("config.yml"),
+            api_token: ApiToken::new("secret"),
+            instances: store,
+            manager,
+            docker: DockerRuntime::new(&Default::default(), false).unwrap(),
+            import_export_jobs: ImportExportJobs::default(),
+            api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
+            install_progress: crate::api::progress::InstallProgressStore::default(),
+            artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+        }
+    }
 }

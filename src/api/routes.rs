@@ -27,6 +27,8 @@ pub struct AppState {
     pub api_rate_limiter: crate::api::security::ApiRateLimiter,
     pub install_progress: crate::api::progress::InstallProgressStore,
     pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
+    pub resource_cache: crate::api::resources::ResourceCache,
+    pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
 }
 
 pub fn build_router(state: AppState) -> Router {

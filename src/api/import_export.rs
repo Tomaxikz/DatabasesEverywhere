@@ -23,10 +23,13 @@ use crate::{
         routes::AppState,
     },
     auth::scopes,
-    instances::{metadata::InstanceStatus, paths::InstancePaths},
+    instances::{
+        metadata::{InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     jobs::import_export::{
         ImportExportAction, ImportExportJob, ImportExportStatus, create_data_archive,
-        extract_data_archive, validate_data_archive,
+        extract_data_archive,
     },
     shared::{protocol::Protocol, shell::sh_quote},
 };
@@ -260,6 +263,47 @@ pub(crate) async fn queue_export_instance(
     queue_export_instance_with_options(state, instance_id, ExportOptions::default()).await
 }
 
+pub(crate) async fn export_instance_to_default_artifact(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<PathBuf, ApiError> {
+    let metadata = state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    let artifact_path = export_artifact_path(
+        state,
+        &metadata.instance_id,
+        metadata.protocol,
+        ExportArchiveFormat::Plain,
+    )
+    .await?;
+    export_instance_artifact(
+        state,
+        &metadata.instance_id,
+        artifact_path.clone(),
+        &ExportOptions::default(),
+    )
+    .await?;
+    Ok(artifact_path)
+}
+
+pub(crate) async fn import_default_artifact_into_metadata(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    artifact_path: &FsPath,
+) -> Result<(), ApiError> {
+    import_instance_artifact(
+        state,
+        &metadata.instance_id,
+        metadata,
+        artifact_path,
+        &ImportOptions::artifact(artifact_path.to_path_buf()),
+    )
+    .await
+}
+
 pub(crate) async fn queue_export_instance_with_options(
     state: &AppState,
     instance_id: &str,
@@ -490,10 +534,17 @@ async fn export_instance_artifact(
         .await
         .ok_or(ApiError::NotFound)?;
     match metadata.protocol {
-        Protocol::Redis => {
-            export_redis_archive(state, instance_id, artifact_path, &options.selection).await
+        Protocol::Redis | Protocol::Qdrant => {
+            export_physical_archive(
+                state,
+                instance_id,
+                metadata.protocol,
+                artifact_path,
+                &options.selection,
+            )
+            .await
         }
-        protocol => export_logical_dump(state, instance_id, protocol, artifact_path, options).await,
+        protocol => export_logical_dump(state, &metadata, protocol, artifact_path, options).await,
     }
 }
 
@@ -509,17 +560,10 @@ async fn import_instance_source(
         .ok_or(ApiError::NotFound)?;
     match &options.source {
         ImportSourceOptions::Artifact(path) => {
-            import_instance_artifact(state, instance_id, metadata.protocol, path, options).await
+            import_instance_artifact(state, instance_id, &metadata, path, options).await
         }
         ImportSourceOptions::Remote(remote) => {
-            import_remote_source(
-                state,
-                instance_id,
-                metadata.protocol,
-                remote,
-                &options.selection,
-            )
-            .await
+            import_remote_source(state, instance_id, &metadata, remote, &options.selection).await
         }
     }
 }
@@ -527,23 +571,27 @@ async fn import_instance_source(
 async fn import_instance_artifact(
     state: &AppState,
     instance_id: &str,
-    protocol: Protocol,
+    metadata: &InstanceMetadata,
     artifact_path: &FsPath,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
+    let protocol = metadata.protocol;
     match protocol {
-        Protocol::Redis => import_redis_archive(state, instance_id, artifact_path).await,
-        protocol => import_logical_dump(state, instance_id, protocol, artifact_path, options).await,
+        Protocol::Redis | Protocol::Qdrant => {
+            import_physical_archive(state, instance_id, protocol, artifact_path).await
+        }
+        protocol => import_logical_dump(state, metadata, protocol, artifact_path, options).await,
     }
 }
 
-async fn export_redis_archive(
+async fn export_physical_archive(
     state: &AppState,
     instance_id: &str,
+    protocol: Protocol,
     artifact_path: PathBuf,
     selection: &ImportExportSelection,
 ) -> Result<(), ApiError> {
-    ensure_full_selection(Protocol::Redis, selection)?;
+    ensure_full_selection(protocol, selection)?;
     let metadata = state
         .instances
         .get(instance_id)
@@ -566,11 +614,21 @@ async fn export_redis_archive(
     result
 }
 
-async fn import_redis_archive(
+async fn import_physical_archive(
     state: &AppState,
     instance_id: &str,
+    protocol: Protocol,
     artifact_path: &FsPath,
 ) -> Result<(), ApiError> {
+    match protocol {
+        Protocol::Redis | Protocol::Qdrant => {}
+        protocol => {
+            return Err(ApiError::BadRequest(format!(
+                "{} is not a physical archive protocol",
+                protocol.as_str()
+            )));
+        }
+    }
     let metadata = state
         .instances
         .get(instance_id)
@@ -599,11 +657,12 @@ async fn import_redis_archive(
 
 async fn export_logical_dump(
     state: &AppState,
-    instance_id: &str,
+    metadata: &InstanceMetadata,
     protocol: Protocol,
     artifact_path: PathBuf,
     options: &ExportOptions,
 ) -> Result<(), ApiError> {
+    let instance_id = &metadata.instance_id;
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     tokio::fs::create_dir_all(
@@ -620,7 +679,7 @@ async fn export_logical_dump(
     let container_temp = format!("{}/{}", container_data_path(protocol), temp_name);
     cleanup_path(&host_temp).await;
 
-    let script = export_script(protocol, &container_temp, &options.selection)?;
+    let script = export_script(metadata, &container_temp, &options.selection)?;
     if let Err(error) = state
         .docker
         .exec_shell(protocol, instance_id, &script)
@@ -638,11 +697,12 @@ async fn export_logical_dump(
 
 async fn import_logical_dump(
     state: &AppState,
-    instance_id: &str,
+    metadata: &InstanceMetadata,
     protocol: Protocol,
     artifact_path: &FsPath,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
+    let instance_id = &metadata.instance_id;
     ensure_full_selection(protocol, &options.selection)?;
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -654,7 +714,7 @@ async fn import_logical_dump(
     prepare_logical_import_artifact(protocol, artifact_path, &host_temp, &paths.data, options)
         .await?;
 
-    let script = import_script(protocol, &container_temp)?;
+    let script = import_script(metadata, &container_temp)?;
     let result = state
         .docker
         .exec_shell(protocol, instance_id, &script)
@@ -990,7 +1050,7 @@ fn dump_candidate_suffixes(protocol: Protocol) -> &'static [&'static str] {
         Protocol::Mariadb => &[".mariadb.sql", ".mysql.sql", ".sql"],
         Protocol::Mongodb => &[".mongodb.archive.gz", ".archive.gz"],
         Protocol::Clickhouse => &[".clickhouse.sql", ".sql"],
-        Protocol::Qdrant => &[".qdrant.snapshot", ".snapshot"],
+        Protocol::Qdrant => &[".qdrant.tar.gz", ".tar.gz"],
     }
 }
 
@@ -1189,10 +1249,11 @@ fn private_or_sensitive_ip(ip: IpAddr) -> bool {
 async fn import_remote_source(
     state: &AppState,
     instance_id: &str,
-    protocol: Protocol,
+    metadata: &InstanceMetadata,
     remote: &RemoteImportSource,
     selection: &ImportExportSelection,
 ) -> Result<(), ApiError> {
+    let protocol = metadata.protocol;
     if state.config.daemon.internal_network {
         return Err(ApiError::BadRequest(
             "remote credential import is disabled while daemon.internal_network is true because database containers have no outbound network access".to_string(),
@@ -1204,7 +1265,7 @@ async fn import_remote_source(
             protocol.as_str()
         )));
     }
-    let script = remote_import_script(protocol, remote, selection)?;
+    let script = remote_import_script(metadata, remote, selection)?;
     state
         .docker
         .exec_shell(protocol, instance_id, &script)
@@ -1221,14 +1282,15 @@ fn redact_remote_error(mut error: String, remote: &RemoteImportSource) -> String
 }
 
 fn remote_import_script(
-    protocol: Protocol,
+    metadata: &InstanceMetadata,
     remote: &RemoteImportSource,
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
+    let protocol = metadata.protocol;
     match protocol {
         Protocol::Postgres => remote_postgres_import_script(remote, selection),
         Protocol::Mariadb => remote_mariadb_import_script(remote, selection),
-        Protocol::Mongodb => remote_mongodb_import_script(remote, selection),
+        Protocol::Mongodb => remote_mongodb_import_script(metadata, remote, selection),
         Protocol::Clickhouse => remote_clickhouse_import_script(remote, selection),
         Protocol::Redis | Protocol::Qdrant => Err(ApiError::NotImplemented(format!(
             "{} remote credential import is not implemented yet",
@@ -1303,9 +1365,11 @@ mariadb-dump \
 }
 
 fn remote_mongodb_import_script(
+    metadata: &InstanceMetadata,
     remote: &RemoteImportSource,
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
+    ensure_mongodb_root_password(metadata)?;
     let database = required_remote_database(remote)?;
     let username = required_remote_username(remote)?;
     let password = required_remote_password(remote)?;
@@ -1326,9 +1390,9 @@ mongodump \
   --gzip \
 | mongorestore \
   --host 127.0.0.1 \
-  --username "$DBE_MONGO_USER" \
-  --password "$DBE_MONGO_PASSWORD" \
-  --authenticationDatabase "$DBE_MONGO_DATABASE" \
+  --username "$DBE_MONGO_ROOT_USER" \
+  --password "$DBE_MONGO_ROOT_PASSWORD" \
+  --authenticationDatabase "admin" \
   --drop \
   --nsFrom {remote_namespace} \
   --nsTo "$DBE_MONGO_DATABASE.*" \
@@ -1741,11 +1805,21 @@ fn required_remote_password(remote: &RemoteImportSource) -> Result<&SecretString
         .ok_or_else(|| ApiError::BadRequest("remote import requires password".to_string()))
 }
 
+fn ensure_mongodb_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+    if metadata.protocol == Protocol::Mongodb && metadata.mongodb_root_password.is_none() {
+        return Err(ApiError::BadRequest(
+            "mongodb internal root password is missing; this instance was created before DBE stored MongoDB maintenance credentials, so DBE cannot export/import protected internal collections such as time-series buckets. Recreate the instance or use a manual admin dump.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn export_script(
-    protocol: Protocol,
+    metadata: &InstanceMetadata,
     output_path: &str,
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
+    let protocol = metadata.protocol;
     let script = match protocol {
         Protocol::Postgres => {
             let filters = postgres_dump_selection_args(selection)?;
@@ -1774,14 +1848,15 @@ mariadb-dump \
             )
         }
         Protocol::Mongodb => {
+            ensure_mongodb_root_password(metadata)?;
             let filters = mongodb_dump_selection_args(selection, "$DBE_MONGO_DATABASE")?;
             format!(
                 r#"set -eu
 mongodump \
   --host 127.0.0.1 \
-  --username "$DBE_MONGO_USER" \
-  --password "$DBE_MONGO_PASSWORD" \
-  --authenticationDatabase "$DBE_MONGO_DATABASE" \
+  --username "$DBE_MONGO_ROOT_USER" \
+  --password "$DBE_MONGO_ROOT_PASSWORD" \
+  --authenticationDatabase "admin" \
   --db "$DBE_MONGO_DATABASE" \
   {filters} \
   --archive={output_path} \
@@ -1833,7 +1908,8 @@ out={output_path}
     Ok(script)
 }
 
-fn import_script(protocol: Protocol, input_path: &str) -> Result<String, ApiError> {
+fn import_script(metadata: &InstanceMetadata, input_path: &str) -> Result<String, ApiError> {
+    let protocol = metadata.protocol;
     let script = match protocol {
         Protocol::Postgres => format!(
             r#"set -eu
@@ -1855,19 +1931,22 @@ mariadb \
   < {input_path}
 "#
         ),
-        Protocol::Mongodb => format!(
-            r#"set -eu
+        Protocol::Mongodb => {
+            ensure_mongodb_root_password(metadata)?;
+            format!(
+                r#"set -eu
 mongorestore \
   --host 127.0.0.1 \
-  --username "$DBE_MONGO_USER" \
-  --password "$DBE_MONGO_PASSWORD" \
-  --authenticationDatabase "$DBE_MONGO_DATABASE" \
+  --username "$DBE_MONGO_ROOT_USER" \
+  --password "$DBE_MONGO_ROOT_PASSWORD" \
+  --authenticationDatabase "admin" \
   --drop \
   --nsInclude "$DBE_MONGO_DATABASE.*" \
   --archive={input_path} \
   --gzip
 "#
-        ),
+            )
+        }
         Protocol::Clickhouse => format!(
             r#"set -eu
 clickhouse-client \
@@ -1911,7 +1990,7 @@ fn dump_extension(protocol: Protocol) -> &'static str {
         Protocol::Mariadb => "mariadb.sql",
         Protocol::Mongodb => "mongodb.archive.gz",
         Protocol::Clickhouse => "clickhouse.sql",
-        Protocol::Qdrant => "qdrant.snapshot",
+        Protocol::Qdrant => "qdrant.tar.gz",
     }
 }
 
@@ -1959,7 +2038,7 @@ async fn compress_gzip(source: &FsPath, target: &FsPath) -> Result<(), ApiError>
             }
             let mut input = std::fs::File::open(source)?;
             let output = std::fs::File::create(target)?;
-            let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
+            let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::new(3));
             std::io::copy(&mut input, &mut encoder)?;
             encoder.finish()?;
             Ok(())
@@ -2040,10 +2119,6 @@ pub(crate) async fn replace_data_from_archive(
         .and_then(|name| name.to_str())
         .ok_or_else(|| ApiError::Runtime("invalid data path".to_string()))?
         .to_string();
-    validate_data_archive(artifact_path.to_path_buf(), expected_root.clone())
-        .await
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-
     tokio::fs::create_dir_all(&paths.data)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to create data directory: {error}")))?;
@@ -2286,12 +2361,21 @@ mod tests {
         assert!(artifact_has_allowed_extension(FsPath::new(
             "instance-1.mongodb.archive.gz"
         )));
+        assert!(artifact_has_allowed_extension(FsPath::new(
+            "instance-1.qdrant.tar.gz"
+        )));
         assert!(!artifact_has_allowed_extension(FsPath::new(
             "instance-1.sh"
         )));
         assert!(!artifact_has_allowed_extension(FsPath::new(
             "instance-1.sql.exe"
         )));
+    }
+
+    #[test]
+    fn qdrant_uses_physical_archive_extension() {
+        assert_eq!(dump_extension(Protocol::Qdrant), "qdrant.tar.gz");
+        assert!(dump_candidate_suffixes(Protocol::Qdrant).contains(&".qdrant.tar.gz"));
     }
 
     #[tokio::test]
@@ -2464,6 +2548,8 @@ mod tests {
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         }
     }
 }

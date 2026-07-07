@@ -7,12 +7,17 @@ use crate::{
     shared::protocol::Protocol,
 };
 
+pub struct MongodbAuth {
+    pub username: String,
+    pub password: SecretString,
+    pub root_password: SecretString,
+}
+
 pub fn instance_spec(
     instance_id: &str,
     image: &str,
     database: &str,
-    username: &str,
-    password: SecretString,
+    auth: MongodbAuth,
     data_path: PathBuf,
     logs_path: PathBuf,
 ) -> DockerInstanceSpec {
@@ -38,15 +43,23 @@ pub fn instance_spec(
         env: vec![
             DockerEnv {
                 key: "DBE_MONGO_USER".to_string(),
-                value: SecretString::from(username.to_string()),
+                value: SecretString::from(auth.username),
             },
             DockerEnv {
                 key: "DBE_MONGO_PASSWORD".to_string(),
-                value: password,
+                value: auth.password,
             },
             DockerEnv {
                 key: "DBE_MONGO_DATABASE".to_string(),
                 value: SecretString::from(database.to_string()),
+            },
+            DockerEnv {
+                key: "DBE_MONGO_ROOT_USER".to_string(),
+                value: SecretString::from("dbe_root".to_string()),
+            },
+            DockerEnv {
+                key: "DBE_MONGO_ROOT_PASSWORD".to_string(),
+                value: auth.root_password,
             },
         ],
         command: vec![
@@ -70,8 +83,11 @@ mod tests {
             "inst_mongo_1",
             "mongo:7",
             "mongo_1",
-            "app_mongo_1",
-            SecretString::from("tenant-secret"),
+            MongodbAuth {
+                username: "app_mongo_1".to_string(),
+                password: SecretString::from("tenant-secret"),
+                root_password: SecretString::from("root-secret"),
+            },
             PathBuf::from("/tmp/data"),
             PathBuf::from("/tmp/logs"),
         );
@@ -82,6 +98,11 @@ mod tests {
         assert_eq!(spec.public_backend_port, None);
         assert!(spec.extra_mounts.is_empty());
         assert!(spec.env.iter().any(|env| env.key == "DBE_MONGO_USER"));
+        assert!(
+            spec.env
+                .iter()
+                .any(|env| env.key == "DBE_MONGO_ROOT_PASSWORD")
+        );
         assert!(
             !spec
                 .env

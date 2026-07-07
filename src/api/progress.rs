@@ -20,9 +20,44 @@ impl InstallProgressStore {
         self.set(InstallProgress {
             instance_id: instance_id.to_string(),
             protocol: protocol.to_string(),
+            action: "create".to_string(),
             status: InstallProgressStatus::Running,
             stage: "queued".to_string(),
             message: "queued instance creation".to_string(),
+            image: Some(image.to_string()),
+            layer: None,
+            current: None,
+            total: None,
+            percent: None,
+            updated_at: now_rfc3339(),
+        });
+    }
+
+    pub fn begin_image_update(&self, instance_id: &str, protocol: Protocol, image: &str) {
+        self.set(InstallProgress {
+            instance_id: instance_id.to_string(),
+            protocol: protocol.to_string(),
+            action: "image_update".to_string(),
+            status: InstallProgressStatus::Running,
+            stage: "queued".to_string(),
+            message: "queued image update".to_string(),
+            image: Some(image.to_string()),
+            layer: None,
+            current: None,
+            total: None,
+            percent: None,
+            updated_at: now_rfc3339(),
+        });
+    }
+
+    pub fn begin_major_upgrade(&self, instance_id: &str, protocol: Protocol, image: &str) {
+        self.set(InstallProgress {
+            instance_id: instance_id.to_string(),
+            protocol: protocol.to_string(),
+            action: "major_upgrade".to_string(),
+            status: InstallProgressStatus::Running,
+            stage: "queued".to_string(),
+            message: "queued major version migration".to_string(),
             image: Some(image.to_string()),
             layer: None,
             current: None,
@@ -116,6 +151,7 @@ impl InstallProgressStore {
 pub struct InstallProgress {
     pub instance_id: String,
     pub protocol: String,
+    pub action: String,
     pub status: InstallProgressStatus,
     pub stage: String,
     pub message: String,

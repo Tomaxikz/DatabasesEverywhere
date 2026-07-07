@@ -5,7 +5,10 @@ use bollard::{
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
 use futures::{StreamExt, TryStreamExt};
-use tokio::time::{Instant, sleep};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, sleep},
+};
 
 use crate::{
     runtime::docker::{
@@ -133,6 +136,20 @@ impl DockerRuntime {
             .filter(|user| !user.is_empty()))
     }
 
+    pub async fn container_image(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(response
+            .config
+            .and_then(|config| config.image)
+            .map(|image| image.trim().to_string())
+            .filter(|image| !image.is_empty()))
+    }
+
     pub async fn logs(
         &self,
         protocol: Protocol,
@@ -169,6 +186,55 @@ impl DockerRuntime {
         Ok(CommandOutput { stdout, stderr })
     }
 
+    pub fn follow_logs(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        tail: Option<usize>,
+    ) -> Result<mpsc::Receiver<Result<CommandOutput, DockerError>>, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        let docker = self.docker.clone();
+        let tail = tail.unwrap_or(100).clamp(1, 2_000).to_string();
+        let (tx, rx) = mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let mut stream = docker.logs(
+                &name,
+                Some(
+                    LogsOptionsBuilder::default()
+                        .stdout(true)
+                        .stderr(true)
+                        .tail(&tail)
+                        .follow(true)
+                        .build(),
+                ),
+            );
+
+            while let Some(chunk) = stream.next().await {
+                let output = match chunk {
+                    Ok(LogOutput::StdErr { message }) => Ok(CommandOutput {
+                        stdout: String::new(),
+                        stderr: String::from_utf8_lossy(&message).to_string(),
+                    }),
+                    Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
+                        Ok(CommandOutput {
+                            stdout: String::from_utf8_lossy(&message).to_string(),
+                            stderr: String::new(),
+                        })
+                    }
+                    Ok(LogOutput::StdIn { .. }) => continue,
+                    Err(error) => Err(DockerError::from(error)),
+                };
+
+                if tx.send(output).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
     pub async fn stats(
         &self,
         protocol: Protocol,
@@ -180,7 +246,7 @@ impl DockerRuntime {
             Some(
                 StatsOptionsBuilder::default()
                     .stream(false)
-                    .one_shot(false)
+                    .one_shot(true)
                     .build(),
             ),
         );

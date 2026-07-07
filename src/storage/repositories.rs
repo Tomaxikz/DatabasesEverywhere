@@ -21,7 +21,8 @@ impl InstanceRepository {
             SELECT
                 instance_metadata.metadata_json,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
-                instance_route_auth.mariadb_root_password
+                instance_route_auth.mariadb_root_password,
+                instance_route_auth.mongodb_root_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
                 ON instance_route_auth.instance_id = instance_metadata.instance_id
@@ -38,6 +39,7 @@ impl InstanceRepository {
                 metadata.mariadb_native_password_sha1_stage2 =
                     row.try_get("mariadb_native_password_sha1_stage2")?;
                 metadata.mariadb_root_password = row.try_get("mariadb_root_password")?;
+                metadata.mongodb_root_password = row.try_get("mongodb_root_password")?;
                 validate_metadata_schema(&metadata)?;
                 Ok(metadata)
             })
@@ -53,7 +55,8 @@ impl InstanceRepository {
             SELECT
                 instance_metadata.metadata_json,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
-                instance_route_auth.mariadb_root_password
+                instance_route_auth.mariadb_root_password,
+                instance_route_auth.mongodb_root_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
                 ON instance_route_auth.instance_id = instance_metadata.instance_id
@@ -74,6 +77,7 @@ impl InstanceRepository {
         metadata.mariadb_native_password_sha1_stage2 =
             row.try_get("mariadb_native_password_sha1_stage2")?;
         metadata.mariadb_root_password = row.try_get("mariadb_root_password")?;
+        metadata.mongodb_root_password = row.try_get("mongodb_root_password")?;
         validate_metadata_schema(&metadata)?;
         Ok(Some(metadata))
     }
@@ -154,6 +158,7 @@ impl InstanceRepository {
 
         if metadata.mariadb_native_password_sha1_stage2.is_some()
             || metadata.mariadb_root_password.is_some()
+            || metadata.mongodb_root_password.is_some()
         {
             sqlx::query(
                 r#"
@@ -161,18 +166,21 @@ impl InstanceRepository {
                     instance_id,
                     mariadb_native_password_sha1_stage2,
                     mariadb_root_password,
+                    mongodb_root_password,
                     updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4)
+                VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     mariadb_native_password_sha1_stage2 = excluded.mariadb_native_password_sha1_stage2,
                     mariadb_root_password = excluded.mariadb_root_password,
+                    mongodb_root_password = excluded.mongodb_root_password,
                     updated_at = excluded.updated_at
                 "#,
             )
             .bind(&metadata.instance_id)
             .bind(&metadata.mariadb_native_password_sha1_stage2)
             .bind(&metadata.mariadb_root_password)
+            .bind(&metadata.mongodb_root_password)
             .bind(&metadata.updated_at)
             .execute(&self.pool)
             .await?;
@@ -324,6 +332,26 @@ mod tests {
         assert!(!public_json.contains("mariadb_root_password"));
     }
 
+    #[tokio::test]
+    async fn persists_hidden_mongodb_root_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let mut metadata = sample_metadata();
+        metadata.protocol = Protocol::Mongodb;
+        metadata.mongodb_root_password = Some("internal-mongo-root-password".to_string());
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.mongodb_root_password.as_deref(),
+            Some("internal-mongo-root-password")
+        );
+        let public_json = serde_json::to_string(&loaded).unwrap();
+        assert!(!public_json.contains("mongodb_root_password"));
+    }
+
     fn sample_metadata() -> InstanceMetadata {
         InstanceMetadata {
             schema_version: SCHEMA_VERSION,
@@ -350,7 +378,10 @@ mod tests {
             route_key_sha256: None,
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
+            mongodb_root_password: None,
             limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
             created_at: "2026-01-01T12:00:00Z".to_string(),
             updated_at: "2026-01-01T12:00:00Z".to_string(),
         }
