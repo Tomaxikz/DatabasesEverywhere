@@ -381,21 +381,6 @@ fn stderr_string(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fuse_quota_uses_database_safe_mount_args() {
-        let args = database_safe_mount_args();
-
-        assert!(args.contains(&"--nopassthrough"));
-        assert!(args.contains(&"--nosplice"));
-        assert!(args.contains(&"--clone-fd"));
-        assert!(!args.contains(&"--nocache"));
-    }
-}
-
 async fn resolve_binary(binary: &str) -> Result<PathBuf, DiskLimitError> {
     if binary.trim().eq_ignore_ascii_case("embedded") {
         return crate::bins::get_fusequota_bin_path()
@@ -413,5 +398,20 @@ fn display_binary(configured: &str, resolved: &Path) -> String {
         format!("embedded ({})", resolved.display())
     } else {
         configured.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuse_quota_uses_database_safe_mount_args() {
+        let args = database_safe_mount_args();
+
+        assert!(args.contains(&"--nopassthrough"));
+        assert!(args.contains(&"--nosplice"));
+        assert!(args.contains(&"--clone-fd"));
+        assert!(!args.contains(&"--nocache"));
     }
 }
