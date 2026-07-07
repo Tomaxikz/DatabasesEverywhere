@@ -1,0 +1,806 @@
+openapi: 3.1.0
+info:
+  title: DatabasesEverywhere API
+  version: 0.1.0
+  description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
+servers:
+  - url: http://127.0.0.1:8090
+    description: Local daemon API
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: panel token
+  schemas:
+    Protocol:
+      type: string
+      enum: [postgres, redis, mariadb, mongodb, clickhouse, qdrant]
+    LimitsRequest:
+      type: object
+      required: [cpu_cores, memory_mib, disk_mib]
+      properties:
+        cpu_cores:
+          type: number
+          example: 0.5
+        memory_mib:
+          type: integer
+          example: 512
+        disk_mib:
+          type: integer
+          example: 1024
+    InstanceLimits:
+      allOf:
+        - $ref: "#/components/schemas/LimitsRequest"
+        - type: object
+          properties:
+            disk_enforced:
+              type: boolean
+            disk_enforcement_method:
+              type: string
+              example: host_filesystem_quota
+    CreateInstanceRequest:
+      type: object
+      required: [instance_id, protocol, database, username, password, public_host]
+      properties:
+        instance_id:
+          type: string
+          example: inst_server_123_pg
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        database:
+          type: string
+          example: server_123
+        username:
+          type: string
+          example: app_server_123
+        password:
+          type: string
+          format: password
+        public_host:
+          type: string
+          example: db.example.com
+        public_port:
+          type: integer
+          nullable: true
+          example: 5434
+        project_id:
+          type: string
+          nullable: true
+          example: server-123
+        limits:
+          $ref: "#/components/schemas/LimitsRequest"
+    Instance:
+      type: object
+      properties:
+        schema_version:
+          type: integer
+        instance_id:
+          type: string
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        status:
+          type: string
+          enum: [creating, running, stopped, failed, deleting]
+        public:
+          type: object
+          properties:
+            host:
+              type: string
+            port:
+              type: integer
+        backend:
+          type: object
+          properties:
+            kind:
+              type: string
+            host:
+              type: string
+            port:
+              type: integer
+        runtime:
+          type: object
+          properties:
+            kind:
+              type: string
+              example: docker
+            container_name:
+              type: string
+            network:
+              type: string
+        database:
+          type: object
+          properties:
+            name:
+              type: string
+            username:
+              type: string
+        limits:
+          $ref: "#/components/schemas/InstanceLimits"
+        created_at:
+          type: string
+        updated_at:
+          type: string
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+    ImportRequest:
+      type: object
+      properties:
+        source:
+          oneOf:
+            - $ref: "#/components/schemas/ArtifactImportSource"
+            - $ref: "#/components/schemas/RemoteImportSource"
+        selection:
+          $ref: "#/components/schemas/ImportExportSelection"
+        artifact_path:
+          type: string
+          description: Legacy artifact import path. Prefer source.type=artifact.
+        unarchive:
+          type: boolean
+          default: false
+        archive_format:
+          type: string
+          nullable: true
+          description: Optional archive wrapper format such as plain, gzip, bzip2, tar, tar.gz, or zip.
+    ExportRequest:
+      type: object
+      properties:
+        selection:
+          $ref: "#/components/schemas/ImportExportSelection"
+    ArtifactImportSource:
+      type: object
+      required: [type, artifact_path]
+      properties:
+        type:
+          type: string
+          const: artifact
+        artifact_path:
+          type: string
+        unarchive:
+          type: boolean
+          default: false
+        archive_format:
+          type: string
+          nullable: true
+    RemoteImportSource:
+      type: object
+      required: [type, protocol, host, port, database, username, password]
+      properties:
+        type:
+          type: string
+          const: remote
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        host:
+          type: string
+        port:
+          type: integer
+        database:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        tls:
+          type: boolean
+          default: false
+    ImportExportSelection:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [full, selective]
+          default: full
+        include:
+          type: array
+          items:
+            type: string
+        exclude:
+          type: array
+          items:
+            type: string
+        fields:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    ImportExportJob:
+      type: object
+      properties:
+        job_id:
+          type: string
+        instance_id:
+          type: string
+        action:
+          type: string
+          enum: [export, import]
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        artifact_path:
+          type: string
+          nullable: true
+        artifact_size_bytes:
+          type: integer
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+        updated_at:
+          type: string
+    RunBackupRequest:
+      type: object
+      properties:
+        instance_id:
+          type: string
+          nullable: true
+        all:
+          type: boolean
+          nullable: true
+    WsTokenRequest:
+      type: object
+      required: [subject, scopes]
+      properties:
+        subject:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+          example: [monitor:read]
+        instances:
+          type: array
+          items:
+            type: string
+          default: []
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 900
+    PowerRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [start, stop, restart, kill]
+    PowerResponse:
+      type: object
+      properties:
+        action:
+          type: string
+          enum: [start, stop, restart, kill]
+        instance:
+          $ref: "#/components/schemas/Instance"
+    ConfigPatchResponse:
+      type: object
+      properties:
+        applied:
+          type: boolean
+        restart_required:
+          type: boolean
+        config_path:
+          type: string
+    UpgradeRequest:
+      type: object
+      required: [url, sha256, restart_command]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: HTTPS URL for the replacement daemon binary.
+        sha256:
+          type: string
+          minLength: 64
+          maxLength: 64
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        restart_command:
+          type: string
+          description: Command name to execute after replacing the binary. Not run through a shell.
+        restart_command_args:
+          type: array
+          items:
+            type: string
+    UpgradeResponse:
+      type: object
+      properties:
+        accepted:
+          type: boolean
+        restart_command:
+          type: string
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or insufficient bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+paths:
+  /api/system:
+    get:
+      summary: Get daemon runtime/configuration summary.
+      x-required-scope: system:read
+      responses:
+        "200":
+          description: System status.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/system/config:
+    patch:
+      summary: Merge a validated config patch into the daemon config file.
+      description: Writes config.yml and returns restart_required=true. Refuses uuid, token_id, and token edits.
+      x-required-scope: config:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Config patch applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigPatchResponse"
+  /api/system/upgrade:
+    post:
+      summary: Download, verify, replace, and restart the daemon binary.
+      description: Disabled unless security.self_upgrade_enabled=true. URL must be HTTPS and sha256 must match the downloaded binary.
+      x-required-scope: upgrades:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpgradeRequest"
+      responses:
+        "200":
+          description: Upgrade accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpgradeResponse"
+  /api/heartbeat:
+    post:
+      summary: Lightweight authenticated health check.
+      x-required-scope: system:read
+      responses:
+        "200":
+          description: Heartbeat response.
+  /api/instances:
+    get:
+      summary: List database instances.
+      x-required-scope: instances:read
+      responses:
+        "200":
+          description: Instance list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Instance"
+    post:
+      summary: Create a database instance.
+      x-required-scope: instances:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInstanceRequest"
+      responses:
+        "200":
+          description: Created instance metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        "409":
+          description: Instance ID already exists.
+  /api/instances/{instance_id}:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get one instance.
+      x-required-scope: instances:read
+      responses:
+        "200":
+          description: Instance metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Delete one instance and its managed container/data.
+      x-required-scope: instances:write
+      responses:
+        "200":
+          description: Delete result.
+  /api/instances/{instance_id}/status:
+    get:
+      summary: Get instance status.
+      x-required-scope: instances:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Status response.
+  /api/instances/{instance_id}/limits:
+    patch:
+      summary: Update CPU, memory, and disk limits for an instance.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LimitsRequest"
+      responses:
+        "200":
+          description: Updated instance metadata.
+  /api/instances/{instance_id}/start:
+    post:
+      summary: Start an instance.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated instance metadata.
+  /api/instances/{instance_id}/stop:
+    post:
+      summary: Stop an instance.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated instance metadata.
+  /api/instances/{instance_id}/restart:
+    post:
+      summary: Restart an instance.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated instance metadata.
+  /api/instances/{instance_id}/power:
+    post:
+      summary: Unified power API for start, stop, restart, and kill.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PowerRequest"
+      responses:
+        "200":
+          description: Power action result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PowerResponse"
+  /api/instances/{instance_id}/image:
+    patch:
+      summary: Pull and switch an instance to a new Docker image.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  example: postgres:18.4
+      responses:
+        "200":
+          description: Image update result.
+  /api/resources:
+    get:
+      summary: List resource usage for all instances.
+      x-required-scope: resources:read
+      responses:
+        "200":
+          description: Resource reports.
+  /api/instances/{instance_id}/resources:
+    get:
+      summary: Get resource usage for one instance.
+      x-required-scope: resources:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resource report.
+  /api/instances/{instance_id}/logs:
+    get:
+      summary: Get recent logs for one instance.
+      x-required-scope: logs:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 200
+      responses:
+        "200":
+          description: Log output.
+  /api/instances/{instance_id}/export:
+    post:
+      summary: Export one instance to a protocol-native dump artifact.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExportRequest"
+      responses:
+        "200":
+          description: Queued export job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/import:
+    post:
+      summary: Import a protocol-native dump artifact into one instance.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportRequest"
+      responses:
+        "200":
+          description: Queued import job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/import-export:
+    get:
+      summary: List import/export jobs.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Job list.
+  /api/import-export/{job_id}:
+    get:
+      summary: Get one import/export job.
+      x-required-scope: import-export:read
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job.
+  /api/backups:
+    get:
+      summary: List backup artifacts.
+      x-required-scope: backups:read
+      responses:
+        "200":
+          description: Backup artifact list.
+    post:
+      summary: Run backup for one instance or all non-Redis instances.
+      x-required-scope: backups:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunBackupRequest"
+      responses:
+        "200":
+          description: Queued backup jobs and skipped instances.
+  /api/backups/status:
+    get:
+      summary: Get automatic backup configuration status.
+      x-required-scope: backups:read
+      responses:
+        "200":
+          description: Backup status.
+  /api/backups/download:
+    get:
+      summary: Download a backup artifact by query name.
+      x-required-scope: backups:read
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Backup file stream.
+  /api/backups/download/{name}:
+    get:
+      summary: Download a backup artifact by path name.
+      x-required-scope: backups:read
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Backup file stream.
+  /api/backups/{name}:
+    delete:
+      summary: Delete a backup artifact.
+      x-required-scope: backups:write
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Delete result.
+  /api/ws-token:
+    post:
+      summary: Issue short-lived WebSocket JWT for monitoring/log streams.
+      x-required-scope: ws-tokens:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WsTokenRequest"
+      responses:
+        "200":
+          description: WebSocket token.
+  /api/images/pull:
+    post:
+      summary: Pull an image for a protocol.
+      x-required-scope: images:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [protocol]
+              properties:
+                protocol:
+                  $ref: "#/components/schemas/Protocol"
+                image:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Pull result.
+  /ws/monitoring:
+    get:
+      summary: WebSocket stream of instance resource snapshots.
+      description: Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages include current instance stats plus install_progress entries for in-flight and recently completed/failed create operations. Each instance includes configured limits plus live usage fields: cpu_usage_percent, memory_usage_bytes, memory_limit_bytes, disk_used_bytes, network_rx_bytes, network_tx_bytes, and a resources object matching GET /api/resources.
+      x-required-scope: monitor:read
+      x-websocket: true
+      responses:
+        "101":
+          description: WebSocket upgrade.
+  /ws/logs:
+    get:
+      summary: WebSocket stream of container logs for one instance.
+      description: Requires a short-lived WebSocket JWT with logs:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected.
+      x-required-scope: logs:read
+      x-websocket: true
+      parameters:
+        - name: instance_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "101":
+          description: WebSocket upgrade.

@@ -1,0 +1,114 @@
+debug: false
+uuid: dbe-node-generated-by-panel
+token_id: dbe-token-id-generated-by-panel
+token: dbe-token-generated-by-panel
+remote: https://panel.example.com
+
+tls:
+  cert: cert.pem
+  key: key.pem
+
+postgres:
+  enabled: true
+  bind: 0.0.0.0:5433
+  tls: false
+
+mariadb:
+  enabled: false
+  bind: 0.0.0.0:3307
+  tls: false
+
+redis:
+  enabled: true
+  bind: 0.0.0.0:6380
+  tls: false
+
+mongodb:
+  enabled: false
+  bind: 0.0.0.0:27017
+  tls: false
+
+clickhouse:
+  enabled: false
+  bind: 0.0.0.0:9000
+  tls: false
+
+qdrant:
+  enabled: false
+  bind: 0.0.0.0:6334
+  tls: false
+
+api:
+  host: 0.0.0.0
+  port: 8090
+  ssl:
+    enabled: false
+    cert: ''
+    key: ''
+    require_client_cert: false
+    client_ca: ''
+
+security:
+  api_body_limit_bytes: 1048576
+  api_rate_limit_per_minute: 600
+  db_connection_limit_per_minute: 240
+  allow_private_remote_imports: false
+  remote_import_allowed_hosts: []
+  self_upgrade_enabled: false
+  pids_limit: 512
+  pids_limits:
+    clickhouse: 4096
+    qdrant: null
+
+artifacts:
+  retention_keep_latest: 20
+  retention_max_age_days: 30
+
+backups:
+  enabled: false
+  interval_minutes: 1440
+  run_on_startup: false
+  retention_keep_latest_per_instance: 7
+  retention_max_age_days: 30
+
+disk:
+  mode: fuse_quota
+  project_id_base: 200000
+  fuse_quota_rescan_interval_seconds: 150
+
+daemon:
+  engine: docker
+  socket_path: ""
+  network: databases-everywhere
+  internal_network: true
+  ipam:
+    subnet: ''
+    gateway: ''
+  allow_public_backend_ports: false
+  container_read_only_rootfs: false
+  container_userns_mode: ''
+  container_seccomp_profile: ''
+  container_apparmor_profile: ''
+  container_security_opts: []
+
+images:
+  postgres: "postgres:18.4"
+  redis: "redis:8.8.0"
+  mariadb: "mariadb:12.3.2"
+  mongodb: "mongo:7.0.37"
+  clickhouse: "clickhouse/clickhouse-server:25.8.25.37"
+  qdrant: "qdrant/qdrant:v1.18.2"
+
+paths:
+  data: /var/lib/dbev
+  metadata: /var/lib/dbev/metadata
+  volumes: /var/lib/dbev/volumes
+  backups: /var/lib/dbev/backups
+  sockets: /run/dbev/sockets
+  locks: /run/dbev/locks
+  logs: /var/log/dbev
+  artifacts: /var/lib/dbev/artifacts
+  exports: /var/lib/dbev/artifacts/exports
+  imports: /var/lib/dbev/artifacts/imports
+  fuse: /var/lib/dbev/fuse
+  tmp: /var/lib/dbev/tmp

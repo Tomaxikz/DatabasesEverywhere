@@ -1,0 +1,108 @@
+use std::path::{Path, PathBuf};
+
+use super::DiskLimitError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MountInfo {
+    pub mountpoint: PathBuf,
+    pub fstype: String,
+    pub source: String,
+    pub options: Vec<String>,
+}
+
+pub(super) fn find_mount(path: &Path) -> Result<MountInfo, DiskLimitError> {
+    let path = path
+        .canonicalize()
+        .map_err(|source| DiskLimitError::PathIo {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(DiskLimitError::Io)?;
+    find_mount_in(&path, &mountinfo).ok_or(DiskLimitError::MountpointNotFound(path))
+}
+
+fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
+    let mut best = None;
+    for line in mountinfo.lines() {
+        let Some((before_sep, after_sep)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(mountpoint) = before_sep.split_whitespace().nth(4) else {
+            continue;
+        };
+        let mut after_parts = after_sep.split_whitespace();
+        let Some(fstype) = after_parts.next() else {
+            continue;
+        };
+        let source = after_parts.next().unwrap_or("-").to_string();
+        let options = after_parts
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .filter(|option| !option.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        let mountpoint = PathBuf::from(unescape_mountinfo(mountpoint));
+        if path.starts_with(&mountpoint)
+            && best.as_ref().is_none_or(|current: &MountInfo| {
+                mountpoint.as_os_str().len() > current.mountpoint.as_os_str().len()
+            })
+        {
+            best = Some(MountInfo {
+                mountpoint,
+                fstype: fstype.to_string(),
+                source,
+                options,
+            });
+        }
+    }
+    best
+}
+
+fn unescape_mountinfo(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_most_specific_mount_with_filesystem_type() {
+        let mountinfo = "\
+1 0 0:1 / / rw - btrfs /dev/sda rw
+2 1 0:2 / /var/lib/databases-everywhere rw - xfs /dev/sdb rw
+";
+
+        let mount = find_mount_in(
+            Path::new("/var/lib/databases-everywhere/instances/inst_1"),
+            mountinfo,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mount.mountpoint,
+            PathBuf::from("/var/lib/databases-everywhere")
+        );
+        assert_eq!(mount.fstype, "xfs");
+        assert_eq!(mount.source, "/dev/sdb");
+    }
+
+    #[test]
+    fn includes_mount_options() {
+        let mountinfo = "\
+1 0 0:1 / / rw,relatime - ext4 /dev/vda3 rw,relatime,prjquota,errors=remount-ro
+";
+
+        let mount = find_mount_in(Path::new("/var/lib/databases-everywhere"), mountinfo).unwrap();
+
+        assert_eq!(
+            mount.options,
+            vec!["rw", "relatime", "prjquota", "errors=remount-ro"]
+        );
+    }
+}

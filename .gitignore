@@ -1,0 +1,6 @@
+/target/
+/.local/
+/.venv/
+/.venv-*/
+/scripts/
+/tests/

@@ -1,0 +1,838 @@
+mod command;
+mod container_config;
+mod disk_probe;
+mod engine;
+mod inspection;
+mod security;
+mod spec;
+
+pub use command::CommandOutput;
+pub use engine::DaemonEngineConnection;
+pub use security::DockerSecurityPolicy;
+pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
+
+use std::collections::{HashMap, HashSet};
+
+use bollard::{
+    Docker,
+    container::LogOutput,
+    errors::Error as BollardError,
+    exec::{CreateExecOptions, StartExecOptions, StartExecResults},
+    models::{
+        ContainerCreateBody, ContainerUpdateBody, HostConfig, Ipam, IpamConfig,
+        NetworkCreateRequest, NetworkInspect,
+    },
+    query_parameters::{
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptions,
+        ListContainersOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        StopContainerOptions,
+    },
+};
+use futures::{StreamExt, TryStreamExt};
+use secrecy::ExposeSecret;
+
+use crate::{
+    config::{DaemonConfig, DaemonEngine, DaemonNetworkIpam},
+    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
+    runtime::docker::container_config::{
+        bind_mount, cpu_to_nano, exposed_ports, healthcheck, mib_to_bytes, published_port_bindings,
+    },
+    shared::{ids::sanitize_docker_suffix, protocol::Protocol},
+};
+
+#[derive(Debug, Clone)]
+pub struct DockerInstanceInspection {
+    pub status: DockerContainerStatus,
+    pub network_ip: Option<String>,
+    pub health: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerContainerStatus {
+    Running,
+    Starting,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerRuntime {
+    docker: Docker,
+    engine: DaemonEngine,
+    socket_path: String,
+    network: String,
+    internal_network: bool,
+    ipam: DaemonNetworkIpam,
+    allow_public_backend_ports: bool,
+    enforce_disk_limits: bool,
+    security: DockerSecurityPolicy,
+    rootless_podman: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerImagePullProgress {
+    pub image: String,
+    pub layer: Option<String>,
+    pub status: String,
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+}
+
+impl DockerRuntime {
+    pub fn new(config: &DaemonConfig, enforce_disk_limits: bool) -> Result<Self, DockerError> {
+        let connection = DaemonEngineConnection::from_config(config);
+        let rootless_podman = connection.engine == DaemonEngine::Podman
+            && connection.socket_path_for_logs().starts_with("/run/user/");
+        Ok(Self {
+            docker: connection.connect()?,
+            engine: connection.engine,
+            socket_path: connection.socket_path_for_logs().to_string(),
+            network: config.network.clone(),
+            internal_network: config.internal_network,
+            ipam: config.ipam.clone(),
+            allow_public_backend_ports: config.allow_public_backend_ports,
+            enforce_disk_limits,
+            security: DockerSecurityPolicy::from_config(config),
+            rootless_podman,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_client(
+        docker: Docker,
+        engine: DaemonEngine,
+        socket_path: impl Into<String>,
+        network: impl Into<String>,
+        internal_network: bool,
+        ipam: DaemonNetworkIpam,
+        allow_public_backend_ports: bool,
+        enforce_disk_limits: bool,
+        security: DockerSecurityPolicy,
+    ) -> Self {
+        let socket_path = socket_path.into();
+        let rootless_podman =
+            engine == DaemonEngine::Podman && socket_path.starts_with("/run/user/");
+        Self {
+            docker,
+            engine,
+            socket_path,
+            network: network.into(),
+            internal_network,
+            ipam,
+            allow_public_backend_ports,
+            enforce_disk_limits,
+            security,
+            rootless_podman,
+        }
+    }
+
+    pub fn engine(&self) -> DaemonEngine {
+        self.engine
+    }
+
+    pub fn engine_name(&self) -> &'static str {
+        self.engine.as_str()
+    }
+
+    pub fn socket_path(&self) -> &str {
+        &self.socket_path
+    }
+
+    pub fn uses_rootless_podman(&self) -> bool {
+        self.engine == DaemonEngine::Podman && self.rootless_podman
+    }
+
+    pub async fn refresh_engine_info(&mut self) -> Result<(), DockerError> {
+        let info = self.docker.info().await?;
+        if self.engine == DaemonEngine::Podman
+            && let Some(security_options) = info.security_options
+        {
+            self.rootless_podman = security_options.iter().any(|option| {
+                let option = option.to_ascii_lowercase();
+                option == "rootless"
+                    || option == "name=rootless"
+                    || option.split(',').any(|part| part.trim() == "rootless")
+            });
+        }
+        Ok(())
+    }
+
+    pub fn rootless_podman_container_user(&self, protocol: Protocol) -> Option<&'static str> {
+        if !self.uses_rootless_podman() {
+            return None;
+        }
+
+        Some(match protocol {
+            Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb => "999:999",
+            Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => "0:0",
+        })
+    }
+
+    pub fn container_name(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<String, DockerError> {
+        let suffix = sanitize_docker_suffix(instance_id)?;
+        Ok(format!("dbe-{}-{suffix}", protocol.as_str()))
+    }
+
+    pub async fn ensure_network(&self) -> Result<(), DockerError> {
+        if let Ok(network) = self.docker.inspect_network(&self.network, None).await {
+            self.validate_existing_network(&network)?;
+            return Ok(());
+        }
+
+        self.docker
+            .create_network(NetworkCreateRequest {
+                name: self.network.clone(),
+                driver: Some("bridge".to_string()),
+                attachable: Some(false),
+                internal: Some(self.internal_network),
+                ipam: network_ipam(&self.ipam),
+                ..Default::default()
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn ping(&self) -> Result<String, DockerError> {
+        self.docker.ping().await.map_err(Into::into)
+    }
+
+    fn validate_existing_network(&self, network: &NetworkInspect) -> Result<(), DockerError> {
+        let existing_internal = network.internal.unwrap_or(false);
+        if existing_internal != self.internal_network {
+            return Err(DockerError::InvalidNetworkSecurity {
+                network: self.network.clone(),
+                expected_internal: self.internal_network,
+                existing_internal: network.internal,
+            });
+        }
+
+        if self.ipam.subnet.trim().is_empty() && self.ipam.gateway.trim().is_empty() {
+            return Ok(());
+        }
+        let configs = network
+            .ipam
+            .as_ref()
+            .and_then(|ipam| ipam.config.as_deref())
+            .unwrap_or(&[]);
+        let subnet_matches = self.ipam.subnet.trim().is_empty()
+            || configs
+                .iter()
+                .any(|config| config.subnet.as_deref() == Some(self.ipam.subnet.as_str()));
+        let gateway_matches = self.ipam.gateway.trim().is_empty()
+            || configs
+                .iter()
+                .any(|config| config.gateway.as_deref() == Some(self.ipam.gateway.as_str()));
+
+        if subnet_matches && gateway_matches {
+            Ok(())
+        } else {
+            let existing: Vec<_> = configs
+                .iter()
+                .map(|config| {
+                    format!(
+                        "subnet={}, gateway={}",
+                        config.subnet.as_deref().unwrap_or(""),
+                        config.gateway.as_deref().unwrap_or("")
+                    )
+                })
+                .collect();
+            Err(DockerError::InvalidNetworkConfig {
+                network: self.network.clone(),
+                expected_subnet: empty_to_none(&self.ipam.subnet),
+                expected_gateway: empty_to_none(&self.ipam.gateway),
+                existing,
+            })
+        }
+    }
+
+    pub fn create_body(
+        &self,
+        spec: &DockerInstanceSpec,
+    ) -> Result<ContainerCreateBody, DockerError> {
+        self.security.validate_spec(spec)?;
+        let memory_bytes = mib_to_bytes(spec.memory_mib);
+        let mut labels = HashMap::from([
+            (MANAGED_LABEL.to_string(), "true".to_string()),
+            (INSTANCE_LABEL.to_string(), spec.instance_id.clone()),
+            (PROTOCOL_LABEL.to_string(), spec.protocol.to_string()),
+        ]);
+        if let Some(project_id) = &spec.project_id {
+            labels.insert(PROJECT_LABEL.to_string(), project_id.clone());
+        }
+
+        let publish_backend_port = self.allow_public_backend_ports || self.uses_rootless_podman();
+        let mut host_config = HostConfig {
+            network_mode: Some(self.network.clone()),
+            nano_cpus: Some(cpu_to_nano(spec.cpu_cores)),
+            memory: Some(memory_bytes),
+            memory_swap: Some(memory_bytes),
+            mounts: Some(container_mounts(spec)),
+            storage_opt: storage_opt(self.enforce_disk_limits, spec.disk_mib),
+            port_bindings: published_port_bindings(
+                publish_backend_port,
+                spec.public_backend_port,
+                spec.container_port,
+            ),
+            ..Default::default()
+        };
+        self.security.apply(&mut host_config);
+        if let Some(userns_mode) = self.rootless_podman_userns_mode(spec.protocol) {
+            host_config.userns_mode = Some(userns_mode.to_string());
+        }
+        if let Some(pids_limit) = spec.pids_limit {
+            host_config.pids_limit = Some(pids_limit);
+        }
+
+        Ok(ContainerCreateBody {
+            image: Some(spec.image.clone()),
+            user: spec.user.clone(),
+            working_dir: spec.working_dir.clone(),
+            entrypoint: spec.entrypoint.clone(),
+            env: Some(
+                spec.env
+                    .iter()
+                    .map(|env| format!("{}={}", env.key, env.value.expose_secret()))
+                    .collect(),
+            ),
+            cmd: if spec.command.is_empty() {
+                None
+            } else {
+                Some(spec.command.clone())
+            },
+            labels: Some(labels),
+            host_config: Some(host_config),
+            exposed_ports: exposed_ports(
+                publish_backend_port,
+                spec.public_backend_port,
+                spec.container_port,
+            ),
+            healthcheck: self.container_healthcheck(spec.protocol),
+            ..Default::default()
+        })
+    }
+
+    fn container_healthcheck(&self, protocol: Protocol) -> Option<bollard::models::HealthConfig> {
+        if self.engine == DaemonEngine::Podman {
+            return None;
+        }
+
+        Some(healthcheck(protocol))
+    }
+
+    fn rootless_podman_userns_mode(&self, protocol: Protocol) -> Option<&'static str> {
+        if !self.uses_rootless_podman() {
+            return None;
+        }
+
+        match protocol {
+            Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb => {
+                Some("keep-id:uid=999,gid=999")
+            }
+            Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => None,
+        }
+    }
+
+    pub fn update_limits_body(cpu_cores: f64, memory_mib: u64) -> ContainerUpdateBody {
+        let memory_bytes = mib_to_bytes(memory_mib);
+        ContainerUpdateBody {
+            nano_cpus: Some(cpu_to_nano(cpu_cores)),
+            memory: Some(memory_bytes),
+            memory_swap: Some(memory_bytes),
+            ..Default::default()
+        }
+    }
+
+    pub async fn create(&self, spec: &DockerInstanceSpec) -> Result<CommandOutput, DockerError> {
+        self.create_inner(spec, None).await
+    }
+
+    pub async fn create_with_progress(
+        &self,
+        spec: &DockerInstanceSpec,
+        progress: &(dyn Fn(DockerImagePullProgress) + Send + Sync),
+    ) -> Result<CommandOutput, DockerError> {
+        self.create_inner(spec, Some(progress)).await
+    }
+
+    async fn create_inner(
+        &self,
+        spec: &DockerInstanceSpec,
+        progress: Option<&(dyn Fn(DockerImagePullProgress) + Send + Sync)>,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(spec.protocol, &spec.instance_id)?;
+        self.ensure_image_with_progress(&spec.image, progress)
+            .await?;
+        let body = self.create_body(spec)?;
+        let response = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::default().name(&name).build()),
+                body,
+            )
+            .await?;
+        Ok(CommandOutput {
+            stdout: response.id,
+            stderr: response.warnings.join("\n"),
+        })
+    }
+
+    pub async fn pull_image(&self, image: &str) -> Result<CommandOutput, DockerError> {
+        self.ensure_image_with_progress(image, None).await?;
+        Ok(CommandOutput {
+            stdout: image.to_string(),
+            stderr: String::new(),
+        })
+    }
+
+    async fn ensure_image_with_progress(
+        &self,
+        image: &str,
+        progress: Option<&(dyn Fn(DockerImagePullProgress) + Send + Sync)>,
+    ) -> Result<(), DockerError> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => {
+                tracing::debug!(image, "docker image already present");
+                if let Some(progress) = progress {
+                    progress(DockerImagePullProgress {
+                        image: image.to_string(),
+                        layer: None,
+                        status: "image already present".to_string(),
+                        current: None,
+                        total: None,
+                    });
+                }
+                return Ok(());
+            }
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        tracing::info!(image, "pulling missing docker image");
+        let mut logged = HashSet::new();
+        let mut stream = self.docker.create_image(
+            Some(
+                CreateImageOptionsBuilder::default()
+                    .from_image(image)
+                    .build(),
+            ),
+            None,
+            None,
+        );
+
+        while let Some(info) = stream.try_next().await? {
+            if let Some(error) = info.error_detail {
+                return Err(DockerError::ImagePullFailed {
+                    image: image.to_string(),
+                    message: error.message.unwrap_or_else(|| "unknown error".to_string()),
+                });
+            }
+            if let Some(status) = info.status {
+                let current = info
+                    .progress_detail
+                    .as_ref()
+                    .and_then(|progress| progress.current)
+                    .and_then(|value| u64::try_from(value).ok());
+                let total = info
+                    .progress_detail
+                    .as_ref()
+                    .and_then(|progress| progress.total)
+                    .and_then(|value| u64::try_from(value).ok());
+                if let Some(progress) = progress {
+                    progress(DockerImagePullProgress {
+                        image: image.to_string(),
+                        layer: info.id.clone(),
+                        status: status.clone(),
+                        current,
+                        total,
+                    });
+                }
+                let key = format!(
+                    "{}:{}:{}",
+                    info.id.as_deref().unwrap_or_default(),
+                    status,
+                    current.unwrap_or_default()
+                );
+                if logged.insert(key) {
+                    tracing::info!(
+                        image,
+                        layer = info.id.as_deref().unwrap_or(""),
+                        status,
+                        current = current.unwrap_or_default(),
+                        total = total.unwrap_or_default(),
+                        "docker image pull progress"
+                    );
+                }
+            }
+        }
+
+        self.docker.inspect_image(image).await?;
+        tracing::info!(image, "docker image pull complete");
+        if let Some(progress) = progress {
+            progress(DockerImagePullProgress {
+                image: image.to_string(),
+                layer: None,
+                status: "image pull complete".to_string(),
+                current: None,
+                total: None,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn start(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
+    pub async fn stop(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker
+            .stop_container(&name, None::<StopContainerOptions>)
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
+    pub async fn restart(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        self.stop(protocol, instance_id).await?;
+        self.start(protocol, instance_id).await
+    }
+
+    pub async fn kill(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker
+            .kill_container(
+                &name,
+                Some(KillContainerOptions {
+                    signal: "SIGKILL".to_string(),
+                }),
+            )
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
+    pub async fn delete(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
+    pub async fn inspect(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(CommandOutput {
+            stdout: serde_json::to_string(&response)?,
+            stderr: String::new(),
+        })
+    }
+
+    pub async fn update_limits(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        cpu_cores: f64,
+        memory_mib: u64,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker
+            .update_container(&name, Self::update_limits_body(cpu_cores, memory_mib))
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
+    pub async fn exec(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        command: Vec<String>,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self.container_name(protocol, instance_id)?;
+        let display_command = command.join(" ");
+        let exec = self
+            .docker
+            .create_exec(
+                &name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(command),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        match self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await?
+        {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(chunk) = output.next().await {
+                    match chunk? {
+                        LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
+                        LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                        LogOutput::Console { message } => stdout.extend_from_slice(&message),
+                        LogOutput::StdIn { .. } => {}
+                    }
+                }
+            }
+            StartExecResults::Detached => {}
+        }
+
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code.unwrap_or_default();
+        let output = CommandOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        };
+        if exit_code == 0 {
+            Ok(output)
+        } else {
+            Err(DockerError::ExecFailed {
+                container: name,
+                command: display_command,
+                exit_code,
+                stderr: output.stderr,
+            })
+        }
+    }
+
+    pub async fn exec_shell(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        script: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        self.exec(
+            protocol,
+            instance_id,
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+        )
+        .await
+    }
+
+    pub async fn remove_managed_containers(&self) -> Result<usize, DockerError> {
+        let filters = HashMap::from([("label".to_string(), vec![format!("{MANAGED_LABEL}=true")])]);
+        let containers = self
+            .docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await?;
+
+        let mut removed = 0;
+        for container in containers {
+            let Some(id) = container.id else {
+                continue;
+            };
+            self.docker
+                .remove_container(
+                    &id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    pub async fn active_managed_container_count(&self) -> Result<usize, DockerError> {
+        let filters = HashMap::from([("label".to_string(), vec![format!("{MANAGED_LABEL}=true")])]);
+        let containers = self
+            .docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default()
+                    .all(false)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await?;
+        Ok(containers.len())
+    }
+
+    pub async fn remove_network(&self) -> Result<(), DockerError> {
+        match self.docker.remove_network(&self.network).await {
+            Ok(()) => Ok(()),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn network_ipam(ipam: &DaemonNetworkIpam) -> Option<Ipam> {
+    if ipam.subnet.trim().is_empty() && ipam.gateway.trim().is_empty() {
+        return None;
+    }
+    Some(Ipam {
+        driver: Some("default".to_string()),
+        config: Some(vec![IpamConfig {
+            subnet: empty_to_none(&ipam.subnet),
+            gateway: empty_to_none(&ipam.gateway),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })
+}
+
+fn empty_to_none(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn container_mounts(spec: &DockerInstanceSpec) -> Vec<bollard::models::Mount> {
+    let mut mounts = vec![
+        bind_mount(&spec.data_path, &spec.data_target, false),
+        bind_mount(&spec.logs_path, &spec.logs_target, false),
+    ];
+    mounts.extend(
+        spec.extra_mounts
+            .iter()
+            .map(|mount| bind_mount(&mount.source, &mount.target, mount.read_only)),
+    );
+    mounts
+}
+
+fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
+    if !enforce_disk_limits || disk_mib == 0 {
+        None
+    } else {
+        Some(HashMap::from([(
+            "size".to_string(),
+            format!("{}m", disk_mib),
+        )]))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DockerError {
+    #[error(transparent)]
+    InvalidId(#[from] crate::shared::ids::IdError),
+    #[error("docker api error: {0}")]
+    Api(#[from] BollardError),
+    #[error("docker security policy rejected spec: {0}")]
+    Security(#[from] security::DockerSecurityError),
+    #[error("docker stats stream ended without data")]
+    EmptyStatsStream,
+    #[error("docker disk limit probe failed for image {image}: {source}")]
+    DiskLimitUnsupported {
+        image: String,
+        source: Box<BollardError>,
+    },
+    #[error(
+        "docker disk limit probe wrote past the configured limit; bind-mounted database data is not quota-enforced"
+    )]
+    DiskLimitNotEnforced,
+    #[error("docker disk limit probe failed: {0}")]
+    DiskLimitProbeFailed(String),
+    #[error("docker image pull failed for {image}: {message}")]
+    ImagePullFailed { image: String, message: String },
+    #[error("docker disk limit probe io failed: {0}")]
+    DiskLimitProbeIo(std::io::Error),
+    #[error(
+        "container {instance_id} was not ready before timeout (status={status}, health={health:?})"
+    )]
+    ContainerNotReady {
+        instance_id: String,
+        status: String,
+        health: Option<String>,
+    },
+    #[error("container {container} has no IP address on docker network {network}")]
+    MissingNetworkAddress { container: String, network: String },
+    #[error(
+        "docker network {network} IPAM does not match config (expected subnet={expected_subnet:?}, gateway={expected_gateway:?}, existing={existing:?}); remove/recreate the network or update config"
+    )]
+    InvalidNetworkConfig {
+        network: String,
+        expected_subnet: Option<String>,
+        expected_gateway: Option<String>,
+        existing: Vec<String>,
+    },
+    #[error(
+        "docker network {network} internal setting does not match config (expected internal={expected_internal}, existing={existing_internal:?}); remove/recreate the network or update config"
+    )]
+    InvalidNetworkSecurity {
+        network: String,
+        expected_internal: bool,
+        existing_internal: Option<bool>,
+    },
+    #[error(
+        "docker exec failed in {container} with exit code {exit_code}: {command}; stderr: {stderr}"
+    )]
+    ExecFailed {
+        container: String,
+        command: String,
+        exit_code: i64,
+        stderr: String,
+    },
+    #[error("docker json serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl DockerError {
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Api(BollardError::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests;
