@@ -1,9 +1,6 @@
 services:
   dbev:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ghcr.io/tomaxikz/databaseseverywhere:local
+    image: ghcr.io/tomaxikz/databaseseverywhere:latest
     container_name: dbev
     restart: unless-stopped
 

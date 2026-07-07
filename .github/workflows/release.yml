@@ -22,6 +22,11 @@ on:
         required: true
         default: false
         type: boolean
+      release_notes:
+        description: "Release notes shown on GitHub"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -76,18 +81,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/dbev" "dist/dbev"
-          chmod 0755 "dist/dbev"
-          tar -C dist -czf "dbev-${{ inputs.version }}-${{ matrix.target }}.tar.gz" dbev
-          sha256sum "dbev-${{ inputs.version }}-${{ matrix.target }}.tar.gz" > "dbev-${{ inputs.version }}-${{ matrix.target }}.tar.gz.sha256"
+          cp "target/${{ matrix.target }}/release/dbev" "dbev-${{ inputs.version }}-${{ matrix.target }}"
+          chmod 0755 "dbev-${{ inputs.version }}-${{ matrix.target }}"
+          sha256sum "dbev-${{ inputs.version }}-${{ matrix.target }}" > "dbev-${{ inputs.version }}-${{ matrix.target }}.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: dbev-${{ inputs.version }}-${{ matrix.target }}
           path: |
-            dbev-${{ inputs.version }}-${{ matrix.target }}.tar.gz
-            dbev-${{ inputs.version }}-${{ matrix.target }}.tar.gz.sha256
+            dbev-${{ inputs.version }}-${{ matrix.target }}
+            dbev-${{ inputs.version }}-${{ matrix.target }}.sha256
           if-no-files-found: error
 
   github-release:
@@ -108,9 +112,10 @@ jobs:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
           name: DatabasesEverywhere ${{ inputs.version }}
+          body: ${{ inputs.release_notes }}
           draft: ${{ inputs.draft }}
           prerelease: ${{ inputs.prerelease }}
           fail_on_unmatched_files: true
           files: |
-            dist/*.tar.gz
+            dist/dbev-*
             dist/*.sha256
