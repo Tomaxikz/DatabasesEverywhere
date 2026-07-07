@@ -34,6 +34,11 @@ clickhouse:
   http_bind: 0.0.0.0:8123
   tls: false
 
+qdrant:
+  enabled: true
+  bind: 0.0.0.0:6334
+  tls: false
+
 api:
   host: 127.0.0.1
   port: 8090
@@ -89,8 +94,15 @@ images:
   postgres: "postgres:18.4"
   redis: "redis:8.8.0"
   mariadb: "mariadb:12.3.2"
-  mongodb: "mongo:7.0.37"
-  clickhouse: "clickhouse/clickhouse-server:25.8.25.37"
+  # MongoDB 8.x is not compatible with Linux kernel 6.19+ / 7.x at the time
+  # of writing due to SERVER-121912. If MongoDB fails to start with that
+  # kernel warning, switch this to the latest known working 7.x tag:
+  # "mongo:7.0.37"
+  # https://www.mongodb.com/docs/v8.2/release-notes/8.0/#mongodb-8-0-incompatible-with-kernel-6-19
+  # https://jira.mongodb.org/browse/SERVER-121912
+  mongodb: "mongo:8.3.4"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
+  qdrant: "qdrant/qdrant:v1.18.2"
 
 paths:
   data: /mnt/4tb/Github/DatabasesEverywhere/.local/data

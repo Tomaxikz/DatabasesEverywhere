@@ -59,6 +59,28 @@ api:
 
 Also tweak gateway ports, `daemon.engine`, `daemon.socket_path`, or `daemon.ipam.subnet` if your host needs it. `api.host` and `api.port` are just the listener bind — the public API URL/domain belongs in the panel's node record.
 
+Current pinned default database images:
+
+```yaml
+images:
+  postgres: "postgres:18.4"
+  redis: "redis:8.8.0"
+  mariadb: "mariadb:12.3.2"
+  mongodb: "mongo:8.3.4"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
+  qdrant: "qdrant/qdrant:v1.18.2"
+```
+
+MongoDB 8.x has a known incompatibility with Linux kernel 6.19+ / 7.x
+(`SERVER-121912`). If a node logs that MongoDB cannot start on that kernel,
+switch only MongoDB back to the latest known working 7.x image:
+`mongo:7.0.37`.
+
+References:
+
+- <https://www.mongodb.com/docs/v8.2/release-notes/8.0/#mongodb-8-0-incompatible-with-kernel-6-19>
+- <https://jira.mongodb.org/browse/SERVER-121912>
+
 Unless you've deliberately set up native filesystem quotas, use this disk section:
 
 ```yaml
