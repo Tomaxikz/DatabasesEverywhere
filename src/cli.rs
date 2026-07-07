@@ -1039,11 +1039,18 @@ async fn cleanup_disk_test_path(limiter: &DiskLimiter, test_path: &Path) {
 
 async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let config = Arc::new(load_config(&config_path)?);
-    ensure_runtime_directories(&config)
+    let runtime_directories = ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
     init_configured_logging(&config)?;
     tracing::info!("\n{}", startup_banner());
+    for directory in runtime_directories {
+        tracing::info!(
+            path = %directory.path,
+            existed = directory.existed,
+            "runtime directory ready"
+        );
+    }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %config_path.display(),
@@ -1630,13 +1637,23 @@ fn parse_numeric_container_user(user: &str) -> Option<(u32, u32)> {
     Some((uid, gid))
 }
 
-async fn ensure_runtime_directories(config: &Config) -> anyhow::Result<()> {
+struct RuntimeDirectoryStatus {
+    path: String,
+    existed: bool,
+}
+
+async fn ensure_runtime_directories(
+    config: &Config,
+) -> anyhow::Result<Vec<RuntimeDirectoryStatus>> {
+    let mut statuses = Vec::new();
     for path in configured_runtime_roots(config) {
+        let existed = tokio::fs::metadata(&path).await.is_ok();
         tokio::fs::create_dir_all(&path)
             .await
             .with_context(|| format!("failed to create configured directory {path}"))?;
+        statuses.push(RuntimeDirectoryStatus { path, existed });
     }
-    Ok(())
+    Ok(statuses)
 }
 
 fn configured_runtime_roots(config: &Config) -> Vec<String> {
@@ -1652,7 +1669,13 @@ fn configured_runtime_roots(config: &Config) -> Vec<String> {
         config.paths.exports_root(),
         config.paths.imports_root(),
         config.paths.fuse_root(),
+        format!(
+            "{}/instances",
+            config.paths.fuse_root().trim_end_matches('/')
+        ),
+        format!("{}/mounts", config.paths.fuse_root().trim_end_matches('/')),
         config.paths.tmp_root(),
+        format!("{}/instances", config.paths.logs.trim_end_matches('/')),
     ]
 }
 
