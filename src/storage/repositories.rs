@@ -1,18 +1,32 @@
+use std::path::Path;
+
 use sqlx::{Row, SqlitePool};
 
 use crate::{
     instances::metadata::{InstanceMetadata, SCHEMA_VERSION},
     shared::backend::BackendEndpoint,
+    storage::secrets::{SecretStore, SecretStoreError},
 };
 
 #[derive(Debug, Clone)]
 pub struct InstanceRepository {
     pool: SqlitePool,
+    secrets: Option<SecretStore>,
 }
 
 impl InstanceRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            secrets: None,
+        }
+    }
+
+    pub fn encrypted(pool: SqlitePool, metadata_root: &Path) -> Result<Self, RepositoryError> {
+        Ok(Self {
+            pool,
+            secrets: Some(SecretStore::open_or_create(metadata_root)?),
+        })
     }
 
     pub async fn list(&self) -> Result<Vec<InstanceMetadata>, RepositoryError> {
@@ -36,10 +50,7 @@ impl InstanceRepository {
             .map(|row| {
                 let metadata_json: String = row.try_get("metadata_json")?;
                 let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-                metadata.mariadb_native_password_sha1_stage2 =
-                    row.try_get("mariadb_native_password_sha1_stage2")?;
-                metadata.mariadb_root_password = row.try_get("mariadb_root_password")?;
-                metadata.mongodb_root_password = row.try_get("mongodb_root_password")?;
+                self.load_route_auth(&mut metadata, &row)?;
                 validate_metadata_schema(&metadata)?;
                 Ok(metadata)
             })
@@ -74,10 +85,7 @@ impl InstanceRepository {
 
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-        metadata.mariadb_native_password_sha1_stage2 =
-            row.try_get("mariadb_native_password_sha1_stage2")?;
-        metadata.mariadb_root_password = row.try_get("mariadb_root_password")?;
-        metadata.mongodb_root_password = row.try_get("mongodb_root_password")?;
+        self.load_route_auth(&mut metadata, &row)?;
         validate_metadata_schema(&metadata)?;
         Ok(Some(metadata))
     }
@@ -153,8 +161,24 @@ impl InstanceRepository {
         .bind(metadata_json)
         .bind(&metadata.created_at)
         .bind(&metadata.updated_at)
-        .execute(&self.pool)
-        .await?;
+            .execute(&self.pool)
+            .await?;
+
+        let mariadb_native_password_sha1_stage2 = self.protect_route_secret(
+            "mariadb_native_password_sha1_stage2",
+            &metadata.instance_id,
+            metadata.mariadb_native_password_sha1_stage2.as_deref(),
+        )?;
+        let mariadb_root_password = self.protect_route_secret(
+            "mariadb_root_password",
+            &metadata.instance_id,
+            metadata.mariadb_root_password.as_deref(),
+        )?;
+        let mongodb_root_password = self.protect_route_secret(
+            "mongodb_root_password",
+            &metadata.instance_id,
+            metadata.mongodb_root_password.as_deref(),
+        )?;
 
         if metadata.mariadb_native_password_sha1_stage2.is_some()
             || metadata.mariadb_root_password.is_some()
@@ -178,9 +202,9 @@ impl InstanceRepository {
                 "#,
             )
             .bind(&metadata.instance_id)
-            .bind(&metadata.mariadb_native_password_sha1_stage2)
-            .bind(&metadata.mariadb_root_password)
-            .bind(&metadata.mongodb_root_password)
+            .bind(&mariadb_native_password_sha1_stage2)
+            .bind(&mariadb_root_password)
+            .bind(&mongodb_root_password)
             .bind(&metadata.updated_at)
             .execute(&self.pool)
             .await?;
@@ -192,6 +216,82 @@ impl InstanceRepository {
         }
 
         Ok(())
+    }
+
+    pub async fn rewrite_protected_route_auth(
+        &self,
+        metadata: &[InstanceMetadata],
+    ) -> Result<usize, RepositoryError> {
+        if self.secrets.is_none() {
+            return Ok(0);
+        }
+        let mut rewritten = 0;
+        for metadata in metadata.iter().filter(|metadata| {
+            metadata.mariadb_native_password_sha1_stage2.is_some()
+                || metadata.mariadb_root_password.is_some()
+                || metadata.mongodb_root_password.is_some()
+        }) {
+            self.upsert(metadata).await?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
+    }
+
+    fn load_route_auth(
+        &self,
+        metadata: &mut InstanceMetadata,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<(), RepositoryError> {
+        metadata.mariadb_native_password_sha1_stage2 = self.unprotect_route_secret(
+            "mariadb_native_password_sha1_stage2",
+            &metadata.instance_id,
+            row.try_get("mariadb_native_password_sha1_stage2")?,
+        )?;
+        metadata.mariadb_root_password = self.unprotect_route_secret(
+            "mariadb_root_password",
+            &metadata.instance_id,
+            row.try_get("mariadb_root_password")?,
+        )?;
+        metadata.mongodb_root_password = self.unprotect_route_secret(
+            "mongodb_root_password",
+            &metadata.instance_id,
+            row.try_get("mongodb_root_password")?,
+        )?;
+        Ok(())
+    }
+
+    fn protect_route_secret(
+        &self,
+        field: &str,
+        instance_id: &str,
+        value: Option<&str>,
+    ) -> Result<Option<String>, RepositoryError> {
+        value
+            .map(|value| {
+                self.secrets
+                    .as_ref()
+                    .map(|secrets| secrets.encrypt(field, instance_id, value))
+                    .unwrap_or_else(|| Ok(value.to_string()))
+            })
+            .transpose()
+            .map_err(RepositoryError::Secrets)
+    }
+
+    fn unprotect_route_secret(
+        &self,
+        field: &str,
+        instance_id: &str,
+        value: Option<String>,
+    ) -> Result<Option<String>, RepositoryError> {
+        value
+            .map(|value| {
+                self.secrets
+                    .as_ref()
+                    .map(|secrets| secrets.decrypt(field, instance_id, &value))
+                    .unwrap_or(Ok(value))
+            })
+            .transpose()
+            .map_err(RepositoryError::Secrets)
     }
 
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {
@@ -252,6 +352,8 @@ pub enum RepositoryError {
     Sqlx(#[from] sqlx::Error),
     #[error("metadata json serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("metadata secret storage failed: {0}")]
+    Secrets(#[from] SecretStoreError),
     #[error("metadata schema version {actual} is not supported")]
     UnsupportedSchema { actual: u32 },
 }
@@ -264,7 +366,7 @@ mod tests {
             DatabaseIdentity, InstanceStatus, PublicEndpoint, RuntimeKind, RuntimeMetadata,
         },
         shared::{limits::InstanceLimits, protocol::Protocol},
-        storage::sqlite,
+        storage::{secrets::is_encrypted, sqlite},
     };
 
     #[tokio::test]
@@ -350,6 +452,63 @@ mod tests {
         );
         let public_json = serde_json::to_string(&loaded).unwrap();
         assert!(!public_json.contains("mongodb_root_password"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_repository_stores_hidden_route_auth_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.protocol = Protocol::Mongodb;
+        metadata.mongodb_root_password = Some("internal-mongo-root-password".to_string());
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let raw: String = sqlx::query_scalar(
+            "SELECT mongodb_root_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_encrypted(&raw));
+        assert!(!raw.contains("internal-mongo-root-password"));
+
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.mongodb_root_password.as_deref(),
+            Some("internal-mongo-root-password")
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_repository_rewrites_legacy_plaintext_route_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let plain_repository = InstanceRepository::new(pool.clone());
+        let mut metadata = sample_metadata();
+        metadata.protocol = Protocol::Mongodb;
+        metadata.mongodb_root_password = Some("legacy-plain-root".to_string());
+        plain_repository.upsert(&metadata).await.unwrap();
+
+        let encrypted_repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let loaded = encrypted_repository.list().await.unwrap();
+        let rewritten = encrypted_repository
+            .rewrite_protected_route_auth(&loaded)
+            .await
+            .unwrap();
+
+        assert_eq!(rewritten, 1);
+        let raw: String = sqlx::query_scalar(
+            "SELECT mongodb_root_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_encrypted(&raw));
+        assert!(!raw.contains("legacy-plain-root"));
     }
 
     fn sample_metadata() -> InstanceMetadata {

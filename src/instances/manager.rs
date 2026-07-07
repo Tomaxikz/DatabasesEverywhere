@@ -18,6 +18,16 @@ impl InstanceManager {
 
     pub async fn load_from_storage(&self) -> Result<(), RepositoryError> {
         let metadata = self.repository.list().await?;
+        let encrypted_rows = self
+            .repository
+            .rewrite_protected_route_auth(&metadata)
+            .await?;
+        if encrypted_rows > 0 {
+            tracing::info!(
+                encrypted_rows,
+                "encrypted protected route authentication metadata"
+            );
+        }
         self.store.replace_all(metadata).await;
         Ok(())
     }

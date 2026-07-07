@@ -733,6 +733,15 @@ async fn reject_duplicate_instance(
     }
 
     let instances = state.instances.list().await;
+    if let Some(existing) = instances.iter().find(|metadata| {
+        metadata.protocol == request.protocol && metadata.database.name == request.database
+    }) {
+        return Err(ApiError::Conflict(format!(
+            "{} database name {} already exists on instance {}; choose a different database name or delete the existing database first",
+            request.protocol, request.database, existing.instance_id
+        )));
+    }
+
     let route_exists = instances.iter().any(|metadata| match request.protocol {
         Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb | Protocol::Clickhouse => {
             metadata.protocol == request.protocol
@@ -753,7 +762,7 @@ async fn reject_duplicate_instance(
 
     if route_exists {
         return Err(ApiError::Conflict(format!(
-            "{} route already exists for username {} and database {}",
+            "{} route already exists for username {} and database {}; choose different credentials or delete the existing database first",
             request.protocol, request.username, request.database
         )));
     }
@@ -1084,6 +1093,64 @@ mod tests {
         assert!(error.to_string().contains("is not allowed"));
     }
 
+    #[tokio::test]
+    async fn create_request_rejects_existing_database_name_for_protocol() {
+        let state = test_state(Config::default()).await;
+        state
+            .instances
+            .upsert(sample_metadata(
+                "inst_existing_pg",
+                Protocol::Postgres,
+                "shared_db",
+                "first_user",
+            ))
+            .await;
+        let mut request = create_request(Protocol::Postgres);
+        request.instance_id = "inst_new_pg".to_string();
+        request.database = "shared_db".to_string();
+        request.username = "second_user".to_string();
+
+        let error = reject_duplicate_instance(&state, &request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("database name shared_db already exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_request_rejects_existing_redis_route_for_username() {
+        let state = test_state(Config::default()).await;
+        state
+            .instances
+            .upsert(sample_metadata(
+                "inst_existing_redis",
+                Protocol::Redis,
+                "first_cache",
+                "shared_user",
+            ))
+            .await;
+        let mut request = create_request(Protocol::Redis);
+        request.instance_id = "inst_new_redis".to_string();
+        request.database = "second_cache".to_string();
+        request.username = "shared_user".to_string();
+
+        let error = reject_duplicate_instance(&state, &request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("redis route already exists for username shared_user")
+        );
+    }
+
     fn create_request(protocol: Protocol) -> CreateInstanceRequest {
         CreateInstanceRequest {
             instance_id: "inst_test_pg".to_string(),
@@ -1096,6 +1163,46 @@ mod tests {
             project_id: None,
             image: None,
             limits: None,
+        }
+    }
+
+    fn sample_metadata(
+        instance_id: &str,
+        protocol: Protocol,
+        database: &str,
+        username: &str,
+    ) -> InstanceMetadata {
+        InstanceMetadata {
+            schema_version: SCHEMA_VERSION,
+            instance_id: instance_id.to_string(),
+            protocol,
+            status: InstanceStatus::Running,
+            public: PublicEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+            },
+            backend: BackendEndpoint::DockerTcp {
+                host: "172.30.0.2".to_string(),
+                port: 5432,
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: format!("dbe-{}-{instance_id}", protocol.as_str()),
+                network: "databases-everywhere".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: database.to_string(),
+                username: username.to_string(),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mongodb_root_password: None,
+            limits: crate::shared::limits::InstanceLimits::default(),
+            image: None,
+            database_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
 

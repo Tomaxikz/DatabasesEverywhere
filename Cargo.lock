@@ -582,6 +582,7 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "secrecy",

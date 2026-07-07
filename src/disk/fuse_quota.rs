@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -369,13 +370,45 @@ fn fuse_paths_with_root(
         }
     };
 
+    let mount_name = fuse_mount_name(data_path, instance_id);
+
     Ok(FuseQuotaPaths {
-        mount_path: fuse_root.join("instances").join(instance_id),
+        mount_path: fuse_root.join("instances").join(&mount_name),
         socket_path: fuse_root
             .join("mounts")
-            .join(instance_id)
+            .join(mount_name)
             .with_extension("sock"),
     })
+}
+
+fn fuse_mount_name(data_path: &Path, instance_id: &std::ffi::OsStr) -> String {
+    let mut hash = Sha256::new();
+    hash.update(data_path.as_os_str().as_encoded_bytes());
+    let digest = hash.finalize();
+    let encoded = hex_prefix(&digest, 24);
+    let readable = instance_id
+        .to_string_lossy()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .take(24)
+        .collect::<String>();
+    if readable.is_empty() {
+        encoded
+    } else {
+        format!("{readable}-{encoded}")
+    }
+}
+
+fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+    let mut output = String::with_capacity(chars);
+    for byte in bytes {
+        if output.len() >= chars {
+            break;
+        }
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output.truncate(chars);
+    output
 }
 
 fn mib_to_bytes(mib: u64) -> u64 {
@@ -444,5 +477,25 @@ mod tests {
     fn parses_quota_used_response() {
         let lines = vec!["quota_used = 12345".to_string(), "OK".to_string()];
         assert_eq!(parse_quota_used_response(&lines).unwrap(), 12345);
+    }
+
+    #[test]
+    fn fuse_paths_keep_socket_path_short_for_long_instance_ids() {
+        let data_path = Path::new(
+            "/var/lib/dbev/volumes/dbe_upgrade_tmp_9689dc77d5ce499c80e4ae5beaec4217_inst_node_db_agent_1_1_mongodb_s1_testt",
+        );
+        let fuse_root = Path::new("/var/lib/dbev/fuse");
+
+        let paths = fuse_paths_with_root(data_path, Some(fuse_root)).unwrap();
+
+        assert!(paths.socket_path.to_string_lossy().len() < 100);
+        assert!(
+            paths
+                .socket_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("dbe_upgrade_tmp_9689dc77")
+        );
     }
 }

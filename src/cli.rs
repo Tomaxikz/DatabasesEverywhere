@@ -1085,8 +1085,10 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let pool = sqlite::connect(std::path::Path::new(&config.paths.metadata_root()))
         .await
         .context("failed to initialize sqlite storage")?;
-    tracing::info!(path = %config.paths.metadata_root(), "sqlite metadata storage ready");
-    let repository = InstanceRepository::new(pool.clone());
+    let metadata_root = config.paths.metadata_root();
+    tracing::info!(path = %metadata_root, "sqlite metadata storage ready");
+    let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
+        .context("failed to initialize encrypted metadata secret storage")?;
     let job_repository = ImportExportJobRepository::new(pool.clone());
     let failed_jobs = job_repository
         .fail_unfinished(
