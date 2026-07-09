@@ -1,25 +1,15 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{IpAddr, ToSocketAddrs},
+    net::IpAddr,
     path::{Component, Path as FsPath, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
-
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, Uri},
-};
-use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
-use tokio::time::timeout;
 
 use crate::{
     api::{
         handlers::{ApiError, ApiResult, authorize_scope},
-        instances::{LifecycleAction, lifecycle_instance},
+        instances::{LifecycleAction, lifecycle_instance_locked},
         routes::AppState,
     },
     auth::scopes,
@@ -28,16 +18,25 @@ use crate::{
         paths::InstancePaths,
     },
     jobs::import_export::{
-        ImportExportAction, ImportExportJob, ImportExportStatus, create_data_archive,
-        extract_data_archive,
+        ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
+        JobAdmissionError, create_data_archive, extract_data_archive,
     },
-    shared::{protocol::Protocol, shell::sh_quote},
+    shared::{network::is_private_or_sensitive_ip, protocol::Protocol, shell::sh_quote},
 };
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, Uri},
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_DEPTH: usize = 32;
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+const REMOTE_IMPORT_TIMEOUT_SECONDS: u64 = 15 * 60;
 const MAX_SELECTION_ITEMS: usize = 512;
 const MAX_SELECTION_FIELDS_PER_ITEM: usize = 512;
 
@@ -88,8 +87,14 @@ pub struct RemoteImportSource {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<SecretString>,
-    #[serde(default)]
+    #[serde(default = "default_remote_tls")]
     pub tls: bool,
+    #[serde(skip)]
+    tls_server_name: Option<String>,
+}
+
+fn default_remote_tls() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -322,13 +327,13 @@ pub(crate) async fn queue_export_instance_with_options(
         options.archive_format,
     )
     .await?;
-    let job = enqueue_job(
+    let (job, admission) = enqueue_job(
         state,
         metadata.instance_id.clone(),
         ImportExportAction::Export,
         Some(artifact_path.display().to_string()),
     )
-    .await;
+    .await?;
 
     tokio::spawn(run_export_job(
         state.clone(),
@@ -336,6 +341,7 @@ pub(crate) async fn queue_export_instance_with_options(
         metadata.instance_id,
         artifact_path,
         options,
+        admission,
     ));
 
     audit_import_export(&job, "queued");
@@ -369,7 +375,7 @@ pub(crate) async fn queue_import_instance(
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
         ImportSourceOptions::Remote(_) => None,
     };
-    let job = enqueue_job(
+    let (job, admission) = enqueue_job(
         state,
         metadata.instance_id.clone(),
         ImportExportAction::Import,
@@ -377,13 +383,14 @@ pub(crate) async fn queue_import_instance(
             .as_ref()
             .map(|path| path.display().to_string()),
     )
-    .await;
+    .await?;
 
     tokio::spawn(run_import_job(
         state.clone(),
         job.job_id.clone(),
         metadata.instance_id,
         options,
+        admission,
     ));
 
     audit_import_export(&job, "queued");
@@ -401,6 +408,7 @@ pub async fn get_import_export_job(
         .import_export_jobs
         .get(&job_id)
         .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(public_job_response(job).await))
 }
@@ -425,7 +433,8 @@ pub async fn list_import_export_jobs(
             status,
             query.limit.unwrap_or(100),
         )
-        .await;
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let mut response = Vec::with_capacity(jobs.len());
     for job in jobs {
         response.push(public_job_response(job).await);
@@ -438,7 +447,19 @@ async fn enqueue_job(
     instance_id: String,
     action: ImportExportAction,
     artifact_path: Option<String>,
-) -> ImportExportJob {
+) -> Result<(ImportExportJob, ImportExportJobPermit), ApiError> {
+    let admission = state
+        .import_export_jobs
+        .try_admit(&instance_id)
+        .map_err(|error| match error {
+            JobAdmissionError::GlobalCapacity => ApiError::RateLimited,
+            JobAdmissionError::InstanceCapacity => ApiError::Conflict(format!(
+                "instance {instance_id} already has the maximum number of running or queued import/export jobs"
+            )),
+            JobAdmissionError::ShuttingDown => {
+                ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
+            }
+        })?;
     let now = crate::jobs::import_export::now_rfc3339();
     let job = ImportExportJob {
         job_id: uuid::Uuid::new_v4().to_string(),
@@ -450,8 +471,12 @@ async fn enqueue_job(
         created_at: now.clone(),
         updated_at: now,
     };
-    state.import_export_jobs.insert(job.clone()).await;
-    job
+    state
+        .import_export_jobs
+        .insert(job.clone())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    Ok((job, admission))
 }
 
 async fn run_export_job(
@@ -460,11 +485,12 @@ async fn run_export_job(
     instance_id: String,
     artifact_path: PathBuf,
     options: ExportOptions,
+    _admission: ImportExportJobPermit,
 ) {
-    state
-        .import_export_jobs
-        .update_status(&job_id, ImportExportStatus::Running, None, None)
-        .await;
+    let _operation = state.instance_locks.lock(&instance_id).await;
+    if !begin_import_export_job(&state, &job_id).await {
+        return;
+    }
     let result =
         export_instance_artifact(&state, &instance_id, artifact_path.clone(), &options).await;
     update_job_result(&state, &job_id, result, Some(artifact_path)).await;
@@ -475,17 +501,46 @@ async fn run_import_job(
     job_id: String,
     instance_id: String,
     options: ImportOptions,
+    _admission: ImportExportJobPermit,
 ) {
-    state
-        .import_export_jobs
-        .update_status(&job_id, ImportExportStatus::Running, None, None)
-        .await;
+    let _operation = state.instance_locks.lock(&instance_id).await;
+    if !begin_import_export_job(&state, &job_id).await {
+        return;
+    }
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
         ImportSourceOptions::Remote(_) => None,
     };
     let result = import_instance_source(&state, &instance_id, &options).await;
     update_job_result(&state, &job_id, result, artifact_path).await;
+}
+
+async fn begin_import_export_job(state: &AppState, job_id: &str) -> bool {
+    if !state.import_export_jobs.is_accepting() {
+        let error_message = "daemon shutdown began before the queued job started";
+        if let Err(error) = state
+            .import_export_jobs
+            .update_status(
+                job_id,
+                ImportExportStatus::Failed,
+                None,
+                Some(error_message.to_string()),
+            )
+            .await
+        {
+            tracing::error!(%job_id, %error, "failed to persist shutdown cancellation for queued import/export job");
+        }
+        return false;
+    }
+    if let Err(error) = state
+        .import_export_jobs
+        .update_status(job_id, ImportExportStatus::Running, None, None)
+        .await
+    {
+        tracing::error!(%job_id, %error, "refusing to run import/export job because its running status could not be persisted");
+        return false;
+    }
+    true
 }
 
 async fn update_job_result(
@@ -497,7 +552,7 @@ async fn update_job_result(
     match result {
         Ok(()) => {
             tracing::info!(%job_id, "audit import_export_job_succeeded");
-            state
+            if let Err(error) = state
                 .import_export_jobs
                 .update_status(
                     job_id,
@@ -505,11 +560,14 @@ async fn update_job_result(
                     artifact_path.map(|path| path.display().to_string()),
                     None,
                 )
-                .await;
+                .await
+            {
+                tracing::error!(%job_id, %error, "import/export operation succeeded but its terminal status could not be persisted");
+            }
         }
         Err(error) => {
             tracing::warn!(%job_id, %error, "audit import_export_job_failed");
-            state
+            if let Err(storage_error) = state
                 .import_export_jobs
                 .update_status(
                     job_id,
@@ -517,7 +575,10 @@ async fn update_job_result(
                     artifact_path.map(|path| path.display().to_string()),
                     Some(error.to_string()),
                 )
-                .await;
+                .await
+            {
+                tracing::error!(%job_id, %storage_error, "import/export operation failed and its terminal status could not be persisted");
+            }
         }
     }
 }
@@ -599,7 +660,7 @@ async fn export_physical_archive(
         .ok_or(ApiError::NotFound)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = lifecycle_instance(state, instance_id, LifecycleAction::Stop).await?;
+        let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
 
     let paths = InstancePaths::new(&state.config.paths, instance_id)
@@ -607,11 +668,7 @@ async fn export_physical_archive(
     let result = create_data_archive(paths.data, artifact_path)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()));
-
-    if was_running {
-        restart_after_job(state, instance_id).await?;
-    }
-    result
+    finish_physical_operation(state, instance_id, was_running, result).await
 }
 
 async fn import_physical_archive(
@@ -636,23 +693,19 @@ async fn import_physical_archive(
         .ok_or(ApiError::NotFound)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = lifecycle_instance(state, instance_id, LifecycleAction::Stop).await?;
+        let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
 
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let result = replace_data_from_archive(paths.clone(), artifact_path).await;
+    let mut result = replace_data_from_archive(paths.clone(), artifact_path).await;
     if result.is_ok() && !state.docker.uses_rootless_podman() {
-        paths
+        result = paths
             .apply_container_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(|error| ApiError::Runtime(error.to_string()));
     }
-
-    if was_running {
-        restart_after_job(state, instance_id).await?;
-    }
-    result
+    finish_physical_operation(state, instance_id, was_running, result).await
 }
 
 async fn export_logical_dump(
@@ -663,36 +716,39 @@ async fn export_logical_dump(
     options: &ExportOptions,
 ) -> Result<(), ApiError> {
     let instance_id = &metadata.instance_id;
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    tokio::fs::create_dir_all(
+    create_private_directory(
         artifact_path
             .parent()
             .ok_or_else(|| ApiError::Runtime("invalid artifact path".to_string()))?,
+        "artifact directory",
     )
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to create artifact dir: {error}")))?;
+    .await?;
 
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-export-{}.{}", uuid::Uuid::new_v4(), extension);
-    let host_temp = paths.data.join(&temp_name);
-    let container_temp = format!("{}/{}", container_data_path(protocol), temp_name);
+    let staging_root = logical_staging_root(state).await?;
+    let host_temp = staging_root.join(&temp_name);
+    let container_temp = format!("/tmp/{temp_name}");
     cleanup_path(&host_temp).await;
 
     let script = export_script(metadata, &container_temp, &options.selection)?;
-    if let Err(error) = state
-        .docker
-        .exec_shell(protocol, instance_id, &script)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))
-    {
-        cleanup_path(&host_temp).await;
-        return Err(error);
+    let result = async {
+        state
+            .docker
+            .exec_shell(protocol, instance_id, &script)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        state
+            .docker
+            .download_file(protocol, instance_id, &container_temp, &host_temp)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        archive_or_copy_export(&host_temp, &artifact_path, options.archive_format).await
     }
-
-    archive_or_copy_export(&host_temp, &artifact_path, options.archive_format).await?;
+    .await;
+    cleanup_container_temp(state, protocol, instance_id, &container_temp).await;
     cleanup_path(&host_temp).await;
-    Ok(())
+    result
 }
 
 async fn import_logical_dump(
@@ -704,23 +760,42 @@ async fn import_logical_dump(
 ) -> Result<(), ApiError> {
     let instance_id = &metadata.instance_id;
     ensure_full_selection(protocol, &options.selection)?;
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-import-{}.{}", uuid::Uuid::new_v4(), extension);
-    let host_temp = paths.data.join(&temp_name);
-    let container_temp = format!("{}/{}", container_data_path(protocol), temp_name);
+    let staging_root = logical_staging_root(state).await?;
+    let host_temp = staging_root.join(&temp_name);
+    let container_temp = format!("/tmp/{temp_name}");
     cleanup_path(&host_temp).await;
-    prepare_logical_import_artifact(protocol, artifact_path, &host_temp, &paths.data, options)
-        .await?;
+    if let Err(error) =
+        prepare_logical_import_artifact(protocol, artifact_path, &host_temp, &staging_root, options)
+            .await
+    {
+        cleanup_path(&host_temp).await;
+        return Err(error);
+    }
 
-    let script = import_script(metadata, &container_temp)?;
-    let result = state
-        .docker
-        .exec_shell(protocol, instance_id, &script)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))
-        .map(|_| ());
+    let script = match import_script(metadata, &container_temp) {
+        Ok(script) => script,
+        Err(error) => {
+            cleanup_path(&host_temp).await;
+            return Err(error);
+        }
+    };
+    let result = async {
+        state
+            .docker
+            .upload_file(protocol, instance_id, &host_temp, &container_temp)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        state
+            .docker
+            .exec_shell(protocol, instance_id, &script)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))
+            .map(|_| ())
+    }
+    .await;
+    cleanup_container_temp(state, protocol, instance_id, &container_temp).await;
     cleanup_path(&host_temp).await;
     result
 }
@@ -729,7 +804,7 @@ async fn prepare_logical_import_artifact(
     protocol: Protocol,
     artifact_path: &FsPath,
     host_temp: &FsPath,
-    data_dir: &FsPath,
+    staging_root: &FsPath,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
     if !options.unarchive {
@@ -747,7 +822,7 @@ async fn prepare_logical_import_artifact(
         ImportArchiveFormat::Gzip => decompress_gzip(artifact_path, host_temp).await,
         ImportArchiveFormat::Bzip2 => decompress_bzip2(artifact_path, host_temp).await,
         ImportArchiveFormat::Tar | ImportArchiveFormat::TarGzip => {
-            let staging = data_dir.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
+            let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
             let result = match extract_tar_archive(
                 artifact_path,
                 &staging,
@@ -762,7 +837,7 @@ async fn prepare_logical_import_artifact(
             result
         }
         ImportArchiveFormat::Zip => {
-            let staging = data_dir.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
+            let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
             let result = match extract_zip_archive(artifact_path, &staging).await {
                 Ok(()) => copy_selected_dump(protocol, &staging, host_temp).await,
                 Err(error) => Err(error),
@@ -780,15 +855,15 @@ async fn decompress_gzip(source: &FsPath, target: &FsPath) -> Result<(), ApiErro
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
-        "gzip decompression",
         "decompress gzip",
         true,
-        move || -> Result<(), std::io::Error> {
+        move |deadline| -> Result<(), std::io::Error> {
             let input = std::fs::File::open(source)?;
             let mut decoder = flate2::read::GzDecoder::new(input);
-            let mut output = std::fs::File::create(target)?;
-            copy_limited(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES)?;
-            Ok(())
+            write_new_private_file(&target, |mut output| {
+                copy_limited_until(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES, deadline)?;
+                output.flush()
+            })
         },
     )
     .await
@@ -798,15 +873,15 @@ async fn decompress_bzip2(source: &FsPath, target: &FsPath) -> Result<(), ApiErr
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
-        "bzip2 decompression",
         "decompress bzip2",
         true,
-        move || -> Result<(), std::io::Error> {
+        move |deadline| -> Result<(), std::io::Error> {
             let input = std::fs::File::open(source)?;
             let mut decoder = bzip2::read::BzDecoder::new(input);
-            let mut output = std::fs::File::create(target)?;
-            copy_limited(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES)?;
-            Ok(())
+            write_new_private_file(&target, |mut output| {
+                copy_limited_until(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES, deadline)?;
+                output.flush()
+            })
         },
     )
     .await
@@ -819,26 +894,23 @@ async fn extract_tar_archive(
 ) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target_dir = target_dir.to_path_buf();
-    timeout(
-        ARCHIVE_OPERATION_TIMEOUT,
-        tokio::task::spawn_blocking(
-            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                std::fs::create_dir_all(&target_dir)?;
-                let input = std::fs::File::open(source)?;
-                if gzipped {
-                    let decoder = flate2::read::GzDecoder::new(input);
-                    let mut archive = tar::Archive::new(decoder);
-                    unpack_tar_safely(&mut archive, &target_dir)?;
-                } else {
-                    let mut archive = tar::Archive::new(input);
-                    unpack_tar_safely(&mut archive, &target_dir)?;
-                }
-                Ok(())
-            },
-        ),
+    tokio::task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let deadline = archive_operation_deadline();
+            create_private_directory_blocking(&target_dir)?;
+            let input = std::fs::File::open(source)?;
+            if gzipped {
+                let decoder = flate2::read::GzDecoder::new(input);
+                let mut archive = tar::Archive::new(decoder);
+                unpack_tar_safely(&mut archive, &target_dir, deadline)?;
+            } else {
+                let mut archive = tar::Archive::new(input);
+                unpack_tar_safely(&mut archive, &target_dir, deadline)?;
+            }
+            Ok(())
+        },
     )
     .await
-    .map_err(|_| ApiError::BadRequest("tar extraction exceeded time limit".to_string()))?
     .map_err(|error| ApiError::Runtime(format!("failed to extract tar archive: {error}")))?
     .map_err(|error| ApiError::BadRequest(format!("failed to extract tar archive: {error}")))
 }
@@ -846,52 +918,48 @@ async fn extract_tar_archive(
 async fn extract_zip_archive(source: &FsPath, target_dir: &FsPath) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target_dir = target_dir.to_path_buf();
-    timeout(
-        ARCHIVE_OPERATION_TIMEOUT,
-        tokio::task::spawn_blocking(
-            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                std::fs::create_dir_all(&target_dir)?;
-                let input = std::fs::File::open(source)?;
-                let mut archive = zip::ZipArchive::new(input)?;
-                if archive.len() > MAX_ARCHIVE_ENTRIES {
+    tokio::task::spawn_blocking(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let deadline = archive_operation_deadline();
+            create_private_directory_blocking(&target_dir)?;
+            let input = std::fs::File::open(source)?;
+            let mut archive = zip::ZipArchive::new(input)?;
+            if archive.len() > MAX_ARCHIVE_ENTRIES {
+                return Err(format!("archive has more than {MAX_ARCHIVE_ENTRIES} entries").into());
+            }
+            let mut total = 0_u64;
+            for index in 0..archive.len() {
+                ensure_archive_deadline(deadline)?;
+                let mut file = archive.by_index(index)?;
+                let enclosed = file
+                    .enclosed_name()
+                    .ok_or_else(|| format!("zip entry {} has unsafe path", file.name()))?
+                    .to_path_buf();
+                validate_relative_archive_path(&enclosed)?;
+                total = total
+                    .checked_add(file.size())
+                    .ok_or("archive uncompressed size overflow")?;
+                if total > MAX_UNARCHIVED_BYTES {
                     return Err(
-                        format!("archive has more than {MAX_ARCHIVE_ENTRIES} entries").into(),
+                        format!("archive expands beyond {MAX_UNARCHIVED_BYTES} bytes").into(),
                     );
                 }
-                let mut total = 0_u64;
-                for index in 0..archive.len() {
-                    let mut file = archive.by_index(index)?;
-                    let enclosed = file
-                        .enclosed_name()
-                        .ok_or_else(|| format!("zip entry {} has unsafe path", file.name()))?
-                        .to_path_buf();
-                    validate_relative_archive_path(&enclosed)?;
-                    total = total
-                        .checked_add(file.size())
-                        .ok_or("archive uncompressed size overflow")?;
-                    if total > MAX_UNARCHIVED_BYTES {
-                        return Err(
-                            format!("archive expands beyond {MAX_UNARCHIVED_BYTES} bytes").into(),
-                        );
-                    }
-                    let size = file.size();
-                    let target = target_dir.join(enclosed);
-                    if file.is_dir() {
-                        std::fs::create_dir_all(&target)?;
-                        continue;
-                    }
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let mut output = std::fs::File::create(target)?;
-                    copy_limited(&mut file, &mut output, size)?;
+                let size = file.size();
+                let target = target_dir.join(enclosed);
+                if file.is_dir() {
+                    create_private_directory_blocking(&target)?;
+                    continue;
                 }
-                Ok(())
-            },
-        ),
+                if let Some(parent) = target.parent() {
+                    create_private_directory_blocking(parent)?;
+                }
+                let mut output = create_private_file_blocking(&target)?;
+                copy_limited_until(&mut file, &mut output, size, deadline)?;
+            }
+            Ok(())
+        },
     )
     .await
-    .map_err(|_| ApiError::BadRequest("zip extraction exceeded time limit".to_string()))?
     .map_err(|error| ApiError::Runtime(format!("failed to extract zip archive: {error}")))?
     .map_err(|error| ApiError::BadRequest(format!("failed to extract zip archive: {error}")))
 }
@@ -899,10 +967,12 @@ async fn extract_zip_archive(source: &FsPath, target_dir: &FsPath) -> Result<(),
 fn unpack_tar_safely<R: Read>(
     archive: &mut tar::Archive<R>,
     target_dir: &FsPath,
+    deadline: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut total = 0_u64;
     let mut entries = 0_usize;
     for entry in archive.entries()? {
+        ensure_archive_deadline(deadline)?;
         entries += 1;
         if entries > MAX_ARCHIVE_ENTRIES {
             return Err(format!("archive has more than {MAX_ARCHIVE_ENTRIES} entries").into());
@@ -923,14 +993,14 @@ fn unpack_tar_safely<R: Read>(
         }
         let target = target_dir.join(&path);
         if kind.is_dir() {
-            std::fs::create_dir_all(target)?;
+            create_private_directory_blocking(&target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_directory_blocking(parent)?;
         }
-        let mut output = std::fs::File::create(target)?;
-        copy_limited(&mut entry, &mut output, size)?;
+        let mut output = create_private_file_blocking(&target)?;
+        copy_limited_until(&mut entry, &mut output, size, deadline)?;
     }
     Ok(())
 }
@@ -959,14 +1029,30 @@ fn validate_relative_archive_path(
     Ok(())
 }
 
-fn copy_limited<R: Read, W: Write>(
+fn archive_operation_deadline() -> Instant {
+    Instant::now() + ARCHIVE_OPERATION_TIMEOUT
+}
+
+fn ensure_archive_deadline(deadline: Instant) -> Result<(), std::io::Error> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "archive operation exceeded time limit",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_limited_until<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     limit: u64,
+    deadline: Instant,
 ) -> Result<u64, std::io::Error> {
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        ensure_archive_deadline(deadline)?;
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             return Ok(total);
@@ -1141,11 +1227,32 @@ async fn validate_import_source(
             required_remote_database(remote)?;
             required_remote_username(remote)?;
             required_remote_password(remote)?;
+            if !remote.tls && !state.config.security.allow_insecure_public_listeners {
+                return Err(ApiError::BadRequest(
+                    "remote imports require TLS; tls=false is allowed only when security.allow_insecure_public_listeners=true for isolated development"
+                        .to_string(),
+                ));
+            }
+            validate_remote_tls_pinning(target_protocol, remote)?;
             resolve_validated_remote_host(state, remote)
                 .await
                 .map(|_| ())
         }
     }
+}
+
+fn validate_remote_tls_pinning(
+    protocol: Protocol,
+    remote: &RemoteImportSource,
+) -> Result<(), ApiError> {
+    let uses_hostname = remote.host.trim().parse::<IpAddr>().is_err();
+    if remote.tls && uses_hostname && protocol != Protocol::Postgres {
+        return Err(ApiError::BadRequest(format!(
+            "{} remote import cannot safely combine DNS pinning with TLS hostname verification; use an IP literal whose certificate contains that IP address, or use PostgreSQL which supports a separate pinned address and certificate hostname",
+            protocol.as_str()
+        )));
+    }
+    Ok(())
 }
 
 async fn harden_import_options(
@@ -1160,9 +1267,8 @@ async fn harden_import_options(
         }
         ImportSourceOptions::Remote(remote) => {
             let resolved_host = resolve_validated_remote_host(state, remote).await?;
-            if !remote.tls {
-                remote.host = resolved_host;
-            }
+            remote.tls_server_name = remote.tls.then(|| remote.host.clone());
+            remote.host = resolved_host;
         }
     }
     Ok(options)
@@ -1196,16 +1302,20 @@ async fn resolve_validated_remote_host(
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(host));
 
-    let addresses = (host, remote.port)
-        .to_socket_addrs()
-        .map_err(|error| ApiError::BadRequest(format!("failed to resolve remote host: {error}")))?;
+    let addresses = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((host, remote.port)),
+    )
+    .await
+    .map_err(|_| ApiError::BadRequest("remote host resolution timed out".to_string()))?
+    .map_err(|error| ApiError::BadRequest(format!("failed to resolve remote host: {error}")))?;
     let mut saw_address = false;
     let mut selected_ip = None;
     for address in addresses {
         saw_address = true;
         if !host_is_allowlisted
             && !state.config.security.allow_private_remote_imports
-            && private_or_sensitive_ip(address.ip())
+            && is_private_or_sensitive_ip(address.ip())
         {
             return Err(ApiError::BadRequest(format!(
                 "remote import host resolves to blocked address {}; add it to security.remote_import_allowed_hosts or enable allow_private_remote_imports",
@@ -1222,28 +1332,6 @@ async fn resolve_validated_remote_host(
     selected_ip.map(|ip| ip.to_string()).ok_or_else(|| {
         ApiError::BadRequest("remote import host did not resolve to any address".to_string())
     })
-}
-
-fn private_or_sensitive_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.octets() == [169, 254, 169, 254]
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.segments()[0] & 0xfe00 == 0xfc00
-                || ip.segments()[0] & 0xffc0 == 0xfe80
-        }
-    }
 }
 
 async fn import_remote_source(
@@ -1266,6 +1354,10 @@ async fn import_remote_source(
         )));
     }
     let script = remote_import_script(metadata, remote, selection)?;
+    let script = format!(
+        "timeout --signal=KILL {REMOTE_IMPORT_TIMEOUT_SECONDS} sh -c {}",
+        sh_quote(&script)
+    );
     state
         .docker
         .exec_shell(protocol, instance_id, &script)
@@ -1307,14 +1399,26 @@ fn remote_postgres_import_script(
     let username = required_remote_username(remote)?;
     let password = required_remote_password(remote)?;
     let filters = postgres_dump_selection_args(selection)?;
-    let sslmode = if remote.tls { "require" } else { "disable" };
+    let sslmode = if remote.tls { "verify-full" } else { "disable" };
+    let tls_server_name = remote
+        .tls_server_name
+        .as_deref()
+        .unwrap_or(remote.host.as_str());
+    let ssl_root_cert = if remote.tls {
+        "PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt "
+    } else {
+        ""
+    };
     Ok(format!(
         r#"set -eu
-PGPASSWORD={remote_password} PGSSLMODE={sslmode} pg_dump \
-  -h {remote_host} \
-  -p {remote_port} \
-  -U {remote_user} \
-  -d {remote_database} \
+PGPASSWORD={remote_password} \
+PGHOST={tls_server_name} \
+PGHOSTADDR={remote_host} \
+PGPORT={remote_port} \
+PGUSER={remote_user} \
+PGDATABASE={remote_database} \
+PGSSLMODE={sslmode} \
+{ssl_root_cert}pg_dump \
   --clean --if-exists --no-owner --no-privileges{filters} \
 | PGPASSWORD="$POSTGRES_PASSWORD" psql \
   -h 127.0.0.1 \
@@ -1325,9 +1429,11 @@ PGPASSWORD={remote_password} PGSSLMODE={sslmode} pg_dump \
         remote_password = sh_quote(password.expose_secret()),
         sslmode = sh_quote(sslmode),
         remote_host = sh_quote(&remote.host),
+        tls_server_name = sh_quote(tls_server_name),
         remote_port = remote.port,
         remote_user = sh_quote(username),
         remote_database = sh_quote(database),
+        ssl_root_cert = ssl_root_cert,
         filters = filters,
     ))
 }
@@ -1340,7 +1446,11 @@ fn remote_mariadb_import_script(
     let username = required_remote_username(remote)?;
     let password = required_remote_password(remote)?;
     let filters = mariadb_dump_selection_args(selection, database)?;
-    let ssl = if remote.tls { " --ssl" } else { " --skip-ssl" };
+    let ssl = if remote.tls {
+        " --ssl --ssl-verify-server-cert --ssl-ca=/etc/ssl/certs/ca-certificates.crt"
+    } else {
+        " --skip-ssl"
+    };
     Ok(format!(
         r#"set -eu
 mariadb-dump \
@@ -1375,7 +1485,11 @@ fn remote_mongodb_import_script(
     let password = required_remote_password(remote)?;
     let filters = mongodb_dump_selection_args(selection, database)?;
     let remote_namespace = format!("{database}.*");
-    let tls = if remote.tls { " --tls" } else { "" };
+    let tls = if remote.tls {
+        " --tls --tlsCAFile /etc/ssl/certs/ca-certificates.crt"
+    } else {
+        ""
+    };
     Ok(format!(
         r#"set -eu
 mongodump \
@@ -1972,14 +2086,30 @@ clickhouse-client \
     Ok(script)
 }
 
-fn container_data_path(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::Postgres => "/var/lib/postgresql",
-        Protocol::Redis => "/data",
-        Protocol::Mariadb => "/var/lib/mysql",
-        Protocol::Mongodb => "/data/db",
-        Protocol::Clickhouse => "/var/lib/clickhouse",
-        Protocol::Qdrant => "/dbe-qdrant/storage",
+async fn logical_staging_root(state: &AppState) -> Result<PathBuf, ApiError> {
+    let root = PathBuf::from(state.config.paths.tmp_root()).join("import-export");
+    create_private_directory(&root, "logical import/export staging directory").await?;
+    Ok(root)
+}
+
+async fn cleanup_container_temp(
+    state: &AppState,
+    protocol: Protocol,
+    instance_id: &str,
+    path: &str,
+) {
+    let script = format!("rm -f -- {}", sh_quote(path));
+    if let Err(error) = state
+        .docker
+        .exec_shell(protocol, instance_id, &script)
+        .await
+    {
+        tracing::warn!(
+            instance_id,
+            %protocol,
+            %error,
+            "failed to remove container import/export temporary file"
+        );
     }
 }
 
@@ -1996,21 +2126,20 @@ fn dump_extension(protocol: Protocol) -> &'static str {
 
 async fn copy_file(from: &FsPath, to: &FsPath) -> Result<(), ApiError> {
     if let Some(parent) = to.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to create parent directory {}: {error}",
-                parent.display()
-            ))
-        })?;
+        create_private_directory(parent, "file parent directory").await?;
     }
-    tokio::fs::copy(from, to).await.map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to copy {} to {}: {error}",
-            from.display(),
-            to.display()
-        ))
-    })?;
-    Ok(())
+    let from = from.to_path_buf();
+    let to = to.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let mut input = std::fs::File::open(&from)?;
+        write_new_private_file(&to, |mut output| {
+            std::io::copy(&mut input, &mut output)?;
+            output.flush()
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Runtime(format!("failed to join file copy task: {error}")))?
+    .map_err(|error| ApiError::Runtime(format!("failed to copy file: {error}")))
 }
 
 async fn archive_or_copy_export(
@@ -2029,19 +2158,20 @@ async fn compress_gzip(source: &FsPath, target: &FsPath) -> Result<(), ApiError>
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
-        "gzip compression",
         "compress gzip",
         false,
-        move || -> Result<(), std::io::Error> {
+        move |deadline| -> Result<(), std::io::Error> {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_private_directory_blocking(parent)?;
             }
             let mut input = std::fs::File::open(source)?;
-            let output = std::fs::File::create(target)?;
-            let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::new(3));
-            std::io::copy(&mut input, &mut encoder)?;
-            encoder.finish()?;
-            Ok(())
+            write_new_private_file(&target, |output| {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(output, flate2::Compression::new(3));
+                copy_limited_until(&mut input, &mut encoder, u64::MAX, deadline)?;
+                encoder.finish()?;
+                Ok(())
+            })
         },
     )
     .await
@@ -2051,33 +2181,32 @@ async fn compress_bzip2(source: &FsPath, target: &FsPath) -> Result<(), ApiError
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
-        "bzip2 compression",
         "compress bzip2",
         false,
-        move || -> Result<(), std::io::Error> {
+        move |deadline| -> Result<(), std::io::Error> {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_private_directory_blocking(parent)?;
             }
             let mut input = std::fs::File::open(source)?;
-            let output = std::fs::File::create(target)?;
-            let mut encoder = bzip2::write::BzEncoder::new(output, bzip2::Compression::default());
-            std::io::copy(&mut input, &mut encoder)?;
-            encoder.finish()?;
-            Ok(())
+            write_new_private_file(&target, |output| {
+                let mut encoder =
+                    bzip2::write::BzEncoder::new(output, bzip2::Compression::default());
+                copy_limited_until(&mut input, &mut encoder, u64::MAX, deadline)?;
+                encoder.finish()?;
+                Ok(())
+            })
         },
     )
     .await
 }
 
 async fn run_archive_file_operation(
-    timeout_label: &'static str,
     failure_label: &'static str,
     io_error_is_bad_request: bool,
-    task: impl FnOnce() -> Result<(), std::io::Error> + Send + 'static,
+    task: impl FnOnce(Instant) -> Result<(), std::io::Error> + Send + 'static,
 ) -> Result<(), ApiError> {
-    let result = timeout(ARCHIVE_OPERATION_TIMEOUT, tokio::task::spawn_blocking(task))
+    let result = tokio::task::spawn_blocking(move || task(archive_operation_deadline()))
         .await
-        .map_err(|_| ApiError::BadRequest(format!("{timeout_label} exceeded time limit")))?
         .map_err(|error| ApiError::Runtime(format!("failed to {failure_label}: {error}")))?;
 
     match result {
@@ -2123,12 +2252,21 @@ pub(crate) async fn replace_data_from_archive(
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to create data directory: {error}")))?;
 
-    let staging_dir = paths.data.join(format!(".dbe-import-{import_id}"));
+    let data_parent = paths
+        .data
+        .parent()
+        .ok_or_else(|| ApiError::Runtime("data directory has no parent".to_string()))?;
+    let workspace = data_parent.join(format!(".dbe-restore-{}-{import_id}", paths.instance_id));
+    create_private_directory(&workspace, "physical restore workspace").await?;
+    let staging_dir = workspace.join("staging");
     let staged_data = staging_dir.join(&expected_root);
-    let backup_dir = paths.data.join(format!(".dbe-backup-{import_id}"));
-    tokio::fs::create_dir_all(&staging_dir)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create import staging: {error}")))?;
+    let backup_dir = workspace.join("previous-data");
+    if let Err(error) =
+        create_private_directory(&staging_dir, "physical import staging directory").await
+    {
+        cleanup_dir(&workspace).await;
+        return Err(error);
+    }
     if let Err(error) = extract_data_archive(
         artifact_path.to_path_buf(),
         staging_dir.clone(),
@@ -2136,36 +2274,45 @@ pub(crate) async fn replace_data_from_archive(
     )
     .await
     {
-        cleanup_dir(&staging_dir).await;
+        cleanup_dir(&workspace).await;
         return Err(ApiError::BadRequest(error.to_string()));
     }
 
-    tokio::fs::create_dir_all(&backup_dir)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create import backup: {error}")))?;
-
     if let Err(error) =
-        move_directory_entries_except(&paths.data, &backup_dir, &[&staging_dir, &backup_dir]).await
+        create_private_directory(&backup_dir, "physical import rollback directory").await
     {
-        cleanup_dir(&staging_dir).await;
-        cleanup_dir(&backup_dir).await;
+        cleanup_dir(&workspace).await;
+        return Err(error);
+    }
+
+    if let Err(error) = move_directory_entries(&paths.data, &backup_dir).await {
+        if let Err(rollback_error) = move_directory_entries(&backup_dir, &paths.data).await {
+            return Err(ApiError::Runtime(format!(
+                "failed to move existing data contents aside: {error}; rollback also failed: {rollback_error}; recovery data was retained at {}",
+                workspace.display()
+            )));
+        }
+        cleanup_dir(&workspace).await;
         return Err(ApiError::Runtime(format!(
             "failed to move existing data contents aside: {error}"
         )));
     }
 
     if let Err(error) = move_directory_entries(&staged_data, &paths.data).await {
-        cleanup_dir_contents_except(&paths.data, &[&staging_dir, &backup_dir]).await;
-        let _ = move_directory_entries(&backup_dir, &paths.data).await;
-        cleanup_dir(&staging_dir).await;
-        cleanup_dir(&backup_dir).await;
+        cleanup_dir_contents(&paths.data).await;
+        if let Err(rollback_error) = move_directory_entries(&backup_dir, &paths.data).await {
+            return Err(ApiError::Runtime(format!(
+                "failed to install imported data contents: {error}; rollback also failed: {rollback_error}; recovery data was retained at {}",
+                workspace.display()
+            )));
+        }
+        cleanup_dir(&workspace).await;
         return Err(ApiError::Runtime(format!(
             "failed to install imported data contents: {error}"
         )));
     }
 
-    cleanup_dir(&backup_dir).await;
-    cleanup_dir(&staging_dir).await;
+    cleanup_dir(&workspace).await;
     Ok(())
 }
 
@@ -2195,22 +2342,48 @@ async fn move_directory_entries_except(
     Ok(())
 }
 
-async fn cleanup_dir_contents_except(path: &FsPath, exclude: &[&FsPath]) {
+async fn cleanup_dir_contents(path: &FsPath) {
     let Ok(mut entries) = tokio::fs::read_dir(path).await else {
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if exclude.iter().any(|excluded| path == **excluded) {
-            continue;
-        }
         cleanup_path(&path).await;
     }
 }
 
-async fn restart_after_job(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    let _ = lifecycle_instance(state, instance_id, LifecycleAction::Start).await?;
-    Ok(())
+pub(crate) async fn finish_physical_operation(
+    state: &AppState,
+    instance_id: &str,
+    was_running: bool,
+    primary_result: Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    if !was_running {
+        return primary_result;
+    }
+
+    let restart_result = lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+        .await
+        .map(|_| ());
+    if let (Err(primary_error), Err(restart_error)) = (&primary_result, &restart_result) {
+        tracing::error!(
+            instance_id,
+            error = %primary_error,
+            restart_error = %restart_error,
+            "physical operation failed and the originally-running instance could not be restarted"
+        );
+    }
+    preserve_primary_error(primary_result, restart_result)
+}
+
+fn preserve_primary_error(
+    primary_result: Result<(), ApiError>,
+    recovery_result: Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    match (primary_result, recovery_result) {
+        (Err(primary_error), _) => Err(primary_error),
+        (Ok(()), recovery_result) => recovery_result,
+    }
 }
 
 async fn export_artifact_path(
@@ -2220,13 +2393,13 @@ async fn export_artifact_path(
     archive_format: ExportArchiveFormat,
 ) -> Result<PathBuf, ApiError> {
     let export_root = PathBuf::from(state.config.paths.exports_root());
-    tokio::fs::create_dir_all(&export_root)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create export dir: {error}")))?;
+    create_private_directory(&export_root, "export directory").await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
     Ok(export_root.join(format!(
-        "{}-{}.{}{}",
+        "{}-{}-{}.{}{}",
         instance_id,
         OffsetDateTime::now_utc().unix_timestamp(),
+        &suffix[..8],
         dump_extension(protocol),
         archive_format.suffix()
     )))
@@ -2276,6 +2449,56 @@ async fn cleanup_path(path: &FsPath) {
     }
 }
 
+async fn create_private_directory(path: &FsPath, label: &str) -> Result<(), ApiError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || create_private_directory_blocking(&path))
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))?
+        .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))
+}
+
+fn create_private_directory_blocking(path: &FsPath) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a real directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_private_file_blocking(path: &FsPath) -> Result<std::fs::File, std::io::Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn write_new_private_file<T>(
+    path: &FsPath,
+    operation: impl FnOnce(std::fs::File) -> Result<T, std::io::Error>,
+) -> Result<T, std::io::Error> {
+    let file = create_private_file_blocking(path)?;
+    let result = operation(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
 async fn validate_artifact_path(state: &AppState, path: &FsPath) -> Result<PathBuf, ApiError> {
     if !path.is_absolute() {
         return Err(ApiError::BadRequest(
@@ -2285,18 +2508,22 @@ async fn validate_artifact_path(state: &AppState, path: &FsPath) -> Result<PathB
     }
     let export_root_path = PathBuf::from(state.config.paths.exports_root());
     let import_root_path = PathBuf::from(state.config.paths.imports_root());
-    tokio::fs::create_dir_all(&export_root_path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create exports root: {error}")))?;
-    tokio::fs::create_dir_all(&import_root_path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create imports root: {error}")))?;
+    create_private_directory(&export_root_path, "exports root").await?;
+    create_private_directory(&import_root_path, "imports root").await?;
     let exports_root = tokio::fs::canonicalize(&export_root_path)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to read exports root: {error}")))?;
     let imports_root = tokio::fs::canonicalize(&import_root_path)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to read imports root: {error}")))?;
+    let source_metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("artifact_path is invalid: {error}")))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(ApiError::BadRequest(
+            "artifact_path must name a real regular file".to_string(),
+        ));
+    }
     let artifact_path = tokio::fs::canonicalize(path)
         .await
         .map_err(|error| ApiError::BadRequest(format!("artifact_path is invalid: {error}")))?;
@@ -2309,6 +2536,16 @@ async fn validate_artifact_path(state: &AppState, path: &FsPath) -> Result<PathB
         return Err(ApiError::BadRequest(
             "artifact_path extension is not allowed for import".to_string(),
         ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|error| {
+                ApiError::Runtime(format!("failed to secure import artifact: {error}"))
+            })?;
     }
     Ok(artifact_path)
 }
@@ -2338,7 +2575,7 @@ fn artifact_has_allowed_extension(path: &FsPath) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io::Cursor, sync::Arc};
 
     use super::*;
     use crate::{
@@ -2349,6 +2586,38 @@ mod tests {
         runtime::docker::DockerRuntime,
         storage::{repositories::InstanceRepository, sqlite},
     };
+
+    #[test]
+    fn archive_copy_stops_at_expired_deadline() {
+        let mut input = Cursor::new(b"contents".as_slice());
+        let mut output = Vec::new();
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+
+        let error = copy_limited_until(&mut input, &mut output, u64::MAX, expired).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn physical_operation_preserves_primary_error_over_restart_error() {
+        let result = preserve_primary_error(
+            Err(ApiError::BadRequest("restore failed".to_string())),
+            Err(ApiError::Runtime("restart failed".to_string())),
+        );
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message == "restore failed")
+        );
+    }
+
+    #[test]
+    fn physical_operation_returns_restart_error_after_primary_success() {
+        let result =
+            preserve_primary_error(Ok(()), Err(ApiError::Runtime("restart failed".to_string())));
+
+        assert!(matches!(result, Err(ApiError::Runtime(message)) if message == "restart failed"));
+    }
 
     #[test]
     fn allows_only_supported_import_artifact_extensions() {
@@ -2401,7 +2670,47 @@ mod tests {
             validate_artifact_path(&state, &allowed).await.unwrap(),
             allowed.canonicalize().unwrap()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&allowed).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&exports).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         assert!(validate_artifact_path(&state, &outside).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_import_rejects_symlinks_inside_allowed_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        let exports = artifacts.join("exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        let real = exports.join("real.postgres.sql");
+        let link = exports.join("linked.postgres.sql");
+        std::fs::write(&real, b"select 1").unwrap();
+        symlink(&real, &link).unwrap();
+        let state = test_state_with_config(Config {
+            paths: crate::config::PathConfig {
+                artifacts: artifacts.display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+
+        let error = validate_artifact_path(&state, &link).await.unwrap_err();
+
+        assert!(error.to_string().contains("real regular file"));
     }
 
     #[tokio::test]
@@ -2457,6 +2766,81 @@ mod tests {
         assert!(error.to_string().contains("blocked address"));
     }
 
+    #[test]
+    fn blocks_non_global_and_ipv4_embedded_remote_addresses() {
+        for address in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::127.0.0.1",
+            "2002:7f00:1::",
+        ] {
+            assert!(
+                is_private_or_sensitive_ip(address.parse().unwrap()),
+                "expected {address} to be blocked"
+            );
+        }
+        assert!(!is_private_or_sensitive_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_private_or_sensitive_ip(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn remote_import_tls_defaults_on_when_omitted() {
+        let remote: RemoteImportSource = serde_json::from_value(serde_json::json!({
+            "protocol": "postgres",
+            "host": "db.example.com",
+            "port": 5432,
+            "database": "app",
+            "username": "user",
+            "password": "secret"
+        }))
+        .unwrap();
+
+        assert!(remote.tls);
+    }
+
+    #[test]
+    fn hostname_tls_pinning_fails_closed_for_clients_without_separate_connect_address() {
+        for protocol in [Protocol::Mariadb, Protocol::Mongodb, Protocol::Clickhouse] {
+            let mut remote = remote_source("db.example.com");
+            remote.protocol = protocol;
+            remote.tls = true;
+
+            let error = validate_remote_tls_pinning(protocol, &remote).unwrap_err();
+
+            assert!(error.to_string().contains("TLS hostname verification"));
+        }
+
+        let mut postgres = remote_source("db.example.com");
+        postgres.tls = true;
+        validate_remote_tls_pinning(Protocol::Postgres, &postgres).unwrap();
+
+        let mut mariadb_ip = remote_source("203.0.113.10");
+        mariadb_ip.protocol = Protocol::Mariadb;
+        mariadb_ip.tls = true;
+        validate_remote_tls_pinning(Protocol::Mariadb, &mariadb_ip).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_import_rejects_plaintext_without_development_override() {
+        let state = test_state(true, Vec::new()).await;
+        let options = ImportOptions {
+            source: ImportSourceOptions::Remote(remote_source("127.0.0.1")),
+            ..Default::default()
+        };
+
+        let error = harden_import_options(&state, Protocol::Postgres, options)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remote imports require TLS"));
+    }
+
     #[tokio::test]
     async fn resolves_allowed_remote_host_to_ip_for_import_execution() {
         let state = test_state(true, Vec::new()).await;
@@ -2471,7 +2855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_tls_remote_hostname_for_certificate_verification() {
+    async fn pins_tls_remote_ip_and_preserves_certificate_server_name() {
         let state = test_state(true, Vec::new()).await;
         let mut remote = remote_source("localhost");
         remote.tls = true;
@@ -2485,7 +2869,17 @@ mod tests {
             .unwrap();
 
         match options.source {
-            ImportSourceOptions::Remote(remote) => assert_eq!(remote.host, "localhost"),
+            ImportSourceOptions::Remote(remote) => {
+                assert!(remote.host.parse::<IpAddr>().is_ok());
+                assert_eq!(remote.tls_server_name.as_deref(), Some("localhost"));
+                let script =
+                    remote_postgres_import_script(&remote, &ImportExportSelection::default())
+                        .unwrap();
+                assert!(script.contains("PGHOST='localhost'"));
+                assert!(script.contains("PGHOSTADDR='"));
+                assert!(script.contains("PGSSLMODE='verify-full'"));
+                assert!(script.contains("PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt"));
+            }
             ImportSourceOptions::Artifact(_) => panic!("expected remote source"),
         }
     }
@@ -2499,6 +2893,7 @@ mod tests {
             username: Some("user".to_string()),
             password: Some(SecretString::from("secret".to_string())),
             tls: false,
+            tls_server_name: None,
         }
     }
 
@@ -2550,6 +2945,7 @@ mod tests {
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
         }
     }
 }

@@ -1,7 +1,8 @@
 debug: true
 uuid: local-node
 token_id: local-token-id
-token: change-me
+token: local-dev-api-token-0123456789abcdef-01
+jwt_signing_key: local-dev-jwt-signing-key-0123456789abcdef-02
 remote: http://127.0.0.1:8090
 
 tls:
@@ -53,6 +54,8 @@ security:
   api_body_limit_bytes: 1048576
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
+  # This file is for isolated local development only.
+  allow_insecure_public_listeners: true
   allow_private_remote_imports: false
   remote_import_allowed_hosts: []
   self_upgrade_enabled: false
@@ -91,32 +94,31 @@ daemon:
   container_security_opts: []
 
 images:
-  postgres: "postgres:18.4"
-  redis: "redis:8.8.0"
-  mariadb: "mariadb:12.3.2"
+  postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
+  redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
+  mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
   # MongoDB 8.x is not compatible with Linux kernel 6.19+ / 7.x at the time
   # of writing due to SERVER-121912. If MongoDB fails to start with that
   # kernel warning, switch this to the latest known working 7.x tag:
-  # "mongo:7.0.37"
+  # "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
   # https://www.mongodb.com/docs/v8.2/release-notes/8.0/#mongodb-8-0-incompatible-with-kernel-6-19
   # https://jira.mongodb.org/browse/SERVER-121912
-  mongodb: "mongo:8.3.4"
-  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
-  qdrant: "qdrant/qdrant:v1.18.2"
+  mongodb: "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
+  qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
   allowed:
     postgres:
-      - "postgres:18.4"
+      - "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
     redis:
-      - "redis:8.8.0"
+      - "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
     mariadb:
-      - "mariadb:12.3.2"
+      - "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
     mongodb:
-      - "mongo:8.3.4"
-      - "mongo:7.0.37"
+      - "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
     clickhouse:
-      - "clickhouse/clickhouse-server:26.4.4.38"
+      - "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
     qdrant:
-      - "qdrant/qdrant:v1.18.2"
+      - "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
 
 paths:
   data: /mnt/4tb/Github/DatabasesEverywhere/.local/data

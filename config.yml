@@ -1,7 +1,8 @@
 debug: false
 uuid: dbe-node-generated-by-panel
 token_id: dbe-token-id-generated-by-panel
-token: dbe-token-generated-by-panel
+token: REPLACE_WITH_32_BYTE_RANDOM_API_TOKEN
+jwt_signing_key: REPLACE_WITH_32_BYTE_RANDOM_JWT_SIGNING_KEY
 remote: https://panel.example.com
 
 tls:
@@ -10,36 +11,36 @@ tls:
 
 postgres:
   enabled: true
-  bind: 0.0.0.0:5433
+  bind: 127.0.0.1:5433
   tls: false
 
 mariadb:
   enabled: false
-  bind: 0.0.0.0:3307
+  bind: 127.0.0.1:3307
   tls: false
 
 redis:
   enabled: true
-  bind: 0.0.0.0:6380
+  bind: 127.0.0.1:6380
   tls: false
 
 mongodb:
   enabled: false
-  bind: 0.0.0.0:27017
+  bind: 127.0.0.1:27017
   tls: false
 
 clickhouse:
   enabled: false
-  bind: 0.0.0.0:9000
+  bind: 127.0.0.1:9000
   tls: false
 
 qdrant:
   enabled: false
-  bind: 0.0.0.0:6334
+  bind: 127.0.0.1:6334
   tls: false
 
 api:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8090
   ssl:
     enabled: false
@@ -52,8 +53,10 @@ security:
   api_body_limit_bytes: 1048576
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
+  allow_insecure_public_listeners: false
   allow_private_remote_imports: false
   remote_import_allowed_hosts: []
+  # API self-upgrade is intentionally unsupported; use package/image rollout.
   self_upgrade_enabled: false
   pids_limit: 512
   pids_limits:
@@ -74,6 +77,8 @@ backups:
 disk:
   mode: fuse_quota
   project_id_base: 200000
+  fuse_quota_binary: embedded
+  fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
 
 daemon:
@@ -92,12 +97,12 @@ daemon:
   container_security_opts: []
 
 images:
-  postgres: "postgres:18.4"
-  redis: "redis:8.8.0"
-  mariadb: "mariadb:12.3.2"
-  mongodb: "mongo:7.0.37"
-  clickhouse: "clickhouse/clickhouse-server:25.8.25.37"
-  qdrant: "qdrant/qdrant:v1.18.2"
+  postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
+  redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
+  mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
+  mongodb: "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
+  clickhouse: "clickhouse/clickhouse-server:25.8.25.37@sha256:9558b6aa8f01a3355e7295b7449d484047970ad35a766c30d3e600613abcfbf0"
+  qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
 
 paths:
   data: /var/lib/dbev

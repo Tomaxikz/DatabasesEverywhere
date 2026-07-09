@@ -2,11 +2,15 @@ pub fn is_pinned_image_reference(image: &str) -> bool {
     has_sha256_digest(image) || has_non_latest_tag(image)
 }
 
-fn has_sha256_digest(image: &str) -> bool {
-    let Some((_, digest)) = image.rsplit_once("@sha256:") else {
+pub fn has_sha256_digest(image: &str) -> bool {
+    let Some((name, digest)) = image.rsplit_once("@sha256:") else {
         return false;
     };
-    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    !name.is_empty()
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn has_non_latest_tag(image: &str) -> bool {

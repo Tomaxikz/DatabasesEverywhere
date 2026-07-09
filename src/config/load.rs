@@ -49,10 +49,13 @@ mod tests {
 remote: https://panel.example.com
 uuid: node-uuid
 token_id: token-id
-token: secret-token
+token: test-api-token-0123456789abcdef-01
+jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
 api:
   host: 0.0.0.0
   port: 8090
+security:
+  allow_insecure_public_listeners: true
 paths:
   data: /var/lib/databases-everywhere
   sockets: /run/databases-everywhere
@@ -65,8 +68,14 @@ paths:
         let config = load_config(&path).unwrap();
 
         assert_eq!(config.daemon.network, "databases-everywhere");
-        assert_eq!(config.images.postgres, "postgres:18.4");
-        assert_eq!(config.images.mongodb, "mongo:7.0.37");
+        assert_eq!(
+            config.images.postgres,
+            "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
+        );
+        assert_eq!(
+            config.images.mongodb,
+            "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
+        );
         assert_eq!(config.api.bind_addr(), "0.0.0.0:8090");
         assert_eq!(config.cors_allowed_hosts(), vec!["panel.example.com"]);
     }

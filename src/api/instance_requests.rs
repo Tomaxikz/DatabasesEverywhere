@@ -2,7 +2,11 @@ use serde::Deserialize;
 
 use crate::{
     api::handlers::ApiError,
-    shared::{ids::validate_instance_id, limits::InstanceLimits, protocol::Protocol},
+    shared::{
+        ids::validate_instance_id,
+        limits::{InstanceLimits, validate_runtime_limits},
+        protocol::Protocol,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +21,8 @@ pub struct CreateInstanceRequest {
     pub project_id: Option<String>,
     pub image: Option<String>,
     pub limits: Option<LimitsRequest>,
+    #[serde(default)]
+    pub purge_stale_resources: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,16 +104,8 @@ fn validate_database_identifier(kind: &str, value: &str) -> Result<(), ApiError>
 }
 
 pub fn validate_limits(limits: &LimitsRequest) -> Result<(), ApiError> {
-    if limits.cpu_cores <= 0.0 {
-        return Err(ApiError::BadRequest(
-            "cpu_cores must be greater than zero".to_string(),
-        ));
-    }
-    if limits.memory_mib == 0 {
-        return Err(ApiError::BadRequest(
-            "memory_mib must be greater than zero".to_string(),
-        ));
-    }
+    validate_runtime_limits(limits.cpu_cores, limits.memory_mib)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     if limits.disk_mib == 0 {
         return Err(ApiError::BadRequest(
             "disk_mib must be greater than zero".to_string(),
@@ -217,5 +215,31 @@ mod tests {
     fn accepts_database_and_username_identifiers() {
         validate_database_name("app_db-1").unwrap();
         validate_username("app_user-1").unwrap();
+    }
+
+    #[test]
+    fn rejects_non_finite_cpu_limits() {
+        for cpu_cores in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = validate_limits(&LimitsRequest {
+                cpu_cores,
+                memory_mib: 1024,
+                disk_mib: 1024,
+            })
+            .unwrap_err();
+
+            assert!(error.to_string().contains("finite"));
+        }
+    }
+
+    #[test]
+    fn rejects_memory_limit_that_would_overflow_docker_bytes() {
+        let error = validate_limits(&LimitsRequest {
+            cpu_cores: 1.0,
+            memory_mib: 1_u64 << 44,
+            disk_mib: 1024,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("memory_mib"));
     }
 }

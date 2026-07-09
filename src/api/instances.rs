@@ -19,6 +19,7 @@ use crate::{
             allocate_loopback_backend_port, backend_endpoint_for_instance,
             create_instance_from_request, launch_container_from_spec, protocol_pids_limit,
             provision_mariadb_tenant_user, provision_mongodb_tenant_user,
+            provision_postgres_tenant_role,
         },
         instance_requests::{
             CreateInstanceRequest, LimitsRequest, limits_from_request, validate_limits,
@@ -414,6 +415,7 @@ pub async fn reconcile_instance(
     uri: Uri,
 ) -> ApiResult<ReconcileResponse> {
     authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    let _operation = state.instance_locks.lock(&instance_id).await;
     let metadata = state
         .instances
         .get(&instance_id)
@@ -429,6 +431,7 @@ pub async fn reconcile_instance(
         .instance_runtime_cache
         .remove(&metadata.instance_id)
         .await;
+    state.resource_cache.remove(&metadata.instance_id).await;
     Ok(Json(ReconcileResponse {
         instance_id,
         status: metadata.status,
@@ -487,11 +490,18 @@ pub async fn update_instance_image(
 ) -> ApiResult<UpdateInstanceImageResponse> {
     authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
     let image = validate_image(&request.image)?.to_string();
+    let _operation = state.instance_locks.lock(&instance_id).await;
     let mut metadata = state
         .instances
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    if metadata.status == InstanceStatus::Quarantined {
+        return Err(ApiError::Conflict(
+            "quarantined instances cannot be updated or migrated; inspect the quarantine cause and repair or recover the instance offline"
+                .to_string(),
+        ));
+    }
     ensure_image_allowed(&state, metadata.protocol, &image)?;
     let current_image = state
         .docker
@@ -636,6 +646,11 @@ pub async fn update_instance_image(
     .map_err(|error| {
         fail_image_update_api(&state, &metadata.instance_id, error.into_api_error())
     })?;
+    if metadata.protocol == Protocol::Postgres {
+        provision_postgres_tenant_role(&state, &metadata.instance_id, &metadata.database.username)
+            .await
+            .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    }
     if metadata.protocol == Protocol::Mariadb {
         let password = requested_password.as_deref().ok_or_else(|| {
             fail_image_update_api(
@@ -1098,6 +1113,12 @@ async fn create_empty_replacement_and_import(
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error.into_api_error()))?;
 
+    if metadata.protocol == Protocol::Postgres {
+        provision_postgres_tenant_role(state, &metadata.instance_id, &metadata.database.username)
+            .await
+            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    }
+
     state.install_progress.stage(
         &metadata.instance_id,
         "import",
@@ -1372,7 +1393,12 @@ async fn cleanup_temporary_replacement(
 }
 
 async fn cleanup_temporary_side_paths(paths: &InstancePaths) {
-    for path in [&paths.logs, &paths.sockets, &paths.artifacts] {
+    for path in [
+        &paths.logs,
+        &paths.sockets,
+        &paths.artifacts,
+        &paths.runtime_config,
+    ] {
         let _ = cleanup_path_if_exists(path).await;
     }
 }
@@ -1541,7 +1567,8 @@ pub async fn delete_instance(
     uri: Uri,
 ) -> ApiResult<DeleteResponse> {
     authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
-    let metadata = state
+    let _operation = state.instance_locks.lock(&instance_id).await;
+    let mut metadata = state
         .instances
         .get(&instance_id)
         .await
@@ -1550,6 +1577,18 @@ pub async fn delete_instance(
         .get("purge")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+
+    metadata.status = deletion_status(metadata.status);
+    metadata.updated_at = now_rfc3339();
+    state
+        .manager
+        .upsert(metadata.clone())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    state
+        .instance_runtime_cache
+        .remove(&metadata.instance_id)
+        .await;
 
     match state
         .docker
@@ -1560,6 +1599,17 @@ pub async fn delete_instance(
         Err(error) if error.is_not_found() => {}
         Err(error) => return Err(docker_error(error)),
     }
+    if purge && let Err(error) = purge_instance_paths(&state, &metadata.instance_id).await {
+        tracing::error!(
+            event = "audit instance_purge_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            error = %error,
+            status = metadata.status.as_str(),
+            "instance metadata was retained so purge can be retried"
+        );
+        return Err(error);
+    }
     let deleted = state
         .manager
         .delete(&metadata.instance_id)
@@ -1569,10 +1619,7 @@ pub async fn delete_instance(
         .instance_runtime_cache
         .remove(&metadata.instance_id)
         .await;
-    if purge {
-        purge_instance_paths(&state, &metadata.instance_id).await?;
-    }
-
+    state.resource_cache.remove(&metadata.instance_id).await;
     tracing::info!(
         event = "audit instance_deleted",
         instance_id = %metadata.instance_id,
@@ -1587,6 +1634,14 @@ pub async fn delete_instance(
     }))
 }
 
+fn deletion_status(current: InstanceStatus) -> InstanceStatus {
+    if current == InstanceStatus::Quarantined {
+        InstanceStatus::Quarantined
+    } else {
+        InstanceStatus::Deleting
+    }
+}
+
 pub async fn update_instance_limits(
     State(state): State<AppState>,
     Path(instance_id): Path<String>,
@@ -1596,6 +1651,7 @@ pub async fn update_instance_limits(
 ) -> ApiResult<InstanceMetadata> {
     authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
     validate_limits(&request)?;
+    let _operation = state.instance_locks.lock(&instance_id).await;
 
     let mut metadata = state
         .instances
@@ -1712,11 +1768,29 @@ pub(crate) async fn lifecycle_instance(
     instance_id: &str,
     action: LifecycleAction,
 ) -> ApiResult<InstanceMetadata> {
+    let _operation = state.instance_locks.lock(instance_id).await;
+    lifecycle_instance_locked(state, instance_id, action).await
+}
+
+pub(crate) async fn lifecycle_instance_locked(
+    state: &AppState,
+    instance_id: &str,
+    action: LifecycleAction,
+) -> ApiResult<InstanceMetadata> {
     let metadata = state
         .instances
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+
+    if metadata.status == InstanceStatus::Quarantined
+        && matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
+    {
+        return Err(ApiError::Conflict(
+            "instance is quarantined for fail-closed safety; inspect job history and logs, then repair, recover, or delete it before attempting to start it"
+                .to_string(),
+        ));
+    }
 
     let inspection = state
         .docker
@@ -1778,6 +1852,14 @@ pub(crate) async fn lifecycle_instance(
             )
             .await
             .map_err(docker_error)?;
+        if metadata.protocol == Protocol::Postgres {
+            provision_postgres_tenant_role(
+                state,
+                &metadata.instance_id,
+                &metadata.database.username,
+            )
+            .await?;
+        }
     }
 
     let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
@@ -1801,7 +1883,13 @@ async fn purge_instance_paths(state: &AppState, instance_id: &str) -> Result<(),
         .purge_instance_data(&paths.data)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    for path in [paths.data, paths.logs, paths.sockets, paths.artifacts] {
+    for path in [
+        paths.data,
+        paths.logs,
+        paths.sockets,
+        paths.artifacts,
+        paths.runtime_config,
+    ] {
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1885,9 +1973,10 @@ async fn instance_image_update_spec(
             paths.logs.clone(),
         ),
         Protocol::Clickhouse => {
-            let hosted_config_path = databases::clickhouse::docker::write_hosted_config(&paths.logs)
-                .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            let hosted_config_path =
+                databases::clickhouse::docker::write_hosted_config(&paths.runtime_config)
+                    .await
+                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
             databases::clickhouse::docker::instance_spec(
                 &metadata.instance_id,
                 image,
@@ -1917,6 +2006,9 @@ async fn instance_image_update_spec(
 pub(crate) fn docker_error(error: DockerError) -> ApiError {
     match error {
         DockerError::InvalidId(error) => ApiError::BadRequest(error.to_string()),
+        error @ DockerError::UntrustedContainerNameCollision { .. } => {
+            ApiError::Conflict(error.to_string())
+        }
         DockerError::Api(BollardError::DockerResponseServerError {
             status_code: 404, ..
         }) => ApiError::NotFound,
@@ -1932,6 +2024,22 @@ pub(crate) fn docker_error(error: DockerError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_preserves_quarantine_to_avoid_claiming_a_duplicate_route() {
+        assert_eq!(
+            deletion_status(InstanceStatus::Quarantined),
+            InstanceStatus::Quarantined
+        );
+        assert_eq!(
+            deletion_status(InstanceStatus::Running),
+            InstanceStatus::Deleting
+        );
+        assert_eq!(
+            deletion_status(InstanceStatus::Deleting),
+            InstanceStatus::Deleting
+        );
+    }
 
     #[test]
     fn parses_major_version_from_common_image_tags() {

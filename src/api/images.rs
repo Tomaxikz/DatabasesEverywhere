@@ -192,6 +192,7 @@ mod tests {
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
             docker: DockerRuntime::new(&Default::default(), false).unwrap(),
             import_export_jobs: ImportExportJobs::default(),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),

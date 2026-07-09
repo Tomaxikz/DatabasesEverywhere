@@ -31,6 +31,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("rate limit exceeded")]
     RateLimited,
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
     #[error("runtime error: {0}")]
@@ -49,6 +51,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -93,7 +96,7 @@ pub fn authorize_websocket_jwt(
     uri: &Uri,
     required_scope: &str,
     instance_id: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<jwt::Claims, ApiError> {
     reject_query_token(uri)?;
     authorize_allowed_host(state, headers, uri)?;
     let token = websocket_token(headers).ok_or(ApiError::Unauthorized)?;
@@ -103,7 +106,6 @@ pub fn authorize_websocket_jwt(
         required_scope,
         instance_id,
     )
-    .map(|_| ())
     .map_err(|error| ApiError::InvalidWebSocketJwt(error.to_string()))
 }
 
@@ -125,7 +127,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-fn websocket_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn websocket_token(headers: &HeaderMap) -> Option<&str> {
     bearer_token(headers).or_else(|| websocket_protocol_token(headers))
 }
 
@@ -236,6 +238,7 @@ mod tests {
             "test-subject",
             vec![crate::auth::scopes::MONITOR_READ.to_string()],
             Vec::new(),
+            true,
             60,
         )
         .unwrap();
@@ -270,6 +273,7 @@ mod tests {
                 uuid: "node-uuid".to_string(),
                 token_id: "token-id".to_string(),
                 token: "secret".to_string(),
+                jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
                 remote: "https://panel.example.com".to_string(),
                 api: crate::config::ApiConfig {
                     host: "127.0.0.1".to_string(),
@@ -282,6 +286,7 @@ mod tests {
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
             docker: DockerRuntime::new(&Default::default(), false).unwrap(),
             import_export_jobs: ImportExportJobs::default(),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),

@@ -24,7 +24,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | --- | --- |
 | Docker | Works |
 | Podman | In progress |
-| systemd services | Someday |
+| systemd services | Works |
 
 ## Supported Databases
 
@@ -51,10 +51,15 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Install
 
-Download the latest release for your architecture and install it to `/usr/local/bin`:
+Official release artifacts currently target x86-64 Linux only. Choose a
+versioned release, verify its published SHA-256, and install it to
+`/usr/local/bin`:
 
 ```bash
-sudo curl -L "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-$(uname -m)-linux" -o /usr/local/bin/dbev
+DBEV_VERSION=v0.1.0 # replace with the reviewed release
+test "$(uname -m)" = x86_64
+sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
+sha256sum /usr/local/bin/dbev # compare with the release checksum
 sudo chmod +x /usr/local/bin/dbev
 ```
 
@@ -88,6 +93,13 @@ Runtime data lives in:
 On daemon boot these runtime directories and their subdirectories are created
 automatically if missing. Compose installs still need
 `/etc/databases-everywhere/config.yml` in place before startup.
+
+The configuration requires two distinct secrets of at least 32 random bytes:
+`token` for API authentication and `jwt_signing_key` for WebSocket and download
+JWTs. The production API listener must remain on loopback behind a hardened
+local reverse proxy; non-loopback database cleartext listeners are rejected
+unless the explicitly development-only `security.allow_insecure_public_listeners`
+override is set.
 
 ## Docs
 

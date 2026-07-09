@@ -2,6 +2,7 @@ mod btrfs;
 mod fuse_quota;
 mod linux_project;
 mod mounts;
+mod project_id;
 mod xfs;
 mod zfs;
 
@@ -62,7 +63,12 @@ impl DiskLimiter {
         match self.config.mode {
             DiskLimitMode::Advisory | DiskLimitMode::DockerStorageOpt => Ok(()),
             DiskLimitMode::FuseQuota => {
-                fuse_quota::verify_startup(self.config.fuse_quota_binary()).await
+                fuse_quota::verify_startup(
+                    self.config.fuse_quota_binary(),
+                    &self.config.fuse_quota_binary_sha256,
+                    self.fuse_root.as_deref(),
+                )
+                .await
             }
             DiskLimitMode::ProjectQuota => {
                 let mount = mounts::find_mount(data_root)?;
@@ -112,6 +118,7 @@ impl DiskLimiter {
                     self.fuse_root.as_deref(),
                     disk_mib,
                     self.config.fuse_quota_binary(),
+                    &self.config.fuse_quota_binary_sha256,
                     self.config.fuse_quota_rescan_interval_seconds,
                 )
                 .await?;
@@ -150,6 +157,7 @@ impl DiskLimiter {
                 self.fuse_root.as_deref(),
                 disk_mib,
                 self.config.fuse_quota_binary(),
+                &self.config.fuse_quota_binary_sha256,
                 self.config.fuse_quota_rescan_interval_seconds,
             )
             .await
@@ -290,6 +298,14 @@ pub enum DiskLimitError {
         #[source]
         source: std::io::Error,
     },
+    #[error("disk limiter project id registry {path} failed: {source}")]
+    ProjectIdRegistry {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("disk limiter could not allocate a unique project id at or above {base}")]
+    ProjectIdExhausted { base: u32 },
     #[error("disk limiter path {path} failed: {source}")]
     PathIo {
         path: String,

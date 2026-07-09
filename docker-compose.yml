@@ -1,6 +1,8 @@
 services:
   dbev:
-    image: ghcr.io/tomaxikz/databaseseverywhere:latest
+    # Set DBEV_IMAGE to a versioned tag or, preferably, an immutable digest.
+    # Compose intentionally refuses to start with an implicit `latest` image.
+    image: ${DBEV_IMAGE:?Set DBEV_IMAGE to an immutable DatabasesEverywhere tag or digest}
     container_name: dbev
     restart: unless-stopped
 
@@ -8,18 +10,40 @@ services:
     # containers created through the host Docker socket.
     network_mode: host
 
-    # Required for Docker API access and FuseQuota disk-limit mounts.
-    privileged: true
+    # FuseQuota needs /dev/fuse and SYS_ADMIN, but not blanket privileged mode.
+    # For project-quota/advisory deployments, remove the device, SYS_ADMIN, and
+    # apparmor override as well.
     devices:
       - /dev/fuse:/dev/fuse
+    cap_drop:
+      - ALL
     cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
+      - no-new-privileges:true
+    read_only: true
+    init: true
+    pids_limit: 1024
+    # Import/export operations have bounded 15-minute deadlines plus recovery.
+    stop_grace_period: 21m
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
 
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /etc/databases-everywhere:/etc/databases-everywhere
+      # Docker socket access is root-equivalent. Run this stack only on a
+      # dedicated host/VM and prefer a narrowly filtered socket proxy.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      # Writable because the authenticated config-admin endpoint persists
+      # validated non-secret configuration updates here.
+      - /etc/databases-everywhere:/etc/databases-everywhere:rw
+      # The host file must already contain an uncommented `user_allow_other`.
+      - /etc/fuse.conf:/etc/fuse.conf:ro
       - type: bind
         source: /var/lib/dbev
         target: /var/lib/dbev

@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{ApiSslConfig, ClickhouseConfig, Config, DiskLimitMode, ListenerConfig, TlsConfig};
-use crate::shared::images::is_pinned_image_reference;
+use crate::shared::images::has_sha256_digest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
@@ -14,12 +14,32 @@ pub enum ConfigValidationError {
     EmptyTokenId,
     #[error("token must not be empty")]
     EmptyApiToken,
+    #[error("token must contain at least 32 bytes of secret material")]
+    WeakApiToken,
+    #[error("token must be replaced with a randomly generated production secret")]
+    PlaceholderApiToken,
+    #[error("jwt_signing_key must not be empty")]
+    EmptyJwtSigningKey,
+    #[error("jwt_signing_key must contain at least 32 bytes of secret material")]
+    WeakJwtSigningKey,
+    #[error("jwt_signing_key must be replaced with a randomly generated production secret")]
+    PlaceholderJwtSigningKey,
+    #[error("jwt_signing_key must be different from token")]
+    ReusedJwtSigningKey,
     #[error("remote must be a full URL such as https://panel.example.com")]
     InvalidRemoteUrl,
     #[error("api.host must be a host or IP address, not a URL/path: {value}")]
     InvalidApiHost { value: String },
     #[error("{field} bind address is invalid: {value}")]
     InvalidBind { field: &'static str, value: String },
+    #[error(
+        "{field} is exposed without TLS at {value}; enable TLS, bind to loopback, or set security.allow_insecure_public_listeners=true only for isolated development"
+    )]
+    InsecurePublicListener { field: &'static str, value: String },
+    #[error(
+        "api.host must be a literal loopback IP address in production; publish the API through a hardened local reverse proxy with connection, header, and idle timeouts (configured bind: {value})"
+    )]
+    DirectPublicApiUnsupported { value: String },
     #[error("daemon.network must not be empty")]
     EmptyDaemonNetwork,
     #[error("{field} must be a CIDR subnet: {value}")]
@@ -46,15 +66,23 @@ pub enum ConfigValidationError {
     MissingClientCaFile { path: String },
     #[error("security.{field} must be greater than zero")]
     InvalidSecurityLimit { field: &'static str },
+    #[error(
+        "security.self_upgrade_enabled is unsupported; deploy upgrades through a signed package or immutable container image"
+    )]
+    UnsupportedSelfUpgrade,
     #[error("disk.project_id_base must be greater than zero when disk.mode=project_quota")]
     InvalidProjectIdBase,
+    #[error(
+        "disk.fuse_quota_binary_sha256 must be the lowercase 64-character SHA-256 of the configured external helper"
+    )]
+    InvalidFuseQuotaBinarySha256,
     #[error("artifacts.retention_keep_latest must be greater than zero")]
     InvalidArtifactRetention,
     #[error("backups.interval_minutes must be greater than zero")]
     InvalidBackupInterval,
     #[error("backups.retention_keep_latest_per_instance must be greater than zero")]
     InvalidBackupRetentionKeepLatest,
-    #[error("{field} must use a non-latest tag or sha256 digest: {image}")]
+    #[error("{field} must use an immutable sha256 digest: {image}")]
     InvalidImageReference { field: &'static str, image: String },
     #[error(
         "images.mongodb={image} is not compatible with Linux kernel {kernel}; MongoDB 8.0+ is affected by SERVER-121912 on kernel 6.19+"
@@ -69,9 +97,8 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     if config.token_id.trim().is_empty() {
         return Err(ConfigValidationError::EmptyTokenId);
     }
-    if config.token.trim().is_empty() {
-        return Err(ConfigValidationError::EmptyApiToken);
-    }
+    validate_api_token(&config.token)?;
+    validate_jwt_signing_key(&config.jwt_signing_key, &config.token)?;
 
     validate_api_host(&config.api.host)?;
     validate_api_hosts(config)?;
@@ -82,6 +109,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
     validate_api_tls(&config.api.ssl)?;
+    validate_cleartext_exposure(config)?;
     validate_security(&config.security)?;
     validate_disk(&config.disk)?;
     if config.artifacts.retention_keep_latest == 0 {
@@ -118,6 +146,101 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
 
     Ok(())
+}
+
+fn validate_api_token(token: &str) -> Result<(), ConfigValidationError> {
+    if token.trim().is_empty() {
+        return Err(ConfigValidationError::EmptyApiToken);
+    }
+    if token.trim().len() < 32 {
+        return Err(ConfigValidationError::WeakApiToken);
+    }
+    if looks_like_placeholder(token) {
+        return Err(ConfigValidationError::PlaceholderApiToken);
+    }
+    Ok(())
+}
+
+fn validate_jwt_signing_key(key: &str, api_token: &str) -> Result<(), ConfigValidationError> {
+    if key.trim().is_empty() {
+        return Err(ConfigValidationError::EmptyJwtSigningKey);
+    }
+    if key.trim().len() < 32 {
+        return Err(ConfigValidationError::WeakJwtSigningKey);
+    }
+    if looks_like_placeholder(key) {
+        return Err(ConfigValidationError::PlaceholderJwtSigningKey);
+    }
+    if key.as_bytes() == api_token.as_bytes() {
+        return Err(ConfigValidationError::ReusedJwtSigningKey);
+    }
+    Ok(())
+}
+
+fn looks_like_placeholder(secret: &str) -> bool {
+    let normalized = secret.trim().to_ascii_lowercase();
+    normalized.contains("change-me")
+        || normalized.contains("changeme")
+        || normalized.contains("replace_with")
+        || normalized.contains("replace-with")
+        || normalized.contains("generated-by-panel")
+        || normalized
+            .as_bytes()
+            .first()
+            .is_some_and(|first| normalized.bytes().all(|byte| byte == *first))
+}
+
+fn validate_cleartext_exposure(config: &Config) -> Result<(), ConfigValidationError> {
+    if config.security.allow_insecure_public_listeners {
+        return Ok(());
+    }
+
+    validate_api_exposure(config)?;
+    for (field, listener) in [
+        ("postgres", &config.postgres),
+        ("mariadb", &config.mariadb),
+        ("redis", &config.redis),
+        ("mongodb", &config.mongodb),
+        ("qdrant", &config.qdrant),
+    ] {
+        if listener.enabled && !listener.tls {
+            reject_non_loopback_bind(field, &listener.bind)?;
+        }
+    }
+    if config.clickhouse.enabled && !config.clickhouse.tls {
+        reject_non_loopback_bind("clickhouse", &config.clickhouse.bind)?;
+        reject_non_loopback_bind("clickhouse.http_bind", &config.clickhouse.http_bind)?;
+    }
+    Ok(())
+}
+
+fn validate_api_exposure(config: &Config) -> Result<(), ConfigValidationError> {
+    let host = config.api.host.trim();
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+    {
+        return Ok(());
+    }
+    Err(ConfigValidationError::DirectPublicApiUnsupported {
+        value: config.api.bind_addr(),
+    })
+}
+
+fn reject_non_loopback_bind(field: &'static str, bind: &str) -> Result<(), ConfigValidationError> {
+    let address = bind
+        .parse::<SocketAddr>()
+        .map_err(|_| ConfigValidationError::InvalidBind {
+            field,
+            value: bind.to_string(),
+        })?;
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(ConfigValidationError::InsecurePublicListener {
+        field,
+        value: bind.to_string(),
+    })
 }
 
 fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigValidationError> {
@@ -160,7 +283,7 @@ fn validate_image_reference(field: &'static str, image: &str) -> Result<(), Conf
             image: image.to_string(),
         });
     }
-    if is_pinned_image_reference(image) {
+    if has_sha256_digest(image) {
         return Ok(());
     }
     Err(ConfigValidationError::InvalidImageReference {
@@ -206,6 +329,7 @@ fn kernel_is_6_19_or_newer(release: &str) -> bool {
 }
 
 fn mongodb_image_is_8_or_newer(image: &str) -> bool {
+    let image = image.split_once('@').map_or(image, |(name, _)| name);
     let tag = image
         .rsplit_once(':')
         .filter(|(name, _)| !name.contains('/'))
@@ -230,6 +354,18 @@ fn mongodb_image_is_8_or_newer(image: &str) -> bool {
 fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidationError> {
     if disk.mode == DiskLimitMode::ProjectQuota && disk.project_id_base == 0 {
         return Err(ConfigValidationError::InvalidProjectIdBase);
+    }
+    let binary = disk.fuse_quota_binary();
+    if !binary.eq_ignore_ascii_case("embedded") {
+        validate_absolute_path("disk.fuse_quota_binary", binary)?;
+        let digest = disk.fuse_quota_binary_sha256.trim();
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ConfigValidationError::InvalidFuseQuotaBinarySha256);
+        }
     }
     Ok(())
 }
@@ -305,6 +441,9 @@ fn validate_api_tls(ssl: &ApiSslConfig) -> Result<(), ConfigValidationError> {
 fn validate_security(
     security: &crate::config::SecurityConfig,
 ) -> Result<(), ConfigValidationError> {
+    if security.self_upgrade_enabled {
+        return Err(ConfigValidationError::UnsupportedSelfUpgrade);
+    }
     if security.api_body_limit_bytes == 0 {
         return Err(ConfigValidationError::InvalidSecurityLimit {
             field: "api_body_limit_bytes",
@@ -390,6 +529,9 @@ fn validate_api_hosts(config: &Config) -> Result<(), ConfigValidationError> {
 
 fn validate_api_host(host: &str) -> Result<(), ConfigValidationError> {
     let host = host.trim();
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
     if host.is_empty()
         || host.contains("://")
         || host.contains('/')
@@ -503,6 +645,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_api_self_upgrade() {
+        let mut config = valid_config();
+        config.security.self_upgrade_enabled = true;
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::UnsupportedSelfUpgrade
+        ));
+    }
+
+    #[test]
     fn rejects_missing_token() {
         let mut config = valid_config();
         config.token = String::new();
@@ -510,6 +663,125 @@ mod tests {
         let error = validate_config(&config).unwrap_err();
 
         assert!(matches!(error, ConfigValidationError::EmptyApiToken));
+    }
+
+    #[test]
+    fn rejects_weak_or_placeholder_secrets() {
+        let mut config = valid_config();
+        config.token = "short-token".to_string();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::WeakApiToken
+        ));
+
+        let mut config = valid_config();
+        config.token = "REPLACE_WITH_32_BYTE_RANDOM_API_TOKEN".to_string();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::PlaceholderApiToken
+        ));
+
+        let mut config = valid_config();
+        config.jwt_signing_key = "REPLACE_WITH_32_BYTE_RANDOM_JWT_SIGNING_KEY".to_string();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::PlaceholderJwtSigningKey
+        ));
+    }
+
+    #[test]
+    fn rejects_reusing_api_token_as_jwt_signing_key() {
+        let mut config = valid_config();
+        config.jwt_signing_key = config.token.clone();
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::ReusedJwtSigningKey
+        ));
+    }
+
+    #[test]
+    fn rejects_exposed_cleartext_listeners_without_development_override() {
+        let mut config = valid_config();
+        config.postgres.bind = "0.0.0.0:5432".to_string();
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InsecurePublicListener {
+                field: "postgres",
+                ..
+            }
+        ));
+
+        config.security.allow_insecure_public_listeners = true;
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_direct_public_api_without_development_override() {
+        let mut config = valid_config();
+        config.api.host = "0.0.0.0".to_string();
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::DirectPublicApiUnsupported { .. }
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("private-key.pem");
+        std::fs::write(&certificate, b"test certificate").unwrap();
+        std::fs::write(&private_key, b"test key").unwrap();
+        config.api.ssl.enabled = true;
+        config.api.ssl.cert = certificate.display().to_string();
+        config.api.ssl.key = private_key.display().to_string();
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::DirectPublicApiUnsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_hostname_api_bind_even_when_named_localhost() {
+        for host in ["localhost", "dbe.internal"] {
+            let mut config = valid_config();
+            config.api.host = host.to_string();
+
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::DirectPublicApiUnsupported { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_literal_ipv4_and_ipv6_loopback_api_binds() {
+        for host in ["127.0.0.1", "::1"] {
+            let mut config = valid_config();
+            config.api.host = host.to_string();
+
+            validate_config(&config).unwrap();
+        }
+    }
+
+    #[test]
+    fn accepts_exposed_listeners_when_tls_is_configured() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("private-key.pem");
+        std::fs::write(&certificate, b"test certificate").unwrap();
+        std::fs::write(&private_key, b"test key").unwrap();
+
+        let mut config = valid_config();
+        config.api.ssl.enabled = true;
+        config.api.ssl.cert = certificate.display().to_string();
+        config.api.ssl.key = private_key.display().to_string();
+        config.postgres.bind = "0.0.0.0:5432".to_string();
+        config.postgres.tls = true;
+        config.tls.cert = certificate.display().to_string();
+        config.tls.key = private_key.display().to_string();
+
+        validate_config(&config).unwrap();
     }
 
     #[test]
@@ -570,6 +842,9 @@ mod tests {
     fn identifies_mongodb_8_or_latest_images() {
         assert!(!mongodb_image_is_8_or_newer("mongo:7.0.37"));
         assert!(mongodb_image_is_8_or_newer("mongo:8.3.4"));
+        assert!(mongodb_image_is_8_or_newer(
+            "mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58"
+        ));
         assert!(mongodb_image_is_8_or_newer("mongo:latest"));
         assert!(mongodb_image_is_8_or_newer("docker.io/library/mongo:8"));
     }
@@ -577,7 +852,7 @@ mod tests {
     #[test]
     fn rejects_unpinned_or_latest_runtime_images() {
         let mut config = valid_config();
-        config.images.clickhouse = "clickhouse/clickhouse-server:latest".to_string();
+        config.images.clickhouse = "clickhouse/clickhouse-server:26.4.4.38".to_string();
 
         let error = validate_config(&config).unwrap_err();
 
@@ -631,10 +906,36 @@ mod tests {
     }
 
     #[test]
+    fn external_fuse_helper_requires_absolute_path_and_sha256() {
+        let mut config = valid_config();
+        config.disk.fuse_quota_binary = "bin/fusequota".to_string();
+        config.disk.fuse_quota_binary_sha256 = "a".repeat(64);
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::RelativePath {
+                field: "disk.fuse_quota_binary",
+                ..
+            }
+        ));
+
+        config.disk.fuse_quota_binary = "/usr/local/libexec/fusequota".to_string();
+        config.disk.fuse_quota_binary_sha256 = "A".repeat(64);
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InvalidFuseQuotaBinarySha256
+        ));
+
+        config.disk.fuse_quota_binary_sha256 = "a".repeat(64);
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
     fn accepts_remote_for_cors() {
         let mut config = valid_config();
         config.remote = "https://panel.example.com".to_string();
         config.api.host = "0.0.0.0".to_string();
+        config.security.allow_insecure_public_listeners = true;
 
         validate_config(&config).unwrap();
 
@@ -669,7 +970,8 @@ mod tests {
         Config {
             uuid: "node-uuid".to_string(),
             token_id: "token-id".to_string(),
-            token: "token".to_string(),
+            token: "test-api-token-0123456789abcdef-01".to_string(),
+            jwt_signing_key: "test-jwt-signing-key-0123456789abcdef-02".to_string(),
             remote: "https://panel.example.com".to_string(),
             ..Default::default()
         }

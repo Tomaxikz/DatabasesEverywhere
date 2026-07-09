@@ -1,6 +1,6 @@
 use std::{fs::File, io::BufReader, sync::Arc};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,13 +21,13 @@ pub enum GatewayTlsError {
     ReadCert {
         path: String,
         #[source]
-        source: std::io::Error,
+        source: rustls_pki_types::pem::Error,
     },
     #[error("failed to read TLS key {path}: {source}")]
     ReadKey {
         path: String,
         #[source]
-        source: std::io::Error,
+        source: rustls_pki_types::pem::Error,
     },
     #[error("TLS cert file {path} did not contain any certificates")]
     EmptyCert { path: String },
@@ -52,8 +52,8 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, GatewayTlsErro
         path: path.to_string(),
         source,
     })?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let reader = BufReader::new(file);
+    let certs = CertificateDer::pem_reader_iter(reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| GatewayTlsError::ReadCert {
             path: path.to_string(),
@@ -72,13 +72,14 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, GatewayTlsError> {
         path: path.to_string(),
         source,
     })?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|source| GatewayTlsError::ReadKey {
+    let reader = BufReader::new(file);
+    PrivateKeyDer::from_pem_reader(reader).map_err(|source| match source {
+        rustls_pki_types::pem::Error::NoItemsFound => GatewayTlsError::EmptyKey {
+            path: path.to_string(),
+        },
+        source => GatewayTlsError::ReadKey {
             path: path.to_string(),
             source,
-        })?
-        .ok_or_else(|| GatewayTlsError::EmptyKey {
-            path: path.to_string(),
-        })
+        },
+    })
 }

@@ -33,7 +33,8 @@ pub async fn failed_jobs(
     let jobs = state
         .import_export_jobs
         .list(None, Some(ImportExportStatus::Failed), 100)
-        .await;
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let mut response = Vec::with_capacity(jobs.len());
     for job in jobs {
         response.push(crate::api::import_export::public_job_response(job).await);
@@ -52,6 +53,7 @@ pub async fn retry_job(
         .import_export_jobs
         .get(&job_id)
         .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
     if job.status != ImportExportStatus::Failed {
         return Err(ApiError::BadRequest(

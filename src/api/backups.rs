@@ -162,6 +162,7 @@ pub async fn restore_backup(
             "instance_id must not be empty".to_string(),
         ));
     }
+    let _operation = state.instance_locks.lock(instance_id).await;
     let metadata = state
         .instances
         .get(instance_id)
@@ -170,7 +171,7 @@ pub async fn restore_backup(
     let path = verified_backup_path_for_instance(&state, &name, instance_id).await?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = crate::api::instances::lifecycle_instance(
+        let _ = crate::api::instances::lifecycle_instance_locked(
             &state,
             instance_id,
             crate::api::instances::LifecycleAction::Stop,
@@ -179,22 +180,16 @@ pub async fn restore_backup(
     }
     let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let result = crate::api::import_export::replace_data_from_archive(paths.clone(), &path).await;
+    let mut result =
+        crate::api::import_export::replace_data_from_archive(paths.clone(), &path).await;
     if result.is_ok() && !state.docker.uses_rootless_podman() {
-        paths
+        result = paths
             .apply_container_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(|error| ApiError::Runtime(error.to_string()));
     }
-    if was_running {
-        let _ = crate::api::instances::lifecycle_instance(
-            &state,
-            instance_id,
-            crate::api::instances::LifecycleAction::Start,
-        )
+    crate::api::import_export::finish_physical_operation(&state, instance_id, was_running, result)
         .await?;
-    }
-    result?;
     let now = crate::jobs::import_export::now_rfc3339();
     Ok(Json(ImportExportJobResponse {
         job: crate::jobs::import_export::ImportExportJob {
@@ -260,6 +255,7 @@ pub(crate) async fn queue_backup_instance(
     state: &AppState,
     instance_id: &str,
 ) -> Result<ImportExportJobResponse, ApiError> {
+    let _operation = state.instance_locks.lock(instance_id).await;
     let metadata = state
         .instances
         .get(instance_id)
@@ -269,7 +265,7 @@ pub(crate) async fn queue_backup_instance(
     let artifact_path = backup_artifact_path(state, &metadata.instance_id).await?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = crate::api::instances::lifecycle_instance(
+        let _ = crate::api::instances::lifecycle_instance_locked(
             state,
             instance_id,
             crate::api::instances::LifecycleAction::Stop,
@@ -281,15 +277,8 @@ pub(crate) async fn queue_backup_instance(
     let result = create_data_archive(paths.data, artifact_path.clone())
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()));
-    if was_running {
-        let _ = crate::api::instances::lifecycle_instance(
-            state,
-            instance_id,
-            crate::api::instances::LifecycleAction::Start,
-        )
+    crate::api::import_export::finish_physical_operation(state, instance_id, was_running, result)
         .await?;
-    }
-    result?;
     prune_instance_backups(state, &metadata.instance_id).await?;
     let job = crate::jobs::import_export::ImportExportJob {
         job_id: uuid::Uuid::new_v4().to_string(),
@@ -416,10 +405,10 @@ async fn backup_path_by_name(state: &AppState, name: &str) -> Result<PathBuf, Ap
 }
 
 async fn backup_artifact_path(state: &AppState, instance_id: &str) -> Result<PathBuf, ApiError> {
-    let dir = backup_root(state).join(instance_id);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create backup dir: {error}")))?;
+    let root = backup_root(state);
+    create_private_directory(&root, "backup root").await?;
+    let dir = root.join(instance_id);
+    create_private_directory(&dir, "backup instance directory").await?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     Ok(dir.join(format!(
         "{}-{}-{}.physical.tar.gz",
@@ -545,9 +534,7 @@ async fn delete_pruned_backup(backup: &BackupFile) -> Result<(), ApiError> {
 
 async fn verify_backup_path(state: &AppState, path: &FsPath) -> Result<PathBuf, ApiError> {
     let root = backup_root(state);
-    tokio::fs::create_dir_all(&root)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create backup root: {error}")))?;
+    create_private_directory(&root, "backup root").await?;
     let root = tokio::fs::canonicalize(&root)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to resolve backup root: {error}")))?;
@@ -591,9 +578,14 @@ async fn read_backup_dir(root: &FsPath, backups: &mut Vec<ArtifactInfo>) -> Resu
             .await
             .map_err(|error| ApiError::Runtime(format!("failed to read backup entry: {error}")))?
         {
-            let metadata = entry.metadata().await.map_err(|error| {
-                ApiError::Runtime(format!("failed to stat backup entry: {error}"))
-            })?;
+            let metadata = tokio::fs::symlink_metadata(entry.path())
+                .await
+                .map_err(|error| {
+                    ApiError::Runtime(format!("failed to stat backup entry: {error}"))
+                })?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
             if metadata.is_dir() {
                 stack.push(entry.path());
                 continue;
@@ -629,5 +621,53 @@ fn validate_backup_name(name: &str) -> Result<(), ApiError> {
         Err(ApiError::BadRequest("invalid backup name".to_string()))
     } else {
         Ok(())
+    }
+}
+
+async fn create_private_directory(path: &FsPath, label: &str) -> Result<(), ApiError> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to create {label}: {error}")))?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to inspect {label}: {error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ApiError::Runtime(format!(
+            "{label} must be a real directory"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| {
+                ApiError::Runtime(format!("failed to secure {label} permissions: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_backup_directory_overrides_process_umask_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("backups");
+
+        create_private_directory(&path, "test backups")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

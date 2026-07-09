@@ -1,0 +1,5 @@
+[advisories]
+# Cargo.lock records the optional `rsa` dependency through SQLx/MySQL and
+# jsonwebtoken's algorithm feature matrix, but the built dependency graph uses
+# SQLite only and the AWS-LC JWT provider. `cargo tree -i rsa` is empty.
+ignore = ["RUSTSEC-2023-0071"]

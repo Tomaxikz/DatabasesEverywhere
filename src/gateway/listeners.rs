@@ -2,15 +2,22 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    time::{Duration, timeout},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
-use super::{resolver::RouteResolver, security::GatewayConnectionLimiter, tunnel};
+use super::{
+    resolver::RouteResolver,
+    security::{GatewayConnectionLimiter, GatewayConnectionRejection},
+    tunnel,
+};
 use crate::{
     constants::ports,
     protocols::{clickhouse, mariadb, mongodb, postgres, qdrant, redis},
@@ -45,6 +52,13 @@ pub enum ListenerError {
     InvalidQdrantBackend,
     #[error("tunnel failed: {0}")]
     Tunnel(#[from] tunnel::TunnelError),
+    #[error("{protocol} client handshake timed out after {timeout_secs}s")]
+    HandshakeTimeout {
+        protocol: &'static str,
+        timeout_secs: u64,
+    },
+    #[error("{protocol} client exceeded the handshake message limit")]
+    HandshakeMessageLimit { protocol: &'static str },
 }
 
 enum GatewayStream {
@@ -93,6 +107,9 @@ impl AsyncWrite for GatewayStream {
 }
 
 const TUNNEL_BUFFER_SIZE: usize = 64 * 1024;
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_ACTIVE_CONNECTIONS_PER_LISTENER: usize = 1024;
+const MAX_MONGODB_HELLO_MESSAGES: usize = 8;
 
 pub async fn run_postgres_listener(
     bind: &str,
@@ -214,24 +231,51 @@ where
         bind,
         tls = tls.is_some(),
         protocol,
+        max_active_connections = MAX_ACTIVE_CONNECTIONS_PER_LISTENER,
         "database listener started"
     );
+    let active_connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS_PER_LISTENER));
 
     loop {
         let (client, peer) = listener.accept().await?;
         client.set_nodelay(true)?;
-        if !limiter.allow(peer.ip()).await {
-            tracing::warn!(%peer, protocol, "audit database_connection_rate_limited");
+        let Ok(global_permit) = Arc::clone(&active_connections).try_acquire_owned() else {
+            tracing::warn!(%peer, protocol, "audit database_connection_global_limit_reached");
             continue;
-        }
+        };
+        let ip_permit = match limiter.try_acquire(peer.ip()) {
+            Ok(permit) => permit,
+            Err(reason) => {
+                let reason = match reason {
+                    GatewayConnectionRejection::RateLimited => "rate",
+                    GatewayConnectionRejection::TooManyActive => "active",
+                    GatewayConnectionRejection::KeyCapacityReached => "key_capacity",
+                };
+                tracing::warn!(%peer, protocol, reason, "audit database_connection_limited");
+                continue;
+            }
+        };
         let resolver = resolver.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
+            let _permits = (global_permit, ip_permit);
             if let Err(error) = handler(client, resolver, tls).await {
                 log_connection_failure(protocol, peer, &error);
             }
         });
     }
+}
+
+async fn client_handshake<T>(
+    protocol: &'static str,
+    future: impl Future<Output = Result<T, ListenerError>>,
+) -> Result<T, ListenerError> {
+    timeout(CLIENT_HANDSHAKE_TIMEOUT, future)
+        .await
+        .map_err(|_| ListenerError::HandshakeTimeout {
+            protocol,
+            timeout_secs: CLIENT_HANDSHAKE_TIMEOUT.as_secs(),
+        })?
 }
 
 fn log_connection_failure(
@@ -248,7 +292,9 @@ fn log_connection_failure(
 
 fn expected_client_failure(error: &ListenerError) -> bool {
     match error {
-        ListenerError::RouteNotFound => true,
+        ListenerError::RouteNotFound
+        | ListenerError::HandshakeTimeout { .. }
+        | ListenerError::HandshakeMessageLimit { .. } => true,
         ListenerError::Io(error) => matches!(
             error.kind(),
             ErrorKind::UnexpectedEof
@@ -276,78 +322,62 @@ async fn handle_postgres_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let mut len_bytes = [0_u8; 4];
-    client.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if !(8..=1024 * 1024).contains(&len) {
-        return Err(postgres::PostgresParseError::InvalidLength.into());
-    }
+    let (client, endpoint, packet) = client_handshake("postgres", async move {
+        let packet = read_postgres_startup_packet(&mut client).await?;
 
-    let mut packet = Vec::with_capacity(len);
-    packet.extend_from_slice(&len_bytes);
-    packet.resize(len, 0);
-    client.read_exact(&mut packet[4..]).await?;
+        let (client, packet) = if postgres::is_ssl_request(&packet) {
+            if let Some(tls) = tls {
+                client.write_all(b"S").await?;
+                let mut client = GatewayStream::Tls(Box::new(tls.accept(client).await?));
+                let packet = read_postgres_startup_packet(&mut client).await?;
+                (client, packet)
+            } else {
+                client.write_all(b"N").await?;
+                let mut client = GatewayStream::Plain(client);
+                let packet = read_postgres_startup_packet(&mut client).await?;
+                (client, packet)
+            }
+        } else if tls.is_some() {
+            return Err(postgres::PostgresParseError::InvalidLength.into());
+        } else {
+            (GatewayStream::Plain(client), packet)
+        };
 
-    if postgres::is_ssl_request(&packet) {
-        if let Some(tls) = tls {
-            client.write_all(b"S").await?;
-            let mut client = GatewayStream::Tls(Box::new(tls.accept(client).await?));
-            return handle_postgres_startup(&mut client, resolver).await;
-        }
-        client.write_all(b"N").await?;
-        return handle_postgres_startup(&mut client, resolver).await;
-    }
-
-    if tls.is_some() {
-        return Err(postgres::PostgresParseError::InvalidLength.into());
-    }
-
-    handle_postgres_route(client, resolver, packet).await
-}
-
-async fn handle_postgres_startup<S>(
-    client: &mut S,
-    resolver: RouteResolver,
-) -> Result<(), ListenerError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut len_bytes = [0_u8; 4];
-    client.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if !(8..=1024 * 1024).contains(&len) {
-        return Err(postgres::PostgresParseError::InvalidLength.into());
-    }
-
-    let mut packet = Vec::with_capacity(len);
-    packet.extend_from_slice(&len_bytes);
-    packet.resize(len, 0);
-    client.read_exact(&mut packet[4..]).await?;
-    handle_postgres_route(client, resolver, packet).await
-}
-
-async fn handle_postgres_route<S>(
-    client: S,
-    resolver: RouteResolver,
-    packet: Vec<u8>,
-) -> Result<(), ListenerError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let route = postgres::parse_startup_route(&packet)?;
-    let endpoint = resolver
-        .resolve_postgres(&route.user, &route.database)
-        .await
-        .ok_or(ListenerError::RouteNotFound)?;
-    tracing::debug!(
-        user = %route.user,
-        database = %route.database,
-        endpoint = ?endpoint,
-        "postgres route resolved"
-    );
+        let route = postgres::parse_startup_route(&packet)?;
+        let endpoint = resolver
+            .resolve_postgres(&route.user, &route.database)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        tracing::debug!(
+            user = %route.user,
+            database = %route.database,
+            endpoint = ?endpoint,
+            "postgres route resolved"
+        );
+        Ok((client, endpoint, packet))
+    })
+    .await?;
 
     tunnel::connect_replay_and_tunnel(client, endpoint, &packet).await?;
     Ok(())
+}
+
+async fn read_postgres_startup_packet<S>(client: &mut S) -> Result<Vec<u8>, ListenerError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut len_bytes = [0_u8; 4];
+    client.read_exact(&mut len_bytes).await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if !(8..=1024 * 1024).contains(&len) {
+        return Err(postgres::PostgresParseError::InvalidLength.into());
+    }
+
+    let mut packet = Vec::with_capacity(len);
+    packet.extend_from_slice(&len_bytes);
+    packet.resize(len, 0);
+    client.read_exact(&mut packet[4..]).await?;
+    Ok(packet)
 }
 
 async fn handle_redis_client(
@@ -355,12 +385,16 @@ async fn handle_redis_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let mut client = accept_direct_tls(client, tls).await?;
-    let (route, initial) = read_redis_initial_frame(&mut client).await?;
-    let endpoint = resolver
-        .resolve_redis(&route.username)
-        .await
-        .ok_or(ListenerError::RouteNotFound)?;
+    let (client, endpoint, initial) = client_handshake("redis", async move {
+        let mut client = accept_direct_tls(client, tls).await?;
+        let (route, initial) = read_redis_initial_frame(&mut client).await?;
+        let endpoint = resolver
+            .resolve_redis(&route.username)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        Ok((client, endpoint, initial))
+    })
+    .await?;
 
     tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
     Ok(())
@@ -371,6 +405,26 @@ async fn handle_mariadb_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
+    let Some((mut client, mut backend)) =
+        client_handshake("mariadb", prepare_mariadb_tunnel(client, resolver, tls)).await?
+    else {
+        return Ok(());
+    };
+    io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut backend,
+        TUNNEL_BUFFER_SIZE,
+        TUNNEL_BUFFER_SIZE,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn prepare_mariadb_tunnel(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+) -> Result<Option<(GatewayStream, TcpStream)>, ListenerError> {
     let mut client = accept_direct_tls(client, tls).await?;
     let gateway_seed = mariadb::new_gateway_auth_seed();
     mariadb::send_gateway_handshake(&mut client, &gateway_seed).await?;
@@ -458,7 +512,7 @@ async fn handle_mariadb_client(
 
     if mariadb::packet_is_error(&backend_response.payload) {
         mariadb::write_packet(&mut client, 2, &backend_response.payload).await?;
-        return Ok(());
+        return Ok(None);
     }
     if !mariadb::packet_is_ok(&backend_response.payload) {
         let message = "unsupported mariadb backend auth response";
@@ -467,6 +521,64 @@ async fn handle_mariadb_client(
     }
 
     mariadb::write_packet(&mut client, 2, &mariadb::ok_packet()).await?;
+    Ok(Some((client, backend)))
+}
+
+async fn handle_mongodb_client(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+) -> Result<(), ListenerError> {
+    let (mut client, mut backend) = client_handshake("mongodb", async move {
+        let mut client = accept_direct_tls(client, tls).await?;
+        for _ in 0..MAX_MONGODB_HELLO_MESSAGES {
+            let message = mongodb::read_message(&mut client).await?;
+            if mongodb::is_hello(&message) {
+                mongodb::write_response(&mut client, &message, mongodb::hello_response()).await?;
+                continue;
+            }
+
+            let route = match mongodb::parse_sasl_start_route(&message) {
+                Ok(route) => route,
+                Err(error) => {
+                    mongodb::write_response(
+                        &mut client,
+                        &message,
+                        mongodb::command_error(&error.to_string(), 18),
+                    )
+                    .await?;
+                    return Err(error.into());
+                }
+            };
+
+            let Some(endpoint) = resolver
+                .resolve_mongodb(&route.username, &route.database)
+                .await
+            else {
+                mongodb::write_response(
+                    &mut client,
+                    &message,
+                    mongodb::command_error("Authentication failed", 18),
+                )
+                .await?;
+                return Err(ListenerError::RouteNotFound);
+            };
+            let BackendEndpoint::DockerTcp { host, port } = endpoint else {
+                return Err(ListenerError::InvalidMongodbBackend);
+            };
+
+            let mut backend = TcpStream::connect((host.as_str(), port)).await?;
+            backend.set_nodelay(true)?;
+            backend.write_all(&message.raw).await?;
+            return Ok((client, backend));
+        }
+
+        Err(ListenerError::HandshakeMessageLimit {
+            protocol: "mongodb",
+        })
+    })
+    .await?;
+
     io::copy_bidirectional_with_sizes(
         &mut client,
         &mut backend,
@@ -477,77 +589,25 @@ async fn handle_mariadb_client(
     Ok(())
 }
 
-async fn handle_mongodb_client(
-    client: TcpStream,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-) -> Result<(), ListenerError> {
-    let mut client = accept_direct_tls(client, tls).await?;
-    loop {
-        let message = mongodb::read_message(&mut client).await?;
-        if mongodb::is_hello(&message) {
-            mongodb::write_response(&mut client, &message, mongodb::hello_response()).await?;
-            continue;
-        }
-
-        let route = match mongodb::parse_sasl_start_route(&message) {
-            Ok(route) => route,
-            Err(error) => {
-                mongodb::write_response(
-                    &mut client,
-                    &message,
-                    mongodb::command_error(&error.to_string(), 18),
-                )
-                .await?;
-                return Err(error.into());
-            }
-        };
-
-        let Some(endpoint) = resolver
-            .resolve_mongodb(&route.username, &route.database)
-            .await
-        else {
-            mongodb::write_response(
-                &mut client,
-                &message,
-                mongodb::command_error("Authentication failed", 18),
-            )
-            .await?;
-            return Err(ListenerError::RouteNotFound);
-        };
-        let BackendEndpoint::DockerTcp { host, port } = endpoint else {
-            return Err(ListenerError::InvalidMongodbBackend);
-        };
-
-        let mut backend = TcpStream::connect((host.as_str(), port)).await?;
-        backend.set_nodelay(true)?;
-        backend.write_all(&message.raw).await?;
-        io::copy_bidirectional_with_sizes(
-            &mut client,
-            &mut backend,
-            TUNNEL_BUFFER_SIZE,
-            TUNNEL_BUFFER_SIZE,
-        )
-        .await?;
-        return Ok(());
-    }
-}
-
 async fn handle_clickhouse_client(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let mut client = accept_direct_tls(client, tls).await?;
-    let initial = read_clickhouse_hello(&mut client).await?;
-    let route = clickhouse::parse_native_initial_route(&initial)?;
-    let endpoint = resolver
-        .resolve_clickhouse(&route.username, &route.database)
-        .await
-        .ok_or(ListenerError::RouteNotFound)?;
-    let BackendEndpoint::DockerTcp { .. } = endpoint else {
-        return Err(ListenerError::InvalidClickhouseBackend);
-    };
+    let (client, endpoint, initial) = client_handshake("clickhouse", async move {
+        let mut client = accept_direct_tls(client, tls).await?;
+        let initial = read_clickhouse_hello(&mut client).await?;
+        let route = clickhouse::parse_native_initial_route(&initial)?;
+        let endpoint = resolver
+            .resolve_clickhouse(&route.username, &route.database)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        let BackendEndpoint::DockerTcp { .. } = endpoint else {
+            return Err(ListenerError::InvalidClickhouseBackend);
+        };
+        Ok((client, endpoint, initial))
+    })
+    .await?;
 
     tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
     Ok(())
@@ -558,14 +618,18 @@ async fn handle_clickhouse_http_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let mut client = accept_direct_tls(client, tls).await?;
-    let initial = read_http_headers(&mut client).await?;
-    let route = clickhouse::parse_http_initial_route(&initial)?;
-    let endpoint = resolver
-        .resolve_clickhouse(&route.username, &route.database)
-        .await
-        .ok_or(ListenerError::RouteNotFound)?;
-    let endpoint = clickhouse_http_endpoint(endpoint)?;
+    let (client, endpoint, initial) = client_handshake("clickhouse_http", async move {
+        let mut client = accept_direct_tls(client, tls).await?;
+        let initial = read_http_headers(&mut client).await?;
+        let route = clickhouse::parse_http_initial_route(&initial)?;
+        let endpoint = resolver
+            .resolve_clickhouse(&route.username, &route.database)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        let endpoint = clickhouse_http_endpoint(endpoint)?;
+        Ok((client, endpoint, initial))
+    })
+    .await?;
 
     tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
     Ok(())
@@ -576,26 +640,30 @@ async fn handle_qdrant_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let client = accept_direct_tls(client, tls).await?;
-    let mut server = qdrant::server_handshake(client).await?;
-    let Some(first_request) = server.accept().await else {
-        return Err(qdrant::QdrantProxyError::MissingApiKey.into());
-    };
-    let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
-    let api_key = qdrant::api_key_from_request(&request)?;
-    let route_key_sha256 = qdrant::route_key_sha256(&api_key);
-    let endpoint = resolver
-        .resolve_qdrant(&route_key_sha256)
-        .await
-        .ok_or(ListenerError::RouteNotFound)?;
-    let BackendEndpoint::DockerTcp { host, port } = endpoint else {
-        return Err(ListenerError::InvalidQdrantBackend);
-    };
+    let (mut server, mut backend) = client_handshake("qdrant", async move {
+        let client = accept_direct_tls(client, tls).await?;
+        let mut server = qdrant::server_handshake(client).await?;
+        let Some(first_request) = server.accept().await else {
+            return Err(qdrant::QdrantProxyError::MissingApiKey.into());
+        };
+        let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
+        let api_key = qdrant::api_key_from_request(&request)?;
+        let route_key_sha256 = qdrant::route_key_sha256(&api_key);
+        let endpoint = resolver
+            .resolve_qdrant(&route_key_sha256)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        let BackendEndpoint::DockerTcp { host, port } = endpoint else {
+            return Err(ListenerError::InvalidQdrantBackend);
+        };
 
-    let backend_stream = TcpStream::connect((host.as_str(), port)).await?;
-    backend_stream.set_nodelay(true)?;
-    let mut backend = qdrant::client_handshake(backend_stream).await?;
-    qdrant::proxy_request(request, respond, &mut backend).await?;
+        let backend_stream = TcpStream::connect((host.as_str(), port)).await?;
+        backend_stream.set_nodelay(true)?;
+        let mut backend = qdrant::client_handshake(backend_stream).await?;
+        qdrant::proxy_request(request, respond, &mut backend).await?;
+        Ok((server, backend))
+    })
+    .await?;
 
     while let Some(next_request) = server.accept().await {
         let (request, respond) = next_request.map_err(qdrant::QdrantProxyError::from)?;

@@ -54,6 +54,7 @@ pub enum InstanceStatus {
     Running,
     Stopped,
     Failed,
+    Quarantined,
     Deleting,
 }
 
@@ -64,6 +65,7 @@ impl InstanceStatus {
             Self::Running => "running",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
+            Self::Quarantined => "quarantined",
             Self::Deleting => "deleting",
         }
     }

@@ -341,7 +341,7 @@ pub fn native_password_token_from_client_token(
         .map(|(left, right)| left ^ right)
         .collect();
     let derived_stage_2 = Sha1::digest(&stage_1);
-    if derived_stage_2.as_slice().ct_eq(&stage_2).unwrap_u8() != 1 {
+    if derived_stage_2[..].ct_eq(&stage_2).unwrap_u8() != 1 {
         return Err(MariadbProxyError::AuthenticationFailed);
     }
 

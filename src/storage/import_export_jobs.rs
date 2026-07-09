@@ -101,7 +101,7 @@ impl ImportExportJobRepository {
         &self,
         job: &ImportExportJob,
     ) -> Result<(), ImportExportJobStorageError> {
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE import_export_jobs
             SET status = ?2,
@@ -118,7 +118,28 @@ impl ImportExportJobRepository {
         .bind(&job.updated_at)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() != 1 {
+            return Err(ImportExportJobStorageError::NotFound {
+                job_id: job.job_id.clone(),
+            });
+        }
         Ok(())
+    }
+
+    pub async fn running_instance_ids(&self) -> Result<Vec<String>, ImportExportJobStorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT instance_id
+            FROM import_export_jobs
+            WHERE status = 'running'
+            ORDER BY instance_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("instance_id").map_err(Into::into))
+            .collect()
     }
 
     pub async fn fail_unfinished(
@@ -163,6 +184,29 @@ impl ImportExportJobRepository {
             })
             .collect()
     }
+
+    pub async fn prune_completed(
+        &self,
+        keep_latest: u32,
+    ) -> Result<u64, ImportExportJobStorageError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM import_export_jobs
+            WHERE status IN ('succeeded', 'failed')
+              AND job_id NOT IN (
+                  SELECT job_id
+                  FROM import_export_jobs
+                  WHERE status IN ('succeeded', 'failed')
+                  ORDER BY updated_at DESC, job_id DESC
+                  LIMIT ?1
+              )
+            "#,
+        )
+        .bind(i64::from(keep_latest.max(1)))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn row_to_job(
@@ -188,6 +232,8 @@ pub enum ImportExportJobStorageError {
     Sqlx(#[from] sqlx::Error),
     #[error("job row parse failed: {0}")]
     Parse(#[from] JobParseError),
+    #[error("import/export job {job_id} was not found")]
+    NotFound { job_id: String },
 }
 
 #[cfg(test)]
@@ -240,6 +286,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_missing_job_status_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = ImportExportJobRepository::new(pool);
+
+        let error = repository.update_status(&sample_job()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ImportExportJobStorageError::NotFound { job_id } if job_id == "job_1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn lists_only_instances_with_running_jobs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = ImportExportJobRepository::new(pool);
+        let mut job = sample_job();
+        repository.insert(&job).await.unwrap();
+        job.job_id = "job_2".to_string();
+        job.status = ImportExportStatus::Running;
+        repository.insert(&job).await.unwrap();
+        job.job_id = "job_3".to_string();
+        job.instance_id = "inst_other".to_string();
+        job.status = ImportExportStatus::Running;
+        repository.insert(&job).await.unwrap();
+
+        assert_eq!(
+            repository.running_instance_ids().await.unwrap(),
+            vec!["inst_abc".to_string(), "inst_other".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn counts_jobs_by_status() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
@@ -254,6 +335,29 @@ mod tests {
         let counts = repository.count_by_status().await.unwrap();
         assert!(counts.contains(&(ImportExportStatus::Queued, 1)));
         assert!(counts.contains(&(ImportExportStatus::Failed, 1)));
+    }
+
+    #[tokio::test]
+    async fn prunes_only_old_completed_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = ImportExportJobRepository::new(pool);
+        for (id, status, updated_at) in [
+            ("old", ImportExportStatus::Succeeded, "2026-01-01T00:00:00Z"),
+            ("new", ImportExportStatus::Failed, "2026-01-02T00:00:00Z"),
+            ("queued", ImportExportStatus::Queued, "2025-01-01T00:00:00Z"),
+        ] {
+            let mut job = sample_job();
+            job.job_id = id.to_string();
+            job.status = status;
+            job.updated_at = updated_at.to_string();
+            repository.insert(&job).await.unwrap();
+        }
+
+        assert_eq!(repository.prune_completed(1).await.unwrap(), 1);
+        assert!(repository.get("old").await.unwrap().is_none());
+        assert!(repository.get("new").await.unwrap().is_some());
+        assert!(repository.get("queued").await.unwrap().is_some());
     }
 
     fn sample_job() -> ImportExportJob {

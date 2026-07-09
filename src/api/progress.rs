@@ -10,6 +10,9 @@ use crate::{
     shared::{protocol::Protocol, time::now_rfc3339},
 };
 
+const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;
+const MAX_PROGRESS_TEXT_CHARS: usize = 2_048;
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallProgressStore {
     inner: Arc<RwLock<HashMap<String, InstallProgress>>>,
@@ -24,7 +27,7 @@ impl InstallProgressStore {
             status: InstallProgressStatus::Running,
             stage: "queued".to_string(),
             message: "queued instance creation".to_string(),
-            image: Some(image.to_string()),
+            image: Some(bounded_progress_text(image)),
             layer: None,
             current: None,
             total: None,
@@ -41,7 +44,7 @@ impl InstallProgressStore {
             status: InstallProgressStatus::Running,
             stage: "queued".to_string(),
             message: "queued image update".to_string(),
-            image: Some(image.to_string()),
+            image: Some(bounded_progress_text(image)),
             layer: None,
             current: None,
             total: None,
@@ -58,7 +61,7 @@ impl InstallProgressStore {
             status: InstallProgressStatus::Running,
             stage: "queued".to_string(),
             message: "queued major version migration".to_string(),
-            image: Some(image.to_string()),
+            image: Some(bounded_progress_text(image)),
             layer: None,
             current: None,
             total: None,
@@ -70,8 +73,8 @@ impl InstallProgressStore {
     pub fn stage(&self, instance_id: &str, stage: &str, message: impl Into<String>) {
         self.update(instance_id, |progress| {
             progress.status = InstallProgressStatus::Running;
-            progress.stage = stage.to_string();
-            progress.message = message.into();
+            progress.stage = bounded_progress_text(stage);
+            progress.message = bounded_progress_text(&message.into());
             progress.layer = None;
             progress.current = None;
             progress.total = None;
@@ -84,9 +87,12 @@ impl InstallProgressStore {
         self.update(instance_id, |progress| {
             progress.status = InstallProgressStatus::Running;
             progress.stage = "pull_image".to_string();
-            progress.message = event.status;
-            progress.image = Some(event.image);
-            progress.layer = event.layer.filter(|layer| !layer.is_empty());
+            progress.message = bounded_progress_text(&event.status);
+            progress.image = Some(bounded_progress_text(&event.image));
+            progress.layer = event
+                .layer
+                .filter(|layer| !layer.is_empty())
+                .map(|layer| bounded_progress_text(&layer));
             progress.current = event.current;
             progress.total = event.total;
             progress.percent = percent(event.current, event.total);
@@ -98,7 +104,7 @@ impl InstallProgressStore {
         self.update(instance_id, |progress| {
             progress.status = InstallProgressStatus::Completed;
             progress.stage = "completed".to_string();
-            progress.message = message.into();
+            progress.message = bounded_progress_text(&message.into());
             progress.layer = None;
             progress.current = None;
             progress.total = None;
@@ -111,7 +117,7 @@ impl InstallProgressStore {
         self.update(instance_id, |progress| {
             progress.status = InstallProgressStatus::Failed;
             progress.stage = "failed".to_string();
-            progress.message = message.into();
+            progress.message = bounded_progress_text(&message.into());
             progress.layer = None;
             progress.current = None;
             progress.total = None;
@@ -133,10 +139,21 @@ impl InstallProgressStore {
     }
 
     fn set(&self, progress: InstallProgress) {
-        self.inner
-            .write()
-            .expect("install progress lock poisoned")
-            .insert(progress.instance_id.clone(), progress);
+        let mut entries = self.inner.write().expect("install progress lock poisoned");
+        if entries.len() >= MAX_INSTALL_PROGRESS_ENTRIES
+            && !entries.contains_key(&progress.instance_id)
+        {
+            let candidate = entries
+                .values()
+                .filter(|entry| entry.status != InstallProgressStatus::Running)
+                .min_by_key(|entry| &entry.updated_at)
+                .or_else(|| entries.values().min_by_key(|entry| &entry.updated_at))
+                .map(|entry| entry.instance_id.clone());
+            if let Some(instance_id) = candidate {
+                entries.remove(&instance_id);
+            }
+        }
+        entries.insert(progress.instance_id.clone(), progress);
     }
 
     fn update(&self, instance_id: &str, update: impl FnOnce(&mut InstallProgress)) {
@@ -163,7 +180,7 @@ pub struct InstallProgress {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallProgressStatus {
     Running,
@@ -178,4 +195,32 @@ fn percent(current: Option<u64>, total: Option<u64>) -> Option<f64> {
         return None;
     }
     Some(((current as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+}
+
+fn bounded_progress_text(value: &str) -> String {
+    value.chars().take(MAX_PROGRESS_TEXT_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_store_and_text_are_bounded() {
+        let store = InstallProgressStore::default();
+        for index in 0..=MAX_INSTALL_PROGRESS_ENTRIES {
+            store.begin(
+                &format!("inst-{index}"),
+                Protocol::Postgres,
+                "postgres:test",
+            );
+            store.complete(&format!("inst-{index}"), "done");
+        }
+
+        assert_eq!(store.list().len(), MAX_INSTALL_PROGRESS_ENTRIES);
+        assert_eq!(
+            bounded_progress_text(&"x".repeat(MAX_PROGRESS_TEXT_CHARS + 1)).len(),
+            MAX_PROGRESS_TEXT_CHARS
+        );
+    }
 }

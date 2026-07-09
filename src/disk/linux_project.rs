@@ -1,6 +1,6 @@
-use std::{hash::Hasher, path::Path};
+use std::path::Path;
 
-use super::{DiskLimitError, displayed_privileged_command, privileged_command};
+use super::{DiskLimitError, displayed_privileged_command, privileged_command, project_id};
 
 pub(super) async fn verify_startup(
     data_root: &Path,
@@ -23,7 +23,7 @@ pub(super) async fn apply(
     project_id_base: u32,
     mount: &Path,
 ) -> Result<String, DiskLimitError> {
-    let project_id = project_id(instance_id, project_id_base);
+    let project_id = project_id::allocate(instance_id, data_path, project_id_base).await?;
     set_project_id(data_path, project_id).await?;
     set_project_quota(mount, project_id, disk_mib).await?;
     Ok("host_linux_project_quota".to_string())
@@ -146,41 +146,9 @@ async fn set_project_quota(
     }
 }
 
-fn project_id(instance_id: &str, base: u32) -> u32 {
-    let mut hasher = Fnv1a32::default();
-    hasher.write(instance_id.as_bytes());
-    base.saturating_add((hasher.finish() as u32) % 1_000_000_000)
-}
-
-#[derive(Default)]
-struct Fnv1a32(u32);
-
-impl Hasher for Fnv1a32 {
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 { 0x811c_9dc5 } else { self.0 };
-        for byte in bytes {
-            hash ^= u32::from(*byte);
-            hash = hash.wrapping_mul(0x0100_0193);
-        }
-        self.0 = hash;
-    }
-
-    fn finish(&self) -> u64 {
-        u64::from(self.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn project_ids_are_stable() {
-        assert_eq!(
-            project_id("inst_abc", 200_000),
-            project_id("inst_abc", 200_000)
-        );
-    }
 
     #[test]
     fn rejects_mount_without_project_quota_option() {

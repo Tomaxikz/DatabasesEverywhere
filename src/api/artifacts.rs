@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::Read,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, Uri, header},
     response::{IntoResponse, Response},
 };
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -35,6 +35,7 @@ use crate::{
 const DOWNLOAD_PURPOSE: &str = "artifact_download";
 const DEFAULT_DOWNLOAD_TTL_SECONDS: i64 = 120;
 const MAX_DOWNLOAD_TTL_SECONDS: i64 = 900;
+const MAX_CONSUMED_DOWNLOAD_TICKETS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadKind {
@@ -87,8 +88,12 @@ impl ArtifactDownloadTickets {
     pub async fn consume(&self, jti: &str, exp: i64) -> bool {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let mut consumed = self.consumed.lock().await;
-        consumed.retain(|_, expires_at| *expires_at >= now);
+        consumed.retain(|_, expires_at| *expires_at > now);
         if consumed.contains_key(jti) {
+            return false;
+        }
+        if consumed.len() >= MAX_CONSUMED_DOWNLOAD_TICKETS {
+            tracing::warn!("audit artifact_download_ticket_capacity_reached");
             return false;
         }
         consumed.insert(jti.to_string(), exp);
@@ -269,7 +274,7 @@ pub async fn signed_backup_download(
 
 async fn issue_download_token(
     state: &AppState,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     name: &str,
     request: IssueDownloadTokenRequest,
     kind: DownloadKind,
@@ -324,7 +329,9 @@ async fn issue_download_token(
     )
     .map_err(|error| ApiError::Runtime(format!("failed to issue download token: {error}")))?;
     let path_url = kind.signed_path(&token);
-    let url = absolute_url(headers, &path_url);
+    // Keep the credential-bearing URL origin-relative. Building an absolute URL
+    // from Host or X-Forwarded-* would let an untrusted proxy/client poison it.
+    let url = path_url.clone();
 
     tracing::info!(
         event = "audit artifact_download_token_issued",
@@ -409,14 +416,10 @@ async fn signed_download(
 }
 
 fn validate_download_token(state: &AppState, token: &str) -> Result<DownloadClaims, ApiError> {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.set_audience(&[AUDIENCE]);
-    validation.set_issuer(&[ISSUER]);
-    validation.validate_nbf = true;
     let claims = decode::<DownloadClaims>(
         token,
         &DecodingKey::from_secret(state.config.websocket_jwt_secret()),
-        &validation,
+        &crate::auth::jwt::strict_hs256_validation(),
     )
     .map_err(|_| ApiError::Unauthorized)?
     .claims;
@@ -538,7 +541,8 @@ async fn ensure_artifact_belongs_to_instance(
     let jobs = state
         .import_export_jobs
         .list(Some(instance_id), Some(ImportExportStatus::Succeeded), 500)
-        .await;
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let belongs = jobs.into_iter().any(|job| {
         job.action == ImportExportAction::Export
             && job
@@ -555,19 +559,6 @@ async fn ensure_artifact_belongs_to_instance(
             "artifact is not associated with the requested instance".to_string(),
         ))
     }
-}
-
-fn absolute_url(headers: &HeaderMap, path: &str) -> String {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("127.0.0.1");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| matches!(*value, "http" | "https"))
-        .unwrap_or("https");
-    format!("{scheme}://{host}{path}")
 }
 
 pub(crate) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
@@ -664,9 +655,7 @@ async fn write_checksum_sidecar(path: &FsPath, metadata: &std::fs::Metadata, has
         metadata.len()
     );
     if let Err(error) = tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::create(sidecar)?;
-        file.write_all(content.as_bytes())?;
-        file.flush()
+        crate::shared::files::atomic_write_private(&sidecar, content.as_bytes())
     })
     .await
     .map_err(std::io::Error::other)
@@ -756,11 +745,13 @@ mod tests {
         state
             .import_export_jobs
             .insert(sample_export_job("inst_abc", &artifact))
-            .await;
+            .await
+            .unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
-        let token = issue_download_token(
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        let ticket = issue_download_token(
             &state,
             &headers,
             artifact_name,
@@ -773,8 +764,11 @@ mod tests {
         )
         .await
         .unwrap()
-        .0
-        .token;
+        .0;
+        assert_eq!(ticket.url, ticket.download_path);
+        assert!(ticket.url.starts_with("/api/"));
+        assert!(!ticket.url.contains("dbe.example.com"));
+        let token = ticket.token;
 
         signed_download(&state, &token, DownloadKind::Artifact)
             .await
@@ -782,6 +776,36 @@ mod tests {
         let error = signed_download(&state, &token, DownloadKind::Artifact)
             .await
             .unwrap_err();
+        assert!(matches!(error, ApiError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn signed_download_rejects_expired_token_without_leeway() {
+        let state = test_state().await;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = DownloadClaims {
+            iss: ISSUER.to_string(),
+            aud: AUDIENCE.to_string(),
+            sub: "panel".to_string(),
+            purpose: DOWNLOAD_PURPOSE.to_string(),
+            kind: DownloadKind::Artifact.as_str().to_string(),
+            artifact: "inst_abc.postgres.sql.gz".to_string(),
+            instance_id: "inst_abc".to_string(),
+            single_use: true,
+            iat: now - 10,
+            nbf: now - 10,
+            exp: now - 1,
+            jti: Uuid::new_v4().to_string(),
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
+        )
+        .unwrap();
+
+        let error = validate_download_token(&state, &token).unwrap_err();
+
         assert!(matches!(error, ApiError::Unauthorized));
     }
 
@@ -798,7 +822,8 @@ mod tests {
         state
             .import_export_jobs
             .insert(sample_export_job("inst_other", &artifact))
-            .await;
+            .await
+            .unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
@@ -845,6 +870,7 @@ mod tests {
                 uuid: "node".to_string(),
                 token_id: "token-id".to_string(),
                 token: "secret".to_string(),
+                jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
                 remote: "https://panel.example.com".to_string(),
                 paths: PathConfig {
                     artifacts: dir.join("artifacts").display().to_string(),
@@ -856,6 +882,7 @@ mod tests {
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
             docker: DockerRuntime::new(&Default::default(), false).unwrap(),
             import_export_jobs: ImportExportJobs::default(),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),

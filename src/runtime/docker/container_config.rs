@@ -81,12 +81,22 @@ pub fn published_port_bindings(
     )]))
 }
 
-pub fn cpu_to_nano(cpu_cores: f64) -> i64 {
-    (cpu_cores * 1_000_000_000.0).round() as i64
+pub fn cpu_to_nano(cpu_cores: f64) -> Option<i64> {
+    if !cpu_cores.is_finite() || cpu_cores <= 0.0 {
+        return None;
+    }
+
+    let nano_cpus = (cpu_cores * 1_000_000_000.0).round();
+    if nano_cpus < 1.0 || nano_cpus >= i64::MAX as f64 {
+        return None;
+    }
+    Some(nano_cpus as i64)
 }
 
-pub fn mib_to_bytes(memory_mib: u64) -> i64 {
-    (memory_mib * 1024 * 1024) as i64
+pub fn mib_to_bytes(memory_mib: u64) -> Option<i64> {
+    memory_mib
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| i64::try_from(bytes).ok())
 }
 
 pub fn serialize_stats(stats: &ContainerStatsResponse) -> Result<String, serde_json::Error> {

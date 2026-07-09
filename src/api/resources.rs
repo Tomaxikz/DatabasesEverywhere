@@ -208,6 +208,14 @@ async fn directory_size(path: PathBuf) -> Result<u64, std::io::Error> {
 }
 
 impl ResourceCache {
+    pub async fn remove(&self, instance_id: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.stats.remove(instance_id);
+        inner.cpu_samples.remove(instance_id);
+        inner.disk.remove(instance_id);
+        inner.disk_refreshing.remove(instance_id);
+    }
+
     pub(crate) fn register_monitor(&self) -> ResourceMonitorGuard {
         self.active_monitors.fetch_add(1, Ordering::Relaxed);
         ResourceMonitorGuard {

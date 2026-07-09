@@ -17,6 +17,8 @@ pub struct InstancePaths {
     pub logs: PathBuf,
     pub sockets: PathBuf,
     pub artifacts: PathBuf,
+    /// Daemon-owned configuration that must never be writable by a database container.
+    pub runtime_config: PathBuf,
 }
 
 impl InstancePaths {
@@ -27,6 +29,8 @@ impl InstancePaths {
         let logs_root = root("paths.logs", &config.logs)?;
         let sockets_root = root("paths.sockets", &config.sockets)?;
         let artifacts_root = root("paths.artifacts", &config.artifacts)?;
+        let metadata_root = root("paths.metadata", &config.metadata_root())?;
+        let runtime_config_root = metadata_root.join("runtime-configs");
 
         Ok(Self {
             instance_id: instance_id.to_string(),
@@ -34,6 +38,7 @@ impl InstancePaths {
             logs: child(&logs_root, instance_id)?,
             sockets: child_direct(&sockets_root, instance_id)?,
             artifacts: child(&artifacts_root, instance_id)?,
+            runtime_config: child_direct(&runtime_config_root, instance_id)?,
         })
     }
 
@@ -42,6 +47,7 @@ impl InstancePaths {
         create_private_dir(&self.logs).await?;
         create_private_dir(&self.sockets).await?;
         create_private_dir(&self.artifacts).await?;
+        create_private_dir(&self.runtime_config).await?;
         Ok(())
     }
 
@@ -428,6 +434,7 @@ mod tests {
 
         assert!(paths.data.starts_with(&config.data));
         assert!(paths.logs.starts_with(&config.logs));
+        assert!(paths.runtime_config.starts_with(config.metadata_root()));
     }
 
     #[cfg(unix)]

@@ -22,6 +22,7 @@ pub struct AppState {
     pub api_token: ApiToken,
     pub instances: InstanceStore,
     pub manager: InstanceManager,
+    pub instance_locks: crate::instances::locks::InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
     pub api_rate_limiter: crate::api::security::ApiRateLimiter,
@@ -40,10 +41,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/system/config",
             patch(crate::api::config_admin::patch_config),
-        )
-        .route(
-            "/api/system/upgrade",
-            post(crate::api::upgrade::self_upgrade),
         )
         .route("/metrics", get(crate::api::metrics::metrics))
         .route(
@@ -196,7 +193,8 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             crate::api::security::rate_limit,
         ))
-        .layer(middleware::from_fn(
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             crate::api::request_trace::trace_request,
         ))
         .layer(cors)

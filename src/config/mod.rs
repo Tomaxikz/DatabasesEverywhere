@@ -1,6 +1,8 @@
 pub mod load;
 pub mod validate;
 
+use std::net::{IpAddr, SocketAddr};
+
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{defaults, docker, ports};
@@ -12,6 +14,7 @@ pub struct Config {
     pub uuid: String,
     pub token_id: String,
     pub token: String,
+    pub jwt_signing_key: String,
     pub remote: String,
     pub tls: TlsConfig,
     pub postgres: ListenerConfig,
@@ -37,17 +40,18 @@ impl Default for Config {
             uuid: String::new(),
             token_id: String::new(),
             token: String::new(),
+            jwt_signing_key: String::new(),
             remote: String::new(),
             tls: TlsConfig::default(),
-            postgres: ListenerConfig::enabled(format!("0.0.0.0:{}", ports::POSTGRES)),
-            mariadb: ListenerConfig::enabled(format!("0.0.0.0:{}", ports::MARIADB)),
-            redis: ListenerConfig::enabled(format!("0.0.0.0:{}", ports::REDIS)),
-            mongodb: ListenerConfig::disabled(format!("0.0.0.0:{}", ports::MONGODB)),
+            postgres: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::POSTGRES)),
+            mariadb: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::MARIADB)),
+            redis: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::REDIS)),
+            mongodb: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MONGODB)),
             clickhouse: ClickhouseConfig::disabled(
-                format!("0.0.0.0:{}", ports::CLICKHOUSE),
-                format!("0.0.0.0:{}", ports::CLICKHOUSE_HTTP),
+                format!("127.0.0.1:{}", ports::CLICKHOUSE),
+                format!("127.0.0.1:{}", ports::CLICKHOUSE_HTTP),
             ),
-            qdrant: ListenerConfig::disabled(format!("0.0.0.0:{}", ports::QDRANT)),
+            qdrant: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::QDRANT)),
             api: ApiConfig::default(),
             security: SecurityConfig::default(),
             artifacts: ArtifactConfig::default(),
@@ -154,7 +158,7 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: ports::API,
             ssl: ApiSslConfig::default(),
         }
@@ -169,13 +173,17 @@ impl Config {
     }
 
     pub fn websocket_jwt_secret(&self) -> &[u8] {
-        self.token.as_bytes()
+        self.jwt_signing_key.as_bytes()
     }
 }
 
 impl ApiConfig {
     pub fn bind_addr(&self) -> String {
-        format!("{}:{}", self.host.trim(), self.port)
+        let host = self.host.trim();
+        host.parse::<IpAddr>().map_or_else(
+            |_| format!("{host}:{}", self.port),
+            |address| SocketAddr::new(address, self.port).to_string(),
+        )
     }
 }
 
@@ -229,6 +237,7 @@ pub struct SecurityConfig {
     pub api_body_limit_bytes: usize,
     pub api_rate_limit_per_minute: u32,
     pub db_connection_limit_per_minute: u32,
+    pub allow_insecure_public_listeners: bool,
     pub allow_private_remote_imports: bool,
     pub remote_import_allowed_hosts: Vec<String>,
     pub self_upgrade_enabled: bool,
@@ -242,6 +251,7 @@ impl Default for SecurityConfig {
             api_body_limit_bytes: 1024 * 1024,
             api_rate_limit_per_minute: 600,
             db_connection_limit_per_minute: 240,
+            allow_insecure_public_listeners: false,
             allow_private_remote_imports: false,
             remote_import_allowed_hosts: Vec::new(),
             self_upgrade_enabled: false,
@@ -388,6 +398,7 @@ pub struct DiskConfig {
     pub mode: DiskLimitMode,
     pub project_id_base: u32,
     pub fuse_quota_binary: String,
+    pub fuse_quota_binary_sha256: String,
     pub fuse_quota_rescan_interval_seconds: u64,
 }
 
@@ -408,6 +419,7 @@ impl Default for DiskConfig {
             mode: DiskLimitMode::FuseQuota,
             project_id_base: 200_000,
             fuse_quota_binary: "embedded".to_string(),
+            fuse_quota_binary_sha256: String::new(),
             fuse_quota_rescan_interval_seconds: 150,
         }
     }
@@ -457,12 +469,12 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         Self {
-            postgres: "postgres:18.4".to_string(),
-            redis: "redis:8.8.0".to_string(),
-            mariadb: "mariadb:12.3.2".to_string(),
-            mongodb: "mongo:7.0.37".to_string(),
-            clickhouse: "clickhouse/clickhouse-server:25.8.25.37".to_string(),
-            qdrant: "qdrant/qdrant:v1.18.2".to_string(),
+            postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4".to_string(),
+            redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32".to_string(),
+            mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f".to_string(),
+            mongodb: "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703".to_string(),
+            clickhouse: "clickhouse/clickhouse-server:25.8.25.37@sha256:9558b6aa8f01a3355e7295b7449d484047970ad35a766c30d3e600613abcfbf0".to_string(),
+            qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c".to_string(),
             allowed: ImageAllowlistConfig::default(),
         }
     }

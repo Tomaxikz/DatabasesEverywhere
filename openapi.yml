@@ -24,12 +24,17 @@ components:
       properties:
         cpu_cores:
           type: number
+          minimum: 0.01
+          maximum: 1024
           example: 0.5
         memory_mib:
           type: integer
+          minimum: 1
+          maximum: 1048576
           example: 512
         disk_mib:
           type: integer
+          minimum: 1
           example: 1024
     InstanceLimits:
       allOf:
@@ -77,6 +82,10 @@ components:
           example: server-123
         limits:
           $ref: "#/components/schemas/LimitsRequest"
+        purge_stale_resources:
+          type: boolean
+          default: false
+          description: Irreversibly remove an orphaned container and persistent paths for this instance_id before retrying creation. Use only after preserving any data you need.
     Instance:
       type: object
       properties:
@@ -88,7 +97,7 @@ components:
           $ref: "#/components/schemas/Protocol"
         status:
           type: string
-          enum: [creating, running, stopped, failed, deleting]
+          enum: [creating, running, stopped, failed, quarantined, deleting]
         public:
           type: object
           properties:
@@ -194,7 +203,8 @@ components:
           format: password
         tls:
           type: boolean
-          default: false
+          default: true
+          description: Required in production. Explicit false is accepted only with the isolated-development insecure-listener override.
     ImportExportSelection:
       type: object
       properties:
@@ -267,6 +277,12 @@ components:
           items:
             type: string
           default: []
+          maxItems: 256
+          description: Explicit instance allow-list. Must be non-empty unless all_instances is true.
+        all_instances:
+          type: boolean
+          default: false
+          description: Explicitly grants node-wide instance access and cannot be combined with a non-empty instances list.
         ttl_seconds:
           type: integer
           minimum: 1
@@ -341,36 +357,6 @@ components:
           type: boolean
         config_path:
           type: string
-    DaemonUpgradeRequest:
-      type: object
-      required: [url, sha256, restart_command]
-      properties:
-        url:
-          type: string
-          format: uri
-          description: HTTPS URL for the replacement daemon binary.
-        sha256:
-          type: string
-          minLength: 64
-          maxLength: 64
-        headers:
-          type: object
-          additionalProperties:
-            type: string
-        restart_command:
-          type: string
-          description: Command name to execute after replacing the binary. Not run through a shell.
-        restart_command_args:
-          type: array
-          items:
-            type: string
-    DaemonUpgradeResponse:
-      type: object
-      properties:
-        accepted:
-          type: boolean
-        restart_command:
-          type: string
   responses:
     Unauthorized:
       description: Missing, invalid, or insufficient bearer token.
@@ -413,24 +399,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConfigPatchResponse"
-  /api/system/upgrade:
-    post:
-      summary: Download, verify, replace, and restart the daemon binary.
-      description: Disabled unless security.self_upgrade_enabled=true. URL must be HTTPS and sha256 must match the downloaded binary.
-      x-required-scope: upgrades:admin
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DaemonUpgradeRequest"
-      responses:
-        "200":
-          description: Upgrade accepted.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DaemonUpgradeResponse"
   /api/heartbeat:
     post:
       summary: Lightweight authenticated health check.

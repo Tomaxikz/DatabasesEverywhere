@@ -5,23 +5,38 @@ use std::{
 
 use axum::{
     body::Body,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, Request},
     middleware::Next,
     response::Response,
 };
 
+use crate::{api::routes::AppState, constants};
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
+pub async fn trace_request(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let host = header_value(request.headers(), "host");
     let user_agent = header_value(request.headers(), "user-agent");
+    let actor = authenticated_actor(&state, request.headers());
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     tracing::info!(
         request_id,
+        actor,
+        peer_ip,
         method = %method,
         path = %path,
         host = %host,
@@ -63,6 +78,17 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
     }
 
     response
+}
+
+fn authenticated_actor(state: &AppState, headers: &HeaderMap) -> String {
+    let authorization = headers
+        .get(constants::AUTHORIZATION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    state
+        .api_token
+        .accepted_from_authorization_header(authorization)
+        .map(|token| token.name)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> String {

@@ -11,10 +11,15 @@ pub use engine::DaemonEngineConnection;
 pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    io::{Error as IoError, ErrorKind, Read, Write},
+    path::{Component, Path},
+    time::{Duration, Instant},
+};
 
 use bollard::{
-    Docker,
+    Docker, body_try_stream,
     container::LogOutput,
     errors::Error as BollardError,
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
@@ -23,13 +28,16 @@ use bollard::{
         NetworkCreateRequest, NetworkInspect,
     },
     query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptions,
-        ListContainersOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
-        StopContainerOptions,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+        DownloadFromContainerOptionsBuilder, KillContainerOptions, ListContainersOptionsBuilder,
+        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+        UploadToContainerOptionsBuilder,
     },
 };
-use futures::{StreamExt, TryStreamExt};
+use bytes::Bytes;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use secrecy::ExposeSecret;
+use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 
 use crate::{
     config::{DaemonConfig, DaemonEngine, DaemonNetworkIpam},
@@ -37,8 +45,20 @@ use crate::{
     runtime::docker::container_config::{
         bind_mount, cpu_to_nano, exposed_ports, healthcheck, mib_to_bytes, published_port_bindings,
     },
-    shared::{ids::sanitize_docker_suffix, protocol::Protocol},
+    shared::{
+        ids::sanitize_docker_suffix,
+        limits::{ResourceLimitError, validate_runtime_limits},
+        protocol::Protocol,
+    },
 };
+
+const MAX_CONTAINER_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL: usize = 1024 * 1024;
+const DOCKER_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DOCKER_EXEC_RECOVERY_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+const DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const EXEC_OUTPUT_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\n";
 
 #[derive(Debug, Clone)]
 pub struct DockerInstanceInspection {
@@ -254,7 +274,14 @@ impl DockerRuntime {
         spec: &DockerInstanceSpec,
     ) -> Result<ContainerCreateBody, DockerError> {
         self.security.validate_spec(spec)?;
-        let memory_bytes = mib_to_bytes(spec.memory_mib);
+        validate_runtime_limits(spec.cpu_cores, spec.memory_mib)?;
+        let nano_cpus = cpu_to_nano(spec.cpu_cores).ok_or(DockerError::CpuLimitConversion {
+            cpu_cores: spec.cpu_cores,
+        })?;
+        let memory_bytes =
+            mib_to_bytes(spec.memory_mib).ok_or(DockerError::MemoryLimitConversion {
+                memory_mib: spec.memory_mib,
+            })?;
         let mut labels = HashMap::from([
             (MANAGED_LABEL.to_string(), "true".to_string()),
             (INSTANCE_LABEL.to_string(), spec.instance_id.clone()),
@@ -267,7 +294,7 @@ impl DockerRuntime {
         let publish_backend_port = self.allow_public_backend_ports || self.uses_rootless_podman();
         let mut host_config = HostConfig {
             network_mode: Some(self.network.clone()),
-            nano_cpus: Some(cpu_to_nano(spec.cpu_cores)),
+            nano_cpus: Some(nano_cpus),
             memory: Some(memory_bytes),
             memory_swap: Some(memory_bytes),
             mounts: Some(container_mounts(spec)),
@@ -336,14 +363,21 @@ impl DockerRuntime {
         }
     }
 
-    pub fn update_limits_body(cpu_cores: f64, memory_mib: u64) -> ContainerUpdateBody {
-        let memory_bytes = mib_to_bytes(memory_mib);
-        ContainerUpdateBody {
-            nano_cpus: Some(cpu_to_nano(cpu_cores)),
+    pub fn update_limits_body(
+        cpu_cores: f64,
+        memory_mib: u64,
+    ) -> Result<ContainerUpdateBody, DockerError> {
+        validate_runtime_limits(cpu_cores, memory_mib)?;
+        let nano_cpus =
+            cpu_to_nano(cpu_cores).ok_or(DockerError::CpuLimitConversion { cpu_cores })?;
+        let memory_bytes =
+            mib_to_bytes(memory_mib).ok_or(DockerError::MemoryLimitConversion { memory_mib })?;
+        Ok(ContainerUpdateBody {
+            nano_cpus: Some(nano_cpus),
             memory: Some(memory_bytes),
             memory_swap: Some(memory_bytes),
             ..Default::default()
-        }
+        })
     }
 
     pub async fn create(&self, spec: &DockerInstanceSpec) -> Result<CommandOutput, DockerError> {
@@ -580,6 +614,30 @@ impl DockerRuntime {
         })
     }
 
+    /// Returns the exact protocol-qualified container name when it belongs to
+    /// the requested DBE instance. A same-name container without the complete
+    /// ownership label tuple is treated as an untrusted collision.
+    pub async fn verified_managed_container_name(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        let response = match self.docker.inspect_container(&container, None).await {
+            Ok(response) => response,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let labels = response
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        verify_managed_instance_labels(&labels, &container, protocol, instance_id)?;
+        Ok(Some(container))
+    }
+
     pub async fn update_limits(
         &self,
         protocol: Protocol,
@@ -588,9 +646,8 @@ impl DockerRuntime {
         memory_mib: u64,
     ) -> Result<CommandOutput, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
-        self.docker
-            .update_container(&name, Self::update_limits_body(cpu_cores, memory_mib))
-            .await?;
+        let body = Self::update_limits_body(cpu_cores, memory_mib)?;
+        self.docker.update_container(&name, body).await?;
         Ok(CommandOutput::empty())
     }
 
@@ -601,7 +658,10 @@ impl DockerRuntime {
         command: Vec<String>,
     ) -> Result<CommandOutput, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
-        let display_command = command.join(" ");
+        let operation = command
+            .first()
+            .map(|program| format!("{program} [arguments redacted]"))
+            .unwrap_or_else(|| "[empty command]".to_string());
         let exec = self
             .docker
             .create_exec(
@@ -615,20 +675,50 @@ impl DockerRuntime {
             )
             .await?;
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        match self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await?
+        let deadline = tokio::time::Instant::now() + DOCKER_EXEC_TIMEOUT;
+        let started = match tokio::time::timeout_at(
+            deadline,
+            self.docker.start_exec(&exec.id, None::<StartExecOptions>),
+        )
+        .await
         {
+            Ok(result) => result?,
+            Err(_) => {
+                self.recover_timed_out_exec(protocol, instance_id, &name, &operation)
+                    .await?;
+                return Err(DockerError::ExecTimedOut {
+                    container: name,
+                    operation,
+                    timeout_seconds: DOCKER_EXEC_TIMEOUT.as_secs(),
+                });
+            }
+        };
+
+        let mut stdout = CappedExecOutput::default();
+        let mut stderr = CappedExecOutput::default();
+        match started {
             StartExecResults::Attached { mut output, .. } => {
-                while let Some(chunk) = output.next().await {
-                    match chunk? {
-                        LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
-                        LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
-                        LogOutput::Console { message } => stdout.extend_from_slice(&message),
-                        LogOutput::StdIn { .. } => {}
+                let drain = async {
+                    while let Some(chunk) = output.next().await {
+                        match chunk? {
+                            LogOutput::StdOut { message } => stdout.append(&message),
+                            LogOutput::StdErr { message } => stderr.append(&message),
+                            LogOutput::Console { message } => stdout.append(&message),
+                            LogOutput::StdIn { .. } => {}
+                        }
+                    }
+                    Ok::<(), BollardError>(())
+                };
+                match tokio::time::timeout_at(deadline, drain).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        self.recover_timed_out_exec(protocol, instance_id, &name, &operation)
+                            .await?;
+                        return Err(DockerError::ExecTimedOut {
+                            container: name,
+                            operation,
+                            timeout_seconds: DOCKER_EXEC_TIMEOUT.as_secs(),
+                        });
                     }
                 }
             }
@@ -638,19 +728,102 @@ impl DockerRuntime {
         let inspect = self.docker.inspect_exec(&exec.id).await?;
         let exit_code = inspect.exit_code.unwrap_or_default();
         let output = CommandOutput {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout: stdout.into_string(),
+            stderr: stderr.into_string(),
         };
         if exit_code == 0 {
             Ok(output)
         } else {
+            tracing::warn!(
+                container = %name,
+                %operation,
+                exit_code,
+                "docker exec failed"
+            );
             Err(DockerError::ExecFailed {
                 container: name,
-                command: display_command,
+                operation,
                 exit_code,
-                stderr: output.stderr,
             })
         }
+    }
+
+    async fn recover_timed_out_exec(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container: &str,
+        operation: &str,
+    ) -> Result<(), DockerError> {
+        tracing::warn!(
+            %container,
+            %operation,
+            timeout_seconds = DOCKER_EXEC_TIMEOUT.as_secs(),
+            "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
+        );
+        match tokio::time::timeout(
+            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
+            self.docker.kill_container(
+                container,
+                Some(KillContainerOptions {
+                    signal: "SIGKILL".to_string(),
+                }),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(source)) => {
+                return Err(exec_recovery_error(container, operation, source));
+            }
+            Err(_) => {
+                return Err(exec_recovery_error(
+                    container,
+                    operation,
+                    format!(
+                        "container kill exceeded {} seconds",
+                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+        }
+
+        match tokio::time::timeout(
+            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
+            self.docker
+                .start_container(container, None::<StartContainerOptions>),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(source)) => {
+                return Err(exec_recovery_error(container, operation, source));
+            }
+            Err(_) => {
+                return Err(exec_recovery_error(
+                    container,
+                    operation,
+                    format!(
+                        "container restart exceeded {} seconds",
+                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+        }
+
+        self.wait_until_ready(
+            protocol,
+            instance_id,
+            DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT,
+        )
+        .await
+        .map_err(|error| exec_recovery_error(container, operation, error))?;
+        tracing::info!(
+            %container,
+            %operation,
+            "managed container recovered after docker exec timeout"
+        );
+        Ok(())
     }
 
     pub async fn exec_shell(
@@ -665,6 +838,142 @@ impl DockerRuntime {
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
         )
         .await
+    }
+
+    pub async fn upload_file(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        host_path: &Path,
+        container_path: &str,
+    ) -> Result<(), DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        let (container_parent, container_file_name) = container_file_parts(container_path)?;
+        let metadata = tokio::fs::symlink_metadata(host_path)
+            .await
+            .map_err(|source| DockerError::FileTransferIo {
+                path: host_path.display().to_string(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DockerError::InvalidTransferSource {
+                path: host_path.display().to_string(),
+            });
+        }
+        if metadata.len() > MAX_CONTAINER_TRANSFER_BYTES {
+            return Err(DockerError::FileTransferTooLarge {
+                path: host_path.display().to_string(),
+                size: metadata.len(),
+                max_bytes: MAX_CONTAINER_TRANSFER_BYTES,
+            });
+        }
+
+        let (uid, gid) = self
+            .configured_container_user(protocol, instance_id)
+            .await?
+            .as_deref()
+            .and_then(numeric_container_user)
+            .unwrap_or((0, 0));
+
+        let file = tokio::fs::File::open(host_path).await.map_err(|source| {
+            DockerError::FileTransferIo {
+                path: host_path.display().to_string(),
+                source,
+            }
+        })?;
+        let header = transfer_tar_header(&container_file_name, metadata.len(), uid, gid)?;
+        let trailer_len = tar_padding(metadata.len()) + 1024;
+        let stream = stream::once(async move { Ok::<Bytes, IoError>(header) })
+            .chain(ReaderStream::new(tokio::io::AsyncReadExt::take(
+                file,
+                metadata.len(),
+            )))
+            .chain(stream::once(async move {
+                Ok::<Bytes, IoError>(Bytes::from(vec![0_u8; trailer_len]))
+            }));
+
+        match tokio::time::timeout(
+            FILE_TRANSFER_TIMEOUT,
+            self.docker.upload_to_container(
+                &container,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path(&container_parent)
+                        .no_overwrite_dir_non_dir("true")
+                        .copy_uidgid("true")
+                        .build(),
+                ),
+                body_try_stream(stream),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                return Err(DockerError::FileTransferTimedOut {
+                    direction: "upload",
+                    path: host_path.display().to_string(),
+                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn download_file(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container_path: &str,
+        host_path: &Path,
+    ) -> Result<(), DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        let (_, expected_file_name) = container_file_parts(container_path)?;
+        let async_deadline = tokio::time::Instant::now() + FILE_TRANSFER_TIMEOUT;
+        let blocking_deadline = Instant::now() + FILE_TRANSFER_TIMEOUT;
+        let stream = self
+            .docker
+            .download_from_container(
+                &container,
+                Some(
+                    DownloadFromContainerOptionsBuilder::default()
+                        .path(container_path)
+                        .build(),
+                ),
+            )
+            .map_err(IoError::other);
+        let stream = stream_with_deadline(stream, async_deadline).boxed();
+        let reader = StreamReader::new(stream);
+        let bridge = SyncIoBridge::new(reader);
+        let host_path = host_path.to_path_buf();
+        let error_path = host_path.display().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            extract_single_regular_file_with_constraints(
+                bridge,
+                &expected_file_name,
+                &host_path,
+                MAX_CONTAINER_TRANSFER_BYTES,
+                blocking_deadline,
+            )
+        })
+        .await
+        .map_err(|error| DockerError::FileTransferTask(error.to_string()))?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == ErrorKind::TimedOut => {
+                Err(DockerError::FileTransferTimedOut {
+                    direction: "download",
+                    path: error_path,
+                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
+                })
+            }
+            Err(source) => Err(DockerError::FileTransferIo {
+                path: error_path,
+                source,
+            }),
+        }
     }
 
     pub async fn remove_managed_containers(&self) -> Result<usize, DockerError> {
@@ -813,6 +1122,289 @@ async fn ensure_bind_mount_file(path: &std::path::Path) -> Result<(), DockerErro
     Ok(())
 }
 
+fn container_file_parts(container_path: &str) -> Result<(String, String), DockerError> {
+    let path = Path::new(container_path);
+    let valid = path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+    let parent = path.parent().and_then(Path::to_str);
+    let file_name = path.file_name().and_then(|value| value.to_str());
+    match (valid, parent, file_name) {
+        (true, Some(parent), Some(file_name)) if !file_name.is_empty() => {
+            Ok((parent.to_string(), file_name.to_string()))
+        }
+        _ => Err(DockerError::InvalidContainerTransferPath {
+            path: container_path.to_string(),
+        }),
+    }
+}
+
+fn numeric_container_user(user: &str) -> Option<(u64, u64)> {
+    let (uid, gid) = user.trim().split_once(':').unwrap_or((user.trim(), ""));
+    let uid = uid.parse::<u64>().ok()?;
+    let gid = if gid.is_empty() {
+        uid
+    } else {
+        gid.parse::<u64>().ok()?
+    };
+    Some((uid, gid))
+}
+
+fn transfer_tar_header(
+    file_name: &str,
+    size: u64,
+    uid: u64,
+    gid: u64,
+) -> Result<Bytes, DockerError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o600);
+    header.set_uid(uid);
+    header.set_gid(gid);
+    header.set_mtime(0);
+    header.set_size(size);
+    header
+        .set_path(file_name)
+        .map_err(|source| DockerError::FileTransferIo {
+            path: file_name.to_string(),
+            source,
+        })?;
+    header.set_cksum();
+    Ok(Bytes::copy_from_slice(header.as_bytes()))
+}
+
+fn tar_padding(size: u64) -> usize {
+    ((512 - (size % 512)) % 512) as usize
+}
+
+fn stream_with_deadline<S>(
+    source: S,
+    deadline: tokio::time::Instant,
+) -> impl Stream<Item = Result<Bytes, IoError>>
+where
+    S: Stream<Item = Result<Bytes, IoError>> + Unpin,
+{
+    stream::unfold((source, false), move |(mut source, finished)| async move {
+        if finished {
+            return None;
+        }
+        match tokio::time::timeout_at(deadline, source.next()).await {
+            Ok(Some(Ok(bytes))) => Some((Ok(bytes), (source, false))),
+            Ok(Some(Err(error))) => Some((Err(error), (source, true))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "container file transfer exceeded time limit",
+                )),
+                (source, true),
+            )),
+        }
+    })
+}
+
+#[cfg(test)]
+fn extract_single_regular_file<R: Read>(
+    reader: R,
+    expected_file_name: &str,
+    host_path: &Path,
+) -> Result<(), IoError> {
+    extract_single_regular_file_with_limit(
+        reader,
+        expected_file_name,
+        host_path,
+        MAX_CONTAINER_TRANSFER_BYTES,
+    )
+}
+
+#[cfg(test)]
+fn extract_single_regular_file_with_limit<R: Read>(
+    reader: R,
+    expected_file_name: &str,
+    host_path: &Path,
+    max_bytes: u64,
+) -> Result<(), IoError> {
+    extract_single_regular_file_with_constraints(
+        reader,
+        expected_file_name,
+        host_path,
+        max_bytes,
+        Instant::now() + FILE_TRANSFER_TIMEOUT,
+    )
+}
+
+fn extract_single_regular_file_with_constraints<R: Read>(
+    reader: R,
+    expected_file_name: &str,
+    host_path: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<(), IoError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = host_path
+        .parent()
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "download target has no parent"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "download target parent must be a real directory",
+        ));
+    }
+
+    let mut created_path = false;
+    let result = (|| {
+        let mut archive = tar::Archive::new(reader);
+        let mut extracted = false;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if !entry.header().entry_type().is_file() {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "container download contained a non-file entry",
+                ));
+            }
+            let entry_path = entry.path()?;
+            let safe_path = entry_path
+                .components()
+                .all(|component| matches!(component, Component::CurDir | Component::Normal(_)));
+            if !safe_path
+                || entry_path.file_name().and_then(|value| value.to_str())
+                    != Some(expected_file_name)
+                || extracted
+            {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "container download contained an unexpected archive path",
+                ));
+            }
+
+            let expected_size = entry.header().size()?;
+            if expected_size > max_bytes {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("container download exceeds the configured {max_bytes}-byte limit"),
+                ));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let mut output = options.open(host_path)?;
+            created_path = true;
+            let copied = copy_download_entry(&mut entry, &mut output, max_bytes, deadline)?;
+            if copied != expected_size {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "container download ended before the declared file size",
+                ));
+            }
+            ensure_file_transfer_deadline(deadline)?;
+            output.flush()?;
+            output.sync_all()?;
+            ensure_file_transfer_deadline(deadline)?;
+            extracted = true;
+        }
+        if !extracted {
+            return Err(IoError::new(
+                ErrorKind::NotFound,
+                "container download did not contain the requested file",
+            ));
+        }
+        Ok(())
+    })();
+
+    if result.is_err() && created_path {
+        let _ = std::fs::remove_file(host_path);
+    }
+    result
+}
+
+fn copy_download_entry<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    max_bytes: u64,
+    deadline: Instant,
+) -> Result<u64, IoError> {
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        ensure_file_transfer_deadline(deadline)?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        copied = copied.checked_add(read as u64).ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "container download size overflow")
+        })?;
+        if copied > max_bytes {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!("container download exceeds the configured {max_bytes}-byte limit"),
+            ));
+        }
+        writer.write_all(&buffer[..read])?;
+    }
+}
+
+fn ensure_file_transfer_deadline(deadline: Instant) -> Result<(), IoError> {
+    if Instant::now() >= deadline {
+        return Err(IoError::new(
+            ErrorKind::TimedOut,
+            "container file transfer exceeded time limit",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CappedExecOutput {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+impl CappedExecOutput {
+    fn append(&mut self, chunk: &[u8]) {
+        if chunk.len() >= MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL {
+            let discarded_output = self.truncated
+                || !self.bytes.is_empty()
+                || chunk.len() > MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL;
+            self.bytes.clear();
+            self.bytes.extend(
+                chunk[chunk.len() - MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL..]
+                    .iter()
+                    .copied(),
+            );
+            self.truncated = discarded_output;
+            return;
+        }
+
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+            self.truncated = true;
+        }
+        self.bytes.extend(chunk.iter().copied());
+    }
+
+    fn into_string(self) -> String {
+        let bytes: Vec<u8> = self.bytes.into_iter().collect();
+        let retained = String::from_utf8_lossy(&bytes);
+        if self.truncated {
+            format!("{EXEC_OUTPUT_TRUNCATION_MARKER}{retained}")
+        } else {
+            retained.into_owned()
+        }
+    }
+}
+
 fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
     if !enforce_disk_limits || disk_mib == 0 {
         None
@@ -824,6 +1416,38 @@ fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<Strin
     }
 }
 
+fn exec_recovery_error(
+    container: &str,
+    operation: &str,
+    reason: impl std::fmt::Display,
+) -> DockerError {
+    DockerError::ExecRecoveryFailed {
+        container: container.to_string(),
+        operation: operation.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn verify_managed_instance_labels(
+    labels: &HashMap<String, String>,
+    container: &str,
+    protocol: Protocol,
+    instance_id: &str,
+) -> Result<(), DockerError> {
+    let is_expected = labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
+        && labels.get(INSTANCE_LABEL).map(String::as_str) == Some(instance_id)
+        && labels.get(PROTOCOL_LABEL).map(String::as_str) == Some(protocol.as_str());
+    if is_expected {
+        Ok(())
+    } else {
+        Err(DockerError::UntrustedContainerNameCollision {
+            container: container.to_string(),
+            instance_id: instance_id.to_string(),
+            protocol: protocol.as_str().to_string(),
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
     #[error(transparent)]
@@ -832,6 +1456,12 @@ pub enum DockerError {
     Api(#[from] BollardError),
     #[error("docker security policy rejected spec: {0}")]
     Security(#[from] security::DockerSecurityError),
+    #[error("invalid container resource limits: {0}")]
+    ResourceLimit(#[from] ResourceLimitError),
+    #[error("cpu limit {cpu_cores} cannot be represented in Docker nano-CPU units")]
+    CpuLimitConversion { cpu_cores: f64 },
+    #[error("memory limit {memory_mib} MiB cannot be represented in Docker bytes")]
+    MemoryLimitConversion { memory_mib: u64 },
     #[error("failed to prepare bind mount source {path}: {source}")]
     MountSourceIo {
         path: String,
@@ -839,6 +1469,37 @@ pub enum DockerError {
     },
     #[error("invalid bind mount source {path}: {reason}")]
     InvalidMountSource { path: String, reason: String },
+    #[error("invalid file-transfer source {path}: expected a real regular file")]
+    InvalidTransferSource { path: String },
+    #[error("invalid container file-transfer path {path}")]
+    InvalidContainerTransferPath { path: String },
+    #[error(
+        "refusing to modify same-name container {container}: it does not have the complete DBE ownership labels for instance {instance_id} and protocol {protocol}"
+    )]
+    UntrustedContainerNameCollision {
+        container: String,
+        instance_id: String,
+        protocol: String,
+    },
+    #[error("file transfer failed for {path}: {source}")]
+    FileTransferIo {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("file transfer {direction} for {path} exceeded the {timeout_seconds}-second deadline")]
+    FileTransferTimedOut {
+        direction: &'static str,
+        path: String,
+        timeout_seconds: u64,
+    },
+    #[error("file transfer source {path} is {size} bytes; maximum is {max_bytes} bytes")]
+    FileTransferTooLarge {
+        path: String,
+        size: u64,
+        max_bytes: u64,
+    },
+    #[error("file transfer task failed: {0}")]
+    FileTransferTask(String),
     #[error("docker stats stream ended without data")]
     EmptyStatsStream,
     #[error("docker disk limit probe failed for image {image}: {source}")]
@@ -883,14 +1544,25 @@ pub enum DockerError {
         expected_internal: bool,
         existing_internal: Option<bool>,
     },
-    #[error(
-        "docker exec failed in {container} with exit code {exit_code}: {command}; stderr: {stderr}"
-    )]
+    #[error("docker exec failed in {container} with exit code {exit_code}: {operation}")]
     ExecFailed {
         container: String,
-        command: String,
+        operation: String,
         exit_code: i64,
-        stderr: String,
+    },
+    #[error(
+        "docker exec timed out after {timeout_seconds} seconds in {container}: {operation}; the container was restarted to cancel the command"
+    )]
+    ExecTimedOut {
+        container: String,
+        operation: String,
+        timeout_seconds: u64,
+    },
+    #[error("failed to recover from timed-out docker exec in {container} ({operation}): {reason}")]
+    ExecRecoveryFailed {
+        container: String,
+        operation: String,
+        reason: String,
     },
     #[error("docker json serialization failed: {0}")]
     Json(#[from] serde_json::Error),

@@ -96,6 +96,22 @@ impl InstanceRepository {
         let runtime_kind = metadata.runtime.kind.as_str();
         let limits_json = serde_json::to_string(&metadata.limits)?;
         let metadata_json = serde_json::to_string(metadata)?;
+        let mariadb_native_password_sha1_stage2 = self.protect_route_secret(
+            "mariadb_native_password_sha1_stage2",
+            &metadata.instance_id,
+            metadata.mariadb_native_password_sha1_stage2.as_deref(),
+        )?;
+        let mariadb_root_password = self.protect_route_secret(
+            "mariadb_root_password",
+            &metadata.instance_id,
+            metadata.mariadb_root_password.as_deref(),
+        )?;
+        let mongodb_root_password = self.protect_route_secret(
+            "mongodb_root_password",
+            &metadata.instance_id,
+            metadata.mongodb_root_password.as_deref(),
+        )?;
+        let mut transaction = self.pool.begin().await?;
 
         sqlx::query(
             r#"
@@ -161,24 +177,8 @@ impl InstanceRepository {
         .bind(metadata_json)
         .bind(&metadata.created_at)
         .bind(&metadata.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
-
-        let mariadb_native_password_sha1_stage2 = self.protect_route_secret(
-            "mariadb_native_password_sha1_stage2",
-            &metadata.instance_id,
-            metadata.mariadb_native_password_sha1_stage2.as_deref(),
-        )?;
-        let mariadb_root_password = self.protect_route_secret(
-            "mariadb_root_password",
-            &metadata.instance_id,
-            metadata.mariadb_root_password.as_deref(),
-        )?;
-        let mongodb_root_password = self.protect_route_secret(
-            "mongodb_root_password",
-            &metadata.instance_id,
-            metadata.mongodb_root_password.as_deref(),
-        )?;
 
         if metadata.mariadb_native_password_sha1_stage2.is_some()
             || metadata.mariadb_root_password.is_some()
@@ -206,15 +206,16 @@ impl InstanceRepository {
             .bind(&mariadb_root_password)
             .bind(&mongodb_root_password)
             .bind(&metadata.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         } else {
             sqlx::query("DELETE FROM instance_route_auth WHERE instance_id = ?1")
                 .bind(&metadata.instance_id)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await?;
         }
 
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -295,15 +296,17 @@ impl InstanceRepository {
     }
 
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {
+        let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM instance_route_auth WHERE instance_id = ?1")
             .bind(instance_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
 
         let result = sqlx::query("DELETE FROM instance_metadata WHERE instance_id = ?1")
             .bind(instance_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -405,6 +408,74 @@ mod tests {
 
         assert!(repository.delete("inst_abc").await.unwrap());
         assert!(repository.get("inst_abc").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_metadata_rejects_duplicate_database_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let first = sample_metadata();
+        let mut duplicate = sample_metadata();
+        duplicate.instance_id = "inst_other".to_string();
+        duplicate.runtime.container_name = "dbe-postgres-inst_other".to_string();
+
+        repository.upsert(&first).await.unwrap();
+
+        assert!(matches!(
+            repository.upsert(&duplicate).await,
+            Err(RepositoryError::Sqlx(sqlx::Error::Database(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_metadata_allows_same_database_for_a_distinct_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let first = sample_metadata();
+        let mut distinct_route = sample_metadata();
+        distinct_route.instance_id = "inst_other".to_string();
+        distinct_route.database.username = "other_user".to_string();
+        distinct_route.runtime.container_name = "dbe-postgres-inst_other".to_string();
+
+        repository.upsert(&first).await.unwrap();
+        repository.upsert(&distinct_route).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_metadata_rejects_duplicate_redis_usernames() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let mut first = sample_metadata();
+        first.protocol = Protocol::Redis;
+        let mut duplicate = first.clone();
+        duplicate.instance_id = "inst_other".to_string();
+        duplicate.database.name = "another_database".to_string();
+        duplicate.runtime.container_name = "dbe-redis-inst_other".to_string();
+
+        repository.upsert(&first).await.unwrap();
+
+        assert!(repository.upsert(&duplicate).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_metadata_rejects_duplicate_qdrant_route_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let mut first = sample_metadata();
+        first.protocol = Protocol::Qdrant;
+        first.route_key_sha256 = Some("same-route-key".to_string());
+        let mut duplicate = first.clone();
+        duplicate.instance_id = "inst_other".to_string();
+        duplicate.database.name = "another_database".to_string();
+        duplicate.runtime.container_name = "dbe-qdrant-inst_other".to_string();
+
+        repository.upsert(&first).await.unwrap();
+
+        assert!(repository.upsert(&duplicate).await.is_err());
     }
 
     #[tokio::test]

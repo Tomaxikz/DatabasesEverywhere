@@ -22,6 +22,8 @@ pub struct IssueWsTokenRequest {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub instances: Vec<String>,
+    #[serde(default)]
+    pub all_instances: bool,
     pub ttl_seconds: Option<i64>,
 }
 
@@ -46,6 +48,7 @@ pub async fn issue_ws_token(
         request.subject.trim(),
         request.scopes.clone(),
         request.instances.clone(),
+        request.all_instances,
         ttl_seconds,
     )
     .map_err(|error| ApiError::Runtime(error.to_string()))?;
@@ -55,6 +58,7 @@ pub async fn issue_ws_token(
         subject = %request.subject,
         scopes = ?request.scopes,
         instances = ?request.instances,
+        all_instances = request.all_instances,
         expires_at_unix,
     );
 
@@ -73,6 +77,25 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
     }
     if request.scopes.is_empty() {
         return Err(ApiError::BadRequest("scopes must not be empty".to_string()));
+    }
+    if request.all_instances && !request.instances.is_empty() {
+        return Err(ApiError::BadRequest(
+            "all_instances=true may not be combined with an instance allow-list".to_string(),
+        ));
+    }
+    if !request.all_instances && request.instances.is_empty() {
+        return Err(ApiError::BadRequest(
+            "provide at least one instance or explicitly set all_instances=true".to_string(),
+        ));
+    }
+    if request.instances.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "instances may contain at most 256 entries".to_string(),
+        ));
+    }
+    for instance_id in &request.instances {
+        crate::shared::ids::validate_instance_id(instance_id)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     }
     for scope in &request.scopes {
         if !known_scope(scope) {
@@ -97,4 +120,33 @@ fn known_scope(scope: &str) -> bool {
             | scopes::IMPORT_EXPORT_WRITE
             | scopes::RECOVERY_ADMIN
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(instances: Vec<&str>, all_instances: bool) -> IssueWsTokenRequest {
+        IssueWsTokenRequest {
+            subject: "panel-user".to_string(),
+            scopes: vec![scopes::MONITOR_READ.to_string()],
+            instances: instances.into_iter().map(str::to_string).collect(),
+            all_instances,
+            ttl_seconds: Some(60),
+        }
+    }
+
+    #[test]
+    fn empty_instance_scope_is_not_implicitly_node_wide() {
+        assert!(matches!(
+            validate_request(&request(Vec::new(), false)),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn node_wide_scope_must_be_explicit_and_unambiguous() {
+        validate_request(&request(Vec::new(), true)).unwrap();
+        assert!(validate_request(&request(vec!["inst_one"], true)).is_err());
+    }
 }

@@ -15,7 +15,6 @@ pub const IMPORT_EXPORT_WRITE: &str = "import-export:write";
 pub const RECOVERY_ADMIN: &str = "recovery:admin";
 pub const IMAGES_ADMIN: &str = "images:admin";
 pub const CONFIG_ADMIN: &str = "config:admin";
-pub const UPGRADES_ADMIN: &str = "upgrades:admin";
 pub const WS_TOKENS_WRITE: &str = "ws-tokens:write";
 
 pub const MONITOR_READ: &str = "monitor:read";
@@ -37,7 +36,6 @@ pub const KNOWN: &[&str] = &[
     RECOVERY_ADMIN,
     IMAGES_ADMIN,
     CONFIG_ADMIN,
-    UPGRADES_ADMIN,
     WS_TOKENS_WRITE,
     MONITOR_READ,
 ];

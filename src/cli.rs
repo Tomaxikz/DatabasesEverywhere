@@ -1,7 +1,7 @@
 use std::{
     fs,
-    io::{ErrorKind, Read},
-    net::{IpAddr, ToSocketAddrs},
+    io::{ErrorKind, Read, Write},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::Arc,
@@ -13,6 +13,7 @@ use anyhow::Context;
 use axum::Router;
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::{Parser, Subcommand};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -34,6 +35,8 @@ use crate::{
         import_export_jobs::ImportExportJobRepository, repositories::InstanceRepository, sqlite,
     },
 };
+
+const IMPORT_EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Parser)]
 #[command(name = "dbev")]
@@ -71,6 +74,9 @@ enum Command {
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    // Keep this call for library consumers that invoke the CLI without using
+    // the bundled binary entry point. Setting the same mask twice is harmless.
+    harden_process_file_creation();
     let cli = Cli::parse();
     if cli.setup {
         init_stdout_logging();
@@ -99,6 +105,17 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Restrict default permissions before the process creates logs, state, or
+/// runtime files. Explicitly requested modes can still be tightened further.
+pub fn harden_process_file_creation() {
+    #[cfg(unix)]
+    {
+        use rustix::fs::Mode;
+
+        rustix::process::umask(Mode::RWXG | Mode::RWXO);
+    }
+}
+
 const SERVICE_USER: &str = "databases-everywhere";
 const SERVICE_GROUP: &str = "databases-everywhere";
 const SERVICE_PATH: &str = "/etc/systemd/system/databases-everywhere.service";
@@ -107,9 +124,10 @@ const INSTALL_PATH: &str = "/usr/local/bin/dbev";
 
 async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     ensure_root()?;
-    ensure_required_setup_commands()?;
+    validate_setup_config_path(&config_path)?;
     require_existing_config(&config_path)?;
     let config = load_config(&config_path)?;
+    ensure_required_setup_commands(config.disk.mode)?;
     ensure_group(SERVICE_GROUP)?;
     ensure_user(SERVICE_USER, SERVICE_GROUP)?;
     add_user_to_runtime_group_if_exists(SERVICE_USER, config.daemon.engine)?;
@@ -117,10 +135,10 @@ async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     install_current_binary(Path::new(INSTALL_PATH))?;
     secure_config_permissions(&config_path)?;
     ensure_system_directories(&config_path)?;
-    write_sudoers()?;
+    configure_quota_sudoers(config.disk.mode)?;
     validate_runtime_support(&config).await?;
-    write_systemd_service(&config_path)?;
-    reload_systemd();
+    write_systemd_service(&config_path, config.daemon.engine, config.disk.mode)?;
+    reload_systemd()?;
     println!("system setup complete");
     println!("config read from: {}", config_path.display());
     println!("node uuid: {}", config.uuid);
@@ -137,8 +155,35 @@ async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_required_setup_commands() -> anyhow::Result<()> {
-    for command in ["sudo", "useradd", "groupadd", "usermod", "chown"] {
+fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<()> {
+    if !config_path.is_absolute()
+        || config_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("setup requires an absolute config path without parent traversal");
+    }
+    let value = config_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("setup config path must be valid UTF-8"))?;
+    if value
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || b"/._-".contains(&byte)))
+    {
+        anyhow::bail!(
+            "setup config path may contain only ASCII letters, digits, '/', '.', '_', and '-'"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_required_setup_commands(disk_mode: DiskLimitMode) -> anyhow::Result<()> {
+    let mut commands = vec!["useradd", "groupadd", "usermod", "chown"];
+    if disk_mode == DiskLimitMode::ProjectQuota {
+        commands.push("sudo");
+        commands.push("visudo");
+    }
+    for command in commands {
         if !command_exists(command)? {
             anyhow::bail!("required setup command {command} was not found");
         }
@@ -171,13 +216,15 @@ fn ensure_fuse_quota_host_config(config: &Config) -> anyhow::Result<()> {
         FuseConfUpdate::Updated(updated) => contents = updated,
     }
 
-    fs::write(path, contents).with_context(|| {
+    atomic_replace_setup_file(path, 0o644, "fuse configuration", |file| {
+        file.write_all(contents.as_bytes())
+    })
+    .with_context(|| {
         format!(
             "failed to write {}; for Docker installs, do not mount this file read-only, or add user_allow_other on the host before starting dbev",
             path.display()
         )
     })?;
-    set_mode(path, 0o644)?;
     println!("enabled fuse allow_other support in /etc/fuse.conf");
     Ok(())
 }
@@ -339,15 +386,52 @@ fn add_user_to_runtime_group_if_exists(user: &str, engine: DaemonEngine) -> anyh
 fn install_current_binary(destination: &Path) -> anyhow::Result<()> {
     let current = std::env::current_exe().context("failed to resolve current executable")?;
     if current != destination {
-        fs::copy(&current, destination).with_context(|| {
+        use rustix::fs::{FileType, Mode, OFlags};
+
+        let source_fd = rustix::fs::open(
+            &current,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("failed to open current executable {}", current.display()))?;
+        let source_stat = rustix::fs::fstat(&source_fd)
+            .map_err(std::io::Error::from)
+            .with_context(|| {
+                format!("failed to inspect current executable {}", current.display())
+            })?;
+        if FileType::from_raw_mode(source_stat.st_mode) != FileType::RegularFile {
+            anyhow::bail!(
+                "current executable {} must be a real regular file",
+                current.display()
+            );
+        }
+        let mut source = fs::File::from(source_fd);
+        atomic_replace_setup_file(destination, 0o755, "installed daemon binary", |target| {
+            std::io::copy(&mut source, target).map(|_| ())
+        })
+        .with_context(|| {
             format!(
                 "failed to install {} to {}",
                 current.display(),
                 destination.display()
             )
         })?;
+    } else {
+        use std::os::unix::fs::MetadataExt;
+
+        validate_setup_replace_target(destination, "installed daemon binary")?;
+        validate_setup_parent_directory(
+            destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("installed daemon path has no parent"))?,
+            "installed daemon binary",
+        )?;
+        if fs::symlink_metadata(destination)?.uid() != 0 {
+            anyhow::bail!("installed daemon binary must be owned by root");
+        }
+        set_mode(destination, 0o755)?;
     }
-    set_mode(destination, 0o755)?;
     Ok(())
 }
 
@@ -365,6 +449,49 @@ fn require_existing_config(config_path: &Path) -> anyhow::Result<()> {
 }
 
 fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()> {
+    let config_metadata = fs::symlink_metadata(config_path)
+        .with_context(|| format!("failed to inspect config {}", config_path.display()))?;
+    if config_metadata.file_type().is_symlink() || !config_metadata.is_file() {
+        anyhow::bail!(
+            "config {} must be a real regular file, not a symlink",
+            config_path.display()
+        );
+    }
+    let config_parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path must have a dedicated parent directory"))?;
+    if config_parent == Path::new("/")
+        || config_parent
+            .parent()
+            .is_none_or(|parent| parent == Path::new("/"))
+    {
+        anyhow::bail!(
+            "config {} must be stored in a dedicated subdirectory so atomic updates do not require write access to a top-level system directory",
+            config_path.display()
+        );
+    }
+    let parent_metadata = fs::symlink_metadata(config_parent).with_context(|| {
+        format!(
+            "failed to inspect config directory {}",
+            config_parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        anyhow::bail!(
+            "config directory {} must be a real directory, not a symlink",
+            config_parent.display()
+        );
+    }
+    run_setup_command(
+        "chown",
+        &[
+            &format!("root:{SERVICE_GROUP}"),
+            &config_parent.display().to_string(),
+        ],
+    )?;
+    // Same-directory atomic config replacement requires create and rename
+    // access. Only root and the dedicated service group can enter this folder.
+    set_mode(config_parent, 0o770)?;
     run_setup_command(
         "chown",
         &[
@@ -372,7 +499,9 @@ fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()> {
             &config_path.display().to_string(),
         ],
     )?;
-    set_mode(config_path, 0o640)?;
+    // The daemon persists validated config-admin changes, while ownership and
+    // group membership still prevent access by unrelated local users.
+    set_mode(config_path, 0o660)?;
     Ok(())
 }
 
@@ -381,6 +510,7 @@ fn ensure_system_directories(config_path: &Path) -> anyhow::Result<()> {
     let paths = configured_runtime_roots(&config);
     for path in &paths {
         fs::create_dir_all(path).with_context(|| format!("failed to create {path}"))?;
+        harden_runtime_directory(Path::new(path), RuntimeDirectoryOwner::SetupManaged)?;
     }
     for path in &paths {
         run_setup_command(
@@ -391,11 +521,16 @@ fn ensure_system_directories(config_path: &Path) -> anyhow::Result<()> {
                 path.as_str(),
             ],
         )?;
+        harden_runtime_directory(Path::new(path), RuntimeDirectoryOwner::SetupManaged)?;
     }
     Ok(())
 }
 
-fn write_sudoers() -> anyhow::Result<()> {
+fn configure_quota_sudoers(disk_mode: DiskLimitMode) -> anyhow::Result<()> {
+    if disk_mode != DiskLimitMode::ProjectQuota {
+        return remove_managed_sudoers();
+    }
+
     let contents = format!(
         r#"# Managed by DatabasesEverywhere --setup.
 # Allows the non-root daemon to apply host filesystem quotas only.
@@ -403,49 +538,264 @@ Cmnd_Alias DBE_QUOTA = /usr/sbin/quotaon, /sbin/quotaon, /usr/sbin/setquota, /sb
 {SERVICE_USER} ALL=(root) NOPASSWD: DBE_QUOTA
 "#
     );
-    fs::write(SUDOERS_PATH, contents).context("failed to write sudoers file")?;
-    set_mode(Path::new(SUDOERS_PATH), 0o440)?;
+    let sudoers_path = Path::new(SUDOERS_PATH);
+    match fs::symlink_metadata(sudoers_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            anyhow::bail!("sudoers path {SUDOERS_PATH} must be a real regular file");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
+    }
+    let parent = sudoers_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("sudoers path has no parent directory"))?;
+    let temporary = parent.join(format!(
+        ".databases-everywhere.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o440);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        set_mode(&temporary, 0o440)?;
+        if command_exists("visudo")? {
+            run_setup_command("visudo", &["-cf", &temporary.display().to_string()])?;
+        }
+        fs::rename(&temporary, sudoers_path).context("failed to install sudoers file")?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
     if command_exists("visudo")? {
         run_setup_command("visudo", &["-cf", SUDOERS_PATH])?;
     }
     Ok(())
 }
 
-fn write_systemd_service(config_path: &Path) -> anyhow::Result<()> {
+fn remove_managed_sudoers() -> anyhow::Result<()> {
+    let path = Path::new(SUDOERS_PATH);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            anyhow::bail!("sudoers path {SUDOERS_PATH} must be a real regular file");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
+    };
+    if !contents.starts_with("# Managed by DatabasesEverywhere --setup.\n") {
+        anyhow::bail!(
+            "refusing to remove unmanaged sudoers file {SUDOERS_PATH}; review it manually"
+        );
+    }
+    fs::remove_file(path).context("failed to remove obsolete managed sudoers file")?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn write_systemd_service(
+    config_path: &Path,
+    engine: DaemonEngine,
+    disk_mode: DiskLimitMode,
+) -> anyhow::Result<()> {
     let exec_start = if config_path == Path::new(defaults::CONFIG_PATH) {
         INSTALL_PATH.to_string()
     } else {
         format!("{INSTALL_PATH} --config {}", config_path.display())
     };
+    let config_parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;
+    let (engine_unit, runtime_group) = match engine {
+        DaemonEngine::Docker => ("docker.service", "docker"),
+        DaemonEngine::Podman => ("podman.socket", "podman"),
+    };
+    let config_parent_for_unit = config_parent.display();
+    let sudo_environment = if disk_mode == DiskLimitMode::ProjectQuota {
+        "Environment=DBE_USE_SUDO=1\n"
+    } else {
+        ""
+    };
+    let privilege_hardening = match disk_mode {
+        // Non-root FuseQuota relies on the host's setuid fusermount helper.
+        DiskLimitMode::FuseQuota | DiskLimitMode::ProjectQuota => "",
+        DiskLimitMode::Advisory | DiskLimitMode::DockerStorageOpt => {
+            "NoNewPrivileges=true\nRestrictSUIDSGID=true\n"
+        }
+    };
     let contents = format!(
         r#"[Unit]
 Description=DatabasesEverywhere
-After=docker.service
-Requires=docker.service
+After={engine_unit}
+Requires={engine_unit}
 
 [Service]
 Type=simple
 User={SERVICE_USER}
 Group={SERVICE_GROUP}
-SupplementaryGroups=docker
-Environment=DBE_USE_SUDO=1
-ExecStart={exec_start} daemon
+SupplementaryGroups={runtime_group}
+{sudo_environment}ExecStart={exec_start} daemon
 Restart=always
 RestartSec=5
+TimeoutStopSec=21min
 LimitNOFILE=1048576
+{privilege_hardening}UMask=0077
+RuntimeDirectory=dbev
+RuntimeDirectoryMode=0700
+StateDirectory=dbev
+StateDirectoryMode=0700
+LogsDirectory=dbev
+LogsDirectoryMode=0700
+ProtectSystem=full
+ReadWritePaths={config_parent_for_unit}
+ProtectHome=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
 "#
     );
-    fs::write(SERVICE_PATH, contents).context("failed to write systemd service")?;
+    atomic_replace_setup_file(Path::new(SERVICE_PATH), 0o644, "systemd service", |file| {
+        file.write_all(contents.as_bytes())
+    })
+    .context("failed to write systemd service")?;
     Ok(())
 }
 
-fn reload_systemd() {
-    if command_exists("systemctl").unwrap_or(false) {
-        let _ = StdCommand::new("systemctl").arg("daemon-reload").status();
+fn reload_systemd() -> anyhow::Result<()> {
+    if command_exists("systemctl")? {
+        run_setup_command("systemctl", &["daemon-reload"])?;
     }
+    Ok(())
+}
+
+fn atomic_replace_setup_file(
+    path: &Path,
+    mode: u32,
+    label: &str,
+    write_contents: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    validate_setup_replace_target(path, label)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} path has no parent directory"))?;
+    validate_setup_parent_directory(parent, label)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{label} path has no file name"))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("failed to create temporary {label}"))?;
+        write_contents(&mut file).with_context(|| format!("failed to write temporary {label}"))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set temporary {label} permissions"))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temporary {label}"))?;
+        drop(file);
+        fs::rename(&temporary, path).with_context(|| format!("failed to install {label}"))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to sync {label} directory"))?;
+
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to verify installed {label}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o777 != mode
+        {
+            anyhow::bail!(
+                "installed {label} must be a root-owned, singly-linked regular file with mode {mode:o}"
+            );
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn validate_setup_replace_target(path: &Path, label: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.nlink() != 1 =>
+        {
+            anyhow::bail!(
+                "{label} {} must be a real, singly-linked regular file",
+                path.display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
+    }
+}
+
+fn validate_setup_parent_directory(parent: &Path, label: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("failed to inspect {label} directory {}", parent.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        anyhow::bail!(
+            "{label} directory {} must be a root-owned real directory not writable by group or others",
+            parent.display()
+        );
+    }
+    Ok(())
 }
 
 fn command_exists(program: &str) -> anyhow::Result<bool> {
@@ -498,6 +848,7 @@ fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 
 async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     let pool = sqlite::connect(std::path::Path::new(&config.paths.metadata_root()))
         .await
@@ -509,6 +860,7 @@ async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     let docker = DockerRuntime::new(&config.daemon, config.disk.mode.uses_docker_storage_opt())
         .context("failed to connect to container engine API")?;
@@ -526,6 +878,7 @@ async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     let metadata_root = config.paths.metadata_root();
     let data_root = std::path::Path::new(&metadata_root);
@@ -548,6 +901,7 @@ async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn migrate_paths(config_path: PathBuf, dry_run: bool, force: bool) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     let plan = PathMigrationPlan::new(&config);
     let actions = plan.actions();
@@ -921,6 +1275,7 @@ async fn disk_test(config_path: PathBuf, quota_mib: u64, write_mib: u64) -> anyh
     ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     validate_runtime_support(&config).await?;
 
@@ -1047,6 +1402,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let runtime_directories = ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     tracing::info!("\n{}", startup_banner());
     for directory in runtime_directories {
@@ -1069,6 +1425,10 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         api_ssl = config.api.ssl.enabled,
         "DatabasesEverywhere daemon starting"
     );
+    tracing::info!(
+        path = %Path::new(&config.paths.locks).join(DAEMON_LOCK_FILE).display(),
+        "exclusive daemon lock acquired"
+    );
     log_boot_configuration(&config, &config_path);
     ensure_fuse_quota_host_config(&config)
         .context("failed to prepare fuse quota host configuration")?;
@@ -1090,6 +1450,10 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
     let job_repository = ImportExportJobRepository::new(pool.clone());
+    let interrupted_running_instances = job_repository
+        .running_instance_ids()
+        .await
+        .context("failed to identify interrupted running import/export jobs")?;
     let failed_jobs = job_repository
         .fail_unfinished(
             "daemon restarted before import/export job completed",
@@ -1100,12 +1464,27 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     if failed_jobs > 0 {
         tracing::warn!(failed_jobs, "marked unfinished import/export jobs failed");
     }
+    let pruned_jobs = job_repository
+        .prune_completed(10_000)
+        .await
+        .context("failed to prune completed import/export jobs during startup")?;
+    if pruned_jobs > 0 {
+        tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
+    }
     let import_export_jobs = ImportExportJobs::with_repository(job_repository);
     let manager = InstanceManager::new(store.clone(), repository);
     manager
         .load_from_storage()
         .await
         .context("failed to load local instance metadata from sqlite")?;
+    let quarantined_interrupted_instances =
+        quarantine_interrupted_job_instances(&manager, &interrupted_running_instances).await?;
+    if quarantined_interrupted_instances > 0 {
+        tracing::warn!(
+            quarantined_interrupted_instances,
+            "quarantined instances with import/export jobs interrupted by an unclean shutdown"
+        );
+    }
 
     let mut docker = DockerRuntime::new(&config.daemon, config.disk.mode.uses_docker_storage_opt())
         .context("failed to connect to container engine API")?;
@@ -1166,15 +1545,26 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         running = reconcile_summary.running,
         stopped = reconcile_summary.stopped,
         failed = reconcile_summary.failed,
+        quarantined = reconcile_summary.quarantined,
         "instance metadata reconciled"
     );
     start_known_instances_on_boot(&config, &manager, &docker)
         .await
         .context("failed to persist boot instance reconciliation")?;
+    let postgres_role_hardening =
+        crate::api::instance_create::harden_postgres_roles_on_boot(&manager, &docker)
+            .await
+            .context("failed to harden legacy PostgreSQL tenant roles before opening gateways")?;
+    tracing::info!(
+        checked = postgres_role_hardening.checked,
+        hardened = postgres_role_hardening.hardened,
+        "legacy PostgreSQL role hardening complete"
+    );
 
     start_gateway_listeners(&config, store.clone())?;
     log_gateway_listener_summary(&config);
 
+    let shutdown_jobs = import_export_jobs.clone();
     let state = AppState {
         config: config.clone(),
         config_path: config_path.clone(),
@@ -1183,6 +1573,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         manager,
         docker,
         import_export_jobs,
+        instance_locks: crate::instances::locks::InstanceLocks::default(),
         api_rate_limiter: crate::api::security::ApiRateLimiter::new(
             config.security.api_rate_limit_per_minute,
         ),
@@ -1193,7 +1584,50 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     };
     crate::api::backups::start_scheduler(state.clone());
     crate::api::resources::start_resource_sampler(state.clone());
-    serve_api(&config, build_router(state)).await
+    let server_result = serve_api(&config, build_router(state), shutdown_jobs.clone()).await;
+    shutdown_jobs.close_admission();
+    if !shutdown_jobs
+        .wait_for_drain(IMPORT_EXPORT_DRAIN_TIMEOUT)
+        .await
+    {
+        anyhow::bail!(
+            "timed out after {} seconds waiting for import/export jobs to finish safely",
+            IMPORT_EXPORT_DRAIN_TIMEOUT.as_secs()
+        );
+    }
+    tracing::info!("active import/export jobs drained");
+    server_result
+}
+
+async fn quarantine_interrupted_job_instances(
+    manager: &InstanceManager,
+    instance_ids: &[String],
+) -> anyhow::Result<usize> {
+    let store = manager.store();
+    let mut quarantined = 0;
+    for instance_id in instance_ids {
+        let Some(mut metadata) = store.get(instance_id).await else {
+            tracing::warn!(
+                %instance_id,
+                "interrupted running import/export job references missing instance metadata"
+            );
+            continue;
+        };
+        metadata.status = InstanceStatus::Quarantined;
+        metadata.updated_at = crate::jobs::import_export::now_rfc3339();
+        manager
+            .upsert(metadata.clone())
+            .await
+            .with_context(|| format!("failed to quarantine interrupted instance {instance_id}"))?;
+        quarantined += 1;
+        tracing::warn!(
+            event = "audit interrupted_job_instance_quarantined",
+            %instance_id,
+            protocol = %metadata.protocol,
+            "quarantined instance before container reconciliation and gateway startup"
+        );
+    }
+    Ok(quarantined)
 }
 
 fn log_boot_configuration(config: &Config, config_path: &Path) {
@@ -1479,7 +1913,7 @@ async fn start_known_instances_on_boot(
             match reconciled.status {
                 InstanceStatus::Running => running += 1,
                 InstanceStatus::Stopped => stopped += 1,
-                InstanceStatus::Failed => failed += 1,
+                InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
                 InstanceStatus::Creating | InstanceStatus::Deleting => {}
             }
             manager.upsert(reconciled).await?;
@@ -1522,7 +1956,7 @@ async fn start_known_instances_on_boot(
         match reconciled.status {
             InstanceStatus::Running => running += 1,
             InstanceStatus::Stopped => stopped += 1,
-            InstanceStatus::Failed => failed += 1,
+            InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
             InstanceStatus::Creating | InstanceStatus::Deleting => {}
         }
         manager.upsert(reconciled).await?;
@@ -1663,9 +2097,184 @@ async fn ensure_runtime_directories(
         tokio::fs::create_dir_all(&path)
             .await
             .with_context(|| format!("failed to create configured directory {path}"))?;
+        harden_runtime_directory(Path::new(&path), RuntimeDirectoryOwner::CurrentProcess)?;
         statuses.push(RuntimeDirectoryStatus { path, existed });
     }
     Ok(statuses)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeDirectoryOwner {
+    SetupManaged,
+    CurrentProcess,
+}
+
+fn harden_runtime_directory(path: &Path, owner: RuntimeDirectoryOwner) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FileType, Mode, OFlags, fchmod, open};
+
+        let directory = open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "failed to securely open runtime directory {}; it must be a real directory, not a symlink",
+                path.display()
+            )
+        })?;
+        let stat = rustix::fs::fstat(&directory)
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("failed to inspect runtime directory {}", path.display()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            anyhow::bail!("runtime path {} must be a real directory", path.display());
+        }
+        if matches!(owner, RuntimeDirectoryOwner::CurrentProcess) {
+            require_runtime_directory_owner(
+                path,
+                stat.st_uid,
+                rustix::process::geteuid().as_raw(),
+            )?;
+        }
+        fchmod(&directory, Mode::RWXU)
+            .map_err(std::io::Error::from)
+            .with_context(|| {
+                format!(
+                    "failed to restrict runtime directory {} to mode 0700",
+                    path.display()
+                )
+            })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = owner;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect runtime directory {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!(
+                "runtime path {} must be a real directory, not a symlink",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn require_runtime_directory_owner(
+    path: &Path,
+    actual_uid: u32,
+    expected_uid: u32,
+) -> anyhow::Result<()> {
+    if actual_uid != expected_uid {
+        anyhow::bail!(
+            "runtime directory {} is owned by uid {actual_uid}, expected daemon uid {expected_uid}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+const DAEMON_LOCK_FILE: &str = "daemon.lock";
+
+struct DaemonLock {
+    _file: std::fs::File,
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+async fn acquire_configured_daemon_lock(config: &Config) -> anyhow::Result<DaemonLock> {
+    let locks_root = Path::new(&config.paths.locks);
+    tokio::fs::create_dir_all(locks_root)
+        .await
+        .with_context(|| format!("failed to create lock directory {}", locks_root.display()))?;
+    harden_runtime_directory(locks_root, RuntimeDirectoryOwner::CurrentProcess)?;
+    acquire_daemon_lock(locks_root).context("failed to acquire the process-lifetime daemon lock")
+}
+
+fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLock> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FileType, FlockOperation, Mode, OFlags};
+
+        let directory = rustix::fs::open(
+            locks_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "failed to securely open lock directory {}",
+                locks_root.display()
+            )
+        })?;
+        let lock_fd = rustix::fs::openat(
+            &directory,
+            DAEMON_LOCK_FILE,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "failed to securely open daemon lock {}",
+                locks_root.join(DAEMON_LOCK_FILE).display()
+            )
+        })?;
+
+        let stat = rustix::fs::fstat(&lock_fd).map_err(std::io::Error::from)?;
+        let expected_uid = rustix::process::geteuid().as_raw();
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_uid != expected_uid
+            || stat.st_nlink != 1
+        {
+            anyhow::bail!(
+                "daemon lock {} must be a regular, singly-linked file owned by uid {expected_uid}",
+                locks_root.join(DAEMON_LOCK_FILE).display()
+            );
+        }
+        rustix::fs::fchmod(&lock_fd, Mode::RUSR | Mode::WUSR)
+            .map_err(std::io::Error::from)
+            .context("failed to restrict daemon lock permissions to 0600")?;
+
+        match rustix::fs::flock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                anyhow::bail!(
+                    "another dbev daemon already owns {}",
+                    locks_root.join(DAEMON_LOCK_FILE).display()
+                );
+            }
+            Err(error) => {
+                return Err(std::io::Error::from(error))
+                    .context("failed to apply an exclusive advisory daemon lock");
+            }
+        }
+
+        let mut file = std::fs::File::from(lock_fd);
+        file.set_len(0)
+            .context("failed to clear daemon lock file")?;
+        writeln!(file, "{}", std::process::id()).context("failed to write daemon lock owner")?;
+        file.sync_data()
+            .context("failed to sync daemon lock owner")?;
+        Ok(DaemonLock { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = locks_root;
+        anyhow::bail!("the dbev daemon lock requires a Unix host")
+    }
 }
 
 fn configured_runtime_roots(config: &Config) -> Vec<String> {
@@ -1803,10 +2412,14 @@ fn listener_tls(
         .context("failed to configure database listener tls")
 }
 
-async fn serve_api(config: &Config, router: Router) -> anyhow::Result<()> {
+async fn serve_api(
+    config: &Config,
+    router: Router,
+    import_export_jobs: ImportExportJobs,
+) -> anyhow::Result<()> {
     let bind = config.api.bind_addr();
     if config.api.ssl.enabled {
-        return serve_api_tls(config, router).await;
+        return serve_api_tls(config, router, import_export_jobs).await;
     }
 
     let listener = TcpListener::bind(&bind)
@@ -1819,13 +2432,20 @@ async fn serve_api(config: &Config, router: Router) -> anyhow::Result<()> {
         "api listener started"
     );
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("api server failed")
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(import_export_jobs))
+    .await
+    .context("api server failed")
 }
 
-async fn serve_api_tls(config: &Config, router: Router) -> anyhow::Result<()> {
+async fn serve_api_tls(
+    config: &Config,
+    router: Router,
+    import_export_jobs: ImportExportJobs,
+) -> anyhow::Result<()> {
     let bind_addr = config.api.bind_addr();
     let listener = std::net::TcpListener::bind(&bind_addr)
         .with_context(|| format!("failed to bind API listener on {bind_addr}"))?;
@@ -1851,13 +2471,14 @@ async fn serve_api_tls(config: &Config, router: Router) -> anyhow::Result<()> {
     let handle = Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
-        shutdown_signal().await;
+        shutdown_signal(import_export_jobs).await;
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
     });
 
     axum_server::from_tcp_rustls(listener, tls)
+        .context("failed to create API TLS server")?
         .handle(handle)
-        .serve(router.into_make_service())
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("api tls server failed")
 }
@@ -1896,17 +2517,14 @@ fn rustls_config_with_client_ca(
     key_pem: Vec<u8>,
     ca_pem: Vec<u8>,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let certs = CertificateDer::pem_reader_iter(cert_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse API TLS certificate")?;
-    let mut keys = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .context("failed to parse API TLS private key")?;
-    let key = keys
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("API TLS private key is missing"))?;
+    let key =
+        PrivateKeyDer::from_pem_slice(&key_pem).context("failed to parse API TLS private key")?;
 
     let mut roots = rustls::RootCertStore::empty();
-    let ca_certs = rustls_pemfile::certs(&mut ca_pem.as_slice())
+    let ca_certs = CertificateDer::pem_reader_iter(ca_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse API client CA certificates")?;
     for cert in ca_certs {
@@ -1924,9 +2542,38 @@ fn rustls_config_with_client_ca(
     Ok(Arc::new(config))
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(import_export_jobs: ImportExportJobs) {
+    let signal = wait_for_termination_signal().await;
+    import_export_jobs.close_admission();
+    tracing::info!(
+        signal,
+        "shutdown signal received; import/export admission closed"
+    );
+}
+
+#[cfg(unix)]
+async fn wait_for_termination_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to install SIGTERM handler; waiting for SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    "CTRL_C"
 }
 
 static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
@@ -1943,6 +2590,10 @@ fn init_stdout_logging() {
 fn init_configured_logging(config: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(&config.paths.logs)
         .with_context(|| format!("failed to create log directory {}", config.paths.logs))?;
+    harden_runtime_directory(
+        Path::new(&config.paths.logs),
+        RuntimeDirectoryOwner::CurrentProcess,
+    )?;
 
     let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
         .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));
@@ -1972,4 +2623,112 @@ fn startup_banner() -> &'static str {
 | |_| | (_| | || (_| | |_) | (_| \__ \  __/\__ \ |___ \ V /  __/ |  | |_| |\ V  V /  __/ | |  __/
 |____/ \__,_|\__\__,_|_.__/ \__,_|___/\___||___/_____| \_/ \___|_|   \__, | \_/\_/ \___|_|  \___|
                                                                       |___/"#
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs::{self, OpenOptions},
+        os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
+        process::Command,
+    };
+
+    use super::*;
+
+    #[test]
+    fn hardens_existing_runtime_directory_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
+
+        harden_runtime_directory(&runtime, RuntimeDirectoryOwner::CurrentProcess).unwrap();
+
+        let mode = fs::metadata(runtime).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn rejects_symlinked_runtime_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &runtime).unwrap();
+
+        let error =
+            harden_runtime_directory(&runtime, RuntimeDirectoryOwner::CurrentProcess).unwrap_err();
+
+        assert!(error.to_string().contains("not a symlink"));
+    }
+
+    #[test]
+    fn rejects_runtime_directory_owned_by_another_uid() {
+        let error = require_runtime_directory_owner(Path::new("/runtime"), 1001, 1000).unwrap_err();
+
+        assert!(error.to_string().contains("owned by uid 1001"));
+    }
+
+    #[test]
+    fn setup_config_path_rejects_unit_file_metacharacters() {
+        assert!(validate_setup_config_path(Path::new("/etc/dbev/config.yml")).is_ok());
+        assert!(validate_setup_config_path(Path::new("relative.yml")).is_err());
+        assert!(validate_setup_config_path(Path::new("/etc/dbev/../config.yml")).is_err());
+        assert!(validate_setup_config_path(Path::new("/etc/dbev/config\nExecStart=evil")).is_err());
+    }
+
+    #[test]
+    fn daemon_lock_is_private_and_exclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let locks = temp.path().join("locks");
+        fs::create_dir(&locks).unwrap();
+        harden_runtime_directory(&locks, RuntimeDirectoryOwner::CurrentProcess).unwrap();
+
+        let first = acquire_daemon_lock(&locks).unwrap();
+        let lock_path = locks.join(DAEMON_LOCK_FILE);
+        let mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let error = acquire_daemon_lock(&locks).err().unwrap();
+        assert!(error.to_string().contains("another dbev daemon"));
+        drop(first);
+
+        acquire_daemon_lock(&locks).unwrap();
+    }
+
+    #[test]
+    fn process_umask_limits_new_files_to_owner_access() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "cli::tests::restrictive_umask_child",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "umask child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "runs in an isolated child process from process_umask_limits_new_files_to_owner_access"]
+    fn restrictive_umask_child() {
+        harden_process_file_creation();
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("created");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&file_path)
+            .unwrap();
+
+        let mode = fs::metadata(file_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

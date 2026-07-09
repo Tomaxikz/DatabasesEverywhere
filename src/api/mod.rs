@@ -16,6 +16,5 @@ pub mod resources;
 pub mod routes;
 pub mod security;
 pub mod system;
-pub mod upgrade;
 pub mod websocket;
 pub mod ws_tokens;

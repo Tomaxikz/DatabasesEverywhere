@@ -4,7 +4,7 @@ use secrecy::SecretString;
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::protocol::Protocol,
+    shared::{files::atomic_write_private, protocol::Protocol},
 };
 
 const HOSTED_CONFIG_FILENAME: &str = "dbe-hosted-overrides.xml";
@@ -74,10 +74,33 @@ pub fn instance_spec(
     }
 }
 
-pub async fn write_hosted_config(logs_path: &Path) -> Result<PathBuf, std::io::Error> {
-    tokio::fs::create_dir_all(logs_path).await?;
-    let path = logs_path.join(HOSTED_CONFIG_FILENAME);
-    tokio::fs::write(&path, hosted_config_xml()).await?;
+pub async fn write_hosted_config(runtime_config_path: &Path) -> Result<PathBuf, std::io::Error> {
+    let runtime_config_path = runtime_config_path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_hosted_config_blocking(&runtime_config_path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn write_hosted_config_blocking(runtime_config_path: &Path) -> Result<PathBuf, std::io::Error> {
+    std::fs::create_dir_all(runtime_config_path)?;
+    let metadata = std::fs::symlink_metadata(runtime_config_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a real runtime configuration directory",
+                runtime_config_path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(runtime_config_path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = runtime_config_path.join(HOSTED_CONFIG_FILENAME);
+    atomic_write_private(&path, hosted_config_xml().as_bytes())?;
     Ok(path)
 }
 
@@ -150,5 +173,28 @@ mod tests {
         assert!(config.contains("<part_log remove=\"1\"/>"));
         assert!(config.contains("<metric_log remove=\"1\"/>"));
         assert!(config.contains("<asynchronous_metric_log remove=\"1\"/>"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaces_a_hosted_config_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        let config_directory = directory.path().join("runtime-config");
+        std::fs::create_dir(&config_directory).unwrap();
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, config_directory.join(HOSTED_CONFIG_FILENAME)).unwrap();
+
+        let path = write_hosted_config(&config_directory).await.unwrap();
+
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert!(
+            !std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

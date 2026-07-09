@@ -33,95 +33,165 @@ on:
         default: true
         type: boolean
       docker_latest:
-        description: "Also tag the Docker image as latest for non-prerelease releases"
+        description: "Also publish the mutable latest tag (not recommended for deployments)"
         required: true
-        default: true
+        default: false
         type: boolean
       docker_platforms:
         description: "Comma-separated Docker platforms to build"
         required: true
-        default: "linux/amd64,linux/arm64"
+        default: "linux/amd64"
         type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build dbev-${{ matrix.asset }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            asset: x86_64-linux
-          - target: aarch64-unknown-linux-gnu
-            asset: aarch64-linux
-          - target: powerpc64le-unknown-linux-gnu
-            asset: ppc64le-linux
-          - target: riscv64gc-unknown-linux-gnu
-            asset: riscv64-linux
-
+  release-gate:
+    name: Validate release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
-      - name: Validate version input
+      - name: Validate source, tag, and package version
+        env:
+          VERSION: ${{ inputs.version }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
         run: |
-          if ! printf '%s' "${{ inputs.version }}" | grep -Eq '^v[0-9]+(\.[0-9]+){1,2}([-.][0-9A-Za-z.-]+)?$'; then
-            echo "version must look like v0.1.0" >&2
+          set -euo pipefail
+
+          if [[ "$VERSION" == *$'\r'* || "$VERSION" == *$'\n'* ]]; then
+            echo "version must not contain CR or LF characters" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "version must be a complete SemVer tag such as v0.1.0" >&2
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+          case "$RELEASE_REF" in
+            refs/heads/main|refs/tags/"$VERSION") ;;
+            *)
+              echo "releases may only run from protected main or the matching version tag" >&2
+              exit 1
+              ;;
+          esac
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "databases-everywhere") | .version')"
+          if [[ "v${package_version}" != "$VERSION" ]]; then
+            echo "release version $VERSION does not match Cargo package version v${package_version}" >&2
+            exit 1
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            tag_commit="$(git rev-list -n 1 "$VERSION")"
+            if [[ "$tag_commit" != "$RELEASE_SHA" ]]; then
+              echo "existing tag $VERSION points to $tag_commit, not selected commit $RELEASE_SHA" >&2
+              exit 1
+            fi
+          elif [[ "$RELEASE_REF" == refs/tags/* ]]; then
+            echo "selected release tag $VERSION does not exist" >&2
+            exit 1
+          fi
+
+  security-audit:
+    name: Security audit
+    runs-on: ubuntu-24.04
+    needs: release-gate
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          tool: cross
+          toolchain: 1.95.0
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Audit dependencies
+        run: |
+          rsa_tree="$(cargo tree --locked --edges normal -i rsa 2>/dev/null || true)"
+          if [ -n "$rsa_tree" ]; then
+            echo "RUSTSEC-2023-0071 is ignored only while rsa is absent from the built graph" >&2
+            printf '%s\n' "$rsa_tree" >&2
+            exit 1
+          fi
+          cargo audit -D warnings
+
+  build:
+    name: Build dbev-x86_64-linux
+    runs-on: ubuntu-24.04
+    needs: security-audit
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-x86_64-linux
 
       - name: Build release binary
-        run: cross build --workspace --release --locked --target ${{ matrix.target }}
+        run: |
+          test "$(uname -m)" = "x86_64"
+          cargo build --workspace --release --locked
 
       - name: Package binary
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/dbev" "dbev-${{ matrix.asset }}"
-          chmod 0755 "dbev-${{ matrix.asset }}"
-          checksum="$(sha256sum "dbev-${{ matrix.asset }}" | awk '{print $1}')"
-          printf '| `%s` | `%s` |\n' "dbev-${{ matrix.asset }}" "$checksum" > "checksum-${{ matrix.asset }}.md"
+          cp target/release/dbev dbev-x86_64-linux
+          chmod 0755 dbev-x86_64-linux
+          checksum="$(sha256sum dbev-x86_64-linux | awk '{print $1}')"
+          printf '| `%s` | `%s` |\n' dbev-x86_64-linux "$checksum" > checksum-x86_64-linux.md
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dbev-${{ matrix.asset }}
+          name: dbev-x86_64-linux
           path: |
-            dbev-${{ matrix.asset }}
-            checksum-${{ matrix.asset }}.md
+            dbev-x86_64-linux
+            checksum-x86_64-linux.md
           if-no-files-found: error
 
   github-release:
     name: Create GitHub release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    environment:
+      name: production-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     needs: build
     if: ${{ inputs.create_github_release }}
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -142,9 +212,14 @@ jobs:
             cat dist/checksum-*.md | sort
           } > release-body.md
 
+      - name: Attest release binaries
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/dbev-*
+
       - name: Create release
         id: create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
@@ -163,17 +238,22 @@ jobs:
 
   docker-image:
     name: Build Docker image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    environment:
+      name: production-release
+    permissions:
+      contents: read
+      packages: write
     needs:
       - build
       - github-release
     if: ${{ always() && needs.build.result == 'success' && (inputs.create_github_release == false || needs.github-release.result == 'success') && inputs.publish_docker && !inputs.draft }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -190,18 +270,6 @@ jobs:
               linux/amd64)
                 docker_dir=".docker/amd64"
                 asset="x86_64-linux"
-                ;;
-              linux/arm64)
-                docker_dir=".docker/arm64"
-                asset="aarch64-linux"
-                ;;
-              linux/ppc64le)
-                docker_dir=".docker/ppc64le"
-                asset="ppc64le-linux"
-                ;;
-              linux/riscv64)
-                docker_dir=".docker/riscv64"
-                asset="riscv64-linux"
                 ;;
               *)
                 echo "unsupported Docker platform: $platform" >&2
@@ -238,22 +306,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
           platforms: ${{ inputs.docker_platforms }}
           push: true
           tags: ${{ steps.docker_tags.outputs.tags }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max

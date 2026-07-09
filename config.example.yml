@@ -1,7 +1,8 @@
 debug: false
 uuid: dbe-node-generated-by-panel
 token_id: dbe-token-id-generated-by-panel
-token: dbe-token-generated-by-panel
+token: REPLACE_WITH_32_BYTE_RANDOM_API_TOKEN
+jwt_signing_key: REPLACE_WITH_32_BYTE_RANDOM_JWT_SIGNING_KEY
 remote: https://playground.cleaveroute.com
 
 tls:
@@ -10,38 +11,38 @@ tls:
 
 postgres:
   enabled: true
-  bind: 0.0.0.0:5434
+  bind: 127.0.0.1:5434
   tls: false
 
 mariadb:
   enabled: true
-  bind: 0.0.0.0:3307
+  bind: 127.0.0.1:3307
   tls: false
 
 redis:
   enabled: true
-  bind: 0.0.0.0:6380
+  bind: 127.0.0.1:6380
   tls: false
 
 mongodb:
   enabled: true
-  bind: 0.0.0.0:27018
+  bind: 127.0.0.1:27018
   tls: false
 
 clickhouse:
   # Native TCP and HTTP are separate public gateways.
   enabled: true
-  bind: 0.0.0.0:9000
-  http_bind: 0.0.0.0:8123
+  bind: 127.0.0.1:9000
+  http_bind: 127.0.0.1:8123
   tls: false
 
 qdrant:
   enabled: true
-  bind: 0.0.0.0:6334
+  bind: 127.0.0.1:6334
   tls: false
 
 api:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8090
   ssl:
     enabled: false
@@ -54,8 +55,13 @@ security:
   api_body_limit_bytes: 1048576
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
+  # Never enable this on a production or shared network. It exists only for
+  # isolated local development where TLS termination is deliberately absent.
+  allow_insecure_public_listeners: false
   allow_private_remote_imports: false
   remote_import_allowed_hosts: []
+  # API self-upgrade is intentionally unsupported; use signed packages or a
+  # digest-pinned container rollout. Validation rejects true.
   self_upgrade_enabled: false
   pids_limit: 512
   pids_limits:
@@ -77,7 +83,13 @@ backups:
 
 disk:
   mode: fuse_quota
+  # Native XFS/ext4 quota modes allocate at most 1,000,000 consecutive IDs
+  # from this base. Reserve that range exclusively for DBE on the host.
   project_id_base: 200000
+  # `embedded` is hash-verified automatically. For a custom helper, use an
+  # absolute path in root-owned, non-writable directories and set its SHA-256.
+  fuse_quota_binary: embedded
+  fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
 
 daemon:
@@ -100,34 +112,34 @@ daemon:
   container_security_opts: []
 
 images:
-  postgres: "postgres:18.4"
-  redis: "redis:8.8.0"
-  mariadb: "mariadb:12.3.2"
+  postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
+  redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
+  mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
   # MongoDB 8.x is not compatible with Linux kernel 6.19+ / 7.x at the time
   # of writing due to SERVER-121912. If MongoDB fails to start with that
   # kernel warning, switch this to the latest known working 7.x tag:
-  # "mongo:7.0.37"
+  # "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
   # https://www.mongodb.com/docs/v8.2/release-notes/8.0/#mongodb-8-0-incompatible-with-kernel-6-19
   # https://jira.mongodb.org/browse/SERVER-121912
-  mongodb: "mongo:8.3.4"
-  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
-  qdrant: "qdrant/qdrant:v1.18.2"
+  mongodb: "mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
+  qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
   # Optional per-protocol update allowlist. The configured image above is always
   # allowed even if it is not repeated here.
   allowed:
     postgres:
-      - "postgres:18.4"
+      - "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
     redis:
-      - "redis:8.8.0"
+      - "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
     mariadb:
-      - "mariadb:12.3.2"
+      - "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
     mongodb:
-      - "mongo:8.3.4"
-      - "mongo:7.0.37"
+      - "mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58"
+      - "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"
     clickhouse:
-      - "clickhouse/clickhouse-server:26.4.4.38"
+      - "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
     qdrant:
-      - "qdrant/qdrant:v1.18.2"
+      - "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
 
 paths:
   data: /var/lib/dbev

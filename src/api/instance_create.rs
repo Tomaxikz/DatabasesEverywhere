@@ -14,15 +14,16 @@ use crate::{
     databases,
     disk::DiskLimiter,
     instances::{
+        manager::InstanceManager,
         metadata::{
             DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
             RuntimeMetadata, SCHEMA_VERSION,
         },
         paths::InstancePaths,
     },
-    runtime::docker::{DockerImagePullProgress, DockerInstanceSpec},
+    runtime::docker::{DockerError, DockerImagePullProgress, DockerInstanceSpec, DockerRuntime},
     shared::{
-        backend::BackendEndpoint, logs::summarize_failure_logs, protocol::Protocol,
+        backend::BackendEndpoint, logs::summarize_failure_logs, protocol::Protocol, redaction,
         shell::sh_quote, time::now_rfc3339,
     },
 };
@@ -32,8 +33,10 @@ pub async fn create_instance_from_request(
     request: CreateInstanceRequest,
 ) -> Result<InstanceMetadata, ApiError> {
     validate_create_request(&request)?;
+    let _creation = state.instance_locks.lock_creation().await;
+    let _operation = state.instance_locks.lock(&request.instance_id).await;
     reject_duplicate_instance(state, &request).await?;
-    reject_stale_instance_resources(state, &request).await?;
+    handle_stale_instance_resources(state, &request).await?;
 
     let cleanup = CreateFailureCleanup::new(state, request.protocol, request.instance_id.clone());
     match create_instance_from_validated_request(state, request).await {
@@ -196,7 +199,7 @@ async fn create_instance_from_validated_request(
         ),
         Protocol::Clickhouse => {
             let hosted_config_path =
-                databases::clickhouse::docker::write_hosted_config(&paths.logs)
+                databases::clickhouse::docker::write_hosted_config(&paths.runtime_config)
                     .await
                     .map_err(|error| fail_runtime(state, &request.instance_id, error))?;
             databases::clickhouse::docker::instance_spec(
@@ -278,13 +281,6 @@ async fn create_instance_from_validated_request(
     )
     .await
     {
-        match &error {
-            ContainerLaunchError::Create(_) => cleanup_created_paths(state, &paths).await,
-            ContainerLaunchError::AfterCreate(_) => {
-                cleanup_created_resources(state, request.protocol, &request.instance_id, &paths)
-                    .await;
-            }
-        }
         let api_error = error.into_api_error();
         state
             .install_progress
@@ -313,7 +309,21 @@ async fn create_instance_from_validated_request(
         )
         .await
         {
-            cleanup_created_resources(state, request.protocol, &request.instance_id, &paths).await;
+            state
+                .install_progress
+                .fail(&request.instance_id, error.to_string());
+            return Err(error);
+        }
+    }
+    if request.protocol == Protocol::Postgres {
+        state.install_progress.stage(
+            &request.instance_id,
+            "provision",
+            "restricting PostgreSQL tenant role",
+        );
+        if let Err(error) =
+            provision_postgres_tenant_role(state, &request.instance_id, &request.username).await
+        {
             state
                 .install_progress
                 .fail(&request.instance_id, error.to_string());
@@ -335,7 +345,6 @@ async fn create_instance_from_validated_request(
     {
         Ok(backend) => backend,
         Err(error) => {
-            cleanup_created_resources(state, request.protocol, &request.instance_id, &paths).await;
             state
                 .install_progress
                 .fail(&request.instance_id, error.to_string());
@@ -512,6 +521,82 @@ pub(crate) async fn provision_mariadb_tenant_user(
         .await
         .map_err(|error| fail_runtime(state, instance_id, error))?;
     Ok(())
+}
+
+pub(crate) async fn provision_postgres_tenant_role(
+    state: &AppState,
+    instance_id: &str,
+    tenant_username: &str,
+) -> Result<(), ApiError> {
+    ensure_postgres_tenant_role_restricted(&state.docker, instance_id, tenant_username)
+        .await
+        .map_err(|error| fail_runtime(state, instance_id, error))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PostgresRoleHardeningSummary {
+    pub checked: usize,
+    pub hardened: usize,
+}
+
+pub(crate) async fn harden_postgres_roles_on_boot(
+    manager: &InstanceManager,
+    docker: &DockerRuntime,
+) -> Result<PostgresRoleHardeningSummary, DockerError> {
+    let instances = manager.store().list().await;
+    let mut checked = 0_usize;
+    let mut hardened = 0_usize;
+    for metadata in instances {
+        if metadata.protocol != Protocol::Postgres || metadata.status != InstanceStatus::Running {
+            continue;
+        }
+        checked += 1;
+        if ensure_postgres_tenant_role_restricted(
+            docker,
+            &metadata.instance_id,
+            &metadata.database.username,
+        )
+        .await?
+        {
+            hardened += 1;
+        }
+    }
+    Ok(PostgresRoleHardeningSummary { checked, hardened })
+}
+
+async fn ensure_postgres_tenant_role_restricted(
+    docker: &DockerRuntime,
+    instance_id: &str,
+    tenant_username: &str,
+) -> Result<bool, DockerError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let maintenance_username = format!("dbe_admin_{}", uuid::Uuid::new_v4().simple());
+        let script = postgres_tenant_provision_script(&maintenance_username, tenant_username);
+        let error = match docker
+            .exec_shell(Protocol::Postgres, instance_id, &script)
+            .await
+        {
+            Ok(output) => return Ok(output.stdout.lines().last() == Some("hardened")),
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn postgres_tenant_provision_script(maintenance_username: &str, tenant_username: &str) -> String {
+    let harden_roles = databases::postgres::provision::harden_tenant_role_sql(
+        maintenance_username,
+        tenant_username,
+    );
+    format!(
+        "set -eu\nis_super=$(psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT rolsuper FROM pg_roles WHERE rolname = current_user')\nif [ \"$is_super\" = t ]; then\n  printf %s {} | psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1\n  printf 'hardened\\n'\nelse\n  printf 'already_restricted\\n'\nfi\n",
+        sh_quote(&harden_roles),
+    )
 }
 
 pub(crate) async fn wait_for_rootless_podman_service(
@@ -733,15 +818,6 @@ async fn reject_duplicate_instance(
     }
 
     let instances = state.instances.list().await;
-    if let Some(existing) = instances.iter().find(|metadata| {
-        metadata.protocol == request.protocol && metadata.database.name == request.database
-    }) {
-        return Err(ApiError::Conflict(format!(
-            "{} database name {} already exists on instance {}; choose a different database name or delete the existing database first",
-            request.protocol, request.database, existing.instance_id
-        )));
-    }
-
     let route_exists = instances.iter().any(|metadata| match request.protocol {
         Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb | Protocol::Clickhouse => {
             metadata.protocol == request.protocol
@@ -751,9 +827,7 @@ async fn reject_duplicate_instance(
         Protocol::Qdrant => {
             let route_key_sha256 = crate::protocols::qdrant::route_key_sha256(&request.password);
             metadata.protocol == request.protocol
-                && (metadata.route_key_sha256.as_deref() == Some(route_key_sha256.as_str())
-                    || (metadata.database.username == request.username
-                        && metadata.database.name == request.database))
+                && metadata.route_key_sha256.as_deref() == Some(route_key_sha256.as_str())
         }
         Protocol::Redis => {
             metadata.protocol == request.protocol && metadata.database.username == request.username
@@ -770,27 +844,20 @@ async fn reject_duplicate_instance(
     Ok(())
 }
 
-async fn reject_stale_instance_resources(
+async fn handle_stale_instance_resources(
     state: &AppState,
     request: &CreateInstanceRequest,
 ) -> Result<(), ApiError> {
-    let container_name = state
-        .docker
-        .container_name(request.protocol, &request.instance_id)
-        .map_err(docker_error)?;
-    match state
-        .docker
-        .inspect(request.protocol, &request.instance_id)
-        .await
-    {
-        Ok(_) => {
-            return Err(ApiError::Conflict(format!(
-                "stale container {container_name} already exists for instance_id {}; delete it with purge=true before recreating this database",
-                request.instance_id
-            )));
+    let mut stale_containers = Vec::new();
+    for protocol in Protocol::ALL {
+        if let Some(container) = state
+            .docker
+            .verified_managed_container_name(protocol, &request.instance_id)
+            .await
+            .map_err(docker_error)?
+        {
+            stale_containers.push((protocol, container));
         }
-        Err(error) if error.is_not_found() => {}
-        Err(error) => return Err(docker_error(error)),
     }
 
     let paths = InstancePaths::new(&state.config.paths, &request.instance_id)
@@ -798,20 +865,53 @@ async fn reject_stale_instance_resources(
     let stale_paths = stale_persistent_paths(&paths)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    if stale_paths.is_empty() {
+    if stale_containers.is_empty() && stale_paths.is_empty() {
         return Ok(());
     }
 
-    Err(ApiError::Conflict(format!(
-        "stale persistent files already exist for instance_id {}; DBE will not reuse them with new credentials because that can break database auth. Purge the old instance first or restore/import the data into a new instance. Stale paths: {}",
-        request.instance_id,
-        stale_paths.join(", ")
-    )))
+    if !request.purge_stale_resources {
+        let resources = stale_containers
+            .iter()
+            .map(|(_, container)| format!("container {container}"))
+            .chain(stale_paths.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(stale_resources_conflict(request, resources));
+    }
+
+    let stale_container_count = stale_containers.len();
+    for (protocol, _) in stale_containers {
+        cleanup_created_container(state, protocol, &request.instance_id).await?;
+    }
+    if !stale_paths.is_empty() {
+        cleanup_created_paths(state, &paths).await?;
+    }
+    tracing::warn!(
+        event = "audit stale_instance_resources_purged",
+        instance_id = %request.instance_id,
+        protocol = %request.protocol,
+        stale_container_count,
+        stale_path_count = stale_paths.len(),
+        "explicitly purged stale resources before retrying instance creation"
+    );
+    Ok(())
+}
+
+fn stale_resources_conflict(request: &CreateInstanceRequest, resources: String) -> ApiError {
+    ApiError::Conflict(format!(
+        "stale resources already exist for instance_id {} and will not be reused with new credentials: {resources}. Recover the data manually, use a different instance_id, or explicitly retry creation with purge_stale_resources=true to irreversibly remove them",
+        request.instance_id
+    ))
 }
 
 async fn stale_persistent_paths(paths: &InstancePaths) -> Result<Vec<String>, std::io::Error> {
     let mut stale = Vec::new();
-    for path in [&paths.data, &paths.logs, &paths.artifacts] {
+    for path in [
+        &paths.data,
+        &paths.logs,
+        &paths.artifacts,
+        &paths.runtime_config,
+    ] {
         if !path_has_entries(path).await? {
             continue;
         }
@@ -834,14 +934,21 @@ async fn path_has_entries(path: &std::path::Path) -> Result<bool, std::io::Error
     Ok(entries.next_entry().await?.is_some())
 }
 
-async fn cleanup_created_container(state: &AppState, protocol: Protocol, instance_id: &str) {
+async fn cleanup_created_container(
+    state: &AppState,
+    protocol: Protocol,
+    instance_id: &str,
+) -> Result<(), ApiError> {
     if let Err(error) = state.docker.delete(protocol, instance_id).await {
         if error.is_not_found() {
             tracing::debug!(%instance_id, %protocol, "container already absent during create failure cleanup");
-            return;
+            return Ok(());
         }
-        tracing::warn!(%error, %instance_id, %protocol, "failed to clean up container after create failure");
+        return Err(ApiError::Runtime(format!(
+            "failed to clean up container after create failure: {error}"
+        )));
     }
+    Ok(())
 }
 
 struct CreateFailureCleanup<'a> {
@@ -866,77 +973,82 @@ impl<'a> CreateFailureCleanup<'a> {
             "cleaning failed installation",
         );
 
-        if let Err(cleanup_error) = self.state.manager.delete(&self.instance_id).await {
-            tracing::warn!(
-                error = %cleanup_error,
-                instance_id = %self.instance_id,
-                "failed to delete metadata after create failure"
-            );
-        }
-        self.state.instances.remove(&self.instance_id).await;
-
-        cleanup_created_container(self.state, self.protocol, &self.instance_id).await;
-        match InstancePaths::new(&self.state.config.paths, &self.instance_id) {
-            Ok(paths) => cleanup_created_paths(self.state, &paths).await,
-            Err(cleanup_error) => {
+        let cleanup_result = self.cleanup_resources().await;
+        if cleanup_result.is_ok() {
+            if let Err(cleanup_error) = self.state.manager.delete(&self.instance_id).await {
                 tracing::warn!(
                     error = %cleanup_error,
                     instance_id = %self.instance_id,
-                    "failed to resolve instance paths after create failure"
+                    "failed to delete metadata after create failure"
                 );
+            } else {
+                self.state.instances.remove(&self.instance_id).await;
             }
         }
 
         self.state.install_progress.fail(
             &self.instance_id,
-            format!("{error}; failed installation was cleaned up"),
+            match &cleanup_result {
+                Ok(()) => format!("{error}; failed installation was cleaned up"),
+                Err(cleanup_error) => {
+                    format!("{error}; cleanup is incomplete and remains retryable: {cleanup_error}")
+                }
+            },
         );
-        tracing::info!(
-            event = "audit instance_create_failed_cleaned",
-            instance_id = %self.instance_id,
-            protocol = %self.protocol,
-            error = %error,
-        );
+        match cleanup_result {
+            Ok(()) => tracing::info!(
+                event = "audit instance_create_failed_cleaned",
+                instance_id = %self.instance_id,
+                protocol = %self.protocol,
+                error = %error,
+            ),
+            Err(cleanup_error) => tracing::error!(
+                event = "audit instance_create_cleanup_incomplete",
+                instance_id = %self.instance_id,
+                protocol = %self.protocol,
+                error = %error,
+                cleanup_error = %cleanup_error,
+            ),
+        }
+    }
+
+    async fn cleanup_resources(&self) -> Result<(), ApiError> {
+        cleanup_created_container(self.state, self.protocol, &self.instance_id).await?;
+        let paths = InstancePaths::new(&self.state.config.paths, &self.instance_id)
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        cleanup_created_paths(self.state, &paths).await
     }
 }
 
-async fn cleanup_created_resources(
-    state: &AppState,
-    protocol: Protocol,
-    instance_id: &str,
-    paths: &InstancePaths,
-) {
-    cleanup_created_container(state, protocol, instance_id).await;
-    cleanup_created_paths(state, paths).await;
-}
+async fn cleanup_created_paths(state: &AppState, paths: &InstancePaths) -> Result<(), ApiError> {
+    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+        .purge_instance_data(&paths.data)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to purge instance data after create failure: {error}"
+            ))
+        })?;
 
-async fn cleanup_created_paths(state: &AppState, paths: &InstancePaths) {
-    if let Err(error) =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .purge_instance_data(&paths.data)
-            .await
-    {
-        tracing::warn!(
-            %error,
-            instance_id = %paths.instance_id,
-            "failed to purge instance data after create failure"
-        );
-    }
-
-    for path in [&paths.data, &paths.logs, &paths.sockets, &paths.artifacts] {
+    for path in [
+        &paths.data,
+        &paths.logs,
+        &paths.sockets,
+        &paths.artifacts,
+        &paths.runtime_config,
+    ] {
         match tokio::fs::remove_dir_all(path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    instance_id = %paths.instance_id,
-                    path = %path.display(),
-                    "failed to remove instance path after create failure"
-                );
+                return Err(ApiError::Runtime(format!(
+                    "failed to remove instance path {} after create failure: {error}",
+                    path.display()
+                )));
             }
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn docker_error_with_logs(
@@ -948,7 +1060,7 @@ pub(crate) async fn docker_error_with_logs(
     let logs = match state.docker.logs(protocol, instance_id, None).await {
         Ok(output) => {
             let combined = format!("{}{}", output.stdout, output.stderr);
-            summarize_failure_logs(&combined, 4_000)
+            summarize_failure_logs(&redaction::redact_connection_url(&combined), 4_000)
         }
         Err(log_error) => format!("failed to read container logs: {log_error}"),
     };
@@ -1094,7 +1206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_request_rejects_existing_database_name_for_protocol() {
+    async fn create_request_allows_same_database_name_for_a_distinct_route_user() {
         let state = test_state(Config::default()).await;
         state
             .instances
@@ -1110,16 +1222,7 @@ mod tests {
         request.database = "shared_db".to_string();
         request.username = "second_user".to_string();
 
-        let error = reject_duplicate_instance(&state, &request)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, ApiError::Conflict(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("database name shared_db already exists")
-        );
+        reject_duplicate_instance(&state, &request).await.unwrap();
     }
 
     #[tokio::test]
@@ -1151,6 +1254,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn postgres_provisioning_is_atomic_and_never_creates_a_login_superuser() {
+        let script = postgres_tenant_provision_script("dbe_admin_test", "tenant_user");
+
+        let create_admin = script.find("CREATE ROLE").unwrap();
+        let demote_tenant = script.find("ALTER ROLE").unwrap();
+        assert!(create_admin < demote_tenant);
+        assert!(script.contains("BEGIN;"));
+        assert!(script.contains("NOLOGIN SUPERUSER"));
+        assert!(script.contains("\"tenant_user\" NOSUPERUSER"));
+        assert!(script.contains("COMMIT;"));
+        assert_eq!(script.matches("| psql").count(), 1);
+        assert!(!script.contains("PASSWORD"));
+        assert!(script.contains("already_restricted"));
+    }
+
     fn create_request(protocol: Protocol) -> CreateInstanceRequest {
         CreateInstanceRequest {
             instance_id: "inst_test_pg".to_string(),
@@ -1163,6 +1282,7 @@ mod tests {
             project_id: None,
             image: None,
             limits: None,
+            purge_stale_resources: false,
         }
     }
 
@@ -1224,6 +1344,7 @@ mod tests {
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
         }
     }
 }

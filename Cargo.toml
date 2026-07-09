@@ -8,9 +8,9 @@ name = "dbev"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.103"
 axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 bzip2 = "0.4"
 bollard = "0.21.0"
@@ -20,10 +20,11 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 h2 = "0.4"
 http = "1.1"
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
 secrecy = { version = "0.10", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-pemfile = "2.2"
+rustls-pki-types = { version = "1.14", features = ["std"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -31,7 +32,7 @@ serde_yaml = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 sha1 = "0.10"
 sha2 = "0.10"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
 subtle = "2.6"
 flate2 = "1.0"
 tar = "0.4"
@@ -39,7 +40,7 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1.38", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-appender = "0.2"
@@ -49,9 +50,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 
 [build-dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-ureq = "3.0"
+sha2 = "0.10"
 zstd = "0.13"
 
 [dev-dependencies]

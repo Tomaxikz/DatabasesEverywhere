@@ -3,6 +3,7 @@ pub mod ids;
 pub mod images;
 pub mod limits;
 pub mod logs;
+pub mod network;
 pub mod protocol;
 pub mod redaction;
 pub mod shell;

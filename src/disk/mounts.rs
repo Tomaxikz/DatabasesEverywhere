@@ -21,6 +21,36 @@ pub(super) fn find_mount(path: &Path) -> Result<MountInfo, DiskLimitError> {
     find_mount_in(&path, &mountinfo).ok_or(DiskLimitError::MountpointNotFound(path))
 }
 
+pub(super) fn is_mountpoint(path: &Path) -> Result<bool, DiskLimitError> {
+    if !path.is_absolute() {
+        return Err(DiskLimitError::PathIo {
+            path: path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mountpoint path must be absolute",
+            ),
+        });
+    }
+    let path = path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(DiskLimitError::Io)?;
+    Ok(is_mountpoint_in(&path, &mountinfo))
+}
+
+fn is_mountpoint_in(path: &Path, mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        let Some((before_sep, _)) = line.split_once(" - ") else {
+            return false;
+        };
+        before_sep
+            .split_whitespace()
+            .nth(4)
+            .is_some_and(|mountpoint| Path::new(&unescape_mountinfo(mountpoint)) == path)
+    })
+}
+
 fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
     let mut best = None;
     for line in mountinfo.lines() {
@@ -104,5 +134,22 @@ mod tests {
             mount.options,
             vec!["rw", "relatime", "prjquota", "errors=remount-ro"]
         );
+    }
+
+    #[test]
+    fn identifies_only_exact_mountpoints() {
+        let mountinfo = "\
+1 0 0:1 / / rw - ext4 /dev/sda rw
+2 1 0:2 / /var/lib/dbev/fuse/instances/db\\040one rw - fuse.fusequota fusequota rw
+";
+
+        assert!(is_mountpoint_in(
+            Path::new("/var/lib/dbev/fuse/instances/db one"),
+            mountinfo
+        ));
+        assert!(!is_mountpoint_in(
+            Path::new("/var/lib/dbev/fuse/instances/db one/data"),
+            mountinfo
+        ));
     }
 }

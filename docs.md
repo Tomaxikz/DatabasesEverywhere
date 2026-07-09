@@ -16,12 +16,25 @@ sudo systemctl enable --now docker
 
 For Podman instead of Docker, install and enable the Podman API socket, then set `daemon.engine: podman` in `config.yml`. Only set `daemon.socket_path` if the default socket discovery doesn't find yours.
 
-Download the latest release for your architecture and install it:
+Official release artifacts currently target x86-64 Linux only. Choose a
+versioned release, verify its SHA-256 against the checksum published in that
+release, and then install it. Do not automate
+installation from the mutable `latest` URL.
 
 ```bash
-sudo curl -L "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-$(uname -m)-linux" -o /usr/local/bin/dbev
+DBEV_VERSION=v0.1.0 # replace with the reviewed release
+test "$(uname -m)" = x86_64
+sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
+# Compare this value with the checksum shown on the GitHub release page.
+sha256sum /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
 ```
+
+Maintainers must configure the GitHub Actions environment named
+`production-release` with required reviewers and restrict deployments to the
+protected `main` branch and version tags. The release workflow rejects other
+refs, requires the requested tag to match the Cargo package version, attests
+release binaries, and publishes Docker provenance and an SBOM.
 
 ### Config
 
@@ -38,38 +51,53 @@ The bits you actually need to change:
 remote: https://panel.example.com
 uuid: replace-with-panel-generated-node-uuid
 token_id: replace-with-panel-generated-token-id
-token: replace-with-long-random-panel-token
+token: replace-with-at-least-32-random-bytes
+jwt_signing_key: replace-with-a-different-32-byte-random-key
 
 api:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8090
 ```
 
-Also tweak gateway ports, `daemon.engine`, `daemon.socket_path`, or `daemon.ipam.subnet` if your host needs it. `api.host` and `api.port` are just the listener bind — the public API URL/domain belongs in the panel's node record.
+Also tweak gateway ports, `daemon.engine`, `daemon.socket_path`, or `daemon.ipam.subnet` if your host needs it. Keep `api.host` on loopback; the public API URL/domain belongs in the panel's node record and must terminate at a local hardened reverse proxy.
 
-Current pinned default database images:
+`token` and `jwt_signing_key` are independent credentials and must each contain
+at least 32 random bytes. Generate them with a cryptographically secure secret
+generator, never copy one into the other, and never commit their real values.
+The template placeholders are deliberately rejected by `check-config`.
+
+For example, run `openssl rand -base64 32` twice and assign each output to one
+of the two fields.
+
+The API listener is production-supported only on loopback, even when its native TLS is configured. Publish it through a local reverse proxy that enforces a global connection cap, header size and header-read deadline, request-body limit, and idle read/write timeouts; this protects sockets that have not yet reached application middleware and slow streaming clients. Database gateway cleartext listeners are also accepted only on loopback; enable gateway TLS before binding them to another interface. The
+`security.allow_insecure_public_listeners` override exists solely for isolated
+local development; enabling it on a production or shared network exposes node
+and database credentials.
+
+Production configuration requires immutable manifest digests. Keep the readable
+tag before `@sha256:` for operator context, but treat the digest as the identity:
 
 ```yaml
 images:
-  postgres: "postgres:18.4"
-  redis: "redis:8.8.0"
-  mariadb: "mariadb:12.3.2"
-  mongodb: "mongo:8.3.4"
-  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
-  qdrant: "qdrant/qdrant:v1.18.2"
+  postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
+  redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
+  mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
+  mongodb: "mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
+  qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
   allowed:
-    postgres: ["postgres:18.4"]
-    redis: ["redis:8.8.0"]
-    mariadb: ["mariadb:12.3.2"]
-    mongodb: ["mongo:8.3.4", "mongo:7.0.37"]
-    clickhouse: ["clickhouse/clickhouse-server:26.4.4.38"]
-    qdrant: ["qdrant/qdrant:v1.18.2"]
+    postgres: ["postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"]
+    redis: ["redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"]
+    mariadb: ["mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"]
+    mongodb: ["mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58", "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"]
+    clickhouse: ["clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"]
+    qdrant: ["qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"]
 ```
 
 MongoDB 8.x has a known incompatibility with Linux kernel 6.19+ / 7.x
 (`SERVER-121912`). If a node logs that MongoDB cannot start on that kernel,
-switch only MongoDB back to the latest known working 7.x image:
-`mongo:7.0.37`.
+switch only MongoDB back to the known working digest:
+`mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703`.
 
 References:
 
@@ -81,14 +109,46 @@ Unless you've deliberately set up native filesystem quotas, use this disk sectio
 ```yaml
 disk:
   mode: fuse_quota
+  fuse_quota_binary: embedded
+  fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
   project_id_base: 200000
 ```
 
+For native XFS or ext4 project quotas, DBE allocates from a bounded range of
+at most 1,000,000 consecutive IDs starting at `project_id_base`. Reserve that
+range exclusively for DBE on the host. XFS mode rejects conflicting entries in
+`/etc/projects` or `/etc/projid` instead of replacing them.
+
+The default systemd unit keeps `/etc` read-only. If you deliberately use XFS
+project quotas, first grant the service account the narrow host permissions it
+needs for `/etc/projects` and `/etc/projid`, then add a dedicated override:
+
+```ini
+# systemctl edit databases-everywhere
+[Service]
+ReadWritePaths=/etc
+```
+
+This override broadens the unit's writable filesystem surface and is not
+needed for the default FuseQuota or container-storage modes. Keep it off hosts
+that do not use XFS project quotas. Native project-quota mode is a privileged
+exception: `--setup` installs a managed passwordless sudo rule for host quota
+tools and enables `DBE_USE_SUDO` only in that mode. Use it on a dedicated host,
+and rerun `--setup` after switching back to FuseQuota, advisory, or Docker
+storage limits so the managed sudoers rule is removed.
+
 FuseQuota uses a helper that's bundled into the binary. When
 `disk.mode: fuse_quota` is configured, `dbev` checks that `/dev/fuse` is
 usable and enables `user_allow_other` in `/etc/fuse.conf` on startup. The host
-still needs kernel FUSE support.
+still needs kernel FUSE support. The checked-in, hash-verified helper currently
+targets x86-64 Linux. Other architectures must build `dbev` from reviewed
+source, install a trusted helper, set its absolute path in
+`disk.fuse_quota_binary`, and set `disk.fuse_quota_binary_sha256` to the
+helper's lowercase SHA-256. External helpers must be root-owned, singly linked,
+executable regular files in root-owned directories that are not writable by
+group or others. The config administration API cannot change either helper
+field, and builds never download executable code automatically.
 
 Recommended paths:
 
@@ -114,6 +174,23 @@ runtime tree under `paths.data`, `paths.logs`, `paths.sockets`, `paths.locks`,
 `paths.artifacts`, `paths.fuse`, and `paths.tmp` if those directories are
 missing.
 
+Compose also requires an explicit immutable image selection:
+
+```bash
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.1.0@sha256:REPLACE_ME'
+docker compose up -d
+```
+
+The supplied FuseQuota profile retains `SYS_ADMIN`, `/dev/fuse`, host
+networking, and write access to the Docker socket, but no longer uses blanket
+privileged mode. Docker socket access is still host-root-equivalent. Deploy the
+manager on a dedicated host or VM; if FuseQuota is not used, remove
+`SYS_ADMIN`, `/dev/fuse`, and the AppArmor override too.
+
+Before starting that profile, ensure the host `/etc/fuse.conf` contains an
+uncommented `user_allow_other`; Compose mounts the file read-only so the daemon
+cannot modify host configuration from inside the container.
+
 Automatic backups:
 
 ```yaml
@@ -135,6 +212,9 @@ sudo dbev migrate-paths
 ```
 
 `sudo dbev --move-new-config` is an alias for the same migration. Stop managed containers first — it refuses to move live data unless you pass `--force`.
+The daemon and mutating maintenance commands hold an exclusive lock under
+`paths.locks`; stop the service before running migrations, metadata reset, or
+development cleanup commands.
 
 ### Setup and start
 
@@ -144,7 +224,9 @@ sudo systemctl enable --now databases-everywhere
 sudo journalctl -u databases-everywhere -f
 ```
 
-`--setup` creates the service user, directories, systemd unit, and the quota sudoers rule. Files end up here:
+`--setup` creates the service user, private directories, and hardened systemd
+unit. It installs a quota sudoers rule only for native project-quota mode.
+Files end up here:
 
 ```text
 /etc/databases-everywhere/config.yml
@@ -200,7 +282,7 @@ Every error is the same shape:
 
 Each endpoint requires one scope. The node token has `*`; scoped tokens matter mostly for WebSocket JWTs.
 
-`system:read`, `instances:read`, `instances:write`, `resources:read`, `logs:read`, `metrics:read`, `artifacts:read`, `artifacts:write`, `backups:read`, `backups:write`, `import-export:read`, `import-export:write`, `recovery:admin`, `images:admin`, `ws-tokens:write`, `monitor:read`, `config:admin`, `upgrades:admin`
+`system:read`, `instances:read`, `instances:write`, `resources:read`, `logs:read`, `metrics:read`, `artifacts:read`, `artifacts:write`, `backups:read`, `backups:write`, `import-export:read`, `import-export:write`, `recovery:admin`, `images:admin`, `ws-tokens:write`, `monitor:read`, `config:admin`
 
 ## Instances
 
@@ -281,7 +363,7 @@ Validation rules your panel should mirror so users get nice errors:
 
 - `database` and `username`: 1–63 chars, must start with an ASCII letter, then letters/digits/`_`/`-` only. Reserved names are rejected (`postgres`, `mysql`, `admin`, `root`, `default`, `dbe_health`, and a few more).
 - `password` and `public_host` must be non-empty.
-- All limits must be > 0. MongoDB and ClickHouse additionally need at least 1024 `memory_mib` **and** 1024 `disk_mib` or they won't even boot.
+- `cpu_cores` must be finite and between `0.01` and `1024`; `memory_mib` must be between `1` and `1048576` (1 TiB); and `disk_mib` must be greater than zero. MongoDB and ClickHouse additionally need at least 1024 `memory_mib` **and** 1024 `disk_mib` or they won't even boot.
 
 ### Updating limits
 
@@ -438,6 +520,8 @@ Import straight from another server:
 }
 ```
 
+Remote TLS defaults to `true`; `tls: false` is rejected unless the isolated-development insecure-listener override is enabled. DNS answers are checked and pinned to prevent rebinding. PostgreSQL can pin the address while verifying the original hostname. For MariaDB, MongoDB, and ClickHouse, use an IP literal whose certificate contains that IP SAN; hostname-based TLS imports are rejected until those client tools can preserve independent hostname verification while using a pinned address.
+
 ### Backups
 
 | Method | Path | Scope | What it does |
@@ -469,14 +553,14 @@ POST /api/backups/{name}/download-token       (scope: backups:read)
 {
   "token_type": "Bearer",
   "token": "…jwt…",
-  "url": "https://node.example.com/api/artifacts/download-signed?token=…",
+  "url": "/api/artifacts/download-signed?token=…",
   "download_path": "/api/artifacts/download-signed?token=…",
   "expires_at_unix": 1751900000,
   "single_use": true
 }
 ```
 
-3. Panel hands `url` to the browser. No auth header needed — the JWT in the query is the whole credential. It expires fast and single-use tokens burn after the first hit, so hand them out at click time, don't store them.
+3. Panel resolves the origin-relative `url` against its trusted daemon origin and hands it to the browser. No auth header is needed — the JWT in the query is the whole credential. It expires fast and single-use tokens burn after the first hit, so hand them out at click time, don't store them. The daemon deliberately does not derive an absolute URL from client-controlled `Host` or forwarding headers.
 
 ### Artifact housekeeping
 
@@ -518,7 +602,7 @@ POST /api/ws-token     (scope: ws-tokens:write)
 }
 ```
 
-Response: `{ "token_type": "Bearer", "token": "…", "expires_at_unix": … }`. TTL defaults to 900s, max 3600. `instances` restricts the token to those instances — leave it empty for node-wide scopes like `monitor:read`, set it when minting for a specific user so they can't watch other people's logs.
+Response: `{ "token_type": "Bearer", "token": "…", "expires_at_unix": … }`. TTL defaults to 900s, max 3600. `instances` restricts the token to those instances. An empty list grants no instance access; node-wide access must be explicitly requested with `"all_instances": true`, and that flag cannot be combined with an allow-list. Each token ID is accepted for one WebSocket upgrade only, so mint a fresh token when reconnecting.
 
 ### Step 2: connect (browser side)
 
@@ -608,21 +692,28 @@ Job objects are the same shape as the REST job response. When an export succeeds
 | --- | --- | --- | --- |
 | GET | `/api/system` | system:read | Node identity, version, engine, which protocols are enabled |
 | PATCH | `/api/system/config` | config:admin | Merge a runtime config patch into `config.yml`; returns `restart_required: true` |
-| POST | `/api/system/upgrade` | upgrades:admin | Download, verify, replace the daemon binary, then run the configured restart command |
 | POST | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
 
 `/api/system` is the right first call after registering a node — it tells you the daemon version, runtime engine, socket, `daemon_internal_network`, and per-protocol `*_enabled` flags so the panel knows what it's allowed to offer.
 
-Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, and `token`; those must be rotated deliberately by writing the config file. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, path, image, or runtime changes to take effect.
+Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, `token`, `jwt_signing_key`, Fuse helper path/digest, public-listener development override, and private-import trust settings; those security boundaries must be changed deliberately in the host config. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, path, image, or runtime changes to take effect.
 
-Self-upgrade is disabled unless `security.self_upgrade_enabled: true`. The request must use an HTTPS binary URL, include a 64-character SHA-256 digest, and provide a restart command plus args. The daemon does not run the command through a shell.
+API-triggered self-upgrade is intentionally unsupported: accepting an executable and its digest from the same administrative request does not provide an independent trust anchor. Keep `security.self_upgrade_enabled: false` and deploy signed packages or immutable, digest-pinned container images through the host's normal rollout mechanism.
+
+If a legacy database contains duplicate route identities, startup preserves the deterministic first claimant and marks every other claimant `quarantined`. Quarantined containers are stopped before gateways open and cannot be started or restarted; their metadata and data remain available for inspection and explicit deletion.
+
+An unclean daemon exit while an import/export job is durably `running` also quarantines the affected instance on the next startup. The container is stopped before gateways open, preventing a possibly orphaned dump or restore process from racing new work. Queued jobs that never started are marked failed without quarantining their instances. Inspect the failed job and database integrity, then recover or repair the quarantined instance offline.
+
+If creation cleanup was interrupted, a normal retry fails closed rather than reusing orphaned files with new credentials. After preserving any required data, retry the create request with `"purge_stale_resources": true` to explicitly and irreversibly remove that instance ID's orphaned container and paths before creation.
+
+Import/export admission is bounded to 64 jobs node-wide and two running-or-queued jobs per instance. The in-memory status cache retains at most 2,048 completed jobs, and SQLite retains the latest 10,000 completed records; queued/running records are never pruned.
 
 ## Integration checklist
 
 Rough order for wiring up a panel:
 
-1. Generate `uuid`, `token_id`, and a long random `token`; render the node's `config.yml`; admin runs setup.
+1. Generate `uuid`, `token_id`, a random API `token`, and a different random `jwt_signing_key`; both secrets must be at least 32 bytes. Render the node's `config.yml`; admin runs setup.
 2. Call `GET /api/system` to verify connectivity and see what the node supports.
 3. Create/manage instances via `/api/instances`; store `instance_id` ↔ your customer records on the panel side (the daemon doesn't know about your users).
 4. Poll `POST /api/heartbeat` for node health.

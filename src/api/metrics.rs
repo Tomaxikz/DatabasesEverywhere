@@ -21,7 +21,11 @@ pub async fn metrics(
 ) -> Result<Response, ApiError> {
     authorize_scope(&state, &headers, &uri, scopes::METRICS_READ)?;
     let instances = state.instances.list().await;
-    let jobs_by_status = state.import_export_jobs.count_by_status().await;
+    let jobs_by_status = state
+        .import_export_jobs
+        .count_by_status()
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let mut out = String::new();
     out.push_str("# HELP dbe_instances_total Managed instances by protocol and status\n");
     out.push_str("# TYPE dbe_instances_total gauge\n");
