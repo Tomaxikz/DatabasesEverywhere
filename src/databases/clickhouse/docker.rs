@@ -131,6 +131,16 @@ fn write_hosted_config_blocking(runtime_config_path: &Path) -> Result<PathBuf, s
     }
     let path = runtime_config_path.join(HOSTED_CONFIG_FILENAME);
     atomic_write_private(&path, hosted_config_xml().as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The host parent remains private, while the file itself must be
+        // readable by the non-root ClickHouse user through its read-only bind
+        // mount. Keeping the file read-only also prevents the container from
+        // modifying daemon-owned configuration.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+    }
     Ok(path)
 }
 
@@ -211,6 +221,24 @@ mod tests {
         assert!(config.contains("<metric_log remove=\"1\"/>"));
         assert!(config.contains("<asynchronous_metric_log remove=\"1\"/>"));
         assert!(config.contains("<listen_host>127.0.0.1</listen_host>"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_config_is_private_on_host_but_readable_in_container() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_hosted_config(dir.path()).await.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
     }
 
     #[cfg(unix)]
