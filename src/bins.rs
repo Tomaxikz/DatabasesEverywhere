@@ -332,7 +332,7 @@ mod tests {
 
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
-            Some("dbev-socket-bridge-1")
+            Some("dbev-socket-bridge-2")
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

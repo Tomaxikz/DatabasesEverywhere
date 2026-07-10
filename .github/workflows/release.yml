@@ -162,7 +162,7 @@ jobs:
         run: |
           test "$(uname -m)" = "x86_64"
           rustc --edition=2024 --target x86_64-unknown-linux-musl -D warnings \
-            -C opt-level=z -C strip=symbols -C panic=abort \
+            -C linker=rust-lld -C opt-level=z -C strip=symbols -C panic=abort \
             helpers/socket_bridge.rs -o /tmp/dbev-socket-bridge
           expected="$(sha256sum /tmp/dbev-socket-bridge | awk '{print $1}')"
           grep -Fq "$expected" build.rs
