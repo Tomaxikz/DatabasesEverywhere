@@ -793,29 +793,23 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
-      summary: Delete one instance and its managed container/data.
+      summary: Irreversibly delete one instance, its managed container, jobs, artifacts, backups, recovery volumes, and all managed data.
       x-required-scope: instances:write
       parameters:
-        - name: purge
-          in: query
-          required: false
-          description: Also remove the instance's managed persistent paths.
-          schema:
-            type: boolean
-            default: false
         - name: confirm
           in: query
-          required: false
-          description: Must be true when purge=true.
+          required: true
+          description: Must be true because instance deletion always purges managed data.
           schema:
             type: boolean
-            default: false
+            const: true
         - name: reason
           in: query
-          required: false
-          description: Required audit reason when purge=true; at most 512 characters.
+          required: true
+          description: Audit reason for irreversible instance deletion; at most 512 characters.
           schema:
             type: string
+            minLength: 1
             maxLength: 512
       responses:
         default:

@@ -301,6 +301,27 @@ pub mod import_export {
             Ok(counts)
         }
 
+        pub async fn delete_for_instance(
+            &self,
+            instance_id: &str,
+        ) -> Result<u64, ImportExportJobStorageError> {
+            let deleted = if let Some(repository) = &self.repository {
+                repository.delete_for_instance(instance_id).await?
+            } else {
+                self.inner
+                    .read()
+                    .await
+                    .values()
+                    .filter(|job| job.instance_id == instance_id)
+                    .count() as u64
+            };
+            self.inner
+                .write()
+                .await
+                .retain(|_, job| job.instance_id != instance_id);
+            Ok(deleted)
+        }
+
         pub async fn update_status(
             &self,
             job_id: &str,

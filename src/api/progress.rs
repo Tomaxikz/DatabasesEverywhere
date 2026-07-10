@@ -107,6 +107,13 @@ impl InstallProgressStore {
             .cloned()
     }
 
+    pub fn remove(&self, instance_id: &str) {
+        self.inner
+            .write()
+            .expect("install progress lock poisoned")
+            .remove(instance_id);
+    }
+
     pub fn close_creation_admission(&self) {
         let _entries = self.inner.write().expect("install progress lock poisoned");
         self.accepting.store(false, Ordering::Release);

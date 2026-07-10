@@ -181,7 +181,6 @@ pub struct PowerResponse {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeleteInstanceQuery {
-    pub purge: bool,
     pub confirm: bool,
     pub reason: String,
 }
@@ -1409,6 +1408,9 @@ async fn cleanup_temporary_side_paths(paths: &InstancePaths) {
         &paths.logs,
         &paths.sockets,
         &paths.artifacts,
+        &paths.exports,
+        &paths.imports,
+        &paths.backups,
         &paths.runtime_config,
     ] {
         let _ = cleanup_path_if_exists(path).await;
@@ -1584,18 +1586,13 @@ pub async fn delete_instance(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let purge = query.purge;
-    let purge_authorization = if purge {
-        Some(DestructiveActionPolicy::authorize(
-            "instance purge",
-            &DestructiveActionConfirmation {
-                confirm: query.confirm,
-                reason: query.reason,
-            },
-        )?)
-    } else {
-        None
-    };
+    let purge_authorization = DestructiveActionPolicy::authorize(
+        "instance deletion",
+        &DestructiveActionConfirmation {
+            confirm: query.confirm,
+            reason: query.reason,
+        },
+    )?;
 
     metadata.status = deletion_status(metadata.status);
     metadata.updated_at = now_rfc3339();
@@ -1618,7 +1615,7 @@ pub async fn delete_instance(
         Err(error) if error.is_not_found() => {}
         Err(error) => return Err(docker_error(error)),
     }
-    if purge && let Err(error) = purge_instance_paths(&state, &metadata.instance_id).await {
+    if let Err(error) = purge_instance_paths(&state, &metadata.instance_id).await {
         tracing::error!(
             event = "audit instance_purge_failed",
             instance_id = %metadata.instance_id,
@@ -1629,6 +1626,11 @@ pub async fn delete_instance(
         );
         return Err(error);
     }
+    state
+        .import_export_jobs
+        .delete_for_instance(&metadata.instance_id)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to purge instance jobs: {error}")))?;
     let deleted = state
         .manager
         .delete(&metadata.instance_id)
@@ -1639,21 +1641,19 @@ pub async fn delete_instance(
         .remove(&metadata.instance_id)
         .await;
     state.resource_cache.remove(&metadata.instance_id).await;
+    state.install_progress.remove(&metadata.instance_id);
     tracing::info!(
         event = "audit instance_deleted",
         instance_id = %metadata.instance_id,
         protocol = %metadata.protocol,
-        purge,
-        purge_reason = purge_authorization
-            .as_ref()
-            .map(|authorization| authorization.reason())
-            .unwrap_or("not_applicable"),
+        purge = true,
+        purge_reason = purge_authorization.reason(),
     );
 
     Ok(ApiResponse::ok(DeleteResponse {
         instance_id,
         deleted,
-        purged: purge,
+        purged: true,
     }))
 }
 
@@ -2029,32 +2029,76 @@ async fn rollback_lifecycle_runtime(
     }
 }
 
-async fn purge_instance_paths(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
+pub(crate) async fn purge_instance_paths(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<(), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
         .purge_instance_data(&paths.data)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    for path in [
+    let mut purge_paths = vec![
         paths.data,
         paths.logs,
         paths.sockets,
         paths.artifacts,
+        paths.exports,
+        paths.imports,
+        paths.backups,
         paths.runtime_config,
-    ] {
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ApiError::Runtime(format!(
-                    "failed to purge {}: {error}",
-                    path.display()
-                )));
-            }
-        }
+    ];
+    let retained_volumes = retained_instance_volume_paths(&purge_paths[0])
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to discover retained instance volumes: {error}"
+            ))
+        })?;
+    purge_paths.extend(retained_volumes);
+    for path in purge_paths {
+        cleanup_path_if_exists(&path).await?;
     }
     Ok(())
+}
+
+pub(crate) async fn retained_instance_volume_paths(
+    data_path: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+    let Some(parent) = data_path.parent() else {
+        return Ok(Vec::new());
+    };
+    let Some(instance_name) = data_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(Vec::new());
+    };
+    let prefixes = [
+        format!(".dbe-major-upgrade-old-{instance_name}-"),
+        format!(".dbe-restore-{instance_name}-"),
+    ];
+    let mut directory = match tokio::fs::read_dir(parent).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut paths = Vec::new();
+    while let Some(entry) = directory.next_entry().await? {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| retained_volume_name_matches(name, &prefixes))
+        {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn retained_volume_name_matches(name: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+    })
 }
 
 async fn instance_image_update_spec(
@@ -2183,6 +2227,31 @@ pub(crate) fn docker_error(error: DockerError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_instance_volume_paths_are_scoped_to_the_exact_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let data_path = root.path().join("inst_customer_db");
+        let old_upgrade = root
+            .path()
+            .join(".dbe-major-upgrade-old-inst_customer_db-550e8400-e29b-41d4-a716-446655440000");
+        let failed_restore = root
+            .path()
+            .join(".dbe-restore-inst_customer_db-550e8400-e29b-41d4-a716-446655440001");
+        let unrelated = root.path().join(
+            ".dbe-major-upgrade-old-inst_customer_db-other-550e8400-e29b-41d4-a716-446655440002",
+        );
+        tokio::fs::create_dir(&old_upgrade).await.unwrap();
+        tokio::fs::create_dir(&failed_restore).await.unwrap();
+        tokio::fs::create_dir(&unrelated).await.unwrap();
+
+        let mut paths = retained_instance_volume_paths(&data_path).await.unwrap();
+        paths.sort();
+        let mut expected = vec![old_upgrade, failed_restore];
+        expected.sort();
+
+        assert_eq!(paths, expected);
+    }
 
     #[test]
     fn deletion_preserves_quarantine_to_avoid_claiming_a_duplicate_route() {

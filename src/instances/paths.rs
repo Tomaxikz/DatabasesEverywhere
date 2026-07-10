@@ -17,6 +17,12 @@ pub struct InstancePaths {
     pub logs: PathBuf,
     pub sockets: PathBuf,
     pub artifacts: PathBuf,
+    /// Portable exports owned by this instance.
+    pub exports: PathBuf,
+    /// Operator-staged imports owned by this instance.
+    pub imports: PathBuf,
+    /// Physical backups are created lazily, but remain owned by the instance.
+    pub backups: PathBuf,
     /// Daemon-owned configuration that must never be writable by a database container.
     pub runtime_config: PathBuf,
     /// Daemon executable copy used only by TCP-only engines as a local socket bridge.
@@ -31,6 +37,9 @@ impl InstancePaths {
         let logs_root = root("paths.logs", &config.logs)?;
         let sockets_root = root("paths.sockets", &config.sockets)?;
         let artifacts_root = root("paths.artifacts", &config.artifacts)?;
+        let exports_root = root("paths.exports", &config.exports_root())?;
+        let imports_root = root("paths.imports", &config.imports_root())?;
+        let backups_root = root("paths.backups", &config.backups_root())?;
         let metadata_root = root("paths.metadata", &config.metadata_root())?;
         let runtime_config_root = metadata_root.join("runtime-configs");
 
@@ -40,6 +49,9 @@ impl InstancePaths {
             logs: child(&logs_root, instance_id)?,
             sockets: child_direct(&sockets_root, instance_id)?,
             artifacts: child(&artifacts_root, instance_id)?,
+            exports: child_direct(&exports_root, instance_id)?,
+            imports: child_direct(&imports_root, instance_id)?,
+            backups: child_direct(&backups_root, instance_id)?,
             runtime_config: child_direct(&runtime_config_root, instance_id)?,
             socket_bridge_binary: metadata_root
                 .join("runtime")
@@ -440,6 +452,9 @@ mod tests {
 
         assert!(paths.data.starts_with(&config.data));
         assert!(paths.logs.starts_with(&config.logs));
+        assert!(paths.exports.starts_with(config.exports_root()));
+        assert!(paths.imports.starts_with(config.imports_root()));
+        assert!(paths.backups.starts_with(config.backups_root()));
         assert!(paths.runtime_config.starts_with(config.metadata_root()));
     }
 

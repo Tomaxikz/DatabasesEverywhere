@@ -984,11 +984,17 @@ async fn stale_persistent_paths(paths: &InstancePaths) -> Result<Vec<String>, st
         &paths.data,
         &paths.logs,
         &paths.artifacts,
+        &paths.exports,
+        &paths.imports,
+        &paths.backups,
         &paths.runtime_config,
     ] {
         if !path_has_entries(path).await? {
             continue;
         }
+        stale.push(path.display().to_string());
+    }
+    for path in crate::api::instances::retained_instance_volume_paths(&paths.data).await? {
         stale.push(path.display().to_string());
     }
     Ok(stale)
@@ -1089,34 +1095,7 @@ impl<'a> CreateFailureCleanup<'a> {
 }
 
 async fn cleanup_created_paths(state: &AppState, paths: &InstancePaths) -> Result<(), ApiError> {
-    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-        .purge_instance_data(&paths.data)
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to purge instance data after create failure: {error}"
-            ))
-        })?;
-
-    for path in [
-        &paths.data,
-        &paths.logs,
-        &paths.sockets,
-        &paths.artifacts,
-        &paths.runtime_config,
-    ] {
-        match tokio::fs::remove_dir_all(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ApiError::Runtime(format!(
-                    "failed to remove instance path {} after create failure: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(())
+    crate::api::instances::purge_instance_paths(state, &paths.instance_id).await
 }
 
 pub(crate) async fn docker_error_with_logs(

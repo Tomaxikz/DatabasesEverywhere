@@ -343,7 +343,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 | GET | `/api/instances` | instances:read | List all instances |
 | POST | `/api/instances` | instances:write | Accept instance creation and return `202` immediately |
 | GET | `/api/instances/{id}` | instances:read | Fetch one |
-| DELETE | `/api/instances/{id}?purge=true` | instances:write | Delete; `purge` also wipes data dirs |
+| DELETE | `/api/instances/{id}?confirm=true&reason=customer%20requested%20deletion` | instances:write | Irreversibly delete the container, job history, imports, exports, backups, retained recovery/upgrade volumes, and all other managed instance data; confirmation and an audit reason are required |
 | GET | `/api/instances/{id}/status` | instances:read | Status plus creation progress while available |
 | POST | `/api/instances/{id}/power` | instances:write | Unified power API: `{ "action": "start" | "stop" | "restart" | "kill" }` |
 | POST | `/api/instances/{id}/reconcile` | instances:write | Re-sync stored status with the runtime |

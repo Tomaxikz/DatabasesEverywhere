@@ -185,6 +185,17 @@ impl ImportExportJobRepository {
             .collect()
     }
 
+    pub async fn delete_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<u64, ImportExportJobStorageError> {
+        let result = sqlx::query("DELETE FROM import_export_jobs WHERE instance_id = ?1")
+            .bind(instance_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn prune_completed(
         &self,
         keep_latest: u32,
@@ -335,6 +346,23 @@ mod tests {
         let counts = repository.count_by_status().await.unwrap();
         assert!(counts.contains(&(ImportExportStatus::Queued, 1)));
         assert!(counts.contains(&(ImportExportStatus::Failed, 1)));
+    }
+
+    #[tokio::test]
+    async fn deletes_only_jobs_owned_by_one_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = ImportExportJobRepository::new(pool);
+        let owned = sample_job();
+        let mut foreign = sample_job();
+        foreign.job_id = "job_other".to_string();
+        foreign.instance_id = "inst_other".to_string();
+        repository.insert(&owned).await.unwrap();
+        repository.insert(&foreign).await.unwrap();
+
+        assert_eq!(repository.delete_for_instance("inst_abc").await.unwrap(), 1);
+        assert!(repository.get("job_1").await.unwrap().is_none());
+        assert!(repository.get("job_other").await.unwrap().is_some());
     }
 
     #[tokio::test]
