@@ -14,7 +14,8 @@ pub mod credentials {
 }
 
 pub mod health {
-    pub const HEALTH_COMMAND: &str = "pg_isready -U \"$POSTGRES_USER\"";
+    pub const HEALTH_COMMAND: &str =
+        "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null";
 }
 
 pub mod logs {
@@ -24,3 +25,6 @@ pub mod logs {
 pub mod metadata {
     pub const PROTOCOL_NAME: &str = "postgres";
 }
+
+#[cfg(test)]
+mod integration_tests;

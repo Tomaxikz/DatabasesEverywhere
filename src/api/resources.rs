@@ -115,7 +115,7 @@ pub async fn list_resources(
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<Vec<ResourceReport>> {
-    authorize_scope(&state, &headers, &uri, scopes::RESOURCES_READ)?;
+    authorize_scope(&state, &headers, &uri, scopes::RESOURCES_ADMIN)?;
     let reports = futures::stream::iter(state.instances.list().await)
         .map(|metadata| {
             let state = state.clone();

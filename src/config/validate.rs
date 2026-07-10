@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{ApiSslConfig, ClickhouseConfig, Config, DiskLimitMode, ListenerConfig, TlsConfig};
-use crate::shared::images::has_sha256_digest;
+use crate::shared::images::is_pinned_image_reference;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
@@ -33,13 +33,9 @@ pub enum ConfigValidationError {
     #[error("{field} bind address is invalid: {value}")]
     InvalidBind { field: &'static str, value: String },
     #[error(
-        "{field} is exposed without TLS at {value}; enable TLS, bind to loopback, or set security.allow_insecure_public_listeners=true only for isolated development"
+        "public api bind {value} requires api.ssl.enabled=true with a valid certificate and key"
     )]
-    InsecurePublicListener { field: &'static str, value: String },
-    #[error(
-        "api.host must be a literal loopback IP address in production; publish the API through a hardened local reverse proxy with connection, header, and idle timeouts (configured bind: {value})"
-    )]
-    DirectPublicApiUnsupported { value: String },
+    PublicApiRequiresTls { value: String },
     #[error("daemon.network must not be empty")]
     EmptyDaemonNetwork,
     #[error("{field} must be a CIDR subnet: {value}")]
@@ -82,7 +78,7 @@ pub enum ConfigValidationError {
     InvalidBackupInterval,
     #[error("backups.retention_keep_latest_per_instance must be greater than zero")]
     InvalidBackupRetentionKeepLatest,
-    #[error("{field} must use an immutable sha256 digest: {image}")]
+    #[error("{field} must include a non-latest tag or valid sha256 digest: {image}")]
     InvalidImageReference { field: &'static str, image: String },
     #[error(
         "images.mongodb={image} is not compatible with Linux kernel {kernel}; MongoDB 8.0+ is affected by SERVER-121912 on kernel 6.19+"
@@ -109,7 +105,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
     validate_api_tls(&config.api.ssl)?;
-    validate_cleartext_exposure(config)?;
+    validate_api_exposure(config)?;
     validate_security(&config.security)?;
     validate_disk(&config.disk)?;
     if config.artifacts.retention_keep_latest == 0 {
@@ -190,56 +186,17 @@ fn looks_like_placeholder(secret: &str) -> bool {
             .is_some_and(|first| normalized.bytes().all(|byte| byte == *first))
 }
 
-fn validate_cleartext_exposure(config: &Config) -> Result<(), ConfigValidationError> {
-    if config.security.allow_insecure_public_listeners {
-        return Ok(());
-    }
-
-    validate_api_exposure(config)?;
-    for (field, listener) in [
-        ("postgres", &config.postgres),
-        ("mariadb", &config.mariadb),
-        ("redis", &config.redis),
-        ("mongodb", &config.mongodb),
-        ("qdrant", &config.qdrant),
-    ] {
-        if listener.enabled && !listener.tls {
-            reject_non_loopback_bind(field, &listener.bind)?;
-        }
-    }
-    if config.clickhouse.enabled && !config.clickhouse.tls {
-        reject_non_loopback_bind("clickhouse", &config.clickhouse.bind)?;
-        reject_non_loopback_bind("clickhouse.http_bind", &config.clickhouse.http_bind)?;
-    }
-    Ok(())
-}
-
 fn validate_api_exposure(config: &Config) -> Result<(), ConfigValidationError> {
     let host = config.api.host.trim();
     if host
         .parse::<IpAddr>()
         .is_ok_and(|address| address.is_loopback())
+        || config.api.ssl.enabled
     {
         return Ok(());
     }
-    Err(ConfigValidationError::DirectPublicApiUnsupported {
+    Err(ConfigValidationError::PublicApiRequiresTls {
         value: config.api.bind_addr(),
-    })
-}
-
-fn reject_non_loopback_bind(field: &'static str, bind: &str) -> Result<(), ConfigValidationError> {
-    let address = bind
-        .parse::<SocketAddr>()
-        .map_err(|_| ConfigValidationError::InvalidBind {
-            field,
-            value: bind.to_string(),
-        })?;
-    if address.ip().is_loopback() {
-        return Ok(());
-    }
-    Err(ConfigValidationError::InsecurePublicListener {
-        field,
-        value: bind.to_string(),
     })
 }
 
@@ -283,7 +240,7 @@ fn validate_image_reference(field: &'static str, image: &str) -> Result<(), Conf
             image: image.to_string(),
         });
     }
-    if has_sha256_digest(image) {
+    if is_pinned_image_reference(image) {
         return Ok(());
     }
     Err(ConfigValidationError::InvalidImageReference {
@@ -701,30 +658,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_exposed_cleartext_listeners_without_development_override() {
+    fn accepts_authenticated_database_gateways_on_public_cleartext_binds() {
         let mut config = valid_config();
         config.postgres.bind = "0.0.0.0:5432".to_string();
-
-        assert!(matches!(
-            validate_config(&config).unwrap_err(),
-            ConfigValidationError::InsecurePublicListener {
-                field: "postgres",
-                ..
-            }
-        ));
-
-        config.security.allow_insecure_public_listeners = true;
+        config.mariadb.bind = "0.0.0.0:3306".to_string();
+        config.redis.bind = "0.0.0.0:6379".to_string();
+        config.mongodb.bind = "0.0.0.0:27017".to_string();
+        config.clickhouse.bind = "0.0.0.0:9000".to_string();
+        config.clickhouse.http_bind = "0.0.0.0:8123".to_string();
+        config.qdrant.bind = "0.0.0.0:6334".to_string();
         validate_config(&config).unwrap();
     }
 
     #[test]
-    fn rejects_direct_public_api_without_development_override() {
+    fn public_api_requires_native_tls_even_with_legacy_development_override() {
         let mut config = valid_config();
         config.api.host = "0.0.0.0".to_string();
+        config.security.allow_insecure_public_listeners = true;
 
         assert!(matches!(
             validate_config(&config).unwrap_err(),
-            ConfigValidationError::DirectPublicApiUnsupported { .. }
+            ConfigValidationError::PublicApiRequiresTls { .. }
         ));
 
         let directory = tempfile::tempdir().unwrap();
@@ -735,21 +689,18 @@ mod tests {
         config.api.ssl.enabled = true;
         config.api.ssl.cert = certificate.display().to_string();
         config.api.ssl.key = private_key.display().to_string();
-        assert!(matches!(
-            validate_config(&config).unwrap_err(),
-            ConfigValidationError::DirectPublicApiUnsupported { .. }
-        ));
+        validate_config(&config).unwrap();
     }
 
     #[test]
-    fn rejects_hostname_api_bind_even_when_named_localhost() {
+    fn rejects_hostname_api_bind_without_native_tls() {
         for host in ["localhost", "dbe.internal"] {
             let mut config = valid_config();
             config.api.host = host.to_string();
 
             assert!(matches!(
                 validate_config(&config).unwrap_err(),
-                ConfigValidationError::DirectPublicApiUnsupported { .. }
+                ConfigValidationError::PublicApiRequiresTls { .. }
             ));
         }
     }
@@ -850,19 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unpinned_or_latest_runtime_images() {
+    fn accepts_normal_version_tags_and_rejects_unversioned_runtime_images() {
         let mut config = valid_config();
         config.images.clickhouse = "clickhouse/clickhouse-server:26.4.4.38".to_string();
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ConfigValidationError::InvalidImageReference {
-                field: "images.clickhouse",
-                ..
-            }
-        ));
+        config.images.postgres = "ghcr.io/example/postgres:18.4".to_string();
+        validate_config(&config).unwrap();
 
         let mut config = valid_config();
         config.images.qdrant = "qdrant/qdrant".to_string();
@@ -879,7 +822,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unpinned_or_latest_allowed_images() {
+    fn accepts_normal_allowed_tags_and_rejects_latest() {
+        let mut config = valid_config();
+        config.images.allowed.postgres = vec!["postgres:18.4".to_string()];
+        validate_config(&config).unwrap();
+
         let mut config = valid_config();
         config.images.allowed.postgres = vec!["postgres:latest".to_string()];
 
@@ -934,12 +881,10 @@ mod tests {
     fn accepts_remote_for_cors() {
         let mut config = valid_config();
         config.remote = "https://panel.example.com".to_string();
-        config.api.host = "0.0.0.0".to_string();
-        config.security.allow_insecure_public_listeners = true;
 
         validate_config(&config).unwrap();
 
-        assert_eq!(config.api.bind_addr(), "0.0.0.0:8090");
+        assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
         assert_eq!(config.cors_allowed_hosts(), vec!["panel.example.com"]);
     }
 

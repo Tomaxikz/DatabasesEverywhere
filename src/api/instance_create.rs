@@ -321,8 +321,13 @@ async fn create_instance_from_validated_request(
             "provision",
             "restricting PostgreSQL tenant role",
         );
-        if let Err(error) =
-            provision_postgres_tenant_role(state, &request.instance_id, &request.username).await
+        if let Err(error) = provision_postgres_tenant_role(
+            state,
+            &request.instance_id,
+            &request.database,
+            &request.username,
+        )
+        .await
         {
             state
                 .install_progress
@@ -526,12 +531,33 @@ pub(crate) async fn provision_mariadb_tenant_user(
 pub(crate) async fn provision_postgres_tenant_role(
     state: &AppState,
     instance_id: &str,
+    database: &str,
     tenant_username: &str,
 ) -> Result<(), ApiError> {
-    ensure_postgres_tenant_role_restricted(&state.docker, instance_id, tenant_username)
+    let script = postgres_tenant_provision_script(database, tenant_username);
+    let output = state
+        .docker
+        .exec_shell(Protocol::Postgres, instance_id, &script)
         .await
         .map_err(|error| fail_runtime(state, instance_id, error))?;
-    Ok(())
+    match output.stdout.lines().last() {
+        Some("provisioned") => Ok(()),
+        Some("legacy_bootstrap_superuser") => Err(fail_runtime(
+            state,
+            instance_id,
+            DockerError::LegacyPostgresBootstrapSuperuser {
+                instance_id: instance_id.to_string(),
+                username: tenant_username.to_string(),
+            },
+        )),
+        _ => Err(fail_runtime(
+            state,
+            instance_id,
+            DockerError::UnexpectedPostgresProvisioningOutput {
+                instance_id: instance_id.to_string(),
+            },
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -543,11 +569,19 @@ pub(crate) struct PostgresRoleHardeningSummary {
 pub(crate) async fn harden_postgres_roles_on_boot(
     manager: &InstanceManager,
     docker: &DockerRuntime,
+    instance_locks: &crate::instances::locks::InstanceLocks,
 ) -> Result<PostgresRoleHardeningSummary, DockerError> {
     let instances = manager.store().list().await;
     let mut checked = 0_usize;
     let mut hardened = 0_usize;
-    for metadata in instances {
+    for snapshot in instances {
+        if snapshot.protocol != Protocol::Postgres {
+            continue;
+        }
+        let _operation = instance_locks.lock(&snapshot.instance_id).await;
+        let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
+            continue;
+        };
         if metadata.protocol != Protocol::Postgres || metadata.status != InstanceStatus::Running {
             continue;
         }
@@ -570,32 +604,45 @@ async fn ensure_postgres_tenant_role_restricted(
     instance_id: &str,
     tenant_username: &str,
 ) -> Result<bool, DockerError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let maintenance_username = format!("dbe_admin_{}", uuid::Uuid::new_v4().simple());
-        let script = postgres_tenant_provision_script(&maintenance_username, tenant_username);
-        let error = match docker
-            .exec_shell(Protocol::Postgres, instance_id, &script)
-            .await
-        {
-            Ok(output) => return Ok(output.stdout.lines().last() == Some("hardened")),
-            Err(error) => error,
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(error);
-        }
-        sleep(Duration::from_secs(1)).await;
+    let script = postgres_tenant_hardening_script(tenant_username);
+    let output = docker
+        .exec_shell(Protocol::Postgres, instance_id, &script)
+        .await?;
+    match output.stdout.lines().last() {
+        Some("hardened") => Ok(true),
+        Some("already_restricted") => Ok(false),
+        Some("legacy_bootstrap_superuser") => Err(DockerError::LegacyPostgresBootstrapSuperuser {
+            instance_id: instance_id.to_string(),
+            username: tenant_username.to_string(),
+        }),
+        Some("missing_tenant_role") => Err(DockerError::MissingPostgresTenantRole {
+            instance_id: instance_id.to_string(),
+            username: tenant_username.to_string(),
+        }),
+        _ => Err(DockerError::UnexpectedPostgresProvisioningOutput {
+            instance_id: instance_id.to_string(),
+        }),
     }
 }
 
-fn postgres_tenant_provision_script(maintenance_username: &str, tenant_username: &str) -> String {
-    let harden_roles = databases::postgres::provision::harden_tenant_role_sql(
-        maintenance_username,
-        tenant_username,
-    );
+fn postgres_tenant_provision_script(database: &str, tenant_username: &str) -> String {
+    let role_state = databases::postgres::provision::tenant_role_state_sql(tenant_username);
+    let provision_role =
+        databases::postgres::provision::provision_tenant_role_sql(database, tenant_username);
     format!(
-        "set -eu\nis_super=$(psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT rolsuper FROM pg_roles WHERE rolname = current_user')\nif [ \"$is_super\" = t ]; then\n  printf %s {} | psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1\n  printf 'hardened\\n'\nelse\n  printf 'already_restricted\\n'\nfi\n",
-        sh_quote(&harden_roles),
+        "set -eu\nadmin_user=$POSTGRES_USER\nif ! psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null 2>&1; then\n  admin_user=${{DBE_POSTGRES_USER:-$POSTGRES_USER}}\nfi\nrole_state=$(psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atq -c {})\ncase \"$role_state\" in\n  10:*) printf 'legacy_bootstrap_superuser\\n'; exit 0 ;;\nesac\nprintf %s {} | psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -v tenant_password=\"$DBE_POSTGRES_PASSWORD\"\nprintf 'provisioned\\n'\n",
+        sh_quote(&role_state),
+        sh_quote(&provision_role),
+    )
+}
+
+fn postgres_tenant_hardening_script(tenant_username: &str) -> String {
+    let role_state = databases::postgres::provision::tenant_role_state_sql(tenant_username);
+    let restrict_role = databases::postgres::provision::restrict_tenant_role_sql(tenant_username);
+    format!(
+        "set -eu\nadmin_user=$POSTGRES_USER\nif ! psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null 2>&1; then\n  admin_user=${{DBE_POSTGRES_USER:-$POSTGRES_USER}}\nfi\nrole_state=$(psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atq -c {})\ncase \"$role_state\" in\n  '') printf 'missing_tenant_role\\n' ;;\n  10:*) printf 'legacy_bootstrap_superuser\\n' ;;\n  *:1) printf %s {} | psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1; printf 'hardened\\n' ;;\n  *) printf 'already_restricted\\n' ;;\nesac\n",
+        sh_quote(&role_state),
+        sh_quote(&restrict_role),
     )
 }
 
@@ -607,7 +654,7 @@ pub(crate) async fn wait_for_rootless_podman_service(
     let (message, command) = match protocol {
         Protocol::Postgres => (
             "waiting for PostgreSQL to accept local connections",
-            "pg_isready -h 127.0.0.1 -U \"$POSTGRES_USER\"",
+            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null",
         ),
         Protocol::Redis => (
             "waiting for Redis to accept local connections",
@@ -1255,18 +1302,27 @@ mod tests {
     }
 
     #[test]
-    fn postgres_provisioning_is_atomic_and_never_creates_a_login_superuser() {
-        let script = postgres_tenant_provision_script("dbe_admin_test", "tenant_user");
+    fn postgres_provisioning_uses_internal_admin_and_tenant_secret_env() {
+        let script = postgres_tenant_provision_script("app_db", "tenant_user");
 
-        let create_admin = script.find("CREATE ROLE").unwrap();
-        let demote_tenant = script.find("ALTER ROLE").unwrap();
-        assert!(create_admin < demote_tenant);
         assert!(script.contains("BEGIN;"));
-        assert!(script.contains("NOLOGIN SUPERUSER"));
-        assert!(script.contains("\"tenant_user\" NOSUPERUSER"));
+        assert!(script.contains("CREATE ROLE \"tenant_user\" LOGIN"));
+        assert!(script.contains("\"tenant_user\" LOGIN NOSUPERUSER"));
+        assert!(script.contains("ALTER DATABASE \"app_db\""));
         assert!(script.contains("COMMIT;"));
         assert_eq!(script.matches("| psql").count(), 1);
-        assert!(!script.contains("PASSWORD"));
+        assert!(script.contains("DBE_POSTGRES_PASSWORD"));
+        assert!(script.contains("legacy_bootstrap_superuser"));
+        assert!(!script.contains("dbe_admin_test"));
+    }
+
+    #[test]
+    fn postgres_hardening_rejects_legacy_bootstrap_tenants() {
+        let script = postgres_tenant_hardening_script("tenant_user");
+
+        assert!(script.contains("10:*"));
+        assert!(script.contains("legacy_bootstrap_superuser"));
+        assert!(script.contains("missing_tenant_role"));
         assert!(script.contains("already_restricted"));
     }
 

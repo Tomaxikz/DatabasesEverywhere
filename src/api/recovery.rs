@@ -18,8 +18,7 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct RestoreArtifactRequest {
-    pub instance_id: String,
-    pub artifact_path: String,
+    pub artifact_id: String,
     pub confirm: bool,
     pub reason: String,
 }
@@ -44,7 +43,7 @@ pub async fn failed_jobs(
 
 pub async fn retry_job(
     State(state): State<AppState>,
-    Path(job_id): Path<String>,
+    Path((instance_id, job_id)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<ImportExportJobResponse> {
@@ -55,6 +54,9 @@ pub async fn retry_job(
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    if job.instance_id != instance_id {
+        return Err(ApiError::NotFound);
+    }
     if job.status != ImportExportStatus::Failed {
         return Err(ApiError::BadRequest(
             "only failed jobs can be retried".to_string(),
@@ -84,6 +86,7 @@ pub async fn retry_job(
 
 pub async fn restore_artifact(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     headers: HeaderMap,
     uri: Uri,
     Json(request): Json<RestoreArtifactRequest>,
@@ -101,14 +104,20 @@ pub async fn restore_artifact(
     }
     tracing::info!(
         event = "audit recovery_restore_requested",
-        instance_id = %request.instance_id,
-        artifact_path = %request.artifact_path,
+        instance_id,
+        artifact_id = %request.artifact_id,
         reason = %request.reason,
     );
-    queue_import_instance(
+    state
+        .instances
+        .get(&instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    let artifact_path = crate::api::artifacts::verified_artifact_path_for_instance(
         &state,
-        &request.instance_id,
-        ImportOptions::artifact(request.artifact_path),
+        &request.artifact_id,
+        &instance_id,
     )
-    .await
+    .await?;
+    queue_import_instance(&state, &instance_id, ImportOptions::artifact(artifact_path)).await
 }

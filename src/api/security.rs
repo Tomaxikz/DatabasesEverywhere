@@ -226,16 +226,37 @@ fn rate_limit_identity(
 }
 
 fn signed_download_query_token(uri: &Uri) -> Option<&str> {
-    if !matches!(
-        uri.path(),
-        "/api/artifacts/download-signed" | "/api/backups/download-signed"
-    ) {
+    if !is_download_path(uri.path()) {
         return None;
     }
     uri.query()?
         .split('&')
         .find_map(|part| part.strip_prefix("token="))
         .filter(|token| !token.is_empty())
+}
+
+fn is_download_path(path: &str) -> bool {
+    let mut segments = path.trim_start_matches('/').split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (
+            Some("api"),
+            Some("instances"),
+            Some(instance_id),
+            Some("artifacts" | "backups"),
+            Some(artifact_id),
+            Some("download"),
+            None,
+        ) if !instance_id.is_empty() && !artifact_id.is_empty()
+    )
 }
 
 fn peer_rate_limit_key(peer: Option<SocketAddr>) -> String {
@@ -271,6 +292,20 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
+
+    #[test]
+    fn recognizes_only_instance_scoped_download_paths() {
+        assert!(is_download_path(
+            "/api/instances/inst_one/artifacts/dump.sql/download"
+        ));
+        assert!(is_download_path(
+            "/api/instances/inst_one/backups/backup.tar.gz/download"
+        ));
+        assert!(!is_download_path("/api/artifacts/download-signed"));
+        assert!(!is_download_path(
+            "/api/instances/inst_one/artifacts/dump.sql/delete"
+        ));
+    }
 
     #[test]
     fn ignores_forwarded_for_header_for_rate_limit_identity() {

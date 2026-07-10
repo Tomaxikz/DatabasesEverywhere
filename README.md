@@ -56,7 +56,7 @@ versioned release, verify its published SHA-256, and install it to
 `/usr/local/bin`:
 
 ```bash
-DBEV_VERSION=v0.1.0 # replace with the reviewed release
+DBEV_VERSION=v0.2.0 # replace with the reviewed release
 test "$(uname -m)" = x86_64
 sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
 sha256sum /usr/local/bin/dbev # compare with the release checksum
@@ -96,14 +96,19 @@ automatically if missing. Compose installs still need
 
 The configuration requires two distinct secrets of at least 32 random bytes:
 `token` for API authentication and `jwt_signing_key` for WebSocket and download
-JWTs. The production API listener must remain on loopback behind a hardened
-local reverse proxy; non-loopback database cleartext listeners are rejected
-unless the explicitly development-only `security.allow_insecure_public_listeners`
-override is set.
+JWTs. The API may remain on loopback behind a reverse proxy or bind directly to
+a public interface when its native TLS certificate and key are enabled;
+cleartext public API binds are rejected. Database gateways may bind to
+non-loopback addresses with or without TLS and continue to enforce each
+database protocol's native credentials. Cleartext public gateways emit a
+startup warning because credentials, queries, and results are not protected
+from network interception. `security.allow_insecure_public_listeners` only
+permits TLS-disabled remote credential imports and never permits a cleartext
+public management API.
 
 ## Docs
 
-Everything else lives in [docs.md](docs.md): node setup, config fields, paths, and a full integration guide for panel developers — every REST endpoint, WebSocket events, auth, signed downloads, the lot.
+Everything else lives in [docs.md](docs.md): node setup, config fields, paths, and a full integration guide for panel developers — every REST endpoint, WebSocket event, auth flow, and temporary download URL.
 
 ## Security
 
@@ -112,7 +117,7 @@ Found a vulnerability? Don't post it publicly — report it via GitHub Security 
 ## Hacking on it
 
 ```bash
-cargo test --lib
+cargo test --all-targets
 cargo build --release
 ```
 

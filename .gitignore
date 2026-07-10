@@ -3,4 +3,9 @@
 /.venv/
 /.venv-*/
 /scripts/
-/tests/
+/tests/*
+!/tests/api_ws_check.js
+!/tests/live_db_audit.sh
+!/tests/openapi_contract.rs
+!/tests/pass.sh
+!/tests/script.sh

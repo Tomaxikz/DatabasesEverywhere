@@ -6,8 +6,8 @@ Security fixes only land in the latest release — there's no backporting to old
 
 | Version | Supported              |
 |---------|------------------------|
-| 0.1.x   | :white_check_mark: Yes |
-| < 0.1.0 | :x: No                 |
+| 0.2.x   | :white_check_mark: Yes |
+| < 0.2.0 | :x: No                 |
 
 > Before reporting, make sure your finding reproduces on the latest release. If it only exists in an older build, the fix is updating — though if something old is nasty enough, we may still put out an advisory so people know to move.
 

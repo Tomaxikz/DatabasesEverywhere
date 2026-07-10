@@ -21,7 +21,10 @@ use crate::{
         ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
         JobAdmissionError, create_data_archive, extract_data_archive,
     },
-    shared::{network::is_private_or_sensitive_ip, protocol::Protocol, shell::sh_quote},
+    shared::{
+        files::is_safe_flat_file_name, network::is_private_or_sensitive_ip, protocol::Protocol,
+        shell::sh_quote,
+    },
 };
 use axum::{
     Json,
@@ -30,7 +33,6 @@ use axum::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
@@ -50,24 +52,18 @@ pub struct ExportRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportRequest {
-    #[serde(default)]
-    pub source: Option<ImportSource>,
-    #[serde(default)]
-    pub artifact_path: String,
-    #[serde(default)]
-    pub unarchive: Option<bool>,
-    #[serde(default)]
-    pub archive_format: Option<String>,
+    pub source: ImportSource,
     #[serde(default)]
     pub selection: Option<ImportExportSelection>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImportSource {
     Artifact {
-        artifact_path: String,
+        artifact_id: String,
         #[serde(default)]
         unarchive: Option<bool>,
         #[serde(default)]
@@ -190,28 +186,20 @@ impl From<&ImportRequest> for ImportOptions {
     fn from(request: &ImportRequest) -> Self {
         let selection = request.selection.clone().unwrap_or_default();
         match &request.source {
-            Some(ImportSource::Artifact {
-                artifact_path,
+            ImportSource::Artifact {
+                artifact_id,
                 unarchive,
                 archive_format,
-            }) => Self {
-                unarchive: unarchive.unwrap_or(request.unarchive.unwrap_or(false)),
-                archive_format: archive_format
-                    .clone()
-                    .or_else(|| request.archive_format.clone()),
-                source: ImportSourceOptions::Artifact(PathBuf::from(artifact_path)),
+            } => Self {
+                unarchive: unarchive.unwrap_or(false),
+                archive_format: archive_format.clone(),
+                source: ImportSourceOptions::Artifact(PathBuf::from(artifact_id)),
                 selection,
             },
-            Some(ImportSource::Remote(remote)) => Self {
+            ImportSource::Remote(remote) => Self {
                 unarchive: false,
                 archive_format: None,
                 source: ImportSourceOptions::Remote(remote.clone()),
-                selection,
-            },
-            None => Self {
-                unarchive: request.unarchive.unwrap_or(false),
-                archive_format: request.archive_format.clone(),
-                source: ImportSourceOptions::Artifact(PathBuf::from(&request.artifact_path)),
                 selection,
             },
         }
@@ -220,16 +208,21 @@ impl From<&ImportRequest> for ImportOptions {
 
 #[derive(Debug, Deserialize)]
 pub struct JobListQuery {
-    pub instance_id: Option<String>,
     pub status: Option<String>,
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ImportExportJobResponse {
-    #[serde(flatten)]
-    pub job: ImportExportJob,
+    pub job_id: String,
+    pub instance_id: String,
+    pub action: ImportExportAction,
+    pub status: ImportExportStatus,
+    pub artifact_id: Option<String>,
     pub artifact_size_bytes: Option<u64>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 pub async fn export_instance(
@@ -369,7 +362,8 @@ pub(crate) async fn queue_import_instance(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let options = harden_import_options(state, metadata.protocol, options).await?;
+    let options =
+        harden_import_options(state, &metadata.instance_id, metadata.protocol, options).await?;
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Import)?;
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
@@ -399,27 +393,41 @@ pub(crate) async fn queue_import_instance(
 
 pub async fn get_import_export_job(
     State(state): State<AppState>,
-    Path(job_id): Path<String>,
+    Path((instance_id, job_id)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<ImportExportJobResponse> {
     authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_READ)?;
+    state
+        .instances
+        .get(&instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
     let job = state
         .import_export_jobs
         .get(&job_id)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    if job.instance_id != instance_id {
+        return Err(ApiError::NotFound);
+    }
     Ok(Json(public_job_response(job).await))
 }
 
 pub async fn list_import_export_jobs(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     Query(query): Query<JobListQuery>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<Vec<ImportExportJobResponse>> {
     authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_READ)?;
+    state
+        .instances
+        .get(&instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
     let status = query
         .status
         .as_deref()
@@ -428,11 +436,7 @@ pub async fn list_import_export_jobs(
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let jobs = state
         .import_export_jobs
-        .list(
-            query.instance_id.as_deref(),
-            status,
-            query.limit.unwrap_or(100),
-        )
+        .list(Some(&instance_id), status, query.limit.unwrap_or(100))
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let mut response = Vec::with_capacity(jobs.len());
@@ -1206,7 +1210,7 @@ async fn validate_import_source(
         ImportSourceOptions::Artifact(path) => {
             if path.as_os_str().is_empty() {
                 return Err(ApiError::BadRequest(
-                    "artifact import requires source.artifact_path or artifact_path".to_string(),
+                    "artifact import requires source.artifact_id".to_string(),
                 ));
             }
             Ok(())
@@ -1257,13 +1261,14 @@ fn validate_remote_tls_pinning(
 
 async fn harden_import_options(
     state: &AppState,
+    instance_id: &str,
     target_protocol: Protocol,
     mut options: ImportOptions,
 ) -> Result<ImportOptions, ApiError> {
     validate_import_source(state, target_protocol, &options).await?;
     match &mut options.source {
         ImportSourceOptions::Artifact(path) => {
-            *path = validate_artifact_path(state, path).await?;
+            *path = validate_artifact_path(state, instance_id, path).await?;
         }
         ImportSourceOptions::Remote(remote) => {
             let resolved_host = resolve_validated_remote_host(state, remote).await?;
@@ -1420,9 +1425,9 @@ PGDATABASE={remote_database} \
 PGSSLMODE={sslmode} \
 {ssl_root_cert}pg_dump \
   --clean --if-exists --no-owner --no-privileges{filters} \
-| PGPASSWORD="$POSTGRES_PASSWORD" psql \
+| PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
   -h 127.0.0.1 \
-  -U "$POSTGRES_USER" \
+  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
   -d "$POSTGRES_DB" \
   -v ON_ERROR_STOP=1
 "#,
@@ -1939,9 +1944,9 @@ fn export_script(
             let filters = postgres_dump_selection_args(selection)?;
             format!(
                 r#"set -eu
-PGPASSWORD="$POSTGRES_PASSWORD" pg_dump \
+PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" pg_dump \
   -h 127.0.0.1 \
-  -U "$POSTGRES_USER" \
+  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
   -d "$POSTGRES_DB" \
   --clean --if-exists --no-owner --no-privileges{filters} \
   > {output_path}
@@ -2027,9 +2032,9 @@ fn import_script(metadata: &InstanceMetadata, input_path: &str) -> Result<String
     let script = match protocol {
         Protocol::Postgres => format!(
             r#"set -eu
-PGPASSWORD="$POSTGRES_PASSWORD" psql \
+PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
   -h 127.0.0.1 \
-  -U "$POSTGRES_USER" \
+  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
   -d "$POSTGRES_DB" \
   -v ON_ERROR_STOP=1 \
   -f {input_path}
@@ -2392,14 +2397,14 @@ async fn export_artifact_path(
     protocol: Protocol,
     archive_format: ExportArchiveFormat,
 ) -> Result<PathBuf, ApiError> {
-    let export_root = PathBuf::from(state.config.paths.exports_root());
+    crate::shared::ids::validate_instance_id(instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let export_root = crate::api::artifacts::instance_export_root(state, instance_id);
     create_private_directory(&export_root, "export directory").await?;
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let artifact_id = uuid::Uuid::new_v4();
     Ok(export_root.join(format!(
-        "{}-{}-{}.{}{}",
-        instance_id,
-        OffsetDateTime::now_utc().unix_timestamp(),
-        &suffix[..8],
+        "{}.{}{}",
+        artifact_id,
         dump_extension(protocol),
         archive_format.suffix()
     )))
@@ -2413,9 +2418,22 @@ pub(crate) async fn public_job_response(job: ImportExportJob) -> ImportExportJob
             .map(|metadata| metadata.len()),
         None => None,
     };
+    let artifact_id = job
+        .artifact_path
+        .as_deref()
+        .and_then(|path| FsPath::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
     ImportExportJobResponse {
-        job,
+        job_id: job.job_id,
+        instance_id: job.instance_id,
+        action: job.action,
+        status: job.status,
+        artifact_id,
         artifact_size_bytes,
+        error: job.error,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
     }
 }
 
@@ -2499,42 +2517,90 @@ fn write_new_private_file<T>(
     result
 }
 
-async fn validate_artifact_path(state: &AppState, path: &FsPath) -> Result<PathBuf, ApiError> {
-    if !path.is_absolute() {
-        return Err(ApiError::BadRequest(
-            "artifact_path must be an absolute path under configured artifacts exports or imports root"
-                .to_string(),
-        ));
+async fn validate_artifact_path(
+    state: &AppState,
+    instance_id: &str,
+    path: &FsPath,
+) -> Result<PathBuf, ApiError> {
+    crate::shared::ids::validate_instance_id(instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let artifact_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_safe_flat_file_name(name))
+        .ok_or_else(|| ApiError::BadRequest("invalid artifact_id".to_string()))?;
+    if !path.is_absolute() && path.to_str() != Some(artifact_id) {
+        return Err(ApiError::BadRequest("invalid artifact_id".to_string()));
     }
-    let export_root_path = PathBuf::from(state.config.paths.exports_root());
-    let import_root_path = PathBuf::from(state.config.paths.imports_root());
-    create_private_directory(&export_root_path, "exports root").await?;
-    create_private_directory(&import_root_path, "imports root").await?;
-    let exports_root = tokio::fs::canonicalize(&export_root_path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read exports root: {error}")))?;
-    let imports_root = tokio::fs::canonicalize(&import_root_path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read imports root: {error}")))?;
-    let source_metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("artifact_path is invalid: {error}")))?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-        return Err(ApiError::BadRequest(
-            "artifact_path must name a real regular file".to_string(),
-        ));
+
+    let base_roots = [
+        PathBuf::from(state.config.paths.exports_root()),
+        PathBuf::from(state.config.paths.imports_root()),
+    ];
+    let mut instance_roots = Vec::with_capacity(base_roots.len());
+    for base_root in base_roots {
+        create_private_directory(&base_root, "artifact root").await?;
+        let instance_root = base_root.join(instance_id);
+        create_private_directory(&instance_root, "instance artifact directory").await?;
+        instance_roots.push(
+            tokio::fs::canonicalize(&instance_root)
+                .await
+                .map_err(|error| {
+                    ApiError::Runtime(format!("failed to resolve instance artifact root: {error}"))
+                })?,
+        );
     }
-    let artifact_path = tokio::fs::canonicalize(path)
-        .await
-        .map_err(|error| ApiError::BadRequest(format!("artifact_path is invalid: {error}")))?;
-    if !artifact_path.starts_with(&exports_root) && !artifact_path.starts_with(&imports_root) {
-        return Err(ApiError::BadRequest(
-            "artifact_path must be under configured artifacts exports or imports root".to_string(),
-        ));
-    }
+
+    let artifact_path = if path.is_absolute() {
+        let source_metadata = tokio::fs::symlink_metadata(path)
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+            return Err(ApiError::BadRequest(
+                "artifact_id must name a real regular file".to_string(),
+            ));
+        }
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
+        let belongs_to_instance = canonical
+            .parent()
+            .is_some_and(|parent| instance_roots.iter().any(|root| parent == root));
+        if !belongs_to_instance {
+            return Err(ApiError::BadRequest(
+                "artifact does not belong to the requested instance".to_string(),
+            ));
+        }
+        canonical
+    } else {
+        let mut resolved = None;
+        for root in &instance_roots {
+            let candidate = root.join(artifact_id);
+            let metadata = match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ApiError::Runtime(format!(
+                        "failed to inspect import artifact: {error}"
+                    )));
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ApiError::BadRequest(
+                    "artifact_id must name a real regular file".to_string(),
+                ));
+            }
+            resolved = Some(tokio::fs::canonicalize(candidate).await.map_err(|error| {
+                ApiError::Runtime(format!("failed to resolve import artifact: {error}"))
+            })?);
+            break;
+        }
+        resolved.ok_or(ApiError::NotFound)?
+    };
+
     if !artifact_has_allowed_extension(&artifact_path) {
         return Err(ApiError::BadRequest(
-            "artifact_path extension is not allowed for import".to_string(),
+            "artifact_id extension is not allowed for import".to_string(),
         ));
     }
     #[cfg(unix)]
@@ -2586,6 +2652,34 @@ mod tests {
         runtime::docker::DockerRuntime,
         storage::{repositories::InstanceRepository, sqlite},
     };
+
+    #[tokio::test]
+    async fn public_job_response_never_exposes_a_host_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("dump.postgres.sql");
+        tokio::fs::write(&artifact, b"select 1").await.unwrap();
+        let job = ImportExportJob {
+            job_id: "job-1".to_string(),
+            instance_id: "instance-1".to_string(),
+            action: ImportExportAction::Export,
+            status: ImportExportStatus::Succeeded,
+            artifact_path: Some(artifact.display().to_string()),
+            error: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let response = serde_json::to_value(public_job_response(job).await).unwrap();
+
+        assert_eq!(response["artifact_id"], "dump.postgres.sql");
+        assert_eq!(response["artifact_size_bytes"], 8);
+        assert!(response.get("artifact_path").is_none());
+        assert!(
+            !response
+                .to_string()
+                .contains(&dir.path().display().to_string())
+        );
+    }
 
     #[test]
     fn archive_copy_stops_at_expired_deadline() {
@@ -2648,13 +2742,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_imports_must_be_under_exports_root() {
+    async fn artifact_imports_are_scoped_to_the_requested_instance() {
         let dir = tempfile::tempdir().unwrap();
         let artifacts = dir.path().join("artifacts");
-        let exports = artifacts.join("exports");
+        let exports = artifacts.join("exports").join("instance-1");
+        let foreign_exports = artifacts.join("exports").join("instance-2");
         std::fs::create_dir_all(&exports).unwrap();
-        let allowed = exports.join("instance.postgres.sql");
-        let outside = artifacts.join("outside.postgres.sql");
+        std::fs::create_dir_all(&foreign_exports).unwrap();
+        let allowed = exports.join("dump.postgres.sql");
+        let outside = foreign_exports.join("dump.postgres.sql");
         std::fs::write(&allowed, b"select 1").unwrap();
         std::fs::write(&outside, b"select 1").unwrap();
         let state = test_state_with_config(Config {
@@ -2667,7 +2763,9 @@ mod tests {
         .await;
 
         assert_eq!(
-            validate_artifact_path(&state, &allowed).await.unwrap(),
+            validate_artifact_path(&state, "instance-1", FsPath::new("dump.postgres.sql"))
+                .await
+                .unwrap(),
             allowed.canonicalize().unwrap()
         );
         #[cfg(unix)]
@@ -2683,7 +2781,10 @@ mod tests {
                 0o700
             );
         }
-        assert!(validate_artifact_path(&state, &outside).await.is_err());
+        let error = validate_artifact_path(&state, "instance-1", &outside)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requested instance"));
     }
 
     #[cfg(unix)]
@@ -2693,7 +2794,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let artifacts = dir.path().join("artifacts");
-        let exports = artifacts.join("exports");
+        let exports = artifacts.join("exports").join("instance-1");
         std::fs::create_dir_all(&exports).unwrap();
         let real = exports.join("real.postgres.sql");
         let link = exports.join("linked.postgres.sql");
@@ -2708,13 +2809,15 @@ mod tests {
         })
         .await;
 
-        let error = validate_artifact_path(&state, &link).await.unwrap_err();
+        let error = validate_artifact_path(&state, "instance-1", &link)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("real regular file"));
     }
 
     #[tokio::test]
-    async fn artifact_import_rejects_relative_paths_before_reading_exports_root() {
+    async fn artifact_import_rejects_relative_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let artifacts = dir.path().join("missing-artifacts");
         let state = test_state_with_config(Config {
@@ -2726,11 +2829,11 @@ mod tests {
         })
         .await;
 
-        let error = validate_artifact_path(&state, FsPath::new("../../etc/passwd"))
+        let error = validate_artifact_path(&state, "instance-1", FsPath::new("../../etc/passwd"))
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("absolute path"));
+        assert!(error.to_string().contains("invalid artifact_id"));
     }
 
     #[tokio::test]
@@ -2748,10 +2851,12 @@ mod tests {
         })
         .await;
 
-        let error = validate_artifact_path(&state, &outside).await.unwrap_err();
+        let error = validate_artifact_path(&state, "instance-1", &outside)
+            .await
+            .unwrap_err();
 
-        assert!(error.to_string().contains("under configured artifacts"));
-        assert!(artifacts.join("exports").is_dir());
+        assert!(error.to_string().contains("requested instance"));
+        assert!(artifacts.join("exports").join("instance-1").is_dir());
     }
 
     #[tokio::test]
@@ -2805,6 +2910,20 @@ mod tests {
     }
 
     #[test]
+    fn import_archive_settings_are_rejected_at_the_top_level() {
+        let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
+            "source": {
+                "type": "artifact",
+                "artifact_id": "dump.postgres.sql.gz"
+            },
+            "unarchive": true,
+            "archive_format": "gzip"
+        }));
+
+        assert!(request.is_err());
+    }
+
+    #[test]
     fn hostname_tls_pinning_fails_closed_for_clients_without_separate_connect_address() {
         for protocol in [Protocol::Mariadb, Protocol::Mongodb, Protocol::Clickhouse] {
             let mut remote = remote_source("db.example.com");
@@ -2834,7 +2953,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = harden_import_options(&state, Protocol::Postgres, options)
+        let error = harden_import_options(&state, "inst_test", Protocol::Postgres, options)
             .await
             .unwrap_err();
 
@@ -2864,7 +2983,7 @@ mod tests {
             ..Default::default()
         };
 
-        let options = harden_import_options(&state, Protocol::Postgres, options)
+        let options = harden_import_options(&state, "inst_test", Protocol::Postgres, options)
             .await
             .unwrap();
 

@@ -1,12 +1,11 @@
 use std::{
-    collections::HashSet,
     future::Future,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     extract::{
-        Query, State,
+        Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
     http::{HeaderMap, Uri},
@@ -20,7 +19,7 @@ use tokio::time::{
 
 use crate::{
     api::{
-        artifacts::{IssueDownloadTokenResponse, issue_artifact_download_ticket},
+        artifacts::{DownloadUrlResponse, create_artifact_download_url},
         handlers::{ApiError, authorize_websocket_jwt},
         import_export::{ImportExportJobResponse, public_job_response},
         progress::InstallProgress,
@@ -36,13 +35,11 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
-    pub instance_id: String,
     pub tail: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct ImportExportQuery {
-    pub instance_id: Option<String>,
     pub job_id: Option<String>,
 }
 
@@ -211,6 +208,7 @@ struct MonitoringInstance {
 
 pub async fn logs(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     Query(query): Query<LogsQuery>,
     headers: HeaderMap,
     uri: Uri,
@@ -221,11 +219,11 @@ pub async fn logs(
         &headers,
         &uri,
         scopes::LOGS_READ,
-        Some(&query.instance_id),
+        Some(&instance_id),
     )?;
     let metadata = state
         .instances
-        .get(&query.instance_id)
+        .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
@@ -238,6 +236,7 @@ pub async fn logs(
 
 pub async fn import_export(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     Query(query): Query<ImportExportQuery>,
     headers: HeaderMap,
     uri: Uri,
@@ -249,13 +248,26 @@ pub async fn import_export(
         &headers,
         &uri,
         scopes::IMPORT_EXPORT_READ,
-        query.instance_id.as_deref(),
+        Some(&instance_id),
     )?;
+    state
+        .instances
+        .get(&instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
     Ok(websocket
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
-            stream_import_export(socket, state, query, download_headers, claims, connection)
+            stream_import_export(
+                socket,
+                state,
+                instance_id,
+                query,
+                download_headers,
+                claims,
+                connection,
+            )
         }))
 }
 
@@ -406,6 +418,7 @@ fn non_empty_redacted(value: &str) -> Option<String> {
 async fn stream_import_export(
     mut socket: WebSocket,
     state: AppState,
+    instance_id: String,
     query: ImportExportQuery,
     download_headers: HeaderMap,
     claims: Claims,
@@ -415,7 +428,7 @@ async fn stream_import_export(
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let Ok(snapshot) = complete_before(
         expiration_deadline,
-        import_export_snapshot(&state, &download_headers, &query, &claims),
+        import_export_snapshot(&state, &download_headers, &instance_id, &query, &claims),
     )
     .await
     else {
@@ -468,7 +481,7 @@ async fn stream_import_export(
             event = events.recv() => {
                 match event {
                     Ok(job) => {
-                        if !job_matches_access(&job, &query, &claims) {
+                        if !job_matches_access(&job, &instance_id, &query, &claims) {
                             continue;
                         }
                         let Ok(job) = complete_before(
@@ -507,6 +520,7 @@ async fn stream_import_export(
                             import_export_snapshot(
                                 &state,
                                 &download_headers,
+                                &instance_id,
                                 &query,
                                 &claims,
                             ),
@@ -533,13 +547,14 @@ async fn stream_import_export(
 async fn import_export_snapshot(
     state: &AppState,
     download_headers: &HeaderMap,
+    instance_id: &str,
     query: &ImportExportQuery,
     claims: &Claims,
 ) -> ImportExportSnapshot {
-    let jobs = snapshot_jobs(state, query, claims).await;
+    let jobs = snapshot_jobs(state, instance_id, query).await;
     let mut response = Vec::with_capacity(jobs.len());
     for job in jobs {
-        if job_matches_access(&job, query, claims) {
+        if job_matches_access(&job, instance_id, query, claims) {
             response.push(public_job_update(state, download_headers, job, claims).await);
         }
     }
@@ -551,8 +566,8 @@ async fn import_export_snapshot(
 
 async fn snapshot_jobs(
     state: &AppState,
+    instance_id: &str,
     query: &ImportExportQuery,
-    claims: &Claims,
 ) -> Vec<ImportExportJob> {
     if let Some(job_id) = query.job_id.as_deref() {
         return match state.import_export_jobs.get(job_id).await {
@@ -565,24 +580,7 @@ async fn snapshot_jobs(
         };
     }
 
-    if let Some(instance_id) = query.instance_id.as_deref() {
-        return list_snapshot_jobs(state, Some(instance_id)).await;
-    }
-
-    if claims.all_instances {
-        return list_snapshot_jobs(state, None).await;
-    }
-
-    let mut instance_ids = HashSet::new();
-    let mut jobs = Vec::new();
-    for instance_id in &claims.instances {
-        if instance_ids.insert(instance_id.as_str()) {
-            jobs.extend(list_snapshot_jobs(state, Some(instance_id)).await);
-        }
-    }
-    jobs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-    jobs.truncate(100);
-    jobs
+    list_snapshot_jobs(state, Some(instance_id)).await
 }
 
 async fn list_snapshot_jobs(state: &AppState, instance_id: Option<&str>) -> Vec<ImportExportJob> {
@@ -595,12 +593,14 @@ async fn list_snapshot_jobs(state: &AppState, instance_id: Option<&str>) -> Vec<
     }
 }
 
-fn job_matches_access(job: &ImportExportJob, query: &ImportExportQuery, claims: &Claims) -> bool {
+fn job_matches_access(
+    job: &ImportExportJob,
+    instance_id: &str,
+    query: &ImportExportQuery,
+    claims: &Claims,
+) -> bool {
     claims.allows_instance(&job.instance_id)
-        && query
-            .instance_id
-            .as_deref()
-            .is_none_or(|instance_id| job.instance_id == instance_id)
+        && job.instance_id == instance_id
         && query
             .job_id
             .as_deref()
@@ -627,7 +627,7 @@ async fn download_ticket_for_job(
     download_headers: &HeaderMap,
     job: &ImportExportJob,
     claims: &Claims,
-) -> Option<IssueDownloadTokenResponse> {
+) -> Option<DownloadUrlResponse> {
     if !claims.allows_instance(&job.instance_id)
         || job.action != ImportExportAction::Export
         || job.status != ImportExportStatus::Succeeded
@@ -639,7 +639,7 @@ async fn download_ticket_for_job(
         .as_deref()
         .and_then(|path| std::path::Path::new(path).file_name())
         .and_then(|name| name.to_str())?;
-    match issue_artifact_download_ticket(
+    match create_artifact_download_url(
         state,
         download_headers,
         artifact_name,
@@ -747,7 +747,7 @@ struct ImportExportJobEvent {
 struct ImportExportJobUpdate {
     #[serde(flatten)]
     job: ImportExportJobResponse,
-    download: Option<IssueDownloadTokenResponse>,
+    download: Option<DownloadUrlResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -777,6 +777,7 @@ mod tests {
 
         assert!(!job_matches_access(
             &foreign_job,
+            "inst_allowed",
             &ImportExportQuery::default(),
             &claims,
         ));
@@ -787,11 +788,15 @@ mod tests {
         let claims = claims_for_instances(vec!["inst_allowed"]);
         let foreign_job = sample_job("job-foreign", "inst_foreign");
         let query = ImportExportQuery {
-            instance_id: None,
             job_id: Some(foreign_job.job_id.clone()),
         };
 
-        assert!(!job_matches_access(&foreign_job, &query, &claims));
+        assert!(!job_matches_access(
+            &foreign_job,
+            "inst_allowed",
+            &query,
+            &claims
+        ));
     }
 
     #[test]
@@ -801,6 +806,7 @@ mod tests {
 
         assert!(job_matches_access(
             &own_job,
+            "inst_allowed",
             &ImportExportQuery::default(),
             &claims,
         ));
@@ -814,6 +820,7 @@ mod tests {
 
         assert!(job_matches_access(
             &job,
+            "inst_any",
             &ImportExportQuery::default(),
             &claims,
         ));
@@ -826,6 +833,7 @@ mod tests {
 
         assert!(!job_matches_access(
             &job,
+            "inst_any",
             &ImportExportQuery::default(),
             &claims,
         ));

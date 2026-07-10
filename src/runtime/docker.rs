@@ -48,7 +48,9 @@ use crate::{
     shared::{
         ids::sanitize_docker_suffix,
         limits::{ResourceLimitError, validate_runtime_limits},
+        logs::truncate_log_tail,
         protocol::Protocol,
+        redaction,
     },
 };
 
@@ -734,16 +736,25 @@ impl DockerRuntime {
         if exit_code == 0 {
             Ok(output)
         } else {
+            let failure_output = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            let failure_output =
+                truncate_log_tail(&redaction::redact_connection_url(failure_output), 4_000);
             tracing::warn!(
                 container = %name,
                 %operation,
                 exit_code,
+                %failure_output,
                 "docker exec failed"
             );
             Err(DockerError::ExecFailed {
                 container: name,
                 operation,
                 exit_code,
+                failure_output,
             })
         }
     }
@@ -1544,12 +1555,29 @@ pub enum DockerError {
         expected_internal: bool,
         existing_internal: Option<bool>,
     },
-    #[error("docker exec failed in {container} with exit code {exit_code}: {operation}")]
+    #[error(
+        "docker exec failed in {container} with exit code {exit_code}: {operation}; output: {failure_output}"
+    )]
     ExecFailed {
         container: String,
         operation: String,
         exit_code: i64,
+        failure_output: String,
     },
+    #[error(
+        "PostgreSQL tenant role {username} in instance {instance_id} is the immutable bootstrap superuser; export the database and recreate the instance with purge before opening its gateway"
+    )]
+    LegacyPostgresBootstrapSuperuser {
+        instance_id: String,
+        username: String,
+    },
+    #[error("PostgreSQL tenant role {username} is missing from managed instance {instance_id}")]
+    MissingPostgresTenantRole {
+        instance_id: String,
+        username: String,
+    },
+    #[error("PostgreSQL provisioning returned no recognized result for instance {instance_id}")]
+    UnexpectedPostgresProvisioningOutput { instance_id: String },
     #[error(
         "docker exec timed out after {timeout_seconds} seconds in {container}: {operation}; the container was restarted to cancel the command"
     )]

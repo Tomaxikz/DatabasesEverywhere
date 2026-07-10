@@ -469,12 +469,12 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         Self {
-            postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4".to_string(),
-            redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32".to_string(),
-            mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f".to_string(),
-            mongodb: "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703".to_string(),
-            clickhouse: "clickhouse/clickhouse-server:25.8.25.37@sha256:9558b6aa8f01a3355e7295b7449d484047970ad35a766c30d3e600613abcfbf0".to_string(),
-            qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c".to_string(),
+            postgres: "postgres:18.4".to_string(),
+            redis: "redis:8.8.0".to_string(),
+            mariadb: "mariadb:12.3.2".to_string(),
+            mongodb: "mongo:7.0.37".to_string(),
+            clickhouse: "clickhouse/clickhouse-server:25.8.25.37".to_string(),
+            qdrant: "qdrant/qdrant:v1.18.2".to_string(),
             allowed: ImageAllowlistConfig::default(),
         }
     }

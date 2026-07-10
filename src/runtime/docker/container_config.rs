@@ -16,7 +16,10 @@ pub fn bind_mount(source: &std::path::Path, target: &str, read_only: bool) -> Mo
 
 pub fn healthcheck(protocol: Protocol) -> HealthConfig {
     let test = match protocol {
-        Protocol::Postgres => vec!["CMD-SHELL", "pg_isready -U \"$POSTGRES_USER\""],
+        Protocol::Postgres => vec![
+            "CMD-SHELL",
+            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null",
+        ],
         Protocol::Redis => vec![
             "CMD",
             "redis-cli",

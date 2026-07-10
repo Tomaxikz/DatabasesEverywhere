@@ -28,8 +28,10 @@ use crate::api::{
 use crate::{
     auth::scopes,
     constants::jwt::{AUDIENCE, ISSUER},
-    jobs::import_export::{ImportExportAction, ImportExportStatus},
-    shared::files::{is_safe_flat_file_name, safe_header_filename},
+    shared::{
+        files::{is_safe_flat_file_name, safe_header_filename},
+        ids::validate_instance_id,
+    },
 };
 
 const DOWNLOAD_PURPOSE: &str = "artifact_download";
@@ -51,18 +53,22 @@ impl DownloadKind {
         }
     }
 
-    fn signed_path(self, token: &str) -> String {
+    fn download_path(self, instance_id: &str, artifact_id: &str, token: &str) -> String {
         match self {
-            Self::Artifact => format!("/api/artifacts/download-signed?token={token}"),
-            Self::Backup => format!("/api/backups/download-signed?token={token}"),
+            Self::Artifact => format!(
+                "/api/instances/{instance_id}/artifacts/{artifact_id}/download?token={token}"
+            ),
+            Self::Backup => {
+                format!("/api/instances/{instance_id}/backups/{artifact_id}/download?token={token}")
+            }
         }
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct ArtifactInfo {
-    pub name: String,
-    pub path: String,
+    pub id: String,
+    pub instance_id: String,
     pub size_bytes: u64,
     pub modified_at: String,
     pub sha256: String,
@@ -75,7 +81,7 @@ pub struct RetentionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DeleteArtifactResponse {
-    pub name: String,
+    pub id: String,
     pub deleted: bool,
 }
 
@@ -102,8 +108,7 @@ impl ArtifactDownloadTickets {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct IssueDownloadTokenRequest {
-    pub instance_id: String,
+pub struct CreateDownloadRequest {
     #[serde(default)]
     pub expires_in_seconds: Option<i64>,
     #[serde(default)]
@@ -111,17 +116,14 @@ pub struct IssueDownloadTokenRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct IssueDownloadTokenResponse {
-    pub token_type: &'static str,
-    pub token: String,
+pub struct DownloadUrlResponse {
     pub url: String,
-    pub download_path: String,
     pub expires_at_unix: i64,
     pub single_use: bool,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SignedDownloadQuery {
+pub struct DownloadQuery {
     pub token: String,
 }
 
@@ -141,29 +143,32 @@ struct DownloadClaims {
     jti: String,
 }
 
-pub async fn list_artifacts(
+pub async fn list_instance_artifacts(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<Vec<ArtifactInfo>> {
     authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_READ)?;
-    Ok(Json(read_artifacts(&state).await?))
+    ensure_instance_exists(&state, &instance_id).await?;
+    Ok(Json(read_instance_artifacts(&state, &instance_id).await?))
 }
 
 pub async fn delete_artifact(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path((instance_id, artifact_id)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<DeleteArtifactResponse> {
     authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_WRITE)?;
-    let path = artifact_path(&state, &name)?;
+    ensure_instance_exists(&state, &instance_id).await?;
+    let path = verified_artifact_path_for_instance(&state, &artifact_id, &instance_id).await?;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
             remove_checksum_sidecar(&path).await;
-            tracing::info!(event = "audit artifact_deleted", artifact = %name);
+            tracing::info!(event = "audit artifact_deleted", instance_id, artifact_id);
             Ok(Json(DeleteArtifactResponse {
-                name,
+                id: artifact_id,
                 deleted: true,
             }))
         }
@@ -176,11 +181,13 @@ pub async fn delete_artifact(
 
 pub async fn apply_retention(
     State(state): State<AppState>,
+    Path(instance_id): Path<String>,
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<RetentionResponse> {
     authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_WRITE)?;
-    let mut artifacts = read_artifacts(&state).await?;
+    ensure_instance_exists(&state, &instance_id).await?;
+    let mut artifacts = read_instance_artifacts(&state, &instance_id).await?;
     artifacts.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     let cutoff = OffsetDateTime::now_utc()
         - time::Duration::days(state.config.artifacts.retention_max_age_days as i64);
@@ -193,17 +200,17 @@ pub async fn apply_retention(
         if index < keep_latest && modified >= cutoff {
             continue;
         }
-        let path = artifact_path(&state, &artifact.name)?;
+        let path = verified_artifact_path_for_instance(&state, &artifact.id, &instance_id).await?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 remove_checksum_sidecar(&path).await;
-                deleted.push(artifact.name);
+                deleted.push(artifact.id);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ApiError::Runtime(format!(
                     "failed to delete artifact {}: {error}",
-                    artifact.name
+                    artifact.id
                 )));
             }
         }
@@ -213,42 +220,58 @@ pub async fn apply_retention(
     Ok(Json(RetentionResponse { deleted }))
 }
 
-pub async fn issue_artifact_download_token(
+pub async fn create_artifact_download(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path((instance_id, artifact_id)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
-    Json(request): Json<IssueDownloadTokenRequest>,
-) -> ApiResult<IssueDownloadTokenResponse> {
+    Json(request): Json<CreateDownloadRequest>,
+) -> ApiResult<DownloadUrlResponse> {
     authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_READ)?;
-    issue_download_token(&state, &headers, &name, request, DownloadKind::Artifact).await
+    create_download_url(
+        &state,
+        &headers,
+        &artifact_id,
+        &instance_id,
+        request,
+        DownloadKind::Artifact,
+    )
+    .await
 }
 
-pub async fn issue_backup_download_token(
+pub async fn create_backup_download(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path((instance_id, backup_id)): Path<(String, String)>,
     headers: HeaderMap,
     uri: Uri,
-    Json(request): Json<IssueDownloadTokenRequest>,
-) -> ApiResult<IssueDownloadTokenResponse> {
+    Json(request): Json<CreateDownloadRequest>,
+) -> ApiResult<DownloadUrlResponse> {
     authorize_scope(&state, &headers, &uri, scopes::BACKUPS_READ)?;
-    issue_download_token(&state, &headers, &name, request, DownloadKind::Backup).await
+    create_download_url(
+        &state,
+        &headers,
+        &backup_id,
+        &instance_id,
+        request,
+        DownloadKind::Backup,
+    )
+    .await
 }
 
-pub(crate) async fn issue_artifact_download_ticket(
+pub(crate) async fn create_artifact_download_url(
     state: &AppState,
     headers: &HeaderMap,
     name: &str,
     instance_id: &str,
     expires_in_seconds: Option<i64>,
     single_use: bool,
-) -> Result<IssueDownloadTokenResponse, ApiError> {
-    issue_download_token(
+) -> Result<DownloadUrlResponse, ApiError> {
+    create_download_url(
         state,
         headers,
         name,
-        IssueDownloadTokenRequest {
-            instance_id: instance_id.to_string(),
+        instance_id,
+        CreateDownloadRequest {
             expires_in_seconds,
             single_use: Some(single_use),
         },
@@ -258,34 +281,47 @@ pub(crate) async fn issue_artifact_download_ticket(
     .map(|Json(response)| response)
 }
 
-pub async fn signed_artifact_download(
+pub async fn download_artifact(
     State(state): State<AppState>,
-    Query(query): Query<SignedDownloadQuery>,
+    Path((instance_id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<DownloadQuery>,
 ) -> Result<Response, ApiError> {
-    signed_download(&state, &query.token, DownloadKind::Artifact).await
+    download(
+        &state,
+        &query.token,
+        &instance_id,
+        &artifact_id,
+        DownloadKind::Artifact,
+    )
+    .await
 }
 
-pub async fn signed_backup_download(
+pub async fn download_backup(
     State(state): State<AppState>,
-    Query(query): Query<SignedDownloadQuery>,
+    Path((instance_id, backup_id)): Path<(String, String)>,
+    Query(query): Query<DownloadQuery>,
 ) -> Result<Response, ApiError> {
-    signed_download(&state, &query.token, DownloadKind::Backup).await
+    download(
+        &state,
+        &query.token,
+        &instance_id,
+        &backup_id,
+        DownloadKind::Backup,
+    )
+    .await
 }
 
-async fn issue_download_token(
+async fn create_download_url(
     state: &AppState,
     _headers: &HeaderMap,
     name: &str,
-    request: IssueDownloadTokenRequest,
+    instance_id: &str,
+    request: CreateDownloadRequest,
     kind: DownloadKind,
-) -> ApiResult<IssueDownloadTokenResponse> {
+) -> ApiResult<DownloadUrlResponse> {
     validate_artifact_name(name)?;
-    let instance_id = request.instance_id.trim();
-    if instance_id.is_empty() {
-        return Err(ApiError::BadRequest(
-            "instance_id must not be empty".to_string(),
-        ));
-    }
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    ensure_instance_exists(state, instance_id).await?;
     let ttl_seconds = request
         .expires_in_seconds
         .unwrap_or(DEFAULT_DOWNLOAD_TTL_SECONDS);
@@ -297,8 +333,7 @@ async fn issue_download_token(
     let single_use = request.single_use.unwrap_or(true);
     match kind {
         DownloadKind::Artifact => {
-            verified_artifact_path(state, name).await?;
-            ensure_artifact_belongs_to_instance(state, name, instance_id).await?;
+            verified_artifact_path_for_instance(state, name, instance_id).await?;
         }
         DownloadKind::Backup => {
             crate::api::backups::verified_backup_path_for_instance(state, name, instance_id)
@@ -328,36 +363,38 @@ async fn issue_download_token(
         &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
     )
     .map_err(|error| ApiError::Runtime(format!("failed to issue download token: {error}")))?;
-    let path_url = kind.signed_path(&token);
+    let path_url = kind.download_path(instance_id, name, &token);
     // Keep the credential-bearing URL origin-relative. Building an absolute URL
     // from Host or X-Forwarded-* would let an untrusted proxy/client poison it.
     let url = path_url.clone();
 
     tracing::info!(
-        event = "audit artifact_download_token_issued",
+        event = "audit artifact_download_url_created",
         artifact = %name,
         instance_id,
         expires_at_unix = exp,
         single_use,
     );
 
-    Ok(Json(IssueDownloadTokenResponse {
-        token_type: "Bearer",
-        token,
+    Ok(Json(DownloadUrlResponse {
         url,
-        download_path: path_url,
         expires_at_unix: exp,
         single_use,
     }))
 }
 
-async fn signed_download(
+async fn download(
     state: &AppState,
     token: &str,
+    instance_id: &str,
+    artifact_id: &str,
     kind: DownloadKind,
 ) -> Result<Response, ApiError> {
     let claims = validate_download_token(state, token)?;
-    if claims.kind != kind.as_str() {
+    if claims.kind != kind.as_str()
+        || claims.instance_id != instance_id
+        || claims.artifact != artifact_id
+    {
         return Err(ApiError::Unauthorized);
     }
     if claims.single_use
@@ -370,10 +407,8 @@ async fn signed_download(
     }
     let path = match kind {
         DownloadKind::Artifact => {
-            let path = verified_artifact_path(state, &claims.artifact).await?;
-            ensure_artifact_belongs_to_instance(state, &claims.artifact, &claims.instance_id)
-                .await?;
-            path
+            verified_artifact_path_for_instance(state, &claims.artifact, &claims.instance_id)
+                .await?
         }
         DownloadKind::Backup => {
             crate::api::backups::verified_backup_path_for_instance(
@@ -393,7 +428,7 @@ async fn signed_download(
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
     tracing::info!(
-        event = "audit artifact_downloaded_signed",
+        event = "audit artifact_downloaded",
         artifact = %claims.artifact,
         instance_id = %claims.instance_id,
         jti = %claims.jti,
@@ -433,9 +468,37 @@ fn validate_download_token(state: &AppState, token: &str) -> Result<DownloadClai
     Ok(claims)
 }
 
-pub(crate) async fn read_artifacts(state: &AppState) -> Result<Vec<ArtifactInfo>, ApiError> {
-    let export_root = export_root(state);
-    let mut entries = match tokio::fs::read_dir(&export_root).await {
+async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    state
+        .instances
+        .get(instance_id)
+        .await
+        .map(|_| ())
+        .ok_or(ApiError::NotFound)
+}
+
+pub(crate) async fn read_instance_artifacts(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<Vec<ArtifactInfo>, ApiError> {
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let instance_root = instance_export_root(state, instance_id);
+    match tokio::fs::symlink_metadata(&instance_root).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ApiError::Runtime(
+                "instance artifact root must be a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ApiError::Runtime(format!(
+                "failed to inspect instance artifact root: {error}"
+            )));
+        }
+    }
+    let mut entries = match tokio::fs::read_dir(&instance_root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -451,11 +514,10 @@ pub(crate) async fn read_artifacts(state: &AppState) -> Result<Vec<ArtifactInfo>
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to read artifact entry: {error}")))?
     {
-        let metadata = entry
-            .metadata()
+        let metadata = tokio::fs::symlink_metadata(entry.path())
             .await
             .map_err(|error| ApiError::Runtime(format!("failed to stat artifact: {error}")))?;
-        if !metadata.is_file() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
         let path = entry.path();
@@ -468,8 +530,8 @@ pub(crate) async fn read_artifacts(state: &AppState) -> Result<Vec<ArtifactInfo>
             .ok_or_else(|| ApiError::Runtime("invalid artifact name".to_string()))?
             .to_string();
         artifacts.push(ArtifactInfo {
-            name,
-            path: path.display().to_string(),
+            id: name,
+            instance_id: instance_id.to_string(),
             size_bytes: metadata.len(),
             modified_at: system_time_rfc3339(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
             sha256: sha256_file(path).await?,
@@ -479,13 +541,12 @@ pub(crate) async fn read_artifacts(state: &AppState) -> Result<Vec<ArtifactInfo>
     Ok(artifacts)
 }
 
-pub(crate) fn artifact_path(state: &AppState, name: &str) -> Result<PathBuf, ApiError> {
-    validate_artifact_name(name)?;
-    Ok(export_root(state).join(name))
-}
-
 pub(crate) fn export_root(state: &AppState) -> PathBuf {
     PathBuf::from(state.config.paths.exports_root())
+}
+
+pub(crate) fn instance_export_root(state: &AppState, instance_id: &str) -> PathBuf {
+    export_root(state).join(instance_id)
 }
 
 fn validate_artifact_name(name: &str) -> Result<(), ApiError> {
@@ -495,12 +556,26 @@ fn validate_artifact_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn verified_artifact_path(state: &AppState, name: &str) -> Result<PathBuf, ApiError> {
+pub(crate) async fn verified_artifact_path_for_instance(
+    state: &AppState,
+    name: &str,
+    instance_id: &str,
+) -> Result<PathBuf, ApiError> {
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     validate_artifact_name(name)?;
-    let root = export_root(state);
-    tokio::fs::create_dir_all(&root)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create artifact root: {error}")))?;
+    let root = instance_export_root(state, instance_id);
+    let root_metadata =
+        tokio::fs::symlink_metadata(&root)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => ApiError::NotFound,
+                _ => ApiError::Runtime(format!("failed to inspect artifact root: {error}")),
+            })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ApiError::Runtime(
+            "instance artifact root must be a real directory".to_string(),
+        ));
+    }
     let root = tokio::fs::canonicalize(&root)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to resolve artifact root: {error}")))?;
@@ -526,39 +601,6 @@ async fn verified_artifact_path(state: &AppState, name: &str) -> Result<PathBuf,
         ));
     }
     Ok(canonical)
-}
-
-async fn ensure_artifact_belongs_to_instance(
-    state: &AppState,
-    name: &str,
-    instance_id: &str,
-) -> Result<(), ApiError> {
-    state
-        .instances
-        .get(instance_id)
-        .await
-        .ok_or(ApiError::NotFound)?;
-    let jobs = state
-        .import_export_jobs
-        .list(Some(instance_id), Some(ImportExportStatus::Succeeded), 500)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    let belongs = jobs.into_iter().any(|job| {
-        job.action == ImportExportAction::Export
-            && job
-                .artifact_path
-                .as_deref()
-                .and_then(|path| FsPath::new(path).file_name())
-                .and_then(|name| name.to_str())
-                .is_some_and(|artifact| artifact == name)
-    });
-    if belongs {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden(
-            "artifact is not associated with the requested instance".to_string(),
-        ))
-    }
 }
 
 pub(crate) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
@@ -711,7 +753,7 @@ mod tests {
             },
             state::InstanceStore,
         },
-        jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportJobs},
+        jobs::import_export::ImportExportJobs,
         runtime::docker::DockerRuntime,
         shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
         storage::{repositories::InstanceRepository, sqlite},
@@ -733,30 +775,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_download_ticket_is_single_use() {
+    async fn temporary_download_url_is_single_use_and_path_scoped() {
         let state = test_state().await;
         let artifact_name = "inst_abc.postgres.sql.gz";
-        let artifact = export_root(&state).join(artifact_name);
+        let artifact = instance_export_root(&state, "inst_abc").join(artifact_name);
         tokio::fs::create_dir_all(artifact.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::write(&artifact, b"dump").await.unwrap();
         state.instances.upsert(sample_metadata("inst_abc")).await;
-        state
-            .import_export_jobs
-            .insert(sample_export_job("inst_abc", &artifact))
-            .await
-            .unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
         headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
-        let ticket = issue_download_token(
+        let ticket = create_download_url(
             &state,
             &headers,
             artifact_name,
-            IssueDownloadTokenRequest {
-                instance_id: "inst_abc".to_string(),
+            "inst_abc",
+            CreateDownloadRequest {
                 expires_in_seconds: Some(60),
                 single_use: Some(true),
             },
@@ -765,22 +802,57 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(ticket.url, ticket.download_path);
-        assert!(ticket.url.starts_with("/api/"));
+        let public_ticket = serde_json::to_value(&ticket).unwrap();
+        let fields = public_ticket.as_object().unwrap();
+        assert_eq!(fields.len(), 3);
+        assert!(fields.contains_key("url"));
+        assert!(fields.contains_key("expires_at_unix"));
+        assert!(fields.contains_key("single_use"));
+        assert!(ticket.url.starts_with(&format!(
+            "/api/instances/inst_abc/artifacts/{artifact_name}/download?token="
+        )));
         assert!(!ticket.url.contains("dbe.example.com"));
-        let token = ticket.token;
+        let token = ticket
+            .url
+            .split_once("token=")
+            .expect("signed URL contains token")
+            .1
+            .to_string();
 
-        signed_download(&state, &token, DownloadKind::Artifact)
-            .await
-            .unwrap();
-        let error = signed_download(&state, &token, DownloadKind::Artifact)
-            .await
-            .unwrap_err();
+        let mismatch = download(
+            &state,
+            &token,
+            "inst_other",
+            artifact_name,
+            DownloadKind::Artifact,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(mismatch, ApiError::Unauthorized));
+
+        download(
+            &state,
+            &token,
+            "inst_abc",
+            artifact_name,
+            DownloadKind::Artifact,
+        )
+        .await
+        .unwrap();
+        let error = download(
+            &state,
+            &token,
+            "inst_abc",
+            artifact_name,
+            DownloadKind::Artifact,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ApiError::Unauthorized));
     }
 
     #[tokio::test]
-    async fn signed_download_rejects_expired_token_without_leeway() {
+    async fn temporary_download_url_rejects_expired_token_without_leeway() {
         let state = test_state().await;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let claims = DownloadClaims {
@@ -813,26 +885,22 @@ mod tests {
     async fn artifact_must_belong_to_requested_instance() {
         let state = test_state().await;
         let artifact_name = "inst_abc.postgres.sql.gz";
-        let artifact = export_root(&state).join(artifact_name);
+        let artifact = instance_export_root(&state, "inst_other").join(artifact_name);
         tokio::fs::create_dir_all(artifact.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::write(&artifact, b"dump").await.unwrap();
+        state.instances.upsert(sample_metadata("inst_abc")).await;
         state.instances.upsert(sample_metadata("inst_other")).await;
-        state
-            .import_export_jobs
-            .insert(sample_export_job("inst_other", &artifact))
-            .await
-            .unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
-        let error = issue_download_token(
+        let error = create_download_url(
             &state,
             &headers,
             artifact_name,
-            IssueDownloadTokenRequest {
-                instance_id: "inst_abc".to_string(),
+            "inst_abc",
+            CreateDownloadRequest {
                 expires_in_seconds: Some(60),
                 single_use: Some(true),
             },
@@ -848,13 +916,13 @@ mod tests {
     #[tokio::test]
     async fn verified_artifact_path_rejects_symlinks() {
         let state = test_state().await;
-        let artifact = export_root(&state).join("link.sql");
+        let artifact = instance_export_root(&state, "inst_abc").join("link.sql");
         tokio::fs::create_dir_all(artifact.parent().unwrap())
             .await
             .unwrap();
         std::os::unix::fs::symlink("/etc/passwd", &artifact).unwrap();
 
-        let error = verified_artifact_path(&state, "link.sql")
+        let error = verified_artifact_path_for_instance(&state, "link.sql", "inst_abc")
             .await
             .unwrap_err();
         assert!(matches!(error, ApiError::BadRequest(_)));
@@ -925,19 +993,6 @@ mod tests {
             database_version: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    fn sample_export_job(instance_id: &str, artifact: &FsPath) -> ImportExportJob {
-        ImportExportJob {
-            job_id: Uuid::new_v4().to_string(),
-            instance_id: instance_id.to_string(),
-            action: ImportExportAction::Export,
-            status: ImportExportStatus::Succeeded,
-            artifact_path: Some(artifact.display().to_string()),
-            error: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:01Z".to_string(),
         }
     }
 }

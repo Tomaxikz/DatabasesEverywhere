@@ -30,7 +30,7 @@ use crate::{
     },
     jobs::import_export::ImportExportJobs,
     runtime::docker::DockerRuntime,
-    shared::{logs::truncate_log_tail, protocol::Protocol},
+    shared::{images::has_sha256_digest, logs::truncate_log_tail, protocol::Protocol},
     storage::{
         import_export_jobs::ImportExportJobRepository, repositories::InstanceRepository, sqlite,
     },
@@ -1548,23 +1548,8 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         quarantined = reconcile_summary.quarantined,
         "instance metadata reconciled"
     );
-    start_known_instances_on_boot(&config, &manager, &docker)
-        .await
-        .context("failed to persist boot instance reconciliation")?;
-    let postgres_role_hardening =
-        crate::api::instance_create::harden_postgres_roles_on_boot(&manager, &docker)
-            .await
-            .context("failed to harden legacy PostgreSQL tenant roles before opening gateways")?;
-    tracing::info!(
-        checked = postgres_role_hardening.checked,
-        hardened = postgres_role_hardening.hardened,
-        "legacy PostgreSQL role hardening complete"
-    );
-
-    start_gateway_listeners(&config, store.clone())?;
-    log_gateway_listener_summary(&config);
-
     let shutdown_jobs = import_export_jobs.clone();
+    let instance_locks = crate::instances::locks::InstanceLocks::default();
     let state = AppState {
         config: config.clone(),
         config_path: config_path.clone(),
@@ -1573,7 +1558,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         manager,
         docker,
         import_export_jobs,
-        instance_locks: crate::instances::locks::InstanceLocks::default(),
+        instance_locks,
         api_rate_limiter: crate::api::security::ApiRateLimiter::new(
             config.security.api_rate_limit_per_minute,
         ),
@@ -1582,8 +1567,11 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         resource_cache: crate::api::resources::ResourceCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
     };
-    crate::api::backups::start_scheduler(state.clone());
     crate::api::resources::start_resource_sampler(state.clone());
+    tracing::info!(
+        "critical startup complete; API will accept requests while managed instances start in the background"
+    );
+    tokio::spawn(complete_managed_runtime_boot(state.clone()));
     let server_result = serve_api(&config, build_router(state), shutdown_jobs.clone()).await;
     shutdown_jobs.close_admission();
     if !shutdown_jobs
@@ -1597,6 +1585,61 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     tracing::info!("active import/export jobs drained");
     server_result
+}
+
+async fn complete_managed_runtime_boot(state: AppState) {
+    if let Err(error) = start_known_instances_on_boot(
+        &state.config,
+        &state.manager,
+        &state.docker,
+        &state.instance_locks,
+    )
+    .await
+    {
+        tracing::error!(
+            %error,
+            "managed instance background startup failed; API remains available and database gateways remain closed"
+        );
+        return;
+    }
+    if !state.import_export_jobs.is_accepting() {
+        return;
+    }
+
+    let postgres_role_hardening = match crate::api::instance_create::harden_postgres_roles_on_boot(
+        &state.manager,
+        &state.docker,
+        &state.instance_locks,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "legacy PostgreSQL role hardening failed; API remains available and database gateways remain closed"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        checked = postgres_role_hardening.checked,
+        hardened = postgres_role_hardening.hardened,
+        "legacy PostgreSQL role hardening complete"
+    );
+    if !state.import_export_jobs.is_accepting() {
+        return;
+    }
+
+    if let Err(error) = start_gateway_listeners(&state.config, state.instances.clone()) {
+        tracing::error!(
+            %error,
+            "database gateway startup failed; API remains available"
+        );
+        return;
+    }
+    log_gateway_listener_summary(&state.config);
+    crate::api::backups::start_scheduler(state);
 }
 
 async fn quarantine_interrupted_job_instances(
@@ -1671,6 +1714,23 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         qdrant = %config.images.qdrant,
         "database images configured"
     );
+    let mutable_images: Vec<&str> = [
+        config.images.postgres.as_str(),
+        config.images.redis.as_str(),
+        config.images.mariadb.as_str(),
+        config.images.mongodb.as_str(),
+        config.images.clickhouse.as_str(),
+        config.images.qdrant.as_str(),
+    ]
+    .into_iter()
+    .filter(|image| !has_sha256_digest(image))
+    .collect();
+    if !mutable_images.is_empty() {
+        tracing::warn!(
+            images = ?mutable_images,
+            "database image tags are mutable; version tags are accepted, while sha256 digests provide stronger reproducibility"
+        );
+    }
     tracing::info!(
         mode = %config.disk.mode.method(),
         enforced = config.disk.mode.enforced(),
@@ -1843,7 +1903,18 @@ fn log_gateway_listener_summary(config: &Config) {
 
 fn log_listener(protocol: &'static str, bind: &str, enabled: bool, tls: bool) {
     if enabled {
-        tracing::info!(protocol, bind, tls, "gateway listener configured");
+        let publicly_reachable = bind
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| !address.ip().is_loopback());
+        if !tls && publicly_reachable {
+            tracing::warn!(
+                protocol,
+                bind,
+                "gateway listener accepts authenticated database traffic without transport encryption"
+            );
+        } else {
+            tracing::info!(protocol, bind, tls, "gateway listener configured");
+        }
     } else {
         tracing::info!(protocol, bind, "gateway listener disabled");
     }
@@ -1870,6 +1941,7 @@ async fn start_known_instances_on_boot(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
+    instance_locks: &crate::instances::locks::InstanceLocks,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await;
     let mut attempted = 0_usize;
@@ -1877,7 +1949,18 @@ async fn start_known_instances_on_boot(
     let mut stopped = 0_usize;
     let mut failed = 0_usize;
 
-    for metadata in instances {
+    for snapshot in instances {
+        if !matches!(
+            snapshot.status,
+            InstanceStatus::Stopped | InstanceStatus::Failed
+        ) {
+            continue;
+        }
+
+        let _operation = instance_locks.lock(&snapshot.instance_id).await;
+        let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
+            continue;
+        };
         if !matches!(
             metadata.status,
             InstanceStatus::Stopped | InstanceStatus::Failed
@@ -1935,7 +2018,7 @@ async fn start_known_instances_on_boot(
                         metadata.protocol,
                         &metadata.instance_id,
                         "managed instance did not become ready during daemon boot",
-                        &error,
+                        error.to_string(),
                     )
                     .await;
                 }
@@ -1946,7 +2029,7 @@ async fn start_known_instances_on_boot(
                     metadata.protocol,
                     &metadata.instance_id,
                     "failed to start managed instance during daemon boot",
-                    &error,
+                    error.to_string(),
                 )
                 .await;
             }
@@ -1977,7 +2060,7 @@ async fn log_boot_container_failure(
     protocol: Protocol,
     instance_id: &str,
     message: &'static str,
-    error: &dyn std::fmt::Display,
+    error: String,
 ) {
     let recent_container_logs = match docker.logs(protocol, instance_id, None).await {
         Ok(output) => {

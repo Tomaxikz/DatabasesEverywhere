@@ -114,11 +114,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
 fn known_scope(scope: &str) -> bool {
     matches!(
         scope,
-        scopes::MONITOR_READ
-            | scopes::LOGS_READ
-            | scopes::IMPORT_EXPORT_READ
-            | scopes::IMPORT_EXPORT_WRITE
-            | scopes::RECOVERY_ADMIN
+        scopes::MONITOR_READ | scopes::LOGS_READ | scopes::IMPORT_EXPORT_READ
     )
 }
 

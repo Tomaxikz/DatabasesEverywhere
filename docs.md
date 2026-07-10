@@ -22,7 +22,7 @@ release, and then install it. Do not automate
 installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.1.0 # replace with the reviewed release
+DBEV_VERSION=v0.2.0 # replace with the reviewed release
 test "$(uname -m)" = x86_64
 sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
 # Compare this value with the checksum shown on the GitHub release page.
@@ -59,7 +59,7 @@ api:
   port: 8090
 ```
 
-Also tweak gateway ports, `daemon.engine`, `daemon.socket_path`, or `daemon.ipam.subnet` if your host needs it. Keep `api.host` on loopback; the public API URL/domain belongs in the panel's node record and must terminate at a local hardened reverse proxy.
+Also tweak gateway ports, `daemon.engine`, `daemon.socket_path`, or `daemon.ipam.subnet` if your host needs it. Keep `api.host` on loopback when using a local reverse proxy. To expose DBE's native HTTPS server directly instead, use `api.host: 0.0.0.0`, enable `api.ssl`, and configure the panel node URL with the public HTTPS port.
 
 `token` and `jwt_signing_key` are independent credentials and must each contain
 at least 32 random bytes. Generate them with a cryptographically secure secret
@@ -69,35 +69,33 @@ The template placeholders are deliberately rejected by `check-config`.
 For example, run `openssl rand -base64 32` twice and assign each output to one
 of the two fields.
 
-The API listener is production-supported only on loopback, even when its native TLS is configured. Publish it through a local reverse proxy that enforces a global connection cap, header size and header-read deadline, request-body limit, and idle read/write timeouts; this protects sockets that have not yet reached application middleware and slow streaming clients. Database gateway cleartext listeners are also accepted only on loopback; enable gateway TLS before binding them to another interface. The
-`security.allow_insecure_public_listeners` override exists solely for isolated
-local development; enabling it on a production or shared network exposes node
-and database credentials.
+The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. `security.allow_insecure_public_listeners` applies only to TLS-disabled remote credential imports and never permits a cleartext public management API.
 
-Production configuration requires immutable manifest digests. Keep the readable
-tag before `@sha256:` for operator context, but treat the digest as the identity:
+Database images may use ordinary versioned Docker Hub, GHCR, or other
+registry references. Bare references and the mutable `latest` tag are rejected;
+an optional `@sha256:` digest can still be used when exact reproducibility is
+desired:
 
 ```yaml
 images:
-  postgres: "postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"
-  redis: "redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"
-  mariadb: "mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"
-  mongodb: "mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58"
-  clickhouse: "clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"
-  qdrant: "qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"
+  postgres: "postgres:18.4"
+  redis: "redis:8.8.0"
+  mariadb: "mariadb:12.3.2"
+  mongodb: "mongo:8.3.4"
+  clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
+  qdrant: "qdrant/qdrant:v1.18.2"
   allowed:
-    postgres: ["postgres:18.4@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4"]
-    redis: ["redis:8.8.0@sha256:2838d5524559494f6f1cd66e97e76b200d64a633a8614200620755ed395daf32"]
-    mariadb: ["mariadb:12.3.2@sha256:628f228f0fd5913a220438693576b29b6fe4dc1fa0a1298c0e98579fae28635f"]
-    mongodb: ["mongo:8.3.4@sha256:0f887198e29c093fd2b36c3e2eb43c7b98e47c081d89fbd5bc212da0cd43ec58", "mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703"]
-    clickhouse: ["clickhouse/clickhouse-server:26.4.4.38@sha256:338a4187b899c53ff2300e3ab33be047a3a7f4ede161af0bed077815be6f2425"]
-    qdrant: ["qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c"]
+    postgres: ["postgres:18.4"]
+    redis: ["redis:8.8.0"]
+    mariadb: ["mariadb:12.3.2"]
+    mongodb: ["mongo:8.3.4", "mongo:7.0.37"]
+    clickhouse: ["clickhouse/clickhouse-server:26.4.4.38"]
+    qdrant: ["qdrant/qdrant:v1.18.2"]
 ```
 
 MongoDB 8.x has a known incompatibility with Linux kernel 6.19+ / 7.x
 (`SERVER-121912`). If a node logs that MongoDB cannot start on that kernel,
-switch only MongoDB back to the known working digest:
-`mongo:7.0.37@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703`.
+switch only MongoDB back to the known working version: `mongo:7.0.37`.
 
 References:
 
@@ -177,7 +175,7 @@ missing.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.1.0@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.2.0@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -252,7 +250,7 @@ Authorization: Bearer <token>
 
 The config token has the `*` scope, so it can do everything. Things to know:
 
-- Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is signed download URLs, which carry their own short-lived JWT.
+- Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is a temporary download URL returned by the download endpoint; it carries its own short-lived JWT.
 - If your request includes an `Origin` header (i.e. it comes from a browser), the origin must match the allowed hosts derived from `remote` — otherwise `401`.
 - Rate limit: 600 requests per minute per token. Exceed it and you get `429`.
 - Request bodies are capped at `security.api_body_limit_bytes`.
@@ -278,11 +276,23 @@ Every error is the same shape:
 | 501 | Endpoint not implemented yet |
 | 500 | Something broke on the daemon side |
 
+## API contract version
+
+`GET /api/system` returns both the daemon binary `version` and the independently
+advertised `api_version`. A panel must verify `api_version` before enabling node
+actions. Contract `0.2.0` is intentionally breaking: heartbeat is now `GET`,
+instance lifecycle uses only `/power`, jobs/artifacts/backups and their
+WebSockets are instance-scoped, import archive settings live inside `source`,
+temporary downloads use authenticated `POST` and capability-authenticated `GET`
+on the same instance-scoped `/download` path, download URL responses expose only
+`url`, `expires_at_unix`, and `single_use`, and backup/restore calls return
+synchronous operation records rather than fake job IDs.
+
 ## Scopes
 
 Each endpoint requires one scope. The node token has `*`; scoped tokens matter mostly for WebSocket JWTs.
 
-`system:read`, `instances:read`, `instances:write`, `resources:read`, `logs:read`, `metrics:read`, `artifacts:read`, `artifacts:write`, `backups:read`, `backups:write`, `import-export:read`, `import-export:write`, `recovery:admin`, `images:admin`, `ws-tokens:write`, `monitor:read`, `config:admin`
+`system:read`, `instances:read`, `instances:write`, `instances:admin`, `resources:read`, `resources:admin`, `logs:read`, `metrics:read`, `artifacts:read`, `artifacts:write`, `backups:read`, `backups:write`, `backups:admin`, `import-export:read`, `import-export:write`, `recovery:admin`, `images:admin`, `ws-tokens:write`, `monitor:read`, `config:admin`
 
 ## Instances
 
@@ -316,7 +326,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `running`, `stopped`, `failed`, `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
@@ -327,20 +337,22 @@ An instance = one database container. The `InstanceMetadata` object you get back
 | GET | `/api/instances/{id}` | instances:read | Fetch one |
 | DELETE | `/api/instances/{id}?purge=true` | instances:write | Delete; `purge` also wipes data dirs |
 | GET | `/api/instances/{id}/status` | instances:read | Just `{instance_id, status}` |
-| POST | `/api/instances/{id}/start` | instances:write | Start (waits until ready, up to 120s) |
-| POST | `/api/instances/{id}/stop` | instances:write | Stop |
-| POST | `/api/instances/{id}/restart` | instances:write | Restart (waits until ready) |
 | POST | `/api/instances/{id}/power` | instances:write | Unified power API: `{ "action": "start" | "stop" | "restart" | "kill" }` |
 | POST | `/api/instances/{id}/reconcile` | instances:write | Re-sync stored status with the runtime |
 | PATCH | `/api/instances/{id}/limits` | instances:write | Update CPU/memory/disk limits |
 | PATCH | `/api/instances/{id}/image` | instances:write | Move to a new image (recreates container) |
 | GET | `/api/instances/{id}/resources` | resources:read | Live resource report |
-| GET | `/api/resources` | resources:read | Resource reports for everything |
-| GET | `/api/runtime-instances` | instances:read | Container-level view (name, runtime, status) |
+| GET | `/api/admin/resources` | resources:admin | Resource reports for everything |
+| GET | `/api/admin/runtime-instances` | instances:admin | Container-level view (name, runtime, status) |
 | GET | `/api/instances/{id}/logs?tail=200` | logs:read | One-shot logs for one instance; `tail` is clamped to 1-2000 lines |
-| GET | `/api/logs/{id}` | logs:read | One-shot logs `{instance_id, stdout, stderr}` |
 
 Lifecycle calls are idempotent-ish: starting a running instance or stopping a stopped one is a no-op, not an error.
+
+Once an authenticated create request is accepted, provisioning continues in a
+detached daemon task even if the HTTP client disconnects. The per-instance lock
+continues to serialize operations and failed provisioning still runs managed
+container/path cleanup, preventing a short panel timeout from leaving an orphaned
+volume behind.
 
 ### Creating an instance
 
@@ -361,9 +373,23 @@ POST /api/instances
 
 Validation rules your panel should mirror so users get nice errors:
 
-- `database` and `username`: 1–63 chars, must start with an ASCII letter, then letters/digits/`_`/`-` only. Reserved names are rejected (`postgres`, `mysql`, `admin`, `root`, `default`, `dbe_health`, and a few more).
+- `database` and `username`: 1–63 chars, must start with an ASCII letter, then letters/digits/`_`/`-` only. Reserved names are rejected (`postgres`, `mysql`, `admin`, `root`, `default`, `dbe_admin`, `dbe_health`, and a few more).
 - `password` and `public_host` must be non-empty.
 - `cpu_cores` must be finite and between `0.01` and `1024`; `memory_mib` must be between `1` and `1048576` (1 TiB); and `disk_mib` must be greater than zero. MongoDB and ClickHouse additionally need at least 1024 `memory_mib` **and** 1024 `disk_mib` or they won't even boot.
+
+PostgreSQL clusters use a randomly protected internal `dbe_admin` bootstrap role
+that is never registered as a gateway route. The requested username is created
+separately as the database owner with `LOGIN` and without superuser, role-creation,
+database-creation, replication, inheritance, or row-security bypass privileges.
+The container health check performs a real query against `POSTGRES_DB`; it does
+not rely on `pg_isready`, which can report that the temporary initialization
+server is accepting connections before the requested database exists.
+
+PostgreSQL instances created by older DBE builds may have used the tenant as the
+immutable bootstrap superuser. DBE refuses to open gateways when it detects that
+legacy layout because PostgreSQL cannot safely demote that role. Export the data
+through the management API, recreate the instance with explicit stale-resource
+purging, and import the dump to migrate it to the restricted tenant layout.
 
 ### Updating limits
 
@@ -403,8 +429,8 @@ The response includes `strategy`:
 ```json
 {
   "strategy": "major_upgrade_migration",
-  "export_artifact_path": "/var/lib/dbev/artifacts/exports/...",
-  "old_volume_backup_path": "/var/lib/dbev/volumes/.dbe-major-upgrade-old-...",
+  "export_artifact_id": "9c39d836-5f8e-4e48-94d6-ec6b1397fdda.postgres.sql",
+  "old_volume_backup_retained": true,
   "warnings": ["..."]
 }
 ```
@@ -412,7 +438,7 @@ The response includes `strategy`:
 ### Pre-pulling images
 
 ```json
-POST /api/images/pull            (scope: images:admin)
+POST /api/admin/images/pull      (scope: images:admin)
 { "protocol": "postgres", "image": "postgres:18.4" }
 ```
 
@@ -420,7 +446,7 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 
 ## Resource reports
 
-`GET /api/resources` and `GET /api/instances/{id}/resources` return:
+`GET /api/admin/resources` and `GET /api/instances/{id}/resources` return:
 
 ```json
 {
@@ -441,8 +467,8 @@ Usage fields are `null` when the container isn't running or stats aren't availab
 
 Three related but different things — don't mix them up:
 
-- **Exports** are portable database-native dumps (`pg_dump` style). They land under `paths.exports` and stay there until deleted or aged out by retention. Good for "download my database" buttons.
-- **Imports** load a dump into an instance, from a staged file or straight from a remote database. Staging files belong under `paths.imports`; the daemon accepts imports from `paths.exports` or `paths.imports` after canonical path checks.
+- **Exports** are portable database-native dumps (`pg_dump` style). They are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs.
+- **Imports** load one of that instance's artifacts or copy data directly from a remote database. An operator can also stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths.
 - **Backups** are physical archives of the whole instance volume, stored under `paths.backups/<instance_id>/`. They're for disaster recovery on the same daemon, not portability.
 
 ### Import/export jobs
@@ -455,7 +481,7 @@ Exports and imports are async. You queue a job, then watch it via polling or the
   "instance_id": "cust-42-db",
   "action": "export",
   "status": "queued",
-  "artifact_path": "/var/lib/dbev/artifacts/exports/…",
+  "artifact_id": "9c39d836-5f8e-4e48-94d6-ec6b1397fdda.postgres.sql",
   "error": null,
   "created_at": "…",
   "updated_at": "…",
@@ -469,8 +495,8 @@ Exports and imports are async. You queue a job, then watch it via polling or the
 | --- | --- | --- | --- |
 | POST | `/api/instances/{id}/export` | import-export:write | Queue an export |
 | POST | `/api/instances/{id}/import` | import-export:write | Queue an import |
-| GET | `/api/import-export` | import-export:read | List jobs (`?instance_id=&status=&limit=`) |
-| GET | `/api/import-export/{job_id}` | import-export:read | One job |
+| GET | `/api/instances/{id}/import-export/jobs` | import-export:read | List that instance's jobs (`?status=&limit=`) |
+| GET | `/api/instances/{id}/import-export/jobs/{job_id}` | import-export:read | One job, after ownership verification |
 
 Export body (all optional — empty body means a full plain dump):
 
@@ -488,19 +514,25 @@ Export/import formats:
 
 | Protocol | Export format | Import support |
 | --- | --- | --- |
-| PostgreSQL | `.postgres.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote PostgreSQL |
-| MariaDB | `.mariadb.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote MariaDB/MySQL |
-| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump, gzip/tar/zip-wrapped archive, remote MongoDB |
-| ClickHouse | `.clickhouse.sql` logical dump | Plain dump, gzip/bzip2/tar/zip-wrapped dump, remote ClickHouse |
+| PostgreSQL | `.postgres.sql` logical dump | Plain dump, gzip/bzip2/tar/zip/rar-wrapped dump, remote PostgreSQL |
+| MariaDB | `.mariadb.sql` logical dump | Plain dump, gzip/bzip2/tar/zip/rar-wrapped dump, remote MariaDB/MySQL |
+| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump, gzip/tar/zip/rar-wrapped archive, remote MongoDB |
+| ClickHouse | `.clickhouse.sql` logical dump | Plain dump, gzip/bzip2/tar/zip/rar-wrapped dump, remote ClickHouse |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
 | Qdrant | `.qdrant.tar.gz` physical archive | Full physical archive only |
 
 Redis and Qdrant exports are full physical volume archives. They are not selective and are not remote-credential imports.
 
-Import from a staged artifact:
+Import one of the target instance's artifacts:
 
 ```json
-{ "artifact_path": "/var/lib/dbev/artifacts/imports/dump.sql.gz", "unarchive": true }
+{
+  "source": {
+    "type": "artifact",
+    "artifact_id": "9c39d836-5f8e-4e48-94d6-ec6b1397fdda.postgres.sql.gz",
+    "unarchive": true
+  }
+}
 ```
 
 Import straight from another server:
@@ -526,35 +558,32 @@ Remote TLS defaults to `true`; `tls: false` is rejected unless the isolated-deve
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
-| GET | `/api/backups` | backups:read | List backup files (`{name, path, size_bytes, modified_at, sha256}`) |
-| GET | `/api/backups/status` | backups:read | The node's backup schedule + retention config |
-| POST | `/api/backups` | backups:write | Run now: `{"instance_id": "…"}` or `{"all": true}` |
-| POST | `/api/backups/{name}/restore` | backups:write | Restore a backup into an instance: `{"instance_id": "…"}` |
-| DELETE | `/api/backups/{name}` | backups:write | Delete a backup file |
-| GET | `/api/backups/download/{name}` | backups:read | Direct download (Bearer auth) |
+| GET | `/api/instances/{id}/backups` | backups:read | List only that instance's backups |
+| POST | `/api/instances/{id}/backups` | backups:write | Back up that instance now; returns the completed backup record |
+| POST | `/api/instances/{id}/backups/{backup_id}/restore` | backups:write | Restore the backup into its owning instance |
+| DELETE | `/api/instances/{id}/backups/{backup_id}` | backups:write | Delete one owned backup |
+| GET | `/api/admin/backups/status` | backups:admin | Node backup schedule and retention configuration |
+| POST | `/api/admin/backups/run` | backups:admin | Back up every eligible instance; returns `backups` and `skipped` |
 
-`POST /api/backups/run` also works — same handler as `POST /api/backups`. Running against `all` returns `{jobs: […], skipped: […]}` where skipped entries explain why (e.g. instance not running).
+Backup list items are `{id, instance_id, size_bytes, modified_at, sha256}`. Host paths are never returned. A backup ID is resolved only below `paths.backups/<instance_id>/`; a backup from one instance cannot be restored, downloaded, or deleted through another instance's route.
 
-### Letting users download files (signed URLs)
+### Letting users download files (temporary URLs)
 
 Your panel authenticates with the node token, but end users' browsers can't. The flow:
 
-1. Panel asks the daemon for a download token:
+1. Panel asks the daemon to create a temporary download URL:
 
 ```json
-POST /api/artifacts/{name}/download-token     (scope: artifacts:read)
-POST /api/backups/{name}/download-token       (scope: backups:read)
-{ "instance_id": "cust-42-db", "expires_in_seconds": 120, "single_use": true }
+POST /api/instances/{id}/artifacts/{artifact_id}/download  (scope: artifacts:read)
+POST /api/instances/{id}/backups/{backup_id}/download      (scope: backups:read)
+{ "expires_in_seconds": 120, "single_use": true }
 ```
 
 2. The daemon answers with a ready-to-use URL:
 
 ```json
 {
-  "token_type": "Bearer",
-  "token": "…jwt…",
-  "url": "/api/artifacts/download-signed?token=…",
-  "download_path": "/api/artifacts/download-signed?token=…",
+  "url": "/api/instances/cust-42-db/artifacts/export.postgres.sql/download?token=…",
   "expires_at_unix": 1751900000,
   "single_use": true
 }
@@ -566,9 +595,11 @@ POST /api/backups/{name}/download-token       (scope: backups:read)
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
-| GET | `/api/artifacts` | artifacts:read | List export/import artifacts |
-| DELETE | `/api/artifacts/{name}` | artifacts:write | Delete one |
-| POST | `/api/artifacts/retention` | artifacts:write | Apply retention now, returns `{deleted: […]}` |
+| GET | `/api/instances/{id}/artifacts` | artifacts:read | List that instance's export artifacts |
+| DELETE | `/api/instances/{id}/artifacts/{artifact_id}` | artifacts:write | Delete one owned artifact |
+| POST | `/api/instances/{id}/artifacts/retention` | artifacts:write | Apply retention to that instance only |
+
+Artifact list items have the same path-free `{id, instance_id, size_bytes, modified_at, sha256}` shape as backups. New exports are stored under `paths.exports/<instance_id>/`.
 
 ### Recovery
 
@@ -576,14 +607,14 @@ For your admin panel's "something went wrong" page. Scope: `recovery:admin`.
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| GET | `/api/recovery/failed-jobs` | All failed import/export jobs |
-| POST | `/api/recovery/jobs/{job_id}/retry` | Re-queue a failed job (only failed ones) |
-| POST | `/api/recovery/restore` | Force-import an artifact into an instance |
+| GET | `/api/admin/recovery/failed-jobs` | All failed import/export jobs |
+| POST | `/api/instances/{id}/recovery/jobs/{job_id}/retry` | Re-queue a failed job after checking its instance |
+| POST | `/api/instances/{id}/recovery/restore` | Force-import one of that instance's artifacts |
 
 Restore requires explicit intent — `confirm` and a `reason` (it's audit-logged):
 
 ```json
-{ "instance_id": "cust-42-db", "artifact_path": "…", "confirm": true, "reason": "customer ticket #123" }
+{ "artifact_id": "9c39d836-5f8e-4e48-94d6-ec6b1397fdda.postgres.sql", "confirm": true, "reason": "customer ticket #123" }
 ```
 
 ## WebSockets
@@ -609,7 +640,7 @@ Response: `{ "token_type": "Bearer", "token": "…", "expires_at_unix": … }`. 
 Browsers can't set an `Authorization` header on a WebSocket, so pass the JWT via the subprotocol:
 
 ```js
-const ws = new WebSocket("wss://node.example.com/ws/logs?instance_id=cust-42-db",
+const ws = new WebSocket("wss://node.example.com/ws/instances/cust-42-db/logs",
                          ["dbe.jwt", token]);
 ```
 
@@ -641,7 +672,7 @@ Every message is a JSON object with a `type` field.
       "disk_enforced": true,
       "network_rx_bytes": 1234,
       "network_tx_bytes": 5678,
-      "resources": { "…": "same shape as /api/resources" },
+      "resources": { "…": "same shape as /api/instances/{id}/resources" },
       "resource_error": null
     }
   ],
@@ -667,7 +698,7 @@ Every message is a JSON object with a `type` field.
 Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories.
 `install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
 
-**`/ws/logs?instance_id=…`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
+**`/ws/instances/{instance_id}/logs`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
 
 ```json
 { "type": "logs", "instance_id": "cust-42-db", "sequence": 7,
@@ -676,15 +707,15 @@ Disk usage is sampled from quota accounting when available and cached per instan
 
 Connection URLs in log output are redacted before they leave the daemon. If fetching logs fails, `stdout`/`stderr` are null and `error` says why.
 
-**`/ws/import-export?instance_id=…&job_id=…`** (scope `import-export:read`) — both query params optional. On connect you get the current state, then push updates as jobs change:
+**`/ws/instances/{instance_id}/import-export?job_id=…`** (scope `import-export:read`, token must cover the instance) — `job_id` is optional. On connect you get that instance's current state, then push updates as its jobs change:
 
 ```json
 { "type": "import_export_snapshot", "jobs": [ { …job fields…, "download": null } ] }
-{ "type": "import_export_job", "job": { …job fields…, "download": { …signed url… } } }
+{ "type": "import_export_job", "job": { …job fields…, "download": { …temporary url… } } }
 { "type": "import_export_lagged", "skipped": 12 }
 ```
 
-Job objects are the same shape as the REST job response. When an export succeeds, the event includes a `download` object — a signed, single-use download ticket valid for ~120 seconds, so your UI can show a download button the moment the export finishes. A `lagged` event means you missed messages; a fresh snapshot follows automatically.
+Job objects are the same shape as the REST job response. When an export succeeds, the event includes a `download` object — a single-use temporary URL valid for ~120 seconds, so your UI can show a download button the moment the export finishes. A `lagged` event means you missed messages; a fresh snapshot follows automatically.
 
 ## System and monitoring endpoints
 
@@ -692,10 +723,19 @@ Job objects are the same shape as the REST job response. When an export succeeds
 | --- | --- | --- | --- |
 | GET | `/api/system` | system:read | Node identity, version, engine, which protocols are enabled |
 | PATCH | `/api/system/config` | config:admin | Merge a runtime config patch into `config.yml`; returns `restart_required: true` |
-| POST | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
+| GET | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
 
-`/api/system` is the right first call after registering a node — it tells you the daemon version, runtime engine, socket, `daemon_internal_network`, and per-protocol `*_enabled` flags so the panel knows what it's allowed to offer.
+`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `daemon_engine`, socket, `disk_mode`, `daemon_internal_network`, and per-protocol `*_enabled` flags so the panel knows what it's allowed to offer.
+
+The API listener becomes available after critical metadata, crash-recovery,
+container-engine, network, and disk checks complete. Existing managed database
+containers then auto-start in a lock-protected background phase, so a slow or
+broken container does not hold node heartbeat or management endpoints offline.
+Heartbeat reports management API liveness, not that every database instance is
+ready; clients should check each instance's status before presenting it as ready.
+Database gateways open after background startup and legacy PostgreSQL role
+hardening complete.
 
 Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, `token`, `jwt_signing_key`, Fuse helper path/digest, public-listener development override, and private-import trust settings; those security boundaries must be changed deliberately in the host config. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, path, image, or runtime changes to take effect.
 
@@ -716,7 +756,7 @@ Rough order for wiring up a panel:
 1. Generate `uuid`, `token_id`, a random API `token`, and a different random `jwt_signing_key`; both secrets must be at least 32 bytes. Render the node's `config.yml`; admin runs setup.
 2. Call `GET /api/system` to verify connectivity and see what the node supports.
 3. Create/manage instances via `/api/instances`; store `instance_id` ↔ your customer records on the panel side (the daemon doesn't know about your users).
-4. Poll `POST /api/heartbeat` for node health.
-5. For live dashboards, mint per-user JWTs with `/api/ws-token` and connect to `/ws/monitoring` and `/ws/logs`.
-6. For "download my data", queue an export, watch `/ws/import-export`, and surface the `download` URL it hands you.
+4. Poll `GET /api/heartbeat` for node health.
+5. For live dashboards, mint per-user JWTs with `/api/ws-token` and connect to `/ws/monitoring` and `/ws/instances/{instance_id}/logs`.
+6. For "download my data", queue an export, watch `/ws/instances/{instance_id}/import-export`, and surface the `download` URL it hands you.
 7. Point Prometheus at `/metrics` if you run one.

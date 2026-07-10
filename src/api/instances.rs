@@ -152,9 +152,8 @@ pub struct UpdateInstanceImageResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub export_artifact_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_volume_backup_path: Option<String>,
+    pub export_artifact_id: Option<String>,
+    pub old_volume_backup_retained: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -200,8 +199,15 @@ pub async fn create_instance(
     Json(request): Json<CreateInstanceRequest>,
 ) -> ApiResult<InstanceMetadata> {
     authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
-    create_instance_from_request(&state, request)
+    let instance_id = request.instance_id.clone();
+    let creation = tokio::spawn(async move { create_instance_from_request(&state, request).await });
+    creation
         .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "instance creation task failed unexpectedly for {instance_id}: {error}"
+            ))
+        })?
         .map(Json)
 }
 
@@ -438,36 +444,6 @@ pub async fn reconcile_instance(
     }))
 }
 
-pub async fn start_instance(
-    State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
-    lifecycle_instance(&state, &instance_id, LifecycleAction::Start).await
-}
-
-pub async fn stop_instance(
-    State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
-    lifecycle_instance(&state, &instance_id, LifecycleAction::Stop).await
-}
-
-pub async fn restart_instance(
-    State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
-    lifecycle_instance(&state, &instance_id, LifecycleAction::Restart).await
-}
-
 pub async fn power_instance(
     State(state): State<AppState>,
     Path(instance_id): Path<String>,
@@ -647,9 +623,14 @@ pub async fn update_instance_image(
         fail_image_update_api(&state, &metadata.instance_id, error.into_api_error())
     })?;
     if metadata.protocol == Protocol::Postgres {
-        provision_postgres_tenant_role(&state, &metadata.instance_id, &metadata.database.username)
-            .await
-            .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+        provision_postgres_tenant_role(
+            &state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+        )
+        .await
+        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     }
     if metadata.protocol == Protocol::Mariadb {
         let password = requested_password.as_deref().ok_or_else(|| {
@@ -734,8 +715,8 @@ pub async fn update_instance_image(
         recreated: true,
         strategy: ImageUpdateStrategy::InPlaceRecreate,
         warnings: Vec::new(),
-        export_artifact_path: None,
-        old_volume_backup_path: None,
+        export_artifact_id: None,
+        old_volume_backup_retained: false,
     }))
 }
 
@@ -881,8 +862,11 @@ async fn update_instance_image_by_major_migration(
             ]);
             warnings
         },
-        export_artifact_path: Some(export_artifact.display().to_string()),
-        old_volume_backup_path: Some(old_volume_backup.display().to_string()),
+        export_artifact_id: export_artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        old_volume_backup_retained: true,
     })
 }
 
@@ -1114,9 +1098,14 @@ async fn create_empty_replacement_and_import(
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error.into_api_error()))?;
 
     if metadata.protocol == Protocol::Postgres {
-        provision_postgres_tenant_role(state, &metadata.instance_id, &metadata.database.username)
-            .await
-            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+        provision_postgres_tenant_role(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+        )
+        .await
+        .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     }
 
     state.install_progress.stage(
@@ -1414,7 +1403,7 @@ async fn validate_replacement_instance(
         "validating replacement database",
     );
     let script = match metadata.protocol {
-        Protocol::Postgres => "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -h 127.0.0.1 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
+        Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h 127.0.0.1 -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
         Protocol::Mariadb => "mariadb -h 127.0.0.1 -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\" -e 'select 1' >/dev/null".to_string(),
         Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
         Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
@@ -1713,7 +1702,7 @@ pub async fn runtime_instances(
     headers: HeaderMap,
     uri: Uri,
 ) -> ApiResult<Vec<RuntimeInstanceResponse>> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_READ)?;
+    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_ADMIN)?;
     let instances = state.instances.list().await;
     Ok(Json(
         instances
@@ -1856,6 +1845,7 @@ pub(crate) async fn lifecycle_instance_locked(
             provision_postgres_tenant_role(
                 state,
                 &metadata.instance_id,
+                &metadata.database.name,
                 &metadata.database.username,
             )
             .await?;

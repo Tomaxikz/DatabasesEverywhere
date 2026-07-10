@@ -71,7 +71,13 @@ fn validate_username(value: &str) -> Result<(), ApiError> {
     validate_database_identifier("username", value)?;
     if matches!(
         value.to_ascii_lowercase().as_str(),
-        "root" | "admin" | "postgres" | "mysql" | "default" | "dbe_health"
+        "root"
+            | "admin"
+            | "postgres"
+            | "mysql"
+            | "default"
+            | crate::databases::postgres::docker::INTERNAL_ADMIN_USERNAME
+            | "dbe_health"
     ) {
         return Err(ApiError::BadRequest(
             "username uses a reserved name".to_string(),
@@ -208,6 +214,7 @@ mod tests {
     fn rejects_reserved_database_and_usernames() {
         assert!(validate_database_name("postgres").is_err());
         assert!(validate_username("root").is_err());
+        assert!(validate_username("dbe_admin").is_err());
         assert!(validate_username("dbe_health").is_err());
     }
 

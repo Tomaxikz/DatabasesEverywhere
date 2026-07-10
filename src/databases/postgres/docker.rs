@@ -7,6 +7,8 @@ use crate::{
     shared::protocol::Protocol,
 };
 
+pub const INTERNAL_ADMIN_USERNAME: &str = "dbe_admin";
+
 #[allow(clippy::too_many_arguments)]
 pub fn instance_spec(
     instance_id: &str,
@@ -18,6 +20,9 @@ pub fn instance_spec(
     logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
+    let bootstrap_password =
+        SecretString::from(format!("dbe-admin-{}", uuid::Uuid::new_v4().simple()));
+
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
         protocol: Protocol::Postgres,
@@ -48,10 +53,18 @@ pub fn instance_spec(
             },
             DockerEnv {
                 key: "POSTGRES_USER".to_string(),
-                value: SecretString::from(username.to_string()),
+                value: SecretString::from(INTERNAL_ADMIN_USERNAME.to_string()),
             },
             DockerEnv {
                 key: "POSTGRES_PASSWORD".to_string(),
+                value: bootstrap_password,
+            },
+            DockerEnv {
+                key: "DBE_POSTGRES_USER".to_string(),
+                value: SecretString::from(username.to_string()),
+            },
+            DockerEnv {
+                key: "DBE_POSTGRES_PASSWORD".to_string(),
                 value: password,
             },
         ],
@@ -61,6 +74,8 @@ pub fn instance_spec(
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -80,5 +95,19 @@ mod tests {
         assert_eq!(spec.container_port, 5432);
         assert_eq!(spec.public_backend_port, None);
         assert_eq!(spec.extra_mounts[0].target, "/var/run/postgresql");
+        assert_eq!(env_value(&spec, "POSTGRES_USER"), INTERNAL_ADMIN_USERNAME);
+        assert_eq!(env_value(&spec, "POSTGRES_DB"), "pg_1");
+        assert_eq!(env_value(&spec, "DBE_POSTGRES_USER"), "app_pg_1");
+        assert_eq!(env_value(&spec, "DBE_POSTGRES_PASSWORD"), "secret");
+        assert_ne!(env_value(&spec, "POSTGRES_PASSWORD"), "secret");
+    }
+
+    fn env_value<'a>(spec: &'a DockerInstanceSpec, key: &str) -> &'a str {
+        spec.env
+            .iter()
+            .find(|environment| environment.key == key)
+            .unwrap()
+            .value
+            .expose_secret()
     }
 }

@@ -12,11 +12,13 @@ use crate::api::{
 };
 use crate::auth::scopes;
 
+pub const API_VERSION: &str = "0.2.0";
+
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
     pub service: &'static str,
     pub version: &'static str,
-    pub runtime: &'static str,
+    pub api_version: &'static str,
     pub uuid: String,
     pub token_id: String,
     pub remote: String,
@@ -29,7 +31,6 @@ pub struct SystemResponse {
     pub daemon_network: String,
     pub daemon_internal_network: bool,
     pub daemon_disk_limits_enforced: bool,
-    pub daemon_disk_enforcement_method: &'static str,
     pub disk_mode: &'static str,
     pub postgres_enabled: bool,
     pub redis_enabled: bool,
@@ -51,7 +52,7 @@ pub async fn system(
     Ok(Json(SystemResponse {
         service: "databases-everywhere",
         version: env!("CARGO_PKG_VERSION"),
-        runtime: state.config.daemon.engine.as_str(),
+        api_version: API_VERSION,
         uuid: state.config.uuid.clone(),
         token_id: state.config.token_id.clone(),
         remote: state.config.remote.clone(),
@@ -64,7 +65,6 @@ pub async fn system(
         daemon_network: state.config.daemon.network.clone(),
         daemon_internal_network: state.config.daemon.internal_network,
         daemon_disk_limits_enforced: state.config.disk.mode.enforced(),
-        daemon_disk_enforcement_method: state.config.disk.mode.method(),
         disk_mode: state.config.disk.mode.method(),
         postgres_enabled: state.config.postgres.enabled,
         redis_enabled: state.config.redis.enabled,
