@@ -55,9 +55,6 @@ security:
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
   # This file is for isolated local development only.
-  allow_insecure_public_listeners: true
-  allow_private_remote_imports: false
-  remote_import_allowed_hosts: []
   self_upgrade_enabled: false
   pids_limit: 512
   pids_limits:
@@ -81,12 +78,7 @@ disk:
 daemon:
   engine: podman
   socket_path: /run/user/1000/podman/podman.sock
-  network: databases-everywhere
-  internal_network: true
-  ipam:
-    subnet: 172.30.0.0/16
-    gateway: 172.30.0.1
-  allow_public_backend_ports: false
+  # Database containers always use network_mode=none and private Unix sockets.
   container_read_only_rootfs: false
   container_userns_mode: ''
   container_seccomp_profile: ''

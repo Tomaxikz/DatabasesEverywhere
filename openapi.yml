@@ -20,6 +20,7 @@ components:
       enum: [postgres, redis, mariadb, mongodb, clickhouse, qdrant]
     LimitsRequest:
       type: object
+      additionalProperties: false
       required: [cpu_cores, memory_mib, disk_mib]
       properties:
         cpu_cores:
@@ -48,6 +49,7 @@ components:
               example: host_filesystem_quota
     CreateInstanceRequest:
       type: object
+      additionalProperties: false
       required: [instance_id, protocol, database, username, password, public_host]
       properties:
         instance_id:
@@ -82,7 +84,11 @@ components:
         purge_stale_resources:
           type: boolean
           default: false
-          description: Irreversibly remove an orphaned container and persistent paths for this instance_id before retrying creation. Use only after preserving any data you need.
+          description: Irreversibly remove an orphaned container and persistent paths for this instance_id before retrying creation. Requires purge_stale_resources_confirmation.
+        purge_stale_resources_confirmation:
+          oneOf:
+            - $ref: "#/components/schemas/DestructiveActionConfirmation"
+            - type: "null"
     Instance:
       type: object
       required: [schema_version, instance_id, protocol, status, public, backend, runtime, database, limits, created_at, updated_at]
@@ -105,6 +111,9 @@ components:
             port:
               type: integer
         backend:
+          description: >-
+            Active instances use unix_socket. docker_tcp is returned only for
+            legacy records quarantined during migration and is never connected.
           oneOf:
             - type: object
               required: [kind, socket_path]
@@ -126,15 +135,16 @@ components:
                   type: integer
         runtime:
           type: object
-          required: [kind, container_name, network]
+          required: [kind, container_name, network_mode]
           properties:
             kind:
               type: string
               example: docker
             container_name:
               type: string
-            network:
+            network_mode:
               type: string
+              const: none
         database:
           type: object
           required: [name, username]
@@ -165,7 +175,9 @@ components:
             current:
               type: [string, "null"]
             error:
-              type: [string, "null"]
+              oneOf:
+                - $ref: "#/components/schemas/PublicDiagnostic"
+                - type: "null"
         created_at:
           type: string
           format: date-time
@@ -175,7 +187,7 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, daemon_network, daemon_internal_network, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled]
+      required: [service, version, api_version, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
@@ -189,8 +201,8 @@ components:
         api_ssl_enabled: {type: boolean}
         daemon_engine: {type: string, enum: [docker, podman]}
         daemon_socket: {type: string}
-        daemon_network: {type: string}
-        daemon_internal_network: {type: boolean}
+        database_container_network_mode: {type: string, const: none}
+        database_backend_transport: {type: string, const: unix_socket}
         daemon_disk_limits_enforced: {type: boolean}
         disk_mode: {type: string}
         postgres_enabled: {type: boolean}
@@ -204,9 +216,20 @@ components:
         qdrant_enabled: {type: boolean}
     HeartbeatResponse:
       type: object
-      required: [status]
+      required: [status, gateways]
       properties:
-        status: {type: string, const: ok}
+        status: {type: string, enum: [ok, not_ready]}
+        gateways:
+          $ref: "#/components/schemas/GatewayReadiness"
+    GatewayReadiness:
+      type: object
+      additionalProperties: false
+      required: [status, expected_listeners, ready_listeners]
+      properties:
+        status: {type: string, enum: [starting, ready, failed, stopping]}
+        expected_listeners: {type: integer, minimum: 0}
+        ready_listeners: {type: integer, minimum: 0}
+        failure: {type: string}
     InstanceStatusResponse:
       type: object
       required: [instance_id, status]
@@ -215,6 +238,39 @@ components:
         status:
           type: string
           enum: [creating, running, stopped, failed, quarantined, deleting]
+        progress:
+          $ref: "#/components/schemas/InstallProgress"
+    CreateInstanceAcceptedResponse:
+      type: object
+      additionalProperties: false
+      required: [instance_id, status, status_url]
+      properties:
+        instance_id: {type: string}
+        status:
+          type: string
+          const: creating
+        status_url:
+          type: string
+          description: Origin-relative URL for polling creation status and progress.
+    InstallProgress:
+      type: object
+      additionalProperties: false
+      required: [instance_id, protocol, action, status, stage, message, image, layer, current, total, percent, updated_at]
+      properties:
+        instance_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        action: {type: string, enum: [create, image_update, major_upgrade]}
+        status: {type: string, enum: [running, completed, failed]}
+        stage: {type: string}
+        message: {type: string}
+        image: {type: [string, "null"]}
+        layer: {type: [string, "null"]}
+        current: {type: [integer, "null"]}
+        total: {type: [integer, "null"]}
+        percent: {type: [number, "null"]}
+        diagnostic:
+          $ref: "#/components/schemas/PublicDiagnostic"
+        updated_at: {type: string, format: date-time}
     DeleteInstanceResponse:
       type: object
       required: [instance_id, deleted, purged]
@@ -224,26 +280,41 @@ components:
         purged: {type: boolean}
     Error:
       type: object
+      additionalProperties: false
+      required: [error, code]
       properties:
         error:
           type: string
+        code:
+          type: string
+        error_id:
+          type: string
+          format: uuid
+          description: Opaque support identifier included only for server-side failures.
+    PublicDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string, maxLength: 512}
+        error_id:
+          type: string
+          format: uuid
+          description: Opaque identifier for correlating an internal asynchronous failure with daemon logs.
     ImportRequest:
       type: object
       additionalProperties: false
       required: [source]
       properties:
         source:
-          oneOf:
-            - $ref: "#/components/schemas/ArtifactImportSource"
-            - $ref: "#/components/schemas/RemoteImportSource"
+          $ref: "#/components/schemas/ArtifactImportSource"
         selection:
           $ref: "#/components/schemas/ImportExportSelection"
     ExportRequest:
       type: object
+      additionalProperties: false
       properties:
-        archive:
-          type: boolean
-          default: false
         archive_format:
           type: [string, "null"]
           enum: [plain, gzip, bzip2, null]
@@ -260,39 +331,13 @@ components:
         artifact_id:
           type: string
           description: ID returned by this instance's artifacts endpoint, or the filename of an operator-staged file under paths.imports/<instance_id>/.
-        unarchive:
-          type: boolean
-          default: false
         archive_format:
           type: [string, "null"]
-          description: Optional archive wrapper format such as plain, gzip, bzip2, tar, tar.gz, zip, or rar.
-    RemoteImportSource:
-      type: object
-      additionalProperties: false
-      required: [type, protocol, host, port, database, username, password]
-      properties:
-        type:
-          type: string
-          const: remote
-        protocol:
-          $ref: "#/components/schemas/Protocol"
-        host:
-          type: string
-        port:
-          type: integer
-        database:
-          type: string
-        username:
-          type: string
-        password:
-          type: string
-          format: password
-        tls:
-          type: boolean
-          default: true
-          description: Required in production. Explicit false is accepted only with the isolated-development insecure-listener override.
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip, rar, null]
+          description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Qdrant physical archives.
     ImportExportSelection:
       type: object
+      additionalProperties: false
       properties:
         mode:
           type: string
@@ -331,7 +376,9 @@ components:
         artifact_size_bytes:
           type: [integer, "null"]
         error:
-          type: [string, "null"]
+          oneOf:
+            - $ref: "#/components/schemas/PublicDiagnostic"
+            - type: "null"
         created_at:
           type: string
           format: date-time
@@ -355,6 +402,7 @@ components:
           type: string
     CreateDownloadRequest:
       type: object
+      additionalProperties: false
       properties:
         expires_in_seconds:
           type: integer
@@ -403,7 +451,7 @@ components:
       properties:
         instance_id: {type: string}
         protocol: {$ref: "#/components/schemas/Protocol"}
-        reason: {type: string}
+        reason: {$ref: "#/components/schemas/PublicDiagnostic"}
     RunBackupsResponse:
       type: object
       additionalProperties: false
@@ -423,8 +471,21 @@ components:
         instance_id: {type: string}
         backup_id: {type: string}
         restored: {type: boolean}
+    DestructiveActionConfirmation:
+      type: object
+      additionalProperties: false
+      required: [confirm, reason]
+      properties:
+        confirm:
+          type: boolean
+          const: true
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
     WsTokenRequest:
       type: object
+      additionalProperties: false
       required: [subject, scopes]
       properties:
         subject:
@@ -460,6 +521,7 @@ components:
         expires_at_unix: {type: integer}
     PowerRequest:
       type: object
+      additionalProperties: false
       required: [action]
       properties:
         action:
@@ -476,6 +538,7 @@ components:
           $ref: "#/components/schemas/Instance"
     UpdateInstanceImageRequest:
       type: object
+      additionalProperties: false
       required: [image]
       properties:
         image:
@@ -568,17 +631,6 @@ components:
           properties:
             rx_bytes: {type: [integer, "null"]}
             tx_bytes: {type: [integer, "null"]}
-    RuntimeInstanceResponse:
-      type: object
-      required: [instance_id, protocol, runtime, container_name, status]
-      properties:
-        instance_id: {type: string}
-        protocol: {type: string}
-        runtime: {type: string}
-        container_name: {type: string}
-        status:
-          type: string
-          enum: [creating, running, stopped, failed, quarantined, deleting]
     PullImageResponse:
       type: object
       required: [protocol, image, pulled]
@@ -587,6 +639,16 @@ components:
         image: {type: string}
         pulled: {type: boolean}
   responses:
+    ApiError:
+      description: Request rejection or server-side failure. Internal details are logged under error_id and are never returned to clients.
+      headers:
+        X-Error-Id:
+          description: Opaque support identifier included for server-side failures.
+          schema: {type: string, format: uuid}
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing, invalid, or insufficient bearer token.
       content:
@@ -605,6 +667,8 @@ paths:
       summary: Get daemon runtime/configuration summary.
       x-required-scope: system:read
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: System status.
           content:
@@ -626,6 +690,8 @@ paths:
               type: object
               additionalProperties: true
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Config patch applied.
           content:
@@ -637,8 +703,16 @@ paths:
       summary: Lightweight authenticated health check.
       x-required-scope: system:read
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Heartbeat response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatResponse"
+        "503":
+          description: API is alive but one or more database gateways are not ready.
           content:
             application/json:
               schema:
@@ -648,6 +722,8 @@ paths:
       summary: Get Prometheus metrics for the daemon.
       x-required-scope: metrics:read
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Prometheus text exposition.
           content:
@@ -659,6 +735,8 @@ paths:
       summary: List database instances.
       x-required-scope: instances:read
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Instance list.
           content:
@@ -677,14 +755,22 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateInstanceRequest"
       responses:
-        "200":
-          description: Created instance metadata.
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Instance creation accepted and continuing in the background.
+          headers:
+            Location:
+              description: Origin-relative instance creation status URL.
+              schema: {type: string}
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Instance"
+                $ref: "#/components/schemas/CreateInstanceAcceptedResponse"
         "409":
           description: Instance ID already exists.
+        "503":
+          description: Creation admission is closed or the bounded creation queue is full.
   /api/instances/{instance_id}:
     parameters:
       - name: instance_id
@@ -696,6 +782,8 @@ paths:
       summary: Get one instance.
       x-required-scope: instances:read
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Instance metadata.
           content:
@@ -715,7 +803,23 @@ paths:
           schema:
             type: boolean
             default: false
+        - name: confirm
+          in: query
+          required: false
+          description: Must be true when purge=true.
+          schema:
+            type: boolean
+            default: false
+        - name: reason
+          in: query
+          required: false
+          description: Required audit reason when purge=true; at most 512 characters.
+          schema:
+            type: string
+            maxLength: 512
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Delete result.
           content:
@@ -733,6 +837,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Status response.
           content:
@@ -756,6 +862,8 @@ paths:
             schema:
               $ref: "#/components/schemas/LimitsRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Updated instance metadata.
           content:
@@ -773,6 +881,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Reconciled instance status.
           content:
@@ -796,6 +906,8 @@ paths:
             schema:
               $ref: "#/components/schemas/PowerRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Power action result.
           content:
@@ -820,6 +932,8 @@ paths:
             schema:
               $ref: "#/components/schemas/UpdateInstanceImageRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Image update result.
           content:
@@ -831,6 +945,8 @@ paths:
       summary: List resource usage for all instances.
       x-required-scope: resources:admin
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Resource reports.
           content:
@@ -850,6 +966,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Resource report.
           content:
@@ -875,6 +993,8 @@ paths:
             maximum: 2000
             default: 200
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Log output.
           content:
@@ -898,8 +1018,14 @@ paths:
             schema:
               $ref: "#/components/schemas/ExportRequest"
       responses:
-        "200":
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
           description: Queued export job.
+          headers:
+            Location:
+              description: Origin-relative job status URL.
+              schema: {type: string}
           content:
             application/json:
               schema:
@@ -921,8 +1047,14 @@ paths:
             schema:
               $ref: "#/components/schemas/ImportRequest"
       responses:
-        "200":
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
           description: Queued import job.
+          headers:
+            Location:
+              description: Origin-relative job status URL.
+              schema: {type: string}
           content:
             application/json:
               schema:
@@ -946,6 +1078,8 @@ paths:
           schema:
             type: integer
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Job list.
           content:
@@ -970,6 +1104,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Job.
           content:
@@ -987,6 +1123,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Backup artifact list.
           content:
@@ -1005,6 +1143,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Completed backup artifact.
           content:
@@ -1016,6 +1156,8 @@ paths:
       summary: Get automatic backup configuration status.
       x-required-scope: backups:admin
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Backup status.
           content:
@@ -1027,6 +1169,8 @@ paths:
       summary: Run backups for all eligible instances.
       x-required-scope: backups:admin
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Completed backups and skipped instances.
           content:
@@ -1049,6 +1193,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Delete result.
           content:
@@ -1077,6 +1223,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Backup file stream.
     post:
@@ -1089,6 +1237,8 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateDownloadRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Temporary download URL.
           content:
@@ -1098,7 +1248,7 @@ paths:
   /api/instances/{instance_id}/backups/{backup_id}/restore:
     post:
       summary: Restore one backup into the same instance that owns it.
-      x-required-scope: backups:write
+      x-required-scope: recovery:admin
       parameters:
         - name: instance_id
           in: path
@@ -1110,7 +1260,15 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DestructiveActionConfirmation"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Completed restore result.
           content:
@@ -1128,6 +1286,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Artifact list.
           content:
@@ -1152,6 +1312,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Delete result.
           content:
@@ -1180,6 +1342,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Artifact file stream.
     post:
@@ -1192,6 +1356,8 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateDownloadRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Temporary download URL.
           content:
@@ -1209,30 +1375,21 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Deleted artifact IDs.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RetentionResponse"
-  /api/admin/runtime-instances:
-    get:
-      summary: List runtime details for every managed instance.
-      x-required-scope: instances:admin
-      responses:
-        "200":
-          description: Runtime instance list.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/RuntimeInstanceResponse"
   /api/admin/recovery/failed-jobs:
     get:
       summary: List failed import/export jobs across the node.
       x-required-scope: recovery:admin
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Failed job list.
           content:
@@ -1257,8 +1414,14 @@ paths:
           schema:
             type: string
       responses:
-        "200":
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
           description: Replacement job.
+          headers:
+            Location:
+              description: Origin-relative replacement job status URL.
+              schema: {type: string}
           content:
             application/json:
               schema:
@@ -1279,6 +1442,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [artifact_id, confirm, reason]
               properties:
                 artifact_id:
@@ -1287,9 +1451,17 @@ paths:
                   type: boolean
                 reason:
                   type: string
+                  minLength: 1
+                  maxLength: 512
       responses:
-        "200":
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
           description: Queued restore job.
+          headers:
+            Location:
+              description: Origin-relative restore job status URL.
+              schema: {type: string}
           content:
             application/json:
               schema:
@@ -1305,6 +1477,8 @@ paths:
             schema:
               $ref: "#/components/schemas/WsTokenRequest"
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: WebSocket token.
           content:
@@ -1321,6 +1495,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [protocol]
               properties:
                 protocol:
@@ -1328,6 +1503,8 @@ paths:
                 image:
                   type: [string, "null"]
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "200":
           description: Pull result.
           content:
@@ -1338,10 +1515,12 @@ paths:
     get:
       summary: WebSocket stream of instance resource snapshots.
       description: >-
-        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages include current instance stats plus install_progress entries for in-flight and recently completed/failed create operations. Each instance includes configured limits plus live usage fields: cpu_usage_percent, memory_usage_bytes, memory_limit_bytes, disk_used_bytes, network_rx_bytes, network_tx_bytes, and a resources object matching GET /api/instances/{instance_id}/resources.
+        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages include current instance stats plus install_progress entries for create, image-update, and major-upgrade operations. Each instance includes configured limits plus live usage fields: cpu_usage_percent, memory_usage_bytes, memory_limit_bytes, disk_used_bytes, network_rx_bytes, network_tx_bytes, and a resources object matching GET /api/instances/{instance_id}/resources.
       x-required-scope: monitor:read
       x-websocket: true
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "101":
           description: WebSocket upgrade.
   /ws/instances/{instance_id}/logs:
@@ -1358,6 +1537,8 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "101":
           description: WebSocket upgrade.
   /ws/instances/{instance_id}/import-export:
@@ -1378,5 +1559,7 @@ paths:
           schema:
             type: string
       responses:
+        default:
+          $ref: "#/components/responses/ApiError"
         "101":
           description: WebSocket upgrade.

@@ -1,8 +1,4 @@
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use bollard::errors::Error as BollardError;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -13,19 +9,24 @@ use tokio::{
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         images::{ensure_image_allowed, validate_image},
         instance_create::{
-            allocate_loopback_backend_port, backend_endpoint_for_instance,
-            create_instance_from_request, launch_container_from_spec, protocol_pids_limit,
-            provision_mariadb_tenant_user, provision_mongodb_tenant_user,
-            provision_postgres_tenant_role,
+            backend_endpoint_for_instance, create_instance_from_request,
+            launch_container_from_spec, protocol_pids_limit, provision_mariadb_tenant_user,
+            provision_mongodb_tenant_user, provision_postgres_tenant_role,
+            requested_or_configured_image,
         },
         instance_requests::{
-            CreateInstanceRequest, LimitsRequest, limits_from_request, validate_limits,
-            validate_protocol_limits,
+            CreateInstanceRequest, LimitsRequest, limits_from_request, validate_create_request,
+            validate_limits, validate_protocol_limits,
         },
+        progress::{BeginCreationError, InstallProgress, InstallProgressStatus},
+        public_diagnostic::PublicDiagnostic,
         routes::AppState,
+        security_policy::{
+            ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy,
+        },
     },
     auth::scopes,
     databases,
@@ -36,7 +37,7 @@ use crate::{
         metadata::InstanceMetadata, metadata::InstanceStatus, reconcile,
     },
     runtime::docker::{DockerContainerStatus, DockerError, DockerInstanceSpec},
-    shared::{backend::BackendEndpoint, protocol::Protocol, redaction, time::now_rfc3339},
+    shared::{protocol::Protocol, redaction, time::now_rfc3339},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -99,6 +100,15 @@ impl InstanceRuntimeInfoCache {
 pub struct InstanceStatusResponse {
     pub instance_id: String,
     pub status: InstanceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<InstallProgress>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateInstanceAcceptedResponse {
+    pub instance_id: String,
+    pub status: InstanceStatus,
+    pub status_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,15 +125,6 @@ pub struct DeleteResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RuntimeInstanceResponse {
-    pub instance_id: String,
-    pub protocol: String,
-    pub runtime: String,
-    pub container_name: String,
-    pub status: InstanceStatus,
-}
-
-#[derive(Debug, Serialize)]
 pub struct LogsResponse {
     pub instance_id: String,
     pub stdout: String,
@@ -131,11 +132,13 @@ pub struct LogsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogsQuery {
     pub tail: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateInstanceImageRequest {
     pub image: String,
     pub password: Option<String>,
@@ -164,6 +167,7 @@ pub enum ImageUpdateStrategy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PowerRequest {
     pub action: LifecycleAction,
 }
@@ -174,12 +178,19 @@ pub struct PowerResponse {
     pub action: LifecycleAction,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeleteInstanceQuery {
+    pub purge: bool,
+    pub confirm: bool,
+    pub reason: String,
+}
+
 pub async fn list_instances(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<Vec<InstanceMetadata>> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_READ)?;
+    auth.require_scope(scopes::INSTANCES_READ)?;
     let instances = futures::future::join_all(
         state
             .instances
@@ -189,41 +200,104 @@ pub async fn list_instances(
             .map(|metadata| enrich_instance_runtime_info(&state, metadata)),
     )
     .await;
-    Ok(Json(instances))
+    Ok(ApiResponse::ok(instances))
 }
 
 pub async fn create_instance(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<CreateInstanceRequest>,
-) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth: ApiRequestContext,
+    ApiJson(request): ApiJson<CreateInstanceRequest>,
+) -> ApiResult<CreateInstanceAcceptedResponse> {
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
+    validate_create_request(&request)?;
     let instance_id = request.instance_id.clone();
-    let creation = tokio::spawn(async move { create_instance_from_request(&state, request).await });
-    creation
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "instance creation task failed unexpectedly for {instance_id}: {error}"
-            ))
-        })?
-        .map(Json)
+    if state.instances.get(&instance_id).await.is_some() {
+        return Err(ApiError::Conflict(format!(
+            "instance_id {instance_id} already exists"
+        )));
+    }
+    let image = requested_or_configured_image(&state, &request)?;
+    let creation_permit = state
+        .install_progress
+        .try_begin_creation(&instance_id, request.protocol, &image)
+        .map_err(|error| match error {
+            BeginCreationError::AlreadyRunning => ApiError::Conflict(format!(
+                "instance creation already running for {instance_id}"
+            )),
+            BeginCreationError::Capacity => ApiError::ServiceUnavailable(
+                "instance creation queue is at capacity; retry later".to_string(),
+            ),
+            BeginCreationError::ShuttingDown => ApiError::ServiceUnavailable(
+                "daemon shutdown has started; new instance creations are not accepted".to_string(),
+            ),
+        })?;
+
+    let task_state = state.clone();
+    let task_instance_id = instance_id.clone();
+    tokio::spawn(async move {
+        let worker_state = task_state.clone();
+        let result =
+            tokio::spawn(async move { create_instance_from_request(&worker_state, request).await })
+                .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                task_state.install_progress.fail_if_running_api_error(
+                    &task_instance_id,
+                    "instance creation",
+                    &error,
+                );
+                tracing::warn!(
+                    event = "audit instance_create_background_failed",
+                    instance_id = %task_instance_id,
+                    %error,
+                    "background instance creation failed"
+                );
+            }
+            Err(error) => {
+                let message = format!("instance creation task failed unexpectedly: {error}");
+                task_state.install_progress.fail_if_running_internal(
+                    &task_instance_id,
+                    "instance creation task",
+                    &message,
+                );
+                tracing::error!(
+                    event = "audit instance_create_task_failed",
+                    instance_id = %task_instance_id,
+                    %error,
+                    "background instance creation task failed unexpectedly"
+                );
+            }
+        }
+        drop(creation_permit);
+    });
+
+    let status_url = format!("/api/instances/{instance_id}/status");
+    let location = status_url.clone();
+    Ok(ApiResponse::accepted_at(
+        CreateInstanceAcceptedResponse {
+            status_url,
+            instance_id,
+            status: InstanceStatus::Creating,
+        },
+        location,
+    ))
 }
 
 pub async fn get_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_READ)?;
+    auth.require_scope(scopes::INSTANCES_READ)?;
     let metadata = state
         .instances
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(enrich_instance_runtime_info(&state, metadata).await))
+    Ok(ApiResponse::ok(
+        enrich_instance_runtime_info(&state, metadata).await,
+    ))
 }
 
 async fn enrich_instance_runtime_info(
@@ -279,9 +353,12 @@ async fn current_database_version(
     if metadata.status != InstanceStatus::Running {
         return InstanceDatabaseVersion {
             current: None,
-            error: Some(format!(
-                "instance is {}; version is only probed for running instances",
-                metadata.status.as_str()
+            error: Some(PublicDiagnostic::public(
+                "not_running",
+                format!(
+                    "instance is {}; version is only probed for running instances",
+                    metadata.status.as_str()
+                ),
             )),
         };
     }
@@ -294,14 +371,17 @@ async fn current_database_version(
     {
         Ok(output) => {
             let current = normalize_database_version(metadata.protocol, &output.stdout);
-            let error = current
-                .is_none()
-                .then(|| "database version command returned no parseable output".to_string());
+            let error = current.is_none().then(|| {
+                PublicDiagnostic::public(
+                    "version_unavailable",
+                    "database version command returned no parseable output",
+                )
+            });
             InstanceDatabaseVersion { current, error }
         }
         Err(error) => InstanceDatabaseVersion {
             current: None,
-            error: Some(short_error(&error.to_string(), 240)),
+            error: Some(PublicDiagnostic::internal("database version probe", error)),
         },
     }
 }
@@ -358,15 +438,6 @@ fn normalize_database_version(protocol: Protocol, stdout: &str) -> Option<String
     (!version.is_empty()).then(|| version.to_string())
 }
 
-fn short_error(value: &str, max_chars: usize) -> String {
-    let mut out = value.trim().replace('\n', "; ");
-    if out.chars().count() > max_chars {
-        out = out.chars().take(max_chars).collect();
-        out.push_str("...");
-    }
-    out
-}
-
 fn fail_image_update_api(state: &AppState, instance_id: &str, error: ApiError) -> ApiError {
     tracing::error!(
         event = "audit instance_image_update_failed",
@@ -376,7 +447,7 @@ fn fail_image_update_api(state: &AppState, instance_id: &str, error: ApiError) -
     );
     state
         .install_progress
-        .fail(instance_id, format!("image update failed: {error}"));
+        .fail_api_error(instance_id, "instance image update", &error);
     error
 }
 
@@ -398,29 +469,37 @@ fn fail_image_update_runtime(
 
 pub async fn get_instance_status(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<InstanceStatusResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_READ)?;
-    let metadata = state
-        .instances
+    auth.require_scope(scopes::INSTANCES_READ)?;
+    let metadata = state.instances.get(&instance_id).await;
+    let progress = state
+        .install_progress
         .get(&instance_id)
-        .await
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(InstanceStatusResponse {
+        .filter(|progress| progress.action == "create");
+    let status = match (metadata, progress.as_ref()) {
+        (Some(metadata), _) => metadata.status,
+        (None, Some(progress)) => match progress.status {
+            InstallProgressStatus::Running => InstanceStatus::Creating,
+            InstallProgressStatus::Failed => InstanceStatus::Failed,
+            InstallProgressStatus::Completed => InstanceStatus::Running,
+        },
+        (None, None) => return Err(ApiError::NotFound),
+    };
+    Ok(ApiResponse::ok(InstanceStatusResponse {
         instance_id,
-        status: metadata.status,
+        status,
+        progress,
     }))
 }
 
 pub async fn reconcile_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<ReconcileResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
     let _operation = state.instance_locks.lock(&instance_id).await;
     let metadata = state
         .instances
@@ -438,7 +517,7 @@ pub async fn reconcile_instance(
         .remove(&metadata.instance_id)
         .await;
     state.resource_cache.remove(&metadata.instance_id).await;
-    Ok(Json(ReconcileResponse {
+    Ok(ApiResponse::ok(ReconcileResponse {
         instance_id,
         status: metadata.status,
     }))
@@ -446,25 +525,25 @@ pub async fn reconcile_instance(
 
 pub async fn power_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<PowerRequest>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiJson(request): ApiJson<PowerRequest>,
 ) -> ApiResult<PowerResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
     let action = request.action;
-    let Json(instance) = lifecycle_instance(&state, &instance_id, action).await?;
-    Ok(Json(PowerResponse { instance, action }))
+    let instance = lifecycle_instance(&state, &instance_id, action)
+        .await?
+        .into_body();
+    Ok(ApiResponse::ok(PowerResponse { instance, action }))
 }
 
 pub async fn update_instance_image(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<UpdateInstanceImageRequest>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiJson(request): ApiJson<UpdateInstanceImageRequest>,
 ) -> ApiResult<UpdateInstanceImageResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
     let image = validate_image(&request.image)?.to_string();
     let _operation = state.instance_locks.lock(&instance_id).await;
     let mut metadata = state
@@ -503,7 +582,7 @@ pub async fn update_instance_image(
             request.password,
         )
         .await
-        .map(Json);
+        .map(ApiResponse::ok);
     }
 
     let image_change = classify_image_update(metadata.protocol, &current_image, &image)?;
@@ -563,23 +642,8 @@ pub async fn update_instance_image(
     )
     .await
     .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    metadata.runtime.network_mode = "none".to_string();
     spec.user = Some(container_user);
-    let rootless_podman_backend_port = if state.docker.uses_rootless_podman() {
-        let port = match &metadata.backend {
-            BackendEndpoint::DockerTcp { host, port } if host == "127.0.0.1" => Some(*port),
-            _ => None,
-        }
-        .unwrap_or(
-            allocate_loopback_backend_port()
-                .await
-                .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?,
-        );
-        spec.public_backend_port = Some(port);
-        Some(port)
-    } else {
-        None
-    };
-
     let progress = state.install_progress.clone();
     let progress_instance_id = metadata.instance_id.clone();
     let pull_progress = move |event| progress.docker_pull(&progress_instance_id, event);
@@ -672,14 +736,9 @@ pub async fn update_instance_image(
         "backend",
         "resolving backend endpoint",
     );
-    metadata.backend = backend_endpoint_for_instance(
-        &state,
-        metadata.protocol,
-        &metadata.instance_id,
-        rootless_podman_backend_port,
-    )
-    .await
-    .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    metadata.backend =
+        backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)
+            .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     if metadata.protocol == Protocol::Mariadb
         && let Some(password) = requested_password
     {
@@ -709,7 +768,7 @@ pub async fn update_instance_image(
         .install_progress
         .complete(&metadata.instance_id, "image update completed");
 
-    Ok(Json(UpdateInstanceImageResponse {
+    Ok(ApiResponse::ok(UpdateInstanceImageResponse {
         instance: metadata,
         image,
         recreated: true,
@@ -755,6 +814,7 @@ async fn update_instance_image_by_major_migration(
     )
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    metadata.runtime.network_mode = "none".to_string();
 
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(|error| fail_image_update_bad_request(state, &metadata.instance_id, error))?;
@@ -807,14 +867,10 @@ async fn update_instance_image_by_major_migration(
             message,
         ));
     }
-    metadata.backend = backend_endpoint_for_instance(
-        state,
-        metadata.protocol,
-        &metadata.instance_id,
-        rootless_backend_port_for_spec(state, &metadata, true).await?,
-    )
-    .await
-    .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    metadata.backend =
+        backend_endpoint_for_instance(state, metadata.protocol, &metadata.instance_id)
+            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    metadata.runtime.network_mode = "none".to_string();
     if metadata.protocol == Protocol::Mariadb {
         metadata.mariadb_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
@@ -1009,7 +1065,6 @@ async fn create_empty_replacement_and_import(
     image: &str,
     password: &str,
     export_artifact: &std::path::Path,
-    reuse_existing_rootless_backend_port: bool,
 ) -> Result<(), ApiError> {
     state.install_progress.stage(
         &metadata.instance_id,
@@ -1054,11 +1109,6 @@ async fn create_empty_replacement_and_import(
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     spec.user = Some(container_user);
-    let rootless_podman_backend_port =
-        rootless_backend_port_for_spec(state, metadata, reuse_existing_rootless_backend_port)
-            .await?;
-    spec.public_backend_port = rootless_podman_backend_port;
-
     let progress = state.install_progress.clone();
     let progress_instance_id = metadata.instance_id.clone();
     let pull_progress = move |event| progress.docker_pull(&progress_instance_id, event);
@@ -1121,14 +1171,9 @@ async fn create_empty_replacement_and_import(
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     validate_replacement_instance(state, metadata, password).await?;
-    metadata.backend = backend_endpoint_for_instance(
-        state,
-        metadata.protocol,
-        &metadata.instance_id,
-        rootless_podman_backend_port,
-    )
-    .await
-    .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    metadata.backend =
+        backend_endpoint_for_instance(state, metadata.protocol, &metadata.instance_id)
+            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     if metadata.protocol == Protocol::Mariadb {
         metadata.mariadb_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
@@ -1182,7 +1227,6 @@ async fn create_staged_replacement_and_import(
         image,
         password,
         export_artifact,
-        false,
     )
     .await
     {
@@ -1322,7 +1366,6 @@ async fn create_empty_replacement_and_import_without_import(
     )
     .await?;
     spec.user = Some(container_user);
-    spec.public_backend_port = rootless_backend_port_for_spec(state, metadata, true).await?;
     let progress = state.install_progress.clone();
     let progress_instance_id = metadata.instance_id.clone();
     let pull_progress = move |event| progress.docker_pull(&progress_instance_id, event);
@@ -1337,26 +1380,6 @@ async fn create_empty_replacement_and_import_without_import(
     )
     .await
     .map_err(|error| error.into_api_error())
-}
-
-async fn rootless_backend_port_for_spec(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-    reuse_existing: bool,
-) -> Result<Option<u16>, ApiError> {
-    if !state.docker.uses_rootless_podman() {
-        return Ok(None);
-    }
-    if reuse_existing
-        && let BackendEndpoint::DockerTcp { host, port } = &metadata.backend
-        && host == "127.0.0.1"
-    {
-        return Ok(Some(*port));
-    }
-    allocate_loopback_backend_port()
-        .await
-        .map(Some)
-        .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))
 }
 
 fn temporary_major_upgrade_instance_id(instance_id: &str) -> String {
@@ -1550,22 +1573,29 @@ fn ensure_major_upgrade_supported(protocol: Protocol) -> Result<(), ApiError> {
 
 pub async fn delete_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<DeleteInstanceQuery>,
 ) -> ApiResult<DeleteResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
     let _operation = state.instance_locks.lock(&instance_id).await;
     let mut metadata = state
         .instances
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let purge = query
-        .get("purge")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let purge = query.purge;
+    let purge_authorization = if purge {
+        Some(DestructiveActionPolicy::authorize(
+            "instance purge",
+            &DestructiveActionConfirmation {
+                confirm: query.confirm,
+                reason: query.reason,
+            },
+        )?)
+    } else {
+        None
+    };
 
     metadata.status = deletion_status(metadata.status);
     metadata.updated_at = now_rfc3339();
@@ -1614,9 +1644,13 @@ pub async fn delete_instance(
         instance_id = %metadata.instance_id,
         protocol = %metadata.protocol,
         purge,
+        purge_reason = purge_authorization
+            .as_ref()
+            .map(|authorization| authorization.reason())
+            .unwrap_or("not_applicable"),
     );
 
-    Ok(Json(DeleteResponse {
+    Ok(ApiResponse::ok(DeleteResponse {
         instance_id,
         deleted,
         purged: purge,
@@ -1633,12 +1667,11 @@ fn deletion_status(current: InstanceStatus) -> InstanceStatus {
 
 pub async fn update_instance_limits(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<LimitsRequest>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiJson(request): ApiJson<LimitsRequest>,
 ) -> ApiResult<InstanceMetadata> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_WRITE)?;
+    auth.require_scope(scopes::INSTANCES_WRITE)?;
     validate_limits(&request)?;
     let _operation = state.instance_locks.lock(&instance_id).await;
 
@@ -1649,16 +1682,30 @@ pub async fn update_instance_limits(
         .ok_or(ApiError::NotFound)?;
     validate_protocol_limits(metadata.protocol, &request)?;
     let limits = limits_from_request(&request);
-    if request.disk_mib != metadata.limits.disk_mib {
-        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .update_instance_limit(&metadata.instance_id, &paths.data, limits.disk_mib)
-            .await
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let previous_limits = metadata.limits.clone();
+    let disk_changed = limits.disk_mib != previous_limits.disk_mib;
+    let paths = if disk_changed {
+        Some(
+            InstancePaths::new(&state.config.paths, &metadata.instance_id)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if let Some(paths) = paths.as_ref()
+        && let Err(error) =
+            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+                .update_instance_limit(&metadata.instance_id, &paths.data, limits.disk_mib)
+                .await
+    {
+        let rollback =
+            rollback_disk_limit(&state, &metadata, paths, previous_limits.disk_mib).await;
+        return Err(ApiError::Runtime(format!(
+            "failed to update disk limit: {error}; rollback: {rollback}"
+        )));
     }
 
-    state
+    if let Err(error) = state
         .docker
         .update_limits(
             metadata.protocol,
@@ -1667,7 +1714,19 @@ pub async fn update_instance_limits(
             limits.memory_mib,
         )
         .await
-        .map_err(docker_error)?;
+    {
+        let rollback = rollback_instance_limits(
+            &state,
+            &metadata,
+            &previous_limits,
+            paths.as_ref(),
+            disk_changed,
+        )
+        .await;
+        return Err(ApiError::Runtime(format!(
+            "failed to update runtime limits: {error}; rollback: {rollback}"
+        )));
+    }
 
     metadata.limits.cpu_cores = limits.cpu_cores;
     metadata.limits.memory_mib = limits.memory_mib;
@@ -1675,11 +1734,19 @@ pub async fn update_instance_limits(
     metadata.limits.disk_enforced = state.config.disk.mode.enforced();
     metadata.limits.disk_enforcement_method = state.config.disk.mode.method().to_string();
     metadata.updated_at = now_rfc3339();
-    state
-        .manager
-        .upsert(metadata.clone())
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+        let rollback = rollback_instance_limits(
+            &state,
+            &metadata,
+            &previous_limits,
+            paths.as_ref(),
+            disk_changed,
+        )
+        .await;
+        return Err(ApiError::Runtime(format!(
+            "failed to persist updated limits: {error}; rollback: {rollback}"
+        )));
+    }
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -1694,38 +1761,78 @@ pub async fn update_instance_limits(
         disk_mib = metadata.limits.disk_mib,
     );
 
-    Ok(Json(metadata))
+    Ok(ApiResponse::ok(metadata))
 }
 
-pub async fn runtime_instances(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> ApiResult<Vec<RuntimeInstanceResponse>> {
-    authorize_scope(&state, &headers, &uri, scopes::INSTANCES_ADMIN)?;
-    let instances = state.instances.list().await;
-    Ok(Json(
-        instances
-            .into_iter()
-            .map(|metadata| RuntimeInstanceResponse {
-                instance_id: metadata.instance_id,
-                protocol: metadata.protocol.to_string(),
-                runtime: metadata.runtime.kind.as_str().to_string(),
-                container_name: metadata.runtime.container_name,
-                status: metadata.status,
-            })
-            .collect(),
-    ))
+async fn rollback_instance_limits(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    previous: &crate::shared::limits::InstanceLimits,
+    paths: Option<&InstancePaths>,
+    disk_changed: bool,
+) -> String {
+    let mut failures = Vec::new();
+    if let Err(error) = state
+        .docker
+        .update_limits(
+            metadata.protocol,
+            &metadata.instance_id,
+            previous.cpu_cores,
+            previous.memory_mib,
+        )
+        .await
+    {
+        failures.push(format!("runtime rollback failed: {error}"));
+    }
+    if disk_changed
+        && let Some(paths) = paths
+        && let Err(error) =
+            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+                .update_instance_limit(&metadata.instance_id, &paths.data, previous.disk_mib)
+                .await
+    {
+        failures.push(format!("disk rollback failed: {error}"));
+    }
+    report_limit_rollback(&metadata.instance_id, failures)
+}
+
+async fn rollback_disk_limit(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    paths: &InstancePaths,
+    disk_mib: u64,
+) -> String {
+    let failures =
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .update_instance_limit(&metadata.instance_id, &paths.data, disk_mib)
+            .await
+            .err()
+            .map(|error| vec![format!("disk rollback failed: {error}")])
+            .unwrap_or_default();
+    report_limit_rollback(&metadata.instance_id, failures)
+}
+
+fn report_limit_rollback(instance_id: &str, failures: Vec<String>) -> String {
+    if failures.is_empty() {
+        return "completed".to_string();
+    }
+    let failures = failures.join("; ");
+    tracing::error!(
+        event = "audit instance_limits_rollback_failed",
+        instance_id,
+        failures,
+        "external limits may require operator reconciliation"
+    );
+    failures
 }
 
 pub async fn instance_logs(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    Query(query): Query<LogsQuery>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<LogsQuery>,
 ) -> ApiResult<LogsResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::LOGS_READ)?;
+    auth.require_scope(scopes::LOGS_READ)?;
     let metadata = state
         .instances
         .get(&instance_id)
@@ -1736,7 +1843,7 @@ pub async fn instance_logs(
         .logs(metadata.protocol, &metadata.instance_id, query.tail)
         .await
         .map_err(docker_error)?;
-    Ok(Json(LogsResponse {
+    Ok(ApiResponse::ok(LogsResponse {
         instance_id,
         stdout: redaction::redact_connection_url(&output.stdout),
         stderr: redaction::redact_connection_url(&output.stderr),
@@ -1793,77 +1900,133 @@ pub(crate) async fn lifecycle_instance_locked(
         LifecycleAction::Kill => inspection.status == DockerContainerStatus::Running,
     };
 
-    if should_call_docker {
-        if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-            let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+    let operation_result: Result<(), ApiError> = async {
+        if should_call_docker {
+            if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
+                let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                DiskLimiter::with_fuse_root(
+                    state.config.disk.clone(),
+                    state.config.paths.fuse_root(),
+                )
                 .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
                 .await
                 .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        }
-        match action {
-            LifecycleAction::Start => {
-                state
-                    .docker
-                    .start(metadata.protocol, &metadata.instance_id)
-                    .await
             }
-            LifecycleAction::Stop => {
-                state
-                    .docker
-                    .stop(metadata.protocol, &metadata.instance_id)
-                    .await
+            match action {
+                LifecycleAction::Start => {
+                    state
+                        .docker
+                        .start(metadata.protocol, &metadata.instance_id)
+                        .await
+                }
+                LifecycleAction::Stop => {
+                    state
+                        .docker
+                        .stop(metadata.protocol, &metadata.instance_id)
+                        .await
+                }
+                LifecycleAction::Restart => {
+                    state
+                        .docker
+                        .restart(metadata.protocol, &metadata.instance_id)
+                        .await
+                }
+                LifecycleAction::Kill => {
+                    state
+                        .docker
+                        .kill(metadata.protocol, &metadata.instance_id)
+                        .await
+                }
             }
-            LifecycleAction::Restart => {
-                state
-                    .docker
-                    .restart(metadata.protocol, &metadata.instance_id)
-                    .await
-            }
-            LifecycleAction::Kill => {
-                state
-                    .docker
-                    .kill(metadata.protocol, &metadata.instance_id)
-                    .await
-            }
-        }
-        .map_err(docker_error)?;
-    }
-
-    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-        state
-            .docker
-            .wait_until_ready(
-                metadata.protocol,
-                &metadata.instance_id,
-                Duration::from_secs(120),
-            )
-            .await
             .map_err(docker_error)?;
-        if metadata.protocol == Protocol::Postgres {
-            provision_postgres_tenant_role(
-                state,
-                &metadata.instance_id,
-                &metadata.database.name,
-                &metadata.database.username,
-            )
-            .await?;
         }
+
+        if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
+            state
+                .docker
+                .wait_until_ready(
+                    metadata.protocol,
+                    &metadata.instance_id,
+                    Duration::from_secs(120),
+                )
+                .await
+                .map_err(docker_error)?;
+            if metadata.protocol == Protocol::Postgres {
+                provision_postgres_tenant_role(
+                    state,
+                    &metadata.instance_id,
+                    &metadata.database.name,
+                    &metadata.database.username,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
+    .await;
 
     let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
-    state
-        .manager
-        .upsert(metadata.clone())
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let persistence_result = state.manager.upsert(metadata.clone()).await;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
         .await;
 
-    Ok(Json(metadata))
+    match (operation_result, persistence_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(operation_error), Ok(())) => return Err(operation_error),
+        (operation_result, Err(persistence_error)) => {
+            let rollback = rollback_lifecycle_runtime(
+                state,
+                &metadata,
+                matches!(
+                    inspection.status,
+                    DockerContainerStatus::Running | DockerContainerStatus::Starting
+                ),
+            )
+            .await;
+            return Err(ApiError::Runtime(format!(
+                "failed to persist lifecycle reconciliation: {persistence_error}; operation: {}; rollback: {rollback}",
+                operation_result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "completed".to_string())
+            )));
+        }
+    }
+
+    Ok(ApiResponse::ok(metadata))
+}
+
+async fn rollback_lifecycle_runtime(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    should_be_running: bool,
+) -> String {
+    let result = if should_be_running {
+        state
+            .docker
+            .start(metadata.protocol, &metadata.instance_id)
+            .await
+    } else {
+        state
+            .docker
+            .stop(metadata.protocol, &metadata.instance_id)
+            .await
+    };
+    match result {
+        Ok(_) => "completed".to_string(),
+        Err(error) => {
+            tracing::error!(
+                event = "audit lifecycle_rollback_failed",
+                instance_id = %metadata.instance_id,
+                %error,
+                "runtime may require operator reconciliation"
+            );
+            format!("failed: {error}")
+        }
+    }
 }
 
 async fn purge_instance_paths(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
@@ -1928,6 +2091,7 @@ async fn instance_image_update_spec(
             image,
             container_data_path.clone(),
             paths.logs.clone(),
+            paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::instance_spec(
             &metadata.instance_id,
@@ -1961,6 +2125,7 @@ async fn instance_image_update_spec(
             },
             container_data_path.clone(),
             paths.logs.clone(),
+            paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
             let hosted_config_path =
@@ -1976,6 +2141,8 @@ async fn instance_image_update_spec(
                 container_data_path,
                 paths.logs.clone(),
                 hosted_config_path,
+                paths.sockets.clone(),
+                paths.socket_bridge_binary.clone(),
             )
         }
         Protocol::Qdrant => databases::qdrant::docker::instance_spec(
@@ -1984,6 +2151,8 @@ async fn instance_image_update_spec(
             password,
             container_data_path,
             paths.logs.clone(),
+            paths.sockets.clone(),
+            paths.socket_bridge_binary.clone(),
         ),
     };
     spec.cpu_cores = metadata.limits.cpu_cores;
@@ -2138,11 +2307,5 @@ mod tests {
             normalize_database_version(Protocol::Qdrant, "qdrant 1.18.2\n"),
             Some("1.18.2".to_string())
         );
-    }
-
-    #[test]
-    fn version_probe_errors_are_shortened() {
-        let error = short_error(&format!("first\n{}", "x".repeat(400)), 20);
-        assert_eq!(error, "first; xxxxxxxxxxxxx...");
     }
 }

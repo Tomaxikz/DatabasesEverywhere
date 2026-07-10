@@ -27,6 +27,7 @@ jobs:
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -45,6 +46,14 @@ jobs:
             exit 1
           fi
           cargo audit -D warnings
+
+      - name: Verify embedded static socket bridge
+        run: |
+          rustc --edition=2024 --target x86_64-unknown-linux-musl -D warnings \
+            -C opt-level=z -C strip=symbols -C panic=abort \
+            helpers/socket_bridge.rs -o /tmp/dbev-socket-bridge
+          expected="$(sha256sum /tmp/dbev-socket-bridge | awk '{print $1}')"
+          grep -Fq "$expected" build.rs
 
       - name: Check formatting
         run: cargo fmt --all -- --check

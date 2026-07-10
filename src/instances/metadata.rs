@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    api::public_diagnostic::PublicDiagnostic,
     config::DaemonEngine,
     shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
 };
@@ -44,7 +45,7 @@ pub struct InstanceImageStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceDatabaseVersion {
     pub current: Option<String>,
-    pub error: Option<String>,
+    pub error: Option<PublicDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +82,8 @@ pub struct PublicEndpoint {
 pub struct RuntimeMetadata {
     pub kind: RuntimeKind,
     pub container_name: String,
-    pub network: String,
+    #[serde(alias = "network")]
+    pub network_mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +99,29 @@ impl RuntimeKind {
             Self::Docker => "docker",
             Self::Podman => "podman",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_metadata_reads_legacy_network_field_as_network_mode() {
+        let runtime: RuntimeMetadata = serde_json::from_value(serde_json::json!({
+            "kind": "docker",
+            "container_name": "dbe-postgres-inst_1",
+            "network": "databases-everywhere"
+        }))
+        .unwrap();
+
+        assert_eq!(runtime.network_mode, "databases-everywhere");
+        assert!(
+            serde_json::to_value(runtime)
+                .unwrap()
+                .get("network_mode")
+                .is_some()
+        );
     }
 }
 

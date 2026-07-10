@@ -31,8 +31,6 @@ pub fn instance_spec(
         memory_mib: 1024,
         disk_mib: 10240,
         pids_limit: None,
-        container_port: Protocol::Mariadb.default_container_port(),
-        public_backend_port: None,
         data_path,
         data_target: "/var/lib/mysql".to_string(),
         logs_path,
@@ -42,6 +40,7 @@ pub fn instance_spec(
             target: "/run/mysqld".to_string(),
             read_only: false,
         }],
+        socket_bridges: Vec::new(),
         env: vec![
             DockerEnv {
                 key: "MARIADB_DATABASE".to_string(),
@@ -60,7 +59,7 @@ pub fn instance_spec(
                 value: root_password,
             },
         ],
-        command: Vec::new(),
+        command: vec!["--skip-networking=ON".to_string()],
     }
 }
 
@@ -84,8 +83,8 @@ mod tests {
 
         assert_eq!(spec.protocol, Protocol::Mariadb);
         assert_eq!(spec.data_target, "/var/lib/mysql");
-        assert_eq!(spec.container_port, 3306);
-        assert_eq!(spec.public_backend_port, None);
         assert_eq!(spec.extra_mounts[0].target, "/run/mysqld");
+        assert_eq!(spec.command, ["--skip-networking=ON"]);
+        assert!(spec.socket_bridges.is_empty());
     }
 }

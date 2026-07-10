@@ -53,9 +53,6 @@ security:
   api_body_limit_bytes: 1048576
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
-  allow_insecure_public_listeners: false
-  allow_private_remote_imports: false
-  remote_import_allowed_hosts: []
   # API self-upgrade is intentionally unsupported; use package/image rollout.
   self_upgrade_enabled: false
   pids_limit: 512
@@ -84,12 +81,7 @@ disk:
 daemon:
   engine: docker
   socket_path: ""
-  network: databases-everywhere
-  internal_network: true
-  ipam:
-    subnet: ''
-    gateway: ''
-  allow_public_backend_ports: false
+  # Database containers always use network_mode=none and private Unix sockets.
   container_read_only_rootfs: false
   container_userns_mode: ''
   container_seccomp_profile: ''

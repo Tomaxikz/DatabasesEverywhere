@@ -1,17 +1,16 @@
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
+use axum::http::StatusCode;
 use serde::Serialize;
 use std::net::SocketAddr;
 
 use crate::api::{
-    handlers::{ApiError, ApiResult, authorize_scope},
+    api_response::{ApiResponse, ApiResult},
     routes::AppState,
+    security_policy::ApiRequestContext,
 };
 use crate::auth::scopes;
 
+// API compatibility is versioned independently from the daemon binary release.
 pub const API_VERSION: &str = "0.2.0";
 
 #[derive(Debug, Serialize)]
@@ -28,8 +27,8 @@ pub struct SystemResponse {
     pub api_ssl_enabled: bool,
     pub daemon_engine: &'static str,
     pub daemon_socket: String,
-    pub daemon_network: String,
-    pub daemon_internal_network: bool,
+    pub database_container_network_mode: &'static str,
+    pub database_backend_transport: &'static str,
     pub daemon_disk_limits_enforced: bool,
     pub disk_mode: &'static str,
     pub postgres_enabled: bool,
@@ -45,11 +44,10 @@ pub struct SystemResponse {
 
 pub async fn system(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<SystemResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::SYSTEM_READ)?;
-    Ok(Json(SystemResponse {
+    auth.require_scope(scopes::SYSTEM_READ)?;
+    Ok(ApiResponse::ok(SystemResponse {
         service: "databases-everywhere",
         version: env!("CARGO_PKG_VERSION"),
         api_version: API_VERSION,
@@ -62,8 +60,8 @@ pub async fn system(
         api_ssl_enabled: state.config.api.ssl.enabled,
         daemon_engine: state.config.daemon.engine.as_str(),
         daemon_socket: state.docker.socket_path().to_string(),
-        daemon_network: state.config.daemon.network.clone(),
-        daemon_internal_network: state.config.daemon.internal_network,
+        database_container_network_mode: "none",
+        database_backend_transport: "unix_socket",
         daemon_disk_limits_enforced: state.config.disk.mode.enforced(),
         disk_mode: state.config.disk.mode.method(),
         postgres_enabled: state.config.postgres.enabled,
@@ -87,13 +85,23 @@ fn clickhouse_http_port(bind: &str) -> u16 {
 #[derive(Debug, Serialize)]
 pub struct HeartbeatResponse {
     pub status: &'static str,
+    pub gateways: crate::gateway::supervisor::GatewayReadinessSnapshot,
 }
 
 pub async fn heartbeat(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Result<Json<HeartbeatResponse>, ApiError> {
-    authorize_scope(&state, &headers, &uri, scopes::SYSTEM_READ)?;
-    Ok(Json(HeartbeatResponse { status: "ok" }))
+    auth: ApiRequestContext,
+) -> ApiResult<HeartbeatResponse> {
+    auth.require_scope(scopes::SYSTEM_READ)?;
+    let gateways = state.gateway_supervisor.snapshot();
+    let ready = state.gateway_supervisor.is_ready();
+    let response = HeartbeatResponse {
+        status: if ready { "ok" } else { "not_ready" },
+        gateways,
+    };
+    Ok(if ready {
+        ApiResponse::ok(response)
+    } else {
+        ApiResponse::with_status(StatusCode::SERVICE_UNAVAILABLE, response)
+    })
 }

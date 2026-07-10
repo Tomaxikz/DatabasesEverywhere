@@ -39,7 +39,7 @@ impl DockerRuntime {
                 "true".to_string(),
             )])),
             host_config: Some(HostConfig {
-                network_mode: Some(self.network.clone()),
+                network_mode: Some("none".to_string()),
                 mounts: Some(vec![bind_mount(&probe_dir, "/data", false)]),
                 storage_opt: storage_opt(true, 64),
                 ..Default::default()

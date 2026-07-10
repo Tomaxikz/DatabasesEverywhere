@@ -54,8 +54,6 @@ jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
 api:
   host: 127.0.0.1
   port: 8090
-security:
-  allow_insecure_public_listeners: true
 paths:
   data: /var/lib/databases-everywhere
   sockets: /run/databases-everywhere
@@ -67,7 +65,7 @@ paths:
 
         let config = load_config(&path).unwrap();
 
-        assert_eq!(config.daemon.network, "databases-everywhere");
+        assert_eq!(config.daemon.engine, crate::config::DaemonEngine::Docker);
         assert_eq!(config.images.postgres, "postgres:18.4");
         assert_eq!(config.images.mongodb, "mongo:7.0.37");
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");

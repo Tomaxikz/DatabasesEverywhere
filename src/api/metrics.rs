@@ -1,14 +1,11 @@
 use axum::{
     extract::State,
-    http::{HeaderMap, Uri, header},
+    http::header,
     response::{IntoResponse, Response},
 };
 
 use crate::{
-    api::{
-        handlers::{ApiError, authorize_scope},
-        routes::AppState,
-    },
+    api::{api_response::ApiError, routes::AppState, security_policy::ApiRequestContext},
     auth::scopes,
     jobs::import_export::ImportExportStatus,
     shared::protocol::Protocol,
@@ -16,10 +13,9 @@ use crate::{
 
 pub async fn metrics(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> Result<Response, ApiError> {
-    authorize_scope(&state, &headers, &uri, scopes::METRICS_READ)?;
+    auth.require_scope(scopes::METRICS_READ)?;
     let instances = state.instances.list().await;
     let jobs_by_status = state
         .import_export_jobs

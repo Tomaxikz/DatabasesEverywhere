@@ -5,10 +5,9 @@ use std::{
 
 use axum::{
     extract::{
-        Path, Query, State,
+        State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
     },
-    http::{HeaderMap, Uri},
     response::Response,
 };
 use serde::{Deserialize, Serialize};
@@ -19,13 +18,15 @@ use tokio::time::{
 
 use crate::{
     api::{
+        api_response::{ApiError, ApiPath, ApiQuery},
         artifacts::{DownloadUrlResponse, create_artifact_download_url},
-        handlers::{ApiError, authorize_websocket_jwt},
         import_export::{ImportExportJobResponse, public_job_response},
         progress::InstallProgress,
+        public_diagnostic::PublicDiagnostic,
         resources::{ResourceReport, resource_report_with_docker_stats},
         routes::AppState,
         security::{WebSocketAdmissionError, WebSocketConnectionPermit},
+        security_policy::WebSocketRequestContext,
     },
     auth::{jwt::Claims, scopes},
     instances::metadata::InstanceMetadata,
@@ -34,22 +35,23 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogsQuery {
     pub tail: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ImportExportQuery {
     pub job_id: Option<String>,
 }
 
 pub async fn monitoring(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: WebSocketRequestContext,
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let claims = authorize_websocket_jwt(&state, &headers, &uri, scopes::MONITOR_READ, None)?;
+    let claims = auth.require_scope(scopes::MONITOR_READ, None)?;
     let connection = admit_websocket(&state, &claims).await?;
     Ok(websocket
         .protocols(["dbe.jwt", "bearer"])
@@ -152,7 +154,7 @@ async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> Mo
             docker_stats,
             resource_error: None,
         },
-        Err(error) => MonitoringInstance {
+        Err(_error) => MonitoringInstance {
             instance_id: metadata.instance_id,
             protocol: metadata.protocol.to_string(),
             status: metadata.status.as_str().to_string(),
@@ -171,7 +173,10 @@ async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> Mo
             network_tx_bytes: None,
             resources: None,
             docker_stats: None,
-            resource_error: Some(error.to_string()),
+            resource_error: Some(PublicDiagnostic::public(
+                "resource_unavailable",
+                "resource metrics are temporarily unavailable",
+            )),
         },
     }
 }
@@ -203,24 +208,17 @@ struct MonitoringInstance {
     network_tx_bytes: Option<u64>,
     resources: Option<ResourceReport>,
     docker_stats: Option<String>,
-    resource_error: Option<String>,
+    resource_error: Option<PublicDiagnostic>,
 }
 
 pub async fn logs(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    Query(query): Query<LogsQuery>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: WebSocketRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<LogsQuery>,
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let claims = authorize_websocket_jwt(
-        &state,
-        &headers,
-        &uri,
-        scopes::LOGS_READ,
-        Some(&instance_id),
-    )?;
+    let claims = auth.require_scope(scopes::LOGS_READ, Some(&instance_id))?;
     let metadata = state
         .instances
         .get(&instance_id)
@@ -236,20 +234,12 @@ pub async fn logs(
 
 pub async fn import_export(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    Query(query): Query<ImportExportQuery>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: WebSocketRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<ImportExportQuery>,
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let download_headers = headers.clone();
-    let claims = authorize_websocket_jwt(
-        &state,
-        &headers,
-        &uri,
-        scopes::IMPORT_EXPORT_READ,
-        Some(&instance_id),
-    )?;
+    let claims = auth.require_scope(scopes::IMPORT_EXPORT_READ, Some(&instance_id))?;
     state
         .instances
         .get(&instance_id)
@@ -259,15 +249,7 @@ pub async fn import_export(
     Ok(websocket
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
-            stream_import_export(
-                socket,
-                state,
-                instance_id,
-                query,
-                download_headers,
-                claims,
-                connection,
-            )
+            stream_import_export(socket, state, instance_id, query, claims, connection)
         }))
 }
 
@@ -315,7 +297,7 @@ async fn stream_logs(
                 sequence: 1,
                 stdout: None,
                 stderr: None,
-                error: Some(error.to_string()),
+                error: Some(PublicDiagnostic::internal("container log stream", error)),
             };
             let _ = send_json_before(&mut socket, &message, expiration_deadline).await;
             return;
@@ -360,7 +342,7 @@ async fn stream_logs(
                         sequence,
                         stdout: None,
                         stderr: None,
-                        error: Some(error.to_string()),
+                        error: Some(PublicDiagnostic::internal("container log stream", error)),
                     },
                     None => LogSnapshot {
                         r#type: "logs",
@@ -368,7 +350,10 @@ async fn stream_logs(
                         sequence,
                         stdout: None,
                         stderr: None,
-                        error: Some("container log stream ended".to_string()),
+                        error: Some(PublicDiagnostic::public(
+                            "stream_ended",
+                            "container log stream ended",
+                        )),
                     },
                 }
             }
@@ -420,7 +405,6 @@ async fn stream_import_export(
     state: AppState,
     instance_id: String,
     query: ImportExportQuery,
-    download_headers: HeaderMap,
     claims: Claims,
     _connection: WebSocketConnectionPermit,
 ) {
@@ -428,7 +412,7 @@ async fn stream_import_export(
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let Ok(snapshot) = complete_before(
         expiration_deadline,
-        import_export_snapshot(&state, &download_headers, &instance_id, &query, &claims),
+        import_export_snapshot(&state, &instance_id, &query, &claims),
     )
     .await
     else {
@@ -486,7 +470,7 @@ async fn stream_import_export(
                         }
                         let Ok(job) = complete_before(
                             expiration_deadline,
-                            public_job_update(&state, &download_headers, job, &claims),
+                            public_job_update(&state, job, &claims),
                         )
                         .await
                         else {
@@ -519,7 +503,6 @@ async fn stream_import_export(
                             expiration_deadline,
                             import_export_snapshot(
                                 &state,
-                                &download_headers,
                                 &instance_id,
                                 &query,
                                 &claims,
@@ -546,7 +529,6 @@ async fn stream_import_export(
 
 async fn import_export_snapshot(
     state: &AppState,
-    download_headers: &HeaderMap,
     instance_id: &str,
     query: &ImportExportQuery,
     claims: &Claims,
@@ -555,7 +537,7 @@ async fn import_export_snapshot(
     let mut response = Vec::with_capacity(jobs.len());
     for job in jobs {
         if job_matches_access(&job, instance_id, query, claims) {
-            response.push(public_job_update(state, download_headers, job, claims).await);
+            response.push(public_job_update(state, job, claims).await);
         }
     }
     ImportExportSnapshot {
@@ -611,11 +593,10 @@ fn job_matches_access(
 // turn an unauthorized job into a signed artifact credential.
 async fn public_job_update(
     state: &AppState,
-    download_headers: &HeaderMap,
     job: ImportExportJob,
     claims: &Claims,
 ) -> ImportExportJobUpdate {
-    let download = download_ticket_for_job(state, download_headers, &job, claims).await;
+    let download = download_ticket_for_job(state, &job, claims).await;
     ImportExportJobUpdate {
         job: public_job_response(job).await,
         download,
@@ -624,7 +605,6 @@ async fn public_job_update(
 
 async fn download_ticket_for_job(
     state: &AppState,
-    download_headers: &HeaderMap,
     job: &ImportExportJob,
     claims: &Claims,
 ) -> Option<DownloadUrlResponse> {
@@ -639,15 +619,8 @@ async fn download_ticket_for_job(
         .as_deref()
         .and_then(|path| std::path::Path::new(path).file_name())
         .and_then(|name| name.to_str())?;
-    match create_artifact_download_url(
-        state,
-        download_headers,
-        artifact_name,
-        &job.instance_id,
-        Some(120),
-        true,
-    )
-    .await
+    match create_artifact_download_url(state, artifact_name, &job.instance_id, Some(120), true)
+        .await
     {
         Ok(ticket) => Some(ticket),
         Err(error) => {
@@ -763,7 +736,7 @@ struct LogSnapshot {
     sequence: u64,
     stdout: Option<String>,
     stderr: Option<String>,
-    error: Option<String>,
+    error: Option<PublicDiagnostic>,
 }
 
 #[cfg(test)]

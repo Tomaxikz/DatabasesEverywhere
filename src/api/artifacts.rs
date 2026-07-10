@@ -7,10 +7,9 @@ use std::{
 };
 
 use axum::{
-    Json,
     body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, Uri, header},
+    extract::State,
+    http::header,
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, decode, encode};
@@ -22,8 +21,9 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::api::{
-    handlers::{ApiError, ApiResult, authorize_scope},
+    api_response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
     routes::AppState,
+    security_policy::ApiRequestContext,
 };
 use crate::{
     auth::scopes,
@@ -108,6 +108,7 @@ impl ArtifactDownloadTickets {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateDownloadRequest {
     #[serde(default)]
     pub expires_in_seconds: Option<i64>,
@@ -123,6 +124,7 @@ pub struct DownloadUrlResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DownloadQuery {
     pub token: String,
 }
@@ -145,29 +147,29 @@ struct DownloadClaims {
 
 pub async fn list_instance_artifacts(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<Vec<ArtifactInfo>> {
-    authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_READ)?;
+    auth.require_scope(scopes::ARTIFACTS_READ)?;
     ensure_instance_exists(&state, &instance_id).await?;
-    Ok(Json(read_instance_artifacts(&state, &instance_id).await?))
+    Ok(ApiResponse::ok(
+        read_instance_artifacts(&state, &instance_id).await?,
+    ))
 }
 
 pub async fn delete_artifact(
     State(state): State<AppState>,
-    Path((instance_id, artifact_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, artifact_id)): ApiPath<(String, String)>,
 ) -> ApiResult<DeleteArtifactResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_WRITE)?;
+    auth.require_scope(scopes::ARTIFACTS_WRITE)?;
     ensure_instance_exists(&state, &instance_id).await?;
     let path = verified_artifact_path_for_instance(&state, &artifact_id, &instance_id).await?;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
             remove_checksum_sidecar(&path).await;
             tracing::info!(event = "audit artifact_deleted", instance_id, artifact_id);
-            Ok(Json(DeleteArtifactResponse {
+            Ok(ApiResponse::ok(DeleteArtifactResponse {
                 id: artifact_id,
                 deleted: true,
             }))
@@ -181,11 +183,10 @@ pub async fn delete_artifact(
 
 pub async fn apply_retention(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<RetentionResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_WRITE)?;
+    auth.require_scope(scopes::ARTIFACTS_WRITE)?;
     ensure_instance_exists(&state, &instance_id).await?;
     let mut artifacts = read_instance_artifacts(&state, &instance_id).await?;
     artifacts.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
@@ -217,20 +218,18 @@ pub async fn apply_retention(
     }
 
     tracing::info!(event = "audit artifact_retention_applied", deleted = ?deleted);
-    Ok(Json(RetentionResponse { deleted }))
+    Ok(ApiResponse::ok(RetentionResponse { deleted }))
 }
 
 pub async fn create_artifact_download(
     State(state): State<AppState>,
-    Path((instance_id, artifact_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<CreateDownloadRequest>,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, artifact_id)): ApiPath<(String, String)>,
+    ApiJson(request): ApiJson<CreateDownloadRequest>,
 ) -> ApiResult<DownloadUrlResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::ARTIFACTS_READ)?;
+    auth.require_scope(scopes::ARTIFACTS_READ)?;
     create_download_url(
         &state,
-        &headers,
         &artifact_id,
         &instance_id,
         request,
@@ -241,15 +240,13 @@ pub async fn create_artifact_download(
 
 pub async fn create_backup_download(
     State(state): State<AppState>,
-    Path((instance_id, backup_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<CreateDownloadRequest>,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
+    ApiJson(request): ApiJson<CreateDownloadRequest>,
 ) -> ApiResult<DownloadUrlResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_READ)?;
+    auth.require_scope(scopes::BACKUPS_READ)?;
     create_download_url(
         &state,
-        &headers,
         &backup_id,
         &instance_id,
         request,
@@ -260,7 +257,6 @@ pub async fn create_backup_download(
 
 pub(crate) async fn create_artifact_download_url(
     state: &AppState,
-    headers: &HeaderMap,
     name: &str,
     instance_id: &str,
     expires_in_seconds: Option<i64>,
@@ -268,7 +264,6 @@ pub(crate) async fn create_artifact_download_url(
 ) -> Result<DownloadUrlResponse, ApiError> {
     create_download_url(
         state,
-        headers,
         name,
         instance_id,
         CreateDownloadRequest {
@@ -278,13 +273,13 @@ pub(crate) async fn create_artifact_download_url(
         DownloadKind::Artifact,
     )
     .await
-    .map(|Json(response)| response)
+    .map(ApiResponse::into_body)
 }
 
 pub async fn download_artifact(
     State(state): State<AppState>,
-    Path((instance_id, artifact_id)): Path<(String, String)>,
-    Query(query): Query<DownloadQuery>,
+    ApiPath((instance_id, artifact_id)): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<DownloadQuery>,
 ) -> Result<Response, ApiError> {
     download(
         &state,
@@ -298,8 +293,8 @@ pub async fn download_artifact(
 
 pub async fn download_backup(
     State(state): State<AppState>,
-    Path((instance_id, backup_id)): Path<(String, String)>,
-    Query(query): Query<DownloadQuery>,
+    ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<DownloadQuery>,
 ) -> Result<Response, ApiError> {
     download(
         &state,
@@ -313,7 +308,6 @@ pub async fn download_backup(
 
 async fn create_download_url(
     state: &AppState,
-    _headers: &HeaderMap,
     name: &str,
     instance_id: &str,
     request: CreateDownloadRequest,
@@ -376,7 +370,7 @@ async fn create_download_url(
         single_use,
     );
 
-    Ok(Json(DownloadUrlResponse {
+    Ok(ApiResponse::ok(DownloadUrlResponse {
         url,
         expires_at_unix: exp,
         single_use,
@@ -739,8 +733,6 @@ pub(crate) fn system_time_rfc3339(time: SystemTime) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use axum::http::{HeaderMap, HeaderValue};
-
     use super::*;
     use crate::{
         auth::api_token::ApiToken,
@@ -785,12 +777,8 @@ mod tests {
         tokio::fs::write(&artifact, b"dump").await.unwrap();
         state.instances.upsert(sample_metadata("inst_abc")).await;
 
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
         let ticket = create_download_url(
             &state,
-            &headers,
             artifact_name,
             "inst_abc",
             CreateDownloadRequest {
@@ -801,7 +789,7 @@ mod tests {
         )
         .await
         .unwrap()
-        .0;
+        .into_body();
         let public_ticket = serde_json::to_value(&ticket).unwrap();
         let fields = public_ticket.as_object().unwrap();
         assert_eq!(fields.len(), 3);
@@ -893,11 +881,8 @@ mod tests {
         state.instances.upsert(sample_metadata("inst_abc")).await;
         state.instances.upsert(sample_metadata("inst_other")).await;
 
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("dbe.example.com:8090"));
         let error = create_download_url(
             &state,
-            &headers,
             artifact_name,
             "inst_abc",
             CreateDownloadRequest {
@@ -947,6 +932,7 @@ mod tests {
                 ..Default::default()
             }),
             config_path: dir.join("config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
@@ -958,6 +944,7 @@ mod tests {
             artifact_downloads: ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
         }
     }
 
@@ -971,14 +958,13 @@ mod tests {
                 host: "db.example.com".to_string(),
                 port: 5434,
             },
-            backend: BackendEndpoint::DockerTcp {
-                host: "172.30.0.2".to_string(),
-                port: 5432,
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),
             },
             runtime: RuntimeMetadata {
                 kind: RuntimeKind::Docker,
                 container_name: format!("dbe-postgres-{instance_id}"),
-                network: "databases-everywhere".to_string(),
+                network_mode: "none".to_string(),
             },
             database: DatabaseIdentity {
                 name: "db".to_string(),

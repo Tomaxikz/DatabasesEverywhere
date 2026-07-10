@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use bollard::models::{ContainerStatsResponse, HealthConfig, Mount, MountType, PortBinding};
+use bollard::models::{ContainerStatsResponse, HealthConfig, Mount, MountType};
 
 use crate::shared::protocol::Protocol;
 
@@ -23,6 +21,8 @@ pub fn healthcheck(protocol: Protocol) -> HealthConfig {
         Protocol::Redis => vec![
             "CMD",
             "redis-cli",
+            "-s",
+            "/run/dbev/redis.sock",
             "--user",
             "dbe_health",
             "-a",
@@ -32,7 +32,7 @@ pub fn healthcheck(protocol: Protocol) -> HealthConfig {
         ],
         Protocol::Mariadb => vec![
             "CMD-SHELL",
-            "mariadb-admin ping -h 127.0.0.1 -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
+            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
         ],
         Protocol::Mongodb => vec![
             "CMD-SHELL",
@@ -42,7 +42,12 @@ pub fn healthcheck(protocol: Protocol) -> HealthConfig {
             "CMD-SHELL",
             "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1'",
         ],
-        Protocol::Qdrant => vec!["CMD-SHELL", "true"],
+        Protocol::Qdrant => vec![
+            "CMD",
+            "/opt/dbev/dbev-socket-bridge",
+            "__socket-bridge-healthcheck",
+            "127.0.0.1:6334",
+        ],
     };
     HealthConfig {
         test: Some(test.into_iter().map(ToString::to_string).collect()),
@@ -52,36 +57,6 @@ pub fn healthcheck(protocol: Protocol) -> HealthConfig {
         start_period: Some(120_000_000_000),
         start_interval: Some(1_000_000_000),
     }
-}
-
-pub fn exposed_ports(
-    enabled: bool,
-    host_port: Option<u16>,
-    container_port: u16,
-) -> Option<Vec<String>> {
-    if enabled && host_port.is_some() {
-        Some(vec![format!("{container_port}/tcp")])
-    } else {
-        None
-    }
-}
-
-pub fn published_port_bindings(
-    enabled: bool,
-    host_port: Option<u16>,
-    container_port: u16,
-) -> Option<HashMap<String, Option<Vec<PortBinding>>>> {
-    if !enabled {
-        return None;
-    }
-    let host_port = host_port?;
-    Some(HashMap::from([(
-        format!("{container_port}/tcp"),
-        Some(vec![PortBinding {
-            host_ip: Some("127.0.0.1".to_string()),
-            host_port: Some(host_port.to_string()),
-        }]),
-    )]))
 }
 
 pub fn cpu_to_nano(cpu_cores: f64) -> Option<i64> {

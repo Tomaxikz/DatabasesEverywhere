@@ -40,7 +40,9 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 ## What it does
 
 - One public gateway listener per database protocol — no port-per-instance chaos.
-- Backend containers are private and don't publish any database ports by default.
+- Database containers have no network interface (`network_mode=none`) and never publish backend ports.
+- The daemon reaches each instance through a private Unix socket; ClickHouse and Qdrant use a hash-verified, statically linked, loopback-only socket bridge inside their isolated containers.
+- Legacy bridge-network/TCP instances are stopped and quarantined on upgrade; preserve required data, delete them explicitly, and recreate them before serving traffic again.
 - Per-instance CPU, memory, PID, and disk limits, so one noisy instance can't eat the whole box.
 - Disk enforcement via FuseQuota when your host doesn't have native project quotas.
 - Native logical dumps for SQL/document stores and physical archive exports for Redis/Qdrant.
@@ -51,7 +53,8 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Install
 
-Official release artifacts currently target x86-64 Linux only. Choose a
+Official release artifacts currently target x86-64 Linux with glibc 2.35 or
+newer. Choose a
 versioned release, verify its published SHA-256, and install it to
 `/usr/local/bin`:
 
@@ -102,9 +105,8 @@ cleartext public API binds are rejected. Database gateways may bind to
 non-loopback addresses with or without TLS and continue to enforce each
 database protocol's native credentials. Cleartext public gateways emit a
 startup warning because credentials, queries, and results are not protected
-from network interception. `security.allow_insecure_public_listeners` only
-permits TLS-disabled remote credential imports and never permits a cleartext
-public management API.
+from network interception. Remote credential imports are intentionally
+unavailable in the network-none model; stage a trusted local artifact first.
 
 ## Docs
 

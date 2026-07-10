@@ -1,14 +1,11 @@
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiJson, ApiResponse, ApiResult},
         routes::AppState,
+        security_policy::ApiRequestContext,
     },
     auth::{jwt, scopes},
 };
@@ -17,6 +14,7 @@ const DEFAULT_TTL_SECONDS: i64 = 900;
 const MAX_TTL_SECONDS: i64 = 3600;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IssueWsTokenRequest {
     pub subject: String,
     pub scopes: Vec<String>,
@@ -36,11 +34,10 @@ pub struct IssueWsTokenResponse {
 
 pub async fn issue_ws_token(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<IssueWsTokenRequest>,
+    auth: ApiRequestContext,
+    ApiJson(request): ApiJson<IssueWsTokenRequest>,
 ) -> ApiResult<IssueWsTokenResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::WS_TOKENS_WRITE)?;
+    auth.require_scope(scopes::WS_TOKENS_WRITE)?;
     validate_request(&request)?;
     let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
     let (token, expires_at_unix) = jwt::issue_ws_token(
@@ -62,7 +59,7 @@ pub async fn issue_ws_token(
         expires_at_unix,
     );
 
-    Ok(Json(IssueWsTokenResponse {
+    Ok(ApiResponse::ok(IssueWsTokenResponse {
         token_type: "Bearer",
         token,
         expires_at_unix,

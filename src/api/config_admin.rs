@@ -2,23 +2,22 @@ use std::{
     fs::File,
     io::{ErrorKind, Write},
     path::Path,
+    sync::Arc,
 };
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiJson, ApiResponse, ApiResult},
         routes::AppState,
+        security_policy::ApiRequestContext,
     },
     auth::scopes,
-    config::{Config, validate::validate_config},
+    config::{Config, load::load_config, validate::validate_config},
 };
 
 const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
@@ -26,11 +25,9 @@ const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
     &["jwt_signing_key"],
     &["token_id"],
     &["uuid"],
+    &["paths"],
     &["disk", "fuse_quota_binary"],
     &["disk", "fuse_quota_binary_sha256"],
-    &["security", "allow_insecure_public_listeners"],
-    &["security", "allow_private_remote_imports"],
-    &["security", "remote_import_allowed_hosts"],
 ];
 
 #[derive(Debug, Serialize)]
@@ -40,34 +37,37 @@ pub struct ConfigPatchResponse {
     pub config_path: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ConfigPatchCoordinator {
+    inner: Arc<Mutex<()>>,
+}
+
+impl ConfigPatchCoordinator {
+    async fn apply(&self, path: &Path, patch: Value) -> Result<(), ApiError> {
+        let _guard = self.inner.lock().await;
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || apply_config_patch(&path, patch))
+            .await
+            .map_err(|error| ApiError::Runtime(format!("failed to join config writer: {error}")))?
+    }
+}
+
 pub async fn patch_config(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(patch): Json<Value>,
+    auth: ApiRequestContext,
+    ApiJson(patch): ApiJson<Value>,
 ) -> ApiResult<ConfigPatchResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::CONFIG_ADMIN)?;
+    auth.require_scope(scopes::CONFIG_ADMIN)?;
     if !patch.is_object() {
         return Err(ApiError::BadRequest(
             "config patch must be a JSON object".to_string(),
         ));
     }
     reject_forbidden_paths(&patch)?;
-
-    let mut document = serde_json::to_value(state.config.as_ref())
-        .map_err(|error| ApiError::Runtime(format!("failed to serialize config: {error}")))?;
-    merge_json(&mut document, patch);
-    let config: Config = serde_json::from_value(document)
-        .map_err(|error| ApiError::BadRequest(format!("invalid config patch: {error}")))?;
-    validate_config(&config).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-
-    let yaml = serde_yaml::to_string(&config)
-        .map_err(|error| ApiError::Runtime(format!("failed to encode config: {error}")))?;
-    let config_path = state.config_path.clone();
-    tokio::task::spawn_blocking(move || atomic_replace_config(&config_path, yaml.as_bytes()))
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to join config writer: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to write config: {error}")))?;
+    state
+        .config_patches
+        .apply(&state.config_path, patch)
+        .await?;
 
     tracing::info!(
         event = "audit config_patch_applied",
@@ -75,11 +75,26 @@ pub async fn patch_config(
         "config patch written; daemon restart required"
     );
 
-    Ok(Json(ConfigPatchResponse {
+    Ok(ApiResponse::ok(ConfigPatchResponse {
         applied: true,
         restart_required: true,
         config_path: state.config_path.display().to_string(),
     }))
+}
+
+fn apply_config_patch(path: &Path, patch: Value) -> Result<(), ApiError> {
+    let current = load_config(path)
+        .map_err(|error| ApiError::Runtime(format!("failed to load current config: {error}")))?;
+    let mut document = serde_json::to_value(current)
+        .map_err(|error| ApiError::Runtime(format!("failed to serialize config: {error}")))?;
+    merge_json(&mut document, patch);
+    let config: Config = serde_json::from_value(document)
+        .map_err(|error| ApiError::BadRequest(format!("invalid config patch: {error}")))?;
+    validate_config(&config).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let yaml = serde_yaml::to_string(&config)
+        .map_err(|error| ApiError::Runtime(format!("failed to encode config: {error}")))?;
+    atomic_replace_config(path, yaml.as_bytes())
+        .map_err(|error| ApiError::Runtime(format!("failed to write config: {error}")))
 }
 
 fn atomic_replace_config(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
@@ -246,17 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_security_boundary_patches() {
-        for patch in [
-            serde_json::json!({ "security": { "allow_insecure_public_listeners": true } }),
-            serde_json::json!({ "security": { "allow_private_remote_imports": true } }),
-            serde_json::json!({ "security": { "remote_import_allowed_hosts": ["internal"] } }),
-        ] {
-            assert!(reject_forbidden_paths(&patch).is_err());
-        }
-    }
-
-    #[test]
     fn rejects_fuse_helper_executable_patch() {
         let patch = serde_json::json!({
             "disk": {
@@ -266,6 +270,16 @@ mod tests {
         });
 
         assert!(reject_forbidden_paths(&patch).is_err());
+    }
+
+    #[test]
+    fn rejects_runtime_path_patch() {
+        assert!(
+            reject_forbidden_paths(&serde_json::json!({
+                "paths": { "data": "/tmp/attacker" }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -292,5 +306,37 @@ mod tests {
 
         assert!(atomic_replace_config(&config, b"replacement").is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "secret");
+    }
+
+    #[test]
+    fn sequential_patches_merge_against_the_latest_disk_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yml");
+        std::fs::write(
+            &path,
+            r#"
+remote: https://panel.example.com
+uuid: node-uuid
+token_id: token-id
+token: test-api-token-0123456789abcdef-01
+jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
+api:
+  host: 127.0.0.1
+  port: 8090
+paths:
+  data: /var/lib/databases-everywhere
+  sockets: /run/databases-everywhere
+  logs: /var/log/databases-everywhere
+  artifacts: /var/lib/databases-everywhere/artifacts
+"#,
+        )
+        .unwrap();
+
+        apply_config_patch(&path, serde_json::json!({"api": {"port": 9090}})).unwrap();
+        apply_config_patch(&path, serde_json::json!({"debug": true})).unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.api.port, 9090);
+        assert!(config.debug);
     }
 }

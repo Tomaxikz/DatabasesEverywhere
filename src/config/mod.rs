@@ -1,11 +1,12 @@
 pub mod load;
+pub mod path_policy;
 pub mod validate;
 
 use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{defaults, docker, ports};
+use crate::constants::{defaults, ports};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -152,6 +153,7 @@ impl Default for ListenerConfig {
 pub struct ApiConfig {
     pub host: String,
     pub port: u16,
+    pub trusted_hosts: Vec<String>,
     pub ssl: ApiSslConfig,
 }
 
@@ -160,6 +162,7 @@ impl Default for ApiConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: ports::API,
+            trusted_hosts: Vec::new(),
             ssl: ApiSslConfig::default(),
         }
     }
@@ -169,6 +172,17 @@ impl Config {
     pub fn cors_allowed_hosts(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         push_url_host(&mut hosts, &self.remote);
+        hosts
+    }
+
+    pub fn request_allowed_hosts(&self) -> Vec<String> {
+        let mut hosts = self.cors_allowed_hosts();
+        for host in &self.api.trusted_hosts {
+            push_unique(&mut hosts, host.trim());
+        }
+        if !matches!(self.api.host.trim(), "0.0.0.0" | "::" | "[::]") {
+            push_unique(&mut hosts, self.api.host.trim());
+        }
         hosts
     }
 
@@ -237,9 +251,6 @@ pub struct SecurityConfig {
     pub api_body_limit_bytes: usize,
     pub api_rate_limit_per_minute: u32,
     pub db_connection_limit_per_minute: u32,
-    pub allow_insecure_public_listeners: bool,
-    pub allow_private_remote_imports: bool,
-    pub remote_import_allowed_hosts: Vec<String>,
     pub self_upgrade_enabled: bool,
     pub pids_limit: i64,
     pub pids_limits: PidsLimitConfig,
@@ -251,9 +262,6 @@ impl Default for SecurityConfig {
             api_body_limit_bytes: 1024 * 1024,
             api_rate_limit_per_minute: 600,
             db_connection_limit_per_minute: 240,
-            allow_insecure_public_listeners: false,
-            allow_private_remote_imports: false,
-            remote_import_allowed_hosts: Vec::new(),
             self_upgrade_enabled: false,
             pids_limit: 512,
             pids_limits: PidsLimitConfig::default(),
@@ -328,10 +336,6 @@ impl Default for BackupConfig {
 pub struct DaemonConfig {
     pub engine: DaemonEngine,
     pub socket_path: String,
-    pub network: String,
-    pub internal_network: bool,
-    pub ipam: DaemonNetworkIpam,
-    pub allow_public_backend_ports: bool,
     pub container_read_only_rootfs: bool,
     pub container_userns_mode: String,
     pub container_seccomp_profile: String,
@@ -344,10 +348,6 @@ impl Default for DaemonConfig {
         Self {
             engine: DaemonEngine::Docker,
             socket_path: String::new(),
-            network: docker::DEFAULT_NETWORK.to_string(),
-            internal_network: true,
-            ipam: DaemonNetworkIpam::default(),
-            allow_public_backend_ports: false,
             container_read_only_rootfs: false,
             container_userns_mode: String::new(),
             container_seccomp_profile: String::new(),
@@ -383,13 +383,6 @@ impl DaemonEngine {
             Self::Podman => "podman",
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct DaemonNetworkIpam {
-    pub subnet: String,
-    pub gateway: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

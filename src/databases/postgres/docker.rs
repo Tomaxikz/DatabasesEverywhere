@@ -35,8 +35,6 @@ pub fn instance_spec(
         memory_mib: 1024,
         disk_mib: 10240,
         pids_limit: None,
-        container_port: Protocol::Postgres.default_container_port(),
-        public_backend_port: None,
         data_path,
         data_target: "/var/lib/postgresql".to_string(),
         logs_path,
@@ -46,6 +44,7 @@ pub fn instance_spec(
             target: "/var/run/postgresql".to_string(),
             read_only: false,
         }],
+        socket_bridges: Vec::new(),
         env: vec![
             DockerEnv {
                 key: "POSTGRES_DB".to_string(),
@@ -68,7 +67,11 @@ pub fn instance_spec(
                 value: password,
             },
         ],
-        command: Vec::new(),
+        command: vec![
+            "postgres".to_string(),
+            "-c".to_string(),
+            "listen_addresses=".to_string(),
+        ],
     }
 }
 
@@ -92,14 +95,14 @@ mod tests {
         );
 
         assert_eq!(spec.data_target, "/var/lib/postgresql");
-        assert_eq!(spec.container_port, 5432);
-        assert_eq!(spec.public_backend_port, None);
         assert_eq!(spec.extra_mounts[0].target, "/var/run/postgresql");
+        assert_eq!(spec.command, ["postgres", "-c", "listen_addresses="]);
         assert_eq!(env_value(&spec, "POSTGRES_USER"), INTERNAL_ADMIN_USERNAME);
         assert_eq!(env_value(&spec, "POSTGRES_DB"), "pg_1");
         assert_eq!(env_value(&spec, "DBE_POSTGRES_USER"), "app_pg_1");
         assert_eq!(env_value(&spec, "DBE_POSTGRES_PASSWORD"), "secret");
         assert_ne!(env_value(&spec, "POSTGRES_PASSWORD"), "secret");
+        assert!(spec.socket_bridges.is_empty());
     }
 
     fn env_value<'a>(spec: &'a DockerInstanceSpec, key: &str) -> &'a str {

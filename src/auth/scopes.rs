@@ -3,7 +3,6 @@ pub const ALL: &str = "*";
 pub const SYSTEM_READ: &str = "system:read";
 pub const INSTANCES_READ: &str = "instances:read";
 pub const INSTANCES_WRITE: &str = "instances:write";
-pub const INSTANCES_ADMIN: &str = "instances:admin";
 pub const RESOURCES_READ: &str = "resources:read";
 pub const RESOURCES_ADMIN: &str = "resources:admin";
 pub const LOGS_READ: &str = "logs:read";
@@ -27,7 +26,6 @@ pub const KNOWN: &[&str] = &[
     SYSTEM_READ,
     INSTANCES_READ,
     INSTANCES_WRITE,
-    INSTANCES_ADMIN,
     RESOURCES_READ,
     RESOURCES_ADMIN,
     LOGS_READ,

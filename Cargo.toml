@@ -12,7 +12,7 @@ anyhow = "1.0.103"
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
-bzip2 = "0.4"
+bzip2 = { version = "0.4", features = ["static"] }
 bollard = "0.21.0"
 bson = "2.13"
 bytes = "1.6"
@@ -55,6 +55,7 @@ zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3.10"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

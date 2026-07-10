@@ -1,16 +1,19 @@
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::IpAddr,
     path::{Component, Path as FsPath, PathBuf},
     time::{Duration, Instant},
 };
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{
+            ApiError, ApiJson, ApiOptionalJson, ApiPath, ApiQuery, ApiResponse, ApiResult,
+        },
         instances::{LifecycleAction, lifecycle_instance_locked},
+        public_diagnostic::PublicDiagnostic,
         routes::AppState,
+        security_policy::ApiRequestContext,
     },
     auth::scopes,
     instances::{
@@ -21,32 +24,22 @@ use crate::{
         ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
         JobAdmissionError, create_data_archive, extract_data_archive,
     },
-    shared::{
-        files::is_safe_flat_file_name, network::is_private_or_sensitive_ip, protocol::Protocol,
-        shell::sh_quote,
-    },
+    shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
 };
-use axum::{
-    Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, Uri},
-};
-use secrecy::{ExposeSecret, SecretString};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_ARCHIVE_DEPTH: usize = 32;
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
-const REMOTE_IMPORT_TIMEOUT_SECONDS: u64 = 15 * 60;
 const MAX_SELECTION_ITEMS: usize = 512;
 const MAX_SELECTION_FIELDS_PER_ITEM: usize = 512;
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExportRequest {
     pub selection: Option<ImportExportSelection>,
-    #[serde(default)]
-    pub archive: Option<bool>,
     #[serde(default)]
     pub archive_format: Option<String>,
 }
@@ -65,32 +58,8 @@ pub enum ImportSource {
     Artifact {
         artifact_id: String,
         #[serde(default)]
-        unarchive: Option<bool>,
-        #[serde(default)]
         archive_format: Option<String>,
     },
-    Remote(RemoteImportSource),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RemoteImportSource {
-    pub protocol: Protocol,
-    pub host: String,
-    pub port: u16,
-    #[serde(default)]
-    pub database: Option<String>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<SecretString>,
-    #[serde(default = "default_remote_tls")]
-    pub tls: bool,
-    #[serde(skip)]
-    tls_server_name: Option<String>,
-}
-
-fn default_remote_tls() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -102,7 +71,7 @@ pub enum SelectionMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ImportExportSelection {
     pub mode: SelectionMode,
     pub include: Vec<String>,
@@ -112,7 +81,6 @@ pub struct ImportExportSelection {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ImportOptions {
-    unarchive: bool,
     archive_format: Option<String>,
     source: ImportSourceOptions,
     selection: ImportExportSelection,
@@ -133,19 +101,19 @@ pub(crate) enum ExportArchiveFormat {
 }
 
 impl ExportArchiveFormat {
-    fn detect(archive: Option<bool>, format: Option<&str>) -> Result<Self, ApiError> {
-        if archive != Some(true) && format.is_none() {
+    fn detect(format: Option<&str>) -> Result<Self, ApiError> {
+        if format.is_none() {
             return Ok(Self::Plain);
         }
         match format
-            .unwrap_or("gzip")
+            .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
             .as_str()
         {
-            "plain" | "none" => Ok(Self::Plain),
-            "gz" | "gzip" => Ok(Self::Gzip),
-            "bz" | "bz2" | "bzip" | "bzip2" => Ok(Self::Bzip2),
+            "plain" => Ok(Self::Plain),
+            "gzip" => Ok(Self::Gzip),
+            "bzip2" => Ok(Self::Bzip2),
             other => Err(ApiError::BadRequest(format!(
                 "unsupported export archive_format {other}; use plain, gzip, or bzip2"
             ))),
@@ -164,7 +132,6 @@ impl ExportArchiveFormat {
 #[derive(Debug, Clone)]
 pub(crate) enum ImportSourceOptions {
     Artifact(PathBuf),
-    Remote(RemoteImportSource),
 }
 
 impl Default for ImportSourceOptions {
@@ -185,28 +152,20 @@ impl ImportOptions {
 impl From<&ImportRequest> for ImportOptions {
     fn from(request: &ImportRequest) -> Self {
         let selection = request.selection.clone().unwrap_or_default();
-        match &request.source {
-            ImportSource::Artifact {
-                artifact_id,
-                unarchive,
-                archive_format,
-            } => Self {
-                unarchive: unarchive.unwrap_or(false),
-                archive_format: archive_format.clone(),
-                source: ImportSourceOptions::Artifact(PathBuf::from(artifact_id)),
-                selection,
-            },
-            ImportSource::Remote(remote) => Self {
-                unarchive: false,
-                archive_format: None,
-                source: ImportSourceOptions::Remote(remote.clone()),
-                selection,
-            },
+        let ImportSource::Artifact {
+            artifact_id,
+            archive_format,
+        } = &request.source;
+        Self {
+            archive_format: archive_format.clone(),
+            source: ImportSourceOptions::Artifact(PathBuf::from(artifact_id)),
+            selection,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobListQuery {
     pub status: Option<String>,
     pub limit: Option<u32>,
@@ -220,27 +179,24 @@ pub struct ImportExportJobResponse {
     pub status: ImportExportStatus,
     pub artifact_id: Option<String>,
     pub artifact_size_bytes: Option<u64>,
-    pub error: Option<String>,
+    pub error: Option<PublicDiagnostic>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 pub async fn export_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    request: Option<Json<ExportRequest>>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiOptionalJson(request): ApiOptionalJson<ExportRequest>,
 ) -> ApiResult<ImportExportJobResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_WRITE)?;
+    auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
     let selection = request
         .as_ref()
-        .and_then(|Json(request)| request.selection.clone())
+        .and_then(|request| request.selection.clone())
         .unwrap_or_default();
     let archive_format = match request.as_ref() {
-        Some(Json(request)) => {
-            ExportArchiveFormat::detect(request.archive, request.archive_format.as_deref())?
-        }
+        Some(request) => ExportArchiveFormat::detect(request.archive_format.as_deref())?,
         None => ExportArchiveFormat::Plain,
     };
     queue_export_instance_with_options(
@@ -312,6 +268,14 @@ pub(crate) async fn queue_export_instance_with_options(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant)
+        && options.archive_format != ExportArchiveFormat::Plain
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{} exports are already physical archives; omit archive_format",
+            metadata.protocol.as_str()
+        )));
+    }
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Export)?;
     let artifact_path = export_artifact_path(
         state,
@@ -338,17 +302,16 @@ pub(crate) async fn queue_export_instance_with_options(
     ));
 
     audit_import_export(&job, "queued");
-    Ok(Json(public_job_response(job).await))
+    Ok(accepted_job_response(job).await)
 }
 
 pub async fn import_instance(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<ImportRequest>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiJson(request): ApiJson<ImportRequest>,
 ) -> ApiResult<ImportExportJobResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_WRITE)?;
+    auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
     queue_import_instance(&state, &instance_id, ImportOptions::from(&request)).await
 }
 
@@ -365,17 +328,13 @@ pub(crate) async fn queue_import_instance(
     let options =
         harden_import_options(state, &metadata.instance_id, metadata.protocol, options).await?;
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Import)?;
-    let artifact_path = match &options.source {
-        ImportSourceOptions::Artifact(path) => Some(path.clone()),
-        ImportSourceOptions::Remote(_) => None,
-    };
+    let ImportSourceOptions::Artifact(artifact_path) = &options.source;
+    let artifact_path = artifact_path.clone();
     let (job, admission) = enqueue_job(
         state,
         metadata.instance_id.clone(),
         ImportExportAction::Import,
-        artifact_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
+        Some(artifact_path.display().to_string()),
     )
     .await?;
 
@@ -388,16 +347,15 @@ pub(crate) async fn queue_import_instance(
     ));
 
     audit_import_export(&job, "queued");
-    Ok(Json(public_job_response(job).await))
+    Ok(accepted_job_response(job).await)
 }
 
 pub async fn get_import_export_job(
     State(state): State<AppState>,
-    Path((instance_id, job_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, job_id)): ApiPath<(String, String)>,
 ) -> ApiResult<ImportExportJobResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_READ)?;
+    auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
     state
         .instances
         .get(&instance_id)
@@ -412,17 +370,16 @@ pub async fn get_import_export_job(
     if job.instance_id != instance_id {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(public_job_response(job).await))
+    Ok(ApiResponse::ok(public_job_response(job).await))
 }
 
 pub async fn list_import_export_jobs(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    Query(query): Query<JobListQuery>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<JobListQuery>,
 ) -> ApiResult<Vec<ImportExportJobResponse>> {
-    authorize_scope(&state, &headers, &uri, scopes::IMPORT_EXPORT_READ)?;
+    auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
     state
         .instances
         .get(&instance_id)
@@ -443,7 +400,16 @@ pub async fn list_import_export_jobs(
     for job in jobs {
         response.push(public_job_response(job).await);
     }
-    Ok(Json(response))
+    Ok(ApiResponse::ok(response))
+}
+
+async fn accepted_job_response(job: ImportExportJob) -> ApiResponse<ImportExportJobResponse> {
+    let response = public_job_response(job).await;
+    let location = format!(
+        "/api/instances/{}/import-export/jobs/{}",
+        response.instance_id, response.job_id
+    );
+    ApiResponse::accepted_at(response, location)
 }
 
 async fn enqueue_job(
@@ -511,24 +477,25 @@ async fn run_import_job(
     if !begin_import_export_job(&state, &job_id).await {
         return;
     }
-    let artifact_path = match &options.source {
-        ImportSourceOptions::Artifact(path) => Some(path.clone()),
-        ImportSourceOptions::Remote(_) => None,
-    };
+    let ImportSourceOptions::Artifact(artifact_path) = &options.source;
+    let artifact_path = artifact_path.clone();
     let result = import_instance_source(&state, &instance_id, &options).await;
-    update_job_result(&state, &job_id, result, artifact_path).await;
+    update_job_result(&state, &job_id, result, Some(artifact_path)).await;
 }
 
 async fn begin_import_export_job(state: &AppState, job_id: &str) -> bool {
     if !state.import_export_jobs.is_accepting() {
-        let error_message = "daemon shutdown began before the queued job started";
+        let diagnostic = PublicDiagnostic::public(
+            "shutdown",
+            "daemon shutdown began before the queued job started",
+        );
         if let Err(error) = state
             .import_export_jobs
             .update_status(
                 job_id,
                 ImportExportStatus::Failed,
                 None,
-                Some(error_message.to_string()),
+                Some(diagnostic.to_storage_string()),
             )
             .await
         {
@@ -571,13 +538,14 @@ async fn update_job_result(
         }
         Err(error) => {
             tracing::warn!(%job_id, %error, "audit import_export_job_failed");
+            let diagnostic = PublicDiagnostic::from_api_error("import/export operation", &error);
             if let Err(storage_error) = state
                 .import_export_jobs
                 .update_status(
                     job_id,
                     ImportExportStatus::Failed,
                     artifact_path.map(|path| path.display().to_string()),
-                    Some(error.to_string()),
+                    Some(diagnostic.to_storage_string()),
                 )
                 .await
             {
@@ -623,14 +591,8 @@ async fn import_instance_source(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    match &options.source {
-        ImportSourceOptions::Artifact(path) => {
-            import_instance_artifact(state, instance_id, &metadata, path, options).await
-        }
-        ImportSourceOptions::Remote(remote) => {
-            import_remote_source(state, instance_id, &metadata, remote, &options.selection).await
-        }
-    }
+    let ImportSourceOptions::Artifact(path) = &options.source;
+    import_instance_artifact(state, instance_id, &metadata, path, options).await
 }
 
 async fn import_instance_artifact(
@@ -811,13 +773,13 @@ async fn prepare_logical_import_artifact(
     staging_root: &FsPath,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
-    if !options.unarchive {
+    let Some(requested_format) = options.archive_format.as_deref() else {
         ensure_import_file_size(artifact_path).await?;
         copy_file(artifact_path, host_temp).await?;
         return Ok(());
-    }
+    };
 
-    let format = ImportArchiveFormat::detect(artifact_path, options.archive_format.as_deref())?;
+    let format = ImportArchiveFormat::parse(requested_format)?;
     match format {
         ImportArchiveFormat::Plain => {
             ensure_import_file_size(artifact_path).await?;
@@ -1156,42 +1118,13 @@ enum ImportArchiveFormat {
 }
 
 impl ImportArchiveFormat {
-    fn detect(path: &FsPath, requested: Option<&str>) -> Result<Self, ApiError> {
-        if let Some(requested) = requested {
-            return Self::parse(requested);
-        }
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
-            Ok(Self::TarGzip)
-        } else if filename.ends_with(".tar") {
-            Ok(Self::Tar)
-        } else if filename.ends_with(".zip") {
-            Ok(Self::Zip)
-        } else if filename.ends_with(".rar") {
-            Ok(Self::Rar)
-        } else if filename.ends_with(".bz2")
-            || filename.ends_with(".bzip2")
-            || filename.ends_with(".gzip2")
-        {
-            Ok(Self::Bzip2)
-        } else if filename.ends_with(".gz") || filename.ends_with(".gzip") {
-            Ok(Self::Gzip)
-        } else {
-            Ok(Self::Plain)
-        }
-    }
-
     fn parse(value: &str) -> Result<Self, ApiError> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "plain" | "none" | "raw" => Ok(Self::Plain),
-            "gz" | "gzip" => Ok(Self::Gzip),
-            "bz" | "bz2" | "bzip" | "bzip2" | "gzip2" => Ok(Self::Bzip2),
+            "plain" => Ok(Self::Plain),
+            "gzip" => Ok(Self::Gzip),
+            "bzip2" => Ok(Self::Bzip2),
             "tar" => Ok(Self::Tar),
-            "tar.gz" | "tgz" | "targz" => Ok(Self::TarGzip),
+            "tar.gz" => Ok(Self::TarGzip),
             "zip" => Ok(Self::Zip),
             "rar" => Ok(Self::Rar),
             other => Err(ApiError::BadRequest(format!(
@@ -1202,58 +1135,22 @@ impl ImportArchiveFormat {
 }
 
 async fn validate_import_source(
-    state: &AppState,
+    _state: &AppState,
     target_protocol: Protocol,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
-    match &options.source {
-        ImportSourceOptions::Artifact(path) => {
-            if path.as_os_str().is_empty() {
-                return Err(ApiError::BadRequest(
-                    "artifact import requires source.artifact_id".to_string(),
-                ));
-            }
-            Ok(())
-        }
-        ImportSourceOptions::Remote(remote) => {
-            if remote.protocol != target_protocol {
-                return Err(ApiError::BadRequest(format!(
-                    "remote protocol {} does not match target instance protocol {}",
-                    remote.protocol, target_protocol
-                )));
-            }
-            if matches!(target_protocol, Protocol::Redis | Protocol::Qdrant) {
-                return Err(ApiError::NotImplemented(format!(
-                    "{} remote credential import is not implemented yet",
-                    target_protocol.as_str()
-                )));
-            }
-            required_remote_database(remote)?;
-            required_remote_username(remote)?;
-            required_remote_password(remote)?;
-            if !remote.tls && !state.config.security.allow_insecure_public_listeners {
-                return Err(ApiError::BadRequest(
-                    "remote imports require TLS; tls=false is allowed only when security.allow_insecure_public_listeners=true for isolated development"
-                        .to_string(),
-                ));
-            }
-            validate_remote_tls_pinning(target_protocol, remote)?;
-            resolve_validated_remote_host(state, remote)
-                .await
-                .map(|_| ())
-        }
+    let ImportSourceOptions::Artifact(path) = &options.source;
+    if path.as_os_str().is_empty() {
+        return Err(ApiError::BadRequest(
+            "artifact import requires source.artifact_id".to_string(),
+        ));
     }
-}
-
-fn validate_remote_tls_pinning(
-    protocol: Protocol,
-    remote: &RemoteImportSource,
-) -> Result<(), ApiError> {
-    let uses_hostname = remote.host.trim().parse::<IpAddr>().is_err();
-    if remote.tls && uses_hostname && protocol != Protocol::Postgres {
+    if matches!(target_protocol, Protocol::Redis | Protocol::Qdrant)
+        && options.archive_format.is_some()
+    {
         return Err(ApiError::BadRequest(format!(
-            "{} remote import cannot safely combine DNS pinning with TLS hostname verification; use an IP literal whose certificate contains that IP address, or use PostgreSQL which supports a separate pinned address and certificate hostname",
-            protocol.as_str()
+            "{} imports consume their physical archive directly; omit archive_format",
+            target_protocol.as_str()
         )));
     }
     Ok(())
@@ -1266,332 +1163,9 @@ async fn harden_import_options(
     mut options: ImportOptions,
 ) -> Result<ImportOptions, ApiError> {
     validate_import_source(state, target_protocol, &options).await?;
-    match &mut options.source {
-        ImportSourceOptions::Artifact(path) => {
-            *path = validate_artifact_path(state, instance_id, path).await?;
-        }
-        ImportSourceOptions::Remote(remote) => {
-            let resolved_host = resolve_validated_remote_host(state, remote).await?;
-            remote.tls_server_name = remote.tls.then(|| remote.host.clone());
-            remote.host = resolved_host;
-        }
-    }
+    let ImportSourceOptions::Artifact(path) = &mut options.source;
+    *path = validate_artifact_path(state, instance_id, path).await?;
     Ok(options)
-}
-
-async fn resolve_validated_remote_host(
-    state: &AppState,
-    remote: &RemoteImportSource,
-) -> Result<String, ApiError> {
-    if remote.port == 0 {
-        return Err(ApiError::BadRequest(
-            "remote import port must be greater than zero".to_string(),
-        ));
-    }
-    let host = remote.host.trim();
-    if host.is_empty()
-        || host.contains('/')
-        || host.contains('\\')
-        || host.contains('@')
-        || host.contains(':') && host.parse::<IpAddr>().is_err()
-    {
-        return Err(ApiError::BadRequest(
-            "remote import host must be a hostname or IP address".to_string(),
-        ));
-    }
-
-    let host_is_allowlisted = state
-        .config
-        .security
-        .remote_import_allowed_hosts
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(host));
-
-    let addresses = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::lookup_host((host, remote.port)),
-    )
-    .await
-    .map_err(|_| ApiError::BadRequest("remote host resolution timed out".to_string()))?
-    .map_err(|error| ApiError::BadRequest(format!("failed to resolve remote host: {error}")))?;
-    let mut saw_address = false;
-    let mut selected_ip = None;
-    for address in addresses {
-        saw_address = true;
-        if !host_is_allowlisted
-            && !state.config.security.allow_private_remote_imports
-            && is_private_or_sensitive_ip(address.ip())
-        {
-            return Err(ApiError::BadRequest(format!(
-                "remote import host resolves to blocked address {}; add it to security.remote_import_allowed_hosts or enable allow_private_remote_imports",
-                address.ip()
-            )));
-        }
-        selected_ip.get_or_insert(address.ip());
-    }
-    if !saw_address {
-        return Err(ApiError::BadRequest(
-            "remote import host did not resolve to any address".to_string(),
-        ));
-    }
-    selected_ip.map(|ip| ip.to_string()).ok_or_else(|| {
-        ApiError::BadRequest("remote import host did not resolve to any address".to_string())
-    })
-}
-
-async fn import_remote_source(
-    state: &AppState,
-    instance_id: &str,
-    metadata: &InstanceMetadata,
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<(), ApiError> {
-    let protocol = metadata.protocol;
-    if state.config.daemon.internal_network {
-        return Err(ApiError::BadRequest(
-            "remote credential import is disabled while daemon.internal_network is true because database containers have no outbound network access".to_string(),
-        ));
-    }
-    if matches!(protocol, Protocol::Redis | Protocol::Qdrant) {
-        return Err(ApiError::NotImplemented(format!(
-            "{} remote credential import is not implemented yet",
-            protocol.as_str()
-        )));
-    }
-    let script = remote_import_script(metadata, remote, selection)?;
-    let script = format!(
-        "timeout --signal=KILL {REMOTE_IMPORT_TIMEOUT_SECONDS} sh -c {}",
-        sh_quote(&script)
-    );
-    state
-        .docker
-        .exec_shell(protocol, instance_id, &script)
-        .await
-        .map_err(|error| ApiError::Runtime(redact_remote_error(error.to_string(), remote)))?;
-    Ok(())
-}
-
-fn redact_remote_error(mut error: String, remote: &RemoteImportSource) -> String {
-    if let Some(password) = &remote.password {
-        error = error.replace(password.expose_secret(), "[redacted]");
-    }
-    error
-}
-
-fn remote_import_script(
-    metadata: &InstanceMetadata,
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    let protocol = metadata.protocol;
-    match protocol {
-        Protocol::Postgres => remote_postgres_import_script(remote, selection),
-        Protocol::Mariadb => remote_mariadb_import_script(remote, selection),
-        Protocol::Mongodb => remote_mongodb_import_script(metadata, remote, selection),
-        Protocol::Clickhouse => remote_clickhouse_import_script(remote, selection),
-        Protocol::Redis | Protocol::Qdrant => Err(ApiError::NotImplemented(format!(
-            "{} remote credential import is not implemented yet",
-            protocol.as_str()
-        ))),
-    }
-}
-
-fn remote_postgres_import_script(
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    let database = required_remote_database(remote)?;
-    let username = required_remote_username(remote)?;
-    let password = required_remote_password(remote)?;
-    let filters = postgres_dump_selection_args(selection)?;
-    let sslmode = if remote.tls { "verify-full" } else { "disable" };
-    let tls_server_name = remote
-        .tls_server_name
-        .as_deref()
-        .unwrap_or(remote.host.as_str());
-    let ssl_root_cert = if remote.tls {
-        "PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt "
-    } else {
-        ""
-    };
-    Ok(format!(
-        r#"set -eu
-PGPASSWORD={remote_password} \
-PGHOST={tls_server_name} \
-PGHOSTADDR={remote_host} \
-PGPORT={remote_port} \
-PGUSER={remote_user} \
-PGDATABASE={remote_database} \
-PGSSLMODE={sslmode} \
-{ssl_root_cert}pg_dump \
-  --clean --if-exists --no-owner --no-privileges{filters} \
-| PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
-  -h 127.0.0.1 \
-  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
-  -d "$POSTGRES_DB" \
-  -v ON_ERROR_STOP=1
-"#,
-        remote_password = sh_quote(password.expose_secret()),
-        sslmode = sh_quote(sslmode),
-        remote_host = sh_quote(&remote.host),
-        tls_server_name = sh_quote(tls_server_name),
-        remote_port = remote.port,
-        remote_user = sh_quote(username),
-        remote_database = sh_quote(database),
-        ssl_root_cert = ssl_root_cert,
-        filters = filters,
-    ))
-}
-
-fn remote_mariadb_import_script(
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    let database = required_remote_database(remote)?;
-    let username = required_remote_username(remote)?;
-    let password = required_remote_password(remote)?;
-    let filters = mariadb_dump_selection_args(selection, database)?;
-    let ssl = if remote.tls {
-        " --ssl --ssl-verify-server-cert --ssl-ca=/etc/ssl/certs/ca-certificates.crt"
-    } else {
-        " --skip-ssl"
-    };
-    Ok(format!(
-        r#"set -eu
-mariadb-dump \
-  -h {remote_host} \
-  -P {remote_port} \
-  -u {remote_user} \
-  -p{remote_password}{ssl} \
-  --single-transaction --routines --triggers{filters} \
-| mariadb \
-  -h 127.0.0.1 \
-  -u "$MARIADB_USER" \
-  -p"$MARIADB_PASSWORD" \
-  "$MARIADB_DATABASE"
-"#,
-        remote_host = sh_quote(&remote.host),
-        remote_port = remote.port,
-        remote_user = sh_quote(username),
-        remote_password = sh_quote(password.expose_secret()),
-        ssl = ssl,
-        filters = filters,
-    ))
-}
-
-fn remote_mongodb_import_script(
-    metadata: &InstanceMetadata,
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    ensure_mongodb_root_password(metadata)?;
-    let database = required_remote_database(remote)?;
-    let username = required_remote_username(remote)?;
-    let password = required_remote_password(remote)?;
-    let filters = mongodb_dump_selection_args(selection, database)?;
-    let remote_namespace = format!("{database}.*");
-    let tls = if remote.tls {
-        " --tls --tlsCAFile /etc/ssl/certs/ca-certificates.crt"
-    } else {
-        ""
-    };
-    Ok(format!(
-        r#"set -eu
-mongodump \
-  --host {remote_host} \
-  --port {remote_port} \
-  --username {remote_user} \
-  --password {remote_password} \
-  --authenticationDatabase {remote_database} \
-  --db {remote_database}{tls} \
-  {filters} \
-  --archive \
-  --gzip \
-| mongorestore \
-  --host 127.0.0.1 \
-  --username "$DBE_MONGO_ROOT_USER" \
-  --password "$DBE_MONGO_ROOT_PASSWORD" \
-  --authenticationDatabase "admin" \
-  --drop \
-  --nsFrom {remote_namespace} \
-  --nsTo "$DBE_MONGO_DATABASE.*" \
-  --archive \
-  --gzip
-"#,
-        remote_host = sh_quote(&remote.host),
-        remote_port = remote.port,
-        remote_user = sh_quote(username),
-        remote_password = sh_quote(password.expose_secret()),
-        remote_database = sh_quote(database),
-        remote_namespace = sh_quote(&remote_namespace),
-        tls = tls,
-        filters = filters,
-    ))
-}
-
-fn remote_clickhouse_import_script(
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    let database = required_remote_database(remote)?;
-    let username = required_remote_username(remote)?;
-    let password = required_remote_password(remote)?;
-    let secure = if remote.tls { " --secure" } else { "" };
-    let table_source = clickhouse_remote_table_source(remote, selection)?;
-    let column_expr = clickhouse_column_expr_function(selection)?;
-    Ok(format!(
-        r#"set -eu
-remote_host={remote_host}
-remote_port={remote_port}
-remote_user={remote_user}
-remote_password={remote_password}
-remote_database={remote_database}
-{table_source} | while IFS= read -r table; do
-  [ -n "$table" ] || continue
-  columns=$({column_expr})
-  if [ "$columns" = "*" ]; then
-    insert_query="INSERT INTO \`$table\` FORMAT Native"
-  else
-    insert_query="INSERT INTO \`$table\` ($columns) FORMAT Native"
-  fi
-  clickhouse-client \
-    --host "$remote_host" \
-    --port "$remote_port" \
-    --user "$remote_user" \
-    --password "$remote_password" \
-    --database "$remote_database"{secure} \
-    --query "SHOW CREATE TABLE \`$table\` FORMAT TabSeparatedRaw" \
-  | sed "s/CREATE TABLE /CREATE TABLE IF NOT EXISTS /" \
-  | clickhouse-client \
-    --host 127.0.0.1 \
-    --user "$CLICKHOUSE_USER" \
-    --password "$CLICKHOUSE_PASSWORD" \
-    --database "$CLICKHOUSE_DB" \
-    --multiquery
-  clickhouse-client \
-    --host "$remote_host" \
-    --port "$remote_port" \
-    --user "$remote_user" \
-    --password "$remote_password" \
-    --database "$remote_database"{secure} \
-    --query "SELECT $columns FROM \`$table\` FORMAT Native" \
-  | clickhouse-client \
-    --host 127.0.0.1 \
-    --user "$CLICKHOUSE_USER" \
-    --password "$CLICKHOUSE_PASSWORD" \
-    --database "$CLICKHOUSE_DB" \
-    --query "$insert_query"
-done
-"#,
-        remote_host = sh_quote(&remote.host),
-        remote_port = remote.port,
-        remote_user = sh_quote(username),
-        remote_password = sh_quote(password.expose_secret()),
-        remote_database = sh_quote(database),
-        table_source = table_source,
-        column_expr = column_expr,
-        secure = secure,
-    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1768,35 +1342,6 @@ fn postgres_dump_selection_args(selection: &ImportExportSelection) -> Result<Str
     Ok(args)
 }
 
-fn mariadb_dump_selection_args(
-    selection: &ImportExportSelection,
-    database: &str,
-) -> Result<String, ApiError> {
-    if selection.mode == SelectionMode::Full {
-        return Ok(format!(" {}", sh_quote(database)));
-    }
-    let mut args = String::new();
-    for item in &selection.exclude {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
-        args.push_str(" --ignore-table=");
-        args.push_str(&sh_quote(&format!("{database}.{table}")));
-    }
-    args.push(' ');
-    args.push_str(&sh_quote(database));
-    for item in &selection.include {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
-        args.push(' ');
-        args.push_str(&sh_quote(table));
-    }
-    Ok(args)
-}
-
 fn mariadb_local_dump_selection_args(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
@@ -1858,28 +1403,6 @@ fn clickhouse_table_source(selection: &ImportExportSelection) -> Result<String, 
     ))
 }
 
-fn clickhouse_remote_table_source(
-    remote: &RemoteImportSource,
-    selection: &ImportExportSelection,
-) -> Result<String, ApiError> {
-    if selection.mode == SelectionMode::Selective {
-        return Ok(format!(
-            "printf '%s\\n' {}",
-            sh_quote(&selection.include.join("\n"))
-        ));
-    }
-    let secure = if remote.tls { " --secure" } else { "" };
-    Ok(format!(
-        r#"clickhouse-client \
-  --host "$remote_host" \
-  --port "$remote_port" \
-  --user "$remote_user" \
-  --password "$remote_password" \
-  --database "$remote_database"{secure} \
-  --query "SHOW TABLES FORMAT TSV""#
-    ))
-}
-
 fn clickhouse_column_expr_function(selection: &ImportExportSelection) -> Result<String, ApiError> {
     if selection.fields.is_empty() {
         return Ok(r#"printf '*'"#.to_string());
@@ -1899,29 +1422,6 @@ fn clickhouse_column_expr_function(selection: &ImportExportSelection) -> Result<
     }
     cases.push_str("  *) printf '*' ;;\nesac");
     Ok(cases)
-}
-
-fn required_remote_database(remote: &RemoteImportSource) -> Result<&str, ApiError> {
-    remote
-        .database
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::BadRequest("remote import requires database".to_string()))
-}
-
-fn required_remote_username(remote: &RemoteImportSource) -> Result<&str, ApiError> {
-    remote
-        .username
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::BadRequest("remote import requires username".to_string()))
-}
-
-fn required_remote_password(remote: &RemoteImportSource) -> Result<&SecretString, ApiError> {
-    remote
-        .password
-        .as_ref()
-        .ok_or_else(|| ApiError::BadRequest("remote import requires password".to_string()))
 }
 
 fn ensure_mongodb_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
@@ -2431,7 +1931,10 @@ pub(crate) async fn public_job_response(job: ImportExportJob) -> ImportExportJob
         status: job.status,
         artifact_id,
         artifact_size_bytes,
-        error: job.error,
+        error: job
+            .error
+            .as_deref()
+            .map(|error| PublicDiagnostic::from_storage("import/export operation", error)),
         created_at: job.created_at,
         updated_at: job.updated_at,
     }
@@ -2681,6 +2184,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn public_job_response_redacts_legacy_internal_failure_text() {
+        let job = ImportExportJob {
+            job_id: "job-legacy".to_string(),
+            instance_id: "instance-1".to_string(),
+            action: ImportExportAction::Import,
+            status: ImportExportStatus::Failed,
+            artifact_path: None,
+            error: Some("password=hunter2 /var/lib/private".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let response = serde_json::to_string(&public_job_response(job).await).unwrap();
+        assert!(response.contains("internal_error"));
+        assert!(!response.contains("hunter2"));
+        assert!(!response.contains("/var/lib/private"));
+    }
+
     #[test]
     fn archive_copy_stops_at_expired_deadline() {
         let mut input = Cursor::new(b"contents".as_slice());
@@ -2859,54 +2381,18 @@ mod tests {
         assert!(artifacts.join("exports").join("instance-1").is_dir());
     }
 
-    #[tokio::test]
-    async fn rejects_remote_imports_resolving_to_private_ips_by_default() {
-        let state = test_state(false, Vec::new()).await;
-        let remote = remote_source("127.0.0.1");
-
-        let error = resolve_validated_remote_host(&state, &remote)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("blocked address"));
-    }
-
     #[test]
-    fn blocks_non_global_and_ipv4_embedded_remote_addresses() {
-        for address in [
-            "0.1.2.3",
-            "100.64.0.1",
-            "198.18.0.1",
-            "240.0.0.1",
-            "::ffff:127.0.0.1",
-            "::127.0.0.1",
-            "64:ff9b::127.0.0.1",
-            "2002:7f00:1::",
-        ] {
-            assert!(
-                is_private_or_sensitive_ip(address.parse().unwrap()),
-                "expected {address} to be blocked"
-            );
-        }
-        assert!(!is_private_or_sensitive_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_private_or_sensitive_ip(
-            "2606:4700:4700::1111".parse().unwrap()
-        ));
-    }
+    fn remote_import_source_type_is_rejected() {
+        let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
+            "source": {
+                "type": "remote",
+                "protocol": "postgres",
+                "host": "db.example.com",
+                "port": 5432
+            }
+        }));
 
-    #[test]
-    fn remote_import_tls_defaults_on_when_omitted() {
-        let remote: RemoteImportSource = serde_json::from_value(serde_json::json!({
-            "protocol": "postgres",
-            "host": "db.example.com",
-            "port": 5432,
-            "database": "app",
-            "username": "user",
-            "password": "secret"
-        }))
-        .unwrap();
-
-        assert!(remote.tls);
+        assert!(request.is_err());
     }
 
     #[test]
@@ -2924,118 +2410,22 @@ mod tests {
     }
 
     #[test]
-    fn hostname_tls_pinning_fails_closed_for_clients_without_separate_connect_address() {
-        for protocol in [Protocol::Mariadb, Protocol::Mongodb, Protocol::Clickhouse] {
-            let mut remote = remote_source("db.example.com");
-            remote.protocol = protocol;
-            remote.tls = true;
+    fn legacy_archive_flags_are_rejected_instead_of_ignored() {
+        let export = serde_json::from_value::<ExportRequest>(serde_json::json!({
+            "archive": true,
+            "archive_format": "gzip"
+        }));
+        assert!(export.is_err());
 
-            let error = validate_remote_tls_pinning(protocol, &remote).unwrap_err();
-
-            assert!(error.to_string().contains("TLS hostname verification"));
-        }
-
-        let mut postgres = remote_source("db.example.com");
-        postgres.tls = true;
-        validate_remote_tls_pinning(Protocol::Postgres, &postgres).unwrap();
-
-        let mut mariadb_ip = remote_source("203.0.113.10");
-        mariadb_ip.protocol = Protocol::Mariadb;
-        mariadb_ip.tls = true;
-        validate_remote_tls_pinning(Protocol::Mariadb, &mariadb_ip).unwrap();
-    }
-
-    #[tokio::test]
-    async fn remote_import_rejects_plaintext_without_development_override() {
-        let state = test_state(true, Vec::new()).await;
-        let options = ImportOptions {
-            source: ImportSourceOptions::Remote(remote_source("127.0.0.1")),
-            ..Default::default()
-        };
-
-        let error = harden_import_options(&state, "inst_test", Protocol::Postgres, options)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("remote imports require TLS"));
-    }
-
-    #[tokio::test]
-    async fn resolves_allowed_remote_host_to_ip_for_import_execution() {
-        let state = test_state(true, Vec::new()).await;
-        let remote = remote_source("localhost");
-
-        let host = resolve_validated_remote_host(&state, &remote)
-            .await
-            .unwrap();
-
-        assert!(host.parse::<IpAddr>().is_ok());
-        assert_ne!(host, "localhost");
-    }
-
-    #[tokio::test]
-    async fn pins_tls_remote_ip_and_preserves_certificate_server_name() {
-        let state = test_state(true, Vec::new()).await;
-        let mut remote = remote_source("localhost");
-        remote.tls = true;
-        let options = ImportOptions {
-            source: ImportSourceOptions::Remote(remote),
-            ..Default::default()
-        };
-
-        let options = harden_import_options(&state, "inst_test", Protocol::Postgres, options)
-            .await
-            .unwrap();
-
-        match options.source {
-            ImportSourceOptions::Remote(remote) => {
-                assert!(remote.host.parse::<IpAddr>().is_ok());
-                assert_eq!(remote.tls_server_name.as_deref(), Some("localhost"));
-                let script =
-                    remote_postgres_import_script(&remote, &ImportExportSelection::default())
-                        .unwrap();
-                assert!(script.contains("PGHOST='localhost'"));
-                assert!(script.contains("PGHOSTADDR='"));
-                assert!(script.contains("PGSSLMODE='verify-full'"));
-                assert!(script.contains("PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt"));
+        let import = serde_json::from_value::<ImportRequest>(serde_json::json!({
+            "source": {
+                "type": "artifact",
+                "artifact_id": "dump.postgres.sql.gz",
+                "unarchive": true,
+                "archive_format": "gzip"
             }
-            ImportSourceOptions::Artifact(_) => panic!("expected remote source"),
-        }
-    }
-
-    fn remote_source(host: &str) -> RemoteImportSource {
-        RemoteImportSource {
-            protocol: Protocol::Postgres,
-            host: host.to_string(),
-            port: 5432,
-            database: Some("app".to_string()),
-            username: Some("user".to_string()),
-            password: Some(SecretString::from("secret".to_string())),
-            tls: false,
-            tls_server_name: None,
-        }
-    }
-
-    async fn test_state(
-        allow_private_remote_imports: bool,
-        remote_import_allowed_hosts: Vec<String>,
-    ) -> AppState {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let store = InstanceStore::default();
-        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
-        test_state_with_store(
-            store,
-            manager,
-            Config {
-                security: crate::config::SecurityConfig {
-                    allow_private_remote_imports,
-                    remote_import_allowed_hosts,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
+        }));
+        assert!(import.is_err());
     }
 
     async fn test_state_with_config(config: Config) -> AppState {
@@ -3054,6 +2444,7 @@ mod tests {
         AppState {
             config: Arc::new(config),
             config_path: std::path::PathBuf::from("/tmp/dbev-test-config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
@@ -3065,6 +2456,7 @@ mod tests {
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             instance_locks: crate::instances::locks::InstanceLocks::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
         }
     }
 }

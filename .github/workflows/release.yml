@@ -136,7 +136,9 @@ jobs:
 
   build:
     name: Build dbev-x86_64-linux
-    runs-on: ubuntu-24.04
+    # Keep the release glibc baseline compatible with Debian bookworm (the
+    # runtime image) and other supported glibc 2.35+ hosts.
+    runs-on: ubuntu-22.04
     needs: security-audit
     permissions:
       contents: read
@@ -149,6 +151,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.95.0
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -158,6 +161,11 @@ jobs:
       - name: Build release binary
         run: |
           test "$(uname -m)" = "x86_64"
+          rustc --edition=2024 --target x86_64-unknown-linux-musl -D warnings \
+            -C opt-level=z -C strip=symbols -C panic=abort \
+            helpers/socket_bridge.rs -o /tmp/dbev-socket-bridge
+          expected="$(sha256sum /tmp/dbev-socket-bridge | awk '{print $1}')"
+          grep -Fq "$expected" build.rs
           cargo build --workspace --release --locked
 
       - name: Package binary

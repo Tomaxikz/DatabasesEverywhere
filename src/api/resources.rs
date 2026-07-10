@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::{Error as IoError, ErrorKind},
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
@@ -8,22 +9,16 @@ use std::{
     time::Duration,
 };
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{
-    sync::Mutex,
-    time::{Instant, timeout},
-};
+use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiPath, ApiResponse, ApiResult},
         routes::AppState,
+        security_policy::ApiRequestContext,
     },
     auth::scopes,
     config::Config,
@@ -41,6 +36,9 @@ use futures::{StreamExt, TryStreamExt};
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_DISK_SCAN_TIMEOUT: Duration = Duration::from_millis(750);
+const BACKGROUND_DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const DISK_SCAN_MAX_ENTRIES: usize = 1_000_000;
+const DISK_SCAN_MAX_DEPTH: usize = 128;
 const RESOURCE_FANOUT_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Default)]
@@ -112,10 +110,9 @@ pub struct NetworkReport {
 
 pub async fn list_resources(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<Vec<ResourceReport>> {
-    authorize_scope(&state, &headers, &uri, scopes::RESOURCES_ADMIN)?;
+    auth.require_scope(scopes::RESOURCES_ADMIN)?;
     let reports = futures::stream::iter(state.instances.list().await)
         .map(|metadata| {
             let state = state.clone();
@@ -124,22 +121,21 @@ pub async fn list_resources(
         .buffer_unordered(RESOURCE_FANOUT_LIMIT)
         .try_collect()
         .await?;
-    Ok(Json(reports))
+    Ok(ApiResponse::ok(reports))
 }
 
 pub async fn instance_resources(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<ResourceReport> {
-    authorize_scope(&state, &headers, &uri, scopes::RESOURCES_READ)?;
+    auth.require_scope(scopes::RESOURCES_READ)?;
     let metadata = state
         .instances
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(resource_report(&state, metadata).await?))
+    Ok(ApiResponse::ok(resource_report(&state, metadata).await?))
 }
 
 pub(crate) async fn resource_report(
@@ -201,8 +197,8 @@ pub(crate) async fn resource_report_with_docker_stats(
     Ok((report, stats.map(|stats| stats.raw)))
 }
 
-async fn directory_size(path: PathBuf) -> Result<u64, std::io::Error> {
-    tokio::task::spawn_blocking(move || directory_size_blocking(&path))
+async fn directory_size(path: PathBuf, budget: Duration) -> Result<u64, std::io::Error> {
+    tokio::task::spawn_blocking(move || directory_size_blocking(&path, budget))
         .await
         .map_err(std::io::Error::other)?
 }
@@ -299,8 +295,8 @@ impl ResourceCache {
             return Ok(sample);
         }
 
-        match timeout(INITIAL_DISK_SCAN_TIMEOUT, directory_size(path.clone())).await {
-            Ok(Ok(used_bytes)) => {
+        match directory_size(path.clone(), INITIAL_DISK_SCAN_TIMEOUT).await {
+            Ok(used_bytes) => {
                 let sample = CachedDiskUsage {
                     used_bytes,
                     sampled_at: Instant::now(),
@@ -308,18 +304,15 @@ impl ResourceCache {
                 self.store_disk_usage(instance_id.to_string(), sample).await;
                 Ok(sample)
             }
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => {
+            Err(error) if error.kind() == ErrorKind::TimedOut => {
                 self.refresh_disk_usage_background(
                     Arc::new(config.clone()),
                     instance_id.to_string(),
                     path,
                 );
-                Ok(CachedDiskUsage {
-                    used_bytes: 0,
-                    sampled_at: Instant::now(),
-                })
+                Err("disk usage scan is still in progress".to_string())
             }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -389,14 +382,14 @@ impl ResourceCache {
                     .await
                 {
                     Ok(Some(used_bytes)) => Ok(used_bytes),
-                    Ok(None) => directory_size(path).await,
+                    Ok(None) => directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await,
                     Err(error) => {
                         tracing::debug!(
                             %instance_id,
                             %error,
                             "quota disk usage unavailable during background refresh"
                         );
-                        directory_size(path).await
+                        directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await
                     }
                 };
             let mut inner = cache.inner.lock().await;
@@ -479,14 +472,14 @@ impl ResourceCache {
                 .await
             {
                 Ok(Some(used_bytes)) => Ok(used_bytes),
-                Ok(None) => directory_size(path).await,
+                Ok(None) => directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await,
                 Err(error) => {
                     tracing::debug!(
                         %instance_id,
                         %error,
                         "quota disk usage unavailable during sampler refresh"
                     );
-                    directory_size(path).await
+                    directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await
                 }
             };
 
@@ -536,21 +529,122 @@ impl Drop for ResourceMonitorGuard {
     }
 }
 
-fn directory_size_blocking(path: &FsPath) -> Result<u64, std::io::Error> {
-    let mut total = 0;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(0);
-    };
-    for entry in entries {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total += directory_size_blocking(&entry.path())?;
-        } else if metadata.is_file() {
-            total += metadata.len();
+fn directory_size_blocking(path: &FsPath, budget: Duration) -> Result<u64, std::io::Error> {
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, openat, statat};
+
+    let started = std::time::Instant::now();
+    let root = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(IoError::from)?;
+    let mut directories = vec![(root, 0_usize)];
+    let mut visited_entries = 0_usize;
+    let mut total = 0_u64;
+
+    while let Some((directory, depth)) = directories.pop() {
+        ensure_scan_budget(started, budget, visited_entries)?;
+        let entries = Dir::read_from(&directory).map_err(IoError::from)?;
+        for entry in entries {
+            ensure_scan_budget(started, budget, visited_entries)?;
+            let entry = entry.map_err(IoError::from)?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            visited_entries = visited_entries.checked_add(1).ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidData, "disk scan entry count overflow")
+            })?;
+            if visited_entries > DISK_SCAN_MAX_ENTRIES {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("disk scan exceeded {DISK_SCAN_MAX_ENTRIES} entries"),
+                ));
+            }
+
+            let stat =
+                statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(IoError::from)?;
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => {
+                    if depth >= DISK_SCAN_MAX_DEPTH {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("disk scan exceeded depth {DISK_SCAN_MAX_DEPTH}"),
+                        ));
+                    }
+                    let child = openat(
+                        &directory,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(IoError::from)?;
+                    directories.push((child, depth + 1));
+                }
+                FileType::RegularFile => {
+                    let size = u64::try_from(stat.st_size).map_err(|_| {
+                        IoError::new(ErrorKind::InvalidData, "file reported a negative size")
+                    })?;
+                    total = total.checked_add(size).ok_or_else(|| {
+                        IoError::new(ErrorKind::InvalidData, "disk usage size overflow")
+                    })?;
+                }
+                _ => {}
+            }
         }
     }
     Ok(total)
+}
+
+fn ensure_scan_budget(
+    started: std::time::Instant,
+    budget: Duration,
+    visited_entries: usize,
+) -> Result<(), std::io::Error> {
+    if started.elapsed() >= budget {
+        return Err(IoError::new(
+            ErrorKind::TimedOut,
+            format!("disk scan timed out after {visited_entries} entries"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod disk_scan_tests {
+    use std::{fs, os::unix::fs::symlink};
+
+    use super::*;
+
+    #[test]
+    fn disk_scan_counts_regular_files_without_following_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data = temporary.path().join("data");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(data.join("nested")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(data.join("root.bin"), [0_u8; 7]).unwrap();
+        fs::write(data.join("nested/child.bin"), [0_u8; 11]).unwrap();
+        fs::write(outside.join("secret.bin"), [0_u8; 101]).unwrap();
+        symlink(&outside, data.join("outside-link")).unwrap();
+
+        assert_eq!(
+            directory_size_blocking(&data, Duration::from_secs(1)).unwrap(),
+            18
+        );
+    }
+
+    #[test]
+    fn disk_scan_rejects_a_symlink_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data = temporary.path().join("data");
+        let linked = temporary.path().join("linked");
+        fs::create_dir(&data).unwrap();
+        symlink(&data, &linked).unwrap();
+
+        assert!(directory_size_blocking(&linked, Duration::from_secs(1)).is_err());
+    }
 }
 
 pub(crate) fn cpu_percent(stats: &Value) -> Option<f64> {

@@ -4,7 +4,15 @@ use secrecy::SecretString;
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::{files::atomic_write_private, protocol::Protocol},
+    runtime::socket_bridge::{SocketBridge, loopback_target},
+    shared::{
+        backend::{
+            CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH,
+            container_backend_socket_path, container_clickhouse_http_socket_path,
+        },
+        files::atomic_write_private,
+        protocol::Protocol,
+    },
 };
 
 const HOSTED_CONFIG_FILENAME: &str = "dbe-hosted-overrides.xml";
@@ -20,6 +28,8 @@ pub fn instance_spec(
     data_path: PathBuf,
     logs_path: PathBuf,
     hosted_config_path: PathBuf,
+    runtime_path: PathBuf,
+    bridge_binary_path: PathBuf,
 ) -> DockerInstanceSpec {
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
@@ -33,17 +43,37 @@ pub fn instance_spec(
         memory_mib: 1024,
         disk_mib: 10240,
         pids_limit: None,
-        container_port: Protocol::Clickhouse.default_container_port(),
-        public_backend_port: None,
         data_path,
         data_target: "/var/lib/clickhouse".to_string(),
         logs_path,
         logs_target: "/var/log/clickhouse-server".to_string(),
-        extra_mounts: vec![DockerMount {
-            source: hosted_config_path,
-            target: HOSTED_CONFIG_TARGET.to_string(),
-            read_only: true,
-        }],
+        extra_mounts: vec![
+            DockerMount {
+                source: hosted_config_path,
+                target: HOSTED_CONFIG_TARGET.to_string(),
+                read_only: true,
+            },
+            DockerMount {
+                source: runtime_path,
+                target: CONTAINER_SOCKET_DIRECTORY.to_string(),
+                read_only: false,
+            },
+            DockerMount {
+                source: bridge_binary_path,
+                target: SOCKET_BRIDGE_CONTAINER_PATH.to_string(),
+                read_only: true,
+            },
+        ],
+        socket_bridges: vec![
+            SocketBridge {
+                socket_path: container_backend_socket_path(Protocol::Clickhouse),
+                target: loopback_target(9000),
+            },
+            SocketBridge {
+                socket_path: container_clickhouse_http_socket_path(),
+                target: loopback_target(8123),
+            },
+        ],
         env: vec![
             DockerEnv {
                 key: "CLICKHOUSE_DB".to_string(),
@@ -126,6 +156,8 @@ fn hosted_config_xml() -> &'static str {
     <backup_log remove="1"/>
     <blob_storage_log remove="1"/>
     <background_schedule_pool_log remove="1"/>
+    <listen_host>127.0.0.1</listen_host>
+    <interserver_listen_host>127.0.0.1</interserver_listen_host>
 </clickhouse>
 "#
 }
@@ -145,16 +177,21 @@ mod tests {
             PathBuf::from("/tmp/data"),
             PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/logs/dbe-hosted-overrides.xml"),
+            PathBuf::from("/tmp/run"),
+            PathBuf::from("/tmp/dbev-socket-bridge"),
         );
 
         assert_eq!(spec.protocol, Protocol::Clickhouse);
         assert_eq!(spec.data_target, "/var/lib/clickhouse");
         assert_eq!(spec.logs_target, "/var/log/clickhouse-server");
-        assert_eq!(spec.container_port, 9000);
-        assert_eq!(spec.public_backend_port, None);
         assert_eq!(spec.pids_limit, None);
         assert_eq!(spec.extra_mounts[0].target, HOSTED_CONFIG_TARGET);
         assert!(spec.extra_mounts[0].read_only);
+        assert_eq!(spec.extra_mounts[1].target, CONTAINER_SOCKET_DIRECTORY);
+        assert_eq!(spec.extra_mounts[2].target, SOCKET_BRIDGE_CONTAINER_PATH);
+        assert_eq!(spec.socket_bridges.len(), 2);
+        assert_eq!(spec.socket_bridges[0].target, loopback_target(9000));
+        assert_eq!(spec.socket_bridges[1].target, loopback_target(8123));
         assert!(
             spec.env
                 .iter()
@@ -173,6 +210,7 @@ mod tests {
         assert!(config.contains("<part_log remove=\"1\"/>"));
         assert!(config.contains("<metric_log remove=\"1\"/>"));
         assert!(config.contains("<asynchronous_metric_log remove=\"1\"/>"));
+        assert!(config.contains("<listen_host>127.0.0.1</listen_host>"));
     }
 
     #[cfg(unix)]

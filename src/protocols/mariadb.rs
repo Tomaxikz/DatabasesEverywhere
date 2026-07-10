@@ -73,10 +73,20 @@ pub async fn read_packet<S>(stream: &mut S) -> Result<MysqlPacket, MariadbProxyE
 where
     S: AsyncRead + Unpin,
 {
+    read_packet_limited(stream, 16 * 1024 * 1024).await
+}
+
+pub async fn read_packet_limited<S>(
+    stream: &mut S,
+    max_payload_size: usize,
+) -> Result<MysqlPacket, MariadbProxyError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut header = [0_u8; 4];
     stream.read_exact(&mut header).await?;
     let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
-    if len > 16 * 1024 * 1024 {
+    if len > max_payload_size.min(16 * 1024 * 1024) {
         return Err(MariadbProxyError::PacketTooLarge);
     }
     let mut payload = vec![0_u8; len];
@@ -610,5 +620,18 @@ mod tests {
     #[test]
     fn gateway_auth_seed_is_not_static() {
         assert_ne!(new_gateway_auth_seed(), new_gateway_auth_seed());
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_packet_over_routing_limit_before_payload_read() {
+        let (mut client, mut gateway) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            client.write_all(&[1, 0, 1, 0]).await.unwrap();
+        });
+
+        assert!(matches!(
+            read_packet_limited(&mut gateway, 64 * 1024).await,
+            Err(MariadbProxyError::PacketTooLarge)
+        ));
     }
 }

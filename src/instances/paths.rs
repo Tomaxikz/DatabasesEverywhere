@@ -19,6 +19,8 @@ pub struct InstancePaths {
     pub artifacts: PathBuf,
     /// Daemon-owned configuration that must never be writable by a database container.
     pub runtime_config: PathBuf,
+    /// Daemon executable copy used only by TCP-only engines as a local socket bridge.
+    pub socket_bridge_binary: PathBuf,
 }
 
 impl InstancePaths {
@@ -39,6 +41,10 @@ impl InstancePaths {
             sockets: child_direct(&sockets_root, instance_id)?,
             artifacts: child(&artifacts_root, instance_id)?,
             runtime_config: child_direct(&runtime_config_root, instance_id)?,
+            socket_bridge_binary: metadata_root
+                .join("runtime")
+                .join("bin")
+                .join(crate::bins::SOCKET_BRIDGE_FILENAME),
         })
     }
 

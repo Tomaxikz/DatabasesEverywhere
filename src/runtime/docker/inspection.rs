@@ -45,19 +45,15 @@ impl DockerRuntime {
                 _ => DockerContainerStatus::Failed,
             })
             .unwrap_or(DockerContainerStatus::Failed);
-        let network_ip = response
-            .network_settings
-            .and_then(|settings| settings.networks)
-            .and_then(|networks| {
-                networks
-                    .get(&self.network)
-                    .and_then(|settings| settings.ip_address.clone())
-                    .filter(|address| !address.is_empty())
-            });
+        let network_mode = response
+            .host_config
+            .and_then(|host_config| host_config.network_mode)
+            .map(|mode| mode.trim().to_ascii_lowercase())
+            .filter(|mode| !mode.is_empty());
 
         Ok(DockerInstanceInspection {
             status,
-            network_ip,
+            network_mode,
             health,
         })
     }
@@ -94,32 +90,6 @@ impl DockerRuntime {
             sleep(Duration::from_secs(1)).await;
             last = self.inspect_instance(protocol, instance_id).await?;
         }
-    }
-
-    pub async fn container_ip(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-    ) -> Result<String, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        let networks = response
-            .network_settings
-            .and_then(|settings| settings.networks)
-            .ok_or_else(|| DockerError::MissingNetworkAddress {
-                container: name.clone(),
-                network: self.network.clone(),
-            })?;
-        let address = networks
-            .get(&self.network)
-            .and_then(|settings| settings.ip_address.as_ref())
-            .filter(|address| !address.is_empty())
-            .ok_or_else(|| DockerError::MissingNetworkAddress {
-                container: name,
-                network: self.network.clone(),
-            })?;
-
-        Ok(address.clone())
     }
 
     pub async fn configured_container_user(

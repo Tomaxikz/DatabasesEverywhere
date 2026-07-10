@@ -10,16 +10,30 @@ use sha2::{Digest, Sha256};
 
 pub const FUSEQUOTA_VERSION: &str = env!("FUSEQUOTA_VERSION");
 const FUSEQUOTA_SHA256: &str = env!("FUSEQUOTA_SHA256");
+pub const SOCKET_BRIDGE_VERSION: &str = env!("SOCKET_BRIDGE_VERSION");
+pub const SOCKET_BRIDGE_FILENAME: &str =
+    concat!("dbev-socket-bridge-", env!("SOCKET_BRIDGE_VERSION"));
+const SOCKET_BRIDGE_SHA256: &str = env!("SOCKET_BRIDGE_SHA256");
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 static FUSEQUOTA_BIN: &[u8] = include_bytes!("../bins/fusequota");
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 static FUSEQUOTA_BIN: &[u8] = &[];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!("../bins/socket-bridge");
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+static SOCKET_BRIDGE_BIN: &[u8] = &[];
 static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn embedded_fusequota_available() -> bool {
     !FUSEQUOTA_BIN.is_empty()
         && !FUSEQUOTA_VERSION.trim().is_empty()
         && !FUSEQUOTA_SHA256.trim().is_empty()
+}
+
+pub fn embedded_socket_bridge_available() -> bool {
+    !SOCKET_BRIDGE_BIN.is_empty()
+        && !SOCKET_BRIDGE_VERSION.trim().is_empty()
+        && !SOCKET_BRIDGE_SHA256.trim().is_empty()
 }
 
 pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
@@ -32,12 +46,52 @@ pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Erro
 
     let _lock = BIN_LOCK.lock().await;
     let runtime_root = runtime_root.to_path_buf();
-    tokio::task::spawn_blocking(move || install_embedded_fusequota(&runtime_root))
-        .await
-        .map_err(Error::other)?
+    tokio::task::spawn_blocking(move || {
+        install_embedded_helper(
+            &runtime_root,
+            "fusequota",
+            FUSEQUOTA_VERSION,
+            FUSEQUOTA_SHA256,
+            FUSEQUOTA_BIN,
+            0o500,
+        )
+    })
+    .await
+    .map_err(Error::other)?
 }
 
-fn install_embedded_fusequota(runtime_root: &Path) -> Result<PathBuf, Error> {
+pub async fn get_socket_bridge_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
+    if !embedded_socket_bridge_available() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            "embedded socket bridge binary is not available for this target",
+        ));
+    }
+
+    let _lock = BIN_LOCK.lock().await;
+    let runtime_root = runtime_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        install_embedded_helper(
+            &runtime_root,
+            "dbev-socket-bridge",
+            SOCKET_BRIDGE_VERSION,
+            SOCKET_BRIDGE_SHA256,
+            SOCKET_BRIDGE_BIN,
+            0o555,
+        )
+    })
+    .await
+    .map_err(Error::other)?
+}
+
+fn install_embedded_helper(
+    runtime_root: &Path,
+    helper_name: &str,
+    version: &str,
+    expected_sha256: &str,
+    compressed_payload: &[u8],
+    executable_mode: u32,
+) -> Result<PathBuf, Error> {
     let helper_dir = runtime_root.join("bin");
     create_private_helper_dir(&helper_dir)?;
 
@@ -49,15 +103,31 @@ fn install_embedded_fusequota(runtime_root: &Path) -> Result<PathBuf, Error> {
     .map_err(Error::other)?;
     verify_private_directory(&directory, &helper_dir)?;
 
-    let file_name = format!("fusequota-{FUSEQUOTA_VERSION}");
+    let file_name = format!("{helper_name}-{version}");
     if let Some(existing) = open_existing_helper(&directory, &file_name)? {
-        verify_helper_file(existing, &helper_dir.join(&file_name))?;
+        verify_helper_file(
+            existing,
+            &helper_dir.join(&file_name),
+            expected_sha256,
+            executable_mode,
+        )?;
         return Ok(helper_dir.join(file_name));
     }
 
-    let executable = zstd::decode_all(FUSEQUOTA_BIN).map_err(Error::other)?;
-    verify_digest(&executable, "embedded fusequota payload")?;
-    install_helper_atomically(&directory, &helper_dir, &file_name, &executable)?;
+    let executable = zstd::decode_all(compressed_payload).map_err(Error::other)?;
+    verify_digest(
+        &executable,
+        &format!("embedded {helper_name} payload"),
+        expected_sha256,
+    )?;
+    install_helper_atomically(
+        &directory,
+        &helper_dir,
+        &file_name,
+        &executable,
+        expected_sha256,
+        executable_mode,
+    )?;
     Ok(helper_dir.join(file_name))
 }
 
@@ -127,23 +197,32 @@ fn open_existing_helper(
     }
 }
 
-fn verify_helper_file(mut file: File, path: &Path) -> Result<(), Error> {
+fn verify_helper_file(
+    mut file: File,
+    path: &Path,
+    expected_sha256: &str,
+    executable_mode: u32,
+) -> Result<(), Error> {
     let metadata = file.metadata()?;
     let expected_uid = rustix::process::geteuid().as_raw();
     let mode = metadata.permissions().mode() & 0o777;
-    if !metadata.is_file() || metadata.uid() != expected_uid || mode != 0o500 {
+    if !metadata.is_file() || metadata.uid() != expected_uid || mode != executable_mode {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!(
-                "embedded helper {} must be a regular uid-{expected_uid} file with mode 500",
-                path.display()
+                "embedded helper {} must be a regular uid-{expected_uid} file with mode {executable_mode:o}",
+                path.display(),
             ),
         ));
     }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    verify_digest(&bytes, &format!("embedded helper {}", path.display()))
+    verify_digest(
+        &bytes,
+        &format!("embedded helper {}", path.display()),
+        expected_sha256,
+    )
 }
 
 fn install_helper_atomically(
@@ -151,6 +230,8 @@ fn install_helper_atomically(
     helper_dir: &Path,
     file_name: &str,
     executable: &[u8],
+    expected_sha256: &str,
+    executable_mode: u32,
 ) -> Result<(), Error> {
     let temporary_name = format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4());
     let temporary_fd = rustix::fs::openat(
@@ -165,7 +246,8 @@ fn install_helper_atomically(
     let write_result: Result<(), Error> = (|| {
         temporary.write_all(executable)?;
         temporary.sync_all()?;
-        rustix::fs::fchmod(&temporary, Mode::RUSR | Mode::XUSR).map_err(Error::other)?;
+        rustix::fs::fchmod(&temporary, Mode::from_raw_mode(executable_mode))
+            .map_err(Error::other)?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -200,12 +282,17 @@ fn install_helper_atomically(
             ),
         )
     })?;
-    verify_helper_file(installed, &helper_dir.join(file_name))
+    verify_helper_file(
+        installed,
+        &helper_dir.join(file_name),
+        expected_sha256,
+        executable_mode,
+    )
 }
 
-fn verify_digest(bytes: &[u8], label: &str) -> Result<(), Error> {
+fn verify_digest(bytes: &[u8], label: &str, expected_sha256: &str) -> Result<(), Error> {
     let actual = format!("{:x}", Sha256::digest(bytes));
-    if actual == FUSEQUOTA_SHA256 {
+    if actual == expected_sha256 {
         return Ok(());
     }
     Err(Error::new(
@@ -234,7 +321,46 @@ mod tests {
         let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(directory_mode, 0o700);
         assert_eq!(file_mode, 0o500);
-        verify_digest(&fs::read(path).unwrap(), "test helper").unwrap();
+        verify_digest(&fs::read(path).unwrap(), "test helper", FUSEQUOTA_SHA256).unwrap();
+    }
+
+    #[tokio::test]
+    async fn installs_static_socket_bridge_for_unprivileged_container_users() {
+        let root = tempfile::tempdir().unwrap();
+
+        let path = get_socket_bridge_bin_path(root.path()).await.unwrap();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("dbev-socket-bridge-1")
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        verify_digest(
+            &fs::read(path).unwrap(),
+            "test socket bridge",
+            SOCKET_BRIDGE_SHA256,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_static_socket_bridge_executes_healthcheck() {
+        let root = tempfile::tempdir().unwrap();
+        let helper = get_socket_bridge_bin_path(root.path()).await.unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target = listener.local_addr().unwrap();
+
+        let status = tokio::process::Command::new(helper)
+            .arg("__socket-bridge-healthcheck")
+            .arg(target.to_string())
+            .status()
+            .await
+            .unwrap();
+
+        assert!(status.success());
     }
 
     #[tokio::test]

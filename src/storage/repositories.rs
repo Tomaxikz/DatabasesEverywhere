@@ -170,7 +170,7 @@ impl InstanceRepository {
         .bind(backend.port.map(i64::from))
         .bind(runtime_kind)
         .bind(&metadata.runtime.container_name)
-        .bind(&metadata.runtime.network)
+        .bind(&metadata.runtime.network_mode)
         .bind(&metadata.database.name)
         .bind(&metadata.database.username)
         .bind(limits_json)
@@ -592,14 +592,13 @@ mod tests {
                 host: "db.example.com".to_string(),
                 port: 5433,
             },
-            backend: BackendEndpoint::DockerTcp {
-                host: "dbe-postgres-inst-abc".to_string(),
-                port: 5432,
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: "/run/dbev/sockets/inst_abc/.s.PGSQL.5432".to_string(),
             },
             runtime: RuntimeMetadata {
                 kind: RuntimeKind::Docker,
                 container_name: "dbe-postgres-inst-abc".to_string(),
-                network: "databases-everywhere".to_string(),
+                network_mode: "none".to_string(),
             },
             database: DatabaseIdentity {
                 name: "app_db".to_string(),

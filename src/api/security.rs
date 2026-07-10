@@ -16,10 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    api::{
-        handlers::{ApiError, websocket_token},
-        routes::AppState,
-    },
+    api::{api_response::ApiError, routes::AppState, security_policy::websocket_token},
     auth::{api_token::ApiToken, jwt},
 };
 

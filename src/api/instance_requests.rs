@@ -1,7 +1,10 @@
 use serde::Deserialize;
 
 use crate::{
-    api::handlers::ApiError,
+    api::{
+        api_response::ApiError,
+        security_policy::{DestructiveActionConfirmation, DestructiveActionPolicy},
+    },
     shared::{
         ids::validate_instance_id,
         limits::{InstanceLimits, validate_runtime_limits},
@@ -10,6 +13,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateInstanceRequest {
     pub instance_id: String,
     pub protocol: Protocol,
@@ -23,9 +27,11 @@ pub struct CreateInstanceRequest {
     pub limits: Option<LimitsRequest>,
     #[serde(default)]
     pub purge_stale_resources: bool,
+    pub purge_stale_resources_confirmation: Option<DestructiveActionConfirmation>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsRequest {
     pub cpu_cores: f64,
     pub memory_mib: u64,
@@ -50,6 +56,17 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
     if let Some(limits) = &request.limits {
         validate_limits(limits)?;
         validate_protocol_limits(request.protocol, limits)?;
+    }
+    if request.purge_stale_resources {
+        let confirmation = request
+            .purge_stale_resources_confirmation
+            .as_ref()
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "stale resource purge requires purge_stale_resources_confirmation".to_string(),
+                )
+            })?;
+        DestructiveActionPolicy::authorize("stale resource purge", confirmation)?;
     }
     Ok(())
 }
@@ -248,5 +265,21 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("memory_mib"));
+    }
+
+    #[test]
+    fn stale_resource_purge_requires_central_confirmation() {
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "instance_id": "inst_test_pg",
+            "protocol": "postgres",
+            "database": "test_db",
+            "username": "test_user",
+            "password": "secret",
+            "public_host": "127.0.0.1",
+            "purge_stale_resources": true
+        }))
+        .unwrap();
+
+        assert!(validate_create_request(&request).is_err());
     }
 }

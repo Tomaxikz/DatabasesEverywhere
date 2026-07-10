@@ -3,16 +3,15 @@ use std::{path::PathBuf, sync::Arc};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{HeaderValue, Method, header},
     middleware,
     routing::{delete, get, patch, post},
 };
-use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     api::{
-        allowed_hosts, artifacts, backups, config_admin, images, import_export,
-        instances as instance_api, metrics, recovery, resources, system, websocket, ws_tokens,
+        api_response, artifacts, backups, config_admin, images, import_export,
+        instances as instance_api, metrics, recovery, resources, security_policy, system,
+        websocket, ws_tokens,
     },
     auth::api_token::ApiToken,
     config::Config,
@@ -26,6 +25,7 @@ use crate::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub config_path: PathBuf,
+    pub config_patches: crate::api::config_admin::ConfigPatchCoordinator,
     pub api_token: ApiToken,
     pub instances: InstanceStore,
     pub manager: InstanceManager,
@@ -37,10 +37,11 @@ pub struct AppState {
     pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
     pub resource_cache: crate::api::resources::ResourceCache,
     pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
+    pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = strict_cors_layer(&state.config.cors_allowed_hosts());
+    let cors = security_policy::cors_layer(&state.config.cors_allowed_hosts());
 
     Router::new()
         .merge(system_routes())
@@ -52,18 +53,24 @@ pub fn build_router(state: AppState) -> Router {
         .merge(backup_routes())
         .merge(recovery_routes())
         .merge(websocket_routes())
+        .fallback(api_response::route_not_found)
+        .method_not_allowed_fallback(api_response::method_not_allowed)
         .layer(DefaultBodyLimit::max(
             state.config.security.api_body_limit_bytes,
         ))
+        .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::api::security::rate_limit,
+            crate::api::security_policy::enforce_request_host_policy,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::api::request_trace::trace_request,
         ))
-        .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::security::rate_limit,
+        ))
         .with_state(state)
 }
 
@@ -108,10 +115,6 @@ fn instance_routes() -> Router<AppState> {
         .route(
             "/api/instances/{instance_id}/limits",
             patch(instance_api::update_instance_limits),
-        )
-        .route(
-            "/api/admin/runtime-instances",
-            get(instance_api::runtime_instances),
         )
 }
 
@@ -217,23 +220,113 @@ fn websocket_routes() -> Router<AppState> {
         )
 }
 
-fn strict_cors_layer(allowed_hosts: &[String]) -> CorsLayer {
-    let allowed_hosts = Arc::new(allowed_hosts.to_vec());
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(
-            move |origin: &HeaderValue, _request_parts| {
-                origin
-                    .to_str()
-                    .map(|origin| allowed_hosts::origin_is_allowed(origin, &allowed_hosts))
-                    .unwrap_or(false)
-            },
-        ))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{
+        auth::api_token::ApiToken,
+        instances::{manager::InstanceManager, state::InstanceStore},
+        storage::{repositories::InstanceRepository, sqlite},
+    };
+
+    #[tokio::test]
+    async fn host_policy_checks_host_even_when_origin_is_allowed() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/heartbeat")
+                    .header(header::HOST, "evil.example.com")
+                    .header(header::ORIGIN, "https://panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["code"], "host_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn authentication_precedes_json_deserialization() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/images/pull")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn extractor_rejections_use_the_api_error_envelope() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/images/pull")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["code"], "bad_request");
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn test_state() -> AppState {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(directory.path()).await.unwrap();
+        let instances = InstanceStore::default();
+        let manager = InstanceManager::new(instances.clone(), InstanceRepository::new(pool));
+        let config = Arc::new(Config {
+            remote: "https://panel.example.com".to_string(),
+            token_id: "test-token".to_string(),
+            token: "secret".to_string(),
+            jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
+            ..Default::default()
+        });
+        AppState {
+            config: config.clone(),
+            config_path: directory.path().join("config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
+            api_token: ApiToken::from_config(&config),
+            instances,
+            manager,
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
+            docker: DockerRuntime::new(&Default::default(), false).unwrap(),
+            import_export_jobs: ImportExportJobs::default(),
+            api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
+            install_progress: crate::api::progress::InstallProgressStore::default(),
+            artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+        }
+    }
 }

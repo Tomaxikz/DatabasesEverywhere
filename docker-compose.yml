@@ -6,8 +6,9 @@ services:
     container_name: dbev
     restart: unless-stopped
 
-    # DBE exposes raw TCP database gateways, and it must reach sibling database
-    # containers created through the host Docker socket.
+    # Host networking lets DBE bind its configured public/loopback gateway
+    # addresses. Managed database containers themselves use network_mode=none
+    # and are reached only through bind-mounted Unix sockets.
     network_mode: host
 
     # FuseQuota needs /dev/fuse and SYS_ADMIN, but not blanket privileged mode.

@@ -46,6 +46,16 @@ pub async fn read_message<S>(stream: &mut S) -> Result<MongoMessage, MongodbProx
 where
     S: AsyncRead + Unpin,
 {
+    read_message_limited(stream, MAX_MESSAGE_SIZE).await
+}
+
+pub async fn read_message_limited<S>(
+    stream: &mut S,
+    max_message_size: usize,
+) -> Result<MongoMessage, MongodbProxyError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut len_bytes = [0_u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = i32::from_le_bytes(len_bytes);
@@ -53,7 +63,7 @@ where
         return Err(MongodbProxyError::MalformedMessage);
     }
     let len = len as usize;
-    if len > MAX_MESSAGE_SIZE {
+    if len > max_message_size.min(MAX_MESSAGE_SIZE) {
         return Err(MongodbProxyError::MessageTooLarge);
     }
 
@@ -317,5 +327,18 @@ mod tests {
 
             assert!(is_hello(&message));
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_declared_message_over_routing_limit_before_payload_read() {
+        let (mut client, mut gateway) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            client.write_all(&(65_537_i32).to_le_bytes()).await.unwrap();
+        });
+
+        assert!(matches!(
+            read_message_limited(&mut gateway, 64 * 1024).await,
+            Err(MongodbProxyError::MessageTooLarge)
+        ));
     }
 }

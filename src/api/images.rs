@@ -1,21 +1,19 @@
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiJson, ApiResponse, ApiResult},
         instances::docker_error,
         routes::AppState,
+        security_policy::ApiRequestContext,
     },
     auth::scopes,
     shared::{images::is_pinned_image_reference, protocol::Protocol},
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullImageRequest {
     pub protocol: Protocol,
     pub image: Option<String>,
@@ -30,11 +28,10 @@ pub struct PullImageResponse {
 
 pub async fn pull_image(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<PullImageRequest>,
+    auth: ApiRequestContext,
+    ApiJson(request): ApiJson<PullImageRequest>,
 ) -> ApiResult<PullImageResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::IMAGES_ADMIN)?;
+    auth.require_scope(scopes::IMAGES_ADMIN)?;
     let image = request
         .image
         .as_deref()
@@ -50,7 +47,7 @@ pub async fn pull_image(
         .await
         .map_err(docker_error)?;
 
-    Ok(Json(PullImageResponse {
+    Ok(ApiResponse::ok(PullImageResponse {
         protocol: request.protocol,
         image,
         pulled: true,
@@ -189,6 +186,7 @@ mod tests {
         AppState {
             config: Arc::new(config),
             config_path: dir.path().join("config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
@@ -200,6 +198,7 @@ mod tests {
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
         }
     }
 }

@@ -23,10 +23,7 @@ use bollard::{
     container::LogOutput,
     errors::Error as BollardError,
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
-    models::{
-        ContainerCreateBody, ContainerUpdateBody, HostConfig, Ipam, IpamConfig,
-        NetworkCreateRequest, NetworkInspect,
-    },
+    models::{ContainerCreateBody, ContainerUpdateBody, HostConfig},
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
         DownloadFromContainerOptionsBuilder, KillContainerOptions, ListContainersOptionsBuilder,
@@ -40,12 +37,12 @@ use secrecy::ExposeSecret;
 use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 
 use crate::{
-    config::{DaemonConfig, DaemonEngine, DaemonNetworkIpam},
+    config::{DaemonConfig, DaemonEngine},
     constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
-    runtime::docker::container_config::{
-        bind_mount, cpu_to_nano, exposed_ports, healthcheck, mib_to_bytes, published_port_bindings,
-    },
+    runtime::docker::container_config::{bind_mount, cpu_to_nano, healthcheck, mib_to_bytes},
+    runtime::socket_bridge::supervisor_arguments,
     shared::{
+        backend::SOCKET_BRIDGE_CONTAINER_PATH,
         ids::sanitize_docker_suffix,
         limits::{ResourceLimitError, validate_runtime_limits},
         logs::truncate_log_tail,
@@ -65,7 +62,7 @@ const EXEC_OUTPUT_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\
 #[derive(Debug, Clone)]
 pub struct DockerInstanceInspection {
     pub status: DockerContainerStatus,
-    pub network_ip: Option<String>,
+    pub network_mode: Option<String>,
     pub health: Option<String>,
 }
 
@@ -82,10 +79,7 @@ pub struct DockerRuntime {
     docker: Docker,
     engine: DaemonEngine,
     socket_path: String,
-    network: String,
-    internal_network: bool,
-    ipam: DaemonNetworkIpam,
-    allow_public_backend_ports: bool,
+    legacy_network: String,
     enforce_disk_limits: bool,
     security: DockerSecurityPolicy,
     rootless_podman: bool,
@@ -109,10 +103,7 @@ impl DockerRuntime {
             docker: connection.connect()?,
             engine: connection.engine,
             socket_path: connection.socket_path_for_logs().to_string(),
-            network: config.network.clone(),
-            internal_network: config.internal_network,
-            ipam: config.ipam.clone(),
-            allow_public_backend_ports: config.allow_public_backend_ports,
+            legacy_network: crate::constants::docker::DEFAULT_NETWORK.to_string(),
             enforce_disk_limits,
             security: DockerSecurityPolicy::from_config(config),
             rootless_podman,
@@ -124,10 +115,6 @@ impl DockerRuntime {
         docker: Docker,
         engine: DaemonEngine,
         socket_path: impl Into<String>,
-        network: impl Into<String>,
-        internal_network: bool,
-        ipam: DaemonNetworkIpam,
-        allow_public_backend_ports: bool,
         enforce_disk_limits: bool,
         security: DockerSecurityPolicy,
     ) -> Self {
@@ -138,10 +125,7 @@ impl DockerRuntime {
             docker,
             engine,
             socket_path,
-            network: network.into(),
-            internal_network,
-            ipam,
-            allow_public_backend_ports,
+            legacy_network: crate::constants::docker::DEFAULT_NETWORK.to_string(),
             enforce_disk_limits,
             security,
             rootless_podman,
@@ -199,76 +183,8 @@ impl DockerRuntime {
         Ok(format!("dbe-{}-{suffix}", protocol.as_str()))
     }
 
-    pub async fn ensure_network(&self) -> Result<(), DockerError> {
-        if let Ok(network) = self.docker.inspect_network(&self.network, None).await {
-            self.validate_existing_network(&network)?;
-            return Ok(());
-        }
-
-        self.docker
-            .create_network(NetworkCreateRequest {
-                name: self.network.clone(),
-                driver: Some("bridge".to_string()),
-                attachable: Some(false),
-                internal: Some(self.internal_network),
-                ipam: network_ipam(&self.ipam),
-                ..Default::default()
-            })
-            .await?;
-        Ok(())
-    }
-
     pub async fn ping(&self) -> Result<String, DockerError> {
         self.docker.ping().await.map_err(Into::into)
-    }
-
-    fn validate_existing_network(&self, network: &NetworkInspect) -> Result<(), DockerError> {
-        let existing_internal = network.internal.unwrap_or(false);
-        if existing_internal != self.internal_network {
-            return Err(DockerError::InvalidNetworkSecurity {
-                network: self.network.clone(),
-                expected_internal: self.internal_network,
-                existing_internal: network.internal,
-            });
-        }
-
-        if self.ipam.subnet.trim().is_empty() && self.ipam.gateway.trim().is_empty() {
-            return Ok(());
-        }
-        let configs = network
-            .ipam
-            .as_ref()
-            .and_then(|ipam| ipam.config.as_deref())
-            .unwrap_or(&[]);
-        let subnet_matches = self.ipam.subnet.trim().is_empty()
-            || configs
-                .iter()
-                .any(|config| config.subnet.as_deref() == Some(self.ipam.subnet.as_str()));
-        let gateway_matches = self.ipam.gateway.trim().is_empty()
-            || configs
-                .iter()
-                .any(|config| config.gateway.as_deref() == Some(self.ipam.gateway.as_str()));
-
-        if subnet_matches && gateway_matches {
-            Ok(())
-        } else {
-            let existing: Vec<_> = configs
-                .iter()
-                .map(|config| {
-                    format!(
-                        "subnet={}, gateway={}",
-                        config.subnet.as_deref().unwrap_or(""),
-                        config.gateway.as_deref().unwrap_or("")
-                    )
-                })
-                .collect();
-            Err(DockerError::InvalidNetworkConfig {
-                network: self.network.clone(),
-                expected_subnet: empty_to_none(&self.ipam.subnet),
-                expected_gateway: empty_to_none(&self.ipam.gateway),
-                existing,
-            })
-        }
     }
 
     pub fn create_body(
@@ -293,19 +209,14 @@ impl DockerRuntime {
             labels.insert(PROJECT_LABEL.to_string(), project_id.clone());
         }
 
-        let publish_backend_port = self.allow_public_backend_ports || self.uses_rootless_podman();
         let mut host_config = HostConfig {
-            network_mode: Some(self.network.clone()),
+            network_mode: Some("none".to_string()),
             nano_cpus: Some(nano_cpus),
             memory: Some(memory_bytes),
             memory_swap: Some(memory_bytes),
             mounts: Some(container_mounts(spec)),
             storage_opt: storage_opt(self.enforce_disk_limits, spec.disk_mib),
-            port_bindings: published_port_bindings(
-                publish_backend_port,
-                spec.public_backend_port,
-                spec.container_port,
-            ),
+            port_bindings: None,
             ..Default::default()
         };
         self.security.apply(&mut host_config);
@@ -333,12 +244,9 @@ impl DockerRuntime {
                 Some(spec.command.clone())
             },
             labels: Some(labels),
+            stop_timeout: Some(30),
             host_config: Some(host_config),
-            exposed_ports: exposed_ports(
-                publish_backend_port,
-                spec.public_backend_port,
-                spec.container_port,
-            ),
+            exposed_ports: None,
             healthcheck: self.container_healthcheck(spec.protocol),
             ..Default::default()
         })
@@ -403,7 +311,10 @@ impl DockerRuntime {
         self.ensure_image_with_progress(&spec.image, progress)
             .await?;
         ensure_bind_mount_sources(spec).await?;
-        let body = self.create_body(spec)?;
+        let mut body = self.create_body(spec)?;
+        if !spec.socket_bridges.is_empty() {
+            self.apply_socket_bridge_wrapper(spec, &mut body).await?;
+        }
         let response = self
             .docker
             .create_container(
@@ -415,6 +326,38 @@ impl DockerRuntime {
             stdout: response.id,
             stderr: response.warnings.join("\n"),
         })
+    }
+
+    async fn apply_socket_bridge_wrapper(
+        &self,
+        spec: &DockerInstanceSpec,
+        body: &mut ContainerCreateBody,
+    ) -> Result<(), DockerError> {
+        let image = self.docker.inspect_image(&spec.image).await?;
+        let image_config = image.config.unwrap_or_default();
+        let entrypoint = spec
+            .entrypoint
+            .clone()
+            .or(image_config.entrypoint)
+            .unwrap_or_default();
+        let command = if spec.command.is_empty() {
+            image_config.cmd.unwrap_or_default()
+        } else {
+            spec.command.clone()
+        };
+        let effective_command = entrypoint.into_iter().chain(command).collect::<Vec<_>>();
+        if effective_command.is_empty() {
+            return Err(DockerError::MissingImageCommand {
+                image: spec.image.clone(),
+            });
+        }
+
+        body.entrypoint = Some(vec![SOCKET_BRIDGE_CONTAINER_PATH.to_string()]);
+        body.cmd = Some(supervisor_arguments(
+            &spec.socket_bridges,
+            &effective_command,
+        ));
+        Ok(())
     }
 
     pub async fn pull_image(&self, image: &str) -> Result<CommandOutput, DockerError> {
@@ -1033,37 +976,13 @@ impl DockerRuntime {
     }
 
     pub async fn remove_network(&self) -> Result<(), DockerError> {
-        match self.docker.remove_network(&self.network).await {
+        match self.docker.remove_network(&self.legacy_network).await {
             Ok(()) => Ok(()),
             Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(()),
             Err(error) => Err(error.into()),
         }
-    }
-}
-
-fn network_ipam(ipam: &DaemonNetworkIpam) -> Option<Ipam> {
-    if ipam.subnet.trim().is_empty() && ipam.gateway.trim().is_empty() {
-        return None;
-    }
-    Some(Ipam {
-        driver: Some("default".to_string()),
-        config: Some(vec![IpamConfig {
-            subnet: empty_to_none(&ipam.subnet),
-            gateway: empty_to_none(&ipam.gateway),
-            ..Default::default()
-        }]),
-        ..Default::default()
-    })
-}
-
-fn empty_to_none(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -1526,6 +1445,8 @@ pub enum DockerError {
     DiskLimitProbeFailed(String),
     #[error("docker image pull failed for {image}: {message}")]
     ImagePullFailed { image: String, message: String },
+    #[error("container image {image} has no command for the socket bridge to supervise")]
+    MissingImageCommand { image: String },
     #[error("docker disk limit probe io failed: {0}")]
     DiskLimitProbeIo(std::io::Error),
     #[error(
@@ -1535,25 +1456,6 @@ pub enum DockerError {
         instance_id: String,
         status: String,
         health: Option<String>,
-    },
-    #[error("container {container} has no IP address on docker network {network}")]
-    MissingNetworkAddress { container: String, network: String },
-    #[error(
-        "docker network {network} IPAM does not match config (expected subnet={expected_subnet:?}, gateway={expected_gateway:?}, existing={existing:?}); remove/recreate the network or update config"
-    )]
-    InvalidNetworkConfig {
-        network: String,
-        expected_subnet: Option<String>,
-        expected_gateway: Option<String>,
-        existing: Vec<String>,
-    },
-    #[error(
-        "docker network {network} internal setting does not match config (expected internal={expected_internal}, existing={existing_internal:?}); remove/recreate the network or update config"
-    )]
-    InvalidNetworkSecurity {
-        network: String,
-        expected_internal: bool,
-        existing_internal: Option<bool>,
     },
     #[error(
         "docker exec failed in {container} with exit code {exit_code}: {operation}; output: {failure_output}"

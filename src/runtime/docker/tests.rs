@@ -6,21 +6,19 @@ use super::*;
 
 #[test]
 fn create_body_does_not_publish_backend_ports_by_default() {
-    let runtime = test_runtime(false);
+    let runtime = test_runtime();
     let body = runtime.create_body(&postgres_spec()).unwrap();
     let host_config = body.host_config.unwrap();
 
     assert!(host_config.port_bindings.is_none());
     assert!(body.exposed_ports.is_none());
-    assert_eq!(
-        host_config.network_mode,
-        Some("databases-everywhere".to_string())
-    );
+    assert_eq!(host_config.network_mode, Some("none".to_string()));
+    assert_eq!(body.stop_timeout, Some(30));
 }
 
 #[test]
 fn create_body_includes_limits_labels_and_security() {
-    let runtime = test_runtime(false);
+    let runtime = test_runtime();
     let body = runtime.create_body(&postgres_spec()).unwrap();
     let host_config = body.host_config.unwrap();
     let labels = body.labels.unwrap();
@@ -47,43 +45,8 @@ fn create_body_includes_limits_labels_and_security() {
 }
 
 #[test]
-fn existing_network_must_match_internal_setting() {
-    let runtime = test_runtime(false);
-    let error = runtime
-        .validate_existing_network(&NetworkInspect {
-            internal: Some(false),
-            ..Default::default()
-        })
-        .unwrap_err();
-
-    assert!(matches!(error, DockerError::InvalidNetworkSecurity { .. }));
-}
-
-#[test]
-fn existing_network_without_internal_flag_defaults_to_non_internal() {
-    let runtime = DockerRuntime::with_client(
-        Docker::connect_with_local_defaults().unwrap(),
-        crate::config::DaemonEngine::Docker,
-        "auto",
-        "databases-everywhere",
-        false,
-        Default::default(),
-        false,
-        true,
-        DockerSecurityPolicy::default(),
-    );
-
-    runtime
-        .validate_existing_network(&NetworkInspect {
-            internal: None,
-            ..Default::default()
-        })
-        .unwrap();
-}
-
-#[test]
 fn create_body_allows_database_specific_pids_limit() {
-    let runtime = test_runtime(false);
+    let runtime = test_runtime();
     let mut spec = postgres_spec();
     spec.pids_limit = Some(4096);
     let body = runtime.create_body(&spec).unwrap();
@@ -93,7 +56,7 @@ fn create_body_allows_database_specific_pids_limit() {
 
 #[test]
 fn create_body_uses_database_specific_mount_target() {
-    let runtime = test_runtime(false);
+    let runtime = test_runtime();
     let body = runtime.create_body(&postgres_spec()).unwrap();
     let mounts = body.host_config.unwrap().mounts.unwrap();
 
@@ -112,7 +75,6 @@ fn podman_create_body_omits_docker_healthcheck() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
-        false,
     );
     let body = runtime.create_body(&postgres_spec()).unwrap();
 
@@ -154,12 +116,10 @@ fn rootless_podman_is_detected_from_user_socket() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
-        false,
     );
     let rootful = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/podman/podman.sock",
-        false,
     );
 
     assert!(runtime.uses_rootless_podman());
@@ -171,7 +131,6 @@ fn rootless_podman_uses_protocol_specific_users() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
-        false,
     );
 
     assert_eq!(
@@ -193,25 +152,15 @@ fn rootless_podman_uses_protocol_specific_users() {
 }
 
 #[test]
-fn rootless_podman_publishes_private_backend_port() {
+fn rootless_podman_also_uses_network_none_without_published_ports() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
-        false,
     );
-    let mut spec = postgres_spec();
-    spec.public_backend_port = Some(29123);
-    let body = runtime.create_body(&spec).unwrap();
+    let body = runtime.create_body(&postgres_spec()).unwrap();
     let host_config = body.host_config.unwrap();
-    let bindings = host_config.port_bindings.unwrap();
-    let binding = bindings
-        .get("5432/tcp")
-        .and_then(|bindings| bindings.as_ref())
-        .and_then(|bindings| bindings.first())
-        .unwrap();
-
-    assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
-    assert_eq!(binding.host_port.as_deref(), Some("29123"));
+    assert!(host_config.port_bindings.is_none());
+    assert_eq!(host_config.network_mode.as_deref(), Some("none"));
 }
 
 #[test]
@@ -219,7 +168,6 @@ fn rootless_podman_sets_keep_id_for_postgres_like_images() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
-        false,
     );
     let body = runtime.create_body(&postgres_spec()).unwrap();
 
@@ -231,7 +179,7 @@ fn rootless_podman_sets_keep_id_for_postgres_like_images() {
 
 #[test]
 fn unsafe_instance_id_is_rejected() {
-    let runtime = test_runtime(false);
+    let runtime = test_runtime();
     let mut spec = postgres_spec();
     spec.instance_id = "../bad".to_string();
 
@@ -429,27 +377,18 @@ fn single_file_archive(path: &str, contents: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn test_runtime(allow_public_backend_ports: bool) -> DockerRuntime {
-    test_runtime_with_engine(
-        crate::config::DaemonEngine::Docker,
-        "auto",
-        allow_public_backend_ports,
-    )
+fn test_runtime() -> DockerRuntime {
+    test_runtime_with_engine(crate::config::DaemonEngine::Docker, "auto")
 }
 
 fn test_runtime_with_engine(
     engine: crate::config::DaemonEngine,
     socket_path: &str,
-    allow_public_backend_ports: bool,
 ) -> DockerRuntime {
     DockerRuntime::with_client(
         Docker::connect_with_local_defaults().unwrap(),
         engine,
         socket_path,
-        "databases-everywhere",
-        true,
-        Default::default(),
-        allow_public_backend_ports,
         true,
         DockerSecurityPolicy::default(),
     )
@@ -468,13 +407,12 @@ fn postgres_spec() -> DockerInstanceSpec {
         memory_mib: 512,
         disk_mib: 10240,
         pids_limit: None,
-        container_port: 5432,
-        public_backend_port: None,
         data_path: PathBuf::from("/var/lib/databases-everywhere/instances/inst_abc/data"),
         data_target: "/var/lib/postgresql".to_string(),
         logs_path: PathBuf::from("/var/log/databases-everywhere/instances/inst_abc"),
         logs_target: "/logs".to_string(),
         extra_mounts: Vec::new(),
+        socket_bridges: Vec::new(),
         env: vec![DockerEnv {
             key: "POSTGRES_PASSWORD".to_string(),
             value: SecretString::from("super-secret"),

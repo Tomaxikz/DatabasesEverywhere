@@ -1,15 +1,16 @@
 use std::{future::Future, time::Duration};
 
 use secrecy::SecretString;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::time::sleep;
 
 use crate::{
     api::{
-        handlers::ApiError,
+        api_response::ApiError,
         images::{ensure_image_allowed, validate_image},
         instance_requests::{CreateInstanceRequest, limits_from_request, validate_create_request},
         instances::docker_error,
         routes::AppState,
+        security_policy::DestructiveActionPolicy,
     },
     databases,
     disk::DiskLimiter,
@@ -159,6 +160,7 @@ async fn create_instance_from_validated_request(
             &image,
             container_data_path.clone(),
             paths.logs.clone(),
+            paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::instance_spec(
             &request.instance_id,
@@ -196,6 +198,7 @@ async fn create_instance_from_validated_request(
             },
             container_data_path.clone(),
             paths.logs.clone(),
+            paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
             let hosted_config_path =
@@ -211,6 +214,8 @@ async fn create_instance_from_validated_request(
                 container_data_path,
                 paths.logs.clone(),
                 hosted_config_path,
+                paths.sockets.clone(),
+                paths.socket_bridge_binary.clone(),
             )
         }
         Protocol::Qdrant => databases::qdrant::docker::instance_spec(
@@ -219,6 +224,8 @@ async fn create_instance_from_validated_request(
             password,
             container_data_path,
             paths.logs.clone(),
+            paths.sockets.clone(),
+            paths.socket_bridge_binary.clone(),
         ),
     };
     spec.project_id = request.project_id.clone();
@@ -227,20 +234,6 @@ async fn create_instance_from_validated_request(
     spec.memory_mib = limits.memory_mib;
     spec.disk_mib = limits.disk_mib;
     spec.pids_limit = Some(protocol_pids_limit(state, request.protocol));
-    let rootless_podman_backend_port = if state.docker.uses_rootless_podman() {
-        let port = allocate_loopback_backend_port()
-            .await
-            .map_err(|error| fail_runtime(state, &request.instance_id, error))?;
-        spec.public_backend_port = Some(port);
-        tracing::debug!(
-            instance_id = request.instance_id,
-            port,
-            "allocated rootless podman loopback backend port"
-        );
-        Some(port)
-    } else {
-        None
-    };
 
     let progress = state.install_progress.clone();
     let progress_instance_id = request.instance_id.clone();
@@ -282,9 +275,11 @@ async fn create_instance_from_validated_request(
     .await
     {
         let api_error = error.into_api_error();
-        state
-            .install_progress
-            .fail(&request.instance_id, api_error.to_string());
+        state.install_progress.fail_api_error(
+            &request.instance_id,
+            "instance creation",
+            &api_error,
+        );
         return Err(api_error);
     }
     if request.protocol == Protocol::Mariadb {
@@ -309,9 +304,11 @@ async fn create_instance_from_validated_request(
         )
         .await
         {
-            state
-                .install_progress
-                .fail(&request.instance_id, error.to_string());
+            state.install_progress.fail_api_error(
+                &request.instance_id,
+                "mariadb provisioning",
+                &error,
+            );
             return Err(error);
         }
     }
@@ -329,30 +326,28 @@ async fn create_instance_from_validated_request(
         )
         .await
         {
-            state
-                .install_progress
-                .fail(&request.instance_id, error.to_string());
+            state.install_progress.fail_api_error(
+                &request.instance_id,
+                "postgres provisioning",
+                &error,
+            );
             return Err(error);
         }
     }
     state.install_progress.stage(
         &request.instance_id,
-        "network",
-        "resolving container network endpoint",
+        "socket",
+        "registering private backend socket",
     );
-    let backend = match backend_endpoint_for_instance(
-        state,
-        request.protocol,
-        &request.instance_id,
-        rootless_podman_backend_port,
-    )
-    .await
+    let backend = match backend_endpoint_for_instance(state, request.protocol, &request.instance_id)
     {
         Ok(backend) => backend,
         Err(error) => {
-            state
-                .install_progress
-                .fail(&request.instance_id, error.to_string());
+            state.install_progress.fail_api_error(
+                &request.instance_id,
+                "instance socket setup",
+                &error,
+            );
             return Err(error);
         }
     };
@@ -373,7 +368,7 @@ async fn create_instance_from_validated_request(
         runtime: RuntimeMetadata {
             kind: RuntimeKind::from(state.config.daemon.engine),
             container_name,
-            network: state.config.daemon.network.clone(),
+            network_mode: "none".to_string(),
         },
         database: DatabaseIdentity {
             name: request.database,
@@ -397,9 +392,11 @@ async fn create_instance_from_validated_request(
         .upsert(metadata.clone())
         .await
         .map_err(|error| {
-            state
-                .install_progress
-                .fail(&metadata.instance_id, error.to_string());
+            state.install_progress.fail_internal(
+                &metadata.instance_id,
+                "instance metadata persistence",
+                &error,
+            );
             ApiError::Runtime(format!(
                 "created container but failed to persist instance metadata: {error}"
             ))
@@ -451,6 +448,12 @@ where
     H: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), ApiError>>,
 {
+    let paths = InstancePaths::new(&state.config.paths, instance_id)
+        .map_err(|error| ContainerLaunchError::Create(ApiError::BadRequest(error.to_string())))?;
+    paths
+        .clear_socket_dir()
+        .await
+        .map_err(|error| ContainerLaunchError::Create(ApiError::Runtime(error.to_string())))?;
     if report_install_progress {
         state
             .install_progress
@@ -658,18 +661,21 @@ pub(crate) async fn wait_for_rootless_podman_service(
         ),
         Protocol::Redis => (
             "waiting for Redis to accept local connections",
-            "redis-cli --user dbe_health -a healthcheck --no-auth-warning ping",
+            "redis-cli -s /run/dbev/redis.sock --user dbe_health -a healthcheck --no-auth-warning ping",
         ),
         Protocol::Mariadb => (
             "waiting for MariaDB to accept local connections",
-            "mariadb-admin ping -h 127.0.0.1 -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
+            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
         ),
         Protocol::Mongodb => return wait_for_mongodb_localhost(state, instance_id).await,
         Protocol::Clickhouse => (
             "waiting for ClickHouse to accept local connections",
             "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1'",
         ),
-        Protocol::Qdrant => return Ok(()),
+        Protocol::Qdrant => (
+            "waiting for Qdrant gRPC to accept local connections",
+            "/opt/dbev/dbev-socket-bridge __socket-bridge-healthcheck 127.0.0.1:6334",
+        ),
     };
 
     state
@@ -725,7 +731,9 @@ async fn wait_for_container_shell_command(
     }
 
     let message = format!("database local readiness did not succeed before timeout: {last_error}");
-    state.install_progress.fail(instance_id, &message);
+    state
+        .install_progress
+        .fail_internal(instance_id, "database readiness", &message);
     Err(ApiError::Runtime(message))
 }
 
@@ -809,7 +817,9 @@ async fn wait_for_mongodb_localhost(state: &AppState, instance_id: &str) -> Resu
         }
     }
     let message = format!("mongodb localhost bootstrap did not become ready: {last_error}");
-    state.install_progress.fail(instance_id, &message);
+    state
+        .install_progress
+        .fail_internal(instance_id, "mongodb bootstrap", &message);
     Err(ApiError::Runtime(message))
 }
 
@@ -824,7 +834,7 @@ fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
     }
 }
 
-fn requested_or_configured_image(
+pub(crate) fn requested_or_configured_image(
     state: &AppState,
     request: &CreateInstanceRequest,
 ) -> Result<String, ApiError> {
@@ -844,12 +854,16 @@ fn fail_bad_request(
     instance_id: &str,
     error: impl std::fmt::Display,
 ) -> ApiError {
-    state.install_progress.fail(instance_id, error.to_string());
+    state
+        .install_progress
+        .fail_public(instance_id, "bad_request", error.to_string());
     ApiError::BadRequest(error.to_string())
 }
 
 fn fail_runtime(state: &AppState, instance_id: &str, error: impl std::fmt::Display) -> ApiError {
-    state.install_progress.fail(instance_id, error.to_string());
+    state
+        .install_progress
+        .fail_internal(instance_id, "instance creation", &error);
     ApiError::Runtime(error.to_string())
 }
 
@@ -926,6 +940,18 @@ async fn handle_stale_instance_resources(
         return Err(stale_resources_conflict(request, resources));
     }
 
+    let authorization = DestructiveActionPolicy::authorize(
+        "stale resource purge",
+        request
+            .purge_stale_resources_confirmation
+            .as_ref()
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "stale resource purge requires purge_stale_resources_confirmation".to_string(),
+                )
+            })?,
+    )?;
+
     let stale_container_count = stale_containers.len();
     for (protocol, _) in stale_containers {
         cleanup_created_container(state, protocol, &request.instance_id).await?;
@@ -939,6 +965,7 @@ async fn handle_stale_instance_resources(
         protocol = %request.protocol,
         stale_container_count,
         stale_path_count = stale_paths.len(),
+        reason = authorization.reason(),
         "explicitly purged stale resources before retrying instance creation"
     );
     Ok(())
@@ -1033,15 +1060,9 @@ impl<'a> CreateFailureCleanup<'a> {
             }
         }
 
-        self.state.install_progress.fail(
-            &self.instance_id,
-            match &cleanup_result {
-                Ok(()) => format!("{error}; failed installation was cleaned up"),
-                Err(cleanup_error) => {
-                    format!("{error}; cleanup is incomplete and remains retryable: {cleanup_error}")
-                }
-            },
-        );
+        self.state
+            .install_progress
+            .fail_api_error(&self.instance_id, "instance creation", error);
         match cleanup_result {
             Ok(()) => tracing::info!(
                 event = "audit instance_create_failed_cleaned",
@@ -1142,37 +1163,17 @@ pub(crate) fn protocol_pids_limit(state: &AppState, protocol: Protocol) -> i64 {
     .unwrap_or(state.config.security.pids_limit)
 }
 
-pub(crate) async fn allocate_loopback_backend_port() -> Result<u16, std::io::Error> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
-pub(crate) async fn backend_endpoint_for_instance(
+pub(crate) fn backend_endpoint_for_instance(
     state: &AppState,
     protocol: Protocol,
     instance_id: &str,
-    rootless_podman_backend_port: Option<u16>,
 ) -> Result<BackendEndpoint, ApiError> {
-    if state.docker.uses_rootless_podman() {
-        let port = rootless_podman_backend_port.ok_or_else(|| {
-            ApiError::Runtime("rootless podman backend port was not allocated".to_string())
-        })?;
-        return Ok(BackendEndpoint::DockerTcp {
-            host: "127.0.0.1".to_string(),
-            port,
-        });
-    }
-
-    let backend_host = state
-        .docker
-        .container_ip(protocol, instance_id)
-        .await
-        .map_err(docker_error)?;
-    Ok(BackendEndpoint::DockerTcp {
-        host: backend_host,
-        port: protocol.default_container_port(),
+    let paths = InstancePaths::new(&state.config.paths, instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    Ok(BackendEndpoint::UnixSocket {
+        socket_path: crate::shared::backend::backend_socket_path(&paths.sockets, protocol)
+            .display()
+            .to_string(),
     })
 }
 
@@ -1339,6 +1340,7 @@ mod tests {
             image: None,
             limits: None,
             purge_stale_resources: false,
+            purge_stale_resources_confirmation: None,
         }
     }
 
@@ -1357,14 +1359,13 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 5432,
             },
-            backend: BackendEndpoint::DockerTcp {
-                host: "172.30.0.2".to_string(),
-                port: 5432,
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),
             },
             runtime: RuntimeMetadata {
                 kind: RuntimeKind::Docker,
                 container_name: format!("dbe-{}-{instance_id}", protocol.as_str()),
-                network: "databases-everywhere".to_string(),
+                network_mode: "none".to_string(),
             },
             database: DatabaseIdentity {
                 name: database.to_string(),
@@ -1390,6 +1391,7 @@ mod tests {
         AppState {
             config: Arc::new(config),
             config_path: dir.path().join("config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
             api_token: ApiToken::new("secret"),
             instances: store,
             manager,
@@ -1400,6 +1402,7 @@ mod tests {
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             instance_locks: crate::instances::locks::InstanceLocks::default(),
         }
     }

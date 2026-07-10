@@ -83,10 +83,7 @@ pub fn validate_ws_token(
     required_scope: &str,
     instance_id: Option<&str>,
 ) -> Result<Claims, JwtAuthError> {
-    let validation = strict_hs256_validation();
-
-    let token = decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)?;
-    let claims = token.claims;
+    let claims = validate_ws_token_claims(token, secret)?;
 
     if !claims.scopes.iter().any(|scope| scope == required_scope) {
         return Err(JwtAuthError::MissingScope {
@@ -103,6 +100,15 @@ pub fn validate_ws_token(
     }
 
     Ok(claims)
+}
+
+pub fn validate_ws_token_claims(token: &str, secret: &[u8]) -> Result<Claims, JwtAuthError> {
+    let token = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret),
+        &strict_hs256_validation(),
+    )?;
+    Ok(token.claims)
 }
 
 /// Returns the stable identity of an otherwise valid daemon JWT. This is used

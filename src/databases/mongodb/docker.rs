@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use secrecy::SecretString;
 
 use crate::{
-    runtime::docker::{DockerEnv, DockerInstanceSpec},
-    shared::protocol::Protocol,
+    runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
+    shared::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
 };
 
 pub struct MongodbAuth {
@@ -20,6 +20,7 @@ pub fn instance_spec(
     auth: MongodbAuth,
     data_path: PathBuf,
     logs_path: PathBuf,
+    runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
@@ -33,13 +34,16 @@ pub fn instance_spec(
         memory_mib: 1024,
         disk_mib: 10240,
         pids_limit: None,
-        container_port: Protocol::Mongodb.default_container_port(),
-        public_backend_port: None,
         data_path,
         data_target: "/data/db".to_string(),
         logs_path,
         logs_target: "/logs".to_string(),
-        extra_mounts: Vec::new(),
+        extra_mounts: vec![DockerMount {
+            source: runtime_path,
+            target: CONTAINER_SOCKET_DIRECTORY.to_string(),
+            read_only: false,
+        }],
+        socket_bridges: Vec::new(),
         env: vec![
             DockerEnv {
                 key: "DBE_MONGO_USER".to_string(),
@@ -66,7 +70,9 @@ pub fn instance_spec(
             "mongod".to_string(),
             "--auth".to_string(),
             "--bind_ip".to_string(),
-            "0.0.0.0".to_string(),
+            "127.0.0.1".to_string(),
+            "--unixSocketPrefix".to_string(),
+            CONTAINER_SOCKET_DIRECTORY.to_string(),
             "--setParameter".to_string(),
             "diagnosticDataCollectionEnabled=false".to_string(),
         ],
@@ -90,13 +96,13 @@ mod tests {
             },
             PathBuf::from("/tmp/data"),
             PathBuf::from("/tmp/logs"),
+            PathBuf::from("/tmp/run"),
         );
 
         assert_eq!(spec.protocol, Protocol::Mongodb);
         assert_eq!(spec.data_target, "/data/db");
-        assert_eq!(spec.container_port, 27017);
-        assert_eq!(spec.public_backend_port, None);
-        assert!(spec.extra_mounts.is_empty());
+        assert_eq!(spec.extra_mounts[0].target, CONTAINER_SOCKET_DIRECTORY);
+        assert!(spec.socket_bridges.is_empty());
         assert!(spec.env.iter().any(|env| env.key == "DBE_MONGO_USER"));
         assert!(
             spec.env
@@ -115,7 +121,9 @@ mod tests {
                 "mongod",
                 "--auth",
                 "--bind_ip",
-                "0.0.0.0",
+                "127.0.0.1",
+                "--unixSocketPrefix",
+                "/run/dbev",
                 "--setParameter",
                 "diagnosticDataCollectionEnabled=false"
             ]

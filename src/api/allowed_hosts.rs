@@ -6,15 +6,9 @@ pub fn request_host(headers: &HeaderMap) -> Option<String> {
 
 pub fn request_host_with_uri(headers: &HeaderMap, uri: Option<&Uri>) -> Option<String> {
     headers
-        .get("origin")
+        .get("host")
         .and_then(|value| value.to_str().ok())
-        .and_then(origin_host)
-        .or_else(|| {
-            headers
-                .get("host")
-                .and_then(|value| value.to_str().ok())
-                .map(normalize_host)
-        })
+        .map(normalize_host)
         .or_else(|| {
             uri.and_then(Uri::authority)
                 .map(|authority| normalize_host(authority.as_str()))
@@ -43,7 +37,15 @@ fn origin_host(origin: &str) -> Option<String> {
 }
 
 fn normalize_host(host: &str) -> String {
-    host.trim().trim_end_matches('/').to_ascii_lowercase()
+    let host = host.trim().trim_end_matches('/');
+    host.parse::<axum::http::uri::Authority>()
+        .map(|authority| {
+            authority
+                .host()
+                .trim_matches(['[', ']'])
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|_| host.trim_matches(['[', ']']).to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -73,7 +75,16 @@ mod tests {
 
         assert_eq!(
             request_host_with_uri(&headers, Some(&uri)),
-            Some("panel.example.com:443".to_string())
+            Some("panel.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn host_is_not_shadowed_by_an_allowed_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "evil.example.com".parse().unwrap());
+        headers.insert("origin", "https://panel.example.com".parse().unwrap());
+
+        assert_eq!(request_host(&headers), Some("evil.example.com".to_string()));
     }
 }

@@ -6,25 +6,63 @@ const FUSEQUOTA_COMPRESSED_SHA256: &str =
     "e1c23625877c4394f2542e7e9b763ff4f9228038d6c497e778b67234ea67d4fa";
 const FUSEQUOTA_EXECUTABLE_SHA256: &str =
     "102ba39c6157469cfc2dd635f5186754a301eb09dd8904b15268d2ba1215943a";
+const SOCKET_BRIDGE_VERSION: &str = "1";
+const SOCKET_BRIDGE_COMPRESSED_SHA256: &str =
+    "4208322f6a79d9bd4de5f7b4d5f6a8a1a7e2083593dca817a8937d4aa113f12b";
+const SOCKET_BRIDGE_EXECUTABLE_SHA256: &str =
+    "ef69810895557d26447d27642ae561036487548c4df9ef4a2b8d3c014a0c2b81";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=bins/fusequota");
     println!("cargo:rerun-if-changed=bins/fusequota.version");
+    println!("cargo:rerun-if-changed=bins/socket-bridge");
+    println!("cargo:rerun-if-changed=bins/socket-bridge.version");
+    println!("cargo:rerun-if-changed=helpers/socket_bridge.rs");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_os == "linux" && target_arch == "x86_64" {
         verify_checked_in_fusequota();
+        verify_checked_in_socket_bridge();
         println!("cargo:rustc-env=FUSEQUOTA_VERSION={FUSEQUOTA_VERSION}");
         println!("cargo:rustc-env=FUSEQUOTA_SHA256={FUSEQUOTA_EXECUTABLE_SHA256}");
+        println!("cargo:rustc-env=SOCKET_BRIDGE_VERSION={SOCKET_BRIDGE_VERSION}");
+        println!("cargo:rustc-env=SOCKET_BRIDGE_SHA256={SOCKET_BRIDGE_EXECUTABLE_SHA256}");
     } else {
         // The checked-in helper is an x86-64 Linux executable. Other targets
         // must configure disk.fuse_quota_binary explicitly instead of silently
         // downloading or attempting to execute a binary for the wrong target.
         println!("cargo:rustc-env=FUSEQUOTA_VERSION=");
         println!("cargo:rustc-env=FUSEQUOTA_SHA256=");
+        println!("cargo:rustc-env=SOCKET_BRIDGE_VERSION=");
+        println!("cargo:rustc-env=SOCKET_BRIDGE_SHA256=");
     }
+}
+
+fn verify_checked_in_socket_bridge() {
+    let version = std::fs::read_to_string("bins/socket-bridge.version")
+        .expect("missing checked-in bins/socket-bridge.version");
+    assert_eq!(
+        version.trim(),
+        SOCKET_BRIDGE_VERSION,
+        "checked-in socket bridge version does not match the pinned build version"
+    );
+
+    let compressed = std::fs::read(Path::new("bins/socket-bridge"))
+        .expect("missing checked-in compressed bins/socket-bridge");
+    assert_digest(
+        "compressed socket bridge",
+        &compressed,
+        SOCKET_BRIDGE_COMPRESSED_SHA256,
+    );
+    let executable = zstd::decode_all(compressed.as_slice())
+        .expect("checked-in socket bridge is not valid zstd");
+    assert_digest(
+        "decompressed socket bridge executable",
+        &executable,
+        SOCKET_BRIDGE_EXECUTABLE_SHA256,
+    );
 }
 
 fn verify_checked_in_fusequota() {

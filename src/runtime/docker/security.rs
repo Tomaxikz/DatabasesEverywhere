@@ -5,7 +5,11 @@ use std::{
 
 use bollard::models::HostConfig;
 
-use crate::config::DaemonConfig;
+use crate::{
+    config::DaemonConfig,
+    runtime::socket_bridge::is_valid_bridge,
+    shared::backend::{CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH},
+};
 
 use super::DockerInstanceSpec;
 
@@ -99,6 +103,39 @@ impl DockerSecurityPolicy {
         for mount in &spec.extra_mounts {
             validate_mount_source(&mount.source)?;
             validate_extra_mount_target(&mount.target)?;
+        }
+        self.validate_socket_bridge_spec(spec)?;
+        Ok(())
+    }
+
+    fn validate_socket_bridge_spec(
+        &self,
+        spec: &DockerInstanceSpec,
+    ) -> Result<(), DockerSecurityError> {
+        if spec.socket_bridges.is_empty() {
+            return Ok(());
+        }
+        if !matches!(
+            spec.protocol,
+            crate::shared::protocol::Protocol::Clickhouse
+                | crate::shared::protocol::Protocol::Qdrant
+        ) || spec
+            .socket_bridges
+            .iter()
+            .any(|bridge| !is_valid_bridge(bridge))
+        {
+            return Err(DockerSecurityError::InvalidSocketBridge);
+        }
+        let helper = spec
+            .extra_mounts
+            .iter()
+            .any(|mount| mount.target == SOCKET_BRIDGE_CONTAINER_PATH && mount.read_only);
+        let sockets = spec
+            .extra_mounts
+            .iter()
+            .any(|mount| mount.target == CONTAINER_SOCKET_DIRECTORY && !mount.read_only);
+        if !helper || !sockets {
+            return Err(DockerSecurityError::InvalidSocketBridge);
         }
         Ok(())
     }
@@ -241,6 +278,8 @@ pub enum DockerSecurityError {
     InvalidMountSource { path: String, reason: String },
     #[error("invalid container mount target {target}: {reason}")]
     InvalidMountTarget { target: String, reason: String },
+    #[error("invalid or incomplete local socket bridge configuration")]
+    InvalidSocketBridge,
 }
 
 #[cfg(test)]
@@ -374,6 +413,21 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn socket_bridge_requires_tcp_only_protocol_and_both_private_mounts() {
+        let mut spec = test_spec();
+        spec.socket_bridges
+            .push(crate::runtime::socket_bridge::SocketBridge {
+                socket_path: "/run/dbev/native.sock".to_string(),
+                target: crate::runtime::socket_bridge::loopback_target(9000),
+            });
+
+        assert!(matches!(
+            DockerSecurityPolicy::default().validate_spec(&spec),
+            Err(DockerSecurityError::InvalidSocketBridge)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_extra_mount_source_symlink_to_forbidden_path() {
@@ -409,13 +463,12 @@ mod tests {
             memory_mib: 512,
             disk_mib: 10240,
             pids_limit: None,
-            container_port: 5432,
-            public_backend_port: None,
             data_path: PathBuf::from("/var/lib/databases-everywhere/instances/inst_abc/data"),
             data_target: "/var/lib/postgresql".to_string(),
             logs_path: PathBuf::from("/var/log/databases-everywhere/instances/inst_abc"),
             logs_target: "/logs".to_string(),
             extra_mounts: Vec::new(),
+            socket_bridges: Vec::new(),
             env: vec![DockerEnv {
                 key: "POSTGRES_PASSWORD".to_string(),
                 value: SecretString::from("secret"),

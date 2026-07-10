@@ -4,19 +4,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::Serialize;
 use tokio::time::sleep;
 
 use crate::{
     api::{
+        api_response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         artifacts::{ArtifactInfo, DeleteArtifactResponse},
-        handlers::{ApiError, ApiResult, authorize_scope},
+        public_diagnostic::PublicDiagnostic,
         routes::AppState,
+        security_policy::{
+            ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy,
+        },
     },
     auth::scopes,
     instances::metadata::{InstanceMetadata, InstanceStatus},
@@ -51,16 +51,15 @@ pub struct RestoreBackupResponse {
 pub struct SkippedBackup {
     pub instance_id: String,
     pub protocol: Protocol,
-    pub reason: String,
+    pub reason: PublicDiagnostic,
 }
 
 pub async fn backup_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<BackupStatusResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_ADMIN)?;
-    Ok(Json(BackupStatusResponse {
+    auth.require_scope(scopes::BACKUPS_ADMIN)?;
+    Ok(ApiResponse::ok(BackupStatusResponse {
         enabled: state.config.backups.enabled,
         interval_minutes: state.config.backups.interval_minutes,
         run_on_startup: state.config.backups.run_on_startup,
@@ -72,52 +71,53 @@ pub async fn backup_status(
 
 pub async fn list_instance_backups(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<Vec<ArtifactInfo>> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_READ)?;
+    auth.require_scope(scopes::BACKUPS_READ)?;
     ensure_instance_exists(&state, &instance_id).await?;
-    Ok(Json(read_instance_backups(&state, &instance_id).await?))
+    Ok(ApiResponse::ok(
+        read_instance_backups(&state, &instance_id).await?,
+    ))
 }
 
 pub async fn run_instance_backup(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<ArtifactInfo> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_WRITE)?;
-    Ok(Json(backup_instance(&state, &instance_id).await?))
+    auth.require_scope(scopes::BACKUPS_WRITE)?;
+    Ok(ApiResponse::ok(
+        backup_instance(&state, &instance_id).await?,
+    ))
 }
 
 pub async fn run_all_backups(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<RunBackupResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_ADMIN)?;
-    Ok(Json(backup_all_instances(&state).await))
+    auth.require_scope(scopes::BACKUPS_ADMIN)?;
+    Ok(ApiResponse::ok(backup_all_instances(&state).await))
 }
 
 pub async fn delete_instance_backup(
     State(state): State<AppState>,
-    Path((instance_id, backup_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
 ) -> ApiResult<DeleteArtifactResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_WRITE)?;
+    auth.require_scope(scopes::BACKUPS_WRITE)?;
     ensure_instance_exists(&state, &instance_id).await?;
     delete_instance_backup_by_id(&state, &instance_id, backup_id).await
 }
 
 pub async fn restore_instance_backup(
     State(state): State<AppState>,
-    Path((instance_id, backup_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
+    ApiJson(confirmation): ApiJson<DestructiveActionConfirmation>,
 ) -> ApiResult<RestoreBackupResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::BACKUPS_WRITE)?;
+    auth.require_scope(scopes::RECOVERY_ADMIN)?;
+    let authorization = DestructiveActionPolicy::authorize("backup restore", &confirmation)?;
     let _operation = state.instance_locks.lock(&instance_id).await;
     let metadata = state
         .instances
@@ -146,8 +146,13 @@ pub async fn restore_instance_backup(
     }
     crate::api::import_export::finish_physical_operation(&state, &instance_id, was_running, result)
         .await?;
-    tracing::info!(event = "audit backup_restored", instance_id, backup_id);
-    Ok(Json(RestoreBackupResponse {
+    tracing::info!(
+        event = "audit backup_restored",
+        instance_id,
+        backup_id,
+        reason = authorization.reason(),
+    );
+    Ok(ApiResponse::ok(RestoreBackupResponse {
         instance_id,
         backup_id,
         restored: true,
@@ -164,7 +169,7 @@ async fn delete_instance_backup_by_id(
         Ok(()) => {
             crate::api::artifacts::remove_checksum_sidecar(&path).await;
             tracing::info!(event = "audit backup_deleted", instance_id, backup_id);
-            Ok(Json(DeleteArtifactResponse {
+            Ok(ApiResponse::ok(DeleteArtifactResponse {
                 id: backup_id,
                 deleted: true,
             }))
@@ -225,13 +230,13 @@ pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse 
                 Err(error) => skipped.push(SkippedBackup {
                     instance_id: metadata.instance_id,
                     protocol: metadata.protocol,
-                    reason: error.to_string(),
+                    reason: PublicDiagnostic::from_api_error("instance backup", &error),
                 }),
             },
             Err(error) => skipped.push(SkippedBackup {
                 instance_id: metadata.instance_id,
                 protocol: metadata.protocol,
-                reason: error.to_string(),
+                reason: PublicDiagnostic::from_api_error("instance backup", &error),
             }),
         }
     }

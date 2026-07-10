@@ -95,20 +95,38 @@ async fn reconcile_metadata(
         .await
     {
         Ok(inspection) => {
+            let socket_backend = matches!(metadata.backend, BackendEndpoint::UnixSocket { .. });
+            if inspection.network_mode.as_deref() != Some("none") || !socket_backend {
+                if matches!(
+                    inspection.status,
+                    DockerContainerStatus::Running | DockerContainerStatus::Starting
+                ) && let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
+                {
+                    tracing::error!(
+                        %error,
+                        instance_id = %metadata.instance_id,
+                        "failed to stop legacy networked container during quarantine"
+                    );
+                }
+                tracing::warn!(
+                    event = "audit legacy_networked_instance_quarantined",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    network_mode = ?inspection.network_mode,
+                    socket_backend,
+                    "quarantined instance that does not satisfy network-none socket isolation; recreate it before reopening gateways"
+                );
+                metadata.status = InstanceStatus::Quarantined;
+                metadata.updated_at = now_rfc3339();
+                return metadata;
+            }
             metadata.status = match inspection.status {
                 DockerContainerStatus::Running => InstanceStatus::Running,
                 DockerContainerStatus::Starting => InstanceStatus::Creating,
                 DockerContainerStatus::Stopped => InstanceStatus::Stopped,
                 DockerContainerStatus::Failed => InstanceStatus::Failed,
             };
-            if let (InstanceStatus::Running, Some(host)) = (metadata.status, inspection.network_ip)
-                && !docker.uses_rootless_podman()
-                && let BackendEndpoint::DockerTcp {
-                    host: current_host, ..
-                } = &mut metadata.backend
-            {
-                *current_host = host;
-            }
+            metadata.runtime.network_mode = "none".to_string();
         }
         Err(error) if error.is_not_found() => {
             metadata.status = InstanceStatus::Failed;

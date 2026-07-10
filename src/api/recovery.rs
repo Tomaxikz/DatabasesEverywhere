@@ -1,22 +1,22 @@
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{HeaderMap, Uri},
-};
+use axum::extract::State;
 use serde::Deserialize;
 
 use crate::{
     api::{
-        handlers::{ApiError, ApiResult, authorize_scope},
+        api_response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         import_export::ImportOptions,
         import_export::{ImportExportJobResponse, queue_export_instance, queue_import_instance},
         routes::AppState,
+        security_policy::{
+            ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy,
+        },
     },
     auth::scopes,
     jobs::import_export::{ImportExportAction, ImportExportStatus},
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestoreArtifactRequest {
     pub artifact_id: String,
     pub confirm: bool,
@@ -25,10 +25,9 @@ pub struct RestoreArtifactRequest {
 
 pub async fn failed_jobs(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
 ) -> ApiResult<Vec<ImportExportJobResponse>> {
-    authorize_scope(&state, &headers, &uri, scopes::RECOVERY_ADMIN)?;
+    auth.require_scope(scopes::RECOVERY_ADMIN)?;
     let jobs = state
         .import_export_jobs
         .list(None, Some(ImportExportStatus::Failed), 100)
@@ -38,16 +37,15 @@ pub async fn failed_jobs(
     for job in jobs {
         response.push(crate::api::import_export::public_job_response(job).await);
     }
-    Ok(Json(response))
+    Ok(ApiResponse::ok(response))
 }
 
 pub async fn retry_job(
     State(state): State<AppState>,
-    Path((instance_id, job_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    uri: Uri,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, job_id)): ApiPath<(String, String)>,
 ) -> ApiResult<ImportExportJobResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::RECOVERY_ADMIN)?;
+    auth.require_scope(scopes::RECOVERY_ADMIN)?;
     let job = state
         .import_export_jobs
         .get(&job_id)
@@ -86,27 +84,21 @@ pub async fn retry_job(
 
 pub async fn restore_artifact(
     State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-    headers: HeaderMap,
-    uri: Uri,
-    Json(request): Json<RestoreArtifactRequest>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+    ApiJson(request): ApiJson<RestoreArtifactRequest>,
 ) -> ApiResult<ImportExportJobResponse> {
-    authorize_scope(&state, &headers, &uri, scopes::RECOVERY_ADMIN)?;
-    if !request.confirm {
-        return Err(ApiError::BadRequest(
-            "restore requires confirm=true".to_string(),
-        ));
-    }
-    if request.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "restore requires a non-empty reason".to_string(),
-        ));
-    }
+    auth.require_scope(scopes::RECOVERY_ADMIN)?;
+    let confirmation = DestructiveActionConfirmation {
+        confirm: request.confirm,
+        reason: request.reason,
+    };
+    let authorization = DestructiveActionPolicy::authorize("recovery restore", &confirmation)?;
     tracing::info!(
         event = "audit recovery_restore_requested",
         instance_id,
         artifact_id = %request.artifact_id,
-        reason = %request.reason,
+        reason = authorization.reason(),
     );
     state
         .instances

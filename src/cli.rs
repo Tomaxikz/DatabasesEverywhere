@@ -18,12 +18,18 @@ use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    api::routes::{AppState, build_router},
+    api::{
+        progress::InstallProgressStore,
+        routes::{AppState, build_router},
+    },
     auth::api_token::ApiToken,
     config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
     constants::{self, defaults},
     disk::DiskLimiter,
-    gateway::{listeners, resolver::RouteResolver, security::GatewayConnectionLimiter},
+    gateway::{
+        listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
+        supervisor::GatewaySupervisor,
+    },
     instances::{
         manager::InstanceManager, metadata::InstanceStatus, paths::InstancePaths, reconcile,
         state::InstanceStore,
@@ -872,7 +878,7 @@ async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
         .remove_network()
         .await
         .context("failed to remove container network")?;
-    println!("removed {removed} managed containers and container network");
+    println!("removed {removed} managed containers and the legacy container network if present");
     Ok(())
 }
 
@@ -1404,6 +1410,9 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .context("failed to create runtime directories")?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
+    let socket_bridge_helper = crate::runtime::socket_bridge::install_helper(&config.paths)
+        .await
+        .context("failed to install the container socket bridge helper")?;
     tracing::info!("\n{}", startup_banner());
     for directory in runtime_directories {
         tracing::info!(
@@ -1428,6 +1437,10 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(
         path = %Path::new(&config.paths.locks).join(DAEMON_LOCK_FILE).display(),
         "exclusive daemon lock acquired"
+    );
+    tracing::info!(
+        path = %socket_bridge_helper.display(),
+        "private container socket bridge helper ready"
     );
     log_boot_configuration(&config, &config_path);
     ensure_fuse_quota_host_config(&config)
@@ -1505,18 +1518,9 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         response = %docker_ping,
         "container engine api reachable"
     );
-    docker
-        .ensure_network()
-        .await
-        .context("failed to ensure container network")?;
     tracing::info!(
         engine = %docker.engine_name(),
-        network = %config.daemon.network,
-        internal_network = config.daemon.internal_network,
-        subnet = ?config.daemon.ipam.subnet,
-        gateway = ?config.daemon.ipam.gateway,
-        allow_public_backend_ports = config.daemon.allow_public_backend_ports,
-        "container network ready"
+        "database containers will run with network_mode=none and private Unix sockets"
     );
     let disk_limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
     disk_limiter
@@ -1549,10 +1553,13 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         "instance metadata reconciled"
     );
     let shutdown_jobs = import_export_jobs.clone();
+    let install_progress = InstallProgressStore::default();
+    let shutdown_creations = install_progress.clone();
     let instance_locks = crate::instances::locks::InstanceLocks::default();
     let state = AppState {
         config: config.clone(),
         config_path: config_path.clone(),
+        config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
         api_token: ApiToken::from_config(&config),
         instances: store,
         manager,
@@ -1562,28 +1569,46 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         api_rate_limiter: crate::api::security::ApiRateLimiter::new(
             config.security.api_rate_limit_per_minute,
         ),
-        install_progress: crate::api::progress::InstallProgressStore::default(),
+        install_progress,
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::resources::ResourceCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+        gateway_supervisor: GatewaySupervisor::new(),
     };
     crate::api::resources::start_resource_sampler(state.clone());
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
     );
     tokio::spawn(complete_managed_runtime_boot(state.clone()));
-    let server_result = serve_api(&config, build_router(state), shutdown_jobs.clone()).await;
+    let gateway_supervisor = state.gateway_supervisor.clone();
+    let server_result = serve_api(
+        &config,
+        build_router(state),
+        shutdown_jobs.clone(),
+        shutdown_creations.clone(),
+        gateway_supervisor,
+    )
+    .await;
     shutdown_jobs.close_admission();
-    if !shutdown_jobs
-        .wait_for_drain(IMPORT_EXPORT_DRAIN_TIMEOUT)
-        .await
-    {
+    shutdown_creations.close_creation_admission();
+    let (jobs_drained, creations_drained) = tokio::join!(
+        shutdown_jobs.wait_for_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
+        shutdown_creations.wait_for_creation_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
+    );
+    if !jobs_drained {
         anyhow::bail!(
             "timed out after {} seconds waiting for import/export jobs to finish safely",
             IMPORT_EXPORT_DRAIN_TIMEOUT.as_secs()
         );
     }
+    if !creations_drained {
+        anyhow::bail!(
+            "timed out after {} seconds waiting for instance creations to finish safely",
+            IMPORT_EXPORT_DRAIN_TIMEOUT.as_secs()
+        );
+    }
     tracing::info!("active import/export jobs drained");
+    tracing::info!("active instance creations drained");
     server_result
 }
 
@@ -1600,6 +1625,9 @@ async fn complete_managed_runtime_boot(state: AppState) {
             %error,
             "managed instance background startup failed; API remains available and database gateways remain closed"
         );
+        state
+            .gateway_supervisor
+            .fail_and_stop("managed instance startup failed");
         return;
     }
     if !state.import_export_jobs.is_accepting() {
@@ -1619,6 +1647,9 @@ async fn complete_managed_runtime_boot(state: AppState) {
                 %error,
                 "legacy PostgreSQL role hardening failed; API remains available and database gateways remain closed"
             );
+            state
+                .gateway_supervisor
+                .fail_and_stop("postgres role hardening failed");
             return;
         }
     };
@@ -1631,7 +1662,13 @@ async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
-    if let Err(error) = start_gateway_listeners(&state.config, state.instances.clone()) {
+    if let Err(error) = start_gateway_listeners(
+        &state.config,
+        state.instances.clone(),
+        state.gateway_supervisor.clone(),
+    )
+    .await
+    {
         tracing::error!(
             %error,
             "database gateway startup failed; API remains available"
@@ -1738,17 +1775,9 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         fuse_quota_binary = %config.disk.fuse_quota_binary(),
         "disk limiter configured"
     );
-    if config.security.allow_private_remote_imports {
-        tracing::warn!(
-            allowed_hosts = ?config.security.remote_import_allowed_hosts,
-            "private remote imports are enabled"
-        );
-    } else {
-        tracing::info!(
-            allowed_hosts = ?config.security.remote_import_allowed_hosts,
-            "private remote imports blocked by default"
-        );
-    }
+    tracing::info!(
+        "remote credential imports disabled because database containers have no network interface"
+    );
 }
 
 fn log_api_host_resolution(config: &Config) {
@@ -2364,6 +2393,10 @@ fn configured_runtime_roots(config: &Config) -> Vec<String> {
     vec![
         config.paths.data.clone(),
         config.paths.metadata_root(),
+        format!(
+            "{}/runtime",
+            config.paths.metadata_root().trim_end_matches('/')
+        ),
         config.paths.volumes_root(),
         config.paths.backups_root(),
         config.paths.logs.clone(),
@@ -2390,97 +2423,257 @@ async fn validate_runtime_support(config: &Config) -> anyhow::Result<()> {
         .context("failed to verify disk limiter support")
 }
 
-fn start_gateway_listeners(config: &Config, store: InstanceStore) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy)]
+enum GatewayListenerKind {
+    Postgres,
+    Redis,
+    Mariadb,
+    Mongodb,
+    Clickhouse,
+    ClickhouseHttp,
+    Qdrant,
+}
+
+impl GatewayListenerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Redis => "redis",
+            Self::Mariadb => "mariadb",
+            Self::Mongodb => "mongodb",
+            Self::Clickhouse => "clickhouse",
+            Self::ClickhouseHttp => "clickhouse_http",
+            Self::Qdrant => "qdrant",
+        }
+    }
+}
+
+struct PreparedGatewayListener {
+    kind: GatewayListenerKind,
+    bind: String,
+    listener: TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    limiter: GatewayConnectionLimiter,
+}
+
+impl PreparedGatewayListener {
+    async fn bind(
+        kind: GatewayListenerKind,
+        bind: String,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+        connection_limit: u32,
+    ) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("failed to bind {} listener on {bind}", kind.as_str()))?;
+        Ok(Self {
+            kind,
+            bind,
+            listener,
+            tls,
+            limiter: GatewayConnectionLimiter::new(connection_limit),
+        })
+    }
+
+    async fn run(
+        self,
+        resolver: RouteResolver,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), listeners::ListenerError> {
+        let Self {
+            kind,
+            bind,
+            listener,
+            tls,
+            limiter,
+        } = self;
+        match kind {
+            GatewayListenerKind::Postgres => {
+                listeners::run_postgres_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+            GatewayListenerKind::Redis => {
+                listeners::run_redis_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+            GatewayListenerKind::Mariadb => {
+                listeners::run_mariadb_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+            GatewayListenerKind::Mongodb => {
+                listeners::run_mongodb_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+            GatewayListenerKind::Clickhouse => {
+                listeners::run_clickhouse_listener(
+                    listener, &bind, resolver, tls, limiter, shutdown,
+                )
+                .await
+            }
+            GatewayListenerKind::ClickhouseHttp => {
+                listeners::run_clickhouse_http_listener(
+                    listener, &bind, resolver, tls, limiter, shutdown,
+                )
+                .await
+            }
+            GatewayListenerKind::Qdrant => {
+                listeners::run_qdrant_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+        }
+    }
+}
+
+async fn start_gateway_listeners(
+    config: &Config,
+    store: InstanceStore,
+    supervisor: GatewaySupervisor,
+) -> anyhow::Result<()> {
+    let connection_limit = config.security.db_connection_limit_per_minute;
+    let expected = usize::from(config.postgres.enabled)
+        + usize::from(config.redis.enabled)
+        + usize::from(config.mariadb.enabled)
+        + usize::from(config.mongodb.enabled)
+        + usize::from(config.clickhouse.enabled) * 2
+        + usize::from(config.qdrant.enabled);
+    if !supervisor.begin(expected) {
+        anyhow::bail!("daemon shutdown started before gateway listeners were bound");
+    }
+
+    let prepared = prepare_gateway_listeners(config, connection_limit).await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            supervisor.fail_and_stop("gateway listener bind failed");
+            return Err(error);
+        }
+    };
+    if supervisor.is_stopping() {
+        anyhow::bail!("daemon shutdown started while gateway listeners were binding");
+    }
     let resolver = RouteResolver::new(store);
-    let db_connection_limit_per_minute = config.security.db_connection_limit_per_minute;
+    let mut listeners = tokio::task::JoinSet::new();
+    for listener in prepared {
+        let protocol = listener.kind.as_str();
+        let resolver = resolver.clone();
+        let shutdown = supervisor.subscribe_shutdown();
+        listeners.spawn(async move {
+            let result = listener.run(resolver, shutdown).await;
+            (protocol, result)
+        });
+    }
+    supervisor.mark_ready();
+
+    if expected == 0 {
+        return Ok(());
+    }
+    tokio::spawn(async move {
+        while let Some(outcome) = listeners.join_next().await {
+            if supervisor.is_stopping() {
+                continue;
+            }
+            let failure = match outcome {
+                Ok((protocol, Ok(()))) => format!("{protocol} listener stopped unexpectedly"),
+                Ok((protocol, Err(error))) => {
+                    tracing::error!(%error, protocol, "database listener stopped");
+                    format!("{protocol} listener stopped")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "database listener task failed");
+                    "database listener task failed".to_string()
+                }
+            };
+            supervisor.fail_and_stop(failure);
+            listeners.abort_all();
+            while listeners.join_next().await.is_some() {}
+            return;
+        }
+    });
+    Ok(())
+}
+
+async fn prepare_gateway_listeners(
+    config: &Config,
+    connection_limit: u32,
+) -> anyhow::Result<Vec<PreparedGatewayListener>> {
+    let mut prepared = Vec::new();
     if config.postgres.enabled {
-        let bind = config.postgres.bind.clone();
-        let resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.postgres.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) =
-                listeners::run_postgres_listener(&bind, resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "postgres listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Postgres,
+                config.postgres.bind.clone(),
+                listener_tls(config.postgres.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
     }
-
     if config.redis.enabled {
-        let bind = config.redis.bind.clone();
-        let resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.redis.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) = listeners::run_redis_listener(&bind, resolver, tls, limiter).await {
-                tracing::error!(%error, "redis listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Redis,
+                config.redis.bind.clone(),
+                listener_tls(config.redis.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
     }
-
     if config.mariadb.enabled {
-        let bind = config.mariadb.bind.clone();
-        let resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.mariadb.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) = listeners::run_mariadb_listener(&bind, resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "mariadb listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Mariadb,
+                config.mariadb.bind.clone(),
+                listener_tls(config.mariadb.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
     }
     if config.mongodb.enabled {
-        let bind = config.mongodb.bind.clone();
-        let resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.mongodb.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) = listeners::run_mongodb_listener(&bind, resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "mongodb listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Mongodb,
+                config.mongodb.bind.clone(),
+                listener_tls(config.mongodb.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
     }
     if config.clickhouse.enabled {
-        let bind = config.clickhouse.bind.clone();
-        let native_resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
         let tls = listener_tls(config.clickhouse.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) =
-                listeners::run_clickhouse_listener(&bind, native_resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "clickhouse listener stopped");
-            }
-        });
-
-        let bind = config.clickhouse.http_bind.clone();
-        let http_resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.clickhouse.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) =
-                listeners::run_clickhouse_http_listener(&bind, http_resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "clickhouse http listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Clickhouse,
+                config.clickhouse.bind.clone(),
+                tls.clone(),
+                connection_limit,
+            )
+            .await?,
+        );
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::ClickhouseHttp,
+                config.clickhouse.http_bind.clone(),
+                tls,
+                connection_limit,
+            )
+            .await?,
+        );
     }
     if config.qdrant.enabled {
-        let bind = config.qdrant.bind.clone();
-        let resolver = resolver.clone();
-        let limiter = GatewayConnectionLimiter::new(db_connection_limit_per_minute);
-        let tls = listener_tls(config.qdrant.tls, config)?;
-        tokio::spawn(async move {
-            if let Err(error) = listeners::run_qdrant_listener(&bind, resolver, tls, limiter).await
-            {
-                tracing::error!(%error, "qdrant listener stopped");
-            }
-        });
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Qdrant,
+                config.qdrant.bind.clone(),
+                listener_tls(config.qdrant.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
     }
-    Ok(())
+    Ok(prepared)
 }
 
 fn listener_tls(
@@ -2499,10 +2692,19 @@ async fn serve_api(
     config: &Config,
     router: Router,
     import_export_jobs: ImportExportJobs,
+    install_progress: InstallProgressStore,
+    gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind = config.api.bind_addr();
     if config.api.ssl.enabled {
-        return serve_api_tls(config, router, import_export_jobs).await;
+        return serve_api_tls(
+            config,
+            router,
+            import_export_jobs,
+            install_progress,
+            gateway_supervisor,
+        )
+        .await;
     }
 
     let listener = TcpListener::bind(&bind)
@@ -2519,7 +2721,11 @@ async fn serve_api(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(import_export_jobs))
+    .with_graceful_shutdown(shutdown_signal(
+        import_export_jobs,
+        install_progress,
+        gateway_supervisor,
+    ))
     .await
     .context("api server failed")
 }
@@ -2528,6 +2734,8 @@ async fn serve_api_tls(
     config: &Config,
     router: Router,
     import_export_jobs: ImportExportJobs,
+    install_progress: InstallProgressStore,
+    gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind_addr = config.api.bind_addr();
     let listener = std::net::TcpListener::bind(&bind_addr)
@@ -2554,7 +2762,7 @@ async fn serve_api_tls(
     let handle = Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
-        shutdown_signal(import_export_jobs).await;
+        shutdown_signal(import_export_jobs, install_progress, gateway_supervisor).await;
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
     });
 
@@ -2625,12 +2833,18 @@ fn rustls_config_with_client_ca(
     Ok(Arc::new(config))
 }
 
-async fn shutdown_signal(import_export_jobs: ImportExportJobs) {
+async fn shutdown_signal(
+    import_export_jobs: ImportExportJobs,
+    install_progress: InstallProgressStore,
+    gateway_supervisor: GatewaySupervisor,
+) {
     let signal = wait_for_termination_signal().await;
     import_export_jobs.close_admission();
+    install_progress.close_creation_admission();
+    gateway_supervisor.shutdown();
     tracing::info!(
         signal,
-        "shutdown signal received; import/export admission closed"
+        "shutdown signal received; background operation admission closed"
     );
 }
 

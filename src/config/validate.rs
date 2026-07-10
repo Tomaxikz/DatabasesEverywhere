@@ -3,7 +3,10 @@ use std::{
     path::Path,
 };
 
-use super::{ApiSslConfig, ClickhouseConfig, Config, DiskLimitMode, ListenerConfig, TlsConfig};
+use super::{
+    ApiSslConfig, ClickhouseConfig, Config, DiskLimitMode, ListenerConfig, TlsConfig,
+    path_policy::{HostPathPolicy, HostPathPolicyError},
+};
 use crate::shared::images::is_pinned_image_reference;
 
 #[derive(Debug, thiserror::Error)]
@@ -36,18 +39,12 @@ pub enum ConfigValidationError {
         "public api bind {value} requires api.ssl.enabled=true with a valid certificate and key"
     )]
     PublicApiRequiresTls { value: String },
-    #[error("daemon.network must not be empty")]
-    EmptyDaemonNetwork,
-    #[error("{field} must be a CIDR subnet: {value}")]
-    InvalidCidr { field: &'static str, value: String },
-    #[error("{field} must be an IP address: {value}")]
-    InvalidIp { field: &'static str, value: String },
-    #[error("daemon.ipam.gateway requires daemon.ipam.subnet")]
-    GatewayRequiresSubnet,
     #[error("{field} must be an absolute path: {value}")]
     RelativePath { field: &'static str, value: String },
     #[error("{field} must not contain parent directory segments: {value}")]
     ParentPath { field: &'static str, value: String },
+    #[error(transparent)]
+    UnsafeRuntimePath(#[from] HostPathPolicyError),
     #[error("{field} TLS requires both cert and key")]
     IncompleteTls { field: &'static str },
     #[error("{field} TLS cert does not exist: {path}")]
@@ -118,26 +115,11 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
         return Err(ConfigValidationError::InvalidBackupRetentionKeepLatest);
     }
 
-    if config.daemon.network.trim().is_empty() {
-        return Err(ConfigValidationError::EmptyDaemonNetwork);
-    }
     if let Some(socket_path) = config.daemon.configured_socket_path() {
         validate_absolute_path("daemon.socket_path", socket_path)?;
     }
-    validate_daemon_ipam(&config.daemon.ipam)?;
 
-    validate_absolute_path("paths.data", &config.paths.data)?;
-    validate_absolute_path("paths.metadata", &config.paths.metadata_root())?;
-    validate_absolute_path("paths.volumes", &config.paths.volumes_root())?;
-    validate_absolute_path("paths.backups", &config.paths.backups_root())?;
-    validate_absolute_path("paths.sockets", &config.paths.sockets)?;
-    validate_absolute_path("paths.locks", &config.paths.locks)?;
-    validate_absolute_path("paths.logs", &config.paths.logs)?;
-    validate_absolute_path("paths.artifacts", &config.paths.artifacts)?;
-    validate_absolute_path("paths.exports", &config.paths.exports_root())?;
-    validate_absolute_path("paths.imports", &config.paths.imports_root())?;
-    validate_absolute_path("paths.fuse", &config.paths.fuse_root())?;
-    validate_absolute_path("paths.tmp", &config.paths.tmp_root())?;
+    HostPathPolicy::validate(&config.paths)?;
     validate_images(&config.images)?;
     validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
 
@@ -327,26 +309,6 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
     Ok(())
 }
 
-fn validate_daemon_ipam(
-    ipam: &crate::config::DaemonNetworkIpam,
-) -> Result<(), ConfigValidationError> {
-    if ipam.subnet.trim().is_empty() && !ipam.gateway.trim().is_empty() {
-        return Err(ConfigValidationError::GatewayRequiresSubnet);
-    }
-    if !ipam.subnet.trim().is_empty() {
-        validate_cidr("daemon.ipam.subnet", &ipam.subnet)?;
-    }
-    if !ipam.gateway.trim().is_empty() {
-        ipam.gateway.parse::<IpAddr>().map(|_| ()).map_err(|_| {
-            ConfigValidationError::InvalidIp {
-                field: "daemon.ipam.gateway",
-                value: ipam.gateway.clone(),
-            }
-        })?;
-    }
-    Ok(())
-}
-
 fn validate_listener(
     name: &'static str,
     listener: &ListenerConfig,
@@ -446,39 +408,13 @@ fn validate_bind(field: &'static str, value: &str) -> Result<(), ConfigValidatio
         })
 }
 
-fn validate_cidr(field: &'static str, value: &str) -> Result<(), ConfigValidationError> {
-    let Some((ip, prefix)) = value.split_once('/') else {
-        return Err(ConfigValidationError::InvalidCidr {
-            field,
-            value: value.to_string(),
-        });
-    };
-    let ip: IpAddr = ip.parse().map_err(|_| ConfigValidationError::InvalidCidr {
-        field,
-        value: value.to_string(),
-    })?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| ConfigValidationError::InvalidCidr {
-            field,
-            value: value.to_string(),
-        })?;
-    let max_prefix = match ip {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if prefix > max_prefix {
-        return Err(ConfigValidationError::InvalidCidr {
-            field,
-            value: value.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn validate_api_hosts(config: &Config) -> Result<(), ConfigValidationError> {
     if super::url_host(&config.remote).is_none() {
         return Err(ConfigValidationError::InvalidRemoteUrl);
+    }
+
+    for host in &config.api.trusted_hosts {
+        validate_api_host(host)?;
     }
 
     Ok(())
@@ -566,7 +502,10 @@ mod tests {
 
         let error = validate_config(&config).unwrap_err();
 
-        assert!(matches!(error, ConfigValidationError::RelativePath { .. }));
+        assert!(matches!(
+            error,
+            ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::Relative { .. })
+        ));
     }
 
     #[test]
@@ -671,10 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn public_api_requires_native_tls_even_with_legacy_development_override() {
+    fn public_api_requires_native_tls() {
         let mut config = valid_config();
         config.api.host = "0.0.0.0".to_string();
-        config.security.allow_insecure_public_listeners = true;
 
         assert!(matches!(
             validate_config(&config).unwrap_err(),
@@ -733,29 +671,6 @@ mod tests {
         config.tls.key = private_key.display().to_string();
 
         validate_config(&config).unwrap();
-    }
-
-    #[test]
-    fn rejects_invalid_daemon_ipam() {
-        let mut config = valid_config();
-        config.daemon.ipam.subnet = "172.30.0.0".to_string();
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(error, ConfigValidationError::InvalidCidr { .. }));
-    }
-
-    #[test]
-    fn rejects_daemon_gateway_without_subnet() {
-        let mut config = valid_config();
-        config.daemon.ipam.gateway = "172.30.0.1".to_string();
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ConfigValidationError::GatewayRequiresSubnet
-        ));
     }
 
     #[test]
@@ -886,6 +801,24 @@ mod tests {
 
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
         assert_eq!(config.cors_allowed_hosts(), vec!["panel.example.com"]);
+        assert_eq!(
+            config.request_allowed_hosts(),
+            vec!["panel.example.com", "127.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_reverse_proxy_host() {
+        let mut config = valid_config();
+        config.api.trusted_hosts = vec!["node.example.com".to_string()];
+
+        validate_config(&config).unwrap();
+
+        assert!(
+            config
+                .request_allowed_hosts()
+                .contains(&"node.example.com".to_string())
+        );
     }
 
     #[test]

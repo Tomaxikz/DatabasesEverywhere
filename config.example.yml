@@ -46,6 +46,10 @@ api:
   # 0.0.0.0 and enable the native TLS settings below.
   host: 127.0.0.1
   port: 8090
+  # Hostnames accepted in the HTTP Host header in addition to `remote` and the
+  # concrete bind host. Add the daemon/reverse-proxy hostname when it differs
+  # from the panel hostname. Ports are ignored during host comparison.
+  trusted_hosts: []
   ssl:
     enabled: false
     cert: ''
@@ -57,11 +61,6 @@ security:
   api_body_limit_bytes: 1048576
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
-  # Allows credential imports from remote databases without TLS. This does not
-  # affect gateway binds or the management API's loopback-only requirement.
-  allow_insecure_public_listeners: false
-  allow_private_remote_imports: false
-  remote_import_allowed_hosts: []
   # API self-upgrade is intentionally unsupported; use signed packages or a
   # digest-pinned container rollout. Validation rejects true.
   self_upgrade_enabled: false
@@ -99,13 +98,8 @@ daemon:
   engine: docker
   # Optional. Leave empty for default socket discovery.
   socket_path: ""
-  network: databases-everywhere
-  # Restricts containers on the managed network from external network access.
-  internal_network: true
-  ipam:
-    subnet: 172.30.0.0/16
-    gateway: 172.30.0.1
-  allow_public_backend_ports: false
+  # Database containers always use network_mode=none. The daemon reaches
+  # each backend through its private, instance-specific Unix socket.
   # Optional Docker HostConfig hardening knobs.
   container_read_only_rootfs: false
   container_userns_mode: ''
