@@ -507,8 +507,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        self.stop(protocol, instance_id).await?;
-        self.start(protocol, instance_id).await
+        let name = self.container_name(protocol, instance_id)?;
+        self.docker.restart_container(&name, None).await?;
+        Ok(CommandOutput::empty())
     }
 
     pub async fn kill(
@@ -1504,6 +1505,16 @@ impl DockerError {
             self,
             Self::Api(BollardError::DockerResponseServerError {
                 status_code: 404,
+                ..
+            })
+        )
+    }
+
+    pub fn is_not_running(&self) -> bool {
+        matches!(
+            self,
+            Self::Api(BollardError::DockerResponseServerError {
+                status_code: 304,
                 ..
             })
         )

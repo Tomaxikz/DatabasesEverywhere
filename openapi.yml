@@ -101,7 +101,7 @@ components:
           $ref: "#/components/schemas/Protocol"
         status:
           type: string
-          enum: [creating, running, stopped, failed, quarantined, deleting]
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
         public:
           type: object
           required: [host, port]
@@ -187,7 +187,7 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled]
+      required: [service, version, api_version, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
@@ -214,13 +214,14 @@ components:
         clickhouse_http_bind: {type: string}
         clickhouse_http_port: {type: integer}
         qdrant_enabled: {type: boolean}
-    HeartbeatResponse:
-      type: object
-      required: [status, gateways]
-      properties:
-        status: {type: string, enum: [ok, not_ready]}
         gateways:
           $ref: "#/components/schemas/GatewayReadiness"
+    HeartbeatResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, const: ok}
     GatewayReadiness:
       type: object
       additionalProperties: false
@@ -237,7 +238,7 @@ components:
         instance_id: {type: string}
         status:
           type: string
-          enum: [creating, running, stopped, failed, quarantined, deleting]
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
         progress:
           $ref: "#/components/schemas/InstallProgress"
     CreateInstanceAcceptedResponse:
@@ -700,19 +701,14 @@ paths:
                 $ref: "#/components/schemas/ConfigPatchResponse"
   /api/heartbeat:
     get:
-      summary: Lightweight authenticated health check.
+      summary: Lightweight authenticated API liveness check.
+      description: Returns success when the authenticated management API is reachable, independently of database instance and gateway readiness.
       x-required-scope: system:read
       responses:
         default:
           $ref: "#/components/responses/ApiError"
         "200":
           description: Heartbeat response.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HeartbeatResponse"
-        "503":
-          description: API is alive but one or more database gateways are not ready.
           content:
             application/json:
               schema:
@@ -732,7 +728,7 @@ paths:
                 type: string
   /api/instances:
     get:
-      summary: List database instances.
+      summary: List database instances with their live classified container statuses.
       x-required-scope: instances:read
       responses:
         default:
@@ -779,7 +775,7 @@ paths:
         schema:
           type: string
     get:
-      summary: Get one instance.
+      summary: Get one instance with its live classified container status.
       x-required-scope: instances:read
       responses:
         default:

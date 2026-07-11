@@ -508,7 +508,23 @@ pub mod import_export {
             entries += 1;
             validate_archive_limits(started, entries, bytes, DATA_ARCHIVE_LIMITS)?;
             validate_archive_path(&path, expected_root, DATA_ARCHIVE_LIMITS.depth)?;
-            validate_entry_type(entry.header().entry_type())?;
+            let entry_type = entry.header().entry_type();
+            validate_entry_type(entry_type)?;
+            if entry_type.is_symlink() {
+                if entry.header().size()? != 0 {
+                    return Err(ImportExportError::InvalidArchive(format!(
+                        "symbolic link {} has non-zero size",
+                        path.display()
+                    )));
+                }
+                let link_name = entry.link_name()?.ok_or_else(|| {
+                    ImportExportError::InvalidArchive(format!(
+                        "symbolic link {} has no target",
+                        path.display()
+                    ))
+                })?;
+                validate_archive_symlink(&path, &link_name, expected_root)?;
+            }
             bytes = bytes.checked_add(entry.header().size()?).ok_or_else(|| {
                 ImportExportError::InvalidArchive("archive size overflow".to_string())
             })?;
@@ -550,13 +566,70 @@ pub mod import_export {
     }
 
     fn validate_entry_type(entry_type: EntryType) -> Result<(), ImportExportError> {
-        if entry_type.is_file() || entry_type.is_dir() {
+        if entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink() {
             Ok(())
         } else {
             Err(ImportExportError::InvalidArchive(
-                "archive may only contain files and directories".to_string(),
+                "archive may only contain files, directories, and safe symbolic links".to_string(),
             ))
         }
+    }
+
+    fn validate_archive_symlink(
+        path: &Path,
+        link_name: &Path,
+        expected_root: &str,
+    ) -> Result<(), ImportExportError> {
+        let parent = path.parent().ok_or_else(|| {
+            ImportExportError::InvalidArchive(format!(
+                "symbolic link {} has no parent",
+                path.display()
+            ))
+        })?;
+        let root = Path::new(expected_root);
+        resolve_link_within(parent, link_name, root).map(|_| ())
+    }
+
+    fn resolve_link_within(
+        parent: &Path,
+        link_name: &Path,
+        root: &Path,
+    ) -> Result<PathBuf, ImportExportError> {
+        if link_name.is_absolute() {
+            return Err(ImportExportError::InvalidArchive(format!(
+                "symbolic link target must be relative: {}",
+                link_name.display()
+            )));
+        }
+
+        let mut resolved = parent.to_path_buf();
+        if !resolved.starts_with(root) {
+            return Err(ImportExportError::InvalidArchive(format!(
+                "symbolic link parent escapes data root: {}",
+                parent.display()
+            )));
+        }
+        for component in link_name.components() {
+            match component {
+                Component::Normal(component) => resolved.push(component),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if resolved == root || !resolved.pop() || !resolved.starts_with(root) {
+                        return Err(ImportExportError::InvalidArchive(format!(
+                            "symbolic link target escapes data root: {}",
+                            link_name.display()
+                        )));
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(ImportExportError::InvalidArchive(format!(
+                        "unsafe symbolic link target: {}",
+                        link_name.display()
+                    )));
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     fn extract_archive_entries<R: Read>(
@@ -569,6 +642,7 @@ pub mod import_export {
         let started = Instant::now();
         let mut entries = 0_usize;
         let mut bytes = 0_u64;
+        let mut pending_symlinks = Vec::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
             entries += 1;
@@ -589,6 +663,23 @@ pub mod import_export {
                     path.display()
                 )));
             }
+            if entry_type.is_symlink() {
+                if entry_size != 0 {
+                    return Err(ImportExportError::InvalidArchive(format!(
+                        "symbolic link {} has non-zero size",
+                        path.display()
+                    )));
+                }
+                let link_name = entry.link_name()?.ok_or_else(|| {
+                    ImportExportError::InvalidArchive(format!(
+                        "symbolic link {} has no target",
+                        path.display()
+                    ))
+                })?;
+                validate_archive_symlink(&path, &link_name, expected_root)?;
+                pending_symlinks.push((target, link_name.into_owned()));
+                continue;
+            }
             if entry_type.is_dir() {
                 create_private_dir_all(&target)?;
                 continue;
@@ -600,7 +691,36 @@ pub mod import_export {
             copy_archive_entry(&mut entry, &mut output, entry_size, started, limits)?;
             output.flush()?;
         }
+        for (target, link_name) in pending_symlinks {
+            if let Some(parent) = target.parent() {
+                ensure_real_directory(parent)?;
+            }
+            match std::fs::symlink_metadata(&target) {
+                Ok(_) => {
+                    return Err(ImportExportError::InvalidArchive(format!(
+                        "symbolic link path conflicts with another archive entry: {}",
+                        target.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            create_symlink(&link_name, &target)?;
+        }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn create_symlink(link_name: &Path, target: &Path) -> Result<(), ImportExportError> {
+        std::os::unix::fs::symlink(link_name, target)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn create_symlink(_link_name: &Path, _target: &Path) -> Result<(), ImportExportError> {
+        Err(ImportExportError::InvalidArchive(
+            "symbolic links are not supported on this platform".to_string(),
+        ))
     }
 
     fn validate_archive_limits(
@@ -691,10 +811,20 @@ pub mod import_export {
                 validate_archive_path_depth(&archive_path, DATA_ARCHIVE_LIMITS.depth)?;
                 let metadata = std::fs::symlink_metadata(&source)?;
                 if metadata.file_type().is_symlink() {
-                    return Err(ImportExportError::InvalidArchive(format!(
-                        "data archive refuses symbolic link {}",
-                        source.display()
-                    )));
+                    let link_name = std::fs::read_link(&source)?;
+                    let parent = source.parent().ok_or_else(|| {
+                        ImportExportError::InvalidArchive(format!(
+                            "symbolic link {} has no parent",
+                            source.display()
+                        ))
+                    })?;
+                    resolve_link_within(parent, &link_name, data_dir)?;
+                    let mut header = tar::Header::new_gnu();
+                    header.set_metadata(&metadata);
+                    header.set_entry_type(EntryType::Symlink);
+                    header.set_size(0);
+                    builder.append_link(&mut header, &archive_path, &link_name)?;
+                    continue;
                 }
                 if metadata.is_dir() {
                     builder.append_dir(&archive_path, &source)?;
@@ -942,23 +1072,61 @@ pub mod import_export {
 
         #[cfg(unix)]
         #[test]
-        fn physical_backup_rejects_source_symlinks() {
+        fn physical_backup_preserves_internal_source_symlinks() {
             use std::os::unix::fs::symlink;
 
             let dir = tempfile::tempdir().unwrap();
             let data = dir.path().join("data");
-            let artifacts = dir.path().join("artifacts");
+            let stored = data.join("store/ab/table");
+            let metadata = data.join("metadata/database");
+            std::fs::create_dir_all(&stored).unwrap();
+            std::fs::create_dir_all(&metadata).unwrap();
+            std::fs::write(stored.join("part.bin"), b"clickhouse data").unwrap();
+            symlink("../../store/ab/table", metadata.join("table")).unwrap();
+            let artifact = dir.path().join("backup.tar.gz");
+            let restored = dir.path().join("restored");
+
+            create_data_archive_blocking(&data, &artifact).unwrap();
+            extract_data_archive_blocking(&artifact, &restored, "data").unwrap();
+
+            let link = restored.join("data/metadata/database/table");
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                Path::new("../../store/ab/table")
+            );
+            assert_eq!(
+                std::fs::read(link.join("part.bin")).unwrap(),
+                b"clickhouse data"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn physical_backup_rejects_source_symlinks_that_escape_data_root() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
             std::fs::create_dir(&data).unwrap();
-            std::fs::create_dir(&artifacts).unwrap();
-            let secret = dir.path().join("secret");
-            std::fs::write(&secret, b"host secret").unwrap();
-            symlink(&secret, data.join("escape")).unwrap();
-            let artifact = artifacts.join("backup.tar.gz");
+            std::fs::write(dir.path().join("secret"), b"host secret").unwrap();
+            symlink("../secret", data.join("escape")).unwrap();
+            let artifact = dir.path().join("backup.tar.gz");
 
             let error = create_data_archive_blocking(&data, &artifact).unwrap_err();
 
-            assert!(error.to_string().contains("refuses symbolic link"));
+            assert!(error.to_string().contains("escapes data root"));
             assert!(!artifact.exists());
+        }
+
+        #[test]
+        fn physical_restore_rejects_archive_symlinks_that_escape_data_root() {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("malicious.tar.gz");
+            write_symlink_archive(&archive, "data/escape", "../secret");
+
+            let error = validate_archive_blocking(&archive, "data").unwrap_err();
+
+            assert!(error.to_string().contains("escapes data root"));
         }
 
         #[cfg(unix)]
@@ -1119,6 +1287,19 @@ pub mod import_export {
             header.set_cksum();
             builder
                 .append(&header, Cursor::new(contents.to_vec()))
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        fn write_symlink_archive(path: &Path, entry_path: &str, link_name: &str) {
+            let file = File::create(path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, entry_path, link_name)
                 .unwrap();
             builder.into_inner().unwrap().finish().unwrap();
         }

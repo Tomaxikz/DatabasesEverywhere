@@ -256,6 +256,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_is_independent_of_gateway_readiness() {
+        let state = test_state().await;
+        state
+            .gateway_supervisor
+            .mark_failed("test gateway startup failure");
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/heartbeat")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await,
+            serde_json::json!({ "status": "ok" })
+        );
+    }
+
+    #[tokio::test]
     async fn authentication_precedes_json_deserialization() {
         let response = build_router(test_state().await)
             .oneshot(

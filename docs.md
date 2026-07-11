@@ -150,6 +150,11 @@ executable regular files in root-owned directories that are not writable by
 group or others. The config administration API cannot change either helper
 field, and builds never download executable code automatically.
 
+FuseQuota helpers belong to the daemon process lifecycle. On graceful shutdown,
+the daemon stops managed containers before unmounting their quota filesystems;
+on startup it remounts quotas and restarts existing FuseQuota-backed containers
+so Docker cannot retain a disconnected pre-restart bind mount.
+
 Recommended paths:
 
 ```yaml
@@ -334,15 +339,15 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime: a container whose health check is still starting is `booting`, a healthy container is `running`, and an exited container is `stopped`. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
-| GET | `/api/instances` | instances:read | List all instances |
+| GET | `/api/instances` | instances:read | List all instances with their live classified container statuses |
 | POST | `/api/instances` | instances:write | Accept instance creation and return `202` immediately |
-| GET | `/api/instances/{id}` | instances:read | Fetch one |
+| GET | `/api/instances/{id}` | instances:read | Fetch one with its live classified container status |
 | DELETE | `/api/instances/{id}?confirm=true&reason=customer%20requested%20deletion` | instances:write | Irreversibly delete the container, job history, imports, exports, backups, retained recovery/upgrade volumes, and all other managed instance data; confirmation and an audit reason are required |
 | GET | `/api/instances/{id}/status` | instances:read | Status plus creation progress while available |
 | POST | `/api/instances/{id}/power` | instances:write | Unified power API: `{ "action": "start" | "stop" | "restart" | "kill" }` |
@@ -733,7 +738,7 @@ Job objects are the same shape as the REST job response. When an export succeeds
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
-| GET | `/api/system` | system:read | Node identity, version, engine, which protocols are enabled |
+| GET | `/api/system` | system:read | Node identity, version, engine, enabled protocols, and gateway readiness |
 | PATCH | `/api/system/config` | config:admin | Merge a runtime config patch into `config.yml`; returns `restart_required: true` |
 | GET | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
@@ -744,8 +749,10 @@ The API listener becomes available after critical metadata, crash-recovery,
 container-engine, socket-isolation, and disk checks complete. Existing managed database
 containers then auto-start in a lock-protected background phase, so a slow or
 broken container does not hold node heartbeat or management endpoints offline.
-Heartbeat reports management API liveness, not that every database instance is
-ready; clients should check each instance's status before presenting it as ready.
+Heartbeat reports management API liveness only. It always returns
+`{"status":"ok"}` once an authenticated request reaches the handler, regardless
+of database instance or gateway state. Clients should use each instance's status
+for instance readiness and `/api/system.gateways` for listener startup state.
 Database gateways open after background startup and legacy PostgreSQL role
 hardening complete.
 

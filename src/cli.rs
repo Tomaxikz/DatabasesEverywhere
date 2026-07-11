@@ -1546,6 +1546,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .context("failed to reconcile instance metadata")?;
     tracing::info!(
         checked = reconcile_summary.checked,
+        booting = reconcile_summary.booting,
         running = reconcile_summary.running,
         stopped = reconcile_summary.stopped,
         failed = reconcile_summary.failed,
@@ -1579,11 +1580,11 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
     );
-    tokio::spawn(complete_managed_runtime_boot(state.clone()));
+    let managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
     let gateway_supervisor = state.gateway_supervisor.clone();
     let server_result = serve_api(
         &config,
-        build_router(state),
+        build_router(state.clone()),
         shutdown_jobs.clone(),
         shutdown_creations.clone(),
         gateway_supervisor,
@@ -1591,6 +1592,8 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     .await;
     shutdown_jobs.close_admission();
     shutdown_creations.close_creation_admission();
+    managed_runtime_boot.abort();
+    let _ = managed_runtime_boot.await;
     let (jobs_drained, creations_drained) = tokio::join!(
         shutdown_jobs.wait_for_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
         shutdown_creations.wait_for_creation_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
@@ -1609,6 +1612,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     tracing::info!("active import/export jobs drained");
     tracing::info!("active instance creations drained");
+    stop_fuse_backed_instances_for_shutdown(&state).await?;
     server_result
 }
 
@@ -1979,22 +1983,24 @@ async fn start_known_instances_on_boot(
     let mut failed = 0_usize;
 
     for snapshot in instances {
-        if !matches!(
-            snapshot.status,
-            InstanceStatus::Stopped | InstanceStatus::Failed
-        ) {
+        let Some(snapshot_action) = managed_boot_action(snapshot.status, config.disk.mode) else {
             continue;
-        }
+        };
 
         let _operation = instance_locks.lock(&snapshot.instance_id).await;
         let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
             continue;
         };
-        if !matches!(
-            metadata.status,
-            InstanceStatus::Stopped | InstanceStatus::Failed
-        ) {
+        let Some(action) = managed_boot_action(metadata.status, config.disk.mode) else {
             continue;
+        };
+        if action != snapshot_action {
+            tracing::debug!(
+                instance_id = %metadata.instance_id,
+                snapshot_action = snapshot_action.as_str(),
+                action = action.as_str(),
+                "managed instance boot action changed after acquiring its operation lock"
+            );
         }
 
         attempted += 1;
@@ -2002,7 +2008,8 @@ async fn start_known_instances_on_boot(
             instance_id = %metadata.instance_id,
             protocol = %metadata.protocol,
             previous_status = ?metadata.status,
-            "starting managed instance on daemon boot"
+            action = action.as_str(),
+            "activating managed instance on daemon boot"
         );
 
         let runtime_paths_ready = if let Err(error) =
@@ -2023,6 +2030,7 @@ async fn start_known_instances_on_boot(
         if !runtime_paths_ready {
             let reconciled = reconcile::reconcile_one(metadata, docker).await;
             match reconciled.status {
+                InstanceStatus::Booting => {}
                 InstanceStatus::Running => running += 1,
                 InstanceStatus::Stopped => stopped += 1,
                 InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
@@ -2032,7 +2040,17 @@ async fn start_known_instances_on_boot(
             continue;
         }
 
-        match docker.start(metadata.protocol, &metadata.instance_id).await {
+        let activation = match action {
+            ManagedBootAction::Start => {
+                docker.start(metadata.protocol, &metadata.instance_id).await
+            }
+            ManagedBootAction::Restart => {
+                docker
+                    .restart(metadata.protocol, &metadata.instance_id)
+                    .await
+            }
+        };
+        match activation {
             Ok(_) => {
                 if let Err(error) = docker
                     .wait_until_ready(
@@ -2057,7 +2075,7 @@ async fn start_known_instances_on_boot(
                     docker,
                     metadata.protocol,
                     &metadata.instance_id,
-                    "failed to start managed instance during daemon boot",
+                    "failed to activate managed instance during daemon boot",
                     error.to_string(),
                 )
                 .await;
@@ -2066,6 +2084,7 @@ async fn start_known_instances_on_boot(
 
         let reconciled = reconcile::reconcile_one(metadata, docker).await;
         match reconciled.status {
+            InstanceStatus::Booting => {}
             InstanceStatus::Running => running += 1,
             InstanceStatus::Stopped => stopped += 1,
             InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
@@ -2082,6 +2101,108 @@ async fn start_known_instances_on_boot(
         "daemon boot managed instance auto-start complete"
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedBootAction {
+    Start,
+    Restart,
+}
+
+impl ManagedBootAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+fn managed_boot_action(
+    status: InstanceStatus,
+    disk_mode: DiskLimitMode,
+) -> Option<ManagedBootAction> {
+    match status {
+        InstanceStatus::Stopped => Some(ManagedBootAction::Start),
+        InstanceStatus::Failed => Some(ManagedBootAction::Restart),
+        InstanceStatus::Running | InstanceStatus::Booting
+            if disk_mode == DiskLimitMode::FuseQuota =>
+        {
+            Some(ManagedBootAction::Restart)
+        }
+        InstanceStatus::Creating
+        | InstanceStatus::Booting
+        | InstanceStatus::Running
+        | InstanceStatus::Quarantined
+        | InstanceStatus::Deleting => None,
+    }
+}
+
+async fn stop_fuse_backed_instances_for_shutdown(state: &AppState) -> anyhow::Result<()> {
+    if state.config.disk.mode != DiskLimitMode::FuseQuota {
+        return Ok(());
+    }
+
+    let disk_limiter =
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+    let instances = state.manager.store().list().await;
+    let mut stopped = 0_usize;
+    let mut unmounted = 0_usize;
+    let mut failures = Vec::new();
+
+    for snapshot in instances {
+        let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
+        let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
+            continue;
+        };
+        match state
+            .docker
+            .stop(metadata.protocol, &metadata.instance_id)
+            .await
+        {
+            Ok(_) => stopped += 1,
+            Err(error) if error.is_not_found() || error.is_not_running() => {}
+            Err(error) => {
+                tracing::error!(
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    %error,
+                    "failed to stop FuseQuota-backed container during daemon shutdown"
+                );
+                failures.push(format!("{} stop failed: {error}", metadata.instance_id));
+                continue;
+            }
+        }
+
+        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)?;
+        match disk_limiter.teardown_instance_mount(&paths.data).await {
+            Ok(()) => unmounted += 1,
+            Err(error) => {
+                tracing::error!(
+                    instance_id = %metadata.instance_id,
+                    data_path = %paths.data.display(),
+                    %error,
+                    "failed to unmount FuseQuota filesystem during daemon shutdown"
+                );
+                failures.push(format!("{} unmount failed: {error}", metadata.instance_id));
+            }
+        }
+    }
+
+    tracing::info!(
+        stopped,
+        unmounted,
+        failures = failures.len(),
+        "FuseQuota-backed managed instances shut down before helper exit"
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "failed to shut down one or more FuseQuota-backed instances safely: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 async fn log_boot_container_failure(
@@ -2931,6 +3052,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn fuse_quota_boot_restarts_containers_after_remount() {
+        assert_eq!(
+            managed_boot_action(InstanceStatus::Running, DiskLimitMode::FuseQuota),
+            Some(ManagedBootAction::Restart)
+        );
+        assert_eq!(
+            managed_boot_action(InstanceStatus::Failed, DiskLimitMode::FuseQuota),
+            Some(ManagedBootAction::Restart)
+        );
+        assert_eq!(
+            managed_boot_action(InstanceStatus::Stopped, DiskLimitMode::FuseQuota),
+            Some(ManagedBootAction::Start)
+        );
+        assert_eq!(
+            managed_boot_action(InstanceStatus::Running, DiskLimitMode::Advisory),
+            None
+        );
+    }
 
     #[test]
     fn hardens_existing_runtime_directory_permissions() {

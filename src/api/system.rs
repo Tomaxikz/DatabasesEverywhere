@@ -1,5 +1,4 @@
 use axum::extract::State;
-use axum::http::StatusCode;
 use serde::Serialize;
 use std::net::SocketAddr;
 
@@ -40,6 +39,7 @@ pub struct SystemResponse {
     pub clickhouse_http_bind: String,
     pub clickhouse_http_port: u16,
     pub qdrant_enabled: bool,
+    pub gateways: crate::gateway::supervisor::GatewayReadinessSnapshot,
 }
 
 pub async fn system(
@@ -73,6 +73,7 @@ pub async fn system(
         clickhouse_http_bind: state.config.clickhouse.http_bind.clone(),
         clickhouse_http_port: clickhouse_http_port(&state.config.clickhouse.http_bind),
         qdrant_enabled: state.config.qdrant.enabled,
+        gateways: state.gateway_supervisor.snapshot(),
     }))
 }
 
@@ -85,23 +86,9 @@ fn clickhouse_http_port(bind: &str) -> u16 {
 #[derive(Debug, Serialize)]
 pub struct HeartbeatResponse {
     pub status: &'static str,
-    pub gateways: crate::gateway::supervisor::GatewayReadinessSnapshot,
 }
 
-pub async fn heartbeat(
-    State(state): State<AppState>,
-    auth: ApiRequestContext,
-) -> ApiResult<HeartbeatResponse> {
+pub async fn heartbeat(auth: ApiRequestContext) -> ApiResult<HeartbeatResponse> {
     auth.require_scope(scopes::SYSTEM_READ)?;
-    let gateways = state.gateway_supervisor.snapshot();
-    let ready = state.gateway_supervisor.is_ready();
-    let response = HeartbeatResponse {
-        status: if ready { "ok" } else { "not_ready" },
-        gateways,
-    };
-    Ok(if ready {
-        ApiResponse::ok(response)
-    } else {
-        ApiResponse::with_status(StatusCode::SERVICE_UNAVAILABLE, response)
-    })
+    Ok(ApiResponse::ok(HeartbeatResponse { status: "ok" }))
 }

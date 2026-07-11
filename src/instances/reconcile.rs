@@ -10,6 +10,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileSummary {
     pub checked: usize,
+    pub booting: usize,
     pub running: usize,
     pub stopped: usize,
     pub failed: usize,
@@ -32,6 +33,7 @@ pub async fn reconcile_all(
             reconcile_metadata(metadata, docker).await
         };
         match reconciled.status {
+            InstanceStatus::Booting => summary.booting += 1,
             InstanceStatus::Running => summary.running += 1,
             InstanceStatus::Stopped => summary.stopped += 1,
             InstanceStatus::Failed => summary.failed += 1,
@@ -120,12 +122,7 @@ async fn reconcile_metadata(
                 metadata.updated_at = now_rfc3339();
                 return metadata;
             }
-            metadata.status = match inspection.status {
-                DockerContainerStatus::Running => InstanceStatus::Running,
-                DockerContainerStatus::Starting => InstanceStatus::Creating,
-                DockerContainerStatus::Stopped => InstanceStatus::Stopped,
-                DockerContainerStatus::Failed => InstanceStatus::Failed,
-            };
+            metadata.status = classify_container_status(inspection.status);
             metadata.runtime.network_mode = "none".to_string();
         }
         Err(error) if error.is_not_found() => {
@@ -138,4 +135,38 @@ async fn reconcile_metadata(
     }
     metadata.updated_at = now_rfc3339();
     metadata
+}
+
+pub fn classify_container_status(status: DockerContainerStatus) -> InstanceStatus {
+    match status {
+        DockerContainerStatus::Running => InstanceStatus::Running,
+        DockerContainerStatus::Starting => InstanceStatus::Booting,
+        DockerContainerStatus::Stopped => InstanceStatus::Stopped,
+        DockerContainerStatus::Failed => InstanceStatus::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_live_container_statuses_for_the_api() {
+        assert_eq!(
+            classify_container_status(DockerContainerStatus::Starting),
+            InstanceStatus::Booting
+        );
+        assert_eq!(
+            classify_container_status(DockerContainerStatus::Running),
+            InstanceStatus::Running
+        );
+        assert_eq!(
+            classify_container_status(DockerContainerStatus::Stopped),
+            InstanceStatus::Stopped
+        );
+        assert_eq!(
+            classify_container_status(DockerContainerStatus::Failed),
+            InstanceStatus::Failed
+        );
+    }
 }

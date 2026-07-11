@@ -26,7 +26,15 @@ pub async fn metrics(
     out.push_str("# HELP dbe_instances_total Managed instances by protocol and status\n");
     out.push_str("# TYPE dbe_instances_total gauge\n");
     for protocol in Protocol::ALL {
-        for status in ["creating", "running", "stopped", "failed", "deleting"] {
+        for status in [
+            "creating",
+            "booting",
+            "running",
+            "stopped",
+            "failed",
+            "quarantined",
+            "deleting",
+        ] {
             let count = instances
                 .iter()
                 .filter(|instance| instance.protocol == protocol)

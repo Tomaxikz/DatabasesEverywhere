@@ -111,6 +111,24 @@ impl InstancePaths {
         }
     }
 
+    /// Reapply the persistent data directory's existing owner after a
+    /// physical restore has created replacement entries as the daemon user.
+    pub async fn reapply_data_owner(&self) -> Result<(), InstancePathError> {
+        #[cfg(unix)]
+        {
+            let owner = self.existing_data_owner().await?;
+            let data = self.data.clone();
+            tokio::task::spawn_blocking(move || chown_recursive(&data, owner))
+                .await
+                .map_err(|error| InstancePathError::Task(error.to_string()))?
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+
     #[cfg(unix)]
     pub async fn apply_socket_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
         let sockets = self.sockets.clone();
@@ -141,6 +159,23 @@ impl InstancePaths {
         use std::os::unix::fs::MetadataExt;
 
         Ok(default_owner_for(metadata.uid(), metadata.gid()))
+    }
+
+    #[cfg(unix)]
+    async fn existing_data_owner(&self) -> Result<ContainerOwner, InstancePathError> {
+        if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
+            return Ok(owner);
+        }
+
+        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
+            InstancePathError::ReadMetadata {
+                path: self.data.display().to_string(),
+                source,
+            }
+        })?;
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(existing_owner_for(metadata.uid(), metadata.gid()))
     }
 
     pub async fn container_user(&self) -> Result<String, InstancePathError> {
@@ -350,6 +385,11 @@ fn default_owner_for(uid: u32, _gid: u32) -> Option<ContainerOwner> {
 }
 
 #[cfg(unix)]
+fn existing_owner_for(uid: u32, gid: u32) -> ContainerOwner {
+    default_owner_for(uid, gid).unwrap_or(ContainerOwner { uid, gid })
+}
+
+#[cfg(unix)]
 fn chown_recursive(path: &Path, owner: ContainerOwner) -> Result<(), InstancePathError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -472,7 +512,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_root_owned_paths_keep_existing_owner() {
-        assert_eq!(default_owner_for(1001, 1001), None);
+    fn non_root_owned_paths_keep_existing_owner_during_initial_setup() {
+        assert_eq!(default_owner_for(1001, 1002), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_restore_reapplies_the_data_roots_existing_owner() {
+        assert_eq!(
+            existing_owner_for(1001, 1002),
+            ContainerOwner {
+                uid: 1001,
+                gid: 1002
+            }
+        );
     }
 }

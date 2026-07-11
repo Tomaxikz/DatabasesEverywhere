@@ -178,7 +178,7 @@ impl DiskLimiter {
 
     pub async fn purge_instance_data(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode == DiskLimitMode::FuseQuota {
-            return fuse_quota::destroy_with_root(data_path, self.fuse_root.as_deref()).await;
+            return self.teardown_instance_mount(data_path).await;
         }
         if self.config.mode != DiskLimitMode::ProjectQuota || !data_path.exists() {
             return Ok(());
@@ -194,6 +194,15 @@ impl DiskLimiter {
                 fstype: fstype.to_string(),
             }),
         }
+    }
+
+    /// Stop the per-instance quota helper and unmount its runtime filesystem.
+    /// The persistent backing directory and its database files are retained.
+    pub async fn teardown_instance_mount(&self, data_path: &Path) -> Result<(), DiskLimitError> {
+        if self.config.mode == DiskLimitMode::FuseQuota {
+            fuse_quota::destroy_with_root(data_path, self.fuse_root.as_deref()).await?;
+        }
+        Ok(())
     }
 
     pub async fn instance_usage_bytes(

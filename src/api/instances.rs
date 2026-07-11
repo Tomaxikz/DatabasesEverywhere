@@ -303,6 +303,7 @@ async fn enrich_instance_runtime_info(
     state: &AppState,
     mut metadata: InstanceMetadata,
 ) -> InstanceMetadata {
+    metadata.status = live_instance_status(state, &metadata).await;
     let configured = state
         .config
         .images
@@ -313,7 +314,11 @@ async fn enrich_instance_runtime_info(
         .await
     {
         metadata.image = Some(image);
-        metadata.database_version = Some(database_version);
+        metadata.database_version = Some(if metadata.status == InstanceStatus::Running {
+            database_version
+        } else {
+            current_database_version(state, &metadata).await
+        });
         return metadata;
     }
 
@@ -343,6 +348,35 @@ async fn enrich_instance_runtime_info(
     metadata.image = Some(image);
     metadata.database_version = Some(database_version);
     metadata
+}
+
+async fn live_instance_status(state: &AppState, metadata: &InstanceMetadata) -> InstanceStatus {
+    if matches!(
+        metadata.status,
+        InstanceStatus::Quarantined | InstanceStatus::Deleting
+    ) {
+        return metadata.status;
+    }
+
+    match state
+        .docker
+        .inspect_instance(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(inspection) => reconcile::classify_container_status(inspection.status),
+        Err(error) if error.is_not_found() && metadata.status == InstanceStatus::Creating => {
+            InstanceStatus::Creating
+        }
+        Err(error) if error.is_not_found() => InstanceStatus::Failed,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                instance_id = %metadata.instance_id,
+                "could not refresh live instance status; returning last known status"
+            );
+            metadata.status
+        }
+    }
 }
 
 async fn current_database_version(
@@ -478,7 +512,7 @@ pub async fn get_instance_status(
         .get(&instance_id)
         .filter(|progress| progress.action == "create");
     let status = match (metadata, progress.as_ref()) {
-        (Some(metadata), _) => metadata.status,
+        (Some(metadata), _) => live_instance_status(&state, &metadata).await,
         (None, Some(progress)) => match progress.status {
             InstallProgressStatus::Running => InstanceStatus::Creating,
             InstallProgressStatus::Failed => InstanceStatus::Failed,
@@ -500,9 +534,20 @@ pub async fn reconcile_instance(
 ) -> ApiResult<ReconcileResponse> {
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     let _operation = state.instance_locks.lock(&instance_id).await;
+    let metadata = reconcile_instance_locked(&state, &instance_id).await?;
+    Ok(ApiResponse::ok(ReconcileResponse {
+        instance_id,
+        status: metadata.status,
+    }))
+}
+
+pub(crate) async fn reconcile_instance_locked(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<InstanceMetadata, ApiError> {
     let metadata = state
         .instances
-        .get(&instance_id)
+        .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
     let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
@@ -516,10 +561,7 @@ pub async fn reconcile_instance(
         .remove(&metadata.instance_id)
         .await;
     state.resource_cache.remove(&metadata.instance_id).await;
-    Ok(ApiResponse::ok(ReconcileResponse {
-        instance_id,
-        status: metadata.status,
-    }))
+    Ok(metadata)
 }
 
 pub async fn power_instance(

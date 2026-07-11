@@ -20,7 +20,7 @@ use crate::{
     },
     auth::scopes,
     instances::metadata::{InstanceMetadata, InstanceStatus},
-    jobs::import_export::create_data_archive,
+    jobs::import_export::{ImportExportJobPermit, JobAdmissionError, create_data_archive},
     shared::{files::is_safe_flat_file_name, ids::validate_instance_id, protocol::Protocol},
 };
 
@@ -118,12 +118,26 @@ pub async fn restore_instance_backup(
 ) -> ApiResult<RestoreBackupResponse> {
     auth.require_scope(scopes::RECOVERY_ADMIN)?;
     let authorization = DestructiveActionPolicy::authorize("backup restore", &confirmation)?;
+    let admission = admit_backup_operation(&state, &instance_id)?;
+    let state = state.clone();
+    let reason = authorization.reason().to_string();
+    tokio::spawn(async move {
+        restore_instance_backup_admitted(state, instance_id, backup_id, reason, admission).await
+    })
+    .await
+    .map_err(|error| ApiError::Runtime(format!("backup restore task failed: {error}")))?
+}
+
+async fn restore_instance_backup_admitted(
+    state: AppState,
+    instance_id: String,
+    backup_id: String,
+    reason: String,
+    _admission: ImportExportJobPermit,
+) -> ApiResult<RestoreBackupResponse> {
     let _operation = state.instance_locks.lock(&instance_id).await;
-    let metadata = state
-        .instances
-        .get(&instance_id)
-        .await
-        .ok_or(ApiError::NotFound)?;
+    ensure_operation_can_start(&state)?;
+    let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
     let path = verified_backup_path_for_instance(&state, &backup_id, &instance_id).await?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
@@ -140,7 +154,7 @@ pub async fn restore_instance_backup(
         crate::api::import_export::replace_data_from_archive(paths.clone(), &path).await;
     if result.is_ok() && !state.docker.uses_rootless_podman() {
         result = paths
-            .apply_container_owner()
+            .reapply_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()));
     }
@@ -150,7 +164,7 @@ pub async fn restore_instance_backup(
         event = "audit backup_restored",
         instance_id,
         backup_id,
-        reason = authorization.reason(),
+        reason,
     );
     Ok(ApiResponse::ok(RestoreBackupResponse {
         instance_id,
@@ -185,12 +199,24 @@ pub(crate) async fn backup_instance(
     state: &AppState,
     instance_id: &str,
 ) -> Result<ArtifactInfo, ApiError> {
-    let _operation = state.instance_locks.lock(instance_id).await;
-    let metadata = state
-        .instances
-        .get(instance_id)
+    let admission = admit_backup_operation(state, instance_id)?;
+    let state = state.clone();
+    let instance_id = instance_id.to_string();
+    tokio::spawn(async move { backup_instance_admitted(state, instance_id, admission).await })
         .await
-        .ok_or(ApiError::NotFound)?;
+        .map_err(|error| ApiError::Runtime(format!("backup task failed: {error}")))?
+}
+
+async fn backup_instance_admitted(
+    state: AppState,
+    instance_id: String,
+    _admission: ImportExportJobPermit,
+) -> Result<ArtifactInfo, ApiError> {
+    let state = &state;
+    let instance_id = instance_id.as_str();
+    let _operation = state.instance_locks.lock(instance_id).await;
+    ensure_operation_can_start(state)?;
+    let metadata = crate::api::instances::reconcile_instance_locked(state, instance_id).await?;
     validate_backup_eligible(&metadata)?;
     let artifact_path = backup_artifact_path(state, &metadata.instance_id).await?;
     let was_running = metadata.status == InstanceStatus::Running;
@@ -207,6 +233,15 @@ pub(crate) async fn backup_instance(
     let result = create_data_archive(paths.data, artifact_path.clone())
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()));
+    if let Err(error) = &result {
+        tracing::error!(
+            event = "audit backup_archive_failed",
+            instance_id,
+            protocol = metadata.protocol.as_str(),
+            error = %error,
+            "failed to archive stopped instance data"
+        );
+    }
     crate::api::import_export::finish_physical_operation(state, instance_id, was_running, result)
         .await?;
     prune_instance_backups(state, &metadata.instance_id).await?;
@@ -224,20 +259,22 @@ pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse 
     let mut backups = Vec::new();
     let mut skipped = Vec::new();
     for metadata in state.instances.list().await {
-        match validate_backup_eligible(&metadata) {
-            Ok(()) => match backup_instance(state, &metadata.instance_id).await {
-                Ok(response) => backups.push(response),
-                Err(error) => skipped.push(SkippedBackup {
+        match backup_instance(state, &metadata.instance_id).await {
+            Ok(response) => backups.push(response),
+            Err(error) => {
+                tracing::warn!(
+                    event = "audit instance_backup_skipped",
+                    instance_id = metadata.instance_id,
+                    protocol = metadata.protocol.as_str(),
+                    error = %error,
+                    "instance backup was skipped"
+                );
+                skipped.push(SkippedBackup {
                     instance_id: metadata.instance_id,
                     protocol: metadata.protocol,
                     reason: PublicDiagnostic::from_api_error("instance backup", &error),
-                }),
-            },
-            Err(error) => skipped.push(SkippedBackup {
-                instance_id: metadata.instance_id,
-                protocol: metadata.protocol,
-                reason: PublicDiagnostic::from_api_error("instance backup", &error),
-            }),
+                });
+            }
         }
     }
     tracing::info!(
@@ -256,20 +293,57 @@ pub fn start_scheduler(state: AppState) {
 
     let interval = Duration::from_secs(state.config.backups.interval_minutes.saturating_mul(60));
     let run_on_startup = state.config.backups.run_on_startup;
+    let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
         tracing::info!(
             interval_minutes = state.config.backups.interval_minutes,
             run_on_startup,
             "automatic backups enabled"
         );
-        if run_on_startup {
+        if run_on_startup && !*shutdown.borrow() {
             run_scheduled_backup_pass(&state).await;
         }
         loop {
-            sleep(interval).await;
-            run_scheduled_backup_pass(&state).await;
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        tracing::info!("automatic backup scheduler stopped");
+                        break;
+                    }
+                }
+                () = sleep(interval) => run_scheduled_backup_pass(&state).await,
+            }
         }
     });
+}
+
+fn admit_backup_operation(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<ImportExportJobPermit, ApiError> {
+    state
+        .import_export_jobs
+        .try_admit(instance_id)
+        .map_err(|error| match error {
+            JobAdmissionError::GlobalCapacity => ApiError::RateLimited,
+            JobAdmissionError::InstanceCapacity => ApiError::Conflict(format!(
+                "instance {instance_id} already has the maximum number of queued data operations"
+            )),
+            JobAdmissionError::ShuttingDown => {
+                ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
+            }
+        })
+}
+
+fn ensure_operation_can_start(state: &AppState) -> Result<(), ApiError> {
+    if state.import_export_jobs.is_accepting() {
+        Ok(())
+    } else {
+        Err(ApiError::ServiceUnavailable(
+            "the daemon is shutting down".to_string(),
+        ))
+    }
 }
 
 async fn run_scheduled_backup_pass(state: &AppState) {

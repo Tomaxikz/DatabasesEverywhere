@@ -461,8 +461,13 @@ async fn run_export_job(
     if !begin_import_export_job(&state, &job_id).await {
         return;
     }
-    let result =
-        export_instance_artifact(&state, &instance_id, artifact_path.clone(), &options).await;
+    let result = match crate::api::instances::reconcile_instance_locked(&state, &instance_id).await
+    {
+        Ok(_) => {
+            export_instance_artifact(&state, &instance_id, artifact_path.clone(), &options).await
+        }
+        Err(error) => Err(error),
+    };
     update_job_result(&state, &job_id, result, Some(artifact_path)).await;
 }
 
@@ -479,7 +484,11 @@ async fn run_import_job(
     }
     let ImportSourceOptions::Artifact(artifact_path) = &options.source;
     let artifact_path = artifact_path.clone();
-    let result = import_instance_source(&state, &instance_id, &options).await;
+    let result = match crate::api::instances::reconcile_instance_locked(&state, &instance_id).await
+    {
+        Ok(_) => import_instance_source(&state, &instance_id, &options).await,
+        Err(error) => Err(error),
+    };
     update_job_result(&state, &job_id, result, Some(artifact_path)).await;
 }
 
@@ -566,6 +575,7 @@ async fn export_instance_artifact(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    validate_logical_operation_eligible(&metadata)?;
     match metadata.protocol {
         Protocol::Redis | Protocol::Qdrant => {
             export_physical_archive(
@@ -591,8 +601,22 @@ async fn import_instance_source(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    validate_logical_operation_eligible(&metadata)?;
     let ImportSourceOptions::Artifact(path) = &options.source;
     import_instance_artifact(state, instance_id, &metadata, path, options).await
+}
+
+fn validate_logical_operation_eligible(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+    if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant)
+        || metadata.status == InstanceStatus::Running
+    {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "instance is not running (status={:?})",
+            metadata.status
+        )))
+    }
 }
 
 async fn import_instance_artifact(
@@ -667,7 +691,7 @@ async fn import_physical_archive(
     let mut result = replace_data_from_archive(paths.clone(), artifact_path).await;
     if result.is_ok() && !state.docker.uses_rootless_podman() {
         result = paths
-            .apply_container_owner()
+            .reapply_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()));
     }

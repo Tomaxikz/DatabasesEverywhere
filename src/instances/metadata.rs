@@ -52,6 +52,7 @@ pub struct InstanceDatabaseVersion {
 #[serde(rename_all = "snake_case")]
 pub enum InstanceStatus {
     Creating,
+    Booting,
     Running,
     Stopped,
     Failed,
@@ -63,6 +64,7 @@ impl InstanceStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Creating => "creating",
+            Self::Booting => "booting",
             Self::Running => "running",
             Self::Stopped => "stopped",
             Self::Failed => "failed",

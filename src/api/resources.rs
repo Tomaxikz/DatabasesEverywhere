@@ -507,14 +507,24 @@ impl ResourceCache {
 }
 
 pub fn start_resource_sampler(state: AppState) {
+    let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(DISK_REFRESH_INTERVAL);
         loop {
-            ticker.tick().await;
-            if !state.resource_cache.has_active_monitors() {
-                continue;
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        tracing::info!("resource sampler stopped");
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    if state.resource_cache.has_active_monitors() {
+                        state.resource_cache.refresh_all_disk_usage(&state).await;
+                    }
+                }
             }
-            state.resource_cache.refresh_all_disk_usage(&state).await;
         }
     });
 }
