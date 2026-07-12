@@ -24,7 +24,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | --- | --- |
 | Docker | Works |
 | Podman | In progress |
-| systemd services | Works |
+| systemd services | planned |
 
 ## Supported Databases
 
