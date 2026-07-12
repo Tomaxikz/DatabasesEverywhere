@@ -47,7 +47,6 @@ use crate::{
 const IMPORT_EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const API_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
-const FUSE_SHUTDOWN_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(name = "dbev")]
@@ -100,7 +99,8 @@ pub async fn run() -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Daemon) {
         Command::Daemon => run_daemon(cli.config).await,
         Command::CheckConfig => {
-            let config = load_config(&cli.config)?;
+            let mut config = load_config(&cli.config)?;
+            detect_and_log_disk_mode(&mut config)?;
             validate_runtime_support(&config).await?;
             println!("config ok");
             Ok(())
@@ -127,8 +127,6 @@ pub fn harden_process_file_creation() {
     }
 }
 
-const SERVICE_USER: &str = "databases-everywhere";
-const SERVICE_GROUP: &str = "databases-everywhere";
 const SERVICE_PATH: &str = "/etc/systemd/system/databases-everywhere.service";
 const SUDOERS_PATH: &str = "/etc/sudoers.d/databases-everywhere";
 const INSTALL_PATH: &str = "/usr/local/bin/dbev";
@@ -137,18 +135,16 @@ async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     ensure_root()?;
     validate_setup_config_path(&config_path)?;
     require_existing_config(&config_path)?;
-    let config = load_config(&config_path)?;
-    ensure_required_setup_commands(config.disk.mode)?;
-    ensure_group(SERVICE_GROUP)?;
-    ensure_user(SERVICE_USER, SERVICE_GROUP)?;
-    add_user_to_runtime_group_if_exists(SERVICE_USER, config.daemon.engine)?;
-    ensure_fuse_quota_host_config(&config)?;
+    let mut config = load_config(&config_path)?;
+    ensure_required_setup_commands()?;
     install_current_binary(Path::new(INSTALL_PATH))?;
     secure_config_permissions(&config_path)?;
     ensure_system_directories(&config_path)?;
-    configure_quota_sudoers(config.disk.mode)?;
+    detect_and_log_disk_mode(&mut config)?;
+    ensure_fuse_quota_host_config(&config)?;
+    remove_obsolete_managed_sudoers()?;
     validate_runtime_support(&config).await?;
-    write_systemd_service(&config_path, config.daemon.engine, config.disk.mode)?;
+    write_systemd_service(&config_path, config.daemon.engine)?;
     reload_systemd()?;
     println!("system setup complete");
     println!("config read from: {}", config_path.display());
@@ -188,13 +184,8 @@ fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_required_setup_commands(disk_mode: DiskLimitMode) -> anyhow::Result<()> {
-    let mut commands = vec!["useradd", "groupadd", "usermod", "chown"];
-    if disk_mode == DiskLimitMode::ProjectQuota {
-        commands.push("sudo");
-        commands.push("visudo");
-    }
-    for command in commands {
+fn ensure_required_setup_commands() -> anyhow::Result<()> {
+    for command in ["chown"] {
         if !command_exists(command)? {
             anyhow::bail!("required setup command {command} was not found");
         }
@@ -294,7 +285,7 @@ fn is_commented_user_allow_other_line(line: &str) -> bool {
 fn ensure_fuse_device_supported() -> anyhow::Result<()> {
     let path = Path::new("/dev/fuse");
     let metadata = fs::metadata(path).with_context(|| {
-        "disk.mode=fuse_quota requires /dev/fuse. Install/enable host FUSE support, then rerun dbev --setup"
+        "automatic disk-limit detection selected FuseQuota, but /dev/fuse is unavailable; install/enable host FUSE support, then rerun dbev --setup"
     })?;
 
     #[cfg(unix)]
@@ -302,7 +293,7 @@ fn ensure_fuse_device_supported() -> anyhow::Result<()> {
         use std::os::unix::fs::FileTypeExt;
         if !metadata.file_type().is_char_device() {
             anyhow::bail!(
-                "disk.mode=fuse_quota requires /dev/fuse to be a character device, but it is not"
+                "automatic disk-limit detection selected FuseQuota, but /dev/fuse is not a character device"
             );
         }
     }
@@ -312,7 +303,7 @@ fn ensure_fuse_device_supported() -> anyhow::Result<()> {
         .write(true)
         .open(path)
         .with_context(
-            || "disk.mode=fuse_quota requires /dev/fuse to be openable read/write by setup",
+            || "automatic disk-limit detection selected FuseQuota, but /dev/fuse is not openable read/write by setup",
         )?;
     println!("fuse quota host support ok: /dev/fuse is available");
     Ok(())
@@ -349,49 +340,6 @@ fn ensure_root() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("--setup must be run as root")
     }
-}
-
-fn ensure_group(group: &str) -> anyhow::Result<()> {
-    if command_success("getent", &["group", group])? {
-        return Ok(());
-    }
-    run_setup_command("groupadd", &["--system", group])
-}
-
-fn ensure_user(user: &str, group: &str) -> anyhow::Result<()> {
-    if command_success("getent", &["passwd", user])? {
-        return Ok(());
-    }
-    run_setup_command(
-        "useradd",
-        &[
-            "--system",
-            "--gid",
-            group,
-            "--home-dir",
-            defaults::DATA_PATH,
-            "--shell",
-            "/usr/sbin/nologin",
-            user,
-        ],
-    )
-}
-
-fn add_user_to_runtime_group_if_exists(user: &str, engine: DaemonEngine) -> anyhow::Result<()> {
-    let group = match engine {
-        DaemonEngine::Docker => "docker",
-        DaemonEngine::Podman => "podman",
-    };
-
-    if command_success("getent", &["group", group])? {
-        run_setup_command("usermod", &["-aG", group, user])?;
-    } else {
-        eprintln!(
-            "warning: group {group} does not exist; {} socket access may fail",
-            engine.as_str()
-        );
-    }
-    Ok(())
 }
 
 fn install_current_binary(destination: &Path) -> anyhow::Result<()> {
@@ -495,24 +443,15 @@ fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()> {
     }
     run_setup_command(
         "chown",
-        &[
-            &format!("root:{SERVICE_GROUP}"),
-            &config_parent.display().to_string(),
-        ],
+        &["root:root", &config_parent.display().to_string()],
     )?;
     // Same-directory atomic config replacement requires create and rename
-    // access. Only root and the dedicated service group can enter this folder.
-    set_mode(config_parent, 0o770)?;
-    run_setup_command(
-        "chown",
-        &[
-            &format!("root:{SERVICE_GROUP}"),
-            &config_path.display().to_string(),
-        ],
-    )?;
-    // The daemon persists validated config-admin changes, while ownership and
-    // group membership still prevent access by unrelated local users.
-    set_mode(config_path, 0o660)?;
+    // access. Only the root-run daemon may enter this directory.
+    set_mode(config_parent, 0o700)?;
+    run_setup_command("chown", &["root:root", &config_path.display().to_string()])?;
+    // The daemon persists validated config-admin changes without exposing the
+    // node credentials to other local users.
+    set_mode(config_path, 0o600)?;
     Ok(())
 }
 
@@ -521,83 +460,15 @@ fn ensure_system_directories(config_path: &Path) -> anyhow::Result<()> {
     let paths = configured_runtime_roots(&config);
     for path in &paths {
         fs::create_dir_all(path).with_context(|| format!("failed to create {path}"))?;
-        harden_runtime_directory(Path::new(path), RuntimeDirectoryOwner::SetupManaged)?;
-    }
-    for path in &paths {
-        run_setup_command(
-            "chown",
-            &[
-                "-R",
-                &format!("{SERVICE_USER}:{SERVICE_GROUP}"),
-                path.as_str(),
-            ],
-        )?;
-        harden_runtime_directory(Path::new(path), RuntimeDirectoryOwner::SetupManaged)?;
+        // Do not recursively change database files: container images use their
+        // own internal UIDs/GIDs, and the root-run daemon can manage them as-is.
+        run_setup_command("chown", &["root:root", path.as_str()])?;
+        harden_runtime_directory(Path::new(path))?;
     }
     Ok(())
 }
 
-fn configure_quota_sudoers(disk_mode: DiskLimitMode) -> anyhow::Result<()> {
-    if disk_mode != DiskLimitMode::ProjectQuota {
-        return remove_managed_sudoers();
-    }
-
-    let contents = format!(
-        r#"# Managed by DatabasesEverywhere --setup.
-# Allows the non-root daemon to apply host filesystem quotas only.
-Cmnd_Alias DBE_QUOTA = /usr/sbin/quotaon, /sbin/quotaon, /usr/sbin/setquota, /sbin/setquota, /usr/bin/chattr, /bin/chattr, /usr/sbin/xfs_quota, /sbin/xfs_quota, /usr/bin/btrfs, /sbin/btrfs, /usr/sbin/zfs, /sbin/zfs
-{SERVICE_USER} ALL=(root) NOPASSWD: DBE_QUOTA
-"#
-    );
-    let sudoers_path = Path::new(SUDOERS_PATH);
-    match fs::symlink_metadata(sudoers_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            anyhow::bail!("sudoers path {SUDOERS_PATH} must be a real regular file");
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
-    }
-    let parent = sudoers_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("sudoers path has no parent directory"))?;
-    let temporary = parent.join(format!(
-        ".databases-everywhere.{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
-    let write_result = (|| -> anyhow::Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-
-            options.mode(0o440);
-        }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("failed to create {}", temporary.display()))?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        set_mode(&temporary, 0o440)?;
-        if command_exists("visudo")? {
-            run_setup_command("visudo", &["-cf", &temporary.display().to_string()])?;
-        }
-        fs::rename(&temporary, sudoers_path).context("failed to install sudoers file")?;
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    write_result?;
-    if command_exists("visudo")? {
-        run_setup_command("visudo", &["-cf", SUDOERS_PATH])?;
-    }
-    Ok(())
-}
-
-fn remove_managed_sudoers() -> anyhow::Result<()> {
+fn remove_obsolete_managed_sudoers() -> anyhow::Result<()> {
     let path = Path::new(SUDOERS_PATH);
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -623,85 +494,45 @@ fn remove_managed_sudoers() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_systemd_service(
-    config_path: &Path,
-    engine: DaemonEngine,
-    disk_mode: DiskLimitMode,
-) -> anyhow::Result<()> {
-    let exec_start = if config_path == Path::new(defaults::CONFIG_PATH) {
-        INSTALL_PATH.to_string()
-    } else {
-        format!("{INSTALL_PATH} --config {}", config_path.display())
-    };
-    let config_parent = config_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;
-    let (engine_unit, runtime_group) = match engine {
-        DaemonEngine::Docker => ("docker.service", "docker"),
-        DaemonEngine::Podman => ("podman.socket", "podman"),
-    };
-    let config_parent_for_unit = config_parent.display();
-    let sudo_environment = if disk_mode == DiskLimitMode::ProjectQuota {
-        "Environment=DBE_USE_SUDO=1\n"
-    } else {
-        ""
-    };
-    let privilege_hardening = match disk_mode {
-        // Non-root FuseQuota relies on the host's setuid fusermount helper.
-        DiskLimitMode::FuseQuota | DiskLimitMode::ProjectQuota => "",
-        DiskLimitMode::Advisory | DiskLimitMode::DockerStorageOpt => {
-            "NoNewPrivileges=true\nRestrictSUIDSGID=true\n"
-        }
-    };
-    let contents = format!(
-        r#"[Unit]
-Description=DatabasesEverywhere
-After={engine_unit}
-Requires={engine_unit}
-
-[Service]
-Type=simple
-User={SERVICE_USER}
-Group={SERVICE_GROUP}
-SupplementaryGroups={runtime_group}
-{sudo_environment}ExecStart={exec_start} daemon
-Restart=always
-RestartSec=5
-TimeoutStopSec=21min
-LimitNOFILE=1048576
-{privilege_hardening}UMask=0077
-RuntimeDirectory=dbev
-RuntimeDirectoryMode=0700
-StateDirectory=dbev
-StateDirectoryMode=0700
-LogsDirectory=dbev
-LogsDirectoryMode=0700
-ProtectSystem=full
-ReadWritePaths={config_parent_for_unit}
-ProtectHome=true
-PrivateTmp=true
-ProtectClock=true
-ProtectControlGroups=true
-ProtectHostname=true
-ProtectKernelLogs=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-RemoveIPC=true
-RestrictRealtime=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-SystemCallArchitectures=native
-
-[Install]
-WantedBy=multi-user.target
-"#
-    );
+fn write_systemd_service(config_path: &Path, engine: DaemonEngine) -> anyhow::Result<()> {
+    let contents = systemd_service_contents(config_path, engine);
     atomic_replace_setup_file(Path::new(SERVICE_PATH), 0o644, "systemd service", |file| {
         file.write_all(contents.as_bytes())
     })
     .context("failed to write systemd service")?;
     Ok(())
+}
+
+fn systemd_service_contents(config_path: &Path, engine: DaemonEngine) -> String {
+    let exec_start = if config_path == Path::new(defaults::CONFIG_PATH) {
+        INSTALL_PATH.to_string()
+    } else {
+        format!("{INSTALL_PATH} --config {}", config_path.display())
+    };
+    let engine_unit = match engine {
+        DaemonEngine::Docker => "docker.service",
+        DaemonEngine::Podman => "podman.socket",
+    };
+    format!(
+        r#"[Unit]
+Description=DatabasesEverywhere
+After={engine_unit}
+Requires={engine_unit}
+PartOf={engine_unit}
+
+[Service]
+User=root
+ExecStart={exec_start} daemon
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=21min
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
 }
 
 fn reload_systemd() -> anyhow::Result<()> {
@@ -821,14 +652,6 @@ fn command_exists(program: &str) -> anyhow::Result<bool> {
     }
 }
 
-fn command_success(program: &str, args: &[&str]) -> anyhow::Result<bool> {
-    let status = StdCommand::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to run {program}"))?;
-    Ok(status.success())
-}
-
 fn run_setup_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
     let output = StdCommand::new(program)
         .args(args)
@@ -873,7 +696,7 @@ async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
-    let docker = DockerRuntime::new(&config.daemon, config.disk.mode.uses_docker_storage_opt())
+    let docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?;
     let removed = docker
         .remove_managed_containers()
@@ -1059,7 +882,7 @@ impl<'a> PathMigrationPlan<'a> {
 }
 
 async fn ensure_no_active_managed_containers(config: &Config) -> anyhow::Result<()> {
-    let docker = DockerRuntime::new(&config.daemon, config.disk.mode.uses_docker_storage_opt())
+    let docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API for migration safety check")?;
     let active = docker
         .active_managed_container_count()
@@ -1282,12 +1105,13 @@ async fn disk_test(config_path: PathBuf, quota_mib: u64, write_mib: u64) -> anyh
         anyhow::bail!("--write-mib must be greater than --quota-mib");
     }
 
-    let config = load_config(&config_path)?;
+    let mut config = load_config(&config_path)?;
     ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
+    detect_and_log_disk_mode(&mut config)?;
     validate_runtime_support(&config).await?;
 
     let limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
@@ -1318,13 +1142,6 @@ async fn run_disk_test(
         .apply_instance_limit(instance_id, test_path, quota_mib)
         .await
         .context("failed to apply disk test quota")?;
-
-    if !enforcement.enforced {
-        anyhow::bail!(
-            "disk test requires enforced disk limits, but configured method {} is advisory",
-            enforcement.method
-        );
-    }
 
     let write_path = enforcement
         .container_data_path
@@ -1409,12 +1226,14 @@ async fn cleanup_disk_test_path(limiter: &DiskLimiter, test_path: &Path) {
 }
 
 async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = Arc::new(load_config(&config_path)?);
+    let mut config = load_config(&config_path)?;
     let runtime_directories = ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
+    detect_and_log_disk_mode(&mut config)?;
+    let config = Arc::new(config);
     let socket_bridge_helper = crate::runtime::socket_bridge::install_helper(&config.paths)
         .await
         .context("failed to install the container socket bridge helper")?;
@@ -1504,7 +1323,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         );
     }
 
-    let mut docker = DockerRuntime::new(&config.daemon, config.disk.mode.uses_docker_storage_opt())
+    let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?;
     let docker_ping = docker
         .ping()
@@ -1532,17 +1351,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .verify_startup(std::path::Path::new(&config.paths.data))
         .await
         .context("failed to verify disk limiter support")?;
-    if disk_limiter.uses_docker_storage_opt() {
-        docker
-            .verify_disk_limit_support(
-                &config.images.redis,
-                std::path::Path::new(&config.paths.data),
-            )
-            .await
-            .context("failed to verify container disk limit support")?;
-        tracing::info!("container disk limit support verified with storage_opt size probe");
-    }
-    reapply_instance_disk_limits(&config, &manager, &disk_limiter)
+    reapply_instance_disk_limits(&config, &manager, &docker, &disk_limiter)
         .await
         .context("failed to reapply instance disk limits")?;
     tracing::info!("instance disk limits reconciled");
@@ -1620,7 +1429,6 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     tracing::info!("active import/export jobs drained");
     tracing::info!("active instance creations drained");
-    stop_fuse_backed_instances_for_shutdown(&state).await?;
     server_result
 }
 
@@ -1974,6 +1782,7 @@ fn log_listener(protocol: &'static str, bind: &str, enabled: bool, tls: bool) {
 async fn reapply_instance_disk_limits(
     config: &Config,
     manager: &InstanceManager,
+    docker: &DockerRuntime,
     disk_limiter: &DiskLimiter,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await;
@@ -1981,6 +1790,33 @@ async fn reapply_instance_disk_limits(
         .map(|metadata| async move {
             let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
                 .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
+            if !disk_limiter
+                .instance_runtime_is_healthy(&paths.data)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to inspect disk-limit runtime for {}",
+                        metadata.instance_id
+                    )
+                })?
+            {
+                match docker.stop(metadata.protocol, &metadata.instance_id).await {
+                    Ok(_) => tracing::warn!(
+                        instance_id = %metadata.instance_id,
+                        protocol = %metadata.protocol,
+                        "stopped managed instance to recover an unavailable disk-limit runtime"
+                    ),
+                    Err(error) if error.is_not_found() || error.is_not_running() => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to stop {} before recovering its disk-limit runtime",
+                                metadata.instance_id
+                            )
+                        });
+                    }
+                }
+            }
             disk_limiter
                 .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
                 .await
@@ -2049,7 +1885,7 @@ async fn start_known_instance_on_boot(
     instance_locks: &crate::instances::locks::InstanceLocks,
     snapshot: crate::instances::metadata::InstanceMetadata,
 ) -> anyhow::Result<Option<InstanceStatus>> {
-    let Some(snapshot_action) = managed_boot_action(snapshot.status, config.disk.mode) else {
+    let Some(snapshot_action) = managed_boot_action(snapshot.status) else {
         return Ok(None);
     };
 
@@ -2057,7 +1893,7 @@ async fn start_known_instance_on_boot(
     let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
         return Ok(None);
     };
-    let Some(action) = managed_boot_action(metadata.status, config.disk.mode) else {
+    let Some(action) = managed_boot_action(metadata.status) else {
         return Ok(None);
     };
     if action != snapshot_action {
@@ -2152,145 +1988,15 @@ impl ManagedBootAction {
     }
 }
 
-fn managed_boot_action(
-    status: InstanceStatus,
-    disk_mode: DiskLimitMode,
-) -> Option<ManagedBootAction> {
+fn managed_boot_action(status: InstanceStatus) -> Option<ManagedBootAction> {
     match status {
         InstanceStatus::Stopped => Some(ManagedBootAction::Start),
         InstanceStatus::Failed => Some(ManagedBootAction::Restart),
-        InstanceStatus::Running | InstanceStatus::Booting
-            if disk_mode == DiskLimitMode::FuseQuota =>
-        {
-            Some(ManagedBootAction::Restart)
-        }
         InstanceStatus::Creating
         | InstanceStatus::Booting
         | InstanceStatus::Running
         | InstanceStatus::Quarantined
         | InstanceStatus::Deleting => None,
-    }
-}
-
-async fn stop_fuse_backed_instances_for_shutdown(state: &AppState) -> anyhow::Result<()> {
-    if state.config.disk.mode != DiskLimitMode::FuseQuota {
-        return Ok(());
-    }
-
-    let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
-    let instances = state.manager.store().list().await;
-    let outcomes = futures::stream::iter(instances)
-        .map(|snapshot| {
-            let disk_limiter = disk_limiter.clone();
-            async move { stop_fuse_backed_instance(state, &disk_limiter, snapshot).await }
-        })
-        .buffer_unordered(FUSE_SHUTDOWN_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    let mut stopped = 0_usize;
-    let mut unmounted = 0_usize;
-    let mut failures = Vec::new();
-
-    for outcome in outcomes {
-        stopped += usize::from(outcome.stopped);
-        unmounted += usize::from(outcome.unmounted);
-        if let Some(failure) = outcome.failure {
-            failures.push(failure);
-        }
-    }
-
-    tracing::info!(
-        stopped,
-        unmounted,
-        failures = failures.len(),
-        concurrency = FUSE_SHUTDOWN_CONCURRENCY,
-        "FuseQuota-backed managed instances shut down before helper exit"
-    );
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "failed to shut down one or more FuseQuota-backed instances safely: {}",
-            failures.join("; ")
-        )
-    }
-}
-
-#[derive(Debug, Default)]
-struct FuseShutdownOutcome {
-    stopped: bool,
-    unmounted: bool,
-    failure: Option<String>,
-}
-
-async fn stop_fuse_backed_instance(
-    state: &AppState,
-    disk_limiter: &DiskLimiter,
-    snapshot: crate::instances::metadata::InstanceMetadata,
-) -> FuseShutdownOutcome {
-    let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
-    let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
-        return FuseShutdownOutcome::default();
-    };
-    let stopped = match state
-        .docker
-        .stop(metadata.protocol, &metadata.instance_id)
-        .await
-    {
-        Ok(_) => true,
-        Err(error) if error.is_not_found() || error.is_not_running() => false,
-        Err(error) => {
-            tracing::error!(
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
-                %error,
-                "failed to stop FuseQuota-backed container during daemon shutdown"
-            );
-            return FuseShutdownOutcome {
-                failure: Some(format!("{} stop failed: {error}", metadata.instance_id)),
-                ..FuseShutdownOutcome::default()
-            };
-        }
-    };
-
-    let paths = match InstancePaths::new(&state.config.paths, &metadata.instance_id) {
-        Ok(paths) => paths,
-        Err(error) => {
-            tracing::error!(
-                instance_id = %metadata.instance_id,
-                %error,
-                "failed to resolve FuseQuota paths during daemon shutdown"
-            );
-            return FuseShutdownOutcome {
-                stopped,
-                failure: Some(format!(
-                    "{} path resolution failed: {error}",
-                    metadata.instance_id
-                )),
-                ..FuseShutdownOutcome::default()
-            };
-        }
-    };
-    match disk_limiter.teardown_instance_mount(&paths.data).await {
-        Ok(()) => FuseShutdownOutcome {
-            stopped,
-            unmounted: true,
-            failure: None,
-        },
-        Err(error) => {
-            tracing::error!(
-                instance_id = %metadata.instance_id,
-                data_path = %paths.data.display(),
-                %error,
-                "failed to unmount FuseQuota filesystem during daemon shutdown"
-            );
-            FuseShutdownOutcome {
-                stopped,
-                failure: Some(format!("{} unmount failed: {error}", metadata.instance_id)),
-                ..FuseShutdownOutcome::default()
-            }
-        }
     }
 }
 
@@ -2419,19 +2125,13 @@ async fn ensure_runtime_directories(
         tokio::fs::create_dir_all(&path)
             .await
             .with_context(|| format!("failed to create configured directory {path}"))?;
-        harden_runtime_directory(Path::new(&path), RuntimeDirectoryOwner::CurrentProcess)?;
+        harden_runtime_directory(Path::new(&path))?;
         statuses.push(RuntimeDirectoryStatus { path, existed });
     }
     Ok(statuses)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RuntimeDirectoryOwner {
-    SetupManaged,
-    CurrentProcess,
-}
-
-fn harden_runtime_directory(path: &Path, owner: RuntimeDirectoryOwner) -> anyhow::Result<()> {
+fn harden_runtime_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use rustix::fs::{FileType, Mode, OFlags, fchmod, open};
@@ -2454,13 +2154,7 @@ fn harden_runtime_directory(path: &Path, owner: RuntimeDirectoryOwner) -> anyhow
         if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
             anyhow::bail!("runtime path {} must be a real directory", path.display());
         }
-        if matches!(owner, RuntimeDirectoryOwner::CurrentProcess) {
-            require_runtime_directory_owner(
-                path,
-                stat.st_uid,
-                rustix::process::geteuid().as_raw(),
-            )?;
-        }
+        require_runtime_directory_owner(path, stat.st_uid, rustix::process::geteuid().as_raw())?;
         fchmod(&directory, Mode::RWXU)
             .map_err(std::io::Error::from)
             .with_context(|| {
@@ -2473,7 +2167,6 @@ fn harden_runtime_directory(path: &Path, owner: RuntimeDirectoryOwner) -> anyhow
 
     #[cfg(not(unix))]
     {
-        let _ = owner;
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("failed to inspect runtime directory {}", path.display()))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2519,7 +2212,7 @@ async fn acquire_configured_daemon_lock(config: &Config) -> anyhow::Result<Daemo
     tokio::fs::create_dir_all(locks_root)
         .await
         .with_context(|| format!("failed to create lock directory {}", locks_root.display()))?;
-    harden_runtime_directory(locks_root, RuntimeDirectoryOwner::CurrentProcess)?;
+    harden_runtime_directory(locks_root)?;
     acquire_daemon_lock(locks_root).context("failed to acquire the process-lifetime daemon lock")
 }
 
@@ -2628,9 +2321,33 @@ fn configured_runtime_roots(config: &Config) -> Vec<String> {
 
 async fn validate_runtime_support(config: &Config) -> anyhow::Result<()> {
     DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
-        .verify_startup(Path::new(&config.paths.data))
+        .verify_startup(Path::new(&config.paths.volumes_root()))
         .await
         .context("failed to verify disk limiter support")
+}
+
+fn detect_and_log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
+    let detection = crate::disk::detect_disk_mode(&config.paths)
+        .context("failed to inspect configured filesystems for disk-limit selection")?;
+    for filesystem in &detection.filesystems {
+        tracing::info!(
+            field = filesystem.field,
+            path = %filesystem.path.display(),
+            mountpoint = %filesystem.mountpoint.display(),
+            source = %filesystem.source,
+            fstype = %filesystem.fstype,
+            options = %filesystem.options.join(","),
+            "configured directory filesystem detected"
+        );
+    }
+    config.disk.mode = detection.mode;
+    tracing::info!(
+        mode = config.disk.mode.method(),
+        reason = detection.reason,
+        volumes = %config.paths.volumes_root(),
+        "disk-limit mode selected automatically"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3148,10 +2865,7 @@ fn init_stdout_logging() {
 fn init_configured_logging(config: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(&config.paths.logs)
         .with_context(|| format!("failed to create log directory {}", config.paths.logs))?;
-    harden_runtime_directory(
-        Path::new(&config.paths.logs),
-        RuntimeDirectoryOwner::CurrentProcess,
-    )?;
+    harden_runtime_directory(Path::new(&config.paths.logs))?;
 
     let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
         .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));
@@ -3194,23 +2908,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fuse_quota_boot_restarts_containers_after_remount() {
+    fn daemon_boot_preserves_running_containers() {
+        assert_eq!(managed_boot_action(InstanceStatus::Running), None);
         assert_eq!(
-            managed_boot_action(InstanceStatus::Running, DiskLimitMode::FuseQuota),
+            managed_boot_action(InstanceStatus::Failed),
             Some(ManagedBootAction::Restart)
         );
         assert_eq!(
-            managed_boot_action(InstanceStatus::Failed, DiskLimitMode::FuseQuota),
-            Some(ManagedBootAction::Restart)
-        );
-        assert_eq!(
-            managed_boot_action(InstanceStatus::Stopped, DiskLimitMode::FuseQuota),
+            managed_boot_action(InstanceStatus::Stopped),
             Some(ManagedBootAction::Start)
         );
-        assert_eq!(
-            managed_boot_action(InstanceStatus::Running, DiskLimitMode::Advisory),
-            None
-        );
+        assert_eq!(managed_boot_action(InstanceStatus::Booting), None);
     }
 
     #[test]
@@ -3220,7 +2928,7 @@ mod tests {
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
 
-        harden_runtime_directory(&runtime, RuntimeDirectoryOwner::CurrentProcess).unwrap();
+        harden_runtime_directory(&runtime).unwrap();
 
         let mode = fs::metadata(runtime).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
@@ -3234,8 +2942,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         symlink(&target, &runtime).unwrap();
 
-        let error =
-            harden_runtime_directory(&runtime, RuntimeDirectoryOwner::CurrentProcess).unwrap_err();
+        let error = harden_runtime_directory(&runtime).unwrap_err();
 
         assert!(error.to_string().contains("not a symlink"));
     }
@@ -3256,11 +2963,37 @@ mod tests {
     }
 
     #[test]
+    fn generated_systemd_service_runs_as_root_without_service_account_sandboxing() {
+        let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), DaemonEngine::Docker);
+
+        assert!(unit.contains("User=root\n"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/dbev daemon\n"));
+        assert!(unit.contains("KillMode=process\n"));
+        assert!(unit.contains("PartOf=docker.service\n"));
+        assert!(!unit.contains("SupplementaryGroups="));
+        assert!(!unit.contains("ProtectSystem="));
+        assert!(!unit.contains("DBE_USE_SUDO"));
+    }
+
+    #[test]
+    fn generated_systemd_service_uses_selected_engine_and_custom_config() {
+        let unit =
+            systemd_service_contents(Path::new("/srv/dbev/config.yml"), DaemonEngine::Podman);
+
+        assert!(unit.contains("After=podman.socket\n"));
+        assert!(unit.contains("Requires=podman.socket\n"));
+        assert!(unit.contains("PartOf=podman.socket\n"));
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/dbev --config /srv/dbev/config.yml daemon\n")
+        );
+    }
+
+    #[test]
     fn daemon_lock_is_private_and_exclusive() {
         let temp = tempfile::tempdir().unwrap();
         let locks = temp.path().join("locks");
         fs::create_dir(&locks).unwrap();
-        harden_runtime_directory(&locks, RuntimeDirectoryOwner::CurrentProcess).unwrap();
+        harden_runtime_directory(&locks).unwrap();
 
         let first = acquire_daemon_lock(&locks).unwrap();
         let lock_path = locks.join(DAEMON_LOCK_FILE);

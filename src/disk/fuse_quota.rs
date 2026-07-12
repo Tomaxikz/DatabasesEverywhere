@@ -231,6 +231,31 @@ pub(super) async fn quota_used_with_root(
     parse_quota_used_response(&response)
 }
 
+pub(super) async fn runtime_is_healthy(
+    data_path: &Path,
+    fuse_root: Option<&Path>,
+) -> Result<bool, DiskLimitError> {
+    let paths = fuse_paths_with_root(data_path, fuse_root)?;
+    if !mounts::is_mountpoint(&paths.mount_path)? {
+        return Ok(false);
+    }
+    let expected_owner = match path_owner(data_path).await {
+        Ok(owner) => owner,
+        Err(DiskLimitError::PathIo { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if !mount_owner_matches(&paths.mount_path, expected_owner).await {
+        return Ok(false);
+    }
+    Ok(send_command(&paths.socket_path, "get quota_used")
+        .await
+        .is_ok())
+}
+
 async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     let started = Instant::now();
     let mut last_error = String::new();

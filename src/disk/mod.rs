@@ -10,7 +10,92 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use crate::config::{DiskConfig, DiskLimitMode};
+use crate::config::{DiskConfig, DiskLimitMode, PathConfig};
+
+#[derive(Debug, Clone)]
+pub struct FilesystemInspection {
+    pub field: &'static str,
+    pub path: PathBuf,
+    pub mountpoint: PathBuf,
+    pub source: String,
+    pub fstype: String,
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskModeDetection {
+    pub mode: DiskLimitMode,
+    pub reason: &'static str,
+    pub filesystems: Vec<FilesystemInspection>,
+}
+
+pub fn detect_disk_mode(paths: &PathConfig) -> Result<DiskModeDetection, DiskLimitError> {
+    let roots = [
+        ("paths.data", paths.data.clone()),
+        ("paths.metadata", paths.metadata_root()),
+        ("paths.volumes", paths.volumes_root()),
+        ("paths.backups", paths.backups_root()),
+        ("paths.sockets", paths.sockets.clone()),
+        ("paths.locks", paths.locks.clone()),
+        ("paths.logs", paths.logs.clone()),
+        ("paths.artifacts", paths.artifacts.clone()),
+        ("paths.exports", paths.exports_root()),
+        ("paths.imports", paths.imports_root()),
+        ("paths.fuse", paths.fuse_root()),
+        ("paths.tmp", paths.tmp_root()),
+    ];
+    let mut filesystems = Vec::with_capacity(roots.len());
+    for (field, configured_path) in roots {
+        let path = PathBuf::from(configured_path);
+        let mount = mounts::find_mount(&path)?;
+        filesystems.push(FilesystemInspection {
+            field,
+            path,
+            mountpoint: mount.mountpoint,
+            source: mount.source,
+            fstype: mount.fstype,
+            options: mount.options,
+        });
+    }
+    let volumes = filesystems
+        .iter()
+        .find(|inspection| inspection.field == "paths.volumes")
+        .expect("paths.volumes is always inspected");
+    let (mode, reason) = select_disk_mode(&volumes.fstype, &volumes.options);
+    Ok(DiskModeDetection {
+        mode,
+        reason,
+        filesystems,
+    })
+}
+
+fn select_disk_mode(fstype: &str, options: &[String]) -> (DiskLimitMode, &'static str) {
+    let project_quota_mounted = options
+        .iter()
+        .any(|option| matches!(option.as_str(), "prjquota" | "pquota"));
+    match fstype {
+        "btrfs" => (
+            DiskLimitMode::ProjectQuota,
+            "Btrfs supports native per-subvolume qgroup limits",
+        ),
+        "zfs" => (
+            DiskLimitMode::ProjectQuota,
+            "ZFS supports native per-dataset refquota limits",
+        ),
+        "xfs" if project_quota_mounted => (
+            DiskLimitMode::ProjectQuota,
+            "XFS is mounted with project quotas enabled",
+        ),
+        "ext4" | "f2fs" if project_quota_mounted => (
+            DiskLimitMode::ProjectQuota,
+            "Linux filesystem is mounted with project quotas enabled",
+        ),
+        _ => (
+            DiskLimitMode::FuseQuota,
+            "the volumes filesystem has no detected native quota facility",
+        ),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DiskLimiter {
@@ -44,24 +129,17 @@ impl DiskLimiter {
         self.config.mode
     }
 
-    pub fn uses_docker_storage_opt(&self) -> bool {
-        self.config.mode.uses_docker_storage_opt()
-    }
-
     pub fn container_data_path(&self, data_path: &Path) -> Result<PathBuf, DiskLimitError> {
         match self.config.mode {
             DiskLimitMode::FuseQuota => {
                 fuse_quota::mount_path_with_root(data_path, self.fuse_root.as_deref())
             }
-            DiskLimitMode::Advisory
-            | DiskLimitMode::DockerStorageOpt
-            | DiskLimitMode::ProjectQuota => Ok(data_path.to_path_buf()),
+            DiskLimitMode::ProjectQuota => Ok(data_path.to_path_buf()),
         }
     }
 
     pub async fn verify_startup(&self, data_root: &Path) -> Result<(), DiskLimitError> {
         match self.config.mode {
-            DiskLimitMode::Advisory | DiskLimitMode::DockerStorageOpt => Ok(()),
             DiskLimitMode::FuseQuota => {
                 fuse_quota::verify_startup(
                     self.config.fuse_quota_binary(),
@@ -102,16 +180,6 @@ impl DiskLimiter {
         disk_mib: u64,
     ) -> Result<DiskEnforcement, DiskLimitError> {
         match self.config.mode {
-            DiskLimitMode::Advisory => Ok(DiskEnforcement {
-                enforced: false,
-                method: DiskLimitMode::Advisory.method().to_string(),
-                container_data_path: None,
-            }),
-            DiskLimitMode::DockerStorageOpt => Ok(DiskEnforcement {
-                enforced: true,
-                method: DiskLimitMode::DockerStorageOpt.method().to_string(),
-                container_data_path: None,
-            }),
             DiskLimitMode::FuseQuota => {
                 let mount_path = fuse_quota::apply_with_root(
                     data_path,
@@ -145,6 +213,21 @@ impl DiskLimiter {
         }
     }
 
+    /// Reports whether the per-instance enforcement runtime can be reused
+    /// without interrupting its container. Non-FUSE modes have no persistent
+    /// helper process to recover.
+    pub async fn instance_runtime_is_healthy(
+        &self,
+        data_path: &Path,
+    ) -> Result<bool, DiskLimitError> {
+        match self.config.mode {
+            DiskLimitMode::FuseQuota => {
+                fuse_quota::runtime_is_healthy(data_path, self.fuse_root.as_deref()).await
+            }
+            DiskLimitMode::ProjectQuota => Ok(true),
+        }
+    }
+
     pub async fn update_instance_limit(
         &self,
         instance_id: &str,
@@ -170,9 +253,6 @@ impl DiskLimiter {
             )
             .await
             .map(|_| ()),
-            DiskLimitMode::Advisory | DiskLimitMode::DockerStorageOpt => {
-                Err(DiskLimitError::UnsupportedUpdate(self.config.mode.method()))
-            }
         }
     }
 
@@ -215,9 +295,7 @@ impl DiskLimiter {
                     .await
                     .map(Some)
             }
-            DiskLimitMode::Advisory
-            | DiskLimitMode::DockerStorageOpt
-            | DiskLimitMode::ProjectQuota => Ok(None),
+            DiskLimitMode::ProjectQuota => Ok(None),
         }
     }
 }
@@ -339,8 +417,6 @@ pub enum DiskLimitError {
     },
     #[error("strict disk limits require an empty unmanaged instance data directory before quota setup: {}", .0.display())]
     DataPathNotEmpty(PathBuf),
-    #[error("disk limit updates are not supported in {0} mode")]
-    UnsupportedUpdate(&'static str),
     #[error("fuse quota requires /dev/fuse to exist and be accessible")]
     FuseDeviceUnavailable,
     #[error("fuse quota requires /etc/fuse.conf to contain user_allow_other")]
@@ -357,4 +433,43 @@ pub enum DiskLimitError {
     FuseBinaryFailed { binary: String, stderr: String },
     #[error("disk limiter task failed: {0}")]
     Task(String),
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+
+    #[test]
+    fn plain_ext4_selects_fuse_quota() {
+        assert_eq!(
+            select_disk_mode("ext4", &["rw".to_string()]).0,
+            DiskLimitMode::FuseQuota
+        );
+    }
+
+    #[test]
+    fn project_quota_mount_options_select_native_quota() {
+        for fstype in ["xfs", "ext4", "f2fs"] {
+            assert_eq!(
+                select_disk_mode(fstype, &["rw".to_string(), "prjquota".to_string()]).0,
+                DiskLimitMode::ProjectQuota
+            );
+            assert_eq!(
+                select_disk_mode(fstype, &["rw".to_string(), "pquota".to_string()]).0,
+                DiskLimitMode::ProjectQuota
+            );
+        }
+    }
+
+    #[test]
+    fn dataset_filesystems_select_native_quota() {
+        assert_eq!(
+            select_disk_mode("btrfs", &["rw".to_string()]).0,
+            DiskLimitMode::ProjectQuota
+        );
+        assert_eq!(
+            select_disk_mode("zfs", &["rw".to_string()]).0,
+            DiskLimitMode::ProjectQuota
+        );
+    }
 }

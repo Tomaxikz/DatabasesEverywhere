@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    ApiSslConfig, ClickhouseConfig, Config, DiskLimitMode, ListenerConfig, TlsConfig,
+    ApiSslConfig, ClickhouseConfig, Config, ListenerConfig, TlsConfig,
     path_policy::{HostPathPolicy, HostPathPolicyError},
 };
 use crate::shared::images::is_pinned_image_reference;
@@ -67,7 +67,7 @@ pub enum ConfigValidationError {
         "security.self_upgrade_enabled is unsupported; deploy upgrades through a signed package or immutable container image"
     )]
     UnsupportedSelfUpgrade,
-    #[error("disk.project_id_base must be greater than zero when disk.mode=project_quota")]
+    #[error("disk.project_id_base must be greater than zero for automatic native quota detection")]
     InvalidProjectIdBase,
     #[error(
         "disk.fuse_quota_binary_sha256 must be the lowercase 64-character SHA-256 of the configured external helper"
@@ -321,7 +321,7 @@ fn mongodb_image_is_8_or_newer(image: &str) -> bool {
 }
 
 fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidationError> {
-    if disk.mode == DiskLimitMode::ProjectQuota && disk.project_id_base == 0 {
+    if disk.project_id_base == 0 {
         return Err(ConfigValidationError::InvalidProjectIdBase);
     }
     let binary = disk.fuse_quota_binary();
@@ -820,7 +820,6 @@ mod tests {
     #[test]
     fn rejects_zero_project_id_base() {
         let mut config = valid_config();
-        config.disk.mode = DiskLimitMode::ProjectQuota;
         config.disk.project_id_base = 0;
 
         let error = validate_config(&config).unwrap_err();

@@ -126,6 +126,36 @@ paths:
     }
 
     #[test]
+    fn rejects_removed_manual_disk_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yml");
+        std::fs::write(
+            &path,
+            r#"
+remote: https://panel.example.com
+uuid: node-uuid
+token_id: token-id
+token: test-api-token-0123456789abcdef-01
+jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
+api:
+  host: 127.0.0.1
+disk:
+  mode: fuse_quota
+paths:
+  data: /var/lib/databases-everywhere
+  sockets: /run/databases-everywhere
+  logs: /var/log/databases-everywhere
+  artifacts: /var/lib/databases-everywhere/artifacts
+"#,
+        )
+        .unwrap();
+
+        let error = load_config(&path).unwrap_err();
+
+        assert!(matches!(error, ConfigLoadError::Parse { .. }));
+    }
+
+    #[test]
     fn rejects_removed_docker_config_section() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");

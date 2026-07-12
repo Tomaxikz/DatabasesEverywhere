@@ -72,7 +72,6 @@ backups:
   retention_max_age_days: 30
 
 disk:
-  mode: advisory
   project_id_base: 200000
 
 daemon:

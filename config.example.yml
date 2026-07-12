@@ -97,9 +97,10 @@ allocation:
   reserved_disk_mib: 2048
 
 disk:
-  mode: fuse_quota
-  # Native XFS/ext4 quota modes allocate at most 1,000,000 consecutive IDs
-  # from this base. Reserve that range exclusively for DBE on the host.
+  # DBE detects native XFS, Btrfs, ZFS, ext4, or f2fs quota support from the
+  # filesystem backing paths.volumes. It falls back to FuseQuota automatically.
+  # Native quota modes allocate at most 1,000,000 consecutive IDs from this
+  # base. Reserve that range exclusively for DBE on the host.
   project_id_base: 200000
   # `embedded` is hash-verified automatically. For a custom helper, use an
   # absolute path in root-owned, non-writable directories and set its SHA-256.

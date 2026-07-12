@@ -26,7 +26,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | --- | --- |
 | Docker | Works |
 | Podman | In progress |
-| systemd services | planned |
+| systemd | Planned |
 
 ## Supported Databases
 
@@ -48,6 +48,8 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Legacy bridge-network/TCP instances are stopped and quarantined on upgrade; preserve required data, delete them explicitly, and recreate them before serving traffic again.
 - Per-instance CPU, memory, PID, and disk limits, so one noisy instance can't eat the whole box.
 - Disk enforcement via FuseQuota when your host doesn't have native project quotas.
+- Automatic per-boot filesystem detection selects native quotas when available
+  and otherwise selects FuseQuota; there is no manual disk-mode switch.
 - Native logical dumps for SQL/document stores and physical archive exports for Redis/Qdrant.
 - Physical backups and restores.
 - Signed artifact downloads.
@@ -75,6 +77,38 @@ Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
 sudo dbev --setup
 sudo systemctl enable --now databases-everywhere
 ```
+
+For the default Docker and FuseQuota configuration, `dbev --setup` writes the
+following complete unit to
+`/etc/systemd/system/databases-everywhere.service`:
+
+```ini
+[Unit]
+Description=DatabasesEverywhere
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/dbev daemon
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=21min
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The daemon runs as root by default, matching other container-management agents.
+This gives it direct access to Docker or Podman, filesystem quotas, FUSE mounts,
+and managed database storage without service-account groups or sudoers rules.
+DBE still applies its restrictive process umask and validates managed paths in
+code. Setup substitutes `podman.socket` when Podman is configured and places a
+custom config path in `ExecStart`. Run `dbev --setup` again after changing those
+settings or installing a release with an updated unit.
 
 By default the daemon reads its config from:
 

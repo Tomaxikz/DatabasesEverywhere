@@ -391,14 +391,51 @@ impl DaemonEngine {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiskConfig {
+    #[serde(skip)]
     pub mode: DiskLimitMode,
     pub project_id_base: u32,
     pub fuse_quota_binary: String,
     pub fuse_quota_binary_sha256: String,
     pub fuse_quota_rescan_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DiskFileConfig {
+    project_id_base: u32,
+    fuse_quota_binary: String,
+    fuse_quota_binary_sha256: String,
+    fuse_quota_rescan_interval_seconds: u64,
+}
+
+impl Default for DiskFileConfig {
+    fn default() -> Self {
+        let defaults = DiskConfig::default();
+        Self {
+            project_id_base: defaults.project_id_base,
+            fuse_quota_binary: defaults.fuse_quota_binary,
+            fuse_quota_binary_sha256: defaults.fuse_quota_binary_sha256,
+            fuse_quota_rescan_interval_seconds: defaults.fuse_quota_rescan_interval_seconds,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DiskConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let file = DiskFileConfig::deserialize(deserializer)?;
+        Ok(Self {
+            mode: DiskLimitMode::default(),
+            project_id_base: file.project_id_base,
+            fuse_quota_binary: file.fuse_quota_binary,
+            fuse_quota_binary_sha256: file.fuse_quota_binary_sha256,
+            fuse_quota_rescan_interval_seconds: file.fuse_quota_rescan_interval_seconds,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,11 +564,26 @@ impl Default for DiskConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[cfg(test)]
+mod disk_config_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_disk_mode_is_not_serialized_as_configuration() {
+        let disk = DiskConfig {
+            mode: DiskLimitMode::ProjectQuota,
+            ..DiskConfig::default()
+        };
+
+        let yaml = serde_yaml::to_string(&disk).unwrap();
+
+        assert!(!yaml.contains("mode:"));
+        assert!(yaml.contains("project_id_base:"));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DiskLimitMode {
-    Advisory,
-    DockerStorageOpt,
     #[default]
     FuseQuota,
     ProjectQuota,
@@ -539,20 +591,14 @@ pub enum DiskLimitMode {
 
 impl DiskLimitMode {
     pub fn enforced(self) -> bool {
-        !matches!(self, Self::Advisory)
+        true
     }
 
     pub fn method(self) -> &'static str {
         match self {
-            Self::Advisory => "not_supported",
-            Self::DockerStorageOpt => "docker_storage_opt_size_bind_mount_probe",
             Self::FuseQuota => "fuse_quota",
             Self::ProjectQuota => "host_filesystem_quota",
         }
-    }
-
-    pub fn uses_docker_storage_opt(self) -> bool {
-        matches!(self, Self::DockerStorageOpt)
     }
 }
 

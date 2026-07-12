@@ -84,7 +84,6 @@ allocation:
   reserved_disk_mib: 2048
 
 disk:
-  mode: fuse_quota
   project_id_base: 200000
   fuse_quota_binary: embedded
   fuse_quota_binary_sha256: ""

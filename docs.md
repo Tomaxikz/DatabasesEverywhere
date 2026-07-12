@@ -134,11 +134,17 @@ allowed. CPU remains a scheduling signal and per-instance runtime limit; it is
 not part of node admission because CPU contention slows work without making the
 host unbootable. Stopped and failed instances remain allocated until deleted.
 
-Unless you've deliberately set up native filesystem quotas, use this disk section:
+Disk enforcement is selected automatically on every daemon boot. DBE inspects
+every configured path and logs its backing mount, source, filesystem type, and
+mount options. The filesystem backing `paths.volumes` determines enforcement:
+Btrfs qgroups, ZFS refquotas, and project-quota-enabled XFS/ext4/f2fs mounts use
+native quotas; other filesystems use FuseQuota. There is deliberately no
+`disk.mode` setting and no unenforced fallback.
+
+Use this disk section:
 
 ```yaml
 disk:
-  mode: fuse_quota
   fuse_quota_binary: embedded
   fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
@@ -150,27 +156,14 @@ at most 1,000,000 consecutive IDs starting at `project_id_base`. Reserve that
 range exclusively for DBE on the host. XFS mode rejects conflicting entries in
 `/etc/projects` or `/etc/projid` instead of replacing them.
 
-The default systemd unit keeps `/etc` read-only. If you deliberately use XFS
-project quotas, first grant the service account the narrow host permissions it
-needs for `/etc/projects` and `/etc/projid`, then add a dedicated override:
+The native systemd service runs as root, so it can configure project quotas and
+FUSE mounts directly without a sudoers rule or a writable-filesystem override.
+Rerun `--setup` after changing the filesystem or its quota mount options so DBE
+rechecks host support for the automatically detected enforcement mode.
 
-```ini
-# systemctl edit databases-everywhere
-[Service]
-ReadWritePaths=/etc
-```
-
-This override broadens the unit's writable filesystem surface and is not
-needed for the default FuseQuota or container-storage modes. Keep it off hosts
-that do not use XFS project quotas. Native project-quota mode is a privileged
-exception: `--setup` installs a managed passwordless sudo rule for host quota
-tools and enables `DBE_USE_SUDO` only in that mode. Use it on a dedicated host,
-and rerun `--setup` after switching back to FuseQuota, advisory, or Docker
-storage limits so the managed sudoers rule is removed.
-
-FuseQuota uses a helper that's bundled into the binary. When
-`disk.mode: fuse_quota` is configured, `dbev` checks that `/dev/fuse` is
-usable and enables `user_allow_other` in `/etc/fuse.conf` on startup. The host
+FuseQuota uses a helper that's bundled into the binary. When automatic
+detection selects FuseQuota, `dbev` checks that `/dev/fuse` is usable and
+enables `user_allow_other` in `/etc/fuse.conf` on startup. The host
 still needs kernel FUSE support. The checked-in, hash-verified helper currently
 targets x86-64 Linux. Other architectures must build `dbev` from reviewed
 source, install a trusted helper, set its absolute path in
@@ -180,10 +173,11 @@ executable regular files in root-owned directories that are not writable by
 group or others. The config administration API cannot change either helper
 field, and builds never download executable code automatically.
 
-FuseQuota helpers belong to the daemon process lifecycle. On graceful shutdown,
-the daemon stops managed containers before unmounting their quota filesystems;
-on startup it remounts quotas and restarts existing FuseQuota-backed containers
-so Docker cannot retain a disconnected pre-restart bind mount.
+The generated systemd unit uses `KillMode=process`, so FuseQuota helpers and
+their mounts survive normal daemon restarts. DBE reconnects to healthy helpers
+on boot without interrupting their containers. If an individual helper is
+missing or stale after a crash or host reboot, DBE stops only that instance,
+rebuilds its quota mount, and starts the instance again.
 
 Recommended paths:
 
@@ -259,8 +253,9 @@ sudo systemctl enable --now databases-everywhere
 sudo journalctl -u databases-everywhere -f
 ```
 
-`--setup` creates the service user, private directories, and hardened systemd
-unit. It installs a quota sudoers rule only for native project-quota mode.
+`--setup` installs the root-run systemd unit, creates root-owned private
+directories, and removes the obsolete managed quota sudoers rule left by older
+releases.
 Files end up here:
 
 ```text
