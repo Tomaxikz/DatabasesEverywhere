@@ -27,7 +27,7 @@ use crate::{
     shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
 };
 use axum::extract::State;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
@@ -76,7 +76,30 @@ pub struct ImportExportSelection {
     pub mode: SelectionMode,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    #[serde(deserialize_with = "deserialize_selection_fields")]
     pub fields: HashMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SelectionFieldsInput {
+    Map(HashMap<String, Vec<String>>),
+    Sequence(Vec<serde::de::IgnoredAny>),
+}
+
+fn deserialize_selection_fields<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match SelectionFieldsInput::deserialize(deserializer)? {
+        SelectionFieldsInput::Map(fields) => Ok(fields),
+        SelectionFieldsInput::Sequence(fields) if fields.is_empty() => Ok(HashMap::new()),
+        SelectionFieldsInput::Sequence(_) => Err(D::Error::custom(
+            "selection.fields must be an object or an empty array",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2578,6 +2601,40 @@ mod tests {
             }
         }));
         assert!(import.is_err());
+    }
+
+    #[test]
+    fn export_selection_accepts_legacy_empty_fields_array() {
+        let request = serde_json::from_value::<ExportRequest>(serde_json::json!({
+            "selection": {
+                "mode": "selective",
+                "include": ["users"],
+                "exclude": [],
+                "fields": []
+            }
+        }))
+        .unwrap();
+
+        assert!(request.selection.unwrap().fields.is_empty());
+    }
+
+    #[test]
+    fn export_selection_rejects_nonempty_fields_array() {
+        let error = serde_json::from_value::<ExportRequest>(serde_json::json!({
+            "selection": {
+                "mode": "selective",
+                "include": ["users"],
+                "exclude": [],
+                "fields": ["id"]
+            }
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("selection.fields must be an object or an empty array")
+        );
     }
 
     async fn test_state_with_config(config: Config) -> AppState {

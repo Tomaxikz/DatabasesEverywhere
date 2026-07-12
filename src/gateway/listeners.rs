@@ -436,7 +436,7 @@ async fn handle_postgres_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, endpoint, packet) = client_handshake("postgres", async move {
+    let (client, target, packet) = client_handshake("postgres", async move {
         let packet = read_postgres_startup_packet(&mut client).await?;
 
         let (client, packet) = if postgres::is_ssl_request(&packet) {
@@ -458,21 +458,21 @@ async fn handle_postgres_client(
         };
 
         let route = postgres::parse_startup_route(&packet)?;
-        let endpoint = resolver
+        let target = resolver
             .resolve_postgres(&route.user, &route.database)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
         tracing::debug!(
             user = %route.user,
             database = %route.database,
-            endpoint = ?endpoint,
+            endpoint = ?target.endpoint,
             "postgres route resolved"
         );
-        Ok((client, endpoint, packet))
+        Ok((client, target, packet))
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, endpoint, &packet).await?;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &packet, target.network).await?;
     Ok(())
 }
 
@@ -499,18 +499,18 @@ async fn handle_redis_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, endpoint, initial) = client_handshake("redis", async move {
+    let (client, target, initial) = client_handshake("redis", async move {
         let mut client = accept_direct_tls(client, tls).await?;
         let (route, initial) = read_redis_initial_frame(&mut client).await?;
-        let endpoint = resolver
+        let target = resolver
             .resolve_redis(&route.username)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
-        Ok((client, endpoint, initial))
+        Ok((client, target, initial))
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network).await?;
     Ok(())
 }
 
@@ -558,7 +558,7 @@ async fn prepare_mariadb_tunnel(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
-) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
     prepare_mysql_wire_tunnel(client, resolver, tls, false).await
 }
 
@@ -566,7 +566,7 @@ async fn prepare_mysql_tunnel(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
-) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
     prepare_mysql_wire_tunnel(client, resolver, tls, true).await
 }
 
@@ -575,7 +575,7 @@ async fn prepare_mysql_wire_tunnel(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
     mysql: bool,
-) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
     let protocol = if mysql { "mysql" } else { "mariadb" };
     let mut client = accept_direct_tls(client, tls).await?;
     let gateway_seed = mariadb::new_gateway_auth_seed();
@@ -620,7 +620,8 @@ async fn prepare_mysql_wire_tunnel(
         protocol,
         "mysql wire route resolved"
     );
-    let mut backend = tunnel::connect_backend(&target.endpoint).await?;
+    let backend = tunnel::connect_backend(&target.endpoint).await?;
+    let mut backend = tunnel::MeteredBackend::new(backend, target.network);
     let backend_handshake_packet = mariadb::read_packet(&mut backend).await?;
     let mut backend_handshake =
         mariadb::parse_backend_handshake(&backend_handshake_packet.payload)?;
@@ -710,7 +711,7 @@ async fn handle_mongodb_client(
                 }
             };
 
-            let Some(endpoint) = resolver
+            let Some(target) = resolver
                 .resolve_mongodb(&route.username, &route.database)
                 .await
             else {
@@ -722,7 +723,8 @@ async fn handle_mongodb_client(
                 .await?;
                 return Err(ListenerError::RouteNotFound);
             };
-            let mut backend = tunnel::connect_backend(&endpoint).await?;
+            let backend = tunnel::connect_backend(&target.endpoint).await?;
+            let mut backend = tunnel::MeteredBackend::new(backend, target.network);
             backend.write_all(&message.raw).await?;
             return Ok((client, backend));
         }
@@ -748,19 +750,19 @@ async fn handle_clickhouse_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, endpoint, initial) = client_handshake("clickhouse", async move {
+    let (client, target, initial) = client_handshake("clickhouse", async move {
         let mut client = accept_direct_tls(client, tls).await?;
         let initial = read_clickhouse_hello(&mut client).await?;
         let route = clickhouse::parse_native_initial_route(&initial)?;
-        let endpoint = resolver
+        let target = resolver
             .resolve_clickhouse(&route.username, &route.database)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
-        Ok((client, endpoint, initial))
+        Ok((client, target, initial))
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network).await?;
     Ok(())
 }
 
@@ -769,20 +771,20 @@ async fn handle_clickhouse_http_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, endpoint, initial) = client_handshake("clickhouse_http", async move {
+    let (client, endpoint, network, initial) = client_handshake("clickhouse_http", async move {
         let mut client = accept_direct_tls(client, tls).await?;
         let initial = read_http_headers(&mut client).await?;
         let route = clickhouse::parse_http_initial_route(&initial)?;
-        let endpoint = resolver
+        let target = resolver
             .resolve_clickhouse(&route.username, &route.database)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
-        let endpoint = clickhouse_http_endpoint(endpoint)?;
-        Ok((client, endpoint, initial))
+        let endpoint = clickhouse_http_endpoint(target.endpoint)?;
+        Ok((client, endpoint, target.network, initial))
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, endpoint, &initial).await?;
+    tunnel::connect_replay_and_tunnel(client, endpoint, &initial, network).await?;
     Ok(())
 }
 
@@ -800,11 +802,12 @@ async fn handle_qdrant_client(
         let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
         let api_key = qdrant::api_key_from_request(&request)?;
         let route_key_sha256 = qdrant::route_key_sha256(&api_key);
-        let endpoint = resolver
+        let target = resolver
             .resolve_qdrant(&route_key_sha256)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
-        let backend_stream = tunnel::connect_backend(&endpoint).await?;
+        let backend_stream = tunnel::connect_backend(&target.endpoint).await?;
+        let backend_stream = tunnel::MeteredBackend::new(backend_stream, target.network);
         let mut backend = qdrant::client_handshake(backend_stream).await?;
         qdrant::proxy_request(request, respond, &mut backend).await?;
         Ok((server, backend))

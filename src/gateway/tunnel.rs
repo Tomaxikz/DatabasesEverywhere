@@ -8,7 +8,7 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::shared::backend::BackendEndpoint;
+use crate::{api::resources::NetworkCounter, shared::backend::BackendEndpoint};
 
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,6 +76,62 @@ impl AsyncWrite for BackendStream {
     }
 }
 
+/// Counts bytes at the backend boundary. Writes are bytes received by the
+/// database instance (RX); reads are bytes sent by it (TX). Measuring here
+/// covers plain and TLS clients uniformly and works with network-none
+/// containers connected through Unix sockets.
+#[derive(Debug)]
+pub(crate) struct MeteredBackend<S> {
+    inner: S,
+    network: NetworkCounter,
+}
+
+impl<S> MeteredBackend<S> {
+    pub(crate) fn new(inner: S, network: NetworkCounter) -> Self {
+        Self { inner, network }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MeteredBackend<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+        if let Poll::Ready(Ok(())) = &result {
+            this.network
+                .add_tx(buffer.filled().len().saturating_sub(before) as u64);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredBackend<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(context, bytes);
+        if let Poll::Ready(Ok(written)) = result {
+            this.network.add_rx(written as u64);
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
 pub async fn connect_backend(endpoint: &BackendEndpoint) -> Result<BackendStream, TunnelError> {
     let description = endpoint_description(endpoint);
     let stream = match endpoint {
@@ -101,16 +157,18 @@ fn endpoint_description(endpoint: &BackendEndpoint) -> String {
     }
 }
 
-pub async fn connect_replay_and_tunnel<S>(
+pub(crate) async fn connect_replay_and_tunnel<S>(
     mut client: S,
     endpoint: BackendEndpoint,
     replay: &[u8],
+    network: NetworkCounter,
 ) -> Result<(), TunnelError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let endpoint_description = endpoint_description(&endpoint);
-    let mut backend = connect_backend(&endpoint).await?;
+    let backend = connect_backend(&endpoint).await?;
+    let mut backend = MeteredBackend::new(backend, network);
     timeout(BACKEND_REPLAY_TIMEOUT, backend.write_all(replay))
         .await
         .map_err(|_| TunnelError::ReplayTimeout {
@@ -166,5 +224,24 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, TunnelError::LegacyDockerTcp));
+    }
+
+    #[tokio::test]
+    async fn metered_backend_reports_live_rx_and_tx_bytes() {
+        let network = NetworkCounter::default();
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut metered = MeteredBackend::new(stream, network.clone());
+
+        metered.write_all(b"request").await.unwrap();
+        let mut request = [0_u8; 7];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+
+        peer.write_all(b"response").await.unwrap();
+        let mut response = [0_u8; 8];
+        metered.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+
+        assert_eq!(network.snapshot(), (7, 8));
     }
 }

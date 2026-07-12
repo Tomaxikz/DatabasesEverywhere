@@ -161,7 +161,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
         run_mysql_listener(
             listener,
             &bind,
-            RouteResolver::new(store),
+            RouteResolver::new(store, crate::api::resources::ResourceCache::default()),
             None,
             GatewayConnectionLimiter::default(),
             shutdown_rx,

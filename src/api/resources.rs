@@ -4,7 +4,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -33,7 +33,7 @@ use crate::{
 
 use futures::{StreamExt, TryStreamExt};
 
-const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_DISK_SCAN_TIMEOUT: Duration = Duration::from_millis(750);
 const BACKGROUND_DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,7 +50,9 @@ pub struct ResourceCache {
 #[derive(Debug, Default)]
 struct ResourceCacheInner {
     stats: HashMap<String, CachedRuntimeStats>,
+    stats_refresh_locks: HashMap<String, Arc<Mutex<()>>>,
     cpu_samples: HashMap<String, CpuStatsSample>,
+    network: HashMap<String, NetworkCounter>,
     disk: HashMap<String, CachedDiskUsage>,
     disk_refreshing: HashMap<String, bool>,
     host_cpu_sample: Option<HostCpuSample>,
@@ -60,9 +62,37 @@ struct ResourceCacheInner {
 #[derive(Debug, Clone)]
 struct CachedRuntimeStats {
     stats: Value,
-    raw: String,
     cpu_usage_percent: Option<f64>,
     sampled_at: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NetworkCounter {
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
+}
+
+impl NetworkCounter {
+    pub(crate) fn add_rx(&self, bytes: u64) {
+        atomic_saturating_add(&self.rx_bytes, bytes);
+    }
+
+    pub(crate) fn add_tx(&self, bytes: u64) {
+        atomic_saturating_add(&self.tx_bytes, bytes);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.rx_bytes.load(Ordering::Relaxed),
+            self.tx_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, bytes: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(bytes))
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -290,20 +320,15 @@ pub(crate) async fn resource_report(
     state: &AppState,
     metadata: InstanceMetadata,
 ) -> Result<ResourceReport, ApiError> {
-    resource_report_with_docker_stats(state, metadata)
-        .await
-        .map(|(report, _)| report)
-}
-
-pub(crate) async fn resource_report_with_docker_stats(
-    state: &AppState,
-    metadata: InstanceMetadata,
-) -> Result<(ResourceReport, Option<String>), ApiError> {
     let stats = state
         .resource_cache
         .runtime_stats(&state.docker, metadata.protocol, &metadata.instance_id)
         .await;
     let stats_value = stats.as_ref().map(|stats| &stats.stats);
+    let (network_rx_bytes, network_tx_bytes) = state
+        .resource_cache
+        .network_usage(&metadata.instance_id)
+        .await;
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let disk_used = state
@@ -337,12 +362,16 @@ pub(crate) async fn resource_report_with_docker_stats(
             enforcement_method: metadata.limits.disk_enforcement_method,
         },
         network: NetworkReport {
-            rx_bytes: stats_value.and_then(network_rx_bytes),
-            tx_bytes: stats_value.and_then(network_tx_bytes),
+            // Database containers have no network namespace attachment. Their
+            // traffic crosses DBE's authenticated host gateways and Unix
+            // sockets, so Docker's optional `networks` stats are not the source
+            // of truth. These counters are updated directly by the gateway.
+            rx_bytes: Some(network_rx_bytes),
+            tx_bytes: Some(network_tx_bytes),
         },
     };
 
-    Ok((report, stats.map(|stats| stats.raw)))
+    Ok(report)
 }
 
 #[derive(Debug)]
@@ -631,7 +660,9 @@ impl ResourceCache {
     pub async fn remove(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
         inner.stats.remove(instance_id);
+        inner.stats_refresh_locks.remove(instance_id);
         inner.cpu_samples.remove(instance_id);
+        inner.network.remove(instance_id);
         inner.disk.remove(instance_id);
         inner.disk_refreshing.remove(instance_id);
     }
@@ -658,22 +689,64 @@ impl ResourceCache {
             return Some(cached);
         }
 
-        let output = docker.stats(protocol, instance_id).await.ok()?;
-        let raw = output.stdout;
-        let stats = serde_json::from_str::<Value>(&raw).ok()?;
+        // Multiple REST requests and monitoring sockets can ask for the same
+        // container simultaneously. Serialize only that instance's refresh,
+        // then recheck the cache so one Docker call feeds every consumer.
+        let refresh_lock = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .stats_refresh_locks
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _refresh = refresh_lock.lock().await;
+        if let Some(cached) = self.fresh_stats(&cache_key).await {
+            return Some(cached);
+        }
+
+        let output = match docker.stats(protocol, instance_id).await {
+            Ok(output) => output,
+            Err(_) => {
+                // Keep the last complete sample briefly during transient Docker
+                // errors instead of making every waiting client retry at once.
+                let mut inner = self.inner.lock().await;
+                let stale = inner.stats.get_mut(&cache_key)?;
+                stale.sampled_at = Instant::now();
+                return Some(stale.clone());
+            }
+        };
+        let stats = serde_json::from_str::<Value>(&output.stdout).ok()?;
         let cpu_usage_percent = self
             .record_cpu_sample(&cache_key, &stats)
             .await
             .or_else(|| cpu_percent(&stats));
         let cached = CachedRuntimeStats {
             stats,
-            raw,
             cpu_usage_percent,
             sampled_at: Instant::now(),
         };
         let mut inner = self.inner.lock().await;
         inner.stats.insert(cache_key, cached.clone());
         Some(cached)
+    }
+
+    pub(crate) async fn network_counter(&self, instance_id: &str) -> NetworkCounter {
+        let mut inner = self.inner.lock().await;
+        inner
+            .network
+            .entry(instance_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) async fn network_usage(&self, instance_id: &str) -> (u64, u64) {
+        let inner = self.inner.lock().await;
+        inner
+            .network
+            .get(instance_id)
+            .map(NetworkCounter::snapshot)
+            .unwrap_or_default()
     }
 
     async fn fresh_stats(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
@@ -703,6 +776,12 @@ impl ResourceCache {
         instance_id: &str,
         path: PathBuf,
     ) -> Result<CachedDiskUsage, String> {
+        if let Some(sample) = self.cached_disk_usage(instance_id).await
+            && sample.sampled_at.elapsed() < DISK_REFRESH_INTERVAL
+        {
+            return Ok(sample);
+        }
+
         if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
             return Ok(sample);
         }
@@ -1105,6 +1184,36 @@ mod node_summary_tests {
     }
 
     #[test]
+    fn container_cpu_counter_resets_do_not_emit_bogus_usage() {
+        let previous = CpuStatsSample {
+            total_usage: 1_000,
+            system_cpu_usage: 10_000,
+            online_cpus: 4,
+        };
+        let reset = CpuStatsSample {
+            total_usage: 10,
+            system_cpu_usage: 100,
+            online_cpus: 4,
+        };
+
+        assert_eq!(cpu_percent_between(previous, reset), None);
+    }
+
+    #[tokio::test]
+    async fn gateway_network_counters_are_shared_and_removed_with_the_instance() {
+        let cache = ResourceCache::default();
+        let first = cache.network_counter("inst_network").await;
+        let second = cache.network_counter("inst_network").await;
+
+        first.add_rx(11);
+        second.add_tx(17);
+        assert_eq!(cache.network_usage("inst_network").await, (11, 17));
+
+        cache.remove("inst_network").await;
+        assert_eq!(cache.network_usage("inst_network").await, (0, 0));
+    }
+
+    #[test]
     fn parses_mem_available_as_scheduler_safe_host_memory() {
         let sample = parse_host_memory(
             "MemTotal:       1000 kB\nMemFree:         100 kB\nMemAvailable:    400 kB\n",
@@ -1258,10 +1367,10 @@ pub(crate) fn cpu_percent_between(
     previous: CpuStatsSample,
     current: CpuStatsSample,
 ) -> Option<f64> {
-    let cpu_delta = current.total_usage.saturating_sub(previous.total_usage);
+    let cpu_delta = current.total_usage.checked_sub(previous.total_usage)?;
     let system_delta = current
         .system_cpu_usage
-        .saturating_sub(previous.system_cpu_usage);
+        .checked_sub(previous.system_cpu_usage)?;
     if system_delta == 0 {
         return None;
     }
@@ -1272,7 +1381,7 @@ fn cpu_sample_from_path(stats: &Value, root: &str) -> Option<CpuStatsSample> {
     Some(CpuStatsSample {
         total_usage: value_u64(stats, &[root, "cpu_usage", "total_usage"])?,
         system_cpu_usage: value_u64(stats, &[root, "system_cpu_usage"])?,
-        online_cpus: value_u64(stats, &[root, "online_cpus"]).unwrap_or(1),
+        online_cpus: value_u64(stats, &[root, "online_cpus"]).unwrap_or(1).max(1),
     })
 }
 
@@ -1280,26 +1389,8 @@ pub(crate) fn memory_usage_bytes(stats: &Value) -> Option<u64> {
     value_u64(stats, &["memory_stats", "usage"])
 }
 
-pub(crate) fn network_rx_bytes(stats: &Value) -> Option<u64> {
-    network_sum(stats, "rx_bytes")
-}
-
-pub(crate) fn network_tx_bytes(stats: &Value) -> Option<u64> {
-    network_sum(stats, "tx_bytes")
-}
-
 pub(crate) fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(1024 * 1024)
-}
-
-pub(crate) fn network_sum(stats: &Value, key: &str) -> Option<u64> {
-    let networks = stats.get("networks")?.as_object()?;
-    Some(
-        networks
-            .values()
-            .filter_map(|network| network.get(key).and_then(Value::as_u64))
-            .sum(),
-    )
 }
 
 pub(crate) fn value_u64(value: &Value, path: &[&str]) -> Option<u64> {

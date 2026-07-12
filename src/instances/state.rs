@@ -6,7 +6,14 @@ use super::metadata::{InstanceMetadata, InstanceStatus};
 use crate::shared::{backend::BackendEndpoint, protocol::Protocol};
 
 #[derive(Debug, Clone)]
+pub struct RouteTarget {
+    pub instance_id: String,
+    pub endpoint: BackendEndpoint,
+}
+
+#[derive(Debug, Clone)]
 pub struct MariadbRouteTarget {
+    pub instance_id: String,
     pub endpoint: BackendEndpoint,
     pub native_password_sha1_stage2: Option<String>,
 }
@@ -46,11 +53,7 @@ impl InstanceStore {
         self.inner.read().await.instances.get(instance_id).cloned()
     }
 
-    pub async fn resolve_postgres(
-        &self,
-        username: &str,
-        database: &str,
-    ) -> Option<BackendEndpoint> {
+    pub async fn resolve_postgres(&self, username: &str, database: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state
             .postgres_routes
@@ -58,16 +61,22 @@ impl InstanceStore {
         state
             .instances
             .get(instance_id)
-            .map(|metadata| metadata.backend.clone())
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
     }
 
-    pub async fn resolve_redis(&self, username: &str) -> Option<BackendEndpoint> {
+    pub async fn resolve_redis(&self, username: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state.redis_routes.get(username)?;
         state
             .instances
             .get(instance_id)
-            .map(|metadata| metadata.backend.clone())
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
     }
 
     pub async fn resolve_mariadb(
@@ -81,6 +90,7 @@ impl InstanceStore {
             .get(&(username.to_string(), database.to_string()))?;
         let metadata = state.instances.get(instance_id)?;
         Some(MariadbRouteTarget {
+            instance_id: metadata.instance_id.clone(),
             endpoint: metadata.backend.clone(),
             native_password_sha1_stage2: metadata.mariadb_native_password_sha1_stage2.clone(),
         })
@@ -97,12 +107,13 @@ impl InstanceStore {
             .get(&(username.to_string(), database.to_string()))?;
         let metadata = state.instances.get(instance_id)?;
         Some(MariadbRouteTarget {
+            instance_id: metadata.instance_id.clone(),
             endpoint: metadata.backend.clone(),
             native_password_sha1_stage2: metadata.mysql_native_password_sha1_stage2.clone(),
         })
     }
 
-    pub async fn resolve_mongodb(&self, username: &str, database: &str) -> Option<BackendEndpoint> {
+    pub async fn resolve_mongodb(&self, username: &str, database: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state
             .mongodb_routes
@@ -110,14 +121,13 @@ impl InstanceStore {
         state
             .instances
             .get(instance_id)
-            .map(|metadata| metadata.backend.clone())
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
     }
 
-    pub async fn resolve_clickhouse(
-        &self,
-        username: &str,
-        database: &str,
-    ) -> Option<BackendEndpoint> {
+    pub async fn resolve_clickhouse(&self, username: &str, database: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state
             .clickhouse_routes
@@ -125,16 +135,22 @@ impl InstanceStore {
         state
             .instances
             .get(instance_id)
-            .map(|metadata| metadata.backend.clone())
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
     }
 
-    pub async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<BackendEndpoint> {
+    pub async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state.qdrant_routes.get(route_key_sha256)?;
         state
             .instances
             .get(instance_id)
-            .map(|metadata| metadata.backend.clone())
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
     }
 }
 

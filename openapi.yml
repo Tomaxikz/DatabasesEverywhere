@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.3.0
+  version: 0.4.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -191,7 +191,7 @@ components:
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.3.0}
+        api_version: {type: string, example: 0.4.0}
         api_readiness:
           type: string
           const: ready
@@ -1577,7 +1577,7 @@ paths:
     get:
       summary: WebSocket stream of instance resource snapshots.
       description: >-
-        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages include current instance stats plus install_progress entries for create, image-update, and major-upgrade operations. Each instance includes configured limits plus live usage fields: cpu_usage_percent, memory_usage_bytes, memory_limit_bytes, disk_used_bytes, network_rx_bytes, network_tx_bytes, and a resources object matching GET /api/instances/{instance_id}/resources.
+        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Full snapshots are emitted every 500 ms and include current instance stats plus install_progress entries for create, image-update, and major-upgrade operations. Each instance includes configured limits plus live usage fields: cpu_usage_percent, memory_usage_bytes, memory_limit_bytes, disk_used_bytes, network_rx_bytes, network_tx_bytes, and a resources object matching GET /api/instances/{instance_id}/resources. Network RX/TX are cumulative bytes observed at the authenticated gateway-to-backend boundary since daemon boot.
       x-required-scope: monitor:read
       x-websocket: true
       responses:

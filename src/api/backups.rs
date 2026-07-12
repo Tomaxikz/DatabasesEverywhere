@@ -20,7 +20,10 @@ use crate::{
     },
     auth::scopes,
     instances::metadata::{InstanceMetadata, InstanceStatus},
-    jobs::import_export::{ImportExportJobPermit, JobAdmissionError, create_data_archive},
+    jobs::import_export::{
+        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError,
+        create_data_archive_with_policy,
+    },
     shared::{files::is_safe_flat_file_name, ids::validate_instance_id, protocol::Protocol},
 };
 
@@ -230,7 +233,12 @@ async fn backup_instance_admitted(
     }
     let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let result = create_data_archive(paths.data, artifact_path.clone())
+    let archive_policy = if metadata.protocol == Protocol::Mysql {
+        DataArchiveSourcePolicy::MysqlDataDirectory
+    } else {
+        DataArchiveSourcePolicy::Strict
+    };
+    let result = create_data_archive_with_policy(paths.data, artifact_path.clone(), archive_policy)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()));
     if let Err(error) = &result {

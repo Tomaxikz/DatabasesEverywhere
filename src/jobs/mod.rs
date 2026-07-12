@@ -418,9 +418,26 @@ pub mod import_export {
         data_dir: PathBuf,
         artifact_path: PathBuf,
     ) -> Result<(), ImportExportError> {
-        tokio::task::spawn_blocking(move || create_data_archive_blocking(&data_dir, &artifact_path))
+        create_data_archive_with_policy(data_dir, artifact_path, DataArchiveSourcePolicy::Strict)
             .await
-            .map_err(|error| ImportExportError::Join(error.to_string()))?
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DataArchiveSourcePolicy {
+        Strict,
+        MysqlDataDirectory,
+    }
+
+    pub async fn create_data_archive_with_policy(
+        data_dir: PathBuf,
+        artifact_path: PathBuf,
+        policy: DataArchiveSourcePolicy,
+    ) -> Result<(), ImportExportError> {
+        tokio::task::spawn_blocking(move || {
+            create_data_archive_blocking(&data_dir, &artifact_path, policy)
+        })
+        .await
+        .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
     pub async fn extract_data_archive(
@@ -449,6 +466,7 @@ pub mod import_export {
     fn create_data_archive_blocking(
         data_dir: &Path,
         artifact_path: &Path,
+        policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
         let parent = artifact_path.parent().ok_or_else(|| {
             ImportExportError::InvalidArchive("artifact has no parent".to_string())
@@ -463,7 +481,7 @@ pub mod import_export {
             let encoder = GzEncoder::new(file, Compression::new(3));
             let mut builder = Builder::new(encoder);
             builder.follow_symlinks(false);
-            append_archive_tree(&mut builder, data_dir, Path::new(root_name))?;
+            append_archive_tree(&mut builder, data_dir, Path::new(root_name), policy)?;
             let encoder = builder.into_inner()?;
             encoder.finish()?;
             Ok(())
@@ -778,6 +796,7 @@ pub mod import_export {
         builder: &mut Builder<W>,
         data_dir: &Path,
         archive_root: &Path,
+        policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
         let root_metadata = std::fs::symlink_metadata(data_dir)?;
         if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
@@ -812,6 +831,9 @@ pub mod import_export {
                 let metadata = std::fs::symlink_metadata(&source)?;
                 if metadata.file_type().is_symlink() {
                     let link_name = std::fs::read_link(&source)?;
+                    if should_skip_source_symlink(policy, &source, data_dir, &link_name) {
+                        continue;
+                    }
                     let parent = source.parent().ok_or_else(|| {
                         ImportExportError::InvalidArchive(format!(
                             "symbolic link {} has no parent",
@@ -854,6 +876,18 @@ pub mod import_export {
             }
         }
         Ok(())
+    }
+
+    fn should_skip_source_symlink(
+        policy: DataArchiveSourcePolicy,
+        source: &Path,
+        data_dir: &Path,
+        link_name: &Path,
+    ) -> bool {
+        policy == DataArchiveSourcePolicy::MysqlDataDirectory
+            && source.parent() == Some(data_dir)
+            && source.file_name().is_some_and(|name| name == "mysql.sock")
+            && link_name == Path::new("/var/run/mysqld/mysqld.sock")
     }
 
     fn append_bounded_archive_file<W: Write>(
@@ -1086,7 +1120,8 @@ pub mod import_export {
             let artifact = dir.path().join("backup.tar.gz");
             let restored = dir.path().join("restored");
 
-            create_data_archive_blocking(&data, &artifact).unwrap();
+            create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict)
+                .unwrap();
             extract_data_archive_blocking(&artifact, &restored, "data").unwrap();
 
             let link = restored.join("data/metadata/database/table");
@@ -1112,9 +1147,61 @@ pub mod import_export {
             symlink("../secret", data.join("escape")).unwrap();
             let artifact = dir.path().join("backup.tar.gz");
 
-            let error = create_data_archive_blocking(&data, &artifact).unwrap_err();
+            let error =
+                create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict)
+                    .unwrap_err();
 
             assert!(error.to_string().contains("escapes data root"));
+            assert!(!artifact.exists());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn mysql_physical_backup_omits_only_the_image_runtime_socket_link() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            let artifact = dir.path().join("backup.tar.gz");
+            let restored = dir.path().join("restored");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("ibdata1"), b"mysql data").unwrap();
+            symlink("/var/run/mysqld/mysqld.sock", data.join("mysql.sock")).unwrap();
+
+            create_data_archive_blocking(
+                &data,
+                &artifact,
+                DataArchiveSourcePolicy::MysqlDataDirectory,
+            )
+            .unwrap();
+            extract_data_archive_blocking(&artifact, &restored, "data").unwrap();
+
+            assert_eq!(
+                std::fs::read(restored.join("data/ibdata1")).unwrap(),
+                b"mysql data"
+            );
+            assert!(!restored.join("data/mysql.sock").exists());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn mysql_physical_backup_rejects_unexpected_socket_link_targets() {
+            use std::os::unix::fs::symlink;
+
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            let artifact = dir.path().join("backup.tar.gz");
+            std::fs::create_dir(&data).unwrap();
+            symlink("/tmp/untrusted.sock", data.join("mysql.sock")).unwrap();
+
+            let error = create_data_archive_blocking(
+                &data,
+                &artifact,
+                DataArchiveSourcePolicy::MysqlDataDirectory,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("must be relative"));
             assert!(!artifact.exists());
         }
 
@@ -1140,7 +1227,8 @@ pub mod import_export {
             std::fs::create_dir(&data).unwrap();
             std::fs::write(data.join("file"), b"contents").unwrap();
 
-            create_data_archive_blocking(&data, &artifact).unwrap();
+            create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict)
+                .unwrap();
 
             assert_eq!(
                 std::fs::metadata(artifact).unwrap().permissions().mode() & 0o777,

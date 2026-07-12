@@ -1485,6 +1485,7 @@ async fn complete_managed_runtime_boot(state: AppState) {
     if let Err(error) = start_gateway_listeners(
         &state.config,
         state.instances.clone(),
+        state.resource_cache.clone(),
         state.gateway_supervisor.clone(),
     )
     .await
@@ -2460,6 +2461,7 @@ impl PreparedGatewayListener {
 async fn start_gateway_listeners(
     config: &Config,
     store: InstanceStore,
+    resources: crate::api::resources::ResourceCache,
     supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let connection_limit = config.security.db_connection_limit_per_minute;
@@ -2485,7 +2487,7 @@ async fn start_gateway_listeners(
     if supervisor.is_stopping() {
         anyhow::bail!("daemon shutdown started while gateway listeners were binding");
     }
-    let resolver = RouteResolver::new(store);
+    let resolver = RouteResolver::new(store, resources);
     let mut listeners = tokio::task::JoinSet::new();
     for listener in prepared {
         let protocol = listener.kind.as_str();

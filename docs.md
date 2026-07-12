@@ -318,9 +318,12 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.3.0` adds MySQL as a distinct protocol and exposes
-`mysql_enabled` from `/api/system`. It retains the scoped route design introduced
-by contract `0.2.0`: heartbeat is `GET`,
+version. Contract `0.4.0` emits monitoring snapshots every 500 ms, sources
+per-instance RX/TX from the authenticated gateway used by network-isolated
+containers, and removes the redundant raw `docker_stats` string from monitoring
+messages. Contract `0.3.0` added MySQL as a distinct protocol and exposed
+`mysql_enabled` from `/api/system`. The API retains the scoped route design
+introduced by contract `0.2.0`: heartbeat is `GET`,
 instance lifecycle uses only `/power`, jobs/artifacts/backups and their
 WebSockets are instance-scoped, import archive settings live inside `source`,
 temporary downloads use authenticated `POST` and capability-authenticated `GET`
@@ -513,7 +516,12 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 }
 ```
 
-Usage fields are `null` when the container isn't running or stats aren't available yet. For continuous monitoring use the WebSocket instead of polling this.
+CPU and memory fields are `null` when the container isn't running or Docker
+stats aren't available yet. Network counters are measured at DBE's authenticated
+gateway-to-Unix-socket boundary because managed containers use
+`network_mode=none`; RX is traffic delivered to the database and TX is traffic
+returned by it. The counters start at zero on daemon boot. For continuous
+monitoring use the WebSocket instead of polling this.
 
 `GET /api/admin/resources/summary` (scope: `resources:admin`) is the
 node-scheduler view. It reports limits reserved by every managed instance,
@@ -753,7 +761,7 @@ Server-side clients can use either the subprotocol trick or a plain `Authorizati
 
 Every message is a JSON object with a `type` field.
 
-**`/ws/monitoring`** (scope `monitor:read`) — a full snapshot every second:
+**`/ws/monitoring`** (scope `monitor:read`) — a full snapshot every 500 ms:
 
 ```json
 {

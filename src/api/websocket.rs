@@ -23,7 +23,7 @@ use crate::{
         import_export::{ImportExportJobResponse, public_job_response},
         progress::InstallProgress,
         public_diagnostic::PublicDiagnostic,
-        resources::{ResourceReport, resource_report_with_docker_stats},
+        resources::{ResourceReport, resource_report},
         routes::AppState,
         security::{WebSocketAdmissionError, WebSocketConnectionPermit},
         security_policy::WebSocketRequestContext,
@@ -66,7 +66,8 @@ async fn stream_monitoring(
 ) {
     let _monitor = state.resource_cache.register_monitor();
     let mut shutdown = state.daemon_shutdown.subscribe();
-    let mut ticker = interval(Duration::from_secs(1));
+    let mut ticker = interval(Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let expiration = sleep_until(expiration_deadline);
     tokio::pin!(expiration);
@@ -117,30 +118,36 @@ async fn monitoring_snapshot(state: &AppState, claims: &Claims) -> MonitoringSna
         .await
         .into_iter()
         .filter(|metadata| claims.allows_instance(&metadata.instance_id));
-    let instances = futures::stream::iter(authorized_instances)
+    let mut instances = futures::stream::iter(authorized_instances)
         .map(|metadata| {
             let state = state.clone();
             async move { monitoring_instance(&state, metadata).await }
         })
         .buffer_unordered(MONITORING_FANOUT_LIMIT)
-        .collect()
+        .collect::<Vec<_>>()
         .await;
+    instances.sort_unstable_by(|left: &MonitoringInstance, right| {
+        left.instance_id.cmp(&right.instance_id)
+    });
+
+    let mut install_progress = state
+        .install_progress
+        .list()
+        .into_iter()
+        .filter(|progress| claims.allows_instance(&progress.instance_id))
+        .collect::<Vec<_>>();
+    install_progress.sort_unstable_by(|left, right| left.instance_id.cmp(&right.instance_id));
 
     MonitoringSnapshot {
         r#type: "stats",
         instances,
-        install_progress: state
-            .install_progress
-            .list()
-            .into_iter()
-            .filter(|progress| claims.allows_instance(&progress.instance_id))
-            .collect(),
+        install_progress,
     }
 }
 
 async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> MonitoringInstance {
-    match resource_report_with_docker_stats(state, metadata.clone()).await {
-        Ok((resources, docker_stats)) => MonitoringInstance {
+    match resource_report(state, metadata.clone()).await {
+        Ok(resources) => MonitoringInstance {
             instance_id: metadata.instance_id,
             protocol: metadata.protocol.to_string(),
             status: metadata.status.as_str().to_string(),
@@ -158,33 +165,37 @@ async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> Mo
             network_rx_bytes: resources.network.rx_bytes,
             network_tx_bytes: resources.network.tx_bytes,
             resources: Some(resources),
-            docker_stats,
             resource_error: None,
         },
-        Err(_error) => MonitoringInstance {
-            instance_id: metadata.instance_id,
-            protocol: metadata.protocol.to_string(),
-            status: metadata.status.as_str().to_string(),
-            runtime: metadata.runtime.kind.as_str(),
-            cpu_cores: metadata.limits.cpu_cores,
-            cpu_limit_cores: metadata.limits.cpu_cores,
-            cpu_usage_percent: None,
-            memory_mib: metadata.limits.memory_mib,
-            memory_usage_bytes: None,
-            memory_limit_bytes: None,
-            disk_mib: metadata.limits.disk_mib,
-            disk_limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
-            disk_used_bytes: None,
-            disk_enforced: metadata.limits.disk_enforced,
-            network_rx_bytes: None,
-            network_tx_bytes: None,
-            resources: None,
-            docker_stats: None,
-            resource_error: Some(PublicDiagnostic::public(
-                "resource_unavailable",
-                "resource metrics are temporarily unavailable",
-            )),
-        },
+        Err(_error) => {
+            let (network_rx_bytes, network_tx_bytes) = state
+                .resource_cache
+                .network_usage(&metadata.instance_id)
+                .await;
+            MonitoringInstance {
+                instance_id: metadata.instance_id,
+                protocol: metadata.protocol.to_string(),
+                status: metadata.status.as_str().to_string(),
+                runtime: metadata.runtime.kind.as_str(),
+                cpu_cores: metadata.limits.cpu_cores,
+                cpu_limit_cores: metadata.limits.cpu_cores,
+                cpu_usage_percent: None,
+                memory_mib: metadata.limits.memory_mib,
+                memory_usage_bytes: None,
+                memory_limit_bytes: None,
+                disk_mib: metadata.limits.disk_mib,
+                disk_limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
+                disk_used_bytes: None,
+                disk_enforced: metadata.limits.disk_enforced,
+                network_rx_bytes: Some(network_rx_bytes),
+                network_tx_bytes: Some(network_tx_bytes),
+                resources: None,
+                resource_error: Some(PublicDiagnostic::public(
+                    "resource_unavailable",
+                    "resource metrics are temporarily unavailable",
+                )),
+            }
+        }
     }
 }
 
@@ -214,7 +225,6 @@ struct MonitoringInstance {
     network_rx_bytes: Option<u64>,
     network_tx_bytes: Option<u64>,
     resources: Option<ResourceReport>,
-    docker_stats: Option<String>,
     resource_error: Option<PublicDiagnostic>,
 }
 
