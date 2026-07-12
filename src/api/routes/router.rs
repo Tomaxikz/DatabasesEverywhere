@@ -6,6 +6,7 @@ use axum::{
     middleware,
     routing::{delete, get, patch, post},
 };
+use tokio::sync::watch;
 
 use crate::{
     api::{
@@ -38,6 +39,29 @@ pub struct AppState {
     pub resource_cache: crate::api::resources::ResourceCache,
     pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
     pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
+    pub daemon_shutdown: DaemonShutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonShutdown {
+    sender: watch::Sender<bool>,
+}
+
+impl Default for DaemonShutdown {
+    fn default() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+}
+
+impl DaemonShutdown {
+    pub fn trigger(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -121,6 +145,10 @@ fn instance_routes() -> Router<AppState> {
 fn resource_routes() -> Router<AppState> {
     Router::new()
         .route("/api/admin/resources", get(resources::list_resources))
+        .route(
+            "/api/admin/resources/summary",
+            get(resources::node_resource_summary),
+        )
         .route(
             "/api/instances/{instance_id}/resources",
             get(resources::instance_resources),
@@ -281,6 +309,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_reports_api_readiness_separately_from_database_gateways() {
+        let state = test_state().await;
+        state
+            .gateway_supervisor
+            .mark_failed("test gateway startup failure");
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["api_readiness"], "ready");
+        assert_eq!(body["gateways"]["status"], "failed");
+    }
+
+    #[tokio::test]
     async fn authentication_precedes_json_deserialization() {
         let response = build_router(test_state().await)
             .oneshot(
@@ -352,6 +404,7 @@ mod tests {
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: DaemonShutdown::default(),
         }
     }
 }

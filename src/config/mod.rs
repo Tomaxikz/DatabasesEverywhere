@@ -20,6 +20,7 @@ pub struct Config {
     pub tls: TlsConfig,
     pub postgres: ListenerConfig,
     pub mariadb: ListenerConfig,
+    pub mysql: ListenerConfig,
     pub redis: ListenerConfig,
     pub mongodb: ListenerConfig,
     pub clickhouse: ClickhouseConfig,
@@ -28,6 +29,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub artifacts: ArtifactConfig,
     pub backups: BackupConfig,
+    pub allocation: AllocationConfig,
     pub disk: DiskConfig,
     pub daemon: DaemonConfig,
     pub images: ImageConfig,
@@ -46,6 +48,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             postgres: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::POSTGRES)),
             mariadb: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::MARIADB)),
+            mysql: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MYSQL)),
             redis: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::REDIS)),
             mongodb: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MONGODB)),
             clickhouse: ClickhouseConfig::disabled(
@@ -57,6 +60,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             artifacts: ArtifactConfig::default(),
             backups: BackupConfig::default(),
+            allocation: AllocationConfig::default(),
             disk: DiskConfig::default(),
             daemon: DaemonConfig::default(),
             images: ImageConfig::default(),
@@ -275,6 +279,7 @@ pub struct PidsLimitConfig {
     pub postgres: Option<i64>,
     pub redis: Option<i64>,
     pub mariadb: Option<i64>,
+    pub mysql: Option<i64>,
     pub mongodb: Option<i64>,
     pub clickhouse: Option<i64>,
     pub qdrant: Option<i64>,
@@ -286,6 +291,7 @@ impl Default for PidsLimitConfig {
             postgres: None,
             redis: None,
             mariadb: None,
+            mysql: None,
             mongodb: None,
             clickhouse: Some(4096),
             qdrant: None,
@@ -395,6 +401,109 @@ pub struct DiskConfig {
     pub fuse_quota_rescan_interval_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AllocationConfig {
+    /// Optional hard reservation ceiling. When omitted, physical memory minus
+    /// `reserved_memory_mib` is used.
+    pub max_memory_mib: Option<u64>,
+    /// Optional hard reservation ceiling. When omitted, the capacity of the
+    /// filesystem backing `paths.volumes` minus `reserved_disk_mib` is used.
+    pub max_disk_mib: Option<u64>,
+    /// Memory kept outside the database allocation pool for the OS and other
+    /// services. This reserve is also required to remain currently available
+    /// before an allocation increase is admitted.
+    pub reserved_memory_mib: u64,
+    /// Disk kept outside the database allocation pool. This reserve is also
+    /// required to remain currently available before an allocation increase.
+    pub reserved_disk_mib: u64,
+}
+
+impl Default for AllocationConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mib: None,
+            max_disk_mib: None,
+            reserved_memory_mib: 512,
+            reserved_disk_mib: 2048,
+        }
+    }
+}
+
+impl AllocationConfig {
+    pub fn effective_memory_limit_bytes(&self, physical_total_bytes: u64) -> u64 {
+        effective_allocation_limit_bytes(
+            physical_total_bytes,
+            self.max_memory_mib,
+            self.reserved_memory_mib,
+        )
+    }
+
+    pub fn effective_disk_limit_bytes(&self, physical_total_bytes: u64) -> u64 {
+        effective_allocation_limit_bytes(
+            physical_total_bytes,
+            self.max_disk_mib,
+            self.reserved_disk_mib,
+        )
+    }
+
+    pub fn reserved_memory_bytes(&self) -> u64 {
+        mib_to_bytes_saturating(self.reserved_memory_mib)
+    }
+
+    pub fn reserved_disk_bytes(&self) -> u64 {
+        mib_to_bytes_saturating(self.reserved_disk_mib)
+    }
+}
+
+fn effective_allocation_limit_bytes(
+    physical_total_bytes: u64,
+    configured_max_mib: Option<u64>,
+    reserved_mib: u64,
+) -> u64 {
+    let after_reserve = physical_total_bytes.saturating_sub(mib_to_bytes_saturating(reserved_mib));
+    configured_max_mib
+        .map(mib_to_bytes_saturating)
+        .unwrap_or(after_reserve)
+        .min(after_reserve)
+}
+
+fn mib_to_bytes_saturating(mib: u64) -> u64 {
+    mib.saturating_mul(1024 * 1024)
+}
+
+#[cfg(test)]
+mod allocation_config_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_pool_keeps_the_reserve_outside_allocations() {
+        let allocation = AllocationConfig {
+            reserved_memory_mib: 512,
+            ..AllocationConfig::default()
+        };
+
+        assert_eq!(
+            allocation.effective_memory_limit_bytes(8 * 1024 * 1024 * 1024),
+            7_680 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn explicit_pool_can_only_reduce_the_safe_physical_pool() {
+        let allocation = AllocationConfig {
+            max_disk_mib: Some(20_000),
+            reserved_disk_mib: 2_048,
+            ..AllocationConfig::default()
+        };
+
+        assert_eq!(
+            allocation.effective_disk_limit_bytes(16_000 * 1024 * 1024),
+            13_952 * 1024 * 1024
+        );
+    }
+}
+
 impl DiskConfig {
     pub fn fuse_quota_binary(&self) -> &str {
         let binary = self.fuse_quota_binary.trim();
@@ -453,6 +562,7 @@ pub struct ImageConfig {
     pub postgres: String,
     pub redis: String,
     pub mariadb: String,
+    pub mysql: String,
     pub mongodb: String,
     pub clickhouse: String,
     pub qdrant: String,
@@ -465,6 +575,7 @@ impl Default for ImageConfig {
             postgres: "postgres:18.4".to_string(),
             redis: "redis:8.8.0".to_string(),
             mariadb: "mariadb:12.3.2".to_string(),
+            mysql: "mysql:8.4".to_string(),
             mongodb: "mongo:7.0.37".to_string(),
             clickhouse: "clickhouse/clickhouse-server:25.8.25.37".to_string(),
             qdrant: "qdrant/qdrant:v1.18.2".to_string(),
@@ -479,6 +590,7 @@ pub struct ImageAllowlistConfig {
     pub postgres: Vec<String>,
     pub redis: Vec<String>,
     pub mariadb: Vec<String>,
+    pub mysql: Vec<String>,
     pub mongodb: Vec<String>,
     pub clickhouse: Vec<String>,
     pub qdrant: Vec<String>,
@@ -490,6 +602,7 @@ impl ImageConfig {
             crate::shared::protocol::Protocol::Postgres => &self.postgres,
             crate::shared::protocol::Protocol::Redis => &self.redis,
             crate::shared::protocol::Protocol::Mariadb => &self.mariadb,
+            crate::shared::protocol::Protocol::Mysql => &self.mysql,
             crate::shared::protocol::Protocol::Mongodb => &self.mongodb,
             crate::shared::protocol::Protocol::Clickhouse => &self.clickhouse,
             crate::shared::protocol::Protocol::Qdrant => &self.qdrant,
@@ -502,6 +615,7 @@ impl ImageConfig {
             crate::shared::protocol::Protocol::Postgres => self.allowed.postgres.iter(),
             crate::shared::protocol::Protocol::Redis => self.allowed.redis.iter(),
             crate::shared::protocol::Protocol::Mariadb => self.allowed.mariadb.iter(),
+            crate::shared::protocol::Protocol::Mysql => self.allowed.mysql.iter(),
             crate::shared::protocol::Protocol::Mongodb => self.allowed.mongodb.iter(),
             crate::shared::protocol::Protocol::Clickhouse => self.allowed.clickhouse.iter(),
             crate::shared::protocol::Protocol::Qdrant => self.allowed.qdrant.iter(),

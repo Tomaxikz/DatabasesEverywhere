@@ -83,6 +83,7 @@ images:
   postgres: "postgres:18.4"
   redis: "redis:8.8.0"
   mariadb: "mariadb:12.3.2"
+  mysql: "mysql:8.4"
   mongodb: "mongo:8.3.4"
   clickhouse: "clickhouse/clickhouse-server:26.4.4.38"
   qdrant: "qdrant/qdrant:v1.18.2"
@@ -90,6 +91,7 @@ images:
     postgres: ["postgres:18.4"]
     redis: ["redis:8.8.0"]
     mariadb: ["mariadb:12.3.2"]
+    mysql: ["mysql:8.4"]
     mongodb: ["mongo:8.3.4", "mongo:7.0.37"]
     clickhouse: ["clickhouse/clickhouse-server:26.4.4.38"]
     qdrant: ["qdrant/qdrant:v1.18.2"]
@@ -103,6 +105,34 @@ References:
 
 - <https://www.mongodb.com/docs/v8.2/release-notes/8.0/#mongodb-8-0-incompatible-with-kernel-6-19>
 - <https://jira.mongodb.org/browse/SERVER-121912>
+
+The supported MySQL baseline is the official `mysql:8.4` LTS image. DBE enables
+the compatibility authentication plugin required by its credential-routing
+gateway; do not substitute MySQL 9.x, where that plugin was removed. MySQL
+containers have `network_mode=none`, expose only a per-instance Unix socket,
+and persist no tenant password in their container environment. DBE encrypts the
+maintenance credential and routing verifier in the metadata store. Enable the
+database gateway's native TLS whenever the listener crosses an untrusted
+network.
+
+Keep memory and disk headroom outside the database allocation pool:
+
+```yaml
+allocation:
+  max_memory_mib: null
+  max_disk_mib: null
+  reserved_memory_mib: 512
+  reserved_disk_mib: 2048
+```
+
+When a maximum is `null`, DBE uses the detected physical capacity minus its
+reserve. An explicit maximum can make the database pool smaller, but cannot
+override the safety reserve. New instances and memory/disk limit increases are
+rejected when either their projected allocations exceed the pool or the host's
+actual available capacity would fall inside the reserve. Decreases are always
+allowed. CPU remains a scheduling signal and per-instance runtime limit; it is
+not part of node admission because CPU contention slows work without making the
+host unbootable. Stopped and failed instances remain allocated until deleted.
 
 Unless you've deliberately set up native filesystem quotas, use this disk section:
 
@@ -293,7 +323,9 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.2.0` is intentionally breaking: heartbeat is now `GET`,
+version. Contract `0.3.0` adds MySQL as a distinct protocol and exposes
+`mysql_enabled` from `/api/system`. It retains the scoped route design introduced
+by contract `0.2.0`: heartbeat is `GET`,
 instance lifecycle uses only `/power`, jobs/artifacts/backups and their
 WebSockets are instance-scoped, import archive settings live inside `source`,
 temporary downloads use authenticated `POST` and capability-authenticated `GET`
@@ -339,7 +371,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime: a container whose health check is still starting is `booting`, a healthy container is `running`, and an exited container is `stopped`. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime: a container whose health check is still starting is `booting`, a healthy container is `running`, and an exited container is `stopped`. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
@@ -447,7 +479,7 @@ PATCH /api/instances/{id}/image
 }
 ```
 
-For Postgres, MariaDB, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
+For Postgres, MariaDB, MySQL, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
 
 The response includes `strategy`:
 
@@ -487,6 +519,64 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 ```
 
 Usage fields are `null` when the container isn't running or stats aren't available yet. For continuous monitoring use the WebSocket instead of polling this.
+
+`GET /api/admin/resources/summary` (scope: `resources:admin`) is the
+node-scheduler view. It reports limits reserved by every managed instance,
+actual usage by DBE containers, and pressure from the entire Linux host:
+
+```json
+{
+  "node_uuid": "node-db-1",
+  "sampled_at": "2026-07-12T12:45:00Z",
+  "cpu": {
+    "total_cores": 16,
+    "allocated_cores": 9.5,
+    "host_usage_percent": 42.7,
+    "managed_usage_cores": 4.2
+  },
+  "memory": {
+    "total_bytes": 68719476736,
+    "allocation_limit_bytes": 68182605824,
+    "reserved_bytes": 536870912,
+    "allocated_bytes": 34359738368,
+    "host_used_bytes": 28991029248,
+    "managed_used_bytes": 12884901888,
+    "available_bytes": 39728447488
+  },
+  "disk": {
+    "total_bytes": 1099511627776,
+    "allocation_limit_bytes": 1097364144128,
+    "reserved_bytes": 2147483648,
+    "allocated_bytes": 536870912000,
+    "host_used_bytes": 429496729600,
+    "managed_used_bytes": 268435456000,
+    "available_bytes": 670014898176
+  },
+  "instances": {
+    "total": 42,
+    "creating": 0,
+    "booting": 2,
+    "running": 34,
+    "stopped": 3,
+    "failed": 1,
+    "quarantined": 1,
+    "deleting": 1
+  }
+}
+```
+
+Allocation includes stopped and failed instances because their limits remain
+reserved and they may be restarted. CPU is sampled from `/proc/stat`, memory
+uses Linux `MemAvailable`, and disk capacity is measured on the filesystem
+backing `paths.volumes`. Host usage includes DBE plus every other process on the
+server. Managed CPU or memory usage is `null` if a running/booting container
+could not be sampled; the endpoint does not return a misleading partial sum.
+`allocation_limit_bytes` and `reserved_bytes` expose the daemon's authoritative
+memory/disk admission policy. Poll this endpoint every 10–30 seconds for
+placement decisions and use allocation pressure as the primary scheduling
+signal, with host pressure as a secondary signal. The panel's check is only an
+optimization: it must handle a capacity rejection because host availability can
+change between sampling and creation.
 
 ## Exports, imports, backups
 
@@ -543,6 +633,7 @@ Export/import formats:
 | --- | --- | --- |
 | PostgreSQL | `.postgres.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
 | MariaDB | `.mariadb.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
+| MySQL | `.mysql.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
 | MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump or gzip/tar/zip/rar-wrapped archive |
 | ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
@@ -738,17 +829,22 @@ Job objects are the same shape as the REST job response. When an export succeeds
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
-| GET | `/api/system` | system:read | Node identity, version, engine, enabled protocols, and gateway readiness |
+| GET | `/api/system` | system:read | Node identity, version, explicit API readiness, enabled protocols, and separate database-gateway readiness |
 | PATCH | `/api/system/config` | config:admin | Merge a runtime config patch into `config.yml`; returns `restart_required: true` |
 | GET | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
 
-`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, and per-protocol `*_enabled` flags so the panel knows what it can offer.
+`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `api_readiness`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, and per-protocol `*_enabled` flags so the panel knows what it can offer. `api_readiness: "ready"` describes the management API only; `gateways.status` independently describes database listeners.
 
 The API listener becomes available after critical metadata, crash-recovery,
 container-engine, socket-isolation, and disk checks complete. Existing managed database
-containers then auto-start in a lock-protected background phase, so a slow or
-broken container does not hold node heartbeat or management endpoints offline.
+containers then auto-start in a lock-protected, bounded-concurrent background
+phase, so a slow or broken container does not hold node heartbeat or management
+endpoints offline. FuseQuota shutdown uses the same bounded concurrency for
+container stops and safe unmounts, reducing normal service restart time without
+skipping graceful active-job draining. API connections, including monitoring
+WebSockets, receive up to 10 seconds to drain before they are closed, so a
+long-lived client cannot hold `systemctl restart` open indefinitely.
 Heartbeat reports management API liveness only. It always returns
 `{"status":"ok"}` once an authenticated request reaches the handler, regardless
 of database instance or gateway state. Clients should use each instance's status

@@ -9,6 +9,7 @@ use crate::{
         images::{ensure_image_allowed, validate_image},
         instance_requests::{CreateInstanceRequest, limits_from_request, validate_create_request},
         instances::docker_error,
+        resources::{mib_to_bytes, read_host_disk, read_host_memory},
         routes::AppState,
         security_policy::DestructiveActionPolicy,
     },
@@ -38,6 +39,12 @@ pub async fn create_instance_from_request(
     let _operation = state.instance_locks.lock(&request.instance_id).await;
     reject_duplicate_instance(state, &request).await?;
     handle_stale_instance_resources(state, &request).await?;
+    let requested_limits = request
+        .limits
+        .as_ref()
+        .map(limits_from_request)
+        .unwrap_or_default();
+    enforce_node_allocation_policy(state, &requested_limits, None).await?;
 
     let cleanup = CreateFailureCleanup::new(state, request.protocol, request.instance_id.clone());
     match create_instance_from_validated_request(state, request).await {
@@ -47,6 +54,131 @@ pub async fn create_instance_from_request(
             Err(error)
         }
     }
+}
+
+pub(crate) async fn enforce_node_allocation_policy(
+    state: &AppState,
+    requested: &crate::shared::limits::InstanceLimits,
+    previous: Option<&crate::shared::limits::InstanceLimits>,
+) -> Result<(), ApiError> {
+    let instances = state.instances.list().await;
+    let allocated_memory_bytes = instances.iter().fold(0_u64, |total, metadata| {
+        total.saturating_add(mib_to_bytes(metadata.limits.memory_mib))
+    });
+    let allocated_disk_bytes = instances.iter().fold(0_u64, |total, metadata| {
+        total.saturating_add(mib_to_bytes(metadata.limits.disk_mib))
+    });
+    let previous_memory_bytes = previous
+        .map(|limits| mib_to_bytes(limits.memory_mib))
+        .unwrap_or_default();
+    let previous_disk_bytes = previous
+        .map(|limits| mib_to_bytes(limits.disk_mib))
+        .unwrap_or_default();
+    let requested_memory_bytes = mib_to_bytes(requested.memory_mib);
+    let requested_disk_bytes = mib_to_bytes(requested.disk_mib);
+    let volumes_root = state.config.paths.volumes_root();
+    let (host_memory, host_disk) = tokio::join!(read_host_memory(), read_host_disk(&volumes_root),);
+    let host_memory = host_memory.map_err(|error| {
+        ApiError::Runtime(format!(
+            "failed to sample host memory for allocation admission: {error}"
+        ))
+    })?;
+    let host_disk = host_disk.map_err(|error| {
+        ApiError::Runtime(format!(
+            "failed to sample host disk for allocation admission: {error}"
+        ))
+    })?;
+    let memory_limit_bytes = state
+        .config
+        .allocation
+        .effective_memory_limit_bytes(host_memory.total_bytes);
+    let disk_limit_bytes = state
+        .config
+        .allocation
+        .effective_disk_limit_bytes(host_disk.total_bytes);
+
+    enforce_resource_allocation(
+        "memory",
+        allocated_memory_bytes,
+        previous_memory_bytes,
+        requested_memory_bytes,
+        memory_limit_bytes,
+        host_memory.available_bytes,
+        state.config.allocation.reserved_memory_bytes(),
+    )?;
+    enforce_resource_allocation(
+        "disk",
+        allocated_disk_bytes,
+        previous_disk_bytes,
+        requested_disk_bytes,
+        disk_limit_bytes,
+        host_disk.available_bytes,
+        state.config.allocation.reserved_disk_bytes(),
+    )?;
+
+    Ok(())
+}
+
+fn enforce_resource_allocation(
+    resource: &str,
+    allocated_bytes: u64,
+    previous_bytes: u64,
+    requested_bytes: u64,
+    allocation_limit_bytes: u64,
+    available_bytes: u64,
+    reserved_bytes: u64,
+) -> Result<(), ApiError> {
+    let additional_bytes = requested_bytes.saturating_sub(previous_bytes);
+    if additional_bytes == 0 {
+        return Ok(());
+    }
+
+    let projected_bytes = allocated_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(requested_bytes);
+    if projected_bytes > allocation_limit_bytes {
+        return Err(allocation_unavailable(
+            resource,
+            projected_bytes,
+            allocation_limit_bytes,
+        ));
+    }
+    if additional_bytes.saturating_add(reserved_bytes) > available_bytes {
+        return Err(available_capacity_unavailable(
+            resource,
+            additional_bytes,
+            available_bytes,
+            reserved_bytes,
+        ));
+    }
+
+    Ok(())
+}
+
+fn allocation_unavailable(resource: &str, projected_bytes: u64, limit_bytes: u64) -> ApiError {
+    ApiError::ServiceUnavailable(format!(
+        "node {resource} allocation capacity exhausted: projected allocation {} MiB exceeds the {} MiB limit",
+        bytes_to_mib_ceil(projected_bytes),
+        bytes_to_mib_ceil(limit_bytes),
+    ))
+}
+
+fn available_capacity_unavailable(
+    resource: &str,
+    additional_bytes: u64,
+    available_bytes: u64,
+    reserved_bytes: u64,
+) -> ApiError {
+    ApiError::ServiceUnavailable(format!(
+        "node {resource} safety reserve would be breached: allocation increase requires {} MiB, {} MiB is available, and {} MiB must remain reserved",
+        bytes_to_mib_ceil(additional_bytes),
+        bytes_to_mib_ceil(available_bytes),
+        bytes_to_mib_ceil(reserved_bytes),
+    ))
+}
+
+fn bytes_to_mib_ceil(bytes: u64) -> u64 {
+    bytes.saturating_add((1024 * 1024) - 1) / (1024 * 1024)
 }
 
 async fn create_instance_from_validated_request(
@@ -81,6 +213,8 @@ async fn create_instance_from_validated_request(
     let password = SecretString::from(request.password.clone());
     let mariadb_root_password = (request.protocol == Protocol::Mariadb)
         .then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
+    let mysql_root_password =
+        (request.protocol == Protocol::Mysql).then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
     let mongodb_root_password = (request.protocol == Protocol::Mongodb)
         .then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
 
@@ -97,6 +231,7 @@ async fn create_instance_from_validated_request(
         }
         Protocol::Postgres
         | Protocol::Mariadb
+        | Protocol::Mysql
         | Protocol::Mongodb
         | Protocol::Clickhouse
         | Protocol::Qdrant => {}
@@ -173,6 +308,21 @@ async fn create_instance_from_validated_request(
                     state,
                     &request.instance_id,
                     "internal mariadb root password was not generated",
+                )
+            })?),
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Mysql => databases::mysql::docker::instance_spec(
+            &request.instance_id,
+            &image,
+            &request.database,
+            SecretString::from(mysql_root_password.clone().ok_or_else(|| {
+                fail_runtime(
+                    state,
+                    &request.instance_id,
+                    "internal mysql root password was not generated",
                 )
             })?),
             container_data_path.clone(),
@@ -312,6 +462,36 @@ async fn create_instance_from_validated_request(
             return Err(error);
         }
     }
+    if request.protocol == Protocol::Mysql {
+        state.install_progress.stage(
+            &request.instance_id,
+            "provision",
+            "creating or updating MySQL tenant user",
+        );
+        if let Err(error) = provision_mysql_tenant_user(
+            state,
+            &request.instance_id,
+            &request.database,
+            &request.username,
+            &request.password,
+            mysql_root_password.as_deref().ok_or_else(|| {
+                fail_runtime(
+                    state,
+                    &request.instance_id,
+                    "internal mysql root password was not generated",
+                )
+            })?,
+        )
+        .await
+        {
+            state.install_progress.fail_api_error(
+                &request.instance_id,
+                "mysql provisioning",
+                &error,
+            );
+            return Err(error);
+        }
+    }
     if request.protocol == Protocol::Postgres {
         state.install_progress.stage(
             &request.instance_id,
@@ -379,6 +559,9 @@ async fn create_instance_from_validated_request(
         mariadb_native_password_sha1_stage2: (request.protocol == Protocol::Mariadb)
             .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
         mariadb_root_password,
+        mysql_native_password_sha1_stage2: (request.protocol == Protocol::Mysql)
+            .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
+        mysql_root_password,
         mongodb_root_password,
         limits,
         image: None,
@@ -531,6 +714,31 @@ pub(crate) async fn provision_mariadb_tenant_user(
     Ok(())
 }
 
+pub(crate) async fn provision_mysql_tenant_user(
+    state: &AppState,
+    instance_id: &str,
+    database: &str,
+    username: &str,
+    password: &str,
+    root_password: &str,
+) -> Result<(), ApiError> {
+    wait_for_mysql_localhost(state, instance_id).await?;
+    let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
+    let sql = databases::mysql::provision::tenant_user_sql(database, username, &verifier)
+        .map_err(|error| fail_bad_request(state, instance_id, error))?;
+    let script = format!(
+        "set -eu\nexport MYSQL_PWD={}\nprintf %s {} | mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
+        sh_quote(root_password),
+        sh_quote(&sql)
+    );
+    state
+        .docker
+        .exec_shell(Protocol::Mysql, instance_id, &script)
+        .await
+        .map_err(|error| fail_runtime(state, instance_id, error))?;
+    Ok(())
+}
+
 pub(crate) async fn provision_postgres_tenant_role(
     state: &AppState,
     instance_id: &str,
@@ -667,6 +875,10 @@ pub(crate) async fn wait_for_rootless_podman_service(
             "waiting for MariaDB to accept local connections",
             "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
         ),
+        Protocol::Mysql => (
+            "waiting for MySQL to accept local connections",
+            "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
+        ),
         Protocol::Mongodb => return wait_for_mongodb_localhost(state, instance_id).await,
         Protocol::Clickhouse => (
             "waiting for ClickHouse to accept local connections",
@@ -702,6 +914,22 @@ async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Resu
         Protocol::Mariadb,
         instance_id,
         "mariadb-admin ping --protocol=socket -u root -p\"$MARIADB_ROOT_PASSWORD\"",
+        Duration::from_secs(120),
+    )
+    .await
+}
+
+async fn wait_for_mysql_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
+    state.install_progress.stage(
+        instance_id,
+        "readiness",
+        "waiting for MySQL local socket to become available",
+    );
+    wait_for_container_shell_command(
+        state,
+        Protocol::Mysql,
+        instance_id,
+        "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
         Duration::from_secs(120),
     )
     .await
@@ -828,6 +1056,7 @@ fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
         Protocol::Postgres => &state.config.images.postgres,
         Protocol::Redis => &state.config.images.redis,
         Protocol::Mariadb => &state.config.images.mariadb,
+        Protocol::Mysql => &state.config.images.mysql,
         Protocol::Mongodb => &state.config.images.mongodb,
         Protocol::Clickhouse => &state.config.images.clickhouse,
         Protocol::Qdrant => &state.config.images.qdrant,
@@ -880,7 +1109,11 @@ async fn reject_duplicate_instance(
 
     let instances = state.instances.list().await;
     let route_exists = instances.iter().any(|metadata| match request.protocol {
-        Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb | Protocol::Clickhouse => {
+        Protocol::Postgres
+        | Protocol::Mariadb
+        | Protocol::Mysql
+        | Protocol::Mongodb
+        | Protocol::Clickhouse => {
             metadata.protocol == request.protocol
                 && metadata.database.username == request.username
                 && metadata.database.name == request.database
@@ -1120,6 +1353,7 @@ fn public_port(state: &AppState, protocol: Protocol) -> u16 {
         Protocol::Postgres => &state.config.postgres.bind,
         Protocol::Redis => &state.config.redis.bind,
         Protocol::Mariadb => &state.config.mariadb.bind,
+        Protocol::Mysql => &state.config.mysql.bind,
         Protocol::Mongodb => &state.config.mongodb.bind,
         Protocol::Clickhouse => &state.config.clickhouse.bind,
         Protocol::Qdrant => &state.config.qdrant.bind,
@@ -1135,6 +1369,7 @@ pub(crate) fn protocol_pids_limit(state: &AppState, protocol: Protocol) -> i64 {
         Protocol::Postgres => overrides.postgres,
         Protocol::Redis => overrides.redis,
         Protocol::Mariadb => overrides.mariadb,
+        Protocol::Mysql => overrides.mysql,
         Protocol::Mongodb => overrides.mongodb,
         Protocol::Clickhouse => overrides.clickhouse,
         Protocol::Qdrant => overrides.qdrant,
@@ -1282,6 +1517,58 @@ mod tests {
     }
 
     #[test]
+    fn allocation_guard_rejects_a_projected_limit_over_the_node_pool() {
+        let error = enforce_resource_allocation(
+            "memory",
+            mib_to_bytes(7_000),
+            0,
+            mib_to_bytes(2_000),
+            mib_to_bytes(8_000),
+            mib_to_bytes(16_000),
+            mib_to_bytes(512),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert!(error.to_string().contains("projected allocation 9000 MiB"));
+    }
+
+    #[test]
+    fn allocation_guard_rejects_an_increase_that_breaches_actual_free_reserve() {
+        let error = enforce_resource_allocation(
+            "disk",
+            mib_to_bytes(10_000),
+            0,
+            mib_to_bytes(1_500),
+            mib_to_bytes(20_000),
+            mib_to_bytes(3_000),
+            mib_to_bytes(2_048),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("safety reserve would be breached")
+        );
+    }
+
+    #[test]
+    fn allocation_guard_allows_decreases_while_node_is_over_capacity() {
+        enforce_resource_allocation(
+            "memory",
+            mib_to_bytes(10_000),
+            mib_to_bytes(2_000),
+            mib_to_bytes(1_000),
+            mib_to_bytes(8_000),
+            0,
+            mib_to_bytes(512),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn postgres_provisioning_uses_internal_admin_and_tenant_secret_env() {
         let script = postgres_tenant_provision_script("app_db", "tenant_user");
 
@@ -1353,6 +1640,8 @@ mod tests {
             route_key_sha256: None,
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
             mongodb_root_password: None,
             limits: crate::shared::limits::InstanceLimits::default(),
             image: None,
@@ -1382,6 +1671,7 @@ mod tests {
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
             instance_locks: crate::instances::locks::InstanceLocks::default(),
         }
     }

@@ -1,3 +1,5 @@
+use futures::StreamExt;
+
 use crate::{
     instances::{
         manager::InstanceManager,
@@ -6,6 +8,8 @@ use crate::{
     runtime::docker::{DockerContainerStatus, DockerRuntime},
     shared::{backend::BackendEndpoint, time::now_rfc3339},
 };
+
+const RECONCILE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileSummary {
@@ -22,16 +26,23 @@ pub async fn reconcile_all(
     docker: &DockerRuntime,
 ) -> Result<ReconcileSummary, anyhow::Error> {
     let instances = manager.store().list().await;
+    let outcomes = futures::stream::iter(instances)
+        .map(|metadata| async move {
+            if metadata.status == InstanceStatus::Quarantined {
+                stop_quarantined_instance(&metadata, docker).await?;
+                Ok::<_, anyhow::Error>(metadata)
+            } else {
+                Ok(reconcile_metadata(metadata, docker).await)
+            }
+        })
+        .buffer_unordered(RECONCILE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut summary = ReconcileSummary::default();
 
-    for metadata in instances {
+    for outcome in outcomes {
+        let reconciled = outcome?;
         summary.checked += 1;
-        let reconciled = if metadata.status == InstanceStatus::Quarantined {
-            stop_quarantined_instance(&metadata, docker).await?;
-            metadata
-        } else {
-            reconcile_metadata(metadata, docker).await
-        };
         match reconciled.status {
             InstanceStatus::Booting => summary.booting += 1,
             InstanceStatus::Running => summary.running += 1,

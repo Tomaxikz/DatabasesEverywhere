@@ -34,6 +34,10 @@ pub fn healthcheck(protocol: Protocol) -> HealthConfig {
             "CMD-SHELL",
             "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
         ],
+        Protocol::Mysql => vec![
+            "CMD-SHELL",
+            "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
+        ],
         Protocol::Mongodb => vec![
             "CMD-SHELL",
             "mongosh --quiet -u \"$DBE_MONGO_USER\" -p \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.adminCommand({ ping: 1 })'",

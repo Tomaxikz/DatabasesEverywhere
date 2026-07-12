@@ -1124,6 +1124,7 @@ fn dump_candidate_suffixes(protocol: Protocol) -> &'static [&'static str] {
         Protocol::Postgres => &[".postgres.sql", ".pgsql.sql", ".sql"],
         Protocol::Redis => &[".redis.tar.gz", ".tar.gz"],
         Protocol::Mariadb => &[".mariadb.sql", ".mysql.sql", ".sql"],
+        Protocol::Mysql => &[".mysql.sql", ".sql"],
         Protocol::Mongodb => &[".mongodb.archive.gz", ".archive.gz"],
         Protocol::Clickhouse => &[".clickhouse.sql", ".sql"],
         Protocol::Qdrant => &[".qdrant.tar.gz", ".tar.gz"],
@@ -1242,7 +1243,7 @@ fn validate_selection(
     }
 
     match protocol {
-        Protocol::Postgres | Protocol::Mariadb => {
+        Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql => {
             for item in selection.include.iter().chain(selection.exclude.iter()) {
                 validate_sql_object_name(protocol, item)?;
             }
@@ -1318,6 +1319,7 @@ fn validate_sql_object_name(protocol: Protocol, value: &str) -> Result<(), ApiEr
     let valid = match protocol {
         Protocol::Postgres => (1..=2).contains(&parts.len()),
         Protocol::Mariadb => (1..=2).contains(&parts.len()),
+        Protocol::Mysql => (1..=2).contains(&parts.len()),
         _ => false,
     } && parts
         .iter()
@@ -1381,6 +1383,30 @@ fn mariadb_local_dump_selection_args(
         args.push_str(&format!(" --ignore-table=\"$MARIADB_DATABASE.{table}\""));
     }
     args.push_str(" \"$MARIADB_DATABASE\"");
+    for item in &selection.include {
+        let table = item
+            .rsplit_once('.')
+            .map(|(_, table)| table)
+            .unwrap_or(item);
+        args.push(' ');
+        args.push_str(&sh_quote(table));
+    }
+    Ok(args)
+}
+
+fn mysql_local_dump_selection_args(selection: &ImportExportSelection) -> Result<String, ApiError> {
+    if selection.mode == SelectionMode::Full {
+        return Ok(" \"$MYSQL_DATABASE\"".to_string());
+    }
+    let mut args = String::new();
+    for item in &selection.exclude {
+        let table = item
+            .rsplit_once('.')
+            .map(|(_, table)| table)
+            .unwrap_or(item);
+        args.push_str(&format!(" --ignore-table=\"$MYSQL_DATABASE.{table}\""));
+    }
+    args.push_str(" \"$MYSQL_DATABASE\"");
     for item in &selection.include {
         let table = item
             .rsplit_once('.')
@@ -1457,6 +1483,16 @@ fn ensure_mongodb_root_password(metadata: &InstanceMetadata) -> Result<(), ApiEr
     Ok(())
 }
 
+fn ensure_mysql_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+    if metadata.protocol == Protocol::Mysql && metadata.mysql_root_password.is_none() {
+        return Err(ApiError::BadRequest(
+            "mysql internal root password is missing; recreate or repair this instance before exporting or importing"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn export_script(
     metadata: &InstanceMetadata,
     output_path: &str,
@@ -1486,6 +1522,20 @@ mariadb-dump \
   -u "$MARIADB_USER" \
   -p"$MARIADB_PASSWORD" \
   --single-transaction --routines --triggers{filters} \
+  > {output_path}
+"#
+            )
+        }
+        Protocol::Mysql => {
+            ensure_mysql_root_password(metadata)?;
+            let filters = mysql_local_dump_selection_args(selection)?;
+            format!(
+                r#"set -eu
+MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump \
+  --protocol=socket \
+  --socket=/var/run/mysqld/mysqld.sock \
+  -u root \
+  --single-transaction --routines --triggers --no-tablespaces --set-gtid-purged=OFF{filters} \
   > {output_path}
 "#
             )
@@ -1574,6 +1624,19 @@ mariadb \
   < {input_path}
 "#
         ),
+        Protocol::Mysql => {
+            ensure_mysql_root_password(metadata)?;
+            format!(
+                r#"set -eu
+MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
+  --protocol=socket \
+  --socket=/var/run/mysqld/mysqld.sock \
+  -u root \
+  "$MYSQL_DATABASE" \
+  < {input_path}
+"#
+            )
+        }
         Protocol::Mongodb => {
             ensure_mongodb_root_password(metadata)?;
             format!(
@@ -1647,6 +1710,7 @@ fn dump_extension(protocol: Protocol) -> &'static str {
         Protocol::Postgres => "postgres.sql",
         Protocol::Redis => "redis.tar.gz",
         Protocol::Mariadb => "mariadb.sql",
+        Protocol::Mysql => "mysql.sql",
         Protocol::Mongodb => "mongodb.archive.gz",
         Protocol::Clickhouse => "clickhouse.sql",
         Protocol::Qdrant => "qdrant.tar.gz",
@@ -2287,6 +2351,70 @@ mod tests {
         assert!(dump_candidate_suffixes(Protocol::Qdrant).contains(&".qdrant.tar.gz"));
     }
 
+    #[test]
+    fn mysql_uses_private_socket_for_logical_export_and_import() {
+        use crate::{
+            instances::metadata::{
+                DatabaseIdentity, PublicEndpoint, RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
+            },
+            shared::{backend::BackendEndpoint, limits::InstanceLimits},
+        };
+
+        let metadata = InstanceMetadata {
+            schema_version: SCHEMA_VERSION,
+            instance_id: "inst_mysql_1".to_string(),
+            protocol: Protocol::Mysql,
+            status: InstanceStatus::Running,
+            public: PublicEndpoint {
+                host: "db.example.com".to_string(),
+                port: 3308,
+            },
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: "/run/dbev/sockets/inst_mysql_1/mysqld.sock".to_string(),
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: "dbe-mysql-inst-mysql-1".to_string(),
+                network_mode: "none".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: "mysql_1".to_string(),
+                username: "app_mysql_1".to_string(),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: Some(
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+            ),
+            mysql_root_password: Some("internal-root-password".to_string()),
+            mongodb_root_password: None,
+            limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let export = export_script(
+            &metadata,
+            "/tmp/export.mysql.sql",
+            &ImportExportSelection::default(),
+        )
+        .unwrap();
+        let import = import_script(&metadata, "/tmp/import.mysql.sql").unwrap();
+
+        assert_eq!(dump_extension(Protocol::Mysql), "mysql.sql");
+        assert!(dump_candidate_suffixes(Protocol::Mysql).contains(&".mysql.sql"));
+        assert!(export.contains("mysqldump"));
+        assert!(export.contains("--socket=/var/run/mysqld/mysqld.sock"));
+        assert!(export.contains("--single-transaction"));
+        assert!(import.contains("mysql \\"));
+        assert!(import.contains("--socket=/var/run/mysqld/mysqld.sock"));
+        assert!(!export.contains("internal-root-password"));
+        assert!(!import.contains("internal-root-password"));
+    }
+
     #[tokio::test]
     async fn artifact_imports_are_scoped_to_the_requested_instance() {
         let dir = tempfile::tempdir().unwrap();
@@ -2481,6 +2609,7 @@ mod tests {
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             instance_locks: crate::instances::locks::InstanceLocks::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
         }
     }
 }

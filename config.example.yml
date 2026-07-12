@@ -19,6 +19,11 @@ mariadb:
   bind: 127.0.0.1:3307
   tls: false
 
+mysql:
+  enabled: true
+  bind: 127.0.0.1:3308
+  tls: false
+
 redis:
   enabled: true
   bind: 127.0.0.1:6380
@@ -69,6 +74,7 @@ security:
     # Optional per-protocol overrides. ClickHouse needs more process/thread
     # headroom during startup than the lighter database images.
     clickhouse: 4096
+    mysql: null
     qdrant: null
 
 artifacts:
@@ -81,6 +87,14 @@ backups:
   run_on_startup: false
   retention_keep_latest_per_instance: 7
   retention_max_age_days: 30
+
+# Node-wide admission guard. Null maxima automatically use detected host
+# capacity minus the reserve. Set explicit maxima to make a smaller DB pool.
+allocation:
+  max_memory_mib: null
+  max_disk_mib: null
+  reserved_memory_mib: 512
+  reserved_disk_mib: 2048
 
 disk:
   mode: fuse_quota
@@ -111,6 +125,7 @@ images:
   postgres: "postgres:18.4"
   redis: "redis:8.8.0"
   mariadb: "mariadb:12.3.2"
+  mysql: "mysql:8.4"
   # MongoDB 8.x is not compatible with Linux kernel 6.19+ / 7.x at the time
   # of writing due to SERVER-121912. If MongoDB fails to start with that
   # kernel warning, switch this to the latest known working 7.x tag:
@@ -129,6 +144,8 @@ images:
       - "redis:8.8.0"
     mariadb:
       - "mariadb:12.3.2"
+    mysql:
+      - "mysql:8.4"
     mongodb:
       - "mongo:8.3.4"
       - "mongo:7.0.37"

@@ -65,12 +65,19 @@ async fn stream_monitoring(
     _connection: WebSocketConnectionPermit,
 ) {
     let _monitor = state.resource_cache.register_monitor();
+    let mut shutdown = state.daemon_shutdown.subscribe();
     let mut ticker = interval(Duration::from_secs(1));
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let expiration = sleep_until(expiration_deadline);
     tokio::pin!(expiration);
     loop {
         tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    close_shutdown_socket(&mut socket).await;
+                    break;
+                }
+            }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
                 break;
@@ -284,6 +291,7 @@ async fn stream_logs(
     jwt_exp: i64,
     _connection: WebSocketConnectionPermit,
 ) {
+    let mut shutdown = state.daemon_shutdown.subscribe();
     let expiration_deadline = jwt_expiration_deadline(jwt_exp);
     let mut logs = match state
         .docker
@@ -311,6 +319,13 @@ async fn stream_logs(
     tokio::pin!(expiration);
     loop {
         let message = tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    close_shutdown_socket(&mut socket).await;
+                    break;
+                }
+                continue;
+            }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
                 break;
@@ -409,6 +424,7 @@ async fn stream_import_export(
     _connection: WebSocketConnectionPermit,
 ) {
     let mut events = state.import_export_jobs.subscribe();
+    let mut shutdown = state.daemon_shutdown.subscribe();
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let Ok(snapshot) = complete_before(
         expiration_deadline,
@@ -434,6 +450,12 @@ async fn stream_import_export(
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    close_shutdown_socket(&mut socket).await;
+                    break;
+                }
+            }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
                 break;
@@ -650,6 +672,10 @@ async fn close_expired_socket(socket: &mut WebSocket) {
 
 async fn close_unresponsive_socket(socket: &mut WebSocket) {
     close_socket(socket, "heartbeat timeout").await;
+}
+
+async fn close_shutdown_socket(socket: &mut WebSocket) {
+    close_socket(socket, "server restarting").await;
 }
 
 async fn close_socket(socket: &mut WebSocket, reason: &'static str) {

@@ -26,6 +26,7 @@ pub mod jwt {
 pub mod ports {
     pub const POSTGRES: u16 = 5433;
     pub const MARIADB: u16 = 3307;
+    pub const MYSQL: u16 = 3308;
     pub const REDIS: u16 = 6380;
     pub const MONGODB: u16 = 27017;
     pub const CLICKHOUSE: u16 = 9000;

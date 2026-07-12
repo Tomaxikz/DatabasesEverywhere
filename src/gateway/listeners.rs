@@ -187,6 +187,29 @@ pub async fn run_mariadb_listener(
     .await
 }
 
+pub async fn run_mysql_listener(
+    listener: TcpListener,
+    bind: &str,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+    limiter: GatewayConnectionLimiter,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), ListenerError> {
+    run_listener(
+        ListenerRuntime {
+            listener,
+            bind: bind.to_string(),
+            protocol: "mysql",
+            resolver,
+            tls,
+            limiter,
+            shutdown,
+        },
+        handle_mysql_client,
+    )
+    .await
+}
+
 pub async fn run_mongodb_listener(
     listener: TcpListener,
     bind: &str,
@@ -511,11 +534,49 @@ async fn handle_mariadb_client(
     Ok(())
 }
 
+async fn handle_mysql_client(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+) -> Result<(), ListenerError> {
+    let Some((mut client, mut backend)) =
+        client_handshake("mysql", prepare_mysql_tunnel(client, resolver, tls)).await?
+    else {
+        return Ok(());
+    };
+    io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut backend,
+        TUNNEL_BUFFER_SIZE,
+        TUNNEL_BUFFER_SIZE,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn prepare_mariadb_tunnel(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+    prepare_mysql_wire_tunnel(client, resolver, tls, false).await
+}
+
+async fn prepare_mysql_tunnel(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+    prepare_mysql_wire_tunnel(client, resolver, tls, true).await
+}
+
+async fn prepare_mysql_wire_tunnel(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+    mysql: bool,
+) -> Result<Option<(GatewayStream, tunnel::BackendStream)>, ListenerError> {
+    let protocol = if mysql { "mysql" } else { "mariadb" };
     let mut client = accept_direct_tls(client, tls).await?;
     let gateway_seed = mariadb::new_gateway_auth_seed();
     mariadb::send_gateway_handshake(&mut client, &gateway_seed).await?;
@@ -530,10 +591,16 @@ async fn prepare_mariadb_tunnel(
         }
     };
 
-    let Some(target) = resolver
-        .resolve_mariadb(&route.username, &route.database)
-        .await
-    else {
+    let target = if mysql {
+        resolver
+            .resolve_mysql(&route.username, &route.database)
+            .await
+    } else {
+        resolver
+            .resolve_mariadb(&route.username, &route.database)
+            .await
+    };
+    let Some(target) = target else {
         mariadb::write_packet(
             &mut client,
             2,
@@ -550,7 +617,8 @@ async fn prepare_mariadb_tunnel(
     tracing::debug!(
         user = %route.username,
         database = %route.database,
-        "mariadb route resolved"
+        protocol,
+        "mysql wire route resolved"
     );
     let mut backend = tunnel::connect_backend(&target.endpoint).await?;
     let backend_handshake_packet = mariadb::read_packet(&mut backend).await?;
@@ -601,7 +669,11 @@ async fn prepare_mariadb_tunnel(
         return Ok(None);
     }
     if !mariadb::packet_is_ok(&backend_response.payload) {
-        let message = "unsupported mariadb backend auth response";
+        let message = if mysql {
+            "unsupported mysql backend auth response"
+        } else {
+            "unsupported mariadb backend auth response"
+        };
         mariadb::write_packet(&mut client, 2, &mariadb::error_packet(message)).await?;
         return Err(mariadb::MariadbProxyError::MalformedPacket.into());
     }

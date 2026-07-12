@@ -169,7 +169,9 @@ impl DockerRuntime {
         }
 
         Some(match protocol {
-            Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb => "999:999",
+            Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
+                "999:999"
+            }
             Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => "0:0",
         })
     }
@@ -266,7 +268,7 @@ impl DockerRuntime {
         }
 
         match protocol {
-            Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb => {
+            Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
                 Some("keep-id:uid=999,gid=999")
             }
             Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => None,

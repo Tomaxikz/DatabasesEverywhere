@@ -53,6 +53,8 @@ struct ResourceCacheInner {
     cpu_samples: HashMap<String, CpuStatsSample>,
     disk: HashMap<String, CachedDiskUsage>,
     disk_refreshing: HashMap<String, bool>,
+    host_cpu_sample: Option<HostCpuSample>,
+    host_cpu_usage: Option<CachedHostCpuUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +110,86 @@ pub struct NetworkReport {
     pub tx_bytes: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct NodeResourceSummary {
+    pub node_uuid: String,
+    pub sampled_at: String,
+    pub cpu: NodeCpuSummary,
+    pub memory: NodeMemorySummary,
+    pub disk: NodeDiskSummary,
+    pub instances: NodeInstanceSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeCpuSummary {
+    pub total_cores: u64,
+    pub allocated_cores: f64,
+    pub host_usage_percent: f64,
+    pub managed_usage_cores: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeMemorySummary {
+    pub total_bytes: u64,
+    pub allocation_limit_bytes: u64,
+    pub reserved_bytes: u64,
+    pub allocated_bytes: u64,
+    pub host_used_bytes: u64,
+    pub managed_used_bytes: Option<u64>,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeDiskSummary {
+    pub total_bytes: u64,
+    pub allocation_limit_bytes: u64,
+    pub reserved_bytes: u64,
+    pub allocated_bytes: u64,
+    pub host_used_bytes: u64,
+    pub managed_used_bytes: Option<u64>,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct NodeInstanceSummary {
+    pub total: u64,
+    pub creating: u64,
+    pub booting: u64,
+    pub running: u64,
+    pub stopped: u64,
+    pub failed: u64,
+    pub quarantined: u64,
+    pub deleting: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostCpuSample {
+    total: u64,
+    idle: u64,
+    cores: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedHostCpuUsage {
+    usage_percent: f64,
+    cores: u64,
+    sampled_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostMemorySample {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostDiskSample {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
 pub async fn list_resources(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -122,6 +204,72 @@ pub async fn list_resources(
         .try_collect()
         .await?;
     Ok(ApiResponse::ok(reports))
+}
+
+pub async fn node_resource_summary(
+    State(state): State<AppState>,
+    auth: ApiRequestContext,
+) -> ApiResult<NodeResourceSummary> {
+    auth.require_scope(scopes::RESOURCES_ADMIN)?;
+    let instances = state.instances.list().await;
+    let resource_reports = futures::stream::iter(instances.iter().cloned())
+        .map(|metadata| {
+            let state = state.clone();
+            async move { resource_report(&state, metadata).await }
+        })
+        .buffer_unordered(RESOURCE_FANOUT_LIMIT)
+        .collect::<Vec<_>>();
+    let volumes_root = state.config.paths.volumes_root();
+    let (host_cpu, host_memory, host_disk, resource_reports) = tokio::join!(
+        state.resource_cache.host_cpu_usage(),
+        read_host_memory(),
+        read_host_disk(&volumes_root),
+        resource_reports,
+    );
+    let host_cpu = host_cpu
+        .map_err(|error| ApiError::Runtime(format!("failed to sample host CPU: {error}")))?;
+    let host_memory = host_memory
+        .map_err(|error| ApiError::Runtime(format!("failed to sample host memory: {error}")))?;
+    let host_disk = host_disk
+        .map_err(|error| ApiError::Runtime(format!("failed to sample host disk: {error}")))?;
+    let allocations = aggregate_allocations_and_statuses(&instances);
+    let managed = aggregate_managed_usage(&resource_reports);
+
+    Ok(ApiResponse::ok(NodeResourceSummary {
+        node_uuid: state.config.uuid.clone(),
+        sampled_at: crate::shared::time::now_rfc3339(),
+        cpu: NodeCpuSummary {
+            total_cores: host_cpu.cores,
+            allocated_cores: allocations.allocated_cpu_cores,
+            host_usage_percent: host_cpu.usage_percent,
+            managed_usage_cores: managed.cpu_usage_cores,
+        },
+        memory: NodeMemorySummary {
+            total_bytes: host_memory.total_bytes,
+            allocation_limit_bytes: state
+                .config
+                .allocation
+                .effective_memory_limit_bytes(host_memory.total_bytes),
+            reserved_bytes: state.config.allocation.reserved_memory_bytes(),
+            allocated_bytes: allocations.allocated_memory_bytes,
+            host_used_bytes: host_memory.used_bytes,
+            managed_used_bytes: managed.memory_used_bytes,
+            available_bytes: host_memory.available_bytes,
+        },
+        disk: NodeDiskSummary {
+            total_bytes: host_disk.total_bytes,
+            allocation_limit_bytes: state
+                .config
+                .allocation
+                .effective_disk_limit_bytes(host_disk.total_bytes),
+            reserved_bytes: state.config.allocation.reserved_disk_bytes(),
+            allocated_bytes: allocations.allocated_disk_bytes,
+            host_used_bytes: host_disk.used_bytes,
+            managed_used_bytes: managed.disk_used_bytes,
+            available_bytes: host_disk.available_bytes,
+        },
+        instances: allocations.instances,
+    }))
 }
 
 pub async fn instance_resources(
@@ -195,6 +343,282 @@ pub(crate) async fn resource_report_with_docker_stats(
     };
 
     Ok((report, stats.map(|stats| stats.raw)))
+}
+
+#[derive(Debug)]
+struct AllocationSummary {
+    allocated_cpu_cores: f64,
+    allocated_memory_bytes: u64,
+    allocated_disk_bytes: u64,
+    instances: NodeInstanceSummary,
+}
+
+#[derive(Debug)]
+struct ManagedUsageSummary {
+    cpu_usage_cores: Option<f64>,
+    memory_used_bytes: Option<u64>,
+    disk_used_bytes: Option<u64>,
+}
+
+fn aggregate_allocations_and_statuses(instances: &[InstanceMetadata]) -> AllocationSummary {
+    let mut allocated_cpu_cores = 0.0;
+    let mut allocated_memory_bytes = 0_u64;
+    let mut allocated_disk_bytes = 0_u64;
+    let mut counts = NodeInstanceSummary::default();
+
+    for instance in instances {
+        allocated_cpu_cores += instance.limits.cpu_cores;
+        allocated_memory_bytes =
+            allocated_memory_bytes.saturating_add(mib_to_bytes(instance.limits.memory_mib));
+        allocated_disk_bytes =
+            allocated_disk_bytes.saturating_add(mib_to_bytes(instance.limits.disk_mib));
+        counts.total = counts.total.saturating_add(1);
+        match instance.status {
+            InstanceStatus::Creating => counts.creating = counts.creating.saturating_add(1),
+            InstanceStatus::Booting => counts.booting = counts.booting.saturating_add(1),
+            InstanceStatus::Running => counts.running = counts.running.saturating_add(1),
+            InstanceStatus::Stopped => counts.stopped = counts.stopped.saturating_add(1),
+            InstanceStatus::Failed => counts.failed = counts.failed.saturating_add(1),
+            InstanceStatus::Quarantined => {
+                counts.quarantined = counts.quarantined.saturating_add(1)
+            }
+            InstanceStatus::Deleting => counts.deleting = counts.deleting.saturating_add(1),
+        }
+    }
+
+    AllocationSummary {
+        allocated_cpu_cores,
+        allocated_memory_bytes,
+        allocated_disk_bytes,
+        instances: counts,
+    }
+}
+
+fn aggregate_managed_usage(reports: &[Result<ResourceReport, ApiError>]) -> ManagedUsageSummary {
+    let mut cpu_usage_cores = 0.0;
+    let mut memory_used_bytes = 0_u64;
+    let mut disk_used_bytes = 0_u64;
+    let mut cpu_complete = true;
+    let mut memory_complete = true;
+    let mut disk_complete = true;
+
+    for report in reports {
+        let Ok(report) = report else {
+            cpu_complete = false;
+            memory_complete = false;
+            disk_complete = false;
+            continue;
+        };
+        let expects_live_sample = matches!(report.status.as_str(), "running" | "booting");
+        match report.cpu.usage_percent {
+            Some(percent) => cpu_usage_cores += percent / 100.0,
+            None if expects_live_sample => cpu_complete = false,
+            None => {}
+        }
+        match report.memory.usage_bytes {
+            Some(bytes) => memory_used_bytes = memory_used_bytes.saturating_add(bytes),
+            None if expects_live_sample => memory_complete = false,
+            None => {}
+        }
+        disk_used_bytes = disk_used_bytes.saturating_add(report.disk.used_bytes);
+    }
+
+    ManagedUsageSummary {
+        cpu_usage_cores: cpu_complete.then_some(cpu_usage_cores),
+        memory_used_bytes: memory_complete.then_some(memory_used_bytes),
+        disk_used_bytes: disk_complete.then_some(disk_used_bytes),
+    }
+}
+
+impl ResourceCache {
+    async fn host_cpu_usage(&self) -> Result<CachedHostCpuUsage, std::io::Error> {
+        {
+            let inner = self.inner.lock().await;
+            if let Some(cached) = inner
+                .host_cpu_usage
+                .filter(|cached| cached.sampled_at.elapsed() < STATS_REFRESH_INTERVAL)
+            {
+                return Ok(cached);
+            }
+        }
+
+        let first = read_host_cpu().await?;
+        if let Some(usage) = self.record_host_cpu_sample(first).await {
+            return Ok(usage);
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = read_host_cpu().await?;
+        self.record_host_cpu_sample(second).await.ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                "host CPU counters did not advance during sampling",
+            )
+        })
+    }
+
+    async fn record_host_cpu_sample(&self, current: HostCpuSample) -> Option<CachedHostCpuUsage> {
+        let mut inner = self.inner.lock().await;
+        let usage_percent = inner
+            .host_cpu_sample
+            .and_then(|previous| host_cpu_percent_between(previous, current));
+        inner.host_cpu_sample = Some(current);
+        let cached = usage_percent.map(|usage_percent| CachedHostCpuUsage {
+            usage_percent,
+            cores: current.cores,
+            sampled_at: Instant::now(),
+        });
+        if let Some(cached) = cached {
+            inner.host_cpu_usage = Some(cached);
+        }
+        cached
+    }
+}
+
+async fn read_host_cpu() -> Result<HostCpuSample, std::io::Error> {
+    let contents = tokio::fs::read_to_string("/proc/stat").await?;
+    parse_host_cpu(&contents)
+}
+
+fn parse_host_cpu(contents: &str) -> Result<HostCpuSample, std::io::Error> {
+    let aggregate = contents
+        .lines()
+        .find(|line| line.starts_with("cpu "))
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing aggregate CPU counters"))?;
+    let values = aggregate
+        .split_whitespace()
+        .skip(1)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| IoError::new(ErrorKind::InvalidData, error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() < 4 {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "aggregate CPU counters are incomplete",
+        ));
+    }
+    // Linux user/nice counters already include guest time, so exclude the guest
+    // fields and sum user through steal only to avoid counting them twice.
+    let total = values
+        .iter()
+        .take(8)
+        .try_fold(0_u64, |total, value| total.checked_add(*value))
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "CPU counters overflowed"))?;
+    let idle = values[3]
+        .checked_add(values.get(4).copied().unwrap_or_default())
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "CPU idle counters overflowed"))?;
+    let cores = contents
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| {
+            name.strip_prefix("cpu").is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+        .count() as u64;
+    if cores == 0 {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "missing per-core CPU counters",
+        ));
+    }
+    Ok(HostCpuSample { total, idle, cores })
+}
+
+fn host_cpu_percent_between(previous: HostCpuSample, current: HostCpuSample) -> Option<f64> {
+    let total_delta = current.total.checked_sub(previous.total)?;
+    let idle_delta = current.idle.checked_sub(previous.idle)?;
+    if total_delta == 0 || idle_delta > total_delta {
+        return None;
+    }
+    Some(((total_delta - idle_delta) as f64 / total_delta as f64) * 100.0)
+}
+
+pub(crate) async fn read_host_memory() -> Result<HostMemorySample, std::io::Error> {
+    let contents = tokio::fs::read_to_string("/proc/meminfo").await?;
+    parse_host_memory(&contents)
+}
+
+fn parse_host_memory(contents: &str) -> Result<HostMemorySample, std::io::Error> {
+    let value_kib = |name: &str| -> Result<u64, std::io::Error> {
+        let line = contents
+            .lines()
+            .find(|line| line.starts_with(name))
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing {name}")))?;
+        let mut fields = line.split_whitespace();
+        let _ = fields.next();
+        let value = fields
+            .next()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing {name} value")))?
+            .parse::<u64>()
+            .map_err(|error| IoError::new(ErrorKind::InvalidData, error))?;
+        match fields.next() {
+            Some("kB") => value
+                .checked_mul(1024)
+                .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "memory value overflowed")),
+            _ => Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!("{name} is not reported in kB"),
+            )),
+        }
+    };
+    let total_bytes = value_kib("MemTotal:")?;
+    let available_bytes = value_kib("MemAvailable:")?;
+    let used_bytes = total_bytes.checked_sub(available_bytes).ok_or_else(|| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            "available memory exceeds total memory",
+        )
+    })?;
+    Ok(HostMemorySample {
+        total_bytes,
+        used_bytes,
+        available_bytes,
+    })
+}
+
+pub(crate) async fn read_host_disk(path: &str) -> Result<HostDiskSample, std::io::Error> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let stats = rustix::fs::statvfs(path.as_str()).map_err(std::io::Error::from)?;
+        host_disk_from_statvfs(&stats)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn host_disk_from_statvfs(stats: &rustix::fs::StatVfs) -> Result<HostDiskSample, std::io::Error> {
+    let block_size = if stats.f_frsize == 0 {
+        stats.f_bsize
+    } else {
+        stats.f_frsize
+    };
+    let total_bytes = stats
+        .f_blocks
+        .checked_mul(block_size)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "disk total overflowed"))?;
+    let free_bytes = stats
+        .f_bfree
+        .checked_mul(block_size)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "disk free space overflowed"))?;
+    let available_bytes = stats
+        .f_bavail
+        .checked_mul(block_size)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "disk available space overflowed"))?;
+    let used_bytes = total_bytes.checked_sub(free_bytes).ok_or_else(|| {
+        IoError::new(
+            ErrorKind::InvalidData,
+            "disk free space exceeds total space",
+        )
+    })?;
+    Ok(HostDiskSample {
+        total_bytes,
+        used_bytes,
+        available_bytes,
+    })
 }
 
 async fn directory_size(path: PathBuf, budget: Duration) -> Result<u64, std::io::Error> {
@@ -654,6 +1078,162 @@ mod disk_scan_tests {
         symlink(&data, &linked).unwrap();
 
         assert!(directory_size_blocking(&linked, Duration::from_secs(1)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod node_summary_tests {
+    use super::*;
+    use crate::{
+        instances::metadata::{
+            DatabaseIdentity, PublicEndpoint, RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
+        },
+        shared::{backend::BackendEndpoint, limits::InstanceLimits},
+    };
+
+    #[test]
+    fn parses_host_cpu_and_calculates_non_idle_percentage() {
+        let previous =
+            parse_host_cpu("cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425\ncpu1 50 0 25 425\n")
+                .unwrap();
+        let current =
+            parse_host_cpu("cpu  150 0 100 950 0 0 0 0 0 0\ncpu0 75 0 50 475\ncpu1 75 0 50 475\n")
+                .unwrap();
+
+        assert_eq!(current.cores, 2);
+        assert_eq!(host_cpu_percent_between(previous, current), Some(50.0));
+    }
+
+    #[test]
+    fn parses_mem_available_as_scheduler_safe_host_memory() {
+        let sample = parse_host_memory(
+            "MemTotal:       1000 kB\nMemFree:         100 kB\nMemAvailable:    400 kB\n",
+        )
+        .unwrap();
+
+        assert_eq!(sample.total_bytes, 1_024_000);
+        assert_eq!(sample.available_bytes, 409_600);
+        assert_eq!(sample.used_bytes, 614_400);
+    }
+
+    #[tokio::test]
+    async fn host_disk_sample_uses_the_target_filesystem() {
+        let directory = tempfile::tempdir().unwrap();
+        let sample = read_host_disk(directory.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(sample.total_bytes > 0);
+        assert!(sample.used_bytes <= sample.total_bytes);
+        assert!(sample.available_bytes <= sample.total_bytes);
+    }
+
+    #[test]
+    fn allocations_include_running_and_stopped_instances() {
+        let running = metadata_with_limits(
+            "inst_running",
+            InstanceStatus::Running,
+            InstanceLimits {
+                cpu_cores: 1.5,
+                memory_mib: 512,
+                disk_mib: 1024,
+                ..InstanceLimits::default()
+            },
+        );
+        let stopped = metadata_with_limits(
+            "inst_stopped",
+            InstanceStatus::Stopped,
+            InstanceLimits {
+                cpu_cores: 0.5,
+                memory_mib: 256,
+                disk_mib: 2048,
+                ..InstanceLimits::default()
+            },
+        );
+
+        let summary = aggregate_allocations_and_statuses(&[running, stopped]);
+
+        assert_eq!(summary.allocated_cpu_cores, 2.0);
+        assert_eq!(summary.allocated_memory_bytes, mib_to_bytes(768));
+        assert_eq!(summary.allocated_disk_bytes, mib_to_bytes(3072));
+        assert_eq!(summary.instances.total, 2);
+        assert_eq!(summary.instances.running, 1);
+        assert_eq!(summary.instances.stopped, 1);
+    }
+
+    #[test]
+    fn managed_usage_is_null_when_a_running_instance_lacks_a_sample() {
+        let reports = vec![Ok(ResourceReport {
+            instance_id: "inst_running".to_string(),
+            protocol: "mysql".to_string(),
+            status: "running".to_string(),
+            cpu: CpuReport {
+                configured_cores: 1.0,
+                usage_percent: None,
+            },
+            memory: MemoryReport {
+                configured_mib: 512,
+                usage_bytes: None,
+                limit_bytes: Some(mib_to_bytes(512)),
+            },
+            disk: DiskReport {
+                configured_mib: 1024,
+                limit_bytes: mib_to_bytes(1024),
+                used_bytes: 123,
+                enforced: true,
+                enforcement_method: "fuse_quota".to_string(),
+            },
+            network: NetworkReport {
+                rx_bytes: None,
+                tx_bytes: None,
+            },
+        })];
+
+        let usage = aggregate_managed_usage(&reports);
+
+        assert_eq!(usage.cpu_usage_cores, None);
+        assert_eq!(usage.memory_used_bytes, None);
+        assert_eq!(usage.disk_used_bytes, Some(123));
+    }
+
+    fn metadata_with_limits(
+        instance_id: &str,
+        status: InstanceStatus,
+        limits: InstanceLimits,
+    ) -> InstanceMetadata {
+        InstanceMetadata {
+            schema_version: SCHEMA_VERSION,
+            instance_id: instance_id.to_string(),
+            protocol: Protocol::Mysql,
+            status,
+            public: PublicEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 3308,
+            },
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: format!("/run/dbev/sockets/{instance_id}/mysqld.sock"),
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: format!("dbe-mysql-{instance_id}"),
+                network_mode: "none".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: format!("db_{instance_id}"),
+                username: format!("user_{instance_id}"),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
+            mongodb_root_password: None,
+            limits,
+            image: None,
+            database_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
     }
 }
 

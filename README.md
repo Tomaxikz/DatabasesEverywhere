@@ -8,7 +8,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Features
 
-- 6+ supported databases
+- 7 supported databases
 - Database imports
 - Database exports
 - Database backups
@@ -17,6 +17,8 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Image updating
 - Major version upgrades
 - Per-database resource limits
+- Node-wide capacity and host-pressure metrics for panel schedulers
+- Node-wide memory and disk admission reserves to protect host availability
 
 ## Status
 
@@ -32,6 +34,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | --- | --- | --- |
 | PostgreSQL | Works | Native PostgreSQL TCP |
 | MariaDB | Works | MySQL/MariaDB TCP |
+| MySQL | Works | MySQL TCP |
 | Redis | Works | RESP |
 | MongoDB | Works | MongoDB wire protocol |
 | ClickHouse | Works | Native TCP and HTTP |

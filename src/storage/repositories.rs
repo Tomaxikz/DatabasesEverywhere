@@ -36,6 +36,8 @@ impl InstanceRepository {
                 instance_metadata.metadata_json,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
+                instance_route_auth.mysql_native_password_sha1_stage2,
+                instance_route_auth.mysql_root_password,
                 instance_route_auth.mongodb_root_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
@@ -67,6 +69,8 @@ impl InstanceRepository {
                 instance_metadata.metadata_json,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
+                instance_route_auth.mysql_native_password_sha1_stage2,
+                instance_route_auth.mysql_root_password,
                 instance_route_auth.mongodb_root_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
@@ -105,6 +109,16 @@ impl InstanceRepository {
             "mariadb_root_password",
             &metadata.instance_id,
             metadata.mariadb_root_password.as_deref(),
+        )?;
+        let mysql_native_password_sha1_stage2 = self.protect_route_secret(
+            "mysql_native_password_sha1_stage2",
+            &metadata.instance_id,
+            metadata.mysql_native_password_sha1_stage2.as_deref(),
+        )?;
+        let mysql_root_password = self.protect_route_secret(
+            "mysql_root_password",
+            &metadata.instance_id,
+            metadata.mysql_root_password.as_deref(),
         )?;
         let mongodb_root_password = self.protect_route_secret(
             "mongodb_root_password",
@@ -182,6 +196,8 @@ impl InstanceRepository {
 
         if metadata.mariadb_native_password_sha1_stage2.is_some()
             || metadata.mariadb_root_password.is_some()
+            || metadata.mysql_native_password_sha1_stage2.is_some()
+            || metadata.mysql_root_password.is_some()
             || metadata.mongodb_root_password.is_some()
         {
             sqlx::query(
@@ -190,13 +206,17 @@ impl InstanceRepository {
                     instance_id,
                     mariadb_native_password_sha1_stage2,
                     mariadb_root_password,
+                    mysql_native_password_sha1_stage2,
+                    mysql_root_password,
                     mongodb_root_password,
                     updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     mariadb_native_password_sha1_stage2 = excluded.mariadb_native_password_sha1_stage2,
                     mariadb_root_password = excluded.mariadb_root_password,
+                    mysql_native_password_sha1_stage2 = excluded.mysql_native_password_sha1_stage2,
+                    mysql_root_password = excluded.mysql_root_password,
                     mongodb_root_password = excluded.mongodb_root_password,
                     updated_at = excluded.updated_at
                 "#,
@@ -204,6 +224,8 @@ impl InstanceRepository {
             .bind(&metadata.instance_id)
             .bind(&mariadb_native_password_sha1_stage2)
             .bind(&mariadb_root_password)
+            .bind(&mysql_native_password_sha1_stage2)
+            .bind(&mysql_root_password)
             .bind(&mongodb_root_password)
             .bind(&metadata.updated_at)
             .execute(&mut *transaction)
@@ -230,6 +252,8 @@ impl InstanceRepository {
         for metadata in metadata.iter().filter(|metadata| {
             metadata.mariadb_native_password_sha1_stage2.is_some()
                 || metadata.mariadb_root_password.is_some()
+                || metadata.mysql_native_password_sha1_stage2.is_some()
+                || metadata.mysql_root_password.is_some()
                 || metadata.mongodb_root_password.is_some()
         }) {
             self.upsert(metadata).await?;
@@ -252,6 +276,16 @@ impl InstanceRepository {
             "mariadb_root_password",
             &metadata.instance_id,
             row.try_get("mariadb_root_password")?,
+        )?;
+        metadata.mysql_native_password_sha1_stage2 = self.unprotect_route_secret(
+            "mysql_native_password_sha1_stage2",
+            &metadata.instance_id,
+            row.try_get("mysql_native_password_sha1_stage2")?,
+        )?;
+        metadata.mysql_root_password = self.unprotect_route_secret(
+            "mysql_root_password",
+            &metadata.instance_id,
+            row.try_get("mysql_root_password")?,
         )?;
         metadata.mongodb_root_password = self.unprotect_route_secret(
             "mongodb_root_password",
@@ -506,6 +540,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_repository_stores_hidden_mysql_auth_material_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.protocol = Protocol::Mysql;
+        metadata.mysql_native_password_sha1_stage2 =
+            Some("0123456789abcdef0123456789abcdef01234567".to_string());
+        metadata.mysql_root_password = Some("internal-mysql-root-password".to_string());
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let (raw_verifier, raw_root): (String, String) = sqlx::query_as(
+            "SELECT mysql_native_password_sha1_stage2, mysql_root_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_encrypted(&raw_verifier));
+        assert!(is_encrypted(&raw_root));
+        assert!(!raw_root.contains("internal-mysql-root-password"));
+
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.mysql_native_password_sha1_stage2.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            loaded.mysql_root_password.as_deref(),
+            Some("internal-mysql-root-password")
+        );
+        let public_json = serde_json::to_string(&loaded).unwrap();
+        assert!(!public_json.contains("mysql_native_password_sha1_stage2"));
+        assert!(!public_json.contains("mysql_root_password"));
+    }
+
+    #[tokio::test]
     async fn persists_hidden_mongodb_root_password() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
@@ -607,6 +679,8 @@ mod tests {
             route_key_sha256: None,
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
             mongodb_root_password: None,
             limits: InstanceLimits::default(),
             image: None,

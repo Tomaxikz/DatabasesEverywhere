@@ -13,8 +13,9 @@ use crate::{
         images::{ensure_image_allowed, validate_image},
         instance_create::{
             backend_endpoint_for_instance, create_instance_from_request,
-            launch_container_from_spec, protocol_pids_limit, provision_mariadb_tenant_user,
-            provision_mongodb_tenant_user, provision_postgres_tenant_role,
+            enforce_node_allocation_policy, launch_container_from_spec, protocol_pids_limit,
+            provision_mariadb_tenant_user, provision_mongodb_tenant_user,
+            provision_mysql_tenant_user, provision_postgres_tenant_role,
             requested_or_configured_image,
         },
         instance_requests::{
@@ -423,6 +424,7 @@ fn database_version_script(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Postgres => "postgres --version 2>/dev/null || psql --version",
         Protocol::Mariadb => "mariadb --version 2>/dev/null || mysqld --version",
+        Protocol::Mysql => "mysqld --version 2>/dev/null || mysql --version",
         Protocol::Redis => "redis-server --version",
         Protocol::Mongodb => "mongod --version | awk '/db version/ {print $3; exit}'",
         Protocol::Clickhouse => "clickhouse-server --version 2>/dev/null || clickhouse --version",
@@ -446,6 +448,16 @@ fn normalize_database_version(protocol: Protocol, stdout: &str) -> Option<String
             .split("Distrib ")
             .nth(1)
             .and_then(|rest| rest.split([',', ' ']).next())
+            .unwrap_or(line),
+        Protocol::Mysql => line
+            .split("Ver ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .or_else(|| {
+                line.split("Distrib ")
+                    .nth(1)
+                    .and_then(|rest| rest.split([',', ' ']).next())
+            })
             .unwrap_or(line),
         Protocol::Redis => line
             .split_whitespace()
@@ -772,6 +784,41 @@ pub async fn update_instance_image(
         .await
         .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     }
+    if metadata.protocol == Protocol::Mysql {
+        let password = requested_password.as_deref().ok_or_else(|| {
+            fail_image_update_api(
+                &state,
+                &metadata.instance_id,
+                ApiError::BadRequest(
+                    "password is required when recreating mysql database containers".to_string(),
+                ),
+            )
+        })?;
+        let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
+            fail_image_update_api(
+                &state,
+                &metadata.instance_id,
+                ApiError::BadRequest(
+                    "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+                ),
+            )
+        })?;
+        state.install_progress.stage(
+            &metadata.instance_id,
+            "provision",
+            "re-provisioning MySQL user",
+        );
+        provision_mysql_tenant_user(
+            &state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            root_password,
+        )
+        .await
+        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    }
     state.install_progress.stage(
         &metadata.instance_id,
         "backend",
@@ -781,10 +828,17 @@ pub async fn update_instance_image(
         backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)
             .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     if metadata.protocol == Protocol::Mariadb
-        && let Some(password) = requested_password
+        && let Some(password) = requested_password.as_deref()
     {
         metadata.mariadb_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+        );
+    }
+    if metadata.protocol == Protocol::Mysql
+        && let Some(password) = requested_password.as_deref()
+    {
+        metadata.mysql_native_password_sha1_stage2 = Some(
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
         );
     }
     metadata.status = InstanceStatus::Running;
@@ -914,6 +968,11 @@ async fn update_instance_image_by_major_migration(
     metadata.runtime.network_mode = "none".to_string();
     if metadata.protocol == Protocol::Mariadb {
         metadata.mariadb_native_password_sha1_stage2 = Some(
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
+        );
+    }
+    if metadata.protocol == Protocol::Mysql {
+        metadata.mysql_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
         );
     }
@@ -1198,6 +1257,22 @@ async fn create_empty_replacement_and_import(
         .await
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     }
+    if metadata.protocol == Protocol::Mysql {
+        provision_mysql_tenant_user(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            metadata.mysql_root_password.as_deref().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "mysql internal root password is missing; automatic major upgrades require an instance created with MySQL maintenance credentials".to_string(),
+                )
+            })?,
+        )
+        .await
+        .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    }
 
     state.install_progress.stage(
         &metadata.instance_id,
@@ -1217,6 +1292,11 @@ async fn create_empty_replacement_and_import(
             .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     if metadata.protocol == Protocol::Mariadb {
         metadata.mariadb_native_password_sha1_stage2 = Some(
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+        );
+    }
+    if metadata.protocol == Protocol::Mysql {
+        metadata.mysql_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
         );
     }
@@ -1420,7 +1500,23 @@ async fn create_empty_replacement_and_import_without_import(
         || async { Ok(()) },
     )
     .await
-    .map_err(|error| error.into_api_error())
+    .map_err(|error| error.into_api_error())?;
+    if metadata.protocol == Protocol::Mysql {
+        provision_mysql_tenant_user(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            metadata.mysql_root_password.as_deref().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "mysql internal root password is missing; container recreation requires maintenance credentials".to_string(),
+                )
+            })?,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn temporary_major_upgrade_instance_id(instance_id: &str) -> String {
@@ -1472,6 +1568,11 @@ async fn validate_replacement_instance(
     let script = match metadata.protocol {
         Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h 127.0.0.1 -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
         Protocol::Mariadb => "mariadb -h 127.0.0.1 -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\" -e 'select 1' >/dev/null".to_string(),
+        Protocol::Mysql => format!(
+            "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
+            crate::shared::shell::sh_quote(&metadata.database.username),
+            crate::shared::shell::sh_quote(&metadata.database.name),
+        ),
         Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
         Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
         Protocol::Redis | Protocol::Qdrant => {
@@ -1605,7 +1706,11 @@ fn major_upgrade_required_error(
 
 fn ensure_major_upgrade_supported(protocol: Protocol) -> Result<(), ApiError> {
     match protocol {
-        Protocol::Postgres | Protocol::Mariadb | Protocol::Mongodb | Protocol::Clickhouse => Ok(()),
+        Protocol::Postgres
+        | Protocol::Mariadb
+        | Protocol::Mysql
+        | Protocol::Mongodb
+        | Protocol::Clickhouse => Ok(()),
         Protocol::Redis => Err(ApiError::BadRequest(
             "redis major upgrades are blocked because Redis uses physical archive restore here; create a fresh Redis instance or use a dedicated Redis migration workflow".to_string(),
         )),
@@ -1715,6 +1820,7 @@ pub async fn update_instance_limits(
 ) -> ApiResult<InstanceMetadata> {
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     validate_limits(&request)?;
+    let _creation = state.instance_locks.lock_creation().await;
     let _operation = state.instance_locks.lock(&instance_id).await;
 
     let mut metadata = state
@@ -1725,6 +1831,7 @@ pub async fn update_instance_limits(
     validate_protocol_limits(metadata.protocol, &request)?;
     let limits = limits_from_request(&request);
     let previous_limits = metadata.limits.clone();
+    enforce_node_allocation_policy(&state, &limits, Some(&previous_limits)).await?;
     let disk_changed = limits.disk_mib != previous_limits.disk_mib;
     let paths = if disk_changed {
         Some(
@@ -2194,6 +2301,19 @@ async fn instance_image_update_spec(
             paths.logs.clone(),
             paths.sockets.clone(),
         ),
+        Protocol::Mysql => databases::mysql::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            &metadata.database.name,
+            SecretString::from(metadata.mysql_root_password.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+                )
+            })?),
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
         Protocol::Mongodb => databases::mongodb::docker::instance_spec(
             &metadata.instance_id,
             image,
@@ -2322,6 +2442,7 @@ mod tests {
             image_major_version("registry.example.com:5000/db/mariadb:12.3.2"),
             Some(12)
         );
+        assert_eq!(image_major_version("mysql:8.4"), Some(8));
     }
 
     #[test]
@@ -2378,6 +2499,7 @@ mod tests {
     #[test]
     fn major_migration_support_is_limited_to_logical_dump_protocols() {
         assert!(ensure_major_upgrade_supported(Protocol::Postgres).is_ok());
+        assert!(ensure_major_upgrade_supported(Protocol::Mysql).is_ok());
         assert!(ensure_major_upgrade_supported(Protocol::Mongodb).is_ok());
         assert!(ensure_major_upgrade_supported(Protocol::Redis).is_err());
         assert!(ensure_major_upgrade_supported(Protocol::Qdrant).is_err());
@@ -2395,6 +2517,13 @@ mod tests {
                 "mariadb  Ver 15.1 Distrib 12.3.2-MariaDB, for Linux (x86_64)\n"
             ),
             Some("12.3.2-MariaDB".to_string())
+        );
+        assert_eq!(
+            normalize_database_version(
+                Protocol::Mysql,
+                "mysqld  Ver 8.4.6 for Linux on x86_64 (MySQL Community Server - GPL)\n"
+            ),
+            Some("8.4.6".to_string())
         );
         assert_eq!(
             normalize_database_version(

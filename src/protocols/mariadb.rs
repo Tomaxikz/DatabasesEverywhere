@@ -13,6 +13,7 @@ const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
 const GATEWAY_CONNECTION_ID: u32 = 1;
 const NATIVE_PASSWORD_PLUGIN: &str = "mysql_native_password";
+const CACHING_SHA2_PASSWORD_PLUGIN: &str = "caching_sha2_password";
 const GATEWAY_AUTH_PLUGIN: &str = NATIVE_PASSWORD_PLUGIN;
 const OK_STATUS_AUTOCOMMIT: [u8; 2] = [0x02, 0x00];
 
@@ -43,7 +44,7 @@ pub enum MariadbProxyError {
     MissingPassword,
     #[error("mysql client did not use {NATIVE_PASSWORD_PLUGIN}")]
     NativePasswordPluginRequired,
-    #[error("mysql native password verifier is missing; recreate the mariadb instance")]
+    #[error("mysql native password verifier is missing; recreate the database instance")]
     MissingNativePasswordVerifier,
     #[error("mysql native password verifier is invalid")]
     InvalidNativePasswordVerifier,
@@ -209,18 +210,37 @@ pub fn backend_handshake_response(
     gateway_seed: &[u8],
     native_password_sha1_stage2_hex: &str,
 ) -> Result<Vec<u8>, MariadbProxyError> {
-    if handshake.auth_plugin != NATIVE_PASSWORD_PLUGIN {
+    // Authenticate the public client before trusting any backend response. This
+    // is required even when MySQL advertises caching_sha2_password first and
+    // will subsequently switch this native-password tenant to its real plugin.
+    let _ = native_password_token_from_client_token(
+        &route.auth_response,
+        gateway_seed,
+        gateway_seed,
+        native_password_sha1_stage2_hex,
+    )?;
+
+    if handshake.auth_plugin != NATIVE_PASSWORD_PLUGIN
+        && handshake.auth_plugin != CACHING_SHA2_PASSWORD_PLUGIN
+    {
         return Err(MariadbProxyError::UnsupportedBackendAuth(
             handshake.auth_plugin.clone(),
         ));
     }
 
-    let auth_response = native_password_token_from_client_token(
-        &route.auth_response,
-        gateway_seed,
-        &handshake.auth_seed,
-        native_password_sha1_stage2_hex,
-    )?;
+    let auth_response = if handshake.auth_plugin == NATIVE_PASSWORD_PLUGIN {
+        native_password_token_from_client_token(
+            &route.auth_response,
+            gateway_seed,
+            &handshake.auth_seed,
+            native_password_sha1_stage2_hex,
+        )?
+    } else {
+        // The account is provisioned with mysql_native_password. An empty
+        // response to MySQL's default greeting causes the server to send the
+        // account-specific AuthSwitchRequest, which is handled below.
+        Vec::new()
+    };
     let capabilities = CLIENT_LONG_PASSWORD
         | CLIENT_LONG_FLAG
         | CLIENT_PROTOCOL_41
@@ -240,7 +260,7 @@ pub fn backend_handshake_response(
     payload.extend_from_slice(&auth_response);
     payload.extend_from_slice(route.database.as_bytes());
     payload.push(0);
-    payload.extend_from_slice(NATIVE_PASSWORD_PLUGIN.as_bytes());
+    payload.extend_from_slice(handshake.auth_plugin.as_bytes());
     payload.push(0);
     payload.push(0);
     Ok(payload)
@@ -301,7 +321,13 @@ pub fn auth_switch_request(payload: &[u8]) -> Option<BackendHandshake> {
     }
     let mut offset = 1;
     let plugin = read_null_string(payload, &mut offset).ok()?;
-    let seed = payload.get(offset..)?.to_vec();
+    let mut seed = payload.get(offset..)?.to_vec();
+    while seed.last() == Some(&0) {
+        seed.pop();
+    }
+    if seed.is_empty() {
+        return None;
+    }
     Some(BackendHandshake {
         auth_seed: seed,
         auth_plugin: plugin,
@@ -620,6 +646,106 @@ mod tests {
     #[test]
     fn gateway_auth_seed_is_not_static() {
         assert_ne!(new_gateway_auth_seed(), new_gateway_auth_seed());
+    }
+
+    #[test]
+    fn mysql_caching_sha2_greeting_still_authenticates_public_client() {
+        let password = "mysql-password-1";
+        let gateway_seed = new_gateway_auth_seed();
+        let stage_2 = native_password_sha1_stage2_hex(password);
+        let route = MariadbRoute {
+            username: "app_mysql_1".to_string(),
+            database: "mysql_1".to_string(),
+            auth_response: native_password_token(password, &gateway_seed),
+        };
+        let handshake = BackendHandshake {
+            auth_seed: b"backend-seed-1234567".to_vec(),
+            auth_plugin: CACHING_SHA2_PASSWORD_PLUGIN.to_string(),
+        };
+
+        let response =
+            backend_handshake_response(&handshake, &route, &gateway_seed, &stage_2).unwrap();
+        let mut offset = 4 + 4 + 1 + 23;
+        assert_eq!(
+            read_null_string(&response, &mut offset).unwrap(),
+            route.username
+        );
+        assert_eq!(
+            response[offset], 0,
+            "initial caching_sha2 response must be empty"
+        );
+        offset += 1;
+        assert_eq!(
+            read_null_string(&response, &mut offset).unwrap(),
+            route.database
+        );
+        assert_eq!(
+            read_null_string(&response, &mut offset).unwrap(),
+            CACHING_SHA2_PASSWORD_PLUGIN
+        );
+    }
+
+    #[test]
+    fn mysql_caching_sha2_greeting_rejects_wrong_public_password() {
+        let password = "mysql-password-1";
+        let gateway_seed = new_gateway_auth_seed();
+        let route = MariadbRoute {
+            username: "app_mysql_1".to_string(),
+            database: "mysql_1".to_string(),
+            auth_response: native_password_token("wrong-password", &gateway_seed),
+        };
+        let handshake = BackendHandshake {
+            auth_seed: b"backend-seed-1234567".to_vec(),
+            auth_plugin: CACHING_SHA2_PASSWORD_PLUGIN.to_string(),
+        };
+
+        assert!(matches!(
+            backend_handshake_response(
+                &handshake,
+                &route,
+                &gateway_seed,
+                &native_password_sha1_stage2_hex(password),
+            ),
+            Err(MariadbProxyError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn mysql_native_auth_switch_derives_backend_token() {
+        let password = "mysql-password-1";
+        let gateway_seed = new_gateway_auth_seed();
+        let backend_seed = b"backend-seed-1234567";
+        let route = MariadbRoute {
+            username: "app_mysql_1".to_string(),
+            database: "mysql_1".to_string(),
+            auth_response: native_password_token(password, &gateway_seed),
+        };
+        let switch = BackendHandshake {
+            auth_seed: backend_seed.to_vec(),
+            auth_plugin: NATIVE_PASSWORD_PLUGIN.to_string(),
+        };
+
+        let response = backend_auth_switch_response(
+            &switch,
+            &route,
+            &gateway_seed,
+            &native_password_sha1_stage2_hex(password),
+        )
+        .unwrap();
+
+        assert_eq!(response, native_password_token(password, backend_seed));
+    }
+
+    #[test]
+    fn auth_switch_parser_excludes_the_wire_terminator_from_the_seed() {
+        let mut payload = vec![0xfe];
+        payload.extend_from_slice(b"mysql_native_password\0");
+        payload.extend_from_slice(b"12345678901234567890\0");
+
+        let switch = auth_switch_request(&payload).unwrap();
+
+        assert_eq!(switch.auth_plugin, NATIVE_PASSWORD_PLUGIN);
+        assert_eq!(switch.auth_seed, b"12345678901234567890");
     }
 
     #[tokio::test]

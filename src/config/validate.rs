@@ -60,6 +60,10 @@ pub enum ConfigValidationError {
     #[error("security.{field} must be greater than zero")]
     InvalidSecurityLimit { field: &'static str },
     #[error(
+        "allocation.{field} must fit in bytes, and configured maxima must be greater than zero"
+    )]
+    InvalidAllocationLimit { field: &'static str },
+    #[error(
         "security.self_upgrade_enabled is unsupported; deploy upgrades through a signed package or immutable container image"
     )]
     UnsupportedSelfUpgrade,
@@ -97,6 +101,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_api_hosts(config)?;
     validate_listener("postgres", &config.postgres, &config.tls)?;
     validate_listener("mariadb", &config.mariadb, &config.tls)?;
+    validate_listener("mysql", &config.mysql, &config.tls)?;
     validate_listener("redis", &config.redis, &config.tls)?;
     validate_listener("mongodb", &config.mongodb, &config.tls)?;
     validate_clickhouse(&config.clickhouse, &config.tls)?;
@@ -104,6 +109,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_api_tls(&config.api.ssl)?;
     validate_api_exposure(config)?;
     validate_security(&config.security)?;
+    validate_allocation(&config.allocation)?;
     validate_disk(&config.disk)?;
     if config.artifacts.retention_keep_latest == 0 {
         return Err(ConfigValidationError::InvalidArtifactRetention);
@@ -123,6 +129,28 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_images(&config.images)?;
     validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
 
+    Ok(())
+}
+
+fn validate_allocation(
+    allocation: &crate::config::AllocationConfig,
+) -> Result<(), ConfigValidationError> {
+    for (field, value) in [
+        ("max_memory_mib", allocation.max_memory_mib),
+        ("max_disk_mib", allocation.max_disk_mib),
+    ] {
+        if value.is_some_and(|value| value == 0 || value.checked_mul(1024 * 1024).is_none()) {
+            return Err(ConfigValidationError::InvalidAllocationLimit { field });
+        }
+    }
+    for (field, value) in [
+        ("reserved_memory_mib", allocation.reserved_memory_mib),
+        ("reserved_disk_mib", allocation.reserved_disk_mib),
+    ] {
+        if value.checked_mul(1024 * 1024).is_none() {
+            return Err(ConfigValidationError::InvalidAllocationLimit { field });
+        }
+    }
     Ok(())
 }
 
@@ -187,6 +215,7 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
         ("images.postgres", images.postgres.as_str()),
         ("images.redis", images.redis.as_str()),
         ("images.mariadb", images.mariadb.as_str()),
+        ("images.mysql", images.mysql.as_str()),
         ("images.mongodb", images.mongodb.as_str()),
         ("images.clickhouse", images.clickhouse.as_str()),
         ("images.qdrant", images.qdrant.as_str()),
@@ -200,6 +229,7 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
         ),
         ("images.allowed.redis", images.allowed.redis.as_slice()),
         ("images.allowed.mariadb", images.allowed.mariadb.as_slice()),
+        ("images.allowed.mysql", images.allowed.mysql.as_slice()),
         ("images.allowed.mongodb", images.allowed.mongodb.as_slice()),
         (
             "images.allowed.clickhouse",
@@ -387,6 +417,7 @@ fn validate_security(
         ("pids_limits.postgres", security.pids_limits.postgres),
         ("pids_limits.redis", security.pids_limits.redis),
         ("pids_limits.mariadb", security.pids_limits.mariadb),
+        ("pids_limits.mysql", security.pids_limits.mysql),
         ("pids_limits.mongodb", security.pids_limits.mongodb),
         ("pids_limits.clickhouse", security.pids_limits.clickhouse),
         ("pids_limits.qdrant", security.pids_limits.qdrant),
@@ -538,6 +569,36 @@ mod tests {
                 field: "pids_limits.clickhouse"
             }
         ));
+    }
+
+    #[test]
+    fn rejects_zero_or_unrepresentable_allocation_limits() {
+        let mut config = valid_config();
+        config.allocation.max_memory_mib = Some(0);
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InvalidAllocationLimit {
+                field: "max_memory_mib"
+            }
+        ));
+
+        let mut config = valid_config();
+        config.allocation.reserved_disk_mib = u64::MAX;
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InvalidAllocationLimit {
+                field: "reserved_disk_mib"
+            }
+        ));
+    }
+
+    #[test]
+    fn accepts_zero_allocation_reserves() {
+        let mut config = valid_config();
+        config.allocation.reserved_memory_mib = 0;
+        config.allocation.reserved_disk_mib = 0;
+
+        validate_config(&config).unwrap();
     }
 
     #[test]

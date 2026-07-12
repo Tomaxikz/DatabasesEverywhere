@@ -25,6 +25,10 @@ pub struct InstanceMetadata {
     #[serde(default, skip_serializing)]
     pub mariadb_root_password: Option<String>,
     #[serde(default, skip_serializing)]
+    pub mysql_native_password_sha1_stage2: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub mysql_root_password: Option<String>,
+    #[serde(default, skip_serializing)]
     pub mongodb_root_password: Option<String>,
     pub limits: InstanceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]

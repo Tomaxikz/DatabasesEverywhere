@@ -33,6 +33,14 @@ impl RouteResolver {
         self.store.resolve_mariadb(username, database).await
     }
 
+    pub async fn resolve_mysql(
+        &self,
+        username: &str,
+        database: &str,
+    ) -> Option<MariadbRouteTarget> {
+        self.store.resolve_mysql(username, database).await
+    }
+
     pub async fn resolve_mongodb(&self, username: &str, database: &str) -> Option<BackendEndpoint> {
         self.store.resolve_mongodb(username, database).await
     }

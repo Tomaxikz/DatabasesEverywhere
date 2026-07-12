@@ -10,13 +10,14 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.2.0";
+pub const API_VERSION: &str = "0.3.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
     pub service: &'static str,
     pub version: &'static str,
     pub api_version: &'static str,
+    pub api_readiness: &'static str,
     pub uuid: String,
     pub token_id: String,
     pub remote: String,
@@ -33,6 +34,7 @@ pub struct SystemResponse {
     pub postgres_enabled: bool,
     pub redis_enabled: bool,
     pub mariadb_enabled: bool,
+    pub mysql_enabled: bool,
     pub mongodb_enabled: bool,
     pub clickhouse_enabled: bool,
     pub clickhouse_http_enabled: bool,
@@ -51,6 +53,7 @@ pub async fn system(
         service: "databases-everywhere",
         version: env!("CARGO_PKG_VERSION"),
         api_version: API_VERSION,
+        api_readiness: "ready",
         uuid: state.config.uuid.clone(),
         token_id: state.config.token_id.clone(),
         remote: state.config.remote.clone(),
@@ -67,6 +70,7 @@ pub async fn system(
         postgres_enabled: state.config.postgres.enabled,
         redis_enabled: state.config.redis.enabled,
         mariadb_enabled: state.config.mariadb.enabled,
+        mysql_enabled: state.config.mysql.enabled,
         mongodb_enabled: state.config.mongodb.enabled,
         clickhouse_enabled: state.config.clickhouse.enabled,
         clickhouse_http_enabled: state.config.clickhouse.enabled,

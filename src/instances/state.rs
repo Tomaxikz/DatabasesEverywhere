@@ -86,6 +86,22 @@ impl InstanceStore {
         })
     }
 
+    pub async fn resolve_mysql(
+        &self,
+        username: &str,
+        database: &str,
+    ) -> Option<MariadbRouteTarget> {
+        let state = self.inner.read().await;
+        let instance_id = state
+            .mysql_routes
+            .get(&(username.to_string(), database.to_string()))?;
+        let metadata = state.instances.get(instance_id)?;
+        Some(MariadbRouteTarget {
+            endpoint: metadata.backend.clone(),
+            native_password_sha1_stage2: metadata.mysql_native_password_sha1_stage2.clone(),
+        })
+    }
+
     pub async fn resolve_mongodb(&self, username: &str, database: &str) -> Option<BackendEndpoint> {
         let state = self.inner.read().await;
         let instance_id = state
@@ -127,6 +143,7 @@ struct InstanceState {
     instances: HashMap<String, InstanceMetadata>,
     postgres_routes: HashMap<(String, String), String>,
     mariadb_routes: HashMap<(String, String), String>,
+    mysql_routes: HashMap<(String, String), String>,
     mongodb_routes: HashMap<(String, String), String>,
     clickhouse_routes: HashMap<(String, String), String>,
     qdrant_routes: HashMap<String, String>,
@@ -174,6 +191,15 @@ impl InstanceState {
                     metadata.instance_id.clone(),
                 );
             }
+            Protocol::Mysql => {
+                self.mysql_routes.insert(
+                    (
+                        metadata.database.username.clone(),
+                        metadata.database.name.clone(),
+                    ),
+                    metadata.instance_id.clone(),
+                );
+            }
             Protocol::Mongodb => {
                 self.mongodb_routes.insert(
                     (
@@ -207,6 +233,8 @@ impl InstanceState {
         self.postgres_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
         self.mariadb_routes
+            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
+        self.mysql_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
         self.mongodb_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);

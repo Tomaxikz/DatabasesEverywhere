@@ -8,16 +8,18 @@ pub enum Protocol {
     Postgres,
     Redis,
     Mariadb,
+    Mysql,
     Mongodb,
     Clickhouse,
     Qdrant,
 }
 
 impl Protocol {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Postgres,
         Self::Redis,
         Self::Mariadb,
+        Self::Mysql,
         Self::Mongodb,
         Self::Clickhouse,
         Self::Qdrant,
@@ -28,6 +30,7 @@ impl Protocol {
             Self::Postgres => "postgres",
             Self::Redis => "redis",
             Self::Mariadb => "mariadb",
+            Self::Mysql => "mysql",
             Self::Mongodb => "mongodb",
             Self::Clickhouse => "clickhouse",
             Self::Qdrant => "qdrant",
@@ -39,6 +42,7 @@ impl Protocol {
             Self::Postgres => 5432,
             Self::Redis => 6379,
             Self::Mariadb => 3306,
+            Self::Mysql => 3306,
             Self::Mongodb => 27017,
             Self::Clickhouse => 9000,
             Self::Qdrant => 6334,
@@ -59,7 +63,8 @@ impl FromStr for Protocol {
         match value {
             "postgres" | "postgresql" => Ok(Self::Postgres),
             "redis" => Ok(Self::Redis),
-            "mariadb" | "mysql" => Ok(Self::Mariadb),
+            "mariadb" => Ok(Self::Mariadb),
+            "mysql" => Ok(Self::Mysql),
             "mongodb" | "mongo" => Ok(Self::Mongodb),
             "clickhouse" | "ch" => Ok(Self::Clickhouse),
             "qdrant" | "qdrant-grpc" => Ok(Self::Qdrant),
@@ -74,4 +79,18 @@ impl FromStr for Protocol {
 #[error("unsupported database protocol: {value}")]
 pub struct ProtocolParseError {
     value: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_is_a_distinct_first_class_protocol() {
+        assert_eq!("mysql".parse::<Protocol>().unwrap(), Protocol::Mysql);
+        assert_eq!("mariadb".parse::<Protocol>().unwrap(), Protocol::Mariadb);
+        assert_ne!(Protocol::Mysql, Protocol::Mariadb);
+        assert!(Protocol::ALL.contains(&Protocol::Mysql));
+        assert_eq!(Protocol::Mysql.default_container_port(), 3306);
+    }
 }

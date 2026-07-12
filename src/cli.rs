@@ -1,5 +1,6 @@
 use std::{
     fs,
+    future::IntoFuture,
     io::{ErrorKind, Read, Write},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -13,6 +14,7 @@ use anyhow::Context;
 use axum::Router;
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -43,6 +45,9 @@ use crate::{
 };
 
 const IMPORT_EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const API_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
+const FUSE_SHUTDOWN_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(name = "dbev")]
@@ -1575,6 +1580,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         resource_cache: crate::api::resources::ResourceCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         gateway_supervisor: GatewaySupervisor::new(),
+        daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
     };
     crate::api::resources::start_resource_sampler(state.clone());
     tracing::info!(
@@ -1582,11 +1588,13 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     );
     let managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
     let gateway_supervisor = state.gateway_supervisor.clone();
+    let daemon_shutdown = state.daemon_shutdown.clone();
     let server_result = serve_api(
         &config,
         build_router(state.clone()),
         shutdown_jobs.clone(),
         shutdown_creations.clone(),
+        daemon_shutdown,
         gateway_supervisor,
     )
     .await;
@@ -1741,6 +1749,7 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         postgres = ?config.security.pids_limits.postgres,
         redis = ?config.security.pids_limits.redis,
         mariadb = ?config.security.pids_limits.mariadb,
+        mysql = ?config.security.pids_limits.mysql,
         mongodb = ?config.security.pids_limits.mongodb,
         clickhouse = ?config.security.pids_limits.clickhouse,
         qdrant = ?config.security.pids_limits.qdrant,
@@ -1750,6 +1759,7 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         postgres = %config.images.postgres,
         redis = %config.images.redis,
         mariadb = %config.images.mariadb,
+        mysql = %config.images.mysql,
         mongodb = %config.images.mongodb,
         clickhouse = %config.images.clickhouse,
         qdrant = %config.images.qdrant,
@@ -1759,6 +1769,7 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         config.images.postgres.as_str(),
         config.images.redis.as_str(),
         config.images.mariadb.as_str(),
+        config.images.mysql.as_str(),
         config.images.mongodb.as_str(),
         config.images.clickhouse.as_str(),
         config.images.qdrant.as_str(),
@@ -1876,6 +1887,7 @@ fn any_database_listener_tls_enabled(config: &Config) -> bool {
     config.postgres.tls
         || config.redis.tls
         || config.mariadb.tls
+        || config.mysql.tls
         || config.mongodb.tls
         || config.clickhouse.tls
         || config.qdrant.tls
@@ -1907,6 +1919,12 @@ fn log_gateway_listener_summary(config: &Config) {
         &config.mariadb.bind,
         config.mariadb.enabled,
         config.mariadb.tls,
+    );
+    log_listener(
+        "mysql",
+        &config.mysql.bind,
+        config.mysql.enabled,
+        config.mysql.tls,
     );
     log_listener(
         "mongodb",
@@ -1959,13 +1977,23 @@ async fn reapply_instance_disk_limits(
     disk_limiter: &DiskLimiter,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await;
-    for metadata in instances {
-        let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
-            .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
-        disk_limiter
-            .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
-            .await
-            .with_context(|| format!("failed to apply disk limit for {}", metadata.instance_id))?;
+    let outcomes = futures::stream::iter(instances)
+        .map(|metadata| async move {
+            let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
+                .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
+            disk_limiter
+                .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+                .await
+                .with_context(|| {
+                    format!("failed to apply disk limit for {}", metadata.instance_id)
+                })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for outcome in outcomes {
+        outcome?;
     }
     Ok(())
 }
@@ -1977,69 +2005,89 @@ async fn start_known_instances_on_boot(
     instance_locks: &crate::instances::locks::InstanceLocks,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await;
+    let outcomes = futures::stream::iter(instances)
+        .map(|snapshot| async move {
+            start_known_instance_on_boot(config, manager, docker, instance_locks, snapshot).await
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut attempted = 0_usize;
     let mut running = 0_usize;
     let mut stopped = 0_usize;
     let mut failed = 0_usize;
 
-    for snapshot in instances {
-        let Some(snapshot_action) = managed_boot_action(snapshot.status, config.disk.mode) else {
+    for outcome in outcomes {
+        let Some(status) = outcome? else {
             continue;
         };
-
-        let _operation = instance_locks.lock(&snapshot.instance_id).await;
-        let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
-            continue;
-        };
-        let Some(action) = managed_boot_action(metadata.status, config.disk.mode) else {
-            continue;
-        };
-        if action != snapshot_action {
-            tracing::debug!(
-                instance_id = %metadata.instance_id,
-                snapshot_action = snapshot_action.as_str(),
-                action = action.as_str(),
-                "managed instance boot action changed after acquiring its operation lock"
-            );
-        }
-
         attempted += 1;
-        tracing::info!(
+        match status {
+            InstanceStatus::Booting => {}
+            InstanceStatus::Running => running += 1,
+            InstanceStatus::Stopped => stopped += 1,
+            InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
+            InstanceStatus::Creating | InstanceStatus::Deleting => {}
+        }
+    }
+
+    tracing::info!(
+        attempted,
+        running,
+        stopped,
+        failed,
+        concurrency = MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
+        "daemon boot managed instance auto-start complete"
+    );
+    Ok(())
+}
+
+async fn start_known_instance_on_boot(
+    config: &Config,
+    manager: &InstanceManager,
+    docker: &DockerRuntime,
+    instance_locks: &crate::instances::locks::InstanceLocks,
+    snapshot: crate::instances::metadata::InstanceMetadata,
+) -> anyhow::Result<Option<InstanceStatus>> {
+    let Some(snapshot_action) = managed_boot_action(snapshot.status, config.disk.mode) else {
+        return Ok(None);
+    };
+
+    let _operation = instance_locks.lock(&snapshot.instance_id).await;
+    let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
+        return Ok(None);
+    };
+    let Some(action) = managed_boot_action(metadata.status, config.disk.mode) else {
+        return Ok(None);
+    };
+    if action != snapshot_action {
+        tracing::debug!(
+            instance_id = %metadata.instance_id,
+            snapshot_action = snapshot_action.as_str(),
+            action = action.as_str(),
+            "managed instance boot action changed after acquiring its operation lock"
+        );
+    }
+
+    tracing::info!(
+        instance_id = %metadata.instance_id,
+        protocol = %metadata.protocol,
+        previous_status = ?metadata.status,
+        action = action.as_str(),
+        "activating managed instance on daemon boot"
+    );
+
+    if let Err(error) =
+        ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
+            .await
+    {
+        tracing::warn!(
             instance_id = %metadata.instance_id,
             protocol = %metadata.protocol,
-            previous_status = ?metadata.status,
-            action = action.as_str(),
-            "activating managed instance on daemon boot"
+            %error,
+            "failed to prepare managed instance runtime directories during daemon boot; skipping container start"
         );
-
-        let runtime_paths_ready = if let Err(error) =
-            ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
-                .await
-        {
-            tracing::warn!(
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
-                %error,
-                "failed to prepare managed instance runtime directories during daemon boot; skipping container start"
-            );
-            false
-        } else {
-            true
-        };
-
-        if !runtime_paths_ready {
-            let reconciled = reconcile::reconcile_one(metadata, docker).await;
-            match reconciled.status {
-                InstanceStatus::Booting => {}
-                InstanceStatus::Running => running += 1,
-                InstanceStatus::Stopped => stopped += 1,
-                InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
-                InstanceStatus::Creating | InstanceStatus::Deleting => {}
-            }
-            manager.upsert(reconciled).await?;
-            continue;
-        }
-
+    } else {
         let activation = match action {
             ManagedBootAction::Start => {
                 docker.start(metadata.protocol, &metadata.instance_id).await
@@ -2081,26 +2129,12 @@ async fn start_known_instances_on_boot(
                 .await;
             }
         }
-
-        let reconciled = reconcile::reconcile_one(metadata, docker).await;
-        match reconciled.status {
-            InstanceStatus::Booting => {}
-            InstanceStatus::Running => running += 1,
-            InstanceStatus::Stopped => stopped += 1,
-            InstanceStatus::Failed | InstanceStatus::Quarantined => failed += 1,
-            InstanceStatus::Creating | InstanceStatus::Deleting => {}
-        }
-        manager.upsert(reconciled).await?;
     }
 
-    tracing::info!(
-        attempted,
-        running,
-        stopped,
-        failed,
-        "daemon boot managed instance auto-start complete"
-    );
-    Ok(())
+    let reconciled = reconcile::reconcile_one(metadata, docker).await;
+    let status = reconciled.status;
+    manager.upsert(reconciled).await?;
+    Ok(Some(status))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2146,46 +2180,23 @@ async fn stop_fuse_backed_instances_for_shutdown(state: &AppState) -> anyhow::Re
     let disk_limiter =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
     let instances = state.manager.store().list().await;
+    let outcomes = futures::stream::iter(instances)
+        .map(|snapshot| {
+            let disk_limiter = disk_limiter.clone();
+            async move { stop_fuse_backed_instance(state, &disk_limiter, snapshot).await }
+        })
+        .buffer_unordered(FUSE_SHUTDOWN_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut stopped = 0_usize;
     let mut unmounted = 0_usize;
     let mut failures = Vec::new();
 
-    for snapshot in instances {
-        let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
-        let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
-            continue;
-        };
-        match state
-            .docker
-            .stop(metadata.protocol, &metadata.instance_id)
-            .await
-        {
-            Ok(_) => stopped += 1,
-            Err(error) if error.is_not_found() || error.is_not_running() => {}
-            Err(error) => {
-                tracing::error!(
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    %error,
-                    "failed to stop FuseQuota-backed container during daemon shutdown"
-                );
-                failures.push(format!("{} stop failed: {error}", metadata.instance_id));
-                continue;
-            }
-        }
-
-        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)?;
-        match disk_limiter.teardown_instance_mount(&paths.data).await {
-            Ok(()) => unmounted += 1,
-            Err(error) => {
-                tracing::error!(
-                    instance_id = %metadata.instance_id,
-                    data_path = %paths.data.display(),
-                    %error,
-                    "failed to unmount FuseQuota filesystem during daemon shutdown"
-                );
-                failures.push(format!("{} unmount failed: {error}", metadata.instance_id));
-            }
+    for outcome in outcomes {
+        stopped += usize::from(outcome.stopped);
+        unmounted += usize::from(outcome.unmounted);
+        if let Some(failure) = outcome.failure {
+            failures.push(failure);
         }
     }
 
@@ -2193,6 +2204,7 @@ async fn stop_fuse_backed_instances_for_shutdown(state: &AppState) -> anyhow::Re
         stopped,
         unmounted,
         failures = failures.len(),
+        concurrency = FUSE_SHUTDOWN_CONCURRENCY,
         "FuseQuota-backed managed instances shut down before helper exit"
     );
     if failures.is_empty() {
@@ -2202,6 +2214,83 @@ async fn stop_fuse_backed_instances_for_shutdown(state: &AppState) -> anyhow::Re
             "failed to shut down one or more FuseQuota-backed instances safely: {}",
             failures.join("; ")
         )
+    }
+}
+
+#[derive(Debug, Default)]
+struct FuseShutdownOutcome {
+    stopped: bool,
+    unmounted: bool,
+    failure: Option<String>,
+}
+
+async fn stop_fuse_backed_instance(
+    state: &AppState,
+    disk_limiter: &DiskLimiter,
+    snapshot: crate::instances::metadata::InstanceMetadata,
+) -> FuseShutdownOutcome {
+    let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
+    let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
+        return FuseShutdownOutcome::default();
+    };
+    let stopped = match state
+        .docker
+        .stop(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(_) => true,
+        Err(error) if error.is_not_found() || error.is_not_running() => false,
+        Err(error) => {
+            tracing::error!(
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "failed to stop FuseQuota-backed container during daemon shutdown"
+            );
+            return FuseShutdownOutcome {
+                failure: Some(format!("{} stop failed: {error}", metadata.instance_id)),
+                ..FuseShutdownOutcome::default()
+            };
+        }
+    };
+
+    let paths = match InstancePaths::new(&state.config.paths, &metadata.instance_id) {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!(
+                instance_id = %metadata.instance_id,
+                %error,
+                "failed to resolve FuseQuota paths during daemon shutdown"
+            );
+            return FuseShutdownOutcome {
+                stopped,
+                failure: Some(format!(
+                    "{} path resolution failed: {error}",
+                    metadata.instance_id
+                )),
+                ..FuseShutdownOutcome::default()
+            };
+        }
+    };
+    match disk_limiter.teardown_instance_mount(&paths.data).await {
+        Ok(()) => FuseShutdownOutcome {
+            stopped,
+            unmounted: true,
+            failure: None,
+        },
+        Err(error) => {
+            tracing::error!(
+                instance_id = %metadata.instance_id,
+                data_path = %paths.data.display(),
+                %error,
+                "failed to unmount FuseQuota filesystem during daemon shutdown"
+            );
+            FuseShutdownOutcome {
+                stopped,
+                failure: Some(format!("{} unmount failed: {error}", metadata.instance_id)),
+                ..FuseShutdownOutcome::default()
+            }
+        }
     }
 }
 
@@ -2549,6 +2638,7 @@ enum GatewayListenerKind {
     Postgres,
     Redis,
     Mariadb,
+    Mysql,
     Mongodb,
     Clickhouse,
     ClickhouseHttp,
@@ -2561,6 +2651,7 @@ impl GatewayListenerKind {
             Self::Postgres => "postgres",
             Self::Redis => "redis",
             Self::Mariadb => "mariadb",
+            Self::Mysql => "mysql",
             Self::Mongodb => "mongodb",
             Self::Clickhouse => "clickhouse",
             Self::ClickhouseHttp => "clickhouse_http",
@@ -2621,6 +2712,10 @@ impl PreparedGatewayListener {
                 listeners::run_mariadb_listener(listener, &bind, resolver, tls, limiter, shutdown)
                     .await
             }
+            GatewayListenerKind::Mysql => {
+                listeners::run_mysql_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
             GatewayListenerKind::Mongodb => {
                 listeners::run_mongodb_listener(listener, &bind, resolver, tls, limiter, shutdown)
                     .await
@@ -2654,6 +2749,7 @@ async fn start_gateway_listeners(
     let expected = usize::from(config.postgres.enabled)
         + usize::from(config.redis.enabled)
         + usize::from(config.mariadb.enabled)
+        + usize::from(config.mysql.enabled)
         + usize::from(config.mongodb.enabled)
         + usize::from(config.clickhouse.enabled) * 2
         + usize::from(config.qdrant.enabled);
@@ -2751,6 +2847,17 @@ async fn prepare_gateway_listeners(
             .await?,
         );
     }
+    if config.mysql.enabled {
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Mysql,
+                config.mysql.bind.clone(),
+                listener_tls(config.mysql.tls, config)?,
+                connection_limit,
+            )
+            .await?,
+        );
+    }
     if config.mongodb.enabled {
         prepared.push(
             PreparedGatewayListener::bind(
@@ -2814,6 +2921,7 @@ async fn serve_api(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind = config.api.bind_addr();
@@ -2823,6 +2931,7 @@ async fn serve_api(
             router,
             import_export_jobs,
             install_progress,
+            daemon_shutdown,
             gateway_supervisor,
         )
         .await;
@@ -2838,17 +2947,39 @@ async fn serve_api(
         "api listener started"
     );
 
-    axum::serve(
+    let (shutdown_observed, mut shutdown_observed_rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        shutdown_signal(
+            import_export_jobs,
+            install_progress,
+            daemon_shutdown,
+            gateway_supervisor,
+        )
+        .await;
+        let _ = shutdown_observed.send(());
+    };
+    let server = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(
-        import_export_jobs,
-        install_progress,
-        gateway_supervisor,
-    ))
-    .await
-    .context("api server failed")
+    .with_graceful_shutdown(shutdown)
+    .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => return result.context("api server failed"),
+        _ = &mut shutdown_observed_rx => {}
+    }
+    match tokio::time::timeout(API_CONNECTION_DRAIN_TIMEOUT, &mut server).await {
+        Ok(result) => result.context("api server failed"),
+        Err(_) => {
+            tracing::warn!(
+                timeout_seconds = API_CONNECTION_DRAIN_TIMEOUT.as_secs(),
+                "API connections did not drain before the restart deadline; closing them"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn serve_api_tls(
@@ -2856,6 +2987,7 @@ async fn serve_api_tls(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind_addr = config.api.bind_addr();
@@ -2883,8 +3015,14 @@ async fn serve_api_tls(
     let handle = Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
-        shutdown_signal(import_export_jobs, install_progress, gateway_supervisor).await;
-        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        shutdown_signal(
+            import_export_jobs,
+            install_progress,
+            daemon_shutdown,
+            gateway_supervisor,
+        )
+        .await;
+        shutdown_handle.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
     });
 
     axum_server::from_tcp_rustls(listener, tls)
@@ -2957,9 +3095,11 @@ fn rustls_config_with_client_ca(
 async fn shutdown_signal(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) {
     let signal = wait_for_termination_signal().await;
+    daemon_shutdown.trigger();
     import_export_jobs.close_admission();
     install_progress.close_creation_admission();
     gateway_supervisor.shutdown();

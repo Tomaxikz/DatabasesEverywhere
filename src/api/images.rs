@@ -199,6 +199,7 @@ mod tests {
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
         }
     }
 }

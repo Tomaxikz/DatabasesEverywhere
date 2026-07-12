@@ -945,6 +945,7 @@ mod tests {
             resource_cache: crate::api::resources::ResourceCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
         }
     }
 
@@ -973,6 +974,8 @@ mod tests {
             route_key_sha256: None,
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
             mongodb_root_password: None,
             limits: InstanceLimits::default(),
             image: None,

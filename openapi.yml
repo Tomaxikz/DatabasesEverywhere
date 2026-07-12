@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.2.0
+  version: 0.3.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -17,7 +17,7 @@ components:
   schemas:
     Protocol:
       type: string
-      enum: [postgres, redis, mariadb, mongodb, clickhouse, qdrant]
+      enum: [postgres, redis, mariadb, mysql, mongodb, clickhouse, qdrant]
     LimitsRequest:
       type: object
       additionalProperties: false
@@ -187,11 +187,15 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
+      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.2.0}
+        api_version: {type: string, example: 0.3.0}
+        api_readiness:
+          type: string
+          const: ready
+          description: Readiness of the management API itself. Database listener readiness is reported separately under gateways.
         uuid: {type: string}
         token_id: {type: string}
         remote: {type: string, format: uri}
@@ -208,6 +212,7 @@ components:
         postgres_enabled: {type: boolean}
         redis_enabled: {type: boolean}
         mariadb_enabled: {type: boolean}
+        mysql_enabled: {type: boolean}
         mongodb_enabled: {type: boolean}
         clickhouse_enabled: {type: boolean}
         clickhouse_http_enabled: {type: boolean}
@@ -632,6 +637,59 @@ components:
           properties:
             rx_bytes: {type: [integer, "null"]}
             tx_bytes: {type: [integer, "null"]}
+    NodeResourceSummary:
+      type: object
+      additionalProperties: false
+      required: [node_uuid, sampled_at, cpu, memory, disk, instances]
+      properties:
+        node_uuid: {type: string}
+        sampled_at: {type: string, format: date-time}
+        cpu:
+          type: object
+          additionalProperties: false
+          required: [total_cores, allocated_cores, host_usage_percent, managed_usage_cores]
+          properties:
+            total_cores: {type: integer, minimum: 1}
+            allocated_cores: {type: number, minimum: 0}
+            host_usage_percent: {type: number, minimum: 0, maximum: 100}
+            managed_usage_cores: {type: [number, "null"], minimum: 0}
+        memory:
+          type: object
+          additionalProperties: false
+          required: [total_bytes, allocation_limit_bytes, reserved_bytes, allocated_bytes, host_used_bytes, managed_used_bytes, available_bytes]
+          properties:
+            total_bytes: {type: integer, minimum: 0}
+            allocation_limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            allocated_bytes: {type: integer, minimum: 0}
+            host_used_bytes: {type: integer, minimum: 0}
+            managed_used_bytes: {type: [integer, "null"], minimum: 0}
+            available_bytes: {type: integer, minimum: 0}
+        disk:
+          type: object
+          additionalProperties: false
+          required: [total_bytes, allocation_limit_bytes, reserved_bytes, allocated_bytes, host_used_bytes, managed_used_bytes, available_bytes]
+          properties:
+            total_bytes: {type: integer, minimum: 0}
+            allocation_limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            allocated_bytes: {type: integer, minimum: 0}
+            host_used_bytes: {type: integer, minimum: 0}
+            managed_used_bytes: {type: [integer, "null"], minimum: 0}
+            available_bytes: {type: integer, minimum: 0}
+        instances:
+          type: object
+          additionalProperties: false
+          required: [total, creating, booting, running, stopped, failed, quarantined, deleting]
+          properties:
+            total: {type: integer, minimum: 0}
+            creating: {type: integer, minimum: 0}
+            booting: {type: integer, minimum: 0}
+            running: {type: integer, minimum: 0}
+            stopped: {type: integer, minimum: 0}
+            failed: {type: integer, minimum: 0}
+            quarantined: {type: integer, minimum: 0}
+            deleting: {type: integer, minimum: 0}
     PullImageResponse:
       type: object
       required: [protocol, image, pulled]
@@ -945,6 +1003,20 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/ResourceReport"
+  /api/admin/resources/summary:
+    get:
+      summary: Get node capacity, allocation, and whole-host resource pressure.
+      description: Allocation includes all managed instances, including stopped instances that may be restarted. Host usage covers the entire Linux node. Managed usage is null when any running or booting instance could not be sampled. Disk totals describe the filesystem backing paths.volumes.
+      x-required-scope: resources:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Node-wide resource summary for scheduling and capacity decisions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeResourceSummary"
   /api/instances/{instance_id}/resources:
     get:
       summary: Get resource usage for one instance.
