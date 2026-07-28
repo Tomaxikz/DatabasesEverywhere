@@ -15,7 +15,9 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use super::{
     resolver::RouteResolver,
-    security::{GatewayConnectionLimiter, GatewayConnectionRejection},
+    security::{
+        GatewayConnectionLimiter, GatewayConnectionRejection, GatewayConnectionRejectionReason,
+    },
     tunnel,
 };
 use crate::{
@@ -324,6 +326,7 @@ where
         "database listener started"
     );
     let active_connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS_PER_LISTENER));
+    let mut global_limit_logged = false;
 
     loop {
         if *shutdown.borrow() {
@@ -346,18 +349,24 @@ where
             continue;
         }
         let Ok(global_permit) = Arc::clone(&active_connections).try_acquire_owned() else {
-            tracing::warn!(%peer, protocol, "audit database_connection_global_limit_reached");
+            if !global_limit_logged {
+                tracing::warn!(%peer, protocol, "audit database_connection_global_limit_reached");
+                global_limit_logged = true;
+            }
             continue;
         };
+        global_limit_logged = false;
         let ip_permit = match limiter.try_acquire(peer.ip()) {
             Ok(permit) => permit,
-            Err(reason) => {
+            Err(GatewayConnectionRejection { reason, should_log }) => {
                 let reason = match reason {
-                    GatewayConnectionRejection::RateLimited => "rate",
-                    GatewayConnectionRejection::TooManyActive => "active",
-                    GatewayConnectionRejection::KeyCapacityReached => "key_capacity",
+                    GatewayConnectionRejectionReason::RateLimited => "rate",
+                    GatewayConnectionRejectionReason::TooManyActive => "active",
+                    GatewayConnectionRejectionReason::KeyCapacityReached => "key_capacity",
                 };
-                tracing::warn!(%peer, protocol, reason, "audit database_connection_limited");
+                if should_log {
+                    tracing::warn!(%peer, protocol, reason, "audit database_connection_limited");
+                }
                 continue;
             }
         };

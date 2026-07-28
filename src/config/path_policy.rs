@@ -202,7 +202,7 @@ fn reject_symlink_components(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::symlink;
 

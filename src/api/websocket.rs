@@ -1,5 +1,7 @@
 use std::{
+    collections::HashSet,
     future::Future,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,7 +13,7 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time::{
     Duration, Instant, MissedTickBehavior, interval, interval_at, sleep_until, timeout_at,
 };
@@ -46,6 +48,20 @@ pub struct ImportExportQuery {
     pub job_id: Option<String>,
 }
 
+const WEBSOCKET_MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const WEBSOCKET_MAX_FRAME_BYTES: usize = 16 * 1024;
+const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 32 * 1024;
+const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+const MONITORING_SNAPSHOT_TTL: Duration = Duration::from_millis(400);
+
+fn secure_websocket_upgrade(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
+    websocket
+        .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
+        .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES)
+        .write_buffer_size(WEBSOCKET_WRITE_BUFFER_BYTES)
+        .max_write_buffer_size(WEBSOCKET_MAX_WRITE_BUFFER_BYTES)
+}
+
 pub async fn monitoring(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,
@@ -53,7 +69,7 @@ pub async fn monitoring(
 ) -> Result<Response, ApiError> {
     let claims = auth.require_scope(scopes::MONITOR_READ, None)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(websocket
+    Ok(secure_websocket_upgrade(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| stream_monitoring(socket, state, claims, connection)))
 }
@@ -61,10 +77,11 @@ pub async fn monitoring(
 async fn stream_monitoring(
     mut socket: WebSocket,
     state: AppState,
-    claims: Claims,
+    claims: Arc<Claims>,
     _connection: WebSocketConnectionPermit,
 ) {
     let _monitor = state.resource_cache.register_monitor();
+    let authorization = InstanceAuthorization::from_claims(&claims);
     let mut shutdown = state.daemon_shutdown.subscribe();
     let mut ticker = interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -92,13 +109,14 @@ async fn stream_monitoring(
             _ = ticker.tick() => {
                 let Ok(message) = complete_before(
                     expiration_deadline,
-                    monitoring_snapshot(&state, &claims),
+                    state.monitoring_cache.snapshot(&state),
                 )
                 .await
                 else {
                     close_expired_socket(&mut socket).await;
                     break;
                 };
+                let message = message.filtered(&authorization);
                 if send_json_before(&mut socket, &message, expiration_deadline).await.is_err() {
                     break;
                 }
@@ -109,16 +127,49 @@ async fn stream_monitoring(
 
 const MONITORING_FANOUT_LIMIT: usize = 16;
 
-async fn monitoring_snapshot(state: &AppState, claims: &Claims) -> MonitoringSnapshot {
+#[derive(Debug, Clone, Default)]
+pub struct MonitoringSnapshotCache {
+    inner: Arc<Mutex<Option<CachedMonitoringSnapshot>>>,
+    refresh_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMonitoringSnapshot {
+    snapshot: Arc<MonitoringSnapshotData>,
+    sampled_at: Instant,
+}
+
+impl MonitoringSnapshotCache {
+    async fn snapshot(&self, state: &AppState) -> Arc<MonitoringSnapshotData> {
+        if let Some(snapshot) = self.fresh().await {
+            return snapshot;
+        }
+        let _refresh = self.refresh_lock.lock().await;
+        if let Some(snapshot) = self.fresh().await {
+            return snapshot;
+        }
+        let snapshot = Arc::new(build_monitoring_snapshot(state).await);
+        *self.inner.lock().await = Some(CachedMonitoringSnapshot {
+            snapshot: Arc::clone(&snapshot),
+            sampled_at: Instant::now(),
+        });
+        snapshot
+    }
+
+    async fn fresh(&self) -> Option<Arc<MonitoringSnapshotData>> {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .filter(|cached| cached.sampled_at.elapsed() < MONITORING_SNAPSHOT_TTL)
+            .map(|cached| Arc::clone(&cached.snapshot))
+    }
+}
+
+async fn build_monitoring_snapshot(state: &AppState) -> MonitoringSnapshotData {
     use futures::StreamExt;
 
-    let authorized_instances = state
-        .instances
-        .list()
-        .await
-        .into_iter()
-        .filter(|metadata| claims.allows_instance(&metadata.instance_id));
-    let mut instances = futures::stream::iter(authorized_instances)
+    let mut instances = futures::stream::iter(state.instances.list().await)
         .map(|metadata| {
             let state = state.clone();
             async move { monitoring_instance(&state, metadata).await }
@@ -134,19 +185,17 @@ async fn monitoring_snapshot(state: &AppState, claims: &Claims) -> MonitoringSna
         .install_progress
         .list()
         .into_iter()
-        .filter(|progress| claims.allows_instance(&progress.instance_id))
         .collect::<Vec<_>>();
     install_progress.sort_unstable_by(|left, right| left.instance_id.cmp(&right.instance_id));
 
-    MonitoringSnapshot {
-        r#type: "stats",
+    MonitoringSnapshotData {
         instances,
         install_progress,
     }
 }
 
 async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> MonitoringInstance {
-    match resource_report(state, metadata.clone()).await {
+    match resource_report(state, &metadata).await {
         Ok(resources) => MonitoringInstance {
             instance_id: metadata.instance_id,
             protocol: metadata.protocol.to_string(),
@@ -199,11 +248,58 @@ async fn monitoring_instance(state: &AppState, metadata: InstanceMetadata) -> Mo
     }
 }
 
-#[derive(Debug, Serialize)]
-struct MonitoringSnapshot {
-    r#type: &'static str,
+#[derive(Debug)]
+struct MonitoringSnapshotData {
     instances: Vec<MonitoringInstance>,
     install_progress: Vec<InstallProgress>,
+}
+
+impl MonitoringSnapshotData {
+    fn filtered<'a>(&'a self, authorization: &'a InstanceAuthorization) -> MonitoringSnapshot<'a> {
+        MonitoringSnapshot {
+            r#type: "stats",
+            instances: self
+                .instances
+                .iter()
+                .filter(|instance| authorization.allows(&instance.instance_id))
+                .collect(),
+            install_progress: self
+                .install_progress
+                .iter()
+                .filter(|progress| authorization.allows(&progress.instance_id))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum InstanceAuthorization {
+    All,
+    Selected(HashSet<String>),
+}
+
+impl InstanceAuthorization {
+    fn from_claims(claims: &Claims) -> Self {
+        if claims.all_instances {
+            Self::All
+        } else {
+            Self::Selected(claims.instances.iter().cloned().collect())
+        }
+    }
+
+    fn allows(&self, instance_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Selected(instances) => instances.contains(instance_id),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MonitoringSnapshot<'a> {
+    r#type: &'static str,
+    instances: Vec<&'a MonitoringInstance>,
+    install_progress: Vec<&'a InstallProgress>,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,7 +338,7 @@ pub async fn logs(
         .await
         .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(websocket
+    Ok(secure_websocket_upgrade(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
             stream_logs(socket, state, metadata, query.tail, claims.exp, connection)
@@ -263,7 +359,7 @@ pub async fn import_export(
         .await
         .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(websocket
+    Ok(secure_websocket_upgrade(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
             stream_import_export(socket, state, instance_id, query, claims, connection)
@@ -430,7 +526,7 @@ async fn stream_import_export(
     state: AppState,
     instance_id: String,
     query: ImportExportQuery,
-    claims: Claims,
+    claims: Arc<Claims>,
     _connection: WebSocketConnectionPermit,
 ) {
     let mut events = state.import_export_jobs.subscribe();

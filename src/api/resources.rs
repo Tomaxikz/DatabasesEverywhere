@@ -10,9 +10,12 @@ use std::{
 };
 
 use axum::extract::State;
+use bollard::models::{ContainerCpuStats, ContainerStatsResponse};
 use serde::Serialize;
-use serde_json::Value;
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 
 use crate::{
     api::{
@@ -40,11 +43,23 @@ const BACKGROUND_DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const DISK_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const DISK_SCAN_MAX_DEPTH: usize = 128;
 const RESOURCE_FANOUT_LIMIT: usize = 16;
+const DISK_SCAN_CONCURRENCY: usize = 4;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResourceCache {
     inner: Arc<Mutex<ResourceCacheInner>>,
     active_monitors: Arc<AtomicUsize>,
+    disk_scan_permits: Arc<Semaphore>,
+}
+
+impl Default for ResourceCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ResourceCacheInner::default())),
+            active_monitors: Arc::new(AtomicUsize::new(0)),
+            disk_scan_permits: Arc::new(Semaphore::new(DISK_SCAN_CONCURRENCY)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -55,14 +70,15 @@ struct ResourceCacheInner {
     network: HashMap<String, NetworkCounter>,
     disk: HashMap<String, CachedDiskUsage>,
     disk_refreshing: HashMap<String, bool>,
+    disk_refresh_locks: HashMap<String, Arc<Mutex<()>>>,
     host_cpu_sample: Option<HostCpuSample>,
     host_cpu_usage: Option<CachedHostCpuUsage>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedRuntimeStats {
-    stats: Value,
     cpu_usage_percent: Option<f64>,
+    memory_usage_bytes: Option<u64>,
     sampled_at: Instant,
 }
 
@@ -228,7 +244,7 @@ pub async fn list_resources(
     let reports = futures::stream::iter(state.instances.list().await)
         .map(|metadata| {
             let state = state.clone();
-            async move { resource_report(&state, metadata).await }
+            async move { resource_report(&state, &metadata).await }
         })
         .buffer_unordered(RESOURCE_FANOUT_LIMIT)
         .try_collect()
@@ -242,10 +258,11 @@ pub async fn node_resource_summary(
 ) -> ApiResult<NodeResourceSummary> {
     auth.require_scope(scopes::RESOURCES_ADMIN)?;
     let instances = state.instances.list().await;
-    let resource_reports = futures::stream::iter(instances.iter().cloned())
+    let allocations = aggregate_allocations_and_statuses(&instances);
+    let resource_reports = futures::stream::iter(instances)
         .map(|metadata| {
             let state = state.clone();
-            async move { resource_report(&state, metadata).await }
+            async move { resource_report(&state, &metadata).await }
         })
         .buffer_unordered(RESOURCE_FANOUT_LIMIT)
         .collect::<Vec<_>>();
@@ -262,7 +279,6 @@ pub async fn node_resource_summary(
         .map_err(|error| ApiError::Runtime(format!("failed to sample host memory: {error}")))?;
     let host_disk = host_disk
         .map_err(|error| ApiError::Runtime(format!("failed to sample host disk: {error}")))?;
-    let allocations = aggregate_allocations_and_statuses(&instances);
     let managed = aggregate_managed_usage(&resource_reports);
 
     Ok(ApiResponse::ok(NodeResourceSummary {
@@ -313,18 +329,17 @@ pub async fn instance_resources(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    Ok(ApiResponse::ok(resource_report(&state, metadata).await?))
+    Ok(ApiResponse::ok(resource_report(&state, &metadata).await?))
 }
 
 pub(crate) async fn resource_report(
     state: &AppState,
-    metadata: InstanceMetadata,
+    metadata: &InstanceMetadata,
 ) -> Result<ResourceReport, ApiError> {
     let stats = state
         .resource_cache
         .runtime_stats(&state.docker, metadata.protocol, &metadata.instance_id)
         .await;
-    let stats_value = stats.as_ref().map(|stats| &stats.stats);
     let (network_rx_bytes, network_tx_bytes) = state
         .resource_cache
         .network_usage(&metadata.instance_id)
@@ -339,19 +354,16 @@ pub(crate) async fn resource_report(
         .used_bytes;
 
     let report = ResourceReport {
-        instance_id: metadata.instance_id,
+        instance_id: metadata.instance_id.clone(),
         protocol: metadata.protocol.to_string(),
         status: metadata.status.as_str().to_string(),
         cpu: CpuReport {
             configured_cores: metadata.limits.cpu_cores,
-            usage_percent: stats
-                .as_ref()
-                .and_then(|stats| stats.cpu_usage_percent)
-                .or_else(|| stats_value.and_then(cpu_percent)),
+            usage_percent: stats.as_ref().and_then(|stats| stats.cpu_usage_percent),
         },
         memory: MemoryReport {
             configured_mib: metadata.limits.memory_mib,
-            usage_bytes: stats_value.and_then(memory_usage_bytes),
+            usage_bytes: stats.as_ref().and_then(|stats| stats.memory_usage_bytes),
             limit_bytes: Some(mib_to_bytes(metadata.limits.memory_mib)),
         },
         disk: DiskReport {
@@ -359,7 +371,7 @@ pub(crate) async fn resource_report(
             limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
             used_bytes: disk_used,
             enforced: metadata.limits.disk_enforced,
-            enforcement_method: metadata.limits.disk_enforcement_method,
+            enforcement_method: metadata.limits.disk_enforcement_method.clone(),
         },
         network: NetworkReport {
             // Database containers have no network namespace attachment. Their
@@ -665,6 +677,7 @@ impl ResourceCache {
         inner.network.remove(instance_id);
         inner.disk.remove(instance_id);
         inner.disk_refreshing.remove(instance_id);
+        inner.disk_refresh_locks.remove(instance_id);
     }
 
     pub(crate) fn register_monitor(&self) -> ResourceMonitorGuard {
@@ -705,8 +718,8 @@ impl ResourceCache {
             return Some(cached);
         }
 
-        let output = match docker.stats(protocol, instance_id).await {
-            Ok(output) => output,
+        let stats = match docker.stats(protocol, instance_id).await {
+            Ok(stats) => stats,
             Err(_) => {
                 // Keep the last complete sample briefly during transient Docker
                 // errors instead of making every waiting client retry at once.
@@ -716,14 +729,17 @@ impl ResourceCache {
                 return Some(stale.clone());
             }
         };
-        let stats = serde_json::from_str::<Value>(&output.stdout).ok()?;
-        let cpu_usage_percent = self
-            .record_cpu_sample(&cache_key, &stats)
-            .await
-            .or_else(|| cpu_percent(&stats));
+        let response_cpu_usage = cpu_percent_from_container_stats(&stats);
+        let cpu_usage_percent = match cpu_sample_from_container_stats(stats.cpu_stats.as_ref()) {
+            Some(current) => self
+                .record_cpu_sample(&cache_key, current)
+                .await
+                .or(response_cpu_usage),
+            None => response_cpu_usage,
+        };
         let cached = CachedRuntimeStats {
-            stats,
             cpu_usage_percent,
+            memory_usage_bytes: stats.memory_stats.as_ref().and_then(|memory| memory.usage),
             sampled_at: Instant::now(),
         };
         let mut inner = self.inner.lock().await;
@@ -758,8 +774,7 @@ impl ResourceCache {
             .cloned()
     }
 
-    async fn record_cpu_sample(&self, instance_id: &str, stats: &Value) -> Option<f64> {
-        let current = current_cpu_sample(stats)?;
+    async fn record_cpu_sample(&self, instance_id: &str, current: CpuStatsSample) -> Option<f64> {
         let mut inner = self.inner.lock().await;
         let usage = inner
             .cpu_samples
@@ -794,11 +809,34 @@ impl ResourceCache {
                 Arc::new(config.clone()),
                 instance_id.to_string(),
                 path,
-            );
+            )
+            .await;
             return Ok(sample);
         }
 
-        match directory_size(path.clone(), INITIAL_DISK_SCAN_TIMEOUT).await {
+        let refresh_lock = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .disk_refresh_locks
+                .entry(instance_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _refresh = refresh_lock.lock().await;
+        if let Some(sample) = self.cached_disk_usage(instance_id).await {
+            return Ok(sample);
+        }
+        if self.disk_refresh_in_progress(instance_id).await {
+            return Err("disk usage scan is still in progress".to_string());
+        }
+        if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
+            return Ok(sample);
+        }
+
+        match self
+            .scan_directory(path.clone(), INITIAL_DISK_SCAN_TIMEOUT)
+            .await
+        {
             Ok(used_bytes) => {
                 let sample = CachedDiskUsage {
                     used_bytes,
@@ -812,7 +850,8 @@ impl ResourceCache {
                     Arc::new(config.clone()),
                     instance_id.to_string(),
                     path,
-                );
+                )
+                .await;
                 Err("disk usage scan is still in progress".to_string())
             }
             Err(error) => Err(error.to_string()),
@@ -858,41 +897,66 @@ impl ResourceCache {
         inner.disk.insert(instance_id, sample);
     }
 
-    fn refresh_disk_usage_background(
+    async fn disk_refresh_in_progress(&self, instance_id: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .disk_refreshing
+            .get(instance_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    async fn scan_directory(&self, path: PathBuf, budget: Duration) -> Result<u64, std::io::Error> {
+        let _permit = self
+            .disk_scan_permits
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("disk scan limiter closed"))?;
+        directory_size(path, budget).await
+    }
+
+    async fn refresh_disk_usage_background(
         &self,
         config: Arc<Config>,
         instance_id: String,
         path: PathBuf,
     ) {
+        {
+            let mut inner = self.inner.lock().await;
+            if inner
+                .disk_refreshing
+                .get(&instance_id)
+                .copied()
+                .unwrap_or(false)
+            {
+                return;
+            }
+            inner.disk_refreshing.insert(instance_id.clone(), true);
+        }
+
         let cache = self.clone();
         tokio::spawn(async move {
-            {
-                let mut inner = cache.inner.lock().await;
-                if inner
-                    .disk_refreshing
-                    .get(&instance_id)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    return;
-                }
-                inner.disk_refreshing.insert(instance_id.clone(), true);
-            }
-
             let result =
                 match DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
                     .instance_usage_bytes(&path)
                     .await
                 {
                     Ok(Some(used_bytes)) => Ok(used_bytes),
-                    Ok(None) => directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await,
+                    Ok(None) => {
+                        cache
+                            .scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
+                            .await
+                    }
                     Err(error) => {
                         tracing::debug!(
                             %instance_id,
                             %error,
                             "quota disk usage unavailable during background refresh"
                         );
-                        directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await
+                        cache
+                            .scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
+                            .await
                     }
                 };
             let mut inner = cache.inner.lock().await;
@@ -975,14 +1039,18 @@ impl ResourceCache {
                 .await
             {
                 Ok(Some(used_bytes)) => Ok(used_bytes),
-                Ok(None) => directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await,
+                Ok(None) => {
+                    self.scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
+                        .await
+                }
                 Err(error) => {
                     tracing::debug!(
                         %instance_id,
                         %error,
                         "quota disk usage unavailable during sampler refresh"
                     );
-                    directory_size(path, BACKGROUND_DISK_SCAN_TIMEOUT).await
+                    self.scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
+                        .await
                 }
             };
 
@@ -1346,9 +1414,9 @@ mod node_summary_tests {
     }
 }
 
-pub(crate) fn cpu_percent(stats: &Value) -> Option<f64> {
-    let current = cpu_sample_from_path(stats, "cpu_stats")?;
-    let previous = cpu_sample_from_path(stats, "precpu_stats")?;
+fn cpu_percent_from_container_stats(stats: &ContainerStatsResponse) -> Option<f64> {
+    let current = cpu_sample_from_container_stats(stats.cpu_stats.as_ref())?;
+    let previous = cpu_sample_from_container_stats(stats.precpu_stats.as_ref())?;
     cpu_percent_between(previous, current)
 }
 
@@ -1357,10 +1425,6 @@ pub(crate) struct CpuStatsSample {
     total_usage: u64,
     system_cpu_usage: u64,
     online_cpus: u64,
-}
-
-pub(crate) fn current_cpu_sample(stats: &Value) -> Option<CpuStatsSample> {
-    cpu_sample_from_path(stats, "cpu_stats")
 }
 
 pub(crate) fn cpu_percent_between(
@@ -1377,26 +1441,15 @@ pub(crate) fn cpu_percent_between(
     Some((cpu_delta as f64 / system_delta as f64) * current.online_cpus as f64 * 100.0)
 }
 
-fn cpu_sample_from_path(stats: &Value, root: &str) -> Option<CpuStatsSample> {
+fn cpu_sample_from_container_stats(stats: Option<&ContainerCpuStats>) -> Option<CpuStatsSample> {
+    let stats = stats?;
     Some(CpuStatsSample {
-        total_usage: value_u64(stats, &[root, "cpu_usage", "total_usage"])?,
-        system_cpu_usage: value_u64(stats, &[root, "system_cpu_usage"])?,
-        online_cpus: value_u64(stats, &[root, "online_cpus"]).unwrap_or(1).max(1),
+        total_usage: stats.cpu_usage.as_ref()?.total_usage?,
+        system_cpu_usage: stats.system_cpu_usage?,
+        online_cpus: u64::from(stats.online_cpus.unwrap_or(1)).max(1),
     })
-}
-
-pub(crate) fn memory_usage_bytes(stats: &Value) -> Option<u64> {
-    value_u64(stats, &["memory_stats", "usage"])
 }
 
 pub(crate) fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(1024 * 1024)
-}
-
-pub(crate) fn value_u64(value: &Value, path: &[&str]) -> Option<u64> {
-    let mut value = value;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    value.as_u64()
 }

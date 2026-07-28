@@ -16,19 +16,25 @@ sudo systemctl enable --now docker
 
 For Podman instead of Docker, install and enable the Podman API socket, then set `daemon.engine: podman` in `config.yml`. Only set `daemon.socket_path` if the default socket discovery doesn't find yours.
 
-Official release artifacts currently target x86-64 Linux with glibc 2.35 or
-newer. Choose a
-versioned release, verify its SHA-256 against the checksum published in that
-release, and then install it. Do not automate
-installation from the mutable `latest` URL.
+Official releases contain only the x86-64 Linux daemon. Windows is not a
+supported target because the daemon depends on Linux container, filesystem,
+and Unix-socket facilities. The Linux artifact targets glibc 2.35 or newer.
+Choose a versioned release and install it. Do not automate installation from
+the mutable `latest` URL.
 
 ```bash
 DBEV_VERSION=v0.2.0 # replace with the reviewed release
 test "$(uname -m)" = x86_64
 sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
-# Compare this value with the checksum shown on the GitHub release page.
-sha256sum /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
+```
+
+Release pages continue to publish SHA-256 checksums for automated consumers.
+For optional provenance verification, install the GitHub CLI and verify the
+binary's signed GitHub Actions attestation:
+
+```bash
+gh attestation verify /usr/local/bin/dbev --repo Tomaxikz/DatabasesEverywhere
 ```
 
 Maintainers must configure the GitHub Actions environment named
@@ -36,6 +42,17 @@ Maintainers must configure the GitHub Actions environment named
 protected `main` branch and version tags. The release workflow rejects other
 refs, requires the requested tag to match the Cargo package version, attests
 release binaries, and publishes Docker provenance and an SBOM.
+
+For local cross-release builds from Windows, install Zig and
+`cargo-zigbuild 0.22.3`, then run `cargo b`. The command builds only the
+static Linux target and writes it to Cargo's normal target tree:
+
+```text
+target/x86_64-unknown-linux-musl/release/dbev
+```
+
+No Windows executable is produced. Run both the daemon and `--bench` from
+Linux.
 
 ### Config
 
@@ -203,6 +220,13 @@ runtime tree under `paths.data`, `paths.logs`, `paths.sockets`, `paths.locks`,
 `paths.artifacts`, `paths.fuse`, and `paths.tmp` if those directories are
 missing.
 
+Every existing ancestor of these runtime paths is checked before creation and
+again after hardening. It must be a real directory (not a symlink), be owned by
+root or the daemon user, and not be writable by group or other users. A
+root-owned sticky directory such as `/tmp` is allowed. This validation applies
+to runtime roots only; it does not change archive upload, import, export, or
+backup path resolution.
+
 Compose also requires an explicit immutable image selection:
 
 ```bash
@@ -284,8 +308,14 @@ The config token has the `*` scope, so it can do everything. Things to know:
 
 - Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is a temporary download URL returned by the download endpoint; it carries its own short-lived JWT.
 - The request `Host` must match `remote`, a concrete `api.host`, or an entry in `api.trusted_hosts`. Add the daemon/reverse-proxy hostname there when it differs from the panel hostname. If an `Origin` header is present, it is checked independently against the browser-origin allow-list derived from `remote`. A mismatch in either value returns `401`.
-- Rate limit: 600 requests per minute per token. Exceed it and you get `429`.
+- Rate limit: 600 requests per minute per authenticated credential and
+  transport-peer IP by default. IPv6 peers share a `/64`. Exceed it and you get
+  `429`.
 - Request bodies are capped at `security.api_body_limit_bytes`.
+- The listener caps active connections at 2048 and in-flight requests at 1024,
+  allows 30 seconds for HTTP headers and TLS handshakes, and aborts a request
+  body after 60 seconds without another frame. These inactivity limits do not
+  impose a 60-second total upload duration.
 
 WebSockets don't use the node token directly — see [WebSockets](#websockets).
 
@@ -318,7 +348,9 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.4.0` emits monitoring snapshots every 500 ms, sources
+version. Contract `0.5.0` exposes the API rate-limit allowance and its
+credential-plus-peer-IP scope through `/api/system`. Contract `0.4.0` emits
+monitoring snapshots every 500 ms, sources
 per-instance RX/TX from the authenticated gateway used by network-isolated
 containers, and removes the redundant raw `docker_stats` string from monitoring
 messages. Contract `0.3.0` added MySQL as a distinct protocol and exposed
@@ -700,7 +732,7 @@ POST /api/instances/{id}/backups/{backup_id}/download      (scope: backups:read)
 }
 ```
 
-3. Panel resolves the origin-relative `url` against its trusted daemon origin and hands it to the browser. No auth header is needed — the JWT in the query is the whole credential. It expires fast and single-use tokens burn after the first hit, so hand them out at click time, don't store them. The daemon deliberately does not derive an absolute URL from client-controlled `Host` or forwarding headers.
+3. Panel resolves the origin-relative `url` against its trusted daemon origin and hands it to the browser. No auth header is needed — the JWT in the query is the whole credential. It expires fast and single-use tokens burn after the first hit, so hand them out at click time, don't store them. The daemon deliberately does not derive an absolute URL from client-controlled `Host` or forwarding headers. Downloads are streamed with bounded buffers and capped at 128 active streams node-wide and 32 per transport peer; admission failure returns `429` without consuming a single-use ticket.
 
 ### Artifact housekeeping
 
@@ -744,7 +776,7 @@ POST /api/ws-token     (scope: ws-tokens:write)
 }
 ```
 
-Response: `{ "token_type": "Bearer", "token": "…", "expires_at_unix": … }`. TTL defaults to 900s, max 3600. `instances` restricts the token to those instances. An empty list grants no instance access; node-wide access must be explicitly requested with `"all_instances": true`, and that flag cannot be combined with an allow-list. Each token ID is accepted for one WebSocket upgrade only, so mint a fresh token when reconnecting.
+Response: `{ "token_type": "Bearer", "token": "…", "expires_at_unix": … }`. TTL defaults to 900s, max 3600. `instances` restricts the token to those instances. An empty list grants no instance access; node-wide access must be explicitly requested with `"all_instances": true`, and that flag cannot be combined with an allow-list. Each token ID is accepted for one WebSocket upgrade only, so mint a fresh token when reconnecting. WebSocket messages and frames are capped at 16 KiB, with bounded write buffering.
 
 ### Step 2: connect (browser side)
 
@@ -806,7 +838,7 @@ Every message is a JSON object with a `type` field.
 }
 ```
 
-Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories.
+Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories. Concurrent fallback walks are coalesced per instance and capped node-wide. Monitoring clients share each completed all-instance sample, which is then filtered against each JWT before serialization.
 `install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
 
 **`/ws/instances/{instance_id}/logs`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
@@ -837,7 +869,7 @@ Job objects are the same shape as the REST job response. When an export succeeds
 | GET | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
 
-`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `api_readiness`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, and per-protocol `*_enabled` flags so the panel knows what it can offer. `api_readiness: "ready"` describes the management API only; `gateways.status` independently describes database listeners.
+`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `api_readiness`, `api_rate_limit_per_minute`, `api_rate_limit_scope`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, and per-protocol `*_enabled` flags so the panel knows what it can offer. `api_readiness: "ready"` describes the management API only; `gateways.status` independently describes database listeners.
 
 The API listener becomes available after critical metadata, crash-recovery,
 container-engine, socket-isolation, and disk checks complete. Existing managed database
@@ -868,6 +900,169 @@ An unclean daemon exit while an import/export job is durably `running` also quar
 If creation cleanup was interrupted, a normal retry fails closed rather than reusing orphaned files with new credentials. After preserving any required data, retry the create request with `"purge_stale_resources": true` to explicitly and irreversibly remove that instance ID's orphaned container and paths before creation.
 
 Import/export admission is bounded to 64 jobs node-wide and two running-or-queued jobs per instance. The in-memory status cache retains at most 2,048 completed jobs, and SQLite retains the latest 10,000 completed records; queued/running records are never pruned.
+
+## Benchmarking a running node
+
+Run the benchmark client as a second `dbev` process on the same node as the
+already-running daemon:
+
+```bash
+sudo dbev --config /etc/databases-everywhere/config.yml --bench
+```
+
+The safe default benchmark does not create, stop, or mutate database
+instances. It performs:
+
+- warmup requests followed by sequential authenticated heartbeat requests;
+- a bounded concurrent heartbeat phase with attempted and successful
+  requests/second plus min, mean, standard deviation, p50, p90, p95, p99, and
+  maximum latency;
+- real HTTP/1.1 WebSocket upgrades to `/ws/monitoring`, each using a fresh
+  single-use JWT;
+- `/proc` sampling of the running daemon and benchmark client, including peak
+  CPU and resident RAM.
+
+For a sustained test, specify the concurrent-phase duration in minutes and let
+the client randomly choose a bounded set of currently running instances:
+
+```bash
+sudo dbev --config /etc/databases-everywhere/config.yml \
+  --bench \
+  --time 5 \
+  --max_instances 4
+```
+
+`--time 5` is the friendly alias for `--bench-time-minutes 5`.
+`--max_instances 4` (also `--max-instances` or
+`--bench-max-instances`) fetches the daemon's instance list, filters it to
+`running`, randomly chooses up to four, and records the exact selection in the
+report. Half of the concurrent requests remain heartbeat requests; the other
+half are distributed evenly over the selected instances' read-only status
+endpoints. Automatic selection never starts, stops, imports, exports, or
+otherwise mutates an instance.
+
+Timed mode is rate-limit-aware by default. It sends concurrent bursts using at
+most 80% of `security.api_rate_limit_per_minute` in each 60-second window and
+reserves the rest for benchmark control calls and normal panel traffic. The
+report separates wall-clock accepted req/s from active-burst accepted req/s,
+so pacing does not hide the API's service capacity. WebSocket, import/export,
+and final validation phases run before the throughput phase and therefore
+cannot fail merely because the load phase exhausted a window.
+
+On an isolated stress node, `--bench-unthrottled` disables this pacing. It
+requires `--time` and can intentionally create large numbers of HTTP 429
+responses. Raise the daemon's configured limit first; repeated rejections are
+log-suppressed within each identity/window to prevent audit-log amplification.
+
+Use a dedicated running instance when container resource sampling or
+import/export throughput is required:
+
+```bash
+sudo dbev --config /etc/databases-everywhere/config.yml \
+  --bench \
+  --bench-instance perf-postgres \
+  --bench-import-export
+```
+
+`--bench-import-export` is explicit destructive authorization. It queues a full
+native export, waits for it to succeed, then imports that fresh artifact back
+into the named instance. Logical imports are not transactional and may leave a
+partially modified database if the native client fails. Redis and Qdrant stop
+temporarily for their physical-volume import. Never target customer data; use
+a disposable performance instance with representative data. After a successful
+re-import the benchmark deletes only the export artifact it created. Add
+`--bench-keep-artifact` to retain it. Failed imports retain it for diagnosis.
+
+When instances are selected, the benchmark samples their containers directly
+through the configured Docker or Podman socket. Multiple containers are
+sampled round-robin, one per interval, to keep the stats observer from
+distorting the load. Per-instance peaks and failed sample counts are reported.
+CPU percentages use 100% for one fully occupied CPU core. Sampling can fail
+temporarily while a physical import has intentionally stopped its container;
+these gaps are counted in the report.
+
+Useful controls:
+
+| CLI option | Environment variable | Default |
+| --- | --- | --- |
+| `--bench-url` | `DBEV_BENCH_URL` | Configured local API listener |
+| `--bench-host` | `DBEV_BENCH_HOST` | Configured/allowed request host |
+| `--bench-instance` | `DBEV_BENCH_INSTANCE` | None |
+| `--bench-max-instances` (`--max_instances`) | `DBEV_BENCH_MAX_INSTANCES` | `0` (disabled; maximum `32`) |
+| `--bench-warmup-requests` | `DBEV_BENCH_WARMUP_REQUESTS` | `10` |
+| `--bench-latency-samples` | `DBEV_BENCH_LATENCY_SAMPLES` | `50` |
+| `--bench-requests` | `DBEV_BENCH_REQUESTS` | `400` |
+| `--bench-time-minutes` (`--time`) | `DBEV_BENCH_TIME_MINUTES` | None (maximum `1440`) |
+| `--bench-unthrottled` | `DBEV_BENCH_UNTHROTTLED` | Disabled; requires `--time` |
+| `--bench-concurrency` | `DBEV_BENCH_CONCURRENCY` | `32` |
+| `--bench-websockets` | `DBEV_BENCH_WEBSOCKETS` | `10` |
+| `--bench-import-export` | `DBEV_BENCH_IMPORT_EXPORT` | Disabled |
+| `--bench-keep-artifact` | `DBEV_BENCH_KEEP_ARTIFACT` | Disabled |
+| `--bench-timeout-seconds` | `DBEV_BENCH_TIMEOUT_SECONDS` | `900` |
+| `--bench-sample-interval-ms` | `DBEV_BENCH_SAMPLE_INTERVAL_MS` | `250` |
+| `--bench-output` | `DBEV_BENCH_OUTPUT` | Unique directory under `./dbev-benchmarks` |
+
+`DBEV_BENCH=true` enables benchmark mode when an environment-only launch is
+preferred. `--bench-insecure-tls` / `DBEV_BENCH_INSECURE_TLS=true` is available
+for an explicitly selected local endpoint with a test certificate; it should
+not be used against an untrusted network.
+
+The benchmark deliberately goes through normal authentication, host policy,
+request admission, and rate limiting. HTTP 429 responses are counted rather
+than hidden. Raise `security.api_rate_limit_per_minute` on an isolated
+performance node if the goal is measuring the server above the production
+throttle.
+
+The API rate limit is applied independently per authenticated
+credential/transport-peer IP, rather than globally per token. IPv4 uses the
+individual address and IPv6 uses a `/64` peer group. Unauthenticated requests
+remain in bounded IP-derived buckets. Forwarding headers are intentionally not
+trusted, so deployments behind a local reverse proxy are limited by the
+proxy's transport IP unless the proxy uses separate source addresses.
+
+Metric math is intentionally transparent:
+
+- latency is measured through full HTTP response-body completion. Percentile
+  `p` sorts the successful samples, places the rank at `(n - 1) * p`, and
+  linearly interpolates adjacent samples for fixed phases. The concurrent phase
+  uses an HDR histogram with three significant digits, allowing a multi-minute
+  run to retain full-run percentiles, mean, and population standard deviation
+  without memory growing with request count;
+- wall HTTP throughput is `responses / phase wall seconds`. Active throughput
+  excludes intentional fixed-window pacing waits and is
+  `responses / time actively dispatching and completing bursts`. Offered,
+  accepted, active accepted, 429 percentage, status-code counts, transport
+  failures, and successful-only latency are all retained so neither pacing nor
+  rate limiting can make a run look faster;
+- WebSocket time starts immediately before the upgrade request and ends only
+  after a valid `101`, upgrade headers, RFC 6455 accept value, and `dbe.jwt`
+  subprotocol are received. JWT mint latency is a separate phase;
+- import/export MiB/s is `artifact bytes / persisted job elapsed seconds`,
+  using the job's server-side `created_at` and `updated_at`. Client wall time
+  and enqueue HTTP latency are reported separately, so polling cadence and
+  queue delay remain visible;
+- Linux process CPU is
+  `process tick delta / host tick delta * logical CPUs * 100`. Container CPU
+  uses the equivalent runtime counters. Thus `100%` means one fully occupied
+  core and values above `100%` are valid. RAM is resident process memory or
+  runtime-reported container memory, and every peak is the maximum sampled
+  value rather than an average.
+
+After the run, an organized ASCII-safe dashboard is printed to the terminal,
+avoiding locale-dependent box-drawing corruption. Status, failures, throughput,
+latency, and diagnostics are colored when stdout is an interactive terminal.
+Set `NO_COLOR=1` to disable ANSI color, or `CLICOLOR_FORCE=1` to retain it when
+piping output.
+
+Each run writes owner-only files and refuses to overwrite an existing report:
+
+- `report.json` — machine-readable options, environment, summaries, and peaks;
+- `report.md` — human-readable comparison tables;
+- `request-samples.csv` — measured requests and WebSocket handshakes. At most
+  100,000 concurrent-phase rows are retained as a uniform reservoir; JSON
+  counters and HDR latency aggregates still cover every request;
+- `resource-samples.csv` — timestamped daemon, client, and container samples;
+- `diagnostics.log` — warnings and failures without API tokens or host paths.
 
 ## Integration checklist
 

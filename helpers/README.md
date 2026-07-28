@@ -15,5 +15,13 @@ rustc +1.95.0 --edition=2024 --target x86_64-unknown-linux-musl \
 zstd -19 --force /tmp/dbev-socket-bridge -o bins/socket-bridge
 ```
 
+On a development host without the `zstd` CLI, the checked-in packer produces
+the same zstd payload format:
+
+```bash
+cargo run --quiet --manifest-path tools/helper-packer/Cargo.toml -- \
+  /tmp/dbev-socket-bridge bins/socket-bridge
+```
+
 Update the pinned version and both SHA-256 values in `build.rs` in the same
 reviewed change. Never download or replace this executable at daemon runtime.

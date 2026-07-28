@@ -30,13 +30,13 @@ pub fn host_is_allowed(host: &str, allowed_hosts: &[String]) -> bool {
         .any(|allowed| allowed == host)
 }
 
-fn origin_host(origin: &str) -> Option<String> {
+pub(crate) fn origin_host(origin: &str) -> Option<String> {
     let rest = origin.split_once("://")?.1;
     let host = rest.split('/').next().unwrap_or(rest);
     Some(normalize_host(host))
 }
 
-fn normalize_host(host: &str) -> String {
+pub(crate) fn normalize_host(host: &str) -> String {
     let host = host.trim().trim_end_matches('/');
     host.parse::<axum::http::uri::Authority>()
         .map(|authority| {

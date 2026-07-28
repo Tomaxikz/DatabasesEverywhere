@@ -1,7 +1,8 @@
+use std::path::Path;
+#[cfg(unix)]
 use std::{
     fs::File,
     io::{ErrorKind, Write},
-    path::Path,
 };
 
 pub fn is_safe_flat_file_name(name: &str) -> bool {
@@ -21,6 +22,7 @@ pub fn is_safe_flat_file_name(name: &str) -> bool {
 /// The caller is responsible for ensuring that the parent directory is private. The
 /// directory is opened once and all create/rename operations are relative to that
 /// descriptor, preventing a last-component swap during the replacement.
+#[cfg(unix)]
 pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 
@@ -73,6 +75,15 @@ pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), std::io:
     result
 }
 
+#[cfg(not(unix))]
+pub fn atomic_write_private(_path: &Path, _contents: &[u8]) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private atomic file replacement is only available on Unix",
+    ))
+}
+
+#[cfg(unix)]
 fn sync_directory(directory: &impl std::os::fd::AsFd) -> Result<(), std::io::Error> {
     match rustix::fs::fsync(directory) {
         Ok(()) => Ok(()),
@@ -90,7 +101,7 @@ pub fn safe_header_filename(name: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -105,7 +116,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
-    #[cfg(unix)]
     #[test]
     fn replaces_destination_symlink_without_following_it() {
         use std::os::unix::fs::symlink;

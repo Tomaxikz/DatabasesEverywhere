@@ -63,6 +63,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Check explicit Linux target
+        run: cargo check-linux
+
       - name: Test
         run: cargo test --workspace --locked
 

@@ -1,22 +1,31 @@
 use std::{
     collections::HashMap,
     io::Read,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
+    pin::Pin,
     sync::Arc,
+    sync::Mutex as StdMutex,
+    task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::header,
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures::Stream;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{fs::File, sync::Mutex};
+use tokio::{
+    fs::File,
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -38,6 +47,9 @@ const DOWNLOAD_PURPOSE: &str = "artifact_download";
 const DEFAULT_DOWNLOAD_TTL_SECONDS: i64 = 120;
 const MAX_DOWNLOAD_TTL_SECONDS: i64 = 900;
 const MAX_CONSUMED_DOWNLOAD_TICKETS: usize = 16_384;
+const MAX_ACTIVE_DOWNLOADS: usize = 128;
+const MAX_ACTIVE_DOWNLOADS_PER_PEER: usize = 32;
+const DOWNLOAD_STREAM_BUFFER_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadKind {
@@ -85,9 +97,21 @@ pub struct DeleteArtifactResponse {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArtifactDownloadTickets {
     consumed: Arc<Mutex<HashMap<String, i64>>>,
+    active_downloads: Arc<Semaphore>,
+    active_by_peer: Arc<StdMutex<HashMap<DownloadPeer, usize>>>,
+}
+
+impl Default for ArtifactDownloadTickets {
+    fn default() -> Self {
+        Self {
+            consumed: Arc::default(),
+            active_downloads: Arc::new(Semaphore::new(MAX_ACTIVE_DOWNLOADS)),
+            active_by_peer: Arc::default(),
+        }
+    }
 }
 
 impl ArtifactDownloadTickets {
@@ -104,6 +128,86 @@ impl ArtifactDownloadTickets {
         }
         consumed.insert(jti.to_string(), exp);
         true
+    }
+
+    fn admit_download(&self, peer: Option<SocketAddr>) -> Result<ArtifactDownloadPermit, ApiError> {
+        let global = Arc::clone(&self.active_downloads)
+            .try_acquire_owned()
+            .map_err(|_| ApiError::RateLimited)?;
+        let peer = DownloadPeer::from_socket(peer);
+        let mut active = self
+            .active_by_peer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let count = active.entry(peer).or_default();
+        if *count >= MAX_ACTIVE_DOWNLOADS_PER_PEER {
+            return Err(ApiError::RateLimited);
+        }
+        *count += 1;
+        drop(active);
+        Ok(ArtifactDownloadPermit {
+            _global: global,
+            peer,
+            active_by_peer: Arc::clone(&self.active_by_peer),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DownloadPeer {
+    V4([u8; 4]),
+    V6Prefix64([u8; 8]),
+    Unknown,
+}
+
+impl DownloadPeer {
+    fn from_socket(peer: Option<SocketAddr>) -> Self {
+        match peer.map(|address| address.ip()) {
+            Some(IpAddr::V4(address)) => Self::V4(address.octets()),
+            Some(IpAddr::V6(address)) => {
+                let mut prefix = [0_u8; 8];
+                prefix.copy_from_slice(&address.octets()[..8]);
+                Self::V6Prefix64(prefix)
+            }
+            None => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactDownloadPermit {
+    _global: OwnedSemaphorePermit,
+    peer: DownloadPeer,
+    active_by_peer: Arc<StdMutex<HashMap<DownloadPeer, usize>>>,
+}
+
+impl Drop for ArtifactDownloadPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .active_by_peer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(count) = active.get_mut(&self.peer) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active.remove(&self.peer);
+        }
+    }
+}
+
+struct DownloadStream {
+    inner: ReaderStream<File>,
+    _permit: ArtifactDownloadPermit,
+}
+
+impl Stream for DownloadStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_next(context)
     }
 }
 
@@ -278,6 +382,7 @@ pub(crate) async fn create_artifact_download_url(
 
 pub async fn download_artifact(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ApiPath((instance_id, artifact_id)): ApiPath<(String, String)>,
     ApiQuery(query): ApiQuery<DownloadQuery>,
 ) -> Result<Response, ApiError> {
@@ -287,12 +392,14 @@ pub async fn download_artifact(
         &instance_id,
         &artifact_id,
         DownloadKind::Artifact,
+        Some(peer),
     )
     .await
 }
 
 pub async fn download_backup(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
     ApiQuery(query): ApiQuery<DownloadQuery>,
 ) -> Result<Response, ApiError> {
@@ -302,6 +409,7 @@ pub async fn download_backup(
         &instance_id,
         &backup_id,
         DownloadKind::Backup,
+        Some(peer),
     )
     .await
 }
@@ -383,6 +491,7 @@ async fn download(
     instance_id: &str,
     artifact_id: &str,
     kind: DownloadKind,
+    peer: Option<SocketAddr>,
 ) -> Result<Response, ApiError> {
     let claims = validate_download_token(state, token)?;
     if claims.kind != kind.as_str()
@@ -391,6 +500,7 @@ async fn download(
     {
         return Err(ApiError::Unauthorized);
     }
+    let permit = state.artifact_downloads.admit_download(peer)?;
     if claims.single_use
         && !state
             .artifact_downloads
@@ -419,7 +529,10 @@ async fn download(
             std::io::ErrorKind::NotFound => ApiError::NotFound,
             _ => ApiError::Runtime(format!("failed to open artifact: {error}")),
         })?;
-    let stream = ReaderStream::new(file);
+    let stream = DownloadStream {
+        inner: ReaderStream::with_capacity(file, DOWNLOAD_STREAM_BUFFER_BYTES),
+        _permit: permit,
+    };
     let body = Body::from_stream(stream);
     tracing::info!(
         event = "audit artifact_downloaded",
@@ -766,6 +879,52 @@ mod tests {
         assert!(validate_artifact_name("inst_1.postgres.sql.gz").is_ok());
     }
 
+    #[test]
+    fn download_streams_are_bounded_per_transport_peer() {
+        let tickets = ArtifactDownloadTickets::default();
+        let peer = Some("192.0.2.10:5000".parse().unwrap());
+        let permits = (0..MAX_ACTIVE_DOWNLOADS_PER_PEER)
+            .map(|_| tickets.admit_download(peer).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            tickets.admit_download(peer),
+            Err(ApiError::RateLimited)
+        ));
+        assert!(
+            tickets
+                .admit_download(Some("192.0.2.11:5000".parse().unwrap()))
+                .is_ok()
+        );
+        drop(permits);
+        assert!(tickets.admit_download(peer).is_ok());
+    }
+
+    #[test]
+    fn download_streams_are_bounded_node_wide() {
+        let tickets = ArtifactDownloadTickets::default();
+        let permits = (0..MAX_ACTIVE_DOWNLOADS)
+            .map(|index| {
+                let third = u8::try_from(index / 256).unwrap();
+                let fourth = u8::try_from(index % 256).unwrap();
+                tickets
+                    .admit_download(Some(SocketAddr::from(([198, 18, third, fourth], 5000))))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            tickets.admit_download(Some("203.0.113.10:5000".parse().unwrap())),
+            Err(ApiError::RateLimited)
+        ));
+        drop(permits);
+        assert!(
+            tickets
+                .admit_download(Some("203.0.113.10:5000".parse().unwrap()))
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn temporary_download_url_is_single_use_and_path_scoped() {
         let state = test_state().await;
@@ -813,6 +972,7 @@ mod tests {
             "inst_other",
             artifact_name,
             DownloadKind::Artifact,
+            None,
         )
         .await
         .unwrap_err();
@@ -824,6 +984,7 @@ mod tests {
             "inst_abc",
             artifact_name,
             DownloadKind::Artifact,
+            None,
         )
         .await
         .unwrap();
@@ -833,6 +994,7 @@ mod tests {
             "inst_abc",
             artifact_name,
             DownloadKind::Artifact,
+            None,
         )
         .await
         .unwrap_err();
@@ -918,7 +1080,7 @@ mod tests {
         let pool = sqlite::connect(&dir).await.unwrap();
         let store = InstanceStore::default();
         let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
-        AppState {
+        AppState::new(crate::api::routes::AppStateData {
             config: Arc::new(Config {
                 uuid: "node".to_string(),
                 token_id: "token-id".to_string(),
@@ -943,10 +1105,11 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
-        }
+        })
     }
 
     fn sample_metadata(instance_id: &str) -> InstanceMetadata {

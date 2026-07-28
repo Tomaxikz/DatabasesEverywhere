@@ -11,7 +11,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +25,9 @@ const SOCKET_ROOT: &str = "/run/dbev";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Each proxied connection currently needs two copy threads. Keep enough PID
+// headroom for the database itself under the daemon's default 512 PID limit.
+const MAX_ACTIVE_BRIDGE_CONNECTIONS: usize = 160;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
@@ -35,6 +41,53 @@ struct Bridge {
 struct Invocation {
     bridges: Vec<Bridge>,
     command: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ConnectionSlots {
+    active: AtomicUsize,
+    rejection_reported: AtomicBool,
+}
+
+impl ConnectionSlots {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            rejection_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let admitted = self
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_ACTIVE_BRIDGE_CONNECTIONS).then_some(active + 1)
+            })
+            .is_ok();
+        admitted.then(|| ConnectionPermit {
+            slots: Arc::clone(self),
+        })
+    }
+
+    fn report_capacity_once(&self) {
+        if !self.rejection_reported.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "dbev socket bridge reached its {MAX_ACTIVE_BRIDGE_CONNECTIONS}-connection safety limit"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionPermit {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.slots.active.fetch_sub(1, Ordering::AcqRel);
+        self.slots.rejection_reported.store(false, Ordering::Release);
+    }
 }
 
 fn main() -> ExitCode {
@@ -162,6 +215,7 @@ fn supervise(invocation: Invocation) -> Result<(), String> {
 
 fn bind_bridges(bridges: &[Bridge]) -> Result<Vec<PathBuf>, String> {
     let mut sockets = Vec::with_capacity(bridges.len());
+    let slots = Arc::new(ConnectionSlots::new());
     for bridge in bridges {
         remove_stale_socket(&bridge.socket_path)?;
         let listener = UnixListener::bind(&bridge.socket_path).map_err(|error| {
@@ -180,21 +234,32 @@ fn bind_bridges(bridges: &[Bridge]) -> Result<Vec<PathBuf>, String> {
         )?;
         sockets.push(bridge.socket_path.clone());
         let target = bridge.target;
+        let slots = Arc::clone(&slots);
         thread::Builder::new()
             .name("dbev-socket-accept".to_string())
-            .spawn(move || accept_connections(listener, target))
+            .spawn(move || accept_connections(listener, target, slots))
             .map_err(|error| format!("failed to start socket accept loop: {error}"))?;
     }
     Ok(sockets)
 }
 
-fn accept_connections(listener: UnixListener, target: SocketAddr) {
+fn accept_connections(
+    listener: UnixListener,
+    target: SocketAddr,
+    slots: Arc<ConnectionSlots>,
+) {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let Some(permit) = slots.try_acquire() else {
+                    slots.report_capacity_once();
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 if let Err(error) = thread::Builder::new()
                     .name("dbev-socket-proxy".to_string())
                     .spawn(move || {
+                        let _permit = permit;
                         if let Err(error) = proxy_connection(stream, target) {
                             eprintln!("dbev socket bridge connection to {target} failed: {error}");
                         }

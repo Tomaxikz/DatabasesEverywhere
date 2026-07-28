@@ -1,5 +1,6 @@
 use axum::extract::State;
 use bollard::errors::Error as BollardError;
+use futures::StreamExt;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -37,22 +38,39 @@ use crate::{
         metadata::InstanceDatabaseVersion, metadata::InstanceImageStatus,
         metadata::InstanceMetadata, metadata::InstanceStatus, reconcile,
     },
-    runtime::docker::{DockerContainerStatus, DockerError, DockerInstanceSpec},
+    runtime::docker::{
+        DockerContainerStatus, DockerError, DockerInstanceInspection, DockerInstanceSpec,
+        DockerRuntime,
+    },
     shared::{protocol::Protocol, redaction, time::now_rfc3339},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 const INSTANCE_RUNTIME_INFO_TTL: TokioDuration = TokioDuration::from_secs(60);
+const INSTANCE_RUNTIME_FANOUT_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Default)]
 pub struct InstanceRuntimeInfoCache {
-    inner: Arc<Mutex<HashMap<String, CachedInstanceRuntimeInfo>>>,
+    inner: Arc<Mutex<InstanceRuntimeInfoCacheInner>>,
+}
+
+#[derive(Debug, Default)]
+struct InstanceRuntimeInfoCacheInner {
+    runtime: HashMap<String, CachedInstanceRuntimeInfo>,
+    inspections: HashMap<String, CachedInstanceInspection>,
+    inspection_locks: HashMap<String, Arc<Mutex<()>>>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedInstanceRuntimeInfo {
     image: InstanceImageStatus,
     database_version: InstanceDatabaseVersion,
+    sampled_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CachedInstanceInspection {
+    inspection: DockerInstanceInspection,
     sampled_at: Instant,
 }
 
@@ -69,6 +87,7 @@ impl InstanceRuntimeInfoCache {
     ) -> Option<(InstanceImageStatus, InstanceDatabaseVersion)> {
         let inner = self.inner.lock().await;
         let cached = inner
+            .runtime
             .get(instance_id)
             .filter(|cached| cached.sampled_at.elapsed() < INSTANCE_RUNTIME_INFO_TTL)
             .filter(|cached| cached.image.configured == configured_image)?;
@@ -82,7 +101,7 @@ impl InstanceRuntimeInfoCache {
         database_version: InstanceDatabaseVersion,
     ) {
         let mut inner = self.inner.lock().await;
-        inner.insert(
+        inner.runtime.insert(
             instance_id,
             CachedInstanceRuntimeInfo {
                 image,
@@ -92,8 +111,50 @@ impl InstanceRuntimeInfoCache {
         );
     }
 
+    async fn inspect_instance(
+        &self,
+        docker: &DockerRuntime,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<DockerInstanceInspection, DockerError> {
+        let requested_at = Instant::now();
+        let refresh_lock = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .inspection_locks
+                .entry(instance_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _refresh = refresh_lock.lock().await;
+
+        {
+            let inner = self.inner.lock().await;
+            if let Some(cached) = inner
+                .inspections
+                .get(instance_id)
+                .filter(|cached| cached.sampled_at >= requested_at)
+            {
+                return Ok(cached.inspection.clone());
+            }
+        }
+
+        let inspection = docker.inspect_instance(protocol, instance_id).await?;
+        self.inner.lock().await.inspections.insert(
+            instance_id.to_string(),
+            CachedInstanceInspection {
+                inspection: inspection.clone(),
+                sampled_at: Instant::now(),
+            },
+        );
+        Ok(inspection)
+    }
+
     pub async fn remove(&self, instance_id: &str) {
-        self.inner.lock().await.remove(instance_id);
+        let mut inner = self.inner.lock().await;
+        inner.runtime.remove(instance_id);
+        inner.inspections.remove(instance_id);
+        inner.inspection_locks.remove(instance_id);
     }
 }
 
@@ -191,15 +252,11 @@ pub async fn list_instances(
     auth: ApiRequestContext,
 ) -> ApiResult<Vec<InstanceMetadata>> {
     auth.require_scope(scopes::INSTANCES_READ)?;
-    let instances = futures::future::join_all(
-        state
-            .instances
-            .list()
-            .await
-            .into_iter()
-            .map(|metadata| enrich_instance_runtime_info(&state, metadata)),
-    )
-    .await;
+    let instances = futures::stream::iter(state.instances.list().await)
+        .map(|metadata| enrich_instance_runtime_info(&state, metadata))
+        .buffered(INSTANCE_RUNTIME_FANOUT_LIMIT)
+        .collect()
+        .await;
     Ok(ApiResponse::ok(instances))
 }
 
@@ -304,7 +361,8 @@ async fn enrich_instance_runtime_info(
     state: &AppState,
     mut metadata: InstanceMetadata,
 ) -> InstanceMetadata {
-    metadata.status = live_instance_status(state, &metadata).await;
+    let inspection = live_instance_inspection(state, &metadata).await;
+    metadata.status = classify_live_instance_status(&metadata, inspection.as_ref());
     let configured = state
         .config
         .images
@@ -323,12 +381,15 @@ async fn enrich_instance_runtime_info(
         return metadata;
     }
 
-    let current = state
-        .docker
-        .container_image(metadata.protocol, &metadata.instance_id)
-        .await
-        .ok()
-        .flatten();
+    let current = match inspection.as_ref() {
+        Some(Ok(inspection)) => inspection.image.clone(),
+        _ => state
+            .docker
+            .container_image(metadata.protocol, &metadata.instance_id)
+            .await
+            .ok()
+            .flatten(),
+    };
     let update_available = current
         .as_deref()
         .is_some_and(|current| current != configured);
@@ -352,24 +413,41 @@ async fn enrich_instance_runtime_info(
 }
 
 async fn live_instance_status(state: &AppState, metadata: &InstanceMetadata) -> InstanceStatus {
+    let inspection = live_instance_inspection(state, metadata).await;
+    classify_live_instance_status(metadata, inspection.as_ref())
+}
+
+async fn live_instance_inspection(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Option<Result<DockerInstanceInspection, DockerError>> {
     if matches!(
         metadata.status,
         InstanceStatus::Quarantined | InstanceStatus::Deleting
     ) {
-        return metadata.status;
+        return None;
     }
 
-    match state
-        .docker
-        .inspect_instance(metadata.protocol, &metadata.instance_id)
-        .await
-    {
-        Ok(inspection) => reconcile::classify_container_status(inspection.status),
-        Err(error) if error.is_not_found() && metadata.status == InstanceStatus::Creating => {
+    Some(
+        state
+            .instance_runtime_cache
+            .inspect_instance(&state.docker, metadata.protocol, &metadata.instance_id)
+            .await,
+    )
+}
+
+fn classify_live_instance_status(
+    metadata: &InstanceMetadata,
+    inspection: Option<&Result<DockerInstanceInspection, DockerError>>,
+) -> InstanceStatus {
+    match inspection {
+        None => metadata.status,
+        Some(Ok(inspection)) => reconcile::classify_container_status(inspection.status),
+        Some(Err(error)) if error.is_not_found() && metadata.status == InstanceStatus::Creating => {
             InstanceStatus::Creating
         }
-        Err(error) if error.is_not_found() => InstanceStatus::Failed,
-        Err(error) => {
+        Some(Err(error)) if error.is_not_found() => InstanceStatus::Failed,
+        Some(Err(error)) => {
             tracing::warn!(
                 %error,
                 instance_id = %metadata.instance_id,

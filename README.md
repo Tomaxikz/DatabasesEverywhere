@@ -58,16 +58,13 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Install
 
-Official release artifacts currently target x86-64 Linux with glibc 2.35 or
-newer. Choose a
-versioned release, verify its published SHA-256, and install it to
-`/usr/local/bin`:
+Official releases target x86-64 Linux with glibc 2.35 or newer. Choose a
+versioned release and install it to `/usr/local/bin`:
 
 ```bash
 DBEV_VERSION=v0.2.0 # replace with the reviewed release
 test "$(uname -m)" = x86_64
 sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
-sha256sum /usr/local/bin/dbev # compare with the release checksum
 sudo chmod +x /usr/local/bin/dbev
 ```
 
@@ -133,6 +130,9 @@ Runtime data lives in:
 On daemon boot these runtime directories and their subdirectories are created
 automatically if missing. Compose installs still need
 `/etc/databases-everywhere/config.yml` in place before startup.
+Every existing ancestor of a configured runtime path must be a real,
+non-symlink directory that is not writable by untrusted users. This prevents a
+local account from redirecting daemon-owned data while the service starts.
 
 The configuration requires two distinct secrets of at least 32 random bytes:
 `token` for API authentication and `jwt_signing_key` for WebSocket and download
@@ -144,6 +144,7 @@ database protocol's native credentials. Cleartext public gateways emit a
 startup warning because credentials, queries, and results are not protected
 from network interception. Remote credential imports are intentionally
 unavailable in the network-none model; stage a trusted local artifact first.
+Daemon file logs rotate daily and retain the latest 14 files.
 
 ## Docs
 
@@ -165,4 +166,20 @@ For messing around locally there's `config.local.yml`:
 ```bash
 cargo run -- --config config.local.yml check-config
 cargo run -- --config config.local.yml daemon
+```
+
+On an x86-64 Linux host, a normal release build produces
+`target/release/dbev`:
+
+```bash
+cargo build --release
+```
+
+Explicit check/test/build aliases are also available, and CI runs
+`cargo check-linux` on every push:
+
+```bash
+cargo check-linux
+cargo test-linux
+cargo build-linux
 ```

@@ -6,14 +6,55 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
-    api::{allowed_hosts, api_response::ApiError, routes::AppState},
+    api::{
+        allowed_hosts, api_response::ApiError, routes::AppState, security::RequestAuthentication,
+    },
     auth::{api_token::AcceptedApiToken, jwt},
+    config::Config,
     constants,
 };
+
+#[derive(Debug, Clone)]
+pub struct HostPolicy {
+    request_hosts: Arc<HashSet<String>>,
+    origin_hosts: Arc<HashSet<String>>,
+}
+
+impl HostPolicy {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            request_hosts: normalized_hosts(config.request_allowed_hosts()),
+            origin_hosts: normalized_hosts(config.cors_allowed_hosts()),
+        }
+    }
+
+    fn allows_request_host(&self, host: &str) -> bool {
+        self.request_hosts.contains(host)
+    }
+
+    fn allows_origin(&self, origin: &str) -> bool {
+        allowed_hosts::origin_host(origin)
+            .map(|host| self.origin_hosts.contains(&host))
+            .unwrap_or(false)
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.request_hosts.is_empty() && !self.origin_hosts.is_empty()
+    }
+}
+
+fn normalized_hosts(hosts: Vec<String>) -> Arc<HashSet<String>> {
+    Arc::new(
+        hosts
+            .into_iter()
+            .map(|host| allowed_hosts::normalize_host(&host))
+            .collect(),
+    )
+}
 
 /// Authentication extracted before path, query, or body parsing.
 ///
@@ -27,7 +68,7 @@ pub struct ApiRequestContext {
 
 #[derive(Debug, Clone)]
 pub struct WebSocketRequestContext {
-    claims: jwt::Claims,
+    claims: Arc<jwt::Claims>,
 }
 
 impl WebSocketRequestContext {
@@ -35,7 +76,7 @@ impl WebSocketRequestContext {
         &self,
         required_scope: &str,
         instance_id: Option<&str>,
-    ) -> Result<jwt::Claims, ApiError> {
+    ) -> Result<Arc<jwt::Claims>, ApiError> {
         if !self
             .claims
             .scopes
@@ -49,7 +90,7 @@ impl WebSocketRequestContext {
         {
             return Err(ApiError::Forbidden(format!("instance:{instance_id}")));
         }
-        Ok(self.claims.clone())
+        Ok(Arc::clone(&self.claims))
     }
 }
 
@@ -61,10 +102,20 @@ impl FromRequestParts<AppState> for WebSocketRequestContext {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         reject_query_token(&parts.uri)?;
+        if let Some(authentication) = parts.extensions.get::<RequestAuthentication>() {
+            return match authentication {
+                RequestAuthentication::WebSocket(claims) => Ok(Self {
+                    claims: Arc::clone(claims),
+                }),
+                _ => Err(ApiError::Unauthorized),
+            };
+        }
         let token = websocket_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
         let claims = jwt::validate_ws_token_claims(token, state.config.websocket_jwt_secret())
             .map_err(|error| ApiError::InvalidWebSocketJwt(error.to_string()))?;
-        Ok(Self { claims })
+        Ok(Self {
+            claims: Arc::new(claims),
+        })
     }
 }
 
@@ -90,6 +141,14 @@ impl FromRequestParts<AppState> for ApiRequestContext {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         reject_query_token(&parts.uri)?;
+        if let Some(authentication) = parts.extensions.get::<RequestAuthentication>() {
+            return match authentication {
+                RequestAuthentication::Api(actor) => Ok(Self {
+                    actor: actor.clone(),
+                }),
+                _ => Err(ApiError::Unauthorized),
+            };
+        }
         let authorization = parts
             .headers
             .get(constants::AUTHORIZATION_HEADER)
@@ -107,12 +166,7 @@ pub fn enforce_allowed_request_hosts(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<(), ApiError> {
-    validate_allowed_request_hosts(
-        headers,
-        uri,
-        &state.config.request_allowed_hosts(),
-        &state.config.cors_allowed_hosts(),
-    )
+    validate_allowed_request_hosts(headers, uri, state.host_policy())
 }
 
 pub async fn enforce_request_host_policy(
@@ -124,14 +178,13 @@ pub async fn enforce_request_host_policy(
     Ok(next.run(request).await)
 }
 
-pub fn cors_layer(allowed_origin_hosts: &[String]) -> CorsLayer {
-    let allowed_origin_hosts = Arc::new(allowed_origin_hosts.to_vec());
+pub fn cors_layer(policy: HostPolicy) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, _request_parts| {
                 origin
                     .to_str()
-                    .map(|origin| allowed_hosts::origin_is_allowed(origin, &allowed_origin_hosts))
+                    .map(|origin| policy.allows_origin(origin))
                     .unwrap_or(false)
             },
         ))
@@ -148,22 +201,21 @@ pub fn cors_layer(allowed_origin_hosts: &[String]) -> CorsLayer {
 fn validate_allowed_request_hosts(
     headers: &HeaderMap,
     uri: &Uri,
-    allowed_request_hosts: &[String],
-    allowed_origin_hosts: &[String],
+    policy: &HostPolicy,
 ) -> Result<(), ApiError> {
-    if allowed_request_hosts.is_empty() || allowed_origin_hosts.is_empty() {
+    if !policy.is_complete() {
         return Err(ApiError::HostNotAllowed);
     }
 
     let request_host =
         allowed_hosts::request_host_with_uri(headers, Some(uri)).ok_or(ApiError::HostNotAllowed)?;
-    if !allowed_hosts::host_is_allowed(&request_host, allowed_request_hosts) {
+    if !policy.allows_request_host(&request_host) {
         return Err(ApiError::HostNotAllowed);
     }
 
     if let Some(origin) = headers.get("origin") {
         let origin = origin.to_str().map_err(|_| ApiError::HostNotAllowed)?;
-        if !allowed_hosts::origin_is_allowed(origin, allowed_origin_hosts) {
+        if !policy.allows_origin(origin) {
             return Err(ApiError::HostNotAllowed);
         }
     }
@@ -311,23 +363,26 @@ mod tests {
 
     #[test]
     fn validates_host_and_origin_independently() {
-        let allowed = vec!["panel.example.com".to_string()];
+        let policy = HostPolicy {
+            request_hosts: normalized_hosts(vec!["panel.example.com".to_string()]),
+            origin_hosts: normalized_hosts(vec!["panel.example.com".to_string()]),
+        };
         let uri = "/api/system".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("host", "evil.example.com".parse().unwrap());
         headers.insert("origin", "https://panel.example.com".parse().unwrap());
 
         assert!(matches!(
-            validate_allowed_request_hosts(&headers, &uri, &allowed, &allowed),
+            validate_allowed_request_hosts(&headers, &uri, &policy),
             Err(ApiError::HostNotAllowed)
         ));
 
         headers.insert("host", "panel.example.com".parse().unwrap());
-        assert!(validate_allowed_request_hosts(&headers, &uri, &allowed, &allowed).is_ok());
+        assert!(validate_allowed_request_hosts(&headers, &uri, &policy).is_ok());
 
         headers.insert("origin", "https://evil.example.com".parse().unwrap());
         assert!(matches!(
-            validate_allowed_request_hosts(&headers, &uri, &allowed, &allowed),
+            validate_allowed_request_hosts(&headers, &uri, &policy),
             Err(ApiError::HostNotAllowed)
         ));
     }

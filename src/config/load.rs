@@ -21,6 +21,12 @@ pub enum ConfigLoadError {
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigLoadError> {
+    let config = parse_config_file(path)?;
+    validate::validate_config(&config)?;
+    Ok(config)
+}
+
+pub(crate) fn parse_config_file(path: impl AsRef<Path>) -> Result<Config, ConfigLoadError> {
     let path = path.as_ref();
     let content = std::fs::read_to_string(path).map_err(|source| ConfigLoadError::Read {
         path: path.display().to_string(),
@@ -31,7 +37,6 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigLoadError> {
             path: path.display().to_string(),
             source,
         })?;
-    validate::validate_config(&config)?;
     Ok(config)
 }
 

@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -17,11 +20,13 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     api::{api_response::ApiError, routes::AppState, security_policy::websocket_token},
-    auth::{api_token::ApiToken, jwt},
+    auth::{api_token::AcceptedApiToken, jwt},
 };
 
 const API_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-const MAX_API_RATE_LIMIT_KEYS: usize = 8192;
+const MAX_API_RATE_LIMIT_KEYS: usize = 65_536;
+const API_RATE_LIMIT_SHARDS: usize = 64;
+const MAX_API_RATE_LIMIT_KEYS_PER_SHARD: usize = MAX_API_RATE_LIMIT_KEYS / API_RATE_LIMIT_SHARDS;
 const UNAUTHENTICATED_RATE_LIMIT_BUCKETS: u16 = 4096;
 const MAX_ACTIVE_WEBSOCKETS: usize = 1024;
 const MAX_ACTIVE_API_REQUESTS: usize = 1024;
@@ -29,10 +34,11 @@ const MAX_CONSUMED_WEBSOCKET_JTIS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct ApiRateLimiter {
-    inner: Arc<Mutex<HashMap<String, RateWindow>>>,
+    inner: Arc<[Mutex<RateLimitShard>; API_RATE_LIMIT_SHARDS]>,
     consumed_websocket_jtis: Arc<Mutex<HashMap<String, i64>>>,
     active_websockets: Arc<Semaphore>,
     active_requests: Arc<Semaphore>,
+    request_capacity_logged: Arc<AtomicBool>,
     max_requests: u32,
 }
 
@@ -45,10 +51,13 @@ impl Default for ApiRateLimiter {
 impl ApiRateLimiter {
     pub fn new(max_requests: u32) -> Self {
         Self {
-            inner: Arc::default(),
+            inner: Arc::new(std::array::from_fn(|_| {
+                Mutex::new(RateLimitShard::default())
+            })),
             consumed_websocket_jtis: Arc::default(),
             active_websockets: Arc::new(Semaphore::new(MAX_ACTIVE_WEBSOCKETS)),
             active_requests: Arc::new(Semaphore::new(MAX_ACTIVE_API_REQUESTS)),
+            request_capacity_logged: Arc::new(AtomicBool::new(false)),
             max_requests: max_requests.max(1),
         }
     }
@@ -80,57 +89,100 @@ impl ApiRateLimiter {
         })
     }
 
-    fn admit_request(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        Arc::clone(&self.active_requests)
-            .try_acquire_owned()
-            .map_err(|_| ApiError::RateLimited)
+    fn admit_request(&self) -> Result<ApiRequestPermit, ApiError> {
+        match Arc::clone(&self.active_requests).try_acquire_owned() {
+            Ok(permit) => Ok(ApiRequestPermit {
+                _permit: permit,
+                capacity_logged: Arc::clone(&self.request_capacity_logged),
+            }),
+            Err(_) => {
+                if !self.request_capacity_logged.swap(true, Ordering::AcqRel) {
+                    tracing::warn!("audit api_request_capacity_reached");
+                }
+                Err(ApiError::RateLimited)
+            }
+        }
     }
 
-    async fn allow(&self, identity: &RateLimitIdentity) -> bool {
+    async fn allow(&self, identity: &RateLimitIdentity) -> RateLimitDecision {
         let now = Instant::now();
-        let mut inner = self.inner.lock().await;
+        let shard = rate_limit_shard(&identity.key);
+        let mut inner = self.inner[shard].lock().await;
         evict_expired_windows(&mut inner, now);
-        if inner.len() >= MAX_API_RATE_LIMIT_KEYS && !inner.contains_key(&identity.key) {
+        if inner.windows.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD
+            && !inner.windows.contains_key(&identity.key)
+        {
             let eviction_candidate = inner
+                .windows
                 .iter()
                 .filter(|(_, window)| !window.trusted)
                 .min_by_key(|(_, window)| window.last_seen)
                 .map(|(key, _)| key.clone());
             if let Some(key) = eviction_candidate {
-                inner.remove(&key);
+                inner.windows.remove(&key);
+                inner.capacity_rejection_logged = false;
             } else if !identity.trusted {
-                tracing::warn!(
-                    keys = inner.len(),
-                    "audit api_rate_limit_key_capacity_reached"
-                );
-                return false;
+                let should_log = !inner.capacity_rejection_logged;
+                inner.capacity_rejection_logged = true;
+                return RateLimitDecision::Rejected { should_log };
             } else if let Some(key) = inner
+                .windows
                 .iter()
                 .min_by_key(|(_, window)| window.last_seen)
                 .map(|(key, _)| key.clone())
             {
-                inner.remove(&key);
+                inner.windows.remove(&key);
+                inner.capacity_rejection_logged = false;
             }
         }
-        let window = inner.entry(identity.key.clone()).or_insert(RateWindow {
-            started_at: now,
-            last_seen: now,
-            count: 0,
-            trusted: identity.trusted,
-        });
+        if !inner.windows.contains_key(&identity.key) {
+            inner.windows.insert(
+                identity.key.clone(),
+                RateWindow {
+                    started_at: now,
+                    last_seen: now,
+                    count: 0,
+                    trusted: identity.trusted,
+                    rejection_logged: false,
+                },
+            );
+        }
+        let window = inner
+            .windows
+            .get_mut(&identity.key)
+            .expect("rate-limit window was inserted");
         if now.duration_since(window.started_at) >= API_RATE_LIMIT_WINDOW {
             window.started_at = now;
             window.count = 0;
+            window.rejection_logged = false;
         }
         window.last_seen = now;
         window.count = window.count.saturating_add(1);
-        window.count <= self.max_requests
+        if window.count <= self.max_requests {
+            RateLimitDecision::Allowed
+        } else {
+            let should_log = !window.rejection_logged;
+            window.rejection_logged = true;
+            RateLimitDecision::Rejected { should_log }
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct WebSocketConnectionPermit {
     _connection: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+struct ApiRequestPermit {
+    _permit: OwnedSemaphorePermit,
+    capacity_logged: Arc<AtomicBool>,
+}
+
+impl Drop for ApiRequestPermit {
+    fn drop(&mut self) {
+        self.capacity_logged.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,11 +193,45 @@ pub enum WebSocketAdmissionError {
     ConnectionCapacity,
 }
 
-fn evict_expired_windows(inner: &mut HashMap<String, RateWindow>, now: Instant) {
-    if inner.len() < MAX_API_RATE_LIMIT_KEYS {
+#[derive(Debug, Default)]
+struct RateLimitShard {
+    windows: HashMap<RateLimitKey, RateWindow>,
+    capacity_rejection_logged: bool,
+}
+
+fn evict_expired_windows(inner: &mut RateLimitShard, now: Instant) {
+    if inner.windows.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
+        inner.capacity_rejection_logged = false;
         return;
     }
-    inner.retain(|_, window| now.duration_since(window.started_at) < API_RATE_LIMIT_WINDOW);
+    inner
+        .windows
+        .retain(|_, window| now.duration_since(window.started_at) < API_RATE_LIMIT_WINDOW);
+    if inner.windows.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
+        inner.capacity_rejection_logged = false;
+    }
+}
+
+fn rate_limit_shard(key: &RateLimitKey) -> usize {
+    match key {
+        RateLimitKey::Authenticated {
+            fingerprint, peer, ..
+        } => {
+            let mut folded = fingerprint
+                .iter()
+                .fold(0_u8, |value, byte| value.rotate_left(1) ^ byte);
+            let peer_bytes: &[u8] = match peer {
+                PeerGroup::V4(address) => address,
+                PeerGroup::V6(prefix) => prefix,
+                PeerGroup::Unknown => &[0],
+            };
+            for byte in peer_bytes {
+                folded = folded.rotate_left(1) ^ byte;
+            }
+            usize::from(folded) % API_RATE_LIMIT_SHARDS
+        }
+        RateLimitKey::Anonymous { bucket } => usize::from(*bucket) % API_RATE_LIMIT_SHARDS,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,71 +240,178 @@ struct RateWindow {
     last_seen: Instant,
     count: u32,
     trusted: bool,
+    rejection_logged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitDecision {
+    Allowed,
+    Rejected { should_log: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RateLimitIdentity {
-    key: String,
+    key: RateLimitKey,
     trusted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RateLimitKey {
+    Authenticated {
+        kind: CredentialKind,
+        fingerprint: [u8; 32],
+        peer: PeerGroup,
+    },
+    Anonymous {
+        bucket: u16,
+    },
+}
+
+impl RateLimitKey {
+    fn audit_label(&self) -> String {
+        match self {
+            Self::Authenticated {
+                kind, fingerprint, ..
+            } => {
+                use std::fmt::Write as _;
+
+                let mut label = format!("{}-peer:", kind.as_str());
+                for byte in fingerprint {
+                    write!(&mut label, "{byte:02x}").expect("writing to a String cannot fail");
+                }
+                label
+            }
+            Self::Anonymous { bucket } => format!("peer-bucket:{bucket}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CredentialKind {
+    Api,
+    Jwt,
+}
+
+impl CredentialKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Jwt => "jwt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerGroup {
+    V4([u8; 4]),
+    V6([u8; 8]),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RequestAuthentication {
+    Api(AcceptedApiToken),
+    WebSocket(Arc<jwt::Claims>),
+    SignedJwt { fingerprint: [u8; 32] },
+    Unauthenticated,
 }
 
 pub async fn rate_limit(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let _request = state
-        .api_rate_limiter
-        .admit_request()
-        .inspect_err(|_| tracing::warn!("audit api_request_capacity_reached"))?;
+    let _request = state.api_rate_limiter.admit_request()?;
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(address)| *address);
-    let identity = rate_limit_identity(
-        &state.api_token,
+    let authentication = authenticate_request(
+        &state,
         state.config.websocket_jwt_secret(),
         request.headers(),
         request.uri(),
-        peer,
     );
-    if state.api_rate_limiter.allow(&identity).await {
-        Ok(next.run(request).await)
-    } else {
-        tracing::warn!(key = %identity.key, "audit api_rate_limited");
-        Err(ApiError::RateLimited)
+    let identity = rate_limit_identity(&authentication, peer);
+    request.extensions_mut().insert(authentication);
+    match state.api_rate_limiter.allow(&identity).await {
+        RateLimitDecision::Allowed => Ok(next.run(request).await),
+        RateLimitDecision::Rejected { should_log } => {
+            if should_log {
+                tracing::warn!(key = %identity.key.audit_label(), "audit api_rate_limited");
+            }
+            Err(ApiError::RateLimited)
+        }
     }
 }
 
-fn rate_limit_identity(
-    api_token: &ApiToken,
+fn authenticate_request(
+    state: &AppState,
     jwt_secret: &[u8],
     headers: &HeaderMap,
     uri: &Uri,
-    peer: Option<SocketAddr>,
-) -> RateLimitIdentity {
+) -> RequestAuthentication {
     let authorization = headers
         .get(crate::constants::AUTHORIZATION_HEADER)
         .and_then(|value| value.to_str().ok());
-    if let Some(accepted) = api_token.accepted_from_authorization_header(authorization) {
-        return RateLimitIdentity {
-            key: fingerprint_identity("api", &accepted.name),
-            trusted: true,
-        };
+    if let Some(accepted) = state
+        .api_token
+        .accepted_from_authorization_header(authorization)
+    {
+        return RequestAuthentication::Api(accepted);
     }
 
-    if let Some(token) = websocket_token(headers).or_else(|| signed_download_query_token(uri))
+    if let Some(token) = websocket_token(headers)
+        && let Ok(claims) = jwt::validate_ws_token_claims(token, jwt_secret)
+    {
+        return RequestAuthentication::WebSocket(Arc::new(claims));
+    }
+
+    if let Some(token) = signed_download_query_token(uri)
         && let Ok(jti) = jwt::validated_token_jti(token, jwt_secret)
     {
-        return RateLimitIdentity {
-            key: fingerprint_identity("jwt", &jti),
-            trusted: true,
+        return RequestAuthentication::SignedJwt {
+            fingerprint: credential_fingerprint(CredentialKind::Jwt, &jti),
         };
     }
 
-    RateLimitIdentity {
-        key: peer_rate_limit_key(peer),
-        trusted: false,
+    RequestAuthentication::Unauthenticated
+}
+
+fn rate_limit_identity(
+    authentication: &RequestAuthentication,
+    peer: Option<SocketAddr>,
+) -> RateLimitIdentity {
+    let peer = peer_rate_limit_group(peer);
+    match authentication {
+        RequestAuthentication::Api(accepted) => RateLimitIdentity {
+            key: RateLimitKey::Authenticated {
+                kind: CredentialKind::Api,
+                fingerprint: accepted.rate_limit_fingerprint(),
+                peer,
+            },
+            trusted: true,
+        },
+        RequestAuthentication::WebSocket(claims) => RateLimitIdentity {
+            key: RateLimitKey::Authenticated {
+                kind: CredentialKind::Jwt,
+                fingerprint: credential_fingerprint(CredentialKind::Jwt, &claims.jti),
+                peer,
+            },
+            trusted: true,
+        },
+        RequestAuthentication::SignedJwt { fingerprint } => RateLimitIdentity {
+            key: RateLimitKey::Authenticated {
+                kind: CredentialKind::Jwt,
+                fingerprint: *fingerprint,
+                peer,
+            },
+            trusted: true,
+        },
+        RequestAuthentication::Unauthenticated => RateLimitIdentity {
+            key: peer_rate_limit_key(peer),
+            trusted: false,
+        },
     }
 }
 
@@ -256,37 +449,39 @@ fn is_download_path(path: &str) -> bool {
     )
 }
 
-fn peer_rate_limit_key(peer: Option<SocketAddr>) -> String {
-    let group = peer_rate_limit_group(peer);
-    let digest = Sha256::digest(group.as_bytes());
+fn peer_rate_limit_key(group: PeerGroup) -> RateLimitKey {
+    let digest = match group {
+        PeerGroup::V4(address) => Sha256::digest(address),
+        PeerGroup::V6(prefix) => Sha256::digest(prefix),
+        PeerGroup::Unknown => Sha256::digest([0]),
+    };
     let bucket = u16::from_be_bytes([digest[0], digest[1]]) % UNAUTHENTICATED_RATE_LIMIT_BUCKETS;
-    format!("peer-bucket:{bucket}")
+    RateLimitKey::Anonymous { bucket }
 }
 
-fn peer_rate_limit_group(peer: Option<SocketAddr>) -> String {
+fn peer_rate_limit_group(peer: Option<SocketAddr>) -> PeerGroup {
     match peer.map(|address| address.ip()) {
-        Some(IpAddr::V4(address)) => format!("peer:{address}"),
+        Some(IpAddr::V4(address)) => PeerGroup::V4(address.octets()),
         Some(IpAddr::V6(address)) => {
-            let segments = address.segments();
-            format!(
-                "peer:{:x}:{:x}:{:x}:{:x}::/64",
-                segments[0], segments[1], segments[2], segments[3]
-            )
+            let mut prefix = [0_u8; 8];
+            prefix.copy_from_slice(&address.octets()[..8]);
+            PeerGroup::V6(prefix)
         }
-        None => "peer:unknown".to_string(),
+        None => PeerGroup::Unknown,
     }
 }
 
-fn fingerprint_identity(kind: &str, value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    format!("{kind}:{digest:x}")
+fn credential_fingerprint(kind: CredentialKind, credential_identity: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(kind.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(credential_identity.as_bytes());
+    digest.finalize().into()
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, net::Ipv4Addr};
-
-    use axum::http::HeaderValue;
 
     use super::*;
 
@@ -305,83 +500,55 @@ mod tests {
     }
 
     #[test]
-    fn ignores_forwarded_for_header_for_rate_limit_identity() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+    fn unauthenticated_identity_uses_the_socket_peer() {
         let peer = "192.0.2.7:5000".parse().unwrap();
 
-        let identity = rate_limit_identity(
-            &ApiToken::new("secret"),
-            b"jwt-secret",
-            &headers,
-            &Uri::from_static("/api/system"),
-            Some(peer),
-        );
+        let identity = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
 
         assert_eq!(
             identity.key,
-            peer_rate_limit_key(Some("192.0.2.7:1234".parse().unwrap()))
+            peer_rate_limit_key(peer_rate_limit_group(Some(
+                "192.0.2.7:1234".parse().unwrap()
+            )))
         );
         assert!(!identity.trusted);
     }
 
     #[test]
-    fn invalid_authorization_uses_peer_bucket_without_leaking_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            crate::constants::AUTHORIZATION_HEADER,
-            HeaderValue::from_static("Bearer super-secret"),
-        );
+    fn unauthenticated_guesses_share_the_same_bounded_peer_bucket() {
         let peer = "192.0.2.7:5000".parse().unwrap();
 
-        let identity = rate_limit_identity(
-            &ApiToken::new("different-secret"),
-            b"jwt-secret",
-            &headers,
-            &Uri::from_static("/api/system"),
-            Some(peer),
-        );
-
-        assert_eq!(
-            identity.key,
-            peer_rate_limit_key(Some("192.0.2.7:1234".parse().unwrap()))
-        );
-        assert!(!identity.key.contains("super-secret"));
-        assert!(!identity.trusted);
-
-        headers.insert(
-            crate::constants::AUTHORIZATION_HEADER,
-            HeaderValue::from_static("Bearer a-different-guess"),
-        );
-        let next_guess = rate_limit_identity(
-            &ApiToken::new("different-secret"),
-            b"jwt-secret",
-            &headers,
-            &Uri::from_static("/api/system"),
-            Some(peer),
-        );
+        let identity = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
+        let next_guess = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
         assert_eq!(identity, next_guess);
+        assert!(!identity.trusted);
     }
 
     #[test]
-    fn valid_api_token_gets_a_stable_trusted_bucket() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            crate::constants::AUTHORIZATION_HEADER,
-            HeaderValue::from_static("Bearer secret"),
-        );
+    fn valid_api_token_gets_a_stable_trusted_peer_bucket() {
+        let accepted = crate::auth::api_token::ApiToken::new("secret")
+            .accepted_from_authorization_header(Some("Bearer secret"))
+            .unwrap();
+        let authentication = RequestAuthentication::Api(accepted);
+        let identity =
+            rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse().unwrap()));
 
-        let identity = rate_limit_identity(
-            &ApiToken::new("secret"),
-            b"jwt-secret",
-            &headers,
-            &Uri::from_static("/api/system"),
-            Some("192.0.2.7:5000".parse().unwrap()),
-        );
-
-        assert!(identity.key.starts_with("api:"));
-        assert!(!identity.key.contains("secret"));
+        assert!(matches!(
+            identity.key,
+            RateLimitKey::Authenticated {
+                kind: CredentialKind::Api,
+                ..
+            }
+        ));
+        assert!(!identity.key.audit_label().contains("secret"));
         assert!(identity.trusted);
+
+        let same_ip_new_port =
+            rate_limit_identity(&authentication, Some("192.0.2.7:9000".parse().unwrap()));
+        let other_ip =
+            rate_limit_identity(&authentication, Some("192.0.2.8:5000".parse().unwrap()));
+        assert_eq!(identity, same_ip_new_port);
+        assert_ne!(identity, other_ip);
     }
 
     #[test]
@@ -396,22 +563,19 @@ mod tests {
             60,
         )
         .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            crate::constants::AUTHORIZATION_HEADER,
-            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
+        let claims = jwt::validate_ws_token_claims(&token, secret).unwrap();
+        let authentication = RequestAuthentication::WebSocket(Arc::new(claims));
+        let identity =
+            rate_limit_identity(&authentication, Some("192.0.2.7:5000".parse().unwrap()));
 
-        let identity = rate_limit_identity(
-            &ApiToken::new("api-secret"),
-            secret,
-            &headers,
-            &Uri::from_static("/ws/monitoring"),
-            Some("192.0.2.7:5000".parse().unwrap()),
-        );
-
-        assert!(identity.key.starts_with("jwt:"));
-        assert!(!identity.key.contains(&token));
+        assert!(matches!(
+            identity.key,
+            RateLimitKey::Authenticated {
+                kind: CredentialKind::Jwt,
+                ..
+            }
+        ));
+        assert!(!identity.key.audit_label().contains(&token));
         assert!(identity.trusted);
     }
 
@@ -421,7 +585,7 @@ mod tests {
         let second = peer_rate_limit_group(Some("[2001:db8:1234:5678::2]:5000".parse().unwrap()));
 
         assert_eq!(first, second);
-        assert_eq!(first, "peer:2001:db8:1234:5678::/64");
+        assert!(matches!(first, PeerGroup::V6(_)));
     }
 
     #[test]
@@ -429,11 +593,49 @@ mod tests {
         let keys = (0..10_000_u32)
             .map(|index| {
                 let address = Ipv4Addr::from(index);
-                peer_rate_limit_key(Some(SocketAddr::from((address, 5000))))
+                peer_rate_limit_key(peer_rate_limit_group(Some(SocketAddr::from((
+                    address, 5000,
+                )))))
             })
             .collect::<HashSet<_>>();
 
         assert!(keys.len() <= usize::from(UNAUTHENTICATED_RATE_LIMIT_BUCKETS));
+    }
+
+    #[tokio::test]
+    async fn rate_windows_are_independent_and_log_only_the_first_rejection() {
+        let limiter = ApiRateLimiter::new(2);
+        let first_peer = RateLimitIdentity {
+            key: RateLimitKey::Authenticated {
+                kind: CredentialKind::Api,
+                fingerprint: [1; 32],
+                peer: PeerGroup::V4([192, 0, 2, 1]),
+            },
+            trusted: true,
+        };
+        let second_peer = RateLimitIdentity {
+            key: RateLimitKey::Authenticated {
+                kind: CredentialKind::Api,
+                fingerprint: [2; 32],
+                peer: PeerGroup::V4([192, 0, 2, 2]),
+            },
+            trusted: true,
+        };
+
+        assert_eq!(limiter.allow(&first_peer).await, RateLimitDecision::Allowed);
+        assert_eq!(limiter.allow(&first_peer).await, RateLimitDecision::Allowed);
+        assert_eq!(
+            limiter.allow(&first_peer).await,
+            RateLimitDecision::Rejected { should_log: true }
+        );
+        assert_eq!(
+            limiter.allow(&first_peer).await,
+            RateLimitDecision::Rejected { should_log: false }
+        );
+        assert_eq!(
+            limiter.allow(&second_peer).await,
+            RateLimitDecision::Allowed
+        );
     }
 
     #[tokio::test]

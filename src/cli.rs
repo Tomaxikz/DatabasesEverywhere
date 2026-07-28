@@ -1,28 +1,39 @@
 use std::{
     fs,
-    future::IntoFuture,
-    io::{ErrorKind, Read, Write},
+    future::Future,
+    io::{self, ErrorKind, Read, Write},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Command as StdCommand,
     sync::Arc,
     sync::OnceLock,
+    task::{Context as TaskContext, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use axum::Router;
-use axum_server::{Handle, tls_rustls::RustlsConfig};
+use axum_server::{
+    Handle,
+    accept::{Accept, NoDelayAcceptor},
+    tls_rustls::RustlsConfig,
+};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
+use hyper_util::rt::TokioTimer;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use tokio::{io::AsyncWriteExt, net::TcpListener};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     api::{
         progress::InstallProgressStore,
-        routes::{AppState, build_router},
+        routes::{AppState, AppStateData, build_router},
     },
     auth::api_token::ApiToken,
     config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
@@ -46,7 +57,102 @@ use crate::{
 
 const IMPORT_EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const API_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const API_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIVE_API_CONNECTIONS: usize = 2048;
 const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone)]
+struct ApiConnectionAcceptor<A> {
+    inner: A,
+    permits: Arc<Semaphore>,
+}
+
+impl<A> ApiConnectionAcceptor<A> {
+    fn new(inner: A) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(MAX_ACTIVE_API_CONNECTIONS)),
+        }
+    }
+}
+
+impl<I, S, A> Accept<I, S> for ApiConnectionAcceptor<A>
+where
+    I: Send + 'static,
+    S: Send + 'static,
+    A: Accept<I, S> + Send + Sync,
+    A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A::Service: Send + 'static,
+    A::Future: Send + 'static,
+{
+    type Stream = AdmittedApiStream<A::Stream>;
+    type Service = A::Service;
+    type Future =
+        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let permit = match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "API connection capacity reached",
+                    ))
+                });
+            }
+        };
+        let accepted = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (stream, service) = accepted.await?;
+            Ok((
+                AdmittedApiStream {
+                    inner: stream,
+                    _permit: permit,
+                },
+                service,
+            ))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AdmittedApiStream<S> {
+    inner: S,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for AdmittedApiStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for AdmittedApiStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "dbev")]
@@ -54,6 +160,8 @@ const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
 pub struct Cli {
     #[arg(short, long, default_value = defaults::CONFIG_PATH)]
     config: PathBuf,
+    #[command(flatten)]
+    bench: crate::bench::BenchArgs,
     #[arg(long)]
     setup: bool,
     #[arg(long)]
@@ -88,6 +196,13 @@ pub async fn run() -> anyhow::Result<()> {
     // the bundled binary entry point. Setting the same mask twice is harmless.
     harden_process_file_creation();
     let cli = Cli::parse();
+    if cli.bench.bench {
+        if cli.setup || cli.move_new_config || cli.command.is_some() {
+            anyhow::bail!("--bench cannot be combined with setup, migration, or daemon commands");
+        }
+        init_stdout_logging();
+        return crate::bench::run(cli.config, cli.bench).await;
+    }
     if cli.setup {
         init_stdout_logging();
         return setup_system(cli.config).await;
@@ -1371,7 +1486,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let install_progress = InstallProgressStore::default();
     let shutdown_creations = install_progress.clone();
     let instance_locks = crate::instances::locks::InstanceLocks::default();
-    let state = AppState {
+    let state = AppState::new(AppStateData {
         config: config.clone(),
         config_path: config_path.clone(),
         config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
@@ -1387,10 +1502,11 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         install_progress,
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::resources::ResourceCache::default(),
+        monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
-    };
+    });
     crate::api::resources::start_resource_sampler(state.clone());
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
@@ -2122,14 +2238,206 @@ async fn ensure_runtime_directories(
 ) -> anyhow::Result<Vec<RuntimeDirectoryStatus>> {
     let mut statuses = Vec::new();
     for path in configured_runtime_roots(config) {
-        let existed = tokio::fs::metadata(&path).await.is_ok();
-        tokio::fs::create_dir_all(&path)
-            .await
-            .with_context(|| format!("failed to create configured directory {path}"))?;
+        validate_runtime_path_ancestors(Path::new(&path), false)?;
+        let existed = match fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect configured directory {path}"));
+            }
+        };
+        create_runtime_directory_tree(Path::new(&path))
+            .with_context(|| format!("failed to securely create configured directory {path}"))?;
         harden_runtime_directory(Path::new(&path))?;
+        validate_runtime_path_ancestors(Path::new(&path), true)?;
         statuses.push(RuntimeDirectoryStatus { path, existed });
     }
     Ok(statuses)
+}
+
+fn create_runtime_directory_tree(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::path::Component;
+
+        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+
+        if !path.is_absolute() || path == Path::new("/") {
+            anyhow::bail!(
+                "runtime directory {} must be an absolute path below the filesystem root",
+                path.display()
+            );
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut directory = open("/", flags, Mode::empty())
+            .map_err(std::io::Error::from)
+            .context("failed to securely open the filesystem root")?;
+        let daemon_uid = rustix::process::geteuid().as_raw();
+        let mut traversed = PathBuf::from("/");
+
+        for component in path.components() {
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => name,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "runtime directory {} contains an unsupported path component",
+                        path.display()
+                    );
+                }
+            };
+            traversed.push(name);
+            let child = match openat(&directory, name, flags, Mode::empty()) {
+                Ok(child) => child,
+                Err(rustix::io::Errno::NOENT) => {
+                    match mkdirat(&directory, name, Mode::RWXU) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => {
+                            return Err(std::io::Error::from(error)).with_context(|| {
+                                format!(
+                                    "failed to create runtime directory component {}",
+                                    traversed.display()
+                                )
+                            });
+                        }
+                    }
+                    openat(&directory, name, flags, Mode::empty())
+                        .map_err(std::io::Error::from)
+                        .with_context(|| {
+                            format!(
+                                "failed to securely open newly created runtime directory component {}",
+                                traversed.display()
+                            )
+                        })?
+                }
+                Err(error) => {
+                    return Err(std::io::Error::from(error)).with_context(|| {
+                        format!(
+                            "runtime directory component {} must be a real directory, not a symlink",
+                            traversed.display()
+                        )
+                    });
+                }
+            };
+            validate_runtime_directory_fd(&child, &traversed, daemon_uid)?;
+            directory = child;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).with_context(|| {
+            format!(
+                "failed to create configured runtime directory {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_runtime_directory_fd(
+    directory: &impl std::os::fd::AsFd,
+    path: &Path,
+    daemon_uid: u32,
+) -> anyhow::Result<()> {
+    let stat = rustix::fs::fstat(directory)
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "failed to inspect runtime path component {}",
+                path.display()
+            )
+        })?;
+    let owner = stat.st_uid;
+    if owner != 0 && owner != daemon_uid {
+        anyhow::bail!(
+            "runtime path component {} is owned by untrusted uid {}; expected root or daemon uid {}",
+            path.display(),
+            owner,
+            daemon_uid
+        );
+    }
+    let mode = stat.st_mode;
+    let writable_by_others = mode & 0o022 != 0;
+    let protected_sticky_directory = owner == 0 && mode & 0o1000 != 0;
+    if writable_by_others && !protected_sticky_directory {
+        anyhow::bail!(
+            "runtime path component {} is writable by group or others (mode {:04o})",
+            path.display(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
+}
+
+fn validate_runtime_path_ancestors(path: &Path, include_target: bool) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let daemon_uid = rustix::process::geteuid().as_raw();
+        let start = if include_target {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let mut ancestors = start.ancestors().collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            let metadata = match fs::symlink_metadata(ancestor) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect runtime path ancestor {} for {}",
+                            ancestor.display(),
+                            path.display()
+                        )
+                    });
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!(
+                    "runtime path ancestor {} for {} must be a real directory",
+                    ancestor.display(),
+                    path.display()
+                );
+            }
+
+            let owner = metadata.uid();
+            if owner != 0 && owner != daemon_uid {
+                anyhow::bail!(
+                    "runtime path ancestor {} for {} is owned by untrusted uid {}; expected root or daemon uid {}",
+                    ancestor.display(),
+                    path.display(),
+                    owner,
+                    daemon_uid
+                );
+            }
+
+            let mode = metadata.permissions().mode();
+            let writable_by_others = mode & 0o022 != 0;
+            let protected_sticky_directory = owner == 0 && mode & 0o1000 != 0;
+            if writable_by_others && !protected_sticky_directory {
+                anyhow::bail!(
+                    "runtime path ancestor {} for {} is writable by group or others (mode {:04o})",
+                    ancestor.display(),
+                    path.display(),
+                    mode & 0o7777
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, include_target);
+    }
+    Ok(())
 }
 
 fn harden_runtime_directory(path: &Path) -> anyhow::Result<()> {
@@ -2663,11 +2971,17 @@ async fn serve_api(
         bind = %bind,
         configured_host = %config.api.host,
         port = config.api.port,
+        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
         "api listener started"
     );
 
-    let (shutdown_observed, mut shutdown_observed_rx) = tokio::sync::oneshot::channel();
-    let shutdown = async move {
+    let listener = listener
+        .into_std()
+        .context("failed to convert API listener")?;
+    let handle = Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
         shutdown_signal(
             import_export_jobs,
             install_progress,
@@ -2675,30 +2989,18 @@ async fn serve_api(
             gateway_supervisor,
         )
         .await;
-        let _ = shutdown_observed.send(());
-    };
-    let server = axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .into_future();
-    tokio::pin!(server);
+        shutdown_handle.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
+    });
 
-    tokio::select! {
-        result = &mut server => return result.context("api server failed"),
-        _ = &mut shutdown_observed_rx => {}
-    }
-    match tokio::time::timeout(API_CONNECTION_DRAIN_TIMEOUT, &mut server).await {
-        Ok(result) => result.context("api server failed"),
-        Err(_) => {
-            tracing::warn!(
-                timeout_seconds = API_CONNECTION_DRAIN_TIMEOUT.as_secs(),
-                "API connections did not drain before the restart deadline; closing them"
-            );
-            Ok(())
-        }
-    }
+    let mut server = axum_server::from_tcp(listener)
+        .context("failed to create API server")?
+        .acceptor(ApiConnectionAcceptor::new(NoDelayAcceptor::new()));
+    configure_api_http(&mut server);
+    server
+        .handle(handle)
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .context("api server failed")
 }
 
 async fn serve_api_tls(
@@ -2729,6 +3031,9 @@ async fn serve_api_tls(
         bind = %bind_addr,
         configured_host = %config.api.host,
         port = config.api.port,
+        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
+        tls_handshake_timeout_seconds = API_TLS_HANDSHAKE_TIMEOUT.as_secs(),
         "api tls listener started"
     );
     let handle = Handle::new();
@@ -2744,12 +3049,32 @@ async fn serve_api_tls(
         shutdown_handle.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
     });
 
-    axum_server::from_tcp_rustls(listener, tls)
+    let mut server = axum_server::from_tcp_rustls(listener, tls)
         .context("failed to create API TLS server")?
+        .map(|acceptor| {
+            ApiConnectionAcceptor::new(
+                acceptor
+                    .handshake_timeout(API_TLS_HANDSHAKE_TIMEOUT)
+                    .acceptor(NoDelayAcceptor::new()),
+            )
+        });
+    configure_api_http(&mut server);
+    server
         .handle(handle)
         .serve(router.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("api tls server failed")
+}
+
+fn configure_api_http<A, Acc>(server: &mut axum_server::Server<A, Acc>)
+where
+    A: axum_server::Address,
+{
+    server
+        .http_builder()
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(API_HEADER_READ_TIMEOUT);
 }
 
 async fn api_rustls_config(config: &Config) -> anyhow::Result<RustlsConfig> {
@@ -2872,7 +3197,9 @@ fn init_configured_logging(config: &Config) -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
         .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("dbev.log")
+        .max_log_files(14)
         .build(&config.paths.logs)
         .with_context(|| format!("failed to initialize log file in {}", config.paths.logs))?;
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
@@ -2947,6 +3274,60 @@ mod tests {
         let error = harden_runtime_directory(&runtime).unwrap_err();
 
         assert!(error.to_string().contains("not a symlink"));
+    }
+
+    #[test]
+    fn rejects_symlinked_runtime_path_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let linked_parent = temp.path().join("linked-parent");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &linked_parent).unwrap();
+
+        let error =
+            validate_runtime_path_ancestors(&linked_parent.join("runtime"), false).unwrap_err();
+
+        assert!(error.to_string().contains("must be a real directory"));
+    }
+
+    #[test]
+    fn securely_creates_nested_runtime_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("nested").join("runtime");
+
+        create_runtime_directory_tree(&runtime).unwrap();
+
+        assert!(runtime.is_dir());
+        assert_eq!(
+            fs::metadata(&runtime).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn secure_runtime_creation_rejects_symlinked_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let linked_parent = temp.path().join("linked-parent");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &linked_parent).unwrap();
+
+        let error = create_runtime_directory_tree(&linked_parent.join("runtime")).unwrap_err();
+
+        assert!(error.to_string().contains("not a symlink"));
+        assert!(!target.join("runtime").exists());
+    }
+
+    #[test]
+    fn rejects_runtime_path_ancestor_writable_by_other_users() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("unsafe-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = validate_runtime_path_ancestors(&parent.join("runtime"), false).unwrap_err();
+
+        assert!(error.to_string().contains("writable by group or others"));
     }
 
     #[test]

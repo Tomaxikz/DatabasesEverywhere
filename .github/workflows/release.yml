@@ -197,7 +197,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    needs: build
+    needs:
+      - build
     if: ${{ inputs.create_github_release }}
     steps:
       - name: Download artifacts

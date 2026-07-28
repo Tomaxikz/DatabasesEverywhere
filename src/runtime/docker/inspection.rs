@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use bollard::{
     container::LogOutput,
+    models::ContainerStatsResponse,
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
 use futures::{StreamExt, TryStreamExt};
@@ -13,7 +14,6 @@ use tokio::{
 use crate::{
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
-        container_config::serialize_stats,
     },
     shared::protocol::Protocol,
 };
@@ -50,11 +50,17 @@ impl DockerRuntime {
             .and_then(|host_config| host_config.network_mode)
             .map(|mode| mode.trim().to_ascii_lowercase())
             .filter(|mode| !mode.is_empty());
+        let image = response
+            .config
+            .and_then(|config| config.image)
+            .map(|image| image.trim().to_string())
+            .filter(|image| !image.is_empty());
 
         Ok(DockerInstanceInspection {
             status,
             network_mode,
             health,
+            image,
         })
     }
 
@@ -209,7 +215,7 @@ impl DockerRuntime {
         &self,
         protocol: Protocol,
         instance_id: &str,
-    ) -> Result<CommandOutput, DockerError> {
+    ) -> Result<ContainerStatsResponse, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
         let mut stream = self.docker.stats(
             &name,
@@ -220,10 +226,6 @@ impl DockerRuntime {
                     .build(),
             ),
         );
-        let stats = stream.next().await.ok_or(DockerError::EmptyStatsStream)??;
-        Ok(CommandOutput {
-            stdout: serialize_stats(&stats)?,
-            stderr: String::new(),
-        })
+        Ok(stream.next().await.ok_or(DockerError::EmptyStatsStream)??)
     }
 }

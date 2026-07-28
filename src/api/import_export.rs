@@ -2650,7 +2650,7 @@ mod tests {
         manager: InstanceManager,
         config: Config,
     ) -> AppState {
-        AppState {
+        AppState::new(crate::api::routes::AppStateData {
             config: Arc::new(config),
             config_path: std::path::PathBuf::from("/tmp/dbev-test-config.yml"),
             config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
@@ -2663,10 +2663,11 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             instance_locks: crate::instances::locks::InstanceLocks::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
-        }
+        })
     }
 }

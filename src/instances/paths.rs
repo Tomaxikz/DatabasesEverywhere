@@ -391,35 +391,106 @@ fn existing_owner_for(uid: u32, gid: u32) -> ContainerOwner {
 
 #[cfg(unix)]
 fn chown_recursive(path: &Path, owner: ContainerOwner) -> Result<(), InstancePathError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let directory = match open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => {
             return Err(InstancePathError::ReadMetadata {
                 path: path.display().to_string(),
-                source,
+                source: std::io::Error::from(error),
             });
         }
     };
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid)).map_err(|source| {
-        InstancePathError::Chown {
-            path: path.display().to_string(),
-            source,
-        }
+    chown_directory_fd(&directory, path, owner)
+}
+
+#[cfg(unix)]
+fn chown_directory_fd(
+    directory: &impl std::os::fd::AsFd,
+    display_path: &Path,
+    owner: ContainerOwner,
+) -> Result<(), InstancePathError> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    use rustix::{
+        fs::{AtFlags, Dir, FileType, Mode, OFlags, chownat, fchown, openat, statat},
+        process::{Gid, Uid},
+    };
+
+    let uid = Uid::from_raw(owner.uid);
+    let gid = Gid::from_raw(owner.gid);
+    fchown(directory, Some(uid), Some(gid)).map_err(|source| InstancePathError::Chown {
+        path: display_path.display().to_string(),
+        source: std::io::Error::from(source),
     })?;
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path).map_err(|source| InstancePathError::ReadDir {
-            path: path.display().to_string(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| InstancePathError::ReadDir {
-                path: path.display().to_string(),
-                source,
-            })?;
-            chown_recursive(&entry.path(), owner)?;
+
+    let mut entries = Dir::read_from(directory).map_err(|source| InstancePathError::ReadDir {
+        path: display_path.display().to_string(),
+        source: std::io::Error::from(source),
+    })?;
+    let mut names = Vec::<CString>::new();
+    for entry in &mut entries {
+        let entry = entry.map_err(|source| InstancePathError::ReadDir {
+            path: display_path.display().to_string(),
+            source: std::io::Error::from(source),
+        })?;
+        let name = entry.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+
+    for name in names {
+        let child_path = display_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let stat = match statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => continue,
+            Err(source) => {
+                return Err(InstancePathError::ReadMetadata {
+                    path: child_path.display().to_string(),
+                    source: std::io::Error::from(source),
+                });
+            }
+        };
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => {}
+            FileType::Directory => {
+                let child = match openat(
+                    directory,
+                    &name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(child) => child,
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(source) => {
+                        return Err(InstancePathError::ReadDir {
+                            path: child_path.display().to_string(),
+                            source: std::io::Error::from(source),
+                        });
+                    }
+                };
+                chown_directory_fd(&child, &child_path, owner)?;
+            }
+            _ => {
+                chownat(
+                    directory,
+                    &name,
+                    Some(uid),
+                    Some(gid),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(|source| InstancePathError::Chown {
+                    path: child_path.display().to_string(),
+                    source: std::io::Error::from(source),
+                })?;
+            }
         }
     }
     Ok(())
@@ -525,6 +596,37 @@ mod tests {
                 uid: 1001,
                 gid: 1002
             }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_owner_repair_does_not_follow_symlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("must-not-be-traversed"), b"outside").unwrap();
+        symlink(&outside, managed.join("outside-link")).unwrap();
+        let owner = ContainerOwner {
+            uid: std::fs::metadata(&managed).unwrap().uid(),
+            gid: std::fs::metadata(&managed).unwrap().gid(),
+        };
+
+        chown_recursive(&managed, owner).unwrap();
+
+        assert_eq!(
+            std::fs::read(outside.join("must-not-be-traversed")).unwrap(),
+            b"outside"
+        );
+        assert!(
+            std::fs::symlink_metadata(managed.join("outside-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 }

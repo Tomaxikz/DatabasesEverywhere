@@ -1,28 +1,37 @@
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::auth::scopes;
 
 #[derive(Debug, Clone)]
 pub struct ApiToken {
-    tokens: Vec<NamedToken>,
+    tokens: Arc<[NamedToken]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct NamedToken {
-    name: String,
-    token: String,
-    scopes: Vec<String>,
+    name: Arc<str>,
+    token: Arc<str>,
+    scopes: Arc<[String]>,
+    rate_limit_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedApiToken {
-    pub name: String,
-    pub scopes: Vec<String>,
+    pub name: Arc<str>,
+    pub scopes: Arc<[String]>,
+    rate_limit_fingerprint: [u8; 32],
 }
 
 impl AcceptedApiToken {
     pub fn has_scope(&self, required_scope: &str) -> bool {
         scopes::allows(&self.scopes, required_scope)
+    }
+
+    pub(crate) fn rate_limit_fingerprint(&self) -> [u8; 32] {
+        self.rate_limit_fingerprint
     }
 }
 
@@ -32,25 +41,29 @@ impl ApiToken {
         let tokens = if expected.trim().is_empty() {
             Vec::new()
         } else {
-            vec![NamedToken {
-                name: "default".to_string(),
-                token: expected,
-                scopes: vec![scopes::ALL.to_string()],
-            }]
+            vec![named_token(
+                "default".to_string(),
+                expected,
+                vec![scopes::ALL.to_string()],
+            )]
         };
-        Self { tokens }
+        Self {
+            tokens: tokens.into(),
+        }
     }
 
     pub fn from_config(config: &crate::config::Config) -> Self {
         let mut tokens = Vec::new();
         if !config.token.trim().is_empty() {
-            tokens.push(NamedToken {
-                name: config.token_id.clone(),
-                token: config.token.clone(),
-                scopes: vec![scopes::ALL.to_string()],
-            });
+            tokens.push(named_token(
+                config.token_id.clone(),
+                config.token.clone(),
+                vec![scopes::ALL.to_string()],
+            ));
         }
-        Self { tokens }
+        Self {
+            tokens: tokens.into(),
+        }
     }
 
     pub fn accepted_from_authorization_header(
@@ -67,6 +80,7 @@ impl ApiToken {
             .map(|token| AcceptedApiToken {
                 name: token.name.clone(),
                 scopes: token.scopes.clone(),
+                rate_limit_fingerprint: token.rate_limit_fingerprint,
             })
     }
 
@@ -75,6 +89,19 @@ impl ApiToken {
             token.len() == expected.token.len()
                 && bool::from(token.as_bytes().ct_eq(expected.token.as_bytes()))
         })
+    }
+}
+
+fn named_token(name: String, token: String, scopes: Vec<String>) -> NamedToken {
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"api");
+    fingerprint.update([0]);
+    fingerprint.update(name.as_bytes());
+    NamedToken {
+        name: Arc::from(name),
+        token: Arc::from(token),
+        scopes: scopes.into(),
+        rate_limit_fingerprint: fingerprint.finalize().into(),
     }
 }
 
@@ -126,7 +153,7 @@ mod tests {
         let accepted = token
             .accepted_from_authorization_header(Some("Bearer secret-a"))
             .unwrap();
-        assert_eq!(accepted.name, "panel-a");
+        assert_eq!(accepted.name.as_ref(), "panel-a");
         assert!(accepted.has_scope(scopes::INSTANCES_READ));
     }
 }

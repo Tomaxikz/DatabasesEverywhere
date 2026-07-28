@@ -1,3 +1,3 @@
 mod router;
 
-pub use router::{AppState, DaemonShutdown, build_router};
+pub use router::{AppState, AppStateData, DaemonShutdown, build_router};

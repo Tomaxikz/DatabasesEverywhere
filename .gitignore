@@ -1,6 +1,9 @@
 /target/
+**/target/
 /.local/
 /.venv/
 /.venv-*/
 /scripts/
 /tests/
+/dbev-benchmarks/
+/dist/

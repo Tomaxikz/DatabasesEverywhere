@@ -183,7 +183,7 @@ mod tests {
         let pool = sqlite::connect(dir.path()).await.unwrap();
         let store = InstanceStore::default();
         let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
-        AppState {
+        AppState::new(crate::api::routes::AppStateData {
             config: Arc::new(config),
             config_path: dir.path().join("config.yml"),
             config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
@@ -197,9 +197,10 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
-        }
+        })
     }
 }

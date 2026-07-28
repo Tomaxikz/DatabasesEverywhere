@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -7,6 +7,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use tokio::sync::watch;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::{
     api::{
@@ -24,6 +25,12 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct AppState {
+    inner: Arc<AppStateData>,
+    host_policy: Arc<security_policy::HostPolicy>,
+}
+
+#[derive(Debug)]
+pub struct AppStateData {
     pub config: Arc<Config>,
     pub config_path: PathBuf,
     pub config_patches: crate::api::config_admin::ConfigPatchCoordinator,
@@ -37,9 +44,32 @@ pub struct AppState {
     pub install_progress: crate::api::progress::InstallProgressStore,
     pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
     pub resource_cache: crate::api::resources::ResourceCache,
+    pub monitoring_cache: crate::api::websocket::MonitoringSnapshotCache,
     pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
     pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
     pub daemon_shutdown: DaemonShutdown,
+}
+
+impl AppState {
+    pub fn new(data: AppStateData) -> Self {
+        let host_policy = Arc::new(security_policy::HostPolicy::from_config(&data.config));
+        Self {
+            inner: Arc::new(data),
+            host_policy,
+        }
+    }
+
+    pub fn host_policy(&self) -> &security_policy::HostPolicy {
+        &self.host_policy
+    }
+}
+
+impl Deref for AppState {
+    type Target = AppStateData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +95,7 @@ impl DaemonShutdown {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = security_policy::cors_layer(&state.config.cors_allowed_hosts());
+    let cors = security_policy::cors_layer(state.host_policy().clone());
 
     Router::new()
         .merge(system_routes())
@@ -82,6 +112,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             state.config.security.api_body_limit_bytes,
         ))
+        .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(60)))
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -330,6 +361,8 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["api_readiness"], "ready");
         assert_eq!(body["gateways"]["status"], "failed");
+        assert_eq!(body["api_rate_limit_per_minute"], 600);
+        assert_eq!(body["api_rate_limit_scope"], "credential_and_peer_ip");
     }
 
     #[tokio::test]
@@ -388,7 +421,7 @@ mod tests {
             jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
             ..Default::default()
         });
-        AppState {
+        AppState::new(AppStateData {
             config: config.clone(),
             config_path: directory.path().join("config.yml"),
             config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
@@ -402,9 +435,10 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             daemon_shutdown: DaemonShutdown::default(),
-        }
+        })
     }
 }

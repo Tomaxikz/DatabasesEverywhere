@@ -64,6 +64,7 @@ pub struct DockerInstanceInspection {
     pub status: DockerContainerStatus,
     pub network_mode: Option<String>,
     pub health: Option<String>,
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

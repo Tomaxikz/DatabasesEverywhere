@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.4.0";
+pub const API_VERSION: &str = "0.5.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -25,6 +25,8 @@ pub struct SystemResponse {
     pub api_port: u16,
     pub api_bind: String,
     pub api_ssl_enabled: bool,
+    pub api_rate_limit_per_minute: u32,
+    pub api_rate_limit_scope: &'static str,
     pub daemon_engine: &'static str,
     pub daemon_socket: String,
     pub database_container_network_mode: &'static str,
@@ -61,6 +63,8 @@ pub async fn system(
         api_port: state.config.api.port,
         api_bind: state.config.api.bind_addr(),
         api_ssl_enabled: state.config.api.ssl.enabled,
+        api_rate_limit_per_minute: state.config.security.api_rate_limit_per_minute,
+        api_rate_limit_scope: "credential_and_peer_ip",
         daemon_engine: state.config.daemon.engine.as_str(),
         daemon_socket: state.docker.socket_path().to_string(),
         database_container_network_mode: "none",

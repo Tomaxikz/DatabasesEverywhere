@@ -1,4 +1,4 @@
-use bollard::models::{ContainerStatsResponse, HealthConfig, Mount, MountType};
+use bollard::models::{HealthConfig, Mount, MountType};
 
 use crate::shared::protocol::Protocol;
 
@@ -79,8 +79,4 @@ pub fn mib_to_bytes(memory_mib: u64) -> Option<i64> {
     memory_mib
         .checked_mul(1024 * 1024)
         .and_then(|bytes| i64::try_from(bytes).ok())
-}
-
-pub fn serialize_stats(stats: &ContainerStatsResponse) -> Result<String, serde_json::Error> {
-    serde_json::to_string(stats)
 }

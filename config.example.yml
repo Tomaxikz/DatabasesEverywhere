@@ -64,6 +64,7 @@ api:
 
 security:
   api_body_limit_bytes: 1048576
+  # Per authenticated credential + transport peer IPv4 (or IPv6 /64).
   api_rate_limit_per_minute: 600
   db_connection_limit_per_minute: 240
   # API self-upgrade is intentionally unsupported; use signed packages or a
