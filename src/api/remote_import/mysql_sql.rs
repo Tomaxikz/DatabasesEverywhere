@@ -510,16 +510,14 @@ impl SqlContext {
         {
             self.object_expected = true;
             self.table_list = matches!(self.statement, StatementKind::Rename | StatementKind::Lock);
-        } else if word.eq_ignore_ascii_case(b"TO")
+        } else if (word.eq_ignore_ascii_case(b"TO")
             && self.statement == StatementKind::Rename
-            && self.table_list
-        {
-            self.object_expected = true;
-        } else if (word.eq_ignore_ascii_case(b"VIEW")
-            || word.eq_ignore_ascii_case(b"EVENT")
-            || word.eq_ignore_ascii_case(b"PROCEDURE")
-            || word.eq_ignore_ascii_case(b"FUNCTION"))
-            && ddl
+            && self.table_list)
+            || ((word.eq_ignore_ascii_case(b"VIEW")
+                || word.eq_ignore_ascii_case(b"EVENT")
+                || word.eq_ignore_ascii_case(b"PROCEDURE")
+                || word.eq_ignore_ascii_case(b"FUNCTION"))
+                && ddl)
             || word.eq_ignore_ascii_case(b"CALL")
         {
             self.object_expected = true;
