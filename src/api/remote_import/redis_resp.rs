@@ -184,7 +184,7 @@ impl RespConnection {
             None
         };
 
-        for resolved in endpoint.addresses.iter().copied() {
+        for resolved in &endpoint.addresses {
             let address = SocketAddr::new(resolved.ip(), endpoint.port);
             let tcp = match timeout_at(deadline, TcpStream::connect(address)).await {
                 Ok(Ok(stream)) => stream,

@@ -825,9 +825,7 @@ async fn export_instance_artifact(
                 protocol,
                 artifact_path,
                 options,
-                None,
-                None,
-                false,
+                LogicalExportControls::default(),
             )
             .await
         }
@@ -931,10 +929,10 @@ async fn import_instance_artifact(
                 protocol,
                 artifact_path,
                 options,
-                source_database,
-                false,
-                false,
-                None,
+                LogicalImportControls {
+                    source_database,
+                    ..LogicalImportControls::default()
+                },
             )
             .await
         }
@@ -969,11 +967,13 @@ async fn import_logical_with_rollback(
         metadata.protocol,
         artifact_path,
         &apply_options,
-        source_database,
-        staging_limit.is_some(),
-        false,
-        remote_exec_timeout,
-        staging_limit,
+        LogicalImportControls {
+            source_database,
+            reuse_staged_artifact: staging_limit.is_some(),
+            exec_timeout: remote_exec_timeout,
+            remove_uploaded_source_limit: staging_limit,
+            ..LogicalImportControls::default()
+        },
     )
     .await?;
     let rollback_limit = match staging_limit {
@@ -1009,9 +1009,11 @@ async fn import_logical_with_rollback(
         metadata.protocol,
         rollback_path.clone(),
         &export_options,
-        rollback_limit,
-        remote_exec_timeout,
-        true,
+        LogicalExportControls {
+            max_output_bytes: rollback_limit,
+            exec_timeout: remote_exec_timeout,
+            include_database_definition: true,
+        },
     )
     .await
     {
@@ -1086,10 +1088,12 @@ async fn import_logical_with_rollback(
         metadata.protocol,
         &rollback_path,
         &rollback_options,
-        None,
-        true,
-        true,
-        remote_exec_timeout,
+        LogicalImportControls {
+            reuse_staged_artifact: true,
+            database_definition_in_dump: true,
+            exec_timeout: remote_exec_timeout,
+            ..LogicalImportControls::default()
+        },
     )
     .await;
     match rollback {
@@ -1441,15 +1445,20 @@ async fn import_physical_archive(
     finish_physical_operation(state, instance_id, was_running, result).await
 }
 
+#[derive(Clone, Copy, Default)]
+struct LogicalExportControls {
+    max_output_bytes: Option<u64>,
+    exec_timeout: Option<Duration>,
+    include_database_definition: bool,
+}
+
 async fn export_logical_dump(
     state: &AppState,
     metadata: &InstanceMetadata,
     protocol: Protocol,
     artifact_path: PathBuf,
     options: &ExportOptions,
-    max_output_bytes: Option<u64>,
-    exec_timeout: Option<Duration>,
-    include_database_definition: bool,
+    controls: LogicalExportControls,
 ) -> Result<(), ApiError> {
     let instance_id = &metadata.instance_id;
     create_private_directory(
@@ -1471,9 +1480,9 @@ async fn export_logical_dump(
         metadata,
         &container_temp,
         &options.selection,
-        include_database_definition,
+        controls.include_database_definition,
     )?;
-    if let Some(max_bytes) = max_output_bytes {
+    if let Some(max_bytes) = controls.max_output_bytes {
         // POSIX shells differ on whether `ulimit -f` blocks are 512 or 1024 bytes.
         // Dividing by 1024 is conservative on both and bounds the container-side
         // dump before Docker transfer begins.
@@ -1486,7 +1495,7 @@ async fn export_logical_dump(
         script = format!("set -eu\nulimit -f {blocks}\n{script}");
     }
     let result = async {
-        let output = match exec_timeout {
+        let output = match controls.exec_timeout {
             Some(timeout) => {
                 state
                     .docker
@@ -1501,7 +1510,7 @@ async fn export_logical_dump(
             }
         };
         output.map_err(|error| ApiError::Runtime(error.to_string()))?;
-        match max_output_bytes {
+        match controls.max_output_bytes {
             Some(max_bytes) => {
                 state
                     .docker
@@ -1530,30 +1539,25 @@ async fn export_logical_dump(
     result
 }
 
+#[derive(Clone, Copy, Default)]
+struct LogicalImportControls<'a> {
+    source_database: Option<&'a str>,
+    reuse_staged_artifact: bool,
+    database_definition_in_dump: bool,
+    exec_timeout: Option<Duration>,
+    remove_uploaded_source_limit: Option<u64>,
+}
+
 async fn import_logical_dump(
     state: &AppState,
     metadata: &InstanceMetadata,
     protocol: Protocol,
     artifact_path: &FsPath,
     options: &ImportOptions,
-    source_database: Option<&str>,
-    reuse_staged_artifact: bool,
-    database_definition_in_dump: bool,
-    exec_timeout: Option<Duration>,
+    controls: LogicalImportControls<'_>,
 ) -> Result<(), ApiError> {
-    let prepared = prepare_logical_import(
-        state,
-        metadata,
-        protocol,
-        artifact_path,
-        options,
-        source_database,
-        reuse_staged_artifact,
-        database_definition_in_dump,
-        exec_timeout,
-        None,
-    )
-    .await?;
+    let prepared =
+        prepare_logical_import(state, metadata, protocol, artifact_path, options, controls).await?;
     let result = apply_prepared_logical_import(state, metadata, &prepared, options.mode).await;
     cleanup_prepared_logical_import(state, metadata, &prepared).await;
     result
@@ -1576,23 +1580,19 @@ async fn prepare_logical_import(
     protocol: Protocol,
     artifact_path: &FsPath,
     options: &ImportOptions,
-    source_database: Option<&str>,
-    reuse_staged_artifact: bool,
-    database_definition_in_dump: bool,
-    exec_timeout: Option<Duration>,
-    remove_uploaded_source_limit: Option<u64>,
+    controls: LogicalImportControls<'_>,
 ) -> Result<PreparedLogicalImport, ApiError> {
     ensure_full_selection(protocol, &options.selection)?;
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-import-{}.{}", uuid::Uuid::new_v4(), extension);
     let staging_root = logical_staging_root(state).await?;
-    let host_temp = if reuse_staged_artifact {
+    let host_temp = if controls.reuse_staged_artifact {
         artifact_path.to_path_buf()
     } else {
         staging_root.join(&temp_name)
     };
     let container_temp = format!("/tmp/{temp_name}");
-    let staged_source_bytes = if reuse_staged_artifact {
+    let staged_source_bytes = if controls.reuse_staged_artifact {
         Some(ensure_import_file_size(&host_temp).await?)
     } else {
         cleanup_path(&host_temp).await;
@@ -1610,7 +1610,8 @@ async fn prepare_logical_import(
         }
         None
     };
-    if let (Some(source_bytes), Some(limit)) = (staged_source_bytes, remove_uploaded_source_limit)
+    if let (Some(source_bytes), Some(limit)) =
+        (staged_source_bytes, controls.remove_uploaded_source_limit)
         && source_bytes > limit
     {
         return Err(ApiError::BadRequest(format!(
@@ -1621,12 +1622,12 @@ async fn prepare_logical_import(
     let script = match import_script(
         metadata,
         &container_temp,
-        source_database,
-        database_definition_in_dump,
+        controls.source_database,
+        controls.database_definition_in_dump,
     ) {
         Ok(script) => script,
         Err(error) => {
-            if !reuse_staged_artifact {
+            if !controls.reuse_staged_artifact {
                 cleanup_path(&host_temp).await;
             }
             return Err(error);
@@ -1638,12 +1639,12 @@ async fn prepare_logical_import(
         .await
     {
         cleanup_container_temp(state, protocol, &metadata.instance_id, &container_temp).await;
-        if !reuse_staged_artifact {
+        if !controls.reuse_staged_artifact {
             cleanup_path(&host_temp).await;
         }
         return Err(ApiError::Runtime(error.to_string()));
     }
-    let removed_host_source_bytes = if remove_uploaded_source_limit.is_some() {
+    let removed_host_source_bytes = if controls.remove_uploaded_source_limit.is_some() {
         let source_bytes = staged_source_bytes.ok_or_else(|| {
             ApiError::Runtime(
                 "remote import source removal requires a staged source artifact".to_string(),
@@ -1672,11 +1673,11 @@ async fn prepare_logical_import(
     Ok(PreparedLogicalImport {
         protocol,
         host_temp,
-        owns_host_temp: !reuse_staged_artifact,
+        owns_host_temp: !controls.reuse_staged_artifact,
         container_temp,
         script,
-        exec_timeout,
-        database_definition_in_dump,
+        exec_timeout: controls.exec_timeout,
+        database_definition_in_dump: controls.database_definition_in_dump,
         removed_host_source_bytes,
     })
 }

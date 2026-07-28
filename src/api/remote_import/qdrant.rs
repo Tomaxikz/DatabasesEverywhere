@@ -1479,10 +1479,7 @@ rm -f -- {socket} {pid} {pid_temp} {log}
     }
 
     fn version_triplet(version: &str) -> Option<(u32, u32, u32)> {
-        let core = version
-            .trim_start_matches('v')
-            .split(|character| matches!(character, '-' | '+'))
-            .next()?;
+        let core = version.trim_start_matches('v').split(['-', '+']).next()?;
         let mut parts = core.split('.');
         let version = (
             parts.next()?.parse().ok()?,

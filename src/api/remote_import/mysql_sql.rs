@@ -207,15 +207,13 @@ fn rewrite_mysql_schema_qualifiers_atomic(
             let mut input = BoundedInput::new(&mut source, max_bytes);
             let mut output = BoundedOutput::new(&mut temporary, max_bytes);
             let mut context = SqlContext::default();
-            let replacements = rewrite_sql(
-                &mut input,
-                &mut output,
+            let identifiers = RewriteIdentifiers {
                 source_database,
                 quoted_target_database,
                 double_quoted_target_database,
-                &mut context,
-                false,
-            )?;
+            };
+            let replacements =
+                rewrite_sql(&mut input, &mut output, &identifiers, &mut context, false)?;
             output.flush()?;
             replacements
         };
@@ -491,24 +489,21 @@ impl SqlContext {
                 | StatementKind::Rename
         );
 
-        if word.eq_ignore_ascii_case(b"FROM")
-            || word.eq_ignore_ascii_case(b"JOIN")
-            || word.eq_ignore_ascii_case(b"REFERENCES")
-        {
+        let from_or_join = word.eq_ignore_ascii_case(b"FROM") || word.eq_ignore_ascii_case(b"JOIN");
+        if from_or_join || word.eq_ignore_ascii_case(b"REFERENCES") {
             self.object_expected = true;
-            if word.eq_ignore_ascii_case(b"FROM") || word.eq_ignore_ascii_case(b"JOIN") {
-                if self.from_table_list_depths.last().copied() != Some(self.parenthesis_depth) {
-                    self.from_table_list_depths.push(self.parenthesis_depth);
-                }
+            if from_or_join
+                && self.from_table_list_depths.last().copied() != Some(self.parenthesis_depth)
+            {
+                self.from_table_list_depths.push(self.parenthesis_depth);
             }
-        } else if word.eq_ignore_ascii_case(b"INTO")
+        } else if (word.eq_ignore_ascii_case(b"INTO")
             && matches!(
                 self.statement,
                 StatementKind::Insert | StatementKind::Replace | StatementKind::Load
-            )
+            ))
+            || (word.eq_ignore_ascii_case(b"UPDATE") && self.statement == StatementKind::Update)
         {
-            self.object_expected = true;
-        } else if word.eq_ignore_ascii_case(b"UPDATE") && self.statement == StatementKind::Update {
             self.object_expected = true;
         } else if (word.eq_ignore_ascii_case(b"TABLE") || word.eq_ignore_ascii_case(b"TABLES"))
             && (ddl || self.statement == StatementKind::Lock)
@@ -525,13 +520,12 @@ impl SqlContext {
             || word.eq_ignore_ascii_case(b"PROCEDURE")
             || word.eq_ignore_ascii_case(b"FUNCTION"))
             && ddl
+            || word.eq_ignore_ascii_case(b"CALL")
         {
             self.object_expected = true;
         } else if word.eq_ignore_ascii_case(b"TRIGGER") && ddl {
             self.object_expected = true;
             self.create_trigger = self.statement == StatementKind::Create;
-        } else if word.eq_ignore_ascii_case(b"CALL") {
-            self.object_expected = true;
         } else if word.eq_ignore_ascii_case(b"ON") && self.create_trigger && !self.trigger_on_seen {
             self.object_expected = true;
             self.trigger_on_seen = true;
@@ -609,12 +603,16 @@ fn is_from_clause_boundary(word: &[u8]) -> bool {
         || word.eq_ignore_ascii_case(b"PROCEDURE")
 }
 
+struct RewriteIdentifiers<'a> {
+    source_database: &'a [u8],
+    quoted_target_database: &'a [u8],
+    double_quoted_target_database: &'a [u8],
+}
+
 fn rewrite_sql<R: Read, W: Write>(
     input: &mut BoundedInput<R>,
     output: &mut BoundedOutput<W>,
-    source_database: &[u8],
-    quoted_target_database: &[u8],
-    double_quoted_target_database: &[u8],
+    identifiers: &RewriteIdentifiers<'_>,
     context: &mut SqlContext,
     executable_comment: bool,
 ) -> Result<u64, MysqlSqlRewriteError> {
@@ -679,8 +677,8 @@ fn rewrite_sql<R: Read, W: Write>(
                 replacements += handle_double_quoted_token(
                     input,
                     output,
-                    source_database,
-                    double_quoted_target_database,
+                    identifiers.source_database,
+                    identifiers.double_quoted_target_database,
                     context,
                     executable_comment,
                 )?;
@@ -688,12 +686,12 @@ fn rewrite_sql<R: Read, W: Write>(
             b'`' => {
                 executable_version_pending = false;
                 let identifier = read_delimited_identifier(input, b'`', executable_comment)?;
-                if identifier.decoded.as_slice() == source_database {
+                if identifier.decoded.as_slice() == identifiers.source_database {
                     replacements += handle_source_qualifier(
                         input,
                         output,
                         &identifier.raw,
-                        quoted_target_database,
+                        identifiers.quoted_target_database,
                         SourceTokenKind::Quoted,
                         context,
                         executable_comment,
@@ -708,8 +706,7 @@ fn rewrite_sql<R: Read, W: Write>(
                     input,
                     output,
                     byte,
-                    source_database,
-                    quoted_target_database,
+                    identifiers,
                     context,
                     executable_comment,
                     executable_version_pending,
@@ -727,9 +724,9 @@ fn rewrite_sql<R: Read, W: Write>(
                 if input.peek_byte()? == Some(b'-') {
                     let _ = input.next_byte()?;
                     output.write_byte(b'-')?;
-                    let starts_comment = input.peek_byte()?.map_or(true, |next| {
-                        next.is_ascii_whitespace() || next.is_ascii_control()
-                    });
+                    let starts_comment = input
+                        .peek_byte()?
+                        .is_none_or(|next| next.is_ascii_whitespace() || next.is_ascii_control());
                     if starts_comment {
                         copy_line_comment(input, output, executable_comment)?;
                     } else {
@@ -768,15 +765,7 @@ fn rewrite_sql<R: Read, W: Write>(
                     false
                 };
                 if is_executable {
-                    replacements += rewrite_sql(
-                        input,
-                        output,
-                        source_database,
-                        quoted_target_database,
-                        double_quoted_target_database,
-                        context,
-                        true,
-                    )?;
+                    replacements += rewrite_sql(input, output, identifiers, context, true)?;
                 } else {
                     copy_block_comment(input, output)?;
                 }
@@ -845,8 +834,7 @@ fn handle_unquoted_token<R: Read, W: Write>(
     input: &mut BoundedInput<R>,
     output: &mut BoundedOutput<W>,
     first_byte: u8,
-    source_database: &[u8],
-    quoted_target_database: &[u8],
+    identifiers: &RewriteIdentifiers<'_>,
     context: &mut SqlContext,
     executable_comment: bool,
     executable_version_pending: bool,
@@ -871,12 +859,12 @@ fn handle_unquoted_token<R: Read, W: Write>(
         output.write_bytes(&token)?;
         return Ok(0);
     }
-    if token.as_slice() == source_database {
+    if token.as_slice() == identifiers.source_database {
         handle_source_qualifier(
             input,
             output,
             &token,
-            quoted_target_database,
+            identifiers.quoted_target_database,
             SourceTokenKind::Unquoted,
             context,
             executable_comment,
@@ -1143,7 +1131,7 @@ fn read_qualifier_gap<R: Read>(
             }
             Some(b'-')
                 if input.peek_nth_byte(1)? == Some(b'-')
-                    && input.peek_nth_byte(2)?.map_or(true, |next| {
+                    && input.peek_nth_byte(2)?.is_none_or(|next| {
                         next.is_ascii_whitespace() || next.is_ascii_control()
                     }) =>
             {
@@ -1479,15 +1467,14 @@ mod tests {
         {
             let mut writer = BoundedOutput::new(&mut rewritten, max_bytes);
             let mut context = SqlContext::default();
-            rewrite_sql(
-                &mut reader,
-                &mut writer,
-                source_database.as_bytes(),
-                &quote_identifier(target_database.as_bytes(), b'`'),
-                &quote_identifier(target_database.as_bytes(), b'"'),
-                &mut context,
-                false,
-            )?;
+            let quoted_target_database = quote_identifier(target_database.as_bytes(), b'`');
+            let double_quoted_target_database = quote_identifier(target_database.as_bytes(), b'"');
+            let identifiers = RewriteIdentifiers {
+                source_database: source_database.as_bytes(),
+                quoted_target_database: &quoted_target_database,
+                double_quoted_target_database: &double_quoted_target_database,
+            };
+            rewrite_sql(&mut reader, &mut writer, &identifiers, &mut context, false)?;
             writer.flush()?;
         }
         Ok(rewritten)
