@@ -58,6 +58,10 @@ pub fn instance_spec(
         }],
         env: vec![
             DockerEnv {
+                key: "QDRANT__TELEMETRY_DISABLED".to_string(),
+                value: SecretString::from("true"),
+            },
+            DockerEnv {
                 key: "QDRANT__SERVICE__HOST".to_string(),
                 value: SecretString::from("127.0.0.1"),
             },
@@ -96,7 +100,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     #[test]
-    fn uses_qdrant_storage_and_grpc_port() {
+    fn uses_qdrant_storage_and_grpc_port_without_telemetry() {
         let spec = instance_spec(
             "inst_qdrant_1",
             "qdrant/qdrant:v1.18.2",
@@ -115,6 +119,9 @@ mod tests {
         assert_eq!(spec.extra_mounts[1].target, SOCKET_BRIDGE_CONTAINER_PATH);
         assert_eq!(spec.socket_bridges.len(), 1);
         assert_eq!(spec.socket_bridges[0].target, loopback_target(6334));
+        assert!(spec.env.iter().any(|env| {
+            env.key == "QDRANT__TELEMETRY_DISABLED" && env.value.expose_secret() == "true"
+        }));
         assert!(
             spec.env
                 .iter()
