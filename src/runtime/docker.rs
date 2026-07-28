@@ -2,12 +2,14 @@ mod command;
 mod container_config;
 mod disk_probe;
 mod engine;
+mod events;
 mod inspection;
 mod security;
 mod spec;
 
 pub use command::CommandOutput;
 pub use engine::DaemonEngineConnection;
+pub use events::{ManagedContainerAction, ManagedContainerEvent};
 pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
 
@@ -39,7 +41,9 @@ use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 use crate::{
     config::{DaemonConfig, DaemonEngine},
     constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
-    runtime::docker::container_config::{bind_mount, cpu_to_nano, healthcheck, mib_to_bytes},
+    runtime::docker::container_config::{
+        bind_mount, cpu_to_nano, disabled_healthcheck, mib_to_bytes,
+    },
     runtime::socket_bridge::supervisor_arguments,
     shared::{
         backend::SOCKET_BRIDGE_CONTAINER_PATH,
@@ -250,17 +254,11 @@ impl DockerRuntime {
             stop_timeout: Some(30),
             host_config: Some(host_config),
             exposed_ports: None,
-            healthcheck: self.container_healthcheck(spec.protocol),
+            // Do not inherit image healthchecks. DBE runs a bounded readiness
+            // query during startup and then follows container lifecycle events.
+            healthcheck: Some(disabled_healthcheck()),
             ..Default::default()
         })
-    }
-
-    fn container_healthcheck(&self, protocol: Protocol) -> Option<bollard::models::HealthConfig> {
-        if self.engine == DaemonEngine::Podman {
-            return None;
-        }
-
-        Some(healthcheck(protocol))
     }
 
     fn rootless_podman_userns_mode(&self, protocol: Protocol) -> Option<&'static str> {
@@ -606,6 +604,32 @@ impl DockerRuntime {
         instance_id: &str,
         command: Vec<String>,
     ) -> Result<CommandOutput, DockerError> {
+        self.exec_with_failure_logging(protocol, instance_id, command, true)
+            .await
+    }
+
+    pub(crate) async fn exec_readiness_probe(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        script: &str,
+    ) -> Result<CommandOutput, DockerError> {
+        self.exec_with_failure_logging(
+            protocol,
+            instance_id,
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            false,
+        )
+        .await
+    }
+
+    async fn exec_with_failure_logging(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        command: Vec<String>,
+        log_failure: bool,
+    ) -> Result<CommandOutput, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
         let operation = command
             .first()
@@ -690,13 +714,15 @@ impl DockerRuntime {
             };
             let failure_output =
                 truncate_log_tail(&redaction::redact_connection_url(failure_output), 4_000);
-            tracing::warn!(
-                container = %name,
-                %operation,
-                exit_code,
-                %failure_output,
-                "docker exec failed"
-            );
+            if log_failure {
+                tracing::warn!(
+                    container = %name,
+                    %operation,
+                    exit_code,
+                    %failure_output,
+                    "docker exec failed"
+                );
+            }
             Err(DockerError::ExecFailed {
                 container: name,
                 operation,
@@ -769,11 +795,11 @@ impl DockerRuntime {
             }
         }
 
-        self.wait_until_ready(
+        Box::pin(self.wait_until_ready(
             protocol,
             instance_id,
             DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT,
-        )
+        ))
         .await
         .map_err(|error| exec_recovery_error(container, operation, error))?;
         tracing::info!(
@@ -1454,12 +1480,13 @@ pub enum DockerError {
     #[error("docker disk limit probe io failed: {0}")]
     DiskLimitProbeIo(std::io::Error),
     #[error(
-        "container {instance_id} was not ready before timeout (status={status}, health={health:?})"
+        "container {instance_id} was not ready before timeout (status={status}, runtime_health={health:?}, startup_readiness={readiness_error:?})"
     )]
     ContainerNotReady {
         instance_id: String,
         status: String,
         health: Option<String>,
+        readiness_error: Option<String>,
     },
     #[error(
         "docker exec failed in {container} with exit code {exit_code}: {operation}; output: {failure_output}"

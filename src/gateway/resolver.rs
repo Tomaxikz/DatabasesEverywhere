@@ -6,12 +6,14 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedRoute {
+    pub instance_id: String,
     pub endpoint: BackendEndpoint,
     pub network: NetworkCounter,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMariadbRoute {
+    pub instance_id: String,
     pub endpoint: BackendEndpoint,
     pub native_password_sha1_stage2: Option<String>,
     pub network: NetworkCounter,
@@ -103,17 +105,21 @@ impl RouteResolver {
         instance_id: String,
         endpoint: BackendEndpoint,
     ) -> ResolvedRoute {
+        let network = self.resources.network_counter(&instance_id).await;
         ResolvedRoute {
+            instance_id,
             endpoint,
-            network: self.resources.network_counter(&instance_id).await,
+            network,
         }
     }
 
     async fn resolve_mariadb_target(&self, target: MariadbRouteTarget) -> ResolvedMariadbRoute {
+        let network = self.resources.network_counter(&target.instance_id).await;
         ResolvedMariadbRoute {
+            instance_id: target.instance_id,
             endpoint: target.endpoint,
             native_password_sha1_stage2: target.native_password_sha1_stage2,
-            network: self.resources.network_counter(&target.instance_id).await,
+            network,
         }
     }
 }

@@ -401,7 +401,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime: a container whose health check is still starting is `booting`, a healthy container is `running`, and an exited container is `stopped`. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
@@ -468,9 +468,11 @@ PostgreSQL clusters use a randomly protected internal `dbe_admin` bootstrap role
 that is never registered as a gateway route. The requested username is created
 separately as the database owner with `LOGIN` and without superuser, role-creation,
 database-creation, replication, inheritance, or row-security bypass privileges.
-The container health check performs a real query against `POSTGRES_DB`; it does
-not rely on `pg_isready`, which can report that the temporary initialization
-server is accepting connections before the requested database exists.
+The one-time PostgreSQL startup readiness check performs a real query against
+`POSTGRES_DB`; it does not rely on `pg_isready`, which can report that the
+temporary initialization server is accepting connections before the requested
+database exists. The query is retried only during the bounded startup window and
+is not installed as a permanent container healthcheck.
 
 PostgreSQL instances created by older DBE builds may have used the tenant as the
 immutable bootstrap superuser. DBE refuses to open gateways when it detects that
@@ -839,7 +841,7 @@ Every message is a JSON object with a `type` field.
 ```
 
 Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories. Concurrent fallback walks are coalesced per instance and capped node-wide. Monitoring clients share each completed all-instance sample, which is then filtered against each JWT before serialization.
-`install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
+`install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. The existing `healthcheck` stage name is retained for API compatibility but represents the bounded startup-readiness check, not a permanent probe. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
 
 **`/ws/instances/{instance_id}/logs`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
 

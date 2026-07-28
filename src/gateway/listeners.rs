@@ -1,9 +1,11 @@
 use std::{
+    collections::HashMap,
     future::Future,
     io::{Error as IoError, ErrorKind},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     task::{Context, Poll},
+    time::Instant as StdInstant,
 };
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -47,6 +49,12 @@ pub enum ListenerError {
     InvalidClickhouseBackend,
     #[error("tunnel failed: {0}")]
     Tunnel(#[from] tunnel::TunnelError),
+    #[error("backend for managed instance {instance_id} failed: {source}")]
+    Backend {
+        instance_id: String,
+        #[source]
+        source: tunnel::TunnelError,
+    },
     #[error("{protocol} client handshake timed out after {timeout_secs}s")]
     HandshakeTimeout {
         protocol: &'static str,
@@ -107,8 +115,18 @@ const MAX_ACTIVE_CONNECTIONS_PER_LISTENER: usize = 1024;
 const MAX_CONCURRENT_CLIENT_HANDSHAKES: usize = 256;
 const MAX_ROUTING_HANDSHAKE_BYTES: usize = 64 * 1024;
 const MAX_MONGODB_HELLO_MESSAGES: usize = 8;
+const BACKEND_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_BACKEND_FAILURE_LOG_KEYS: usize = 4_096;
 
 static CLIENT_HANDSHAKE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static BACKEND_FAILURE_LOGS: OnceLock<StdMutex<HashMap<String, BackendFailureLogWindow>>> =
+    OnceLock::new();
+
+#[derive(Debug)]
+struct BackendFailureLogWindow {
+    last_logged: StdInstant,
+    suppressed: u64,
+}
 
 struct ListenerRuntime {
     listener: TcpListener,
@@ -408,8 +426,73 @@ fn log_connection_failure(
 ) {
     if expected_client_failure(error) {
         tracing::debug!(%peer, %error, protocol, "database connection rejected");
+    } else if let ListenerError::Backend {
+        instance_id,
+        source,
+    } = error
+    {
+        match backend_failure_log_permit(protocol, instance_id) {
+            Some(suppressed) => tracing::warn!(
+                event = "database_backend_connection_failed",
+                %peer,
+                %source,
+                protocol,
+                instance_id,
+                suppressed_since_last_warning = suppressed,
+                "managed database backend connection failed; inspect the container lifecycle and logs"
+            ),
+            None => tracing::debug!(
+                %peer,
+                %source,
+                protocol,
+                instance_id,
+                "duplicate managed database backend failure suppressed"
+            ),
+        }
     } else {
         tracing::warn!(%peer, %error, protocol, "database connection failed");
+    }
+}
+
+fn backend_failure_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
+    let now = StdInstant::now();
+    let key = format!("{protocol}\0{instance_id}");
+    let mut windows = BACKEND_FAILURE_LOGS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if windows.len() >= MAX_BACKEND_FAILURE_LOG_KEYS && !windows.contains_key(&key) {
+        windows.retain(|_, window| {
+            now.duration_since(window.last_logged) < BACKEND_FAILURE_WARNING_INTERVAL
+        });
+        if windows.len() >= MAX_BACKEND_FAILURE_LOG_KEYS {
+            return Some(0);
+        }
+    }
+
+    match windows.get_mut(&key) {
+        Some(window)
+            if now.duration_since(window.last_logged) < BACKEND_FAILURE_WARNING_INTERVAL =>
+        {
+            window.suppressed = window.suppressed.saturating_add(1);
+            None
+        }
+        Some(window) => {
+            let suppressed = window.suppressed;
+            window.last_logged = now;
+            window.suppressed = 0;
+            Some(suppressed)
+        }
+        None => {
+            windows.insert(
+                key,
+                BackendFailureLogWindow {
+                    last_logged: now,
+                    suppressed: 0,
+                },
+            );
+            Some(0)
+        }
     }
 }
 
@@ -436,6 +519,16 @@ fn expected_client_failure(error: &ListenerError) -> bool {
         | ListenerError::Clickhouse(clickhouse::ClickhouseParseError::IncompleteHttpRequest) => {
             true
         }
+        ListenerError::Backend {
+            source: tunnel::TunnelError::Tunnel(error),
+            ..
+        } => matches!(
+            error.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+        ),
         _ => false,
     }
 }
@@ -481,7 +574,13 @@ async fn handle_postgres_client(
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, target.endpoint, &packet, target.network).await?;
+    let instance_id = target.instance_id;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &packet, target.network)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id,
+            source,
+        })?;
     Ok(())
 }
 
@@ -519,7 +618,13 @@ async fn handle_redis_client(
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network).await?;
+    let instance_id = target.instance_id;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id,
+            source,
+        })?;
     Ok(())
 }
 
@@ -629,7 +734,12 @@ async fn prepare_mysql_wire_tunnel(
         protocol,
         "mysql wire route resolved"
     );
-    let backend = tunnel::connect_backend(&target.endpoint).await?;
+    let backend = tunnel::connect_backend(&target.endpoint)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id: target.instance_id.clone(),
+            source,
+        })?;
     let mut backend = tunnel::MeteredBackend::new(backend, target.network);
     let backend_handshake_packet = mariadb::read_packet(&mut backend).await?;
     let mut backend_handshake =
@@ -732,7 +842,12 @@ async fn handle_mongodb_client(
                 .await?;
                 return Err(ListenerError::RouteNotFound);
             };
-            let backend = tunnel::connect_backend(&target.endpoint).await?;
+            let backend = tunnel::connect_backend(&target.endpoint)
+                .await
+                .map_err(|source| ListenerError::Backend {
+                    instance_id: target.instance_id,
+                    source,
+                })?;
             let mut backend = tunnel::MeteredBackend::new(backend, target.network);
             backend.write_all(&message.raw).await?;
             return Ok((client, backend));
@@ -771,7 +886,13 @@ async fn handle_clickhouse_client(
     })
     .await?;
 
-    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network).await?;
+    let instance_id = target.instance_id;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id,
+            source,
+        })?;
     Ok(())
 }
 
@@ -780,20 +901,32 @@ async fn handle_clickhouse_http_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, endpoint, network, initial) = client_handshake("clickhouse_http", async move {
-        let mut client = accept_direct_tls(client, tls).await?;
-        let initial = read_http_headers(&mut client).await?;
-        let route = clickhouse::parse_http_initial_route(&initial)?;
-        let target = resolver
-            .resolve_clickhouse(&route.username, &route.database)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
-        let endpoint = clickhouse_http_endpoint(target.endpoint)?;
-        Ok((client, endpoint, target.network, initial))
-    })
-    .await?;
+    let (client, instance_id, endpoint, network, initial) =
+        client_handshake("clickhouse_http", async move {
+            let mut client = accept_direct_tls(client, tls).await?;
+            let initial = read_http_headers(&mut client).await?;
+            let route = clickhouse::parse_http_initial_route(&initial)?;
+            let target = resolver
+                .resolve_clickhouse(&route.username, &route.database)
+                .await
+                .ok_or(ListenerError::RouteNotFound)?;
+            let endpoint = clickhouse_http_endpoint(target.endpoint)?;
+            Ok((
+                client,
+                target.instance_id,
+                endpoint,
+                target.network,
+                initial,
+            ))
+        })
+        .await?;
 
-    tunnel::connect_replay_and_tunnel(client, endpoint, &initial, network).await?;
+    tunnel::connect_replay_and_tunnel(client, endpoint, &initial, network)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id,
+            source,
+        })?;
     Ok(())
 }
 
@@ -815,7 +948,12 @@ async fn handle_qdrant_client(
             .resolve_qdrant(&route_key_sha256)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
-        let backend_stream = tunnel::connect_backend(&target.endpoint).await?;
+        let backend_stream = tunnel::connect_backend(&target.endpoint)
+            .await
+            .map_err(|source| ListenerError::Backend {
+                instance_id: target.instance_id,
+                source,
+            })?;
         let backend_stream = tunnel::MeteredBackend::new(backend_stream, target.network);
         let mut backend = qdrant::client_handshake(backend_stream).await?;
         qdrant::proxy_request(request, respond, &mut backend).await?;

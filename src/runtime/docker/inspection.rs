@@ -14,9 +14,12 @@ use tokio::{
 use crate::{
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
+        container_config::startup_readiness_script,
     },
     shared::protocol::Protocol,
 };
+
+const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl DockerRuntime {
     pub async fn inspect_instance(
@@ -34,14 +37,10 @@ impl DockerRuntime {
             .map(|status| status.as_ref().to_string());
         let status = state
             .and_then(|state| state.status)
-            .map(|status| match (status.as_ref(), health.as_deref()) {
-                ("running", Some("healthy" | "none")) | ("running", None) => {
-                    DockerContainerStatus::Running
-                }
-                ("running", Some("starting")) => DockerContainerStatus::Starting,
-                ("running", Some("unhealthy")) => DockerContainerStatus::Failed,
-                ("created" | "restarting", _) => DockerContainerStatus::Starting,
-                ("paused" | "exited" | "stopping", _) => DockerContainerStatus::Stopped,
+            .map(|status| match status.as_ref() {
+                "running" => DockerContainerStatus::Running,
+                "created" | "restarting" => DockerContainerStatus::Starting,
+                "paused" | "exited" | "stopping" => DockerContainerStatus::Stopped,
                 _ => DockerContainerStatus::Failed,
             })
             .unwrap_or(DockerContainerStatus::Failed);
@@ -68,18 +67,59 @@ impl DockerRuntime {
         &self,
         protocol: Protocol,
         instance_id: &str,
-        timeout: Duration,
+        readiness_timeout: Duration,
     ) -> Result<DockerInstanceInspection, DockerError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + readiness_timeout;
         let mut last = self.inspect_instance(protocol, instance_id).await?;
+        let mut last_readiness_error = None;
         loop {
             match last.status {
-                DockerContainerStatus::Running => return Ok(last),
+                DockerContainerStatus::Running => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(DockerError::ContainerNotReady {
+                            instance_id: instance_id.to_string(),
+                            status: format!("{:?}", last.status),
+                            health: last.health,
+                            readiness_error: last_readiness_error,
+                        });
+                    }
+                    let attempt_timeout = STARTUP_READINESS_ATTEMPT_TIMEOUT.min(remaining);
+                    match tokio::time::timeout(
+                        attempt_timeout,
+                        self.exec_readiness_probe(
+                            protocol,
+                            instance_id,
+                            startup_readiness_script(protocol),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            tracing::debug!(
+                                instance_id,
+                                %protocol,
+                                "database startup readiness confirmed"
+                            );
+                            return Ok(last);
+                        }
+                        Ok(Err(error)) => {
+                            last_readiness_error = Some(error.to_string());
+                        }
+                        Err(_) => {
+                            last_readiness_error = Some(format!(
+                                "readiness attempt exceeded {} seconds",
+                                attempt_timeout.as_secs()
+                            ));
+                        }
+                    }
+                }
                 DockerContainerStatus::Failed | DockerContainerStatus::Stopped => {
                     return Err(DockerError::ContainerNotReady {
                         instance_id: instance_id.to_string(),
                         status: format!("{:?}", last.status),
                         health: last.health,
+                        readiness_error: last_readiness_error,
                     });
                 }
                 DockerContainerStatus::Starting => {}
@@ -90,6 +130,7 @@ impl DockerRuntime {
                     instance_id: instance_id.to_string(),
                     status: format!("{:?}", last.status),
                     health: last.health,
+                    readiness_error: last_readiness_error,
                 });
             }
 

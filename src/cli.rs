@@ -48,8 +48,10 @@ use crate::{
         state::InstanceStore,
     },
     jobs::import_export::ImportExportJobs,
-    runtime::docker::DockerRuntime,
-    shared::{images::has_sha256_digest, logs::truncate_log_tail, protocol::Protocol},
+    runtime::docker::{DockerContainerStatus, DockerRuntime, ManagedContainerEvent},
+    shared::{
+        images::has_sha256_digest, logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
+    },
     storage::{
         import_export_jobs::ImportExportJobRepository, repositories::InstanceRepository, sqlite,
     },
@@ -61,6 +63,8 @@ const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_API_CONNECTIONS: usize = 2048;
 const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
+const CONTAINER_EVENT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const CONTAINER_EVENT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct ApiConnectionAcceptor<A> {
@@ -1511,6 +1515,7 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
     );
+    let managed_container_events = tokio::spawn(monitor_managed_container_events(state.clone()));
     let managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
     let gateway_supervisor = state.gateway_supervisor.clone();
     let daemon_shutdown = state.daemon_shutdown.clone();
@@ -1525,6 +1530,8 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     .await;
     shutdown_jobs.close_admission();
     shutdown_creations.close_creation_admission();
+    managed_container_events.abort();
+    let _ = managed_container_events.await;
     managed_runtime_boot.abort();
     let _ = managed_runtime_boot.await;
     let (jobs_drained, creations_drained) = tokio::join!(
@@ -1546,6 +1553,270 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!("active import/export jobs drained");
     tracing::info!("active instance creations drained");
     server_result
+}
+
+async fn monitor_managed_container_events(state: AppState) {
+    let mut shutdown = state.daemon_shutdown.subscribe();
+    let mut reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
+    let mut first_subscription = true;
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+
+        let docker = state.docker.clone();
+        let mut events = docker.managed_container_events();
+        if first_subscription {
+            tracing::info!(
+                engine = %docker.engine_name(),
+                "subscribed to managed container lifecycle events"
+            );
+            first_subscription = false;
+        } else {
+            tracing::debug!(
+                engine = %docker.engine_name(),
+                "resubscribed to managed container lifecycle events"
+            );
+        }
+
+        let stream_error = loop {
+            let next = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+                next = events.next() => next,
+            };
+            match next {
+                Some(Ok(event)) => {
+                    reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
+                    if let Err(error) = reconcile_managed_container_event(&state, event).await {
+                        tracing::error!(
+                            %error,
+                            "failed to reconcile a managed container lifecycle event"
+                        );
+                    }
+                }
+                Some(Err(error)) => break Some(error.to_string()),
+                None => break None,
+            }
+        };
+
+        match stream_error {
+            Some(error) => tracing::warn!(
+                %error,
+                reconnect_delay_seconds = reconnect_delay.as_secs(),
+                "managed container event stream failed; reconciling a runtime snapshot before reconnecting"
+            ),
+            None => tracing::warn!(
+                reconnect_delay_seconds = reconnect_delay.as_secs(),
+                "managed container event stream ended; reconciling a runtime snapshot before reconnecting"
+            ),
+        }
+        reconcile_managed_container_snapshot(&state).await;
+
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(reconnect_delay) => {}
+        }
+        reconnect_delay = reconnect_delay
+            .saturating_mul(2)
+            .min(CONTAINER_EVENT_RECONNECT_MAX_DELAY);
+    }
+}
+
+async fn reconcile_managed_container_event(
+    state: &AppState,
+    event: ManagedContainerEvent,
+) -> anyhow::Result<()> {
+    let instance_id = event.instance_id.clone();
+    reconcile_managed_container_state(state, &instance_id, Some(event)).await
+}
+
+async fn reconcile_managed_container_snapshot(state: &AppState) {
+    let instances = state.instances.list().await;
+    let outcomes = futures::stream::iter(instances)
+        .map(|metadata| async move {
+            reconcile_managed_container_state(state, &metadata.instance_id, None).await
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for outcome in outcomes {
+        if let Err(error) = outcome {
+            tracing::error!(
+                %error,
+                "failed to reconcile managed container runtime snapshot"
+            );
+        }
+    }
+}
+
+async fn reconcile_managed_container_state(
+    state: &AppState,
+    instance_id: &str,
+    event: Option<ManagedContainerEvent>,
+) -> anyhow::Result<()> {
+    let _operation = state.instance_locks.lock(instance_id).await;
+    let Some(metadata) = state.instances.get(instance_id).await else {
+        return Ok(());
+    };
+
+    if let Some(event) = event.as_ref()
+        && metadata.protocol != event.protocol
+    {
+        tracing::error!(
+            event = "audit managed_container_event_label_mismatch",
+            instance_id,
+            stored_protocol = %metadata.protocol,
+            event_protocol = %event.protocol,
+            "ignored a managed container event whose ownership labels disagree with durable metadata"
+        );
+        return Ok(());
+    }
+
+    if metadata.status == InstanceStatus::Deleting {
+        return Ok(());
+    }
+
+    if metadata.status == InstanceStatus::Quarantined {
+        let should_stop = event
+            .as_ref()
+            .is_none_or(|event| event.action.activates_container());
+        if should_stop {
+            match state
+                .docker
+                .inspect_instance(metadata.protocol, &metadata.instance_id)
+                .await
+            {
+                Ok(inspection)
+                    if matches!(
+                        inspection.status,
+                        DockerContainerStatus::Running | DockerContainerStatus::Starting
+                    ) =>
+                {
+                    state
+                        .docker
+                        .stop(metadata.protocol, &metadata.instance_id)
+                        .await?;
+                    tracing::warn!(
+                        event = "audit quarantined_instance_event_stopped",
+                        instance_id = %metadata.instance_id,
+                        protocol = %metadata.protocol,
+                        "stopped an externally activated quarantined instance"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.is_not_found() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        state
+            .instance_runtime_cache
+            .remove(&metadata.instance_id)
+            .await;
+        state.resource_cache.remove(&metadata.instance_id).await;
+        return Ok(());
+    }
+
+    let previous_status = metadata.status;
+    let activation_readiness_error = if event.as_ref().is_some_and(|event| {
+        event.action.activates_container() && previous_status != InstanceStatus::Running
+    }) {
+        state
+            .docker
+            .wait_until_ready(
+                metadata.protocol,
+                &metadata.instance_id,
+                Duration::from_secs(120),
+            )
+            .await
+            .err()
+    } else {
+        None
+    };
+    if activation_readiness_error.is_some()
+        && let Err(error) = state
+            .docker
+            .stop(metadata.protocol, &metadata.instance_id)
+            .await
+        && !error.is_not_running()
+        && !error.is_not_found()
+    {
+        tracing::error!(
+            event = "audit event_readiness_cleanup_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "an externally activated database failed startup readiness and could not be stopped"
+        );
+    }
+
+    let mut reconciled = reconcile::reconcile_one(metadata, &state.docker).await;
+    let unexpected_failure = event.as_ref().is_some_and(|event| {
+        event.action.indicates_unexpected_failure()
+            && matches!(
+                previous_status,
+                InstanceStatus::Booting | InstanceStatus::Running | InstanceStatus::Failed
+            )
+    });
+    let preserve_failure = previous_status == InstanceStatus::Failed
+        && event
+            .as_ref()
+            .is_some_and(|event| event.action.deactivates_container());
+    if activation_readiness_error.is_some() || unexpected_failure || preserve_failure {
+        reconciled.status = InstanceStatus::Failed;
+        reconciled.updated_at = now_rfc3339();
+    }
+    let current_status = reconciled.status;
+    state.manager.upsert(reconciled.clone()).await?;
+    state
+        .instance_runtime_cache
+        .remove(&reconciled.instance_id)
+        .await;
+    state.resource_cache.remove(&reconciled.instance_id).await;
+
+    if let Some(event) = event {
+        if let Some(readiness_error) = activation_readiness_error {
+            tracing::error!(
+                event = "audit managed_container_startup_readiness_failed",
+                instance_id = %reconciled.instance_id,
+                protocol = %reconciled.protocol,
+                action = event.action.as_str(),
+                previous_status = previous_status.as_str(),
+                current_status = current_status.as_str(),
+                error = %readiness_error,
+                "managed database container activation did not become ready and was stopped"
+            );
+        } else if unexpected_failure {
+            tracing::error!(
+                event = "audit managed_container_runtime_failure",
+                instance_id = %reconciled.instance_id,
+                protocol = %reconciled.protocol,
+                action = event.action.as_str(),
+                previous_status = previous_status.as_str(),
+                current_status = current_status.as_str(),
+                "managed database container stopped unexpectedly; inspect its container logs and resource limits"
+            );
+        } else {
+            tracing::info!(
+                instance_id = %reconciled.instance_id,
+                protocol = %reconciled.protocol,
+                action = event.action.as_str(),
+                previous_status = previous_status.as_str(),
+                current_status = current_status.as_str(),
+                "managed container lifecycle event reconciled"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn complete_managed_runtime_boot(state: AppState) {
@@ -2030,10 +2301,13 @@ async fn start_known_instance_on_boot(
         "activating managed instance on daemon boot"
     );
 
+    let mut boot_failed = false;
+    let mut startup_readiness_failed = false;
     if let Err(error) =
         ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
             .await
     {
+        boot_failed = true;
         tracing::warn!(
             instance_id = %metadata.instance_id,
             protocol = %metadata.protocol,
@@ -2061,6 +2335,8 @@ async fn start_known_instance_on_boot(
                     )
                     .await
                 {
+                    boot_failed = true;
+                    startup_readiness_failed = true;
                     log_boot_container_failure(
                         docker,
                         metadata.protocol,
@@ -2072,6 +2348,7 @@ async fn start_known_instance_on_boot(
                 }
             }
             Err(error) => {
+                boot_failed = true;
                 log_boot_container_failure(
                     docker,
                     metadata.protocol,
@@ -2084,7 +2361,25 @@ async fn start_known_instance_on_boot(
         }
     }
 
-    let reconciled = reconcile::reconcile_one(metadata, docker).await;
+    if startup_readiness_failed
+        && let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
+        && !error.is_not_running()
+        && !error.is_not_found()
+    {
+        tracing::error!(
+            event = "audit boot_readiness_cleanup_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "database failed startup readiness during daemon boot and could not be stopped"
+        );
+    }
+
+    let mut reconciled = reconcile::reconcile_one(metadata, docker).await;
+    if boot_failed {
+        reconciled.status = InstanceStatus::Failed;
+        reconciled.updated_at = now_rfc3339();
+    }
     let status = reconciled.status;
     manager.upsert(reconciled).await?;
     Ok(Some(status))

@@ -71,14 +71,22 @@ fn create_body_uses_database_specific_mount_target() {
 }
 
 #[test]
-fn podman_create_body_omits_docker_healthcheck() {
+fn create_body_disables_permanent_healthchecks_for_every_engine() {
+    let docker = test_runtime();
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
     );
-    let body = runtime.create_body(&postgres_spec()).unwrap();
 
-    assert!(body.healthcheck.is_none());
+    for body in [
+        docker.create_body(&postgres_spec()).unwrap(),
+        runtime.create_body(&postgres_spec()).unwrap(),
+    ] {
+        assert_eq!(
+            body.healthcheck.and_then(|healthcheck| healthcheck.test),
+            Some(vec!["NONE".to_string()])
+        );
+    }
 }
 
 #[tokio::test]

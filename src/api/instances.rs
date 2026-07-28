@@ -2127,6 +2127,7 @@ pub(crate) async fn lifecycle_instance_locked(
         LifecycleAction::Kill => inspection.status == DockerContainerStatus::Running,
     };
 
+    let mut startup_readiness_failed = false;
     let operation_result: Result<(), ApiError> = async {
         if should_call_docker {
             if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
@@ -2170,7 +2171,7 @@ pub(crate) async fn lifecycle_instance_locked(
         }
 
         if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-            state
+            if let Err(error) = state
                 .docker
                 .wait_until_ready(
                     metadata.protocol,
@@ -2178,7 +2179,10 @@ pub(crate) async fn lifecycle_instance_locked(
                     Duration::from_secs(120),
                 )
                 .await
-                .map_err(docker_error)?;
+            {
+                startup_readiness_failed = true;
+                return Err(docker_error(error));
+            }
             if metadata.protocol == Protocol::Postgres {
                 provision_postgres_tenant_role(
                     state,
@@ -2193,7 +2197,28 @@ pub(crate) async fn lifecycle_instance_locked(
     }
     .await;
 
-    let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
+    if startup_readiness_failed
+        && let Err(error) = state
+            .docker
+            .stop(metadata.protocol, &metadata.instance_id)
+            .await
+        && !error.is_not_running()
+        && !error.is_not_found()
+    {
+        tracing::error!(
+            event = "audit startup_readiness_cleanup_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "database startup readiness failed and the container could not be stopped"
+        );
+    }
+
+    let mut metadata = reconcile::reconcile_one(metadata, &state.docker).await;
+    if startup_readiness_failed {
+        metadata.status = InstanceStatus::Failed;
+        metadata.updated_at = now_rfc3339();
+    }
     let persistence_result = state.manager.upsert(metadata.clone()).await;
     state
         .instance_runtime_cache

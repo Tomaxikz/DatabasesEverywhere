@@ -12,54 +12,42 @@ pub fn bind_mount(source: &std::path::Path, target: &str, read_only: bool) -> Mo
     }
 }
 
-pub fn healthcheck(protocol: Protocol) -> HealthConfig {
-    let test = match protocol {
-        Protocol::Postgres => vec![
-            "CMD-SHELL",
-            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null",
-        ],
-        Protocol::Redis => vec![
-            "CMD",
-            "redis-cli",
-            "-s",
-            "/run/dbev/redis.sock",
-            "--user",
-            "dbe_health",
-            "-a",
-            "healthcheck",
-            "--no-auth-warning",
-            "ping",
-        ],
-        Protocol::Mariadb => vec![
-            "CMD-SHELL",
-            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
-        ],
-        Protocol::Mysql => vec![
-            "CMD-SHELL",
-            "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
-        ],
-        Protocol::Mongodb => vec![
-            "CMD-SHELL",
-            "mongosh --quiet -u \"$DBE_MONGO_USER\" -p \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.adminCommand({ ping: 1 })'",
-        ],
-        Protocol::Clickhouse => vec![
-            "CMD-SHELL",
-            "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1'",
-        ],
-        Protocol::Qdrant => vec![
-            "CMD",
-            "/opt/dbev/dbev-socket-bridge",
-            "__socket-bridge-healthcheck",
-            "127.0.0.1:6334",
-        ],
-    };
+/// Explicitly disables image-provided and daemon-managed healthchecks.
+///
+/// DBE performs a bounded readiness query while an instance starts. Keeping a
+/// Docker healthcheck after startup would run synthetic database traffic
+/// forever without providing any automatic recovery.
+pub fn disabled_healthcheck() -> HealthConfig {
     HealthConfig {
-        test: Some(test.into_iter().map(ToString::to_string).collect()),
-        interval: Some(30_000_000_000),
-        timeout: Some(5_000_000_000),
-        retries: Some(3),
-        start_period: Some(120_000_000_000),
-        start_interval: Some(1_000_000_000),
+        test: Some(vec!["NONE".to_string()]),
+        ..Default::default()
+    }
+}
+
+/// A real database readiness query used only while starting an instance.
+pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Postgres => {
+            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null"
+        }
+        Protocol::Redis => {
+            "redis-cli -s /run/dbev/redis.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
+        }
+        Protocol::Mariadb => {
+            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" >/dev/null"
+        }
+        Protocol::Mysql => {
+            "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null"
+        }
+        Protocol::Mongodb => {
+            "mongosh --quiet -u \"$DBE_MONGO_USER\" -p \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.adminCommand({ ping: 1 })' >/dev/null"
+        }
+        Protocol::Clickhouse => {
+            "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null"
+        }
+        Protocol::Qdrant => {
+            "/opt/dbev/dbev-socket-bridge __socket-bridge-healthcheck 127.0.0.1:6334"
+        }
     }
 }
 

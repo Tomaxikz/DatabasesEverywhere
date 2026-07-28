@@ -669,7 +669,7 @@ where
         state.install_progress.stage(
             instance_id,
             "healthcheck",
-            "waiting for database healthcheck",
+            "confirming one-time database startup readiness",
         );
     }
     if let Err(error) = state
@@ -680,11 +680,6 @@ where
         return Err(ContainerLaunchError::AfterCreate(
             docker_error_with_logs(state, protocol, instance_id, error).await,
         ));
-    }
-    if state.docker.uses_rootless_podman() {
-        wait_for_rootless_podman_service(state, protocol, instance_id)
-            .await
-            .map_err(ContainerLaunchError::AfterCreate)?;
     }
     Ok(())
 }
@@ -855,52 +850,6 @@ fn postgres_tenant_hardening_script(tenant_username: &str) -> String {
         sh_quote(&role_state),
         sh_quote(&restrict_role),
     )
-}
-
-pub(crate) async fn wait_for_rootless_podman_service(
-    state: &AppState,
-    protocol: Protocol,
-    instance_id: &str,
-) -> Result<(), ApiError> {
-    let (message, command) = match protocol {
-        Protocol::Postgres => (
-            "waiting for PostgreSQL to accept local connections",
-            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null",
-        ),
-        Protocol::Redis => (
-            "waiting for Redis to accept local connections",
-            "redis-cli -s /run/dbev/redis.sock --user dbe_health -a healthcheck --no-auth-warning ping",
-        ),
-        Protocol::Mariadb => (
-            "waiting for MariaDB to accept local connections",
-            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\"",
-        ),
-        Protocol::Mysql => (
-            "waiting for MySQL to accept local connections",
-            "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
-        ),
-        Protocol::Mongodb => return wait_for_mongodb_localhost(state, instance_id).await,
-        Protocol::Clickhouse => (
-            "waiting for ClickHouse to accept local connections",
-            "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1'",
-        ),
-        Protocol::Qdrant => (
-            "waiting for Qdrant gRPC to accept local connections",
-            "/opt/dbev/dbev-socket-bridge __socket-bridge-healthcheck 127.0.0.1:6334",
-        ),
-    };
-
-    state
-        .install_progress
-        .stage(instance_id, "readiness", message);
-    wait_for_container_shell_command(
-        state,
-        protocol,
-        instance_id,
-        command,
-        Duration::from_secs(120),
-    )
-    .await
 }
 
 async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
