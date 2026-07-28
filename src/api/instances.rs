@@ -1643,25 +1643,13 @@ async fn validate_replacement_instance(
         "validate",
         "validating replacement database",
     );
-    let script = match metadata.protocol {
-        Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h 127.0.0.1 -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
-        Protocol::Mariadb => "mariadb -h 127.0.0.1 -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\" -e 'select 1' >/dev/null".to_string(),
-        Protocol::Mysql => format!(
-            "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
-            crate::shared::shell::sh_quote(&metadata.database.username),
-            crate::shared::shell::sh_quote(&metadata.database.name),
-        ),
-        Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
-        Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
-        Protocol::Redis | Protocol::Qdrant => {
-            return Err(ApiError::BadRequest(format!(
-                "{} major upgrade migration is not supported",
-                metadata.protocol
-            )));
-        }
-    };
+    let command = replacement_validation_command(
+        metadata.protocol,
+        &metadata.database.username,
+        &metadata.database.name,
+    )?;
     let script = format!(
-        "set -eu\nexport DBE_UPGRADE_PASSWORD={}\n{script}",
+        "set -eu\nexport DBE_UPGRADE_PASSWORD={}\n{command}",
         crate::shared::shell::sh_quote(password)
     );
     state
@@ -1670,6 +1658,31 @@ async fn validate_replacement_instance(
         .await
         .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
     Ok(())
+}
+
+fn replacement_validation_command(
+    protocol: Protocol,
+    username: &str,
+    database: &str,
+) -> Result<String, ApiError> {
+    let command = match protocol {
+        Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h /var/run/postgresql -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
+        Protocol::Mariadb => "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\" -e 'select 1' >/dev/null".to_string(),
+        Protocol::Mysql => format!(
+            "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
+            crate::shared::shell::sh_quote(username),
+            crate::shared::shell::sh_quote(database),
+        ),
+        Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
+        Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
+        Protocol::Redis | Protocol::Qdrant => {
+            return Err(ApiError::BadRequest(format!(
+                "{} major upgrade migration is not supported",
+                protocol
+            )));
+        }
+    };
+    Ok(command)
 }
 
 async fn stop_and_delete_container(
@@ -2606,6 +2619,24 @@ mod tests {
         assert!(ensure_major_upgrade_supported(Protocol::Mongodb).is_ok());
         assert!(ensure_major_upgrade_supported(Protocol::Redis).is_err());
         assert!(ensure_major_upgrade_supported(Protocol::Qdrant).is_err());
+    }
+
+    #[test]
+    fn replacement_validation_uses_managed_database_unix_sockets() {
+        let postgres =
+            replacement_validation_command(Protocol::Postgres, "app_user", "app_db").unwrap();
+        assert!(postgres.contains("-h /var/run/postgresql"));
+        assert!(!postgres.contains("-h 127.0.0.1"));
+
+        let mariadb =
+            replacement_validation_command(Protocol::Mariadb, "app_user", "app_db").unwrap();
+        assert!(mariadb.contains("--protocol=socket"));
+        assert!(mariadb.contains("--socket=/run/mysqld/mysqld.sock"));
+        assert!(!mariadb.contains("-h 127.0.0.1"));
+
+        let mysql = replacement_validation_command(Protocol::Mysql, "app_user", "app_db").unwrap();
+        assert!(mysql.contains("--protocol=socket"));
+        assert!(mysql.contains("--socket=/var/run/mysqld/mysqld.sock"));
     }
 
     #[test]

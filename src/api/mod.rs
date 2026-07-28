@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod progress;
 pub mod public_diagnostic;
 pub mod recovery;
+pub mod remote_import;
 pub mod request_trace;
 pub mod resources;
 pub mod routes;

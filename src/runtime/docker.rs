@@ -4,12 +4,14 @@ mod disk_probe;
 mod engine;
 mod events;
 mod inspection;
+mod remote_import;
 mod security;
 mod spec;
 
 pub use command::CommandOutput;
 pub use engine::DaemonEngineConnection;
 pub use events::{ManagedContainerAction, ManagedContainerEvent};
+pub use remote_import::RemoteImportHelperSpec;
 pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
 
@@ -604,7 +606,21 @@ impl DockerRuntime {
         instance_id: &str,
         command: Vec<String>,
     ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_failure_logging(protocol, instance_id, command, true)
+        self.exec_with_failure_logging(protocol, instance_id, command, true, DOCKER_EXEC_TIMEOUT)
+            .await
+    }
+
+    pub async fn exec_with_timeout(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        command: Vec<String>,
+        timeout: Duration,
+    ) -> Result<CommandOutput, DockerError> {
+        if timeout.is_zero() {
+            return Err(DockerError::InvalidExecTimeout);
+        }
+        self.exec_with_failure_logging(protocol, instance_id, command, true, timeout)
             .await
     }
 
@@ -619,6 +635,7 @@ impl DockerRuntime {
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
             false,
+            DOCKER_EXEC_TIMEOUT,
         )
         .await
     }
@@ -629,6 +646,7 @@ impl DockerRuntime {
         instance_id: &str,
         command: Vec<String>,
         log_failure: bool,
+        timeout: Duration,
     ) -> Result<CommandOutput, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
         let operation = command
@@ -648,7 +666,7 @@ impl DockerRuntime {
             )
             .await?;
 
-        let deadline = tokio::time::Instant::now() + DOCKER_EXEC_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         let started = match tokio::time::timeout_at(
             deadline,
             self.docker.start_exec(&exec.id, None::<StartExecOptions>),
@@ -657,12 +675,12 @@ impl DockerRuntime {
         {
             Ok(result) => result?,
             Err(_) => {
-                self.recover_timed_out_exec(protocol, instance_id, &name, &operation)
+                self.recover_timed_out_exec(protocol, instance_id, &name, &operation, timeout)
                     .await?;
                 return Err(DockerError::ExecTimedOut {
                     container: name,
                     operation,
-                    timeout_seconds: DOCKER_EXEC_TIMEOUT.as_secs(),
+                    timeout_seconds: timeout.as_secs(),
                 });
             }
         };
@@ -685,12 +703,18 @@ impl DockerRuntime {
                 match tokio::time::timeout_at(deadline, drain).await {
                     Ok(result) => result?,
                     Err(_) => {
-                        self.recover_timed_out_exec(protocol, instance_id, &name, &operation)
-                            .await?;
+                        self.recover_timed_out_exec(
+                            protocol,
+                            instance_id,
+                            &name,
+                            &operation,
+                            timeout,
+                        )
+                        .await?;
                         return Err(DockerError::ExecTimedOut {
                             container: name,
                             operation,
-                            timeout_seconds: DOCKER_EXEC_TIMEOUT.as_secs(),
+                            timeout_seconds: timeout.as_secs(),
                         });
                     }
                 }
@@ -738,11 +762,12 @@ impl DockerRuntime {
         instance_id: &str,
         container: &str,
         operation: &str,
+        timeout: Duration,
     ) -> Result<(), DockerError> {
         tracing::warn!(
             %container,
             %operation,
-            timeout_seconds = DOCKER_EXEC_TIMEOUT.as_secs(),
+            timeout_seconds = timeout.as_secs(),
             "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
         );
         match tokio::time::timeout(
@@ -820,6 +845,22 @@ impl DockerRuntime {
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+        )
+        .await
+    }
+
+    pub async fn exec_shell_with_timeout(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutput, DockerError> {
+        self.exec_with_timeout(
+            protocol,
+            instance_id,
+            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            timeout,
         )
         .await
     }
@@ -912,6 +953,25 @@ impl DockerRuntime {
         container_path: &str,
         host_path: &Path,
     ) -> Result<(), DockerError> {
+        self.download_file_bounded(
+            protocol,
+            instance_id,
+            container_path,
+            host_path,
+            MAX_CONTAINER_TRANSFER_BYTES,
+        )
+        .await
+    }
+
+    pub async fn download_file_bounded(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container_path: &str,
+        host_path: &Path,
+        max_bytes: u64,
+    ) -> Result<(), DockerError> {
+        let max_bytes = max_bytes.min(MAX_CONTAINER_TRANSFER_BYTES);
         let container = self.container_name(protocol, instance_id)?;
         let (_, expected_file_name) = container_file_parts(container_path)?;
         let async_deadline = tokio::time::Instant::now() + FILE_TRANSFER_TIMEOUT;
@@ -938,7 +998,7 @@ impl DockerRuntime {
                 bridge,
                 &expected_file_name,
                 &host_path,
-                MAX_CONTAINER_TRANSFER_BYTES,
+                max_bytes,
                 blocking_deadline,
             )
         })
@@ -1460,6 +1520,40 @@ pub enum DockerError {
     },
     #[error("file transfer task failed: {0}")]
     FileTransferTask(String),
+    #[error("invalid remote import helper specification: {reason}")]
+    InvalidRemoteImportHelperSpec { reason: String },
+    #[error("remote import helper work directory operation failed for {path}: {source}")]
+    RemoteImportHelperIo {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("remote import helper filesystem task failed: {0}")]
+    RemoteImportHelperTask(String),
+    #[error("remote import helper output is {size} bytes; maximum is {max_bytes} bytes")]
+    RemoteImportHelperOutputTooLarge { size: u64, max_bytes: u64 },
+    #[error("remote import helper exceeded its {timeout_seconds}-second deadline")]
+    RemoteImportHelperTimedOut { timeout_seconds: u64 },
+    #[error("remote import helper was cancelled")]
+    RemoteImportHelperCancelled,
+    #[error("remote import helper wait stream ended without an exit status")]
+    RemoteImportHelperWaitEnded,
+    #[error("remote import helper exited with code {exit_code}: {failure_output}")]
+    RemoteImportHelperFailed {
+        exit_code: i64,
+        failure_output: String,
+    },
+    #[error("failed to force-remove remote import helper {container}: {source}")]
+    RemoteImportHelperCleanupFailed {
+        container: String,
+        source: BollardError,
+    },
+    #[error(
+        "timed out after {timeout_seconds} seconds while force-removing remote import helper {container}"
+    )]
+    RemoteImportHelperCleanupTimedOut {
+        container: String,
+        timeout_seconds: u64,
+    },
     #[error("docker stats stream ended without data")]
     EmptyStatsStream,
     #[error("docker disk limit probe failed for image {image}: {source}")]
@@ -1497,6 +1591,8 @@ pub enum DockerError {
         exit_code: i64,
         failure_output: String,
     },
+    #[error("docker exec timeout must be greater than zero")]
+    InvalidExecTimeout,
     #[error(
         "PostgreSQL tenant role {username} in instance {instance_id} is the immutable bootstrap superuser; export the database and recreate the instance with purge before opening its gateway"
     )]

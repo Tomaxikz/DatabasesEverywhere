@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use hyper_util::rt::TokioTimer;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpListener,
@@ -32,6 +33,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use crate::{
     api::{
+        api_response::ApiError,
         progress::InstallProgressStore,
         routes::{AppState, AppStateData, build_router},
     },
@@ -1406,10 +1408,11 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
     let job_repository = ImportExportJobRepository::new(pool.clone());
-    let interrupted_running_instances = job_repository
-        .running_instance_ids()
-        .await
-        .context("failed to identify interrupted running import/export jobs")?;
+    let interrupted_running_import_instances =
+        job_repository
+            .running_import_instance_ids()
+            .await
+            .context("failed to identify interrupted running import jobs")?;
     let failed_jobs = job_repository
         .fail_unfinished(
             "daemon restarted before import/export job completed",
@@ -1434,11 +1437,24 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .await
         .context("failed to load local instance metadata from sqlite")?;
     let quarantined_interrupted_instances =
-        quarantine_interrupted_job_instances(&manager, &interrupted_running_instances).await?;
+        quarantine_interrupted_job_instances(&manager, &interrupted_running_import_instances)
+            .await?;
     if quarantined_interrupted_instances > 0 {
         tracing::warn!(
             quarantined_interrupted_instances,
-            "quarantined instances with import/export jobs interrupted by an unclean shutdown"
+            "quarantined instances with mutating import jobs interrupted by an unclean shutdown"
+        );
+    }
+    let quarantined_recovery_instances = quarantine_retained_import_recovery_manifests(
+        &manager,
+        Path::new(&config.paths.tmp_root()),
+    )
+    .await
+    .context("failed to quarantine instances with retained import recovery manifests")?;
+    if quarantined_recovery_instances > 0 {
+        tracing::warn!(
+            quarantined_recovery_instances,
+            "quarantined instances with retained import recovery manifests"
         );
     }
 
@@ -1448,6 +1464,53 @@ async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .ping()
         .await
         .context("failed to ping container engine API")?;
+    let remote_import_helper_reconciliation = docker.reconcile_remote_import_helpers().await;
+    match &remote_import_helper_reconciliation {
+        Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
+            tracing::warn!(
+                reconciled_remote_import_helpers = *reconciled_remote_import_helpers,
+                "removed stale remote import helper containers"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failed to reconcile stale remote import helper containers; credential cleanup will still run before startup aborts"
+            );
+        }
+    }
+    let remote_import_tmp_root = PathBuf::from(config.paths.tmp_root());
+    let remove_orphaned_remote_import_staging = remote_import_helper_reconciliation.is_ok();
+    let stale_credential_cleanup =
+        crate::api::remote_import::cleanup_stale_remote_import_credentials(
+            &remote_import_tmp_root,
+            remove_orphaned_remote_import_staging,
+        )
+        .await;
+    if stale_credential_cleanup.errors > 0 {
+        tracing::warn!(
+            scanned_entries = stale_credential_cleanup.scanned_entries,
+            job_directories = stale_credential_cleanup.job_directories,
+            removed_files = stale_credential_cleanup.removed_files,
+            removed_directories = stale_credential_cleanup.removed_directories,
+            skipped_entries = stale_credential_cleanup.skipped_entries,
+            errors = stale_credential_cleanup.errors,
+            limit_reached = stale_credential_cleanup.limit_reached,
+            "stale remote import credential cleanup completed with errors"
+        );
+    } else {
+        tracing::info!(
+            scanned_entries = stale_credential_cleanup.scanned_entries,
+            job_directories = stale_credential_cleanup.job_directories,
+            removed_files = stale_credential_cleanup.removed_files,
+            removed_directories = stale_credential_cleanup.removed_directories,
+            skipped_entries = stale_credential_cleanup.skipped_entries,
+            "stale remote import credential cleanup completed"
+        );
+    }
+    remote_import_helper_reconciliation
+        .context("failed to reconcile stale remote import helper containers")?;
     if let Err(error) = docker.refresh_engine_info().await {
         tracing::warn!(
             %error,
@@ -1841,6 +1904,24 @@ async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
+    let (qdrant_bridges_checked, qdrant_bridge_cleanup_errors) =
+        cleanup_stale_qdrant_import_bridges_on_boot(&state).await;
+    if qdrant_bridge_cleanup_errors > 0 {
+        tracing::warn!(
+            qdrant_bridges_checked,
+            qdrant_bridge_cleanup_errors,
+            "stale qdrant remote-import bridge cleanup completed with errors"
+        );
+    } else {
+        tracing::info!(
+            qdrant_bridges_checked,
+            "stale qdrant remote-import bridge cleanup complete"
+        );
+    }
+    if !state.import_export_jobs.is_accepting() {
+        return;
+    }
+
     let postgres_role_hardening = match crate::api::instance_create::harden_postgres_roles_on_boot(
         &state.manager,
         &state.docker,
@@ -1887,6 +1968,52 @@ async fn complete_managed_runtime_boot(state: AppState) {
     crate::api::backups::start_scheduler(state);
 }
 
+async fn cleanup_stale_qdrant_import_bridges_on_boot(state: &AppState) -> (usize, usize) {
+    let instance_ids = state
+        .instances
+        .list()
+        .await
+        .into_iter()
+        .filter(|metadata| metadata.protocol == Protocol::Qdrant)
+        .map(|metadata| metadata.instance_id)
+        .collect::<Vec<_>>();
+    let outcomes = futures::stream::iter(instance_ids)
+        .map(|instance_id| async move {
+            let _operation = state.instance_locks.lock(&instance_id).await;
+            let Some(metadata) = state.instances.get(&instance_id).await else {
+                return Ok::<_, (String, ApiError)>(false);
+            };
+            if metadata.protocol != Protocol::Qdrant || metadata.status != InstanceStatus::Running {
+                return Ok(false);
+            }
+            crate::api::remote_import::cleanup_stale_qdrant_bridge(state, &instance_id)
+                .await
+                .map(|()| true)
+                .map_err(|error| (instance_id, error))
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut checked = 0_usize;
+    let mut errors = 0_usize;
+    for outcome in outcomes {
+        match outcome {
+            Ok(true) => checked += 1,
+            Ok(false) => {}
+            Err((instance_id, error)) => {
+                errors += 1;
+                tracing::warn!(
+                    %instance_id,
+                    %error,
+                    "failed to clean stale qdrant remote-import bridge"
+                );
+            }
+        }
+    }
+    (checked, errors)
+}
+
 async fn quarantine_interrupted_job_instances(
     manager: &InstanceManager,
     instance_ids: &[String],
@@ -1897,7 +2024,7 @@ async fn quarantine_interrupted_job_instances(
         let Some(mut metadata) = store.get(instance_id).await else {
             tracing::warn!(
                 %instance_id,
-                "interrupted running import/export job references missing instance metadata"
+                "interrupted running import job references missing instance metadata"
             );
             continue;
         };
@@ -1916,6 +2043,260 @@ async fn quarantine_interrupted_job_instances(
         );
     }
     Ok(quarantined)
+}
+
+#[derive(Debug, Deserialize)]
+struct RetainedImportRecoveryIdentity {
+    schema_version: u32,
+    recovery_kind: String,
+    instance_id: String,
+    protocol: String,
+}
+
+async fn quarantine_retained_import_recovery_manifests(
+    manager: &InstanceManager,
+    tmp_root: &Path,
+) -> anyhow::Result<usize> {
+    const MAX_MANIFESTS: usize = 1024;
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    const MAX_SCANNED_ENTRIES_PER_ROOT: usize = 4096;
+
+    let root = tmp_root.join("import-export");
+    let mut manifests = Vec::new();
+    collect_logical_recovery_manifests(
+        &root,
+        &mut manifests,
+        MAX_MANIFESTS,
+        MAX_SCANNED_ENTRIES_PER_ROOT,
+    )
+    .await?;
+    let remote_root = tmp_root.join("remote-import");
+    collect_remote_recovery_manifests(
+        &remote_root,
+        &mut manifests,
+        MAX_MANIFESTS,
+        MAX_SCANNED_ENTRIES_PER_ROOT,
+    )
+    .await?;
+
+    let mut quarantined = 0_usize;
+    let mut seen_instances = std::collections::HashSet::new();
+    for path in manifests {
+        let manifest_path = path.clone();
+        let contents = tokio::task::spawn_blocking(move || {
+            crate::shared::files::read_private_regular_file_bounded(
+                &manifest_path,
+                MAX_MANIFEST_BYTES,
+            )
+        })
+        .await
+        .with_context(|| format!("failed to join recovery manifest read {}", path.display()))?
+        .with_context(|| format!("failed to read recovery manifest {}", path.display()))?;
+        let identity: RetainedImportRecoveryIdentity = serde_json::from_slice(&contents)
+            .with_context(|| format!("invalid recovery manifest {}", path.display()))?;
+        if identity.schema_version != 1
+            || !matches!(
+                identity.recovery_kind.as_str(),
+                "logical_remote_import" | "redis_remote_import" | "qdrant_remote_import"
+            )
+        {
+            anyhow::bail!(
+                "unsupported recovery manifest schema or kind in {}",
+                path.display()
+            );
+        }
+        crate::shared::ids::validate_instance_id(&identity.instance_id)
+            .with_context(|| format!("unsafe instance id in {}", path.display()))?;
+        let manifest_protocol = identity
+            .protocol
+            .parse::<Protocol>()
+            .with_context(|| format!("invalid protocol in {}", path.display()))?;
+        if !recovery_kind_matches_protocol(&identity.recovery_kind, manifest_protocol) {
+            anyhow::bail!(
+                "recovery kind and protocol do not match in {}",
+                path.display()
+            );
+        }
+        tracing::error!(
+            event = "audit retained_import_recovery_manifest",
+            path = %path.display(),
+            instance_id = %identity.instance_id,
+            protocol = %manifest_protocol,
+            recovery_kind = %identity.recovery_kind,
+            "an interrupted import has durable rollback metadata; quarantining its target"
+        );
+        if !seen_instances.insert(identity.instance_id.clone()) {
+            continue;
+        }
+        let Some(mut instance) = manager.store().get(&identity.instance_id).await else {
+            tracing::warn!(
+                instance_id = %identity.instance_id,
+                path = %path.display(),
+                "recovery manifest references missing instance metadata"
+            );
+            continue;
+        };
+        if instance.protocol != manifest_protocol {
+            anyhow::bail!(
+                "recovery manifest {} protocol {} does not match stored instance {} protocol {}",
+                path.display(),
+                manifest_protocol,
+                identity.instance_id,
+                instance.protocol
+            );
+        }
+        if instance.status != InstanceStatus::Quarantined {
+            instance.status = InstanceStatus::Quarantined;
+            instance.updated_at = crate::jobs::import_export::now_rfc3339();
+            manager.upsert(instance).await.with_context(|| {
+                format!(
+                    "failed to persist recovery quarantine for {}",
+                    identity.instance_id
+                )
+            })?;
+            quarantined += 1;
+        }
+    }
+    Ok(quarantined)
+}
+
+async fn collect_logical_recovery_manifests(
+    root: &Path,
+    manifests: &mut Vec<PathBuf>,
+    max_manifests: usize,
+    max_scanned_entries: usize,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to scan recovery root {}", root.display()));
+        }
+    };
+    let mut scanned = 0_usize;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed while scanning recovery root {}", root.display()))?
+    {
+        scanned += 1;
+        if scanned > max_scanned_entries {
+            anyhow::bail!(
+                "recovery root {} exceeds the {}-entry scan safety limit",
+                root.display(),
+                max_scanned_entries
+            );
+        }
+        let name = entry.file_name();
+        if is_generated_logical_recovery_manifest_name(&name) {
+            push_recovery_manifest(manifests, entry.path(), max_manifests)?;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_remote_recovery_manifests(
+    root: &Path,
+    manifests: &mut Vec<PathBuf>,
+    max_manifests: usize,
+    max_scanned_entries: usize,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to scan recovery root {}", root.display()));
+        }
+    };
+    let mut scanned = 0_usize;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("failed while scanning recovery root {}", root.display()))?
+    {
+        scanned += 1;
+        if scanned > max_scanned_entries {
+            anyhow::bail!(
+                "recovery root {} exceeds the {}-entry scan safety limit",
+                root.display(),
+                max_scanned_entries
+            );
+        }
+        if !is_canonical_uuid_file_name(&entry.file_name()) {
+            continue;
+        }
+        let directory = entry.path();
+        let metadata = tokio::fs::symlink_metadata(&directory)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to inspect remote-import recovery entry {}",
+                    directory.display()
+                )
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let manifest = directory.join("recovery-manifest.json");
+        match tokio::fs::symlink_metadata(&manifest).await {
+            Ok(_) => push_recovery_manifest(manifests, manifest, max_manifests)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect recovery manifest {}", manifest.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_recovery_manifest(
+    manifests: &mut Vec<PathBuf>,
+    path: PathBuf,
+    max_manifests: usize,
+) -> anyhow::Result<()> {
+    if manifests.len() >= max_manifests {
+        anyhow::bail!(
+            "retained import recovery manifest count exceeds the {}-file safety limit",
+            max_manifests
+        );
+    }
+    manifests.push(path);
+    Ok(())
+}
+
+fn is_generated_logical_recovery_manifest_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(uuid) = name
+        .strip_prefix(".dbe-import-recovery-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    is_canonical_uuid(uuid)
+}
+
+fn is_canonical_uuid_file_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(is_canonical_uuid)
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
+fn recovery_kind_matches_protocol(kind: &str, protocol: Protocol) -> bool {
+    match kind {
+        "logical_remote_import" => !matches!(protocol, Protocol::Redis | Protocol::Qdrant),
+        "redis_remote_import" => protocol == Protocol::Redis,
+        "qdrant_remote_import" => protocol == Protocol::Qdrant,
+        _ => false,
+    }
 }
 
 fn log_boot_configuration(config: &Config, config_path: &Path) {
@@ -1986,9 +2367,16 @@ fn log_boot_configuration(config: &Config, config_path: &Path) {
         fuse_quota_binary = %config.disk.fuse_quota_binary(),
         "disk limiter configured"
     );
-    tracing::info!(
-        "remote credential imports disabled because database containers have no network interface"
-    );
+    if config.security.remote_import.enabled {
+        tracing::info!(
+            allow_plaintext = config.security.remote_import.allow_plaintext,
+            allowed_private_hosts = config.security.remote_import.allowed_private_hosts.len(),
+            max_concurrent_jobs = config.security.remote_import.max_concurrent_jobs,
+            "remote credential imports enabled by node policy; target database containers remain network-isolated"
+        );
+    } else {
+        tracing::info!("remote credential imports disabled by node policy");
+    }
 }
 
 fn log_api_host_resolution(config: &Config) {
@@ -3530,6 +3918,125 @@ mod tests {
     };
 
     use super::*;
+    use crate::{
+        instances::metadata::{
+            DatabaseIdentity, InstanceMetadata, PublicEndpoint, RuntimeKind, RuntimeMetadata,
+            SCHEMA_VERSION,
+        },
+        jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
+        shared::{backend::BackendEndpoint, limits::InstanceLimits},
+    };
+
+    #[tokio::test]
+    async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata_root = temp.path().join("metadata");
+        let pool = sqlite::connect(&metadata_root).await.unwrap();
+        let repository = InstanceRepository::new(pool.clone());
+        let manager = InstanceManager::new(InstanceStore::default(), repository.clone());
+        manager.upsert(recovery_test_metadata()).await.unwrap();
+
+        let jobs = ImportExportJobRepository::new(pool);
+        jobs.insert(&ImportExportJob {
+            job_id: "job-terminal".to_string(),
+            instance_id: "inst_recovery".to_string(),
+            action: ImportExportAction::Import,
+            status: ImportExportStatus::Failed,
+            artifact_path: None,
+            replay_options: None,
+            error: Some("rollback failed".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:01Z".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(jobs.running_import_instance_ids().await.unwrap().is_empty());
+
+        let tmp_root = temp.path().join("tmp");
+        let recovery_root = tmp_root.join("import-export");
+        tokio::fs::create_dir_all(&recovery_root).await.unwrap();
+        tokio::fs::write(
+            recovery_root.join(".dbe-import-recovery-00000000-0000-4000-8000-000000000001.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "recovery_kind": "logical_remote_import",
+                "instance_id": "inst_recovery",
+                "protocol": "postgres",
+                "import_mode": "wipe",
+                "rollback_file": "rollback.postgres.sql",
+                "created_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            quarantine_retained_import_recovery_manifests(&manager, &tmp_root)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let reloaded = InstanceManager::new(InstanceStore::default(), repository);
+        reloaded.load_from_storage().await.unwrap();
+        assert_eq!(
+            reloaded.store().get("inst_recovery").await.unwrap().status,
+            InstanceStatus::Quarantined
+        );
+    }
+
+    fn recovery_test_metadata() -> InstanceMetadata {
+        InstanceMetadata {
+            schema_version: SCHEMA_VERSION,
+            instance_id: "inst_recovery".to_string(),
+            protocol: Protocol::Postgres,
+            status: InstanceStatus::Running,
+            public: PublicEndpoint {
+                host: "db.example.com".to_string(),
+                port: 5433,
+            },
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: "/run/dbev/sockets/inst_recovery/.s.PGSQL.5432".to_string(),
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: "dbe-postgres-inst-recovery".to_string(),
+                network_mode: "none".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: "app_db".to_string(),
+                username: "app".to_string(),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
+            mongodb_root_password: None,
+            limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovery_scan_accepts_only_canonical_generated_names() {
+        assert!(is_generated_logical_recovery_manifest_name(
+            std::ffi::OsStr::new(".dbe-import-recovery-00000000-0000-4000-8000-000000000001.json")
+        ));
+        assert!(!is_generated_logical_recovery_manifest_name(
+            std::ffi::OsStr::new(".dbe-import-recovery-manual.json")
+        ));
+        assert!(is_canonical_uuid_file_name(std::ffi::OsStr::new(
+            "00000000-0000-4000-8000-000000000001"
+        )));
+        assert!(!is_canonical_uuid_file_name(std::ffi::OsStr::new(
+            "00000000000040008000000000000001"
+        )));
+    }
 
     #[test]
     fn daemon_boot_preserves_running_containers() {

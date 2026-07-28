@@ -81,7 +81,7 @@ fn postgres_18_provisions_a_restricted_database_owner() {
             "psql",
             "-X",
             "-h",
-            "127.0.0.1",
+            "/var/run/postgresql",
             "-U",
             TENANT,
             "-d",

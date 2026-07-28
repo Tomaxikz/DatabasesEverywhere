@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.5.0
+  version: 0.6.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -187,11 +187,11 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, postgres_enabled, redis_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
+      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, remote_import_enabled, postgres_enabled, redis_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.5.0}
+        api_version: {type: string, example: 0.6.0}
         api_readiness:
           type: string
           const: ready
@@ -216,6 +216,9 @@ components:
         database_backend_transport: {type: string, const: unix_socket}
         daemon_disk_limits_enforced: {type: boolean}
         disk_mode: {type: string}
+        remote_import_enabled:
+          type: boolean
+          description: Whether this node accepts credential-based remote import sources.
         postgres_enabled: {type: boolean}
         redis_enabled: {type: boolean}
         mariadb_enabled: {type: boolean}
@@ -321,7 +324,24 @@ components:
       required: [source]
       properties:
         source:
-          $ref: "#/components/schemas/ArtifactImportSource"
+          oneOf:
+            - $ref: "#/components/schemas/ArtifactImportSource"
+            - $ref: "#/components/schemas/RemoteImportSource"
+          discriminator:
+            propertyName: type
+            mapping:
+              artifact: "#/components/schemas/ArtifactImportSource"
+              remote: "#/components/schemas/RemoteImportSource"
+        mode:
+          type: string
+          enum: [merge, wipe]
+          default: merge
+          description: >-
+            For credential imports, merge replaces source-named
+            objects/keys/collections while preserving target-only data; wipe
+            clears the target database first. Redis and Qdrant artifact imports
+            always replace the complete physical database, so mode does not
+            change their behavior.
         selection:
           $ref: "#/components/schemas/ImportExportSelection"
     ExportRequest:
@@ -346,8 +366,65 @@ components:
           description: ID returned by this instance's artifacts endpoint, or the filename of an operator-staged file under paths.imports/<instance_id>/.
         archive_format:
           type: [string, "null"]
-          enum: [plain, gzip, bzip2, tar, tar.gz, zip, rar, null]
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
           description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Qdrant physical archives.
+    RemoteImportSource:
+      type: object
+      additionalProperties: false
+      required: [type, host]
+      description: Protocol-specific remote credentials. Qdrant imports also migrate aliases attached to selected source collections; source aliases win same-name conflicts.
+      properties:
+        type:
+          type: string
+          const: remote
+        host:
+          type: string
+          minLength: 1
+          maxLength: 253
+          description: DNS name or literal IP only after surrounding whitespace is removed; URLs, paths, userinfo, and embedded ports are rejected.
+          example: source-db.example.com
+        port:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 65535
+          description: Optional protocol port. A TLS-aware protocol default is used when omitted.
+        tls:
+          type: boolean
+          default: true
+          description: Verified TLS is the default. Plaintext also requires security.remote_import.allow_plaintext on the node.
+        database:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Required for PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Omit for Redis and Qdrant. MariaDB/MySQL additionally allow at most 64 characters. MongoDB applies a 63-byte limit and rejects slash, backslash, dot, space, double quote, and dollar sign. ClickHouse additionally requires at most 128 ASCII letters, digits, underscores, or dashes.
+        username:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Required for SQL/ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Optional with password for MongoDB and Redis ACL authentication.
+        password:
+          type: [string, "null"]
+          format: password
+          writeOnly: true
+          description: Source credentials are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis keeps it in process memory. SQL passwords cannot contain NUL, CR, or LF.
+        authentication_database:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Optional MongoDB authentication database. It follows MongoDB's 63-byte database-name restrictions or may be exactly $external. Defaults to database and is accepted only when username and password are both supplied.
+        database_index:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 4294967295
+          description: Redis logical database index. Defaults to 0.
+        api_key:
+          type: [string, "null"]
+          format: password
+          writeOnly: true
+          description: Optional Qdrant API key kept in process memory and not stored in a credential file, durable job record, or job metadata. It must be a syntactically valid HTTP header value and permit cluster-topology, collection, and alias reads plus snapshot creation, download, and cleanup.
     ImportExportSelection:
       type: object
       additionalProperties: false
@@ -1101,7 +1178,7 @@ paths:
                 $ref: "#/components/schemas/ImportExportJob"
   /api/instances/{instance_id}/import:
     post:
-      summary: Import a protocol-native dump artifact into one instance.
+      summary: Import a protocol-native artifact or a remote database into one instance.
       x-required-scope: import-export:write
       parameters:
         - name: instance_id
@@ -1471,7 +1548,7 @@ paths:
                   $ref: "#/components/schemas/ImportExportJob"
   /api/instances/{instance_id}/recovery/jobs/{job_id}/retry:
     post:
-      summary: Retry a failed job after verifying it belongs to the instance.
+      summary: Retry a failed export or artifact import from its sanitized replay options. Credential imports and legacy jobs must be resubmitted.
       x-required-scope: recovery:admin
       parameters:
         - name: instance_id

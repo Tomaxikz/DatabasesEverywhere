@@ -23,16 +23,18 @@ impl ImportExportJobRepository {
                 action,
                 status,
                 artifact_path,
+                replay_options,
                 error,
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(job_id) DO UPDATE SET
                 instance_id = excluded.instance_id,
                 action = excluded.action,
                 status = excluded.status,
                 artifact_path = excluded.artifact_path,
+                replay_options = excluded.replay_options,
                 error = excluded.error,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at
@@ -43,6 +45,7 @@ impl ImportExportJobRepository {
         .bind(job.action.as_str())
         .bind(job.status.as_str())
         .bind(&job.artifact_path)
+        .bind(&job.replay_options)
         .bind(&job.error)
         .bind(&job.created_at)
         .bind(&job.updated_at)
@@ -57,7 +60,7 @@ impl ImportExportJobRepository {
     ) -> Result<Option<ImportExportJob>, ImportExportJobStorageError> {
         let row = sqlx::query(
             r#"
-            SELECT job_id, instance_id, action, status, artifact_path, error, created_at, updated_at
+            SELECT job_id, instance_id, action, status, artifact_path, replay_options, error, created_at, updated_at
             FROM import_export_jobs
             WHERE job_id = ?1
             LIMIT 1
@@ -80,7 +83,7 @@ impl ImportExportJobRepository {
         let status = status.map(ImportExportStatus::as_str);
         let rows = sqlx::query(
             r#"
-            SELECT job_id, instance_id, action, status, artifact_path, error, created_at, updated_at
+            SELECT job_id, instance_id, action, status, artifact_path, replay_options, error, created_at, updated_at
             FROM import_export_jobs
             WHERE (?1 IS NULL OR instance_id = ?1)
               AND (?2 IS NULL OR status = ?2)
@@ -106,14 +109,16 @@ impl ImportExportJobRepository {
             UPDATE import_export_jobs
             SET status = ?2,
                 artifact_path = ?3,
-                error = ?4,
-                updated_at = ?5
+                replay_options = ?4,
+                error = ?5,
+                updated_at = ?6
             WHERE job_id = ?1
             "#,
         )
         .bind(&job.job_id)
         .bind(job.status.as_str())
         .bind(&job.artifact_path)
+        .bind(&job.replay_options)
         .bind(&job.error)
         .bind(&job.updated_at)
         .execute(&self.pool)
@@ -126,12 +131,15 @@ impl ImportExportJobRepository {
         Ok(())
     }
 
-    pub async fn running_instance_ids(&self) -> Result<Vec<String>, ImportExportJobStorageError> {
+    pub async fn running_import_instance_ids(
+        &self,
+    ) -> Result<Vec<String>, ImportExportJobStorageError> {
         let rows = sqlx::query(
             r#"
             SELECT DISTINCT instance_id
             FROM import_export_jobs
             WHERE status = 'running'
+              AND action = 'import'
             ORDER BY instance_id
             "#,
         )
@@ -231,6 +239,7 @@ fn row_to_job(
         action: ImportExportAction::parse(&action)?,
         status: ImportExportStatus::parse(&status)?,
         artifact_path: row.try_get("artifact_path")?,
+        replay_options: row.try_get("replay_options")?,
         error: row.try_get("error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -270,6 +279,10 @@ mod tests {
         let stored = repository.get("job_1").await.unwrap().unwrap();
         assert_eq!(stored.status, ImportExportStatus::Succeeded);
         assert_eq!(stored.instance_id, "inst_abc");
+        assert_eq!(
+            stored.replay_options.as_deref(),
+            Some(r#"{"kind":"export"}"#)
+        );
     }
 
     #[tokio::test]
@@ -311,22 +324,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_only_instances_with_running_jobs_once() {
+    async fn lists_only_instances_with_running_imports_once() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
         let repository = ImportExportJobRepository::new(pool);
         let mut job = sample_job();
         repository.insert(&job).await.unwrap();
         job.job_id = "job_2".to_string();
+        job.action = ImportExportAction::Import;
         job.status = ImportExportStatus::Running;
         repository.insert(&job).await.unwrap();
         job.job_id = "job_3".to_string();
         job.instance_id = "inst_other".to_string();
         job.status = ImportExportStatus::Running;
         repository.insert(&job).await.unwrap();
+        job.job_id = "job_4".to_string();
+        job.instance_id = "inst_export_only".to_string();
+        job.action = ImportExportAction::Export;
+        repository.insert(&job).await.unwrap();
 
         assert_eq!(
-            repository.running_instance_ids().await.unwrap(),
+            repository.running_import_instance_ids().await.unwrap(),
             vec!["inst_abc".to_string(), "inst_other".to_string()]
         );
     }
@@ -395,6 +413,7 @@ mod tests {
             action: ImportExportAction::Export,
             status: ImportExportStatus::Queued,
             artifact_path: Some("/tmp/export.tar.gz".to_string()),
+            replay_options: Some(r#"{"kind":"export"}"#.to_string()),
             error: None,
             created_at: "2026-01-01T12:00:00Z".to_string(),
             updated_at: "2026-01-01T12:00:00Z".to_string(),

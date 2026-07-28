@@ -140,9 +140,9 @@ cleartext public API binds are rejected. Database gateways may bind to
 non-loopback addresses with or without TLS and continue to enforce each
 database protocol's native credentials. Cleartext public gateways emit a
 startup warning because credentials, queries, and results are not protected
-from network interception. Remote credential imports are intentionally
-unavailable in the network-none model; stage a trusted local artifact first.
-Daemon file logs rotate daily and retain the latest 14 files.
+from network interception. Remote imports use temporary acquisition workers;
+target database containers stay network-isolated. Daemon file logs rotate
+daily and retain the latest 14 files.
 
 ## Docs
 

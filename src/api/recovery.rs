@@ -5,14 +5,14 @@ use crate::{
     api::{
         api_response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         import_export::ImportOptions,
-        import_export::{ImportExportJobResponse, queue_export_instance, queue_import_instance},
+        import_export::{ImportExportJobResponse, queue_import_instance, replay_failed_job},
         routes::AppState,
         security_policy::{
             ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy,
         },
     },
     auth::scopes,
-    jobs::import_export::{ImportExportAction, ImportExportStatus},
+    jobs::import_export::ImportExportStatus,
 };
 
 #[derive(Debug, Deserialize)]
@@ -66,20 +66,7 @@ pub async fn retry_job(
         instance_id = %job.instance_id,
         action = job.action.as_str(),
     );
-    match job.action {
-        ImportExportAction::Export => queue_export_instance(&state, &job.instance_id).await,
-        ImportExportAction::Import => {
-            let artifact_path = job.artifact_path.ok_or_else(|| {
-                ApiError::BadRequest("failed import job has no artifact_path".to_string())
-            })?;
-            queue_import_instance(
-                &state,
-                &job.instance_id,
-                ImportOptions::artifact(artifact_path),
-            )
-            .await
-        }
-    }
+    replay_failed_job(&state, &job).await
 }
 
 pub async fn restore_artifact(
@@ -100,7 +87,7 @@ pub async fn restore_artifact(
         artifact_id = %request.artifact_id,
         reason = authorization.reason(),
     );
-    state
+    let metadata = state
         .instances
         .get(&instance_id)
         .await
@@ -111,5 +98,10 @@ pub async fn restore_artifact(
         &instance_id,
     )
     .await?;
-    queue_import_instance(&state, &instance_id, ImportOptions::artifact(artifact_path)).await
+    queue_import_instance(
+        &state,
+        &instance_id,
+        ImportOptions::recovery_restore(artifact_path, metadata.protocol),
+    )
+    .await
 }

@@ -9,6 +9,14 @@ use super::{
 };
 use crate::shared::images::is_pinned_image_reference;
 
+const MAX_REMOTE_IMPORT_JOBS: usize = 64;
+const MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: u64 = 5 * 60;
+const MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+// Container upload/download operations use the same hard ceiling. Keeping the
+// configurable bound at or below it prevents a remote acquisition from
+// succeeding only to fail deterministically during target staging.
+const MAX_REMOTE_IMPORT_STAGED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
     #[error("uuid must not be empty")]
@@ -59,6 +67,20 @@ pub enum ConfigValidationError {
     MissingClientCaFile { path: String },
     #[error("security.{field} must be greater than zero")]
     InvalidSecurityLimit { field: &'static str },
+    #[error("security.remote_import.{field} must be between {minimum} and {maximum}, inclusive")]
+    InvalidRemoteImportLimit {
+        field: &'static str,
+        minimum: u64,
+        maximum: u64,
+    },
+    #[error(
+        "security.remote_import.operation_timeout_seconds must be greater than or equal to connect_timeout_seconds"
+    )]
+    InvalidRemoteImportTimeoutOrder,
+    #[error(
+        "security.remote_import.allowed_private_hosts contains an invalid host name or IP address: {value}"
+    )]
+    InvalidRemoteImportHost { value: String },
     #[error(
         "allocation.{field} must fit in bytes, and configured maxima must be greater than zero"
     )]
@@ -426,6 +448,63 @@ fn validate_security(
             return Err(ConfigValidationError::InvalidSecurityLimit { field });
         }
     }
+    validate_remote_import_security(&security.remote_import)?;
+    Ok(())
+}
+
+fn validate_remote_import_security(
+    remote: &crate::config::RemoteImportSecurityConfig,
+) -> Result<(), ConfigValidationError> {
+    validate_remote_import_limit(
+        "max_concurrent_jobs",
+        remote.max_concurrent_jobs as u64,
+        1,
+        MAX_REMOTE_IMPORT_JOBS as u64,
+    )?;
+    validate_remote_import_limit(
+        "connect_timeout_seconds",
+        remote.connect_timeout_seconds,
+        1,
+        MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS,
+    )?;
+    validate_remote_import_limit(
+        "operation_timeout_seconds",
+        remote.operation_timeout_seconds,
+        1,
+        MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS,
+    )?;
+    validate_remote_import_limit(
+        "max_staged_bytes",
+        remote.max_staged_bytes,
+        1,
+        MAX_REMOTE_IMPORT_STAGED_BYTES,
+    )?;
+    if remote.operation_timeout_seconds < remote.connect_timeout_seconds {
+        return Err(ConfigValidationError::InvalidRemoteImportTimeoutOrder);
+    }
+    for host in &remote.allowed_private_hosts {
+        if super::normalize_remote_import_host(host).is_none() {
+            return Err(ConfigValidationError::InvalidRemoteImportHost {
+                value: host.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_import_limit(
+    field: &'static str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), ConfigValidationError> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigValidationError::InvalidRemoteImportLimit {
+            field,
+            minimum,
+            maximum,
+        });
+    }
     Ok(())
 }
 
@@ -569,6 +648,115 @@ mod tests {
                 field: "pids_limits.clickhouse"
             }
         ));
+    }
+
+    #[test]
+    fn remote_import_security_defaults_are_valid() {
+        let config = valid_config();
+
+        validate_config(&config).unwrap();
+
+        let remote = &config.security.remote_import;
+        assert!(remote.enabled);
+        assert!(!remote.allow_plaintext);
+        assert!(remote.allowed_private_hosts.is_empty());
+        assert_eq!(remote.max_concurrent_jobs, 4);
+        assert_eq!(remote.connect_timeout_seconds, 15);
+        assert_eq!(remote.operation_timeout_seconds, 900);
+        assert_eq!(remote.max_staged_bytes, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_out_of_range_remote_import_limits() {
+        for value in [0, 65] {
+            let mut config = valid_config();
+            config.security.remote_import.max_concurrent_jobs = value;
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::InvalidRemoteImportLimit {
+                    field: "max_concurrent_jobs",
+                    ..
+                }
+            ));
+        }
+
+        for value in [0, MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS + 1] {
+            let mut config = valid_config();
+            config.security.remote_import.connect_timeout_seconds = value;
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::InvalidRemoteImportLimit {
+                    field: "connect_timeout_seconds",
+                    ..
+                }
+            ));
+        }
+
+        for value in [0, MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS + 1] {
+            let mut config = valid_config();
+            config.security.remote_import.operation_timeout_seconds = value;
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::InvalidRemoteImportLimit {
+                    field: "operation_timeout_seconds",
+                    ..
+                }
+            ));
+        }
+
+        for value in [0, MAX_REMOTE_IMPORT_STAGED_BYTES + 1] {
+            let mut config = valid_config();
+            config.security.remote_import.max_staged_bytes = value;
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::InvalidRemoteImportLimit {
+                    field: "max_staged_bytes",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn remote_import_operation_timeout_must_cover_connect_timeout() {
+        let mut config = valid_config();
+        config.security.remote_import.connect_timeout_seconds = 30;
+        config.security.remote_import.operation_timeout_seconds = 29;
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InvalidRemoteImportTimeoutOrder
+        ));
+    }
+
+    #[test]
+    fn validates_remote_import_private_host_allowlist_syntax() {
+        let mut config = valid_config();
+        config.security.remote_import.allowed_private_hosts = vec![
+            "db.internal.example".to_string(),
+            "10.20.30.40".to_string(),
+            "[fd00::1234]".to_string(),
+        ];
+        validate_config(&config).unwrap();
+
+        for invalid in [
+            "",
+            "https://db.internal",
+            "db.internal/path",
+            "db_name.internal",
+            "-db.internal",
+            "db..internal",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+        ] {
+            let mut config = valid_config();
+            config.security.remote_import.allowed_private_hosts = vec![invalid.to_string()];
+            assert!(matches!(
+                validate_config(&config).unwrap_err(),
+                ConfigValidationError::InvalidRemoteImportHost { .. }
+            ));
+        }
     }
 
     #[test]

@@ -140,6 +140,10 @@ struct CachedMonitoringSnapshot {
 }
 
 impl MonitoringSnapshotCache {
+    pub(crate) async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
+
     async fn snapshot(&self, state: &AppState) -> Arc<MonitoringSnapshotData> {
         if let Some(snapshot) = self.fresh().await {
             return snapshot;
@@ -967,6 +971,7 @@ mod tests {
             action: ImportExportAction::Export,
             status: ImportExportStatus::Succeeded,
             artifact_path: Some(format!("/tmp/{instance_id}.sql")),
+            replay_options: None,
             error: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

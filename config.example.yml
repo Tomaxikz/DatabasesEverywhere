@@ -77,6 +77,22 @@ security:
     clickhouse: 4096
     mysql: null
     qdrant: null
+  remote_import:
+    enabled: true
+    # Plaintext source credentials are rejected unless this is explicitly
+    # enabled. TLS remains the default on every remote import request.
+    allow_plaintext: false
+    # Public addresses are accepted by default. A private RFC1918, ULA, or
+    # carrier-grade NAT address is accepted only when its exact requested host
+    # name or IP is listed here. Loopback, link-local, metadata, multicast,
+    # documentation, and reserved ranges are always rejected.
+    allowed_private_hosts: []
+    max_concurrent_jobs: 4
+    connect_timeout_seconds: 15
+    # Upper bound for an acquisition or target-operation phase. Redis and
+    # Qdrant additionally reserve part of one such window for rollback.
+    operation_timeout_seconds: 900
+    max_staged_bytes: 8589934592
 
 artifacts:
   retention_keep_latest: 20

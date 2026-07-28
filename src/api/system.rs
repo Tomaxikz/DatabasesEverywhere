@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.5.0";
+pub const API_VERSION: &str = "0.6.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -33,6 +33,7 @@ pub struct SystemResponse {
     pub database_backend_transport: &'static str,
     pub daemon_disk_limits_enforced: bool,
     pub disk_mode: &'static str,
+    pub remote_import_enabled: bool,
     pub postgres_enabled: bool,
     pub redis_enabled: bool,
     pub mariadb_enabled: bool,
@@ -71,6 +72,7 @@ pub async fn system(
         database_backend_transport: "unix_socket",
         daemon_disk_limits_enforced: state.config.disk.mode.enforced(),
         disk_mode: state.config.disk.mode.method(),
+        remote_import_enabled: state.config.security.remote_import.enabled,
         postgres_enabled: state.config.postgres.enabled,
         redis_enabled: state.config.redis.enabled,
         mariadb_enabled: state.config.mariadb.enabled,
@@ -99,4 +101,74 @@ pub struct HeartbeatResponse {
 pub async fn heartbeat(auth: ApiRequestContext) -> ApiResult<HeartbeatResponse> {
     auth.require_scope(scopes::SYSTEM_READ)?;
     Ok(ApiResponse::ok(HeartbeatResponse { status: "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml::Value;
+
+    #[test]
+    fn openapi_advertises_remote_import_capability_and_discriminator() {
+        let document: Value =
+            serde_yaml::from_str(include_str!("../../openapi.yml")).expect("valid OpenAPI YAML");
+        assert_eq!(document["info"]["version"].as_str(), Some(API_VERSION));
+
+        let schemas = &document["components"]["schemas"];
+        let system = &schemas["SystemResponse"];
+        assert!(system["properties"]["remote_import_enabled"].is_mapping());
+        assert!(
+            system["required"]
+                .as_sequence()
+                .expect("SystemResponse required array")
+                .iter()
+                .any(|field| field.as_str() == Some("remote_import_enabled"))
+        );
+
+        let discriminator = &schemas["ImportRequest"]["properties"]["source"]["discriminator"];
+        assert_eq!(discriminator["propertyName"].as_str(), Some("type"));
+        assert_eq!(
+            discriminator["mapping"]["artifact"].as_str(),
+            Some("#/components/schemas/ArtifactImportSource")
+        );
+        assert_eq!(
+            discriminator["mapping"]["remote"].as_str(),
+            Some("#/components/schemas/RemoteImportSource")
+        );
+    }
+
+    #[test]
+    fn openapi_remote_source_constraints_match_request_validation() {
+        let document: Value =
+            serde_yaml::from_str(include_str!("../../openapi.yml")).expect("valid OpenAPI YAML");
+        let properties = &document["components"]["schemas"]["RemoteImportSource"]["properties"];
+
+        assert_eq!(properties["host"]["minLength"].as_i64(), Some(1));
+        assert_eq!(properties["host"]["maxLength"].as_i64(), Some(253));
+        for field in ["database", "username", "authentication_database"] {
+            assert_eq!(properties[field]["minLength"].as_i64(), Some(1));
+            assert_eq!(properties[field]["maxLength"].as_i64(), Some(256));
+            assert_eq!(
+                properties[field]["pattern"].as_str(),
+                Some(r"^[^\u0000-\u001F\u007F-\u009F]+$")
+            );
+        }
+        assert_eq!(properties["password"]["writeOnly"].as_bool(), Some(true));
+        assert_eq!(properties["api_key"]["writeOnly"].as_bool(), Some(true));
+        let password_description = properties["password"]["description"]
+            .as_str()
+            .expect("password description");
+        assert!(password_description.contains("durable job records or metadata"));
+        assert!(password_description.contains("mode-0600"));
+
+        let artifact_formats = document["components"]["schemas"]["ArtifactImportSource"]
+            ["properties"]["archive_format"]["enum"]
+            .as_sequence()
+            .expect("artifact archive format enum");
+        assert!(
+            !artifact_formats
+                .iter()
+                .any(|format| format.as_str() == Some("rar"))
+        );
+    }
 }

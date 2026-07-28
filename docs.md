@@ -88,7 +88,7 @@ The template placeholders are deliberately rejected by `check-config`.
 For example, run `openssl rand -base64 32` twice and assign each output to one
 of the two fields.
 
-The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. Remote credential imports are unavailable because database containers have no outbound network interface; download through a trusted host-side workflow and import a local artifact.
+The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. Managed database containers remain network-isolated. Credential-based imports use short-lived, hardened acquisition helpers (or a bounded host client for Redis/Qdrant) and never add a network interface to the target container.
 
 Database images may use ordinary versioned Docker Hub, GHCR, or other
 registry references. Bare references and the mutable `latest` tag are rejected;
@@ -348,7 +348,9 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.5.0` exposes the API rate-limit allowance and its
+version. Contract `0.6.0` adds typed credential-based remote imports with
+verified TLS, SSRF controls, per-protocol acquisition, merge/wipe modes, and
+rollback-first target handling. Contract `0.5.0` exposes the API rate-limit allowance and its
 credential-plus-peer-IP scope through `/api/system`. Contract `0.4.0` emits
 monitoring snapshots every 500 ms, sources
 per-instance RX/TX from the authenticated gateway used by network-isolated
@@ -620,7 +622,7 @@ change between sampling and creation.
 Three related but different things — don't mix them up:
 
 - **Exports** are portable database-native dumps (`pg_dump` style). They are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs.
-- **Imports** load one of that instance's trusted local artifacts. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, and direct remote-database credentials are not accepted.
+- **Imports** load one of that instance's trusted local artifacts or acquire a native dump/snapshot directly from a typed remote source. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, helper images, commands, or connection URLs.
 - **Backups** are physical archives of the whole instance volume, stored under `paths.backups/<instance_id>/`. They're for disaster recovery on the same daemon, not portability.
 
 ### Import/export jobs
@@ -642,7 +644,7 @@ Exports and imports are async. You queue a job, then watch it via polling or the
 ```
 
 `status` goes `queued` → `running` → `succeeded` or `failed`. `artifact_size_bytes` fills in once the file exists.
-Queueing, retry, and recovery-restore endpoints return `202 Accepted` with a
+Queueing, safe retry, and recovery-restore endpoints return `202 Accepted` with a
 `Location` header pointing at the instance-scoped job status endpoint.
 
 | Method | Path | Scope | What it does |
@@ -668,15 +670,18 @@ Export/import formats:
 
 | Protocol | Export format | Import support |
 | --- | --- | --- |
-| PostgreSQL | `.postgres.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
-| MariaDB | `.mariadb.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
-| MySQL | `.mysql.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
-| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump or gzip/tar/zip/rar-wrapped archive |
-| ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip/rar-wrapped dump |
+| PostgreSQL | `.postgres.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
+| MariaDB | `.mariadb.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
+| MySQL | `.mysql.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
+| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump or gzip/tar/zip-wrapped archive |
+| ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
 | Qdrant | `.qdrant.tar.gz` physical archive | Full physical archive only |
 
-Redis and Qdrant exports are full physical volume archives and are not selective. All protocols import from trusted local artifacts; direct remote-credential imports are unavailable under network-none isolation.
+Redis and Qdrant artifact exports are full physical volume archives and are not
+selective. Remote Redis imports copy binary-safe DUMP/RESTORE records; remote
+Qdrant imports use collection snapshots. The target database container remains
+in `network_mode=none` for every protocol.
 
 Import one of the target instance's artifacts:
 
@@ -690,7 +695,90 @@ Import one of the target instance's artifacts:
 }
 ```
 
-To migrate from another server, download the dump through a trusted host-side workflow, place it under `paths.imports/<instance_id>/`, and submit it as an artifact import. Database containers cannot contact the source directly.
+Import directly from credentials (the target instance determines the protocol):
+
+```json
+{
+  "source": {
+    "type": "remote",
+    "host": "source-db.example.com",
+    "port": 5432,
+    "tls": true,
+    "database": "app",
+    "username": "migration_user",
+    "password": "source-only-secret"
+  },
+  "mode": "merge"
+}
+```
+
+For credential imports, `merge` replaces source-named
+objects/keys/collections and preserves target-only data; `wipe` clears the
+target first. Redis and Qdrant artifact imports are different: those archives
+always replace the complete physical database, so `mode` does not change their
+behavior. PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse use their native
+dump tools in a one-shot helper. Redis uses binary-safe
+SCAN/DUMP/PTTL/RESTORE, and Qdrant uses collection snapshots.
+
+Credential values are not stored in durable job records or job metadata.
+PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse acquisition writes the
+required secret to a mode-`0600`, job-private temporary credential file, then
+removes it immediately after the helper exits. After an unclean daemon stop,
+startup removes known credential files and deletes generated staging that has
+no durable recovery manifest; manifest-backed rollback data is retained.
+Redis and Qdrant credentials remain in process memory. A failed
+credential-based import must therefore be submitted again; the recovery retry
+endpoint cannot replay it.
+
+Remote `database`, `username`, and `authentication_database` values are
+trimmed and cannot contain control characters. They are limited to 1-256 UTF-8
+bytes unless a protocol applies a stricter rule. MongoDB database names are
+limited to 63 UTF-8 bytes and reject slash, backslash, dot, space, double quote,
+and dollar sign; an authentication database may instead be exactly
+`$external`. MongoDB `authentication_database` is accepted only with both
+`username` and `password`. A ClickHouse source database name must be at most
+128 bytes and contain only ASCII letters, digits, underscores, or dashes. SQL
+passwords also cannot contain NUL, CR, or LF. MySQL and MariaDB source database
+names are limited to 64 characters. A Qdrant `api_key` must be a valid HTTP
+header value; invalid values are rejected without echoing the secret.
+
+MySQL and MariaDB logical imports structurally rebase qualified references from
+the source database to the managed target database without changing quoted
+strings, row data, or ordinary comments. MySQL object definers are rewritten
+to the target tenant account; an unfamiliar or ambiguous dump form is rejected
+instead of restoring a privileged or source-only definer.
+ClickHouse likewise rebases structurally identifiable database-qualified table
+and function references in its generated SQL; ambiguous qualified SQL is
+rejected before the target is changed.
+
+Qdrant collection snapshots do not contain aliases, so DBE reads aliases
+separately and migrates those attached to the selected source collections.
+Source aliases win same-name conflicts; target aliases attached to untouched
+collections are otherwise preserved. Alias changes are applied atomically, and
+an update error triggers rollback of the exact pre-import target alias map
+together with the collection snapshots. Recovery snapshots are retained if
+automatic rollback cannot complete. Qdrant snapshot imports require the same
+major and minor version; the target cannot have an older patch release than
+the source.
+
+Credential imports reject Redis Cluster and distributed Qdrant endpoints.
+SCAN and a Qdrant collection snapshot are node-local in those topologies and
+could otherwise produce a silently partial migration. Use the database's
+cluster-aware migration tooling or a verified standalone source instead.
+
+Remote acquisition does not lock the source database. Quiesce source writes
+when a single point-in-time migration is required, especially for MongoDB,
+ClickHouse, Redis, and multi-collection Qdrant imports. MongoDB selective
+imports currently accept exactly one included collection; use a full import
+for multiple collections. As with artifact imports, also quiesce client writes
+to target objects being replaced: DBE serializes management jobs but cannot
+stop already-authorized database clients from issuing native writes.
+
+Remote TLS is verified by default. Plaintext requires both `"tls": false` and
+`security.remote_import.allow_plaintext: true`. Private RFC1918/ULA/CGNAT
+destinations require an exact entry in
+`security.remote_import.allowed_private_hosts`; loopback, link-local, metadata,
+multicast, reserved, and mixed public/private DNS answers are always rejected.
 
 ### Backups
 
@@ -753,7 +841,7 @@ For your admin panel's "something went wrong" page. Scope: `recovery:admin`.
 | Method | Path | What it does |
 | --- | --- | --- |
 | GET | `/api/admin/recovery/failed-jobs` | All failed import/export jobs |
-| POST | `/api/instances/{id}/recovery/jobs/{job_id}/retry` | Re-queue a failed job after checking its instance |
+| POST | `/api/instances/{id}/recovery/jobs/{job_id}/retry` | Re-queue a failed export or artifact import with its stored non-secret mode/archive/selection options; credential imports and jobs created before replay metadata was added return `400` and must be resubmitted |
 | POST | `/api/instances/{id}/recovery/restore` | Force-import one of that instance's artifacts |
 
 Restore requires explicit intent — `confirm` and a `reason` (it's audit-logged):
@@ -871,7 +959,7 @@ Job objects are the same shape as the REST job response. When an export succeeds
 | GET | `/api/heartbeat` | system:read | `{"status":"ok"}` — cheap liveness check for the panel |
 | GET | `/metrics` | metrics:read | Prometheus text: instance counts by protocol/status, job counts, disk enforcement flag |
 
-`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `api_readiness`, `api_rate_limit_per_minute`, `api_rate_limit_scope`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, and per-protocol `*_enabled` flags so the panel knows what it can offer. `api_readiness: "ready"` describes the management API only; `gateways.status` independently describes database listeners.
+`/api/system` is the right first call after registering a node — it tells you the daemon `version`, contract `api_version`, `api_readiness`, `api_rate_limit_per_minute`, `api_rate_limit_scope`, `daemon_engine`, socket, `disk_mode`, fixed `database_container_network_mode`, backend transport, `remote_import_enabled`, and per-protocol `*_enabled` flags so the panel knows what it can offer. `api_readiness: "ready"` describes the management API only; `gateways.status` independently describes database listeners.
 
 The API listener becomes available after critical metadata, crash-recovery,
 container-engine, socket-isolation, and disk checks complete. Existing managed database

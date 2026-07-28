@@ -239,6 +239,67 @@ pub(crate) fn url_host(value: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn normalize_remote_import_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Some(address.to_string());
+    }
+    if let Some(address) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+    {
+        return Some(address.to_string());
+    }
+
+    let host = value.strip_suffix('.').unwrap_or(value);
+    if host.is_empty()
+        || host.len() > 253
+        || !host.is_ascii()
+        || host.bytes().any(|byte| byte.is_ascii_control())
+        || host
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b':' | b'@' | b'#' | b'?' | b'[' | b']'))
+    {
+        return None;
+    }
+
+    let labels = host.split('.').collect::<Vec<_>>();
+    if labels.iter().any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return None;
+    }
+
+    // libc resolvers accept several legacy numeric IPv4 spellings such as
+    // `2130706433`, `127.1`, and `0x7f.0.0.1`. Reject numeric-looking names so
+    // they cannot bypass the canonical IpAddr classification in the caller.
+    let numeric_notation = labels.iter().all(|label| {
+        label.bytes().all(|byte| byte.is_ascii_digit())
+            || label
+                .strip_prefix("0x")
+                .or_else(|| label.strip_prefix("0X"))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+    });
+    if numeric_notation {
+        return None;
+    }
+
+    Some(host.to_ascii_lowercase())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiSslConfig {
@@ -258,6 +319,7 @@ pub struct SecurityConfig {
     pub self_upgrade_enabled: bool,
     pub pids_limit: i64,
     pub pids_limits: PidsLimitConfig,
+    pub remote_import: RemoteImportSecurityConfig,
 }
 
 impl Default for SecurityConfig {
@@ -269,6 +331,33 @@ impl Default for SecurityConfig {
             self_upgrade_enabled: false,
             pids_limit: 512,
             pids_limits: PidsLimitConfig::default(),
+            remote_import: RemoteImportSecurityConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteImportSecurityConfig {
+    pub enabled: bool,
+    pub allow_plaintext: bool,
+    pub allowed_private_hosts: Vec<String>,
+    pub max_concurrent_jobs: usize,
+    pub connect_timeout_seconds: u64,
+    pub operation_timeout_seconds: u64,
+    pub max_staged_bytes: u64,
+}
+
+impl Default for RemoteImportSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_plaintext: false,
+            allowed_private_hosts: Vec::new(),
+            max_concurrent_jobs: 4,
+            connect_timeout_seconds: 15,
+            operation_timeout_seconds: 15 * 60,
+            max_staged_bytes: 8 * 1024 * 1024 * 1024,
         }
     }
 }

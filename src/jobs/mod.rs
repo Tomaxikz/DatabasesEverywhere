@@ -10,7 +10,7 @@ pub mod import_export {
     use std::{
         collections::HashMap,
         fs::{File, OpenOptions},
-        io::{Read, Write},
+        io::{self, Read, Write},
         path::{Component, Path, PathBuf},
         sync::{
             Arc, Mutex, MutexGuard,
@@ -60,6 +60,8 @@ pub mod import_export {
         pub action: ImportExportAction,
         pub status: ImportExportStatus,
         pub artifact_path: Option<String>,
+        #[serde(skip)]
+        pub replay_options: Option<String>,
         pub error: Option<String>,
         pub created_at: String,
         pub updated_at: String,
@@ -440,6 +442,23 @@ pub mod import_export {
         .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
+    pub async fn create_data_archive_bounded(
+        data_dir: PathBuf,
+        artifact_path: PathBuf,
+        max_output_bytes: u64,
+    ) -> Result<(), ImportExportError> {
+        tokio::task::spawn_blocking(move || {
+            create_data_archive_bounded_blocking(
+                &data_dir,
+                &artifact_path,
+                DataArchiveSourcePolicy::Strict,
+                max_output_bytes,
+            )
+        })
+        .await
+        .map_err(|error| ImportExportError::Join(error.to_string()))?
+    }
+
     pub async fn extract_data_archive(
         artifact_path: PathBuf,
         data_parent: PathBuf,
@@ -468,6 +487,15 @@ pub mod import_export {
         artifact_path: &Path,
         policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
+        create_data_archive_bounded_blocking(data_dir, artifact_path, policy, u64::MAX)
+    }
+
+    fn create_data_archive_bounded_blocking(
+        data_dir: &Path,
+        artifact_path: &Path,
+        policy: DataArchiveSourcePolicy,
+        max_output_bytes: u64,
+    ) -> Result<(), ImportExportError> {
         let parent = artifact_path.parent().ok_or_else(|| {
             ImportExportError::InvalidArchive("artifact has no parent".to_string())
         })?;
@@ -478,7 +506,10 @@ pub mod import_export {
             .and_then(|name| name.to_str())
             .ok_or_else(|| ImportExportError::InvalidArchive("invalid data dir".to_string()))?;
         let result = (|| {
-            let encoder = GzEncoder::new(file, Compression::new(3));
+            let encoder = GzEncoder::new(
+                BoundedWriter::new(file, max_output_bytes),
+                Compression::new(3),
+            );
             let mut builder = Builder::new(encoder);
             builder.follow_symlinks(false);
             append_archive_tree(&mut builder, data_dir, Path::new(root_name), policy)?;
@@ -490,6 +521,37 @@ pub mod import_export {
             let _ = std::fs::remove_file(artifact_path);
         }
         result
+    }
+
+    struct BoundedWriter<W> {
+        inner: W,
+        remaining: u64,
+    }
+
+    impl<W> BoundedWriter<W> {
+        const fn new(inner: W, max_bytes: u64) -> Self {
+            Self {
+                inner,
+                remaining: max_bytes,
+            }
+        }
+    }
+
+    impl<W: Write> Write for BoundedWriter<W> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer.len() as u64 > self.remaining {
+                return Err(io::Error::other(
+                    "archive output exceeds configured byte limit",
+                ));
+            }
+            let written = self.inner.write(buffer)?;
+            self.remaining = self.remaining.saturating_sub(written as u64);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
     }
 
     fn extract_data_archive_blocking(
@@ -1237,6 +1299,30 @@ pub mod import_export {
         }
 
         #[test]
+        fn bounded_physical_backup_removes_partial_artifact() {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            let artifact = dir.path().join("backup.tar.gz");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("file"), b"contents").unwrap();
+
+            let error = create_data_archive_bounded_blocking(
+                &data,
+                &artifact,
+                DataArchiveSourcePolicy::Strict,
+                1,
+            )
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("archive output exceeds configured byte limit")
+            );
+            assert!(!artifact.exists());
+        }
+
+        #[test]
         fn physical_backup_reader_ignores_concurrent_file_growth() {
             use std::fs::OpenOptions;
 
@@ -1339,6 +1425,7 @@ pub mod import_export {
                 action: ImportExportAction::Export,
                 status: ImportExportStatus::Queued,
                 artifact_path: None,
+                replay_options: None,
                 error: None,
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
