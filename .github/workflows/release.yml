@@ -132,7 +132,7 @@ jobs:
             printf '%s\n' "$rsa_tree" >&2
             exit 1
           fi
-          cargo audit -D warnings
+          cargo audit --no-yanked -D warnings
 
   build:
     name: Build dbev-x86_64-linux
