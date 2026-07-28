@@ -161,13 +161,6 @@ jobs:
       - name: Build release binary
         run: |
           test "$(uname -m)" = "x86_64"
-          rustc --edition=2024 --target x86_64-unknown-linux-musl -D warnings \
-            --remap-path-prefix "$PWD"=/workspace \
-            --remap-path-prefix "$(rustc --print sysroot)"=/rust-toolchain \
-            -C linker=rust-lld -C opt-level=z -C strip=symbols -C panic=abort \
-            helpers/socket_bridge.rs -o /tmp/dbev-socket-bridge
-          expected="$(sha256sum /tmp/dbev-socket-bridge | awk '{print $1}')"
-          grep -Fq "$expected" build.rs
           cargo build --workspace --release --locked
 
       - name: Package binary
@@ -177,6 +170,7 @@ jobs:
           cp target/release/dbev dbev-x86_64-linux
           chmod 0755 dbev-x86_64-linux
           checksum="$(sha256sum dbev-x86_64-linux | awk '{print $1}')"
+          printf '%s  %s\n' "$checksum" dbev-x86_64-linux > dbev-x86_64-linux.sha256
           printf '| `%s` | `%s` |\n' dbev-x86_64-linux "$checksum" > checksum-x86_64-linux.md
 
       - name: Upload workflow artifact
@@ -185,6 +179,7 @@ jobs:
           name: dbev-x86_64-linux
           path: |
             dbev-x86_64-linux
+            dbev-x86_64-linux.sha256
             checksum-x86_64-linux.md
           if-no-files-found: error
 
@@ -226,7 +221,7 @@ jobs:
       - name: Attest release binaries
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: dist/dbev-*
+          subject-path: dist/dbev-x86_64-linux
 
       - name: Create release
         id: create_release

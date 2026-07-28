@@ -7,6 +7,10 @@ const FUSEQUOTA_COMPRESSED_SHA256: &str =
 const FUSEQUOTA_EXECUTABLE_SHA256: &str =
     "102ba39c6157469cfc2dd635f5186754a301eb09dd8904b15268d2ba1215943a";
 const SOCKET_BRIDGE_VERSION: &str = "5";
+// Pin the reviewed source and both artifact forms. Rust/LLD output is not
+// guaranteed to be byte-identical when the compiler host OS changes.
+const SOCKET_BRIDGE_SOURCE_SHA256: &str =
+    "34a06686c9a42d6f55f280d6f2bd24002152b51867cf0655d126b7e6997cfb19";
 const SOCKET_BRIDGE_COMPRESSED_SHA256: &str =
     "3e8f16c994ad8f96ecfe2b4509db2ecac4e40b7368ceb2ff5388e7f5634a4aea";
 const SOCKET_BRIDGE_EXECUTABLE_SHA256: &str =
@@ -48,6 +52,10 @@ fn verify_checked_in_socket_bridge() {
         SOCKET_BRIDGE_VERSION,
         "checked-in socket bridge version does not match the pinned build version"
     );
+
+    let source = std::fs::read("helpers/socket_bridge.rs")
+        .expect("missing checked-in helpers/socket_bridge.rs");
+    assert_digest("socket bridge source", &source, SOCKET_BRIDGE_SOURCE_SHA256);
 
     let compressed = std::fs::read(Path::new("bins/socket-bridge"))
         .expect("missing checked-in compressed bins/socket-bridge");
