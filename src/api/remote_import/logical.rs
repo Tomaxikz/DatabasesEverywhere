@@ -1073,7 +1073,6 @@ mod tests {
         std::fs::write(&input, fixture).unwrap();
         let output = std::process::Command::new("awk")
             .arg(POSTGRES_TOC_FILTER_PROGRAM)
-            .arg("--")
             .arg(&input)
             .output()
             .unwrap();
@@ -1241,7 +1240,6 @@ mod tests {
         let parse = |show_create: &str| {
             std::process::Command::new("awk")
                 .arg(CLICKHOUSE_ENGINE_AWK_PROGRAM)
-                .arg("--")
                 .arg("-")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
