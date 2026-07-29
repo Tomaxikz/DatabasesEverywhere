@@ -1,1 +1,6 @@
+/.gitattributes text eol=lf
 helpers/socket_bridge.rs text eol=lf
+*.sh text eol=lf
+.githooks/* text eol=lf
+.github/workflows/*.yml text eol=lf
+Dockerfile text eol=lf

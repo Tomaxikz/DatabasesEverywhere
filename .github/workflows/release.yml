@@ -60,6 +60,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate source, tag, and package version
         env:
@@ -113,6 +114,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -146,6 +149,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -169,9 +174,9 @@ jobs:
           mkdir -p dist
           cp target/release/dbev dbev-x86_64-linux
           chmod 0755 dbev-x86_64-linux
-          checksum="$(sha256sum dbev-x86_64-linux | awk '{print $1}')"
+          read -r checksum _ < <(sha256sum dbev-x86_64-linux)
           printf '%s  %s\n' "$checksum" dbev-x86_64-linux > dbev-x86_64-linux.sha256
-          printf '| `%s` | `%s` |\n' dbev-x86_64-linux "$checksum" > checksum-x86_64-linux.md
+          printf '| %s | %s |\n' dbev-x86_64-linux "$checksum" > checksum-x86_64-linux.md
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -239,8 +244,10 @@ jobs:
             dist/dbev-*
 
       - name: Print release URL
+        env:
+          RELEASE_URL: ${{ steps.create_release.outputs.url }}
         run: |
-          echo "Release URL: ${{ steps.create_release.outputs.url }}"
+          echo "Release URL: $RELEASE_URL"
 
   docker-image:
     name: Build Docker image
@@ -257,6 +264,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Download release binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

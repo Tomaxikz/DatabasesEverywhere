@@ -3,39 +3,95 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
     branches:
-      - "**"
+      - main
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  lint-and-test:
-    name: Lint and test
+  global_lint:
+    name: Global lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Lint GitHub Actions syntax
+        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8 # v2.1.2
+        with:
+          version: 1.7.12
+          cache: false
+          pyflakes: false
+
+      - name: Lint shell scripts
+        run: shellcheck ci/check.sh .githooks/pre-push
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Install workflow security linter
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        with:
+          tool: zizmor@1.28.0
+          fallback: none
+
+      - name: Audit GitHub Actions security
+        run: zizmor --offline --strict-collection --min-severity=medium .
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-musl
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: false
+
+      - name: Lint Rust workspace
+        run: bash ci/check.sh lint
+
+  security_audit:
+    name: Dependency security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: global_lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
         with:
           tool: cargo-audit@0.22.2
+          fallback: none
 
       - name: Audit dependencies
         run: |
@@ -47,17 +103,173 @@ jobs:
           fi
           cargo audit --no-yanked -D warnings
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+  tests:
+    name: Linux tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: global_lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
 
-      - name: Check explicit Linux target
-        run: cargo check-linux
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: tests
+          cache-on-failure: false
 
-      - name: Test
-        run: cargo test --workspace --locked
+      - name: Check and test Linux workspace
+        run: bash ci/check.sh test
 
-      - name: Release build
+  documentation:
+    name: Rust documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: global_lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: documentation
+          cache-on-failure: false
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  codeql:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: global_lint
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - rust
+          - actions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          category: /language:${{ matrix.language }}
+
+  release_build:
+    name: Release build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - security_audit
+      - tests
+      - documentation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release
+          cache-on-failure: false
+
+      - name: Build optimized binary
         run: cargo build --workspace --release --locked
+
+  ci_gate:
+    name: CI gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - global_lint
+      - security_audit
+      - tests
+      - documentation
+      - codeql
+      - release_build
+    steps:
+      - name: Require every CI stage
+        env:
+          GLOBAL_LINT_RESULT: ${{ needs.global_lint.result }}
+          SECURITY_AUDIT_RESULT: ${{ needs.security_audit.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          DOCUMENTATION_RESULT: ${{ needs.documentation.result }}
+          CODEQL_RESULT: ${{ needs.codeql.result }}
+          RELEASE_BUILD_RESULT: ${{ needs.release_build.result }}
+        run: |
+          failed=0
+          {
+            echo "## CI gate"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for stage in \
+            "global lint=$GLOBAL_LINT_RESULT" \
+            "dependency security=$SECURITY_AUDIT_RESULT" \
+            "Linux tests=$TESTS_RESULT" \
+            "Rust documentation=$DOCUMENTATION_RESULT" \
+            "CodeQL=$CODEQL_RESULT" \
+            "release build=$RELEASE_BUILD_RESULT"
+          do
+            label="${stage%%=*}"
+            result="${stage##*=}"
+            if [ "$result" = "success" ]; then
+              printf 'PASS  %s\n' "$stage"
+              printf '| %s | PASS (%s) |\n' "$label" "$result" >> "$GITHUB_STEP_SUMMARY"
+            else
+              printf 'FAIL  %s\n' "$stage" >&2
+              printf '| %s | FAIL (%s) |\n' "$label" "$result" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+          exit "$failed"

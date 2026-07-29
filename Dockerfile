@@ -4,6 +4,9 @@ LABEL org.opencontainers.image.title="DatabasesEverywhere"
 LABEL org.opencontainers.image.description="Container-backed database hosting daemon"
 LABEL org.opencontainers.image.source="https://github.com/Tomaxikz/DatabasesEverywhere"
 
+# The base image is digest-pinned; package versions intentionally follow its
+# Debian security repository instead of freezing vulnerable package revisions.
+# hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates fuse3 \
     && rm -rf /var/lib/apt/lists/* \
@@ -17,6 +20,7 @@ VOLUME ["/etc/databases-everywhere", "/var/lib/dbev", "/var/log/dbev", "/run/dbe
 
 # Root is currently required only by the FuseQuota/SYS_ADMIN deployment. The
 # Docker socket remains a root-equivalent capability; use a dedicated host/VM.
+# hadolint ignore=DL3002
 USER 0:0
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/dbev"]
