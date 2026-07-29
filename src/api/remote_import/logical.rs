@@ -1276,11 +1276,12 @@ mod tests {
             ..ImportExportSelection::default()
         };
         let maximum_output_names = output_names(Protocol::Mongodb, &maximum_selection).unwrap();
+        let maximum_directory = tempfile::tempdir().unwrap();
         let maximum_script = runtime
             .block_on(prepare_mongodb(
                 &source,
                 &maximum_selection,
-                directory.path(),
+                maximum_directory.path(),
                 &maximum_output_names,
                 37,
             ))
