@@ -44,7 +44,7 @@ case "${1:-pre-push}" in
     test_all
     ;;
   *)
-    echo "usage: ci/check.sh [lint|test|pre-push]" >&2
+    echo "usage: .github/ci/check.sh [lint|test|pre-push]" >&2
     exit 2
     ;;
 esac

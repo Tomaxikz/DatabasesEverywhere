@@ -2,13 +2,14 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ring::{
+use aws_lc_rs::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
@@ -17,7 +18,7 @@ const KEY_FILE_NAME: &str = "metadata.key";
 
 #[derive(Debug, Clone)]
 pub struct SecretStore {
-    key: LessSafeKey,
+    key: Arc<LessSafeKey>,
 }
 
 impl SecretStore {
@@ -37,7 +38,7 @@ impl SecretStore {
         let unbound = UnboundKey::new(&aead::AES_256_GCM, &key_bytes)
             .map_err(|_| SecretStoreError::Crypto("failed to initialize metadata key".into()))?;
         Ok(Self {
-            key: LessSafeKey::new(unbound),
+            key: Arc::new(LessSafeKey::new(unbound)),
         })
     }
 
@@ -249,5 +250,26 @@ mod tests {
                 .decrypt("mongodb_root_password", "inst_2", &encrypted)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn decrypts_metadata_written_by_the_legacy_ring_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(KEY_FILE_NAME),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        )
+        .unwrap();
+        let store = SecretStore::open_or_create(dir.path()).unwrap();
+
+        let plaintext = store
+            .decrypt(
+                "mongodb_root_password",
+                "inst_legacy",
+                "dbev1:AAECAwQFBgcICQoL:NGe1aaCRDgfNxd8Y9kMrXdOO6BQGgw",
+            )
+            .unwrap();
+
+        assert_eq!(plaintext, "secret");
     }
 }

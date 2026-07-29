@@ -14,13 +14,41 @@ pub const SOCKET_BRIDGE_VERSION: &str = env!("SOCKET_BRIDGE_VERSION");
 pub const SOCKET_BRIDGE_FILENAME: &str =
     concat!("dbev-socket-bridge-", env!("SOCKET_BRIDGE_VERSION"));
 const SOCKET_BRIDGE_SHA256: &str = env!("SOCKET_BRIDGE_SHA256");
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-static FUSEQUOTA_BIN: &[u8] = include_bytes!("../bins/fusequota");
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+static FUSEQUOTA_BIN: &[u8] = include_bytes!(env!("FUSEQUOTA_PAYLOAD_PATH"));
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+)))]
 static FUSEQUOTA_BIN: &[u8] = &[];
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!("../bins/socket-bridge");
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!(env!("SOCKET_BRIDGE_PAYLOAD_PATH"));
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+)))]
 static SOCKET_BRIDGE_BIN: &[u8] = &[];
 static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

@@ -766,7 +766,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
     validate_external_binary_metadata(
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
         stat.st_uid,
-        stat.st_nlink,
+        link_count_u64(stat.st_nlink),
         stat.st_mode,
     )?;
 
@@ -828,6 +828,10 @@ fn open_trusted_root_owned_directory(path: &Path) -> Result<rustix::fd::OwnedFd,
         }
     }
     Ok(directory)
+}
+
+fn link_count_u64<T: Into<u64>>(link_count: T) -> u64 {
+    link_count.into()
 }
 
 fn validate_external_binary_metadata(

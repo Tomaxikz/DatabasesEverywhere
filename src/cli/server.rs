@@ -419,7 +419,7 @@ where
 }
 
 pub(super) async fn api_rustls_config(config: &Config) -> anyhow::Result<RustlsConfig> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     if !config.api.ssl.require_client_cert {
         return RustlsConfig::from_pem_file(&config.api.ssl.cert, &config.api.ssl.key)
             .await

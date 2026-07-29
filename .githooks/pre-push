@@ -2,4 +2,4 @@
 set -euo pipefail
 
 repository_root="$(git rev-parse --show-toplevel)"
-exec bash "$repository_root/ci/check.sh" pre-push
+exec bash "$repository_root/.github/ci/check.sh" pre-push

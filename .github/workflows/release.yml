@@ -22,8 +22,13 @@ on:
         required: true
         default: false
         type: boolean
+      release_notes_file:
+        description: "Committed Markdown file for the full changelog, for example release-notes/v0.3.3.md"
+        required: false
+        default: ""
+        type: string
       release_notes:
-        description: "Release notes shown on GitHub"
+        description: "Short inline release notes (use release_notes_file for a full changelog)"
         required: false
         default: ""
         type: string
@@ -138,13 +143,26 @@ jobs:
           cargo audit --no-yanked -D warnings
 
   build:
-    name: Build dbev-x86_64-linux
+    name: Build dbev-${{ matrix.asset_arch }}-linux
     # Keep the release glibc baseline compatible with Debian bookworm (the
     # runtime image) and other supported glibc 2.35+ hosts.
     runs-on: ubuntu-22.04
     needs: security-audit
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - asset_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
+          - asset_arch: riscv64
+            rust_target: riscv64gc-unknown-linux-gnu
+            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
 
     steps:
       - name: Checkout
@@ -156,36 +174,51 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.95.0
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Install cross compiler
+        if: matrix.asset_arch != 'x86_64'
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+          case "$ASSET_ARCH" in
+            arm64)
+              packages=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu)
+              ;;
+            riscv64)
+              packages=(gcc-riscv64-linux-gnu g++-riscv64-linux-gnu)
+              ;;
+            *)
+              echo "unsupported cross-compiler architecture: $ASSET_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends "${packages[@]}"
+
+      - name: Install Zig for the RISC-V static helper
+        if: matrix.asset_arch == 'riscv64'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: release-x86_64-linux
+          key: release-${{ matrix.asset_arch }}-linux
 
       - name: Build release binary
-        run: |
-          test "$(uname -m)" = "x86_64"
-          cargo build --workspace --release --locked
-
-      - name: Package binary
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp target/release/dbev dbev-x86_64-linux
-          chmod 0755 dbev-x86_64-linux
-          read -r checksum _ < <(sha256sum dbev-x86_64-linux)
-          printf '%s  %s\n' "$checksum" dbev-x86_64-linux > dbev-x86_64-linux.sha256
-          printf '| %s | %s |\n' dbev-x86_64-linux "$checksum" > checksum-x86_64-linux.md
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dbev-x86_64-linux
-          path: |
-            dbev-x86_64-linux
-            dbev-x86_64-linux.sha256
-            checksum-x86_64-linux.md
+          name: dbev-${{ matrix.asset_arch }}-linux
+          path: target/release-artifacts/dbev-${{ matrix.asset_arch }}-linux
           if-no-files-found: error
 
   github-release:
@@ -201,6 +234,11 @@ jobs:
       - build
     if: ${{ inputs.create_github_release }}
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -210,23 +248,52 @@ jobs:
       - name: Build release body
         env:
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          RELEASE_NOTES_FILE: ${{ inputs.release_notes_file }}
         run: |
           set -euo pipefail
-          {
-            if [ -n "$RELEASE_NOTES" ]; then
-              printf '%s\n\n' "$RELEASE_NOTES"
+
+          if [ -n "$RELEASE_NOTES" ] && [ -n "$RELEASE_NOTES_FILE" ]; then
+            echo "set either release_notes or release_notes_file, not both" >&2
+            exit 1
+          fi
+
+          if [ -n "$RELEASE_NOTES_FILE" ]; then
+            if [[ "$RELEASE_NOTES_FILE" == *$'\r'* || "$RELEASE_NOTES_FILE" == *$'\n'* ]]; then
+              echo "release_notes_file must not contain CR or LF characters" >&2
+              exit 1
             fi
-            echo "## Checksums"
-            echo
-            echo "| Asset | SHA256 |"
-            echo "| --- | --- |"
-            cat dist/checksum-*.md | sort
-          } > release-body.md
+            if [[ "$RELEASE_NOTES_FILE" = /* ]]; then
+              echo "release_notes_file must be relative to the repository" >&2
+              exit 1
+            fi
+
+            workspace="$(realpath --canonicalize-existing "$GITHUB_WORKSPACE")"
+            if ! notes_path="$(realpath --canonicalize-existing "$workspace/$RELEASE_NOTES_FILE" 2>/dev/null)"; then
+              echo "release_notes_file does not exist in the selected release commit" >&2
+              exit 1
+            fi
+            case "$notes_path" in
+              "$workspace"/*) ;;
+              *)
+                echo "release_notes_file resolves outside the repository" >&2
+                exit 1
+                ;;
+            esac
+            if [ ! -f "$notes_path" ] || [ ! -s "$notes_path" ]; then
+              echo "release_notes_file must point to a non-empty regular file" >&2
+              exit 1
+            fi
+            cp -- "$notes_path" release-body.md
+          elif [ -n "$RELEASE_NOTES" ]; then
+            printf '%s\n' "$RELEASE_NOTES" > release-body.md
+          else
+            : > release-body.md
+          fi
 
       - name: Attest release binaries
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: dist/dbev-x86_64-linux
+          subject-path: dist/dbev-*-linux
 
       - name: Create release
         id: create_release
@@ -236,12 +303,13 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: DatabasesEverywhere ${{ inputs.version }}
           body_path: release-body.md
+          generate_release_notes: ${{ inputs.release_notes_file == '' && inputs.release_notes == '' }}
           draft: ${{ inputs.draft }}
           prerelease: ${{ inputs.prerelease }}
           make_latest: ${{ inputs.prerelease && 'false' || 'true' }}
           fail_on_unmatched_files: true
           files: |
-            dist/dbev-*
+            dist/dbev-*-linux
 
       - name: Print release URL
         env:

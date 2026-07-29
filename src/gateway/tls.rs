@@ -38,7 +38,7 @@ pub enum GatewayTlsError {
 }
 
 pub fn acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, GatewayTlsError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
     let config = rustls::ServerConfig::builder()

@@ -40,7 +40,7 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck ci/check.sh .githooks/pre-push
+        run: shellcheck .github/ci/check.sh .github/ci/build-release-target.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
@@ -69,7 +69,7 @@ jobs:
           cache-on-failure: false
 
       - name: Lint Rust workspace
-        run: bash ci/check.sh lint
+        run: bash .github/ci/check.sh lint
 
   security_audit:
     name: Dependency security
@@ -126,7 +126,7 @@ jobs:
           cache-on-failure: false
 
       - name: Check and test Linux workspace
-        run: bash ci/check.sh test
+        run: bash .github/ci/check.sh test
 
   documentation:
     name: Rust documentation
@@ -196,13 +196,26 @@ jobs:
           category: /language:${{ matrix.language }}
 
   release_build:
-    name: Release build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Release build (${{ matrix.asset_arch }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     needs:
       - security_audit
       - tests
       - documentation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - asset_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
+          - asset_arch: riscv64
+            rust_target: riscv64gc-unknown-linux-gnu
+            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -213,15 +226,46 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.95.0
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Install cross compiler
+        if: matrix.asset_arch != 'x86_64'
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+          case "$ASSET_ARCH" in
+            arm64)
+              packages=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu)
+              ;;
+            riscv64)
+              packages=(gcc-riscv64-linux-gnu g++-riscv64-linux-gnu)
+              ;;
+            *)
+              echo "unsupported cross-compiler architecture: $ASSET_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends "${packages[@]}"
+
+      - name: Install Zig for the RISC-V static helper
+        if: matrix.asset_arch == 'riscv64'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: release
+          key: release-${{ matrix.asset_arch }}
           cache-on-failure: false
 
       - name: Build optimized binary
-        run: cargo build --workspace --release --locked
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"
 
   ci_gate:
     name: CI gate
