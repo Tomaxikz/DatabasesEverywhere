@@ -27,7 +27,14 @@ that gate fails when any required stage fails or is skipped.
 
 ## Release notes
 
-For a full GitHub release changelog, copy `release-notes/TEMPLATE.md` to a
-versioned file such as `release-notes/v0.3.3.md`, edit it, commit it, and enter
-that path in the release workflow's `release_notes_file` input. The shorter
-`release_notes` input remains available for a one-line release description.
+GitHub generates release notes automatically when the optional `release_notes`
+input is empty. GitHub's web form renders workflow string inputs on one line;
+to provide a complete multiline Markdown body without committing a notes file,
+use the GitHub CLI:
+
+```bash
+gh workflow run release.yml --ref main -f version=v0.3.3 \
+  -F release_notes=@CHANGELOG.md
+```
+
+`CHANGELOG.md` may be any local file and does not need to be committed.

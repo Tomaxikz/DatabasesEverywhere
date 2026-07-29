@@ -22,13 +22,8 @@ on:
         required: true
         default: false
         type: boolean
-      release_notes_file:
-        description: "Committed Markdown file for the full changelog, for example release-notes/v0.3.3.md"
-        required: false
-        default: ""
-        type: string
       release_notes:
-        description: "Short inline release notes (use release_notes_file for a full changelog)"
+        description: "Full Markdown release notes (use the GitHub CLI or API for multiple lines)"
         required: false
         default: ""
         type: string
@@ -234,11 +229,6 @@ jobs:
       - build
     if: ${{ inputs.create_github_release }}
     steps:
-      - name: Checkout release notes
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -248,43 +238,10 @@ jobs:
       - name: Build release body
         env:
           RELEASE_NOTES: ${{ inputs.release_notes }}
-          RELEASE_NOTES_FILE: ${{ inputs.release_notes_file }}
         run: |
           set -euo pipefail
 
-          if [ -n "$RELEASE_NOTES" ] && [ -n "$RELEASE_NOTES_FILE" ]; then
-            echo "set either release_notes or release_notes_file, not both" >&2
-            exit 1
-          fi
-
-          if [ -n "$RELEASE_NOTES_FILE" ]; then
-            if [[ "$RELEASE_NOTES_FILE" == *$'\r'* || "$RELEASE_NOTES_FILE" == *$'\n'* ]]; then
-              echo "release_notes_file must not contain CR or LF characters" >&2
-              exit 1
-            fi
-            if [[ "$RELEASE_NOTES_FILE" = /* ]]; then
-              echo "release_notes_file must be relative to the repository" >&2
-              exit 1
-            fi
-
-            workspace="$(realpath --canonicalize-existing "$GITHUB_WORKSPACE")"
-            if ! notes_path="$(realpath --canonicalize-existing "$workspace/$RELEASE_NOTES_FILE" 2>/dev/null)"; then
-              echo "release_notes_file does not exist in the selected release commit" >&2
-              exit 1
-            fi
-            case "$notes_path" in
-              "$workspace"/*) ;;
-              *)
-                echo "release_notes_file resolves outside the repository" >&2
-                exit 1
-                ;;
-            esac
-            if [ ! -f "$notes_path" ] || [ ! -s "$notes_path" ]; then
-              echo "release_notes_file must point to a non-empty regular file" >&2
-              exit 1
-            fi
-            cp -- "$notes_path" release-body.md
-          elif [ -n "$RELEASE_NOTES" ]; then
+          if [ -n "$RELEASE_NOTES" ]; then
             printf '%s\n' "$RELEASE_NOTES" > release-body.md
           else
             : > release-body.md
@@ -303,7 +260,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: DatabasesEverywhere ${{ inputs.version }}
           body_path: release-body.md
-          generate_release_notes: ${{ inputs.release_notes_file == '' && inputs.release_notes == '' }}
+          generate_release_notes: ${{ inputs.release_notes == '' }}
           draft: ${{ inputs.draft }}
           prerelease: ${{ inputs.prerelease }}
           make_latest: ${{ inputs.prerelease && 'false' || 'true' }}

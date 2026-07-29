@@ -225,6 +225,7 @@ impl BenchClient {
         concurrency: usize,
         insecure_tls: bool,
     ) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         validate_base_url(base_url)?;
         let host_header = host_header
             .map(HeaderValue::from_str)
