@@ -435,6 +435,7 @@ components:
           default: full
         include:
           type: array
+          description: Required and non-empty when mode is selective. MongoDB credential imports accept multiple collection names; MongoDB exports accept exactly one.
           items:
             type: string
         exclude:

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::{Component, Path as FsPath, PathBuf},
     time::{Duration, Instant},
@@ -876,10 +876,15 @@ async fn import_instance_source(
                         &metadata.database.name,
                     )
                     .await?;
-                    let result = import_logical_with_rollback(
+                    let artifact_paths = staged
+                        .paths
+                        .iter()
+                        .map(PathBuf::as_path)
+                        .collect::<Vec<_>>();
+                    let result = import_logical_artifacts_with_rollback(
                         state,
                         &metadata,
-                        &staged.path,
+                        &artifact_paths,
                         options,
                         staged.source_database.as_deref(),
                         Some(state.config.security.remote_import.max_staged_bytes),
@@ -947,6 +952,30 @@ async fn import_logical_with_rollback(
     source_database: Option<&str>,
     staging_limit: Option<u64>,
 ) -> Result<(), ApiError> {
+    import_logical_artifacts_with_rollback(
+        state,
+        metadata,
+        &[artifact_path],
+        options,
+        source_database,
+        staging_limit,
+    )
+    .await
+}
+
+async fn import_logical_artifacts_with_rollback(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    artifact_paths: &[&FsPath],
+    options: &ImportOptions,
+    source_database: Option<&str>,
+    staging_limit: Option<u64>,
+) -> Result<(), ApiError> {
+    if artifact_paths.is_empty() {
+        return Err(ApiError::Runtime(
+            "logical import did not contain any artifacts".to_string(),
+        ));
+    }
     let remote_exec_timeout = staging_limit.map(|_| {
         Duration::from_secs(
             state
@@ -961,38 +990,62 @@ async fn import_logical_with_rollback(
     // selection would reject it or filter it a second time.
     let mut apply_options = options.clone();
     apply_options.selection = ImportExportSelection::default();
-    let prepared = prepare_logical_import(
-        state,
-        metadata,
-        metadata.protocol,
-        artifact_path,
-        &apply_options,
-        LogicalImportControls {
-            source_database,
-            reuse_staged_artifact: staging_limit.is_some(),
-            exec_timeout: remote_exec_timeout,
-            remove_uploaded_source_limit: staging_limit,
-            ..LogicalImportControls::default()
-        },
-    )
-    .await?;
-    let rollback_limit = match staging_limit {
-        Some(limit) => match prepared.removed_host_source_bytes {
-            Some(source_bytes) => Some(limit.saturating_sub(source_bytes)),
-            None => {
-                cleanup_prepared_logical_import(state, metadata, &prepared).await;
-                return Err(ApiError::Runtime(
-                    "remote import source staging accounting was unavailable".to_string(),
-                ));
-            }
-        },
-        None => None,
+    let controls = LogicalImportControls {
+        source_database,
+        reuse_staged_artifact: staging_limit.is_some(),
+        exec_timeout: remote_exec_timeout,
+        remove_uploaded_source_limit: staging_limit,
+        ..LogicalImportControls::default()
     };
+    let mut prepared = Vec::with_capacity(artifact_paths.len());
+    for artifact_path in artifact_paths {
+        match prepare_logical_import(
+            state,
+            metadata,
+            metadata.protocol,
+            artifact_path,
+            &apply_options,
+            controls,
+        )
+        .await
+        {
+            Ok(artifact) => prepared.push(artifact),
+            Err(error) => {
+                cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+                return Err(error);
+            }
+        }
+    }
+    let retained_source_bytes = match staging_limit {
+        Some(limit) => {
+            let mut total = 0_u64;
+            for artifact in &prepared {
+                let Some(source_bytes) = artifact.removed_host_source_bytes else {
+                    cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+                    return Err(ApiError::Runtime(
+                        "remote import source staging accounting was unavailable".to_string(),
+                    ));
+                };
+                total = match total.checked_add(source_bytes) {
+                    Some(total) if total <= limit => total,
+                    _ => {
+                        cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+                        return Err(ApiError::BadRequest(format!(
+                            "remote import sources exceed the configured staging limit of {limit} bytes"
+                        )));
+                    }
+                };
+            }
+            total
+        }
+        None => 0,
+    };
+    let rollback_limit = staging_limit.map(|limit| limit - retained_source_bytes);
 
     let rollback_root = match logical_staging_root(state).await {
         Ok(root) => root,
         Err(error) => {
-            cleanup_prepared_logical_import(state, metadata, &prepared).await;
+            cleanup_prepared_logical_imports(state, metadata, &prepared).await;
             return Err(error);
         }
     };
@@ -1017,36 +1070,34 @@ async fn import_logical_with_rollback(
     )
     .await
     {
-        cleanup_prepared_logical_import(state, metadata, &prepared).await;
+        cleanup_prepared_logical_imports(state, metadata, &prepared).await;
         cleanup_path(&rollback_path).await;
         return Err(error);
     }
-    if let Some(limit) = staging_limit {
-        let retained_source_bytes = prepared.removed_host_source_bytes.unwrap_or_default();
-        if let Err(error) = ensure_remote_import_staging_budget_with_retained_bytes(
+    if let Some(limit) = staging_limit
+        && let Err(error) = ensure_remote_import_staging_budget_with_retained_bytes(
             &[&rollback_path],
             retained_source_bytes,
             limit,
         )
         .await
-        {
-            cleanup_prepared_logical_import(state, metadata, &prepared).await;
-            cleanup_path(&rollback_path).await;
-            return Err(error);
-        }
+    {
+        cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+        cleanup_path(&rollback_path).await;
+        return Err(error);
     }
     if let Err(error) =
         write_logical_recovery_manifest(&recovery_manifest, metadata, &rollback_path, options.mode)
             .await
     {
-        cleanup_prepared_logical_import(state, metadata, &prepared).await;
+        cleanup_prepared_logical_imports(state, metadata, &prepared).await;
         cleanup_path(&rollback_path).await;
         return Err(error);
     }
 
     let primary =
-        apply_prepared_logical_import(state, metadata, &prepared, apply_options.mode).await;
-    cleanup_prepared_logical_import(state, metadata, &prepared).await;
+        apply_prepared_logical_imports(state, metadata, &prepared, apply_options.mode).await;
+    cleanup_prepared_logical_imports(state, metadata, &prepared).await;
     if primary.is_ok() {
         if let Err(error) = commit_recovery_manifest(&recovery_manifest).await {
             let quarantine = quarantine_after_uncertain_import(state, &metadata.instance_id).await;
@@ -1688,33 +1739,70 @@ async fn apply_prepared_logical_import(
     prepared: &PreparedLogicalImport,
     mode: ImportMode,
 ) -> Result<(), ApiError> {
+    apply_prepared_logical_imports(state, metadata, std::slice::from_ref(prepared), mode).await
+}
+
+async fn apply_prepared_logical_imports(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    prepared: &[PreparedLogicalImport],
+    mode: ImportMode,
+) -> Result<(), ApiError> {
+    let first = prepared.first().ok_or_else(|| {
+        ApiError::Runtime("logical import did not contain any prepared artifacts".to_string())
+    })?;
+    if prepared.iter().any(|artifact| {
+        artifact.protocol != metadata.protocol
+            || artifact.exec_timeout != first.exec_timeout
+            || artifact.database_definition_in_dump != first.database_definition_in_dump
+    }) {
+        return Err(ApiError::Runtime(
+            "logical import artifacts had inconsistent execution controls".to_string(),
+        ));
+    }
     let instance_id = &metadata.instance_id;
     if mode == ImportMode::Wipe {
         wipe_logical_target(
             state,
             metadata,
-            prepared.exec_timeout,
-            prepared.database_definition_in_dump,
+            first.exec_timeout,
+            first.database_definition_in_dump,
         )
         .await?;
     }
-    let result = match prepared.exec_timeout {
-        Some(timeout) => {
-            state
-                .docker
-                .exec_shell_with_timeout(prepared.protocol, instance_id, &prepared.script, timeout)
-                .await
-        }
-        None => {
-            state
-                .docker
-                .exec_shell(prepared.protocol, instance_id, &prepared.script)
-                .await
-        }
-    };
-    result
-        .map_err(|error| ApiError::Runtime(error.to_string()))
-        .map(|_| ())
+    let import_started = Instant::now();
+    for artifact in prepared {
+        let result = match artifact.exec_timeout {
+            Some(timeout) => {
+                let remaining = timeout
+                    .checked_sub(import_started.elapsed())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| {
+                        ApiError::Runtime(format!(
+                            "{} import timed out while applying multiple artifacts",
+                            metadata.protocol.as_str()
+                        ))
+                    })?;
+                state
+                    .docker
+                    .exec_shell_with_timeout(
+                        artifact.protocol,
+                        instance_id,
+                        &artifact.script,
+                        remaining,
+                    )
+                    .await
+            }
+            None => {
+                state
+                    .docker
+                    .exec_shell(artifact.protocol, instance_id, &artifact.script)
+                    .await
+            }
+        };
+        result.map_err(|error| ApiError::Runtime(error.to_string()))?;
+    }
+    Ok(())
 }
 
 async fn cleanup_prepared_logical_import(
@@ -1731,6 +1819,16 @@ async fn cleanup_prepared_logical_import(
     .await;
     if prepared.owns_host_temp {
         cleanup_path(&prepared.host_temp).await;
+    }
+}
+
+async fn cleanup_prepared_logical_imports(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    prepared: &[PreparedLogicalImport],
+) {
+    for artifact in prepared {
+        cleanup_prepared_logical_import(state, metadata, artifact).await;
     }
 }
 
@@ -2225,16 +2323,21 @@ fn validate_selection(
             for item in selection.include.iter().chain(selection.exclude.iter()) {
                 validate_simple_identifier("mongodb collection", item)?;
             }
-            if selection.include.len() != 1 {
+            let mut included_collections = HashSet::with_capacity(selection.include.len());
+            if let Some(duplicate) = selection
+                .include
+                .iter()
+                .find(|collection| !included_collections.insert(collection.as_str()))
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "mongodb selection includes collection {duplicate} more than once"
+                )));
+            }
+            if matches!(use_case, SelectionUse::Export) && selection.include.len() != 1 {
                 return Err(ApiError::NotImplemented(format!(
                     "mongodb selective {} currently supports exactly one included collection",
                     selection_use_name(use_case)
                 )));
-            }
-            if selection.exclude.contains(&selection.include[0]) {
-                return Err(ApiError::BadRequest(
-                    "mongodb selection cannot include and exclude the same collection".to_string(),
-                ));
             }
             if !selection.fields.is_empty() {
                 return Err(ApiError::NotImplemented(
@@ -4081,6 +4184,37 @@ mod tests {
         assert!(!args.contains("--excludeCollection"));
         assert!(!args.contains("--nsInclude"));
         assert!(!args.contains("--nsExclude"));
+    }
+
+    #[test]
+    fn mongodb_remote_import_accepts_multiple_collections_but_export_stays_single_collection() {
+        let selection = ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: vec!["orders".to_string(), "customers".to_string()],
+            ..ImportExportSelection::default()
+        };
+
+        validate_selection(Protocol::Mongodb, &selection, SelectionUse::Import).unwrap();
+        let export_error =
+            validate_selection(Protocol::Mongodb, &selection, SelectionUse::Export).unwrap_err();
+        assert!(
+            export_error
+                .to_string()
+                .contains("exactly one included collection")
+        );
+    }
+
+    #[test]
+    fn mongodb_selection_rejects_duplicate_included_collections() {
+        let selection = ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: vec!["orders".to_string(), "orders".to_string()],
+            ..ImportExportSelection::default()
+        };
+
+        let error =
+            validate_selection(Protocol::Mongodb, &selection, SelectionUse::Import).unwrap_err();
+        assert!(error.to_string().contains("more than once"));
     }
 
     #[tokio::test]

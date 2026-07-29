@@ -21,7 +21,7 @@ pub(super) async fn run_helper(
     selection: &ImportExportSelection,
     target_username: &str,
     work_dir: &Path,
-    output_name: &str,
+    output_names: &[String],
 ) -> Result<(), ApiError> {
     let connect_timeout_seconds = state.config.security.remote_import.connect_timeout_seconds;
     let image = state
@@ -51,7 +51,14 @@ pub(super) async fn run_helper(
             .await?
         }
         Protocol::Mongodb => {
-            prepare_mongodb(source, selection, work_dir, connect_timeout_seconds).await?
+            prepare_mongodb(
+                source,
+                selection,
+                work_dir,
+                output_names,
+                connect_timeout_seconds,
+            )
+            .await?
         }
         Protocol::Clickhouse => {
             prepare_clickhouse(source, selection, work_dir, connect_timeout_seconds).await?
@@ -63,7 +70,11 @@ pub(super) async fn run_helper(
             )));
         }
     };
-    debug_assert!(script.contains(output_name));
+    debug_assert!(
+        output_names
+            .iter()
+            .all(|output_name| script.contains(output_name))
+    );
 
     let spec = RemoteImportHelperSpec {
         image,
@@ -83,6 +94,35 @@ pub(super) async fn run_helper(
         Ok(_) => Ok(()),
         Err(error) => Err(remote_helper_error(protocol, &error)),
     }
+}
+
+pub(super) fn output_names(
+    protocol: Protocol,
+    selection: &ImportExportSelection,
+) -> Result<Vec<String>, ApiError> {
+    let names = match protocol {
+        Protocol::Postgres => vec!["source.postgres.sql".to_string()],
+        Protocol::Mariadb => vec!["source.mariadb.sql".to_string()],
+        Protocol::Mysql => vec!["source.mysql.sql".to_string()],
+        Protocol::Clickhouse => vec!["source.clickhouse.sql".to_string()],
+        Protocol::Mongodb => {
+            let collection_count = mongodb_selected_collections(selection)?.len();
+            if collection_count == 1 {
+                vec!["source.mongodb.archive.gz".to_string()]
+            } else {
+                (0..collection_count)
+                    .map(|index| format!("source.mongodb.{index:04}.archive.gz"))
+                    .collect()
+            }
+        }
+        Protocol::Redis | Protocol::Qdrant => {
+            return Err(ApiError::BadRequest(format!(
+                "{} cannot be acquired as a logical dump",
+                protocol.as_str()
+            )));
+        }
+    };
+    Ok(names)
 }
 
 fn remote_helper_error(protocol: Protocol, error: &DockerError) -> ApiError {
@@ -273,10 +313,16 @@ async fn prepare_mongodb(
     source: &RemoteImportSource,
     selection: &ImportExportSelection,
     work_dir: &Path,
+    output_names: &[String],
     connect_timeout_seconds: u64,
 ) -> Result<String, ApiError> {
     let database = required(source.database.as_deref(), "source.database")?;
-    let filters = mongodb_selection_args(selection)?;
+    let collections = mongodb_selected_collections(selection)?;
+    if collections.len() != output_names.len() {
+        return Err(ApiError::Runtime(
+            "mongodb remote import output plan did not match its collection selection".to_string(),
+        ));
+    }
     let host = if source.endpoint.host.contains(':') {
         format!("[{}]", source.endpoint.host)
     } else {
@@ -308,16 +354,20 @@ async fn prepare_mongodb(
                 .unwrap_or(database),
         ));
     }
-    Ok(format!(
-        r#"set -eu
-umask 077
-mongodump \
-  --config /work/mongodump.yml \
-  --db {}{authentication}{filters} \
-  --archive=/work/source.mongodb.archive.gz --gzip
-"#,
+    let mut script = format!(
+        "set -eu\numask 077\ndump_collection() {{\n  mongodump --config /work/mongodump.yml --db {}{authentication} \"$@\" --gzip\n}}\n",
         sh_quote(database),
-    ))
+    );
+    for (collection, output_name) in collections.into_iter().zip(output_names) {
+        let collection = collection
+            .map(|collection| format!(" --collection={}", sh_quote(collection)))
+            .unwrap_or_default();
+        script.push_str(&format!(
+            "dump_collection{collection} --archive={}\n",
+            sh_quote(&format!("/work/{output_name}")),
+        ));
+    }
+    Ok(script)
 }
 
 #[derive(Serialize)]
@@ -641,25 +691,31 @@ fn postgres_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn mongodb_selection_args(selection: &ImportExportSelection) -> Result<String, ApiError> {
+fn mongodb_selected_collections(
+    selection: &ImportExportSelection,
+) -> Result<Vec<Option<&str>>, ApiError> {
     if selection.mode == SelectionMode::Full {
-        return Ok(String::new());
+        return Ok(vec![None]);
     }
-    if selection.include.len() != 1 {
-        return Err(ApiError::NotImplemented(
-            "mongodb remote selective import currently supports exactly one included collection"
-                .to_string(),
-        ));
-    }
-    if selection.exclude.contains(&selection.include[0]) {
+    if selection.include.is_empty() {
         return Err(ApiError::BadRequest(
-            "mongodb remote selection cannot include and exclude the same collection".to_string(),
+            "mongodb remote selective import requires at least one included collection".to_string(),
         ));
     }
-    let mut args = String::new();
-    args.push_str(" --collection=");
-    args.push_str(&sh_quote(&selection.include[0]));
-    Ok(args)
+    if let Some(overlap) = selection
+        .include
+        .iter()
+        .find(|collection| selection.exclude.contains(*collection))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "mongodb remote selection cannot include and exclude the same collection: {overlap}"
+        )));
+    }
+    Ok(selection
+        .include
+        .iter()
+        .map(|collection| Some(collection.as_str()))
+        .collect())
 }
 
 fn clickhouse_table_selection(selection: &ImportExportSelection) -> (String, String) {
@@ -1121,34 +1177,43 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_selection_uses_supported_collection_flags() {
+    fn mongodb_output_plan_supports_multiple_collections() {
         let selection = ImportExportSelection {
             mode: SelectionMode::Selective,
-            include: vec!["orders".to_string()],
+            include: vec!["orders".to_string(), "customers".to_string()],
             exclude: vec!["audit".to_string()],
             ..ImportExportSelection::default()
         };
 
-        let args = mongodb_selection_args(&selection).unwrap();
+        let collections = mongodb_selected_collections(&selection).unwrap();
+        let names = output_names(Protocol::Mongodb, &selection).unwrap();
 
-        assert!(args.contains("--collection='orders'"));
-        assert!(!args.contains("--excludeCollection"));
-        assert!(!args.contains("--nsInclude"));
-        assert!(!args.contains("--nsExclude"));
+        assert_eq!(collections, vec![Some("orders"), Some("customers")]);
+        assert_eq!(
+            names,
+            vec![
+                "source.mongodb.0000.archive.gz",
+                "source.mongodb.0001.archive.gz"
+            ]
+        );
     }
 
     #[test]
-    fn mongodb_selection_rejects_multiple_included_collections() {
+    fn mongodb_output_plan_keeps_the_single_archive_name() {
         let selection = ImportExportSelection {
             mode: SelectionMode::Selective,
-            include: vec!["orders".to_string(), "customers".to_string()],
+            include: vec!["orders".to_string()],
             ..ImportExportSelection::default()
         };
 
-        assert!(matches!(
-            mongodb_selection_args(&selection),
-            Err(ApiError::NotImplemented(_))
-        ));
+        assert_eq!(
+            output_names(Protocol::Mongodb, &selection).unwrap(),
+            vec!["source.mongodb.archive.gz"]
+        );
+        assert_eq!(
+            output_names(Protocol::Mongodb, &ImportExportSelection::default()).unwrap(),
+            vec!["source.mongodb.archive.gz"]
+        );
     }
 
     #[test]
@@ -1172,12 +1237,19 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let selection = ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: vec!["orders".to_string(), "customers".to_string()],
+            ..ImportExportSelection::default()
+        };
+        let planned_output_names = output_names(Protocol::Mongodb, &selection).unwrap();
 
         let script = runtime
             .block_on(prepare_mongodb(
                 &source,
-                &ImportExportSelection::default(),
+                &selection,
                 directory.path(),
+                &planned_output_names,
                 37,
             ))
             .unwrap();
@@ -1189,6 +1261,37 @@ mod tests {
         assert!(client_config.contains("serverSelectionTimeoutMS=37000"));
         assert!(client_config.contains("tls=true"));
         assert!(!script.contains("secret"));
+        assert_eq!(script.matches("mongodump ").count(), 1);
+        assert_eq!(script.matches("dump_collection --collection=").count(), 2);
+        assert!(script.contains("--collection='orders'"));
+        assert!(script.contains("--collection='customers'"));
+        assert!(script.contains("/work/source.mongodb.0000.archive.gz"));
+        assert!(script.contains("/work/source.mongodb.0001.archive.gz"));
+
+        let maximum_selection = ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: (0..512)
+                .map(|index| format!("collection_{index:04}_{}", "x".repeat(110)))
+                .collect(),
+            ..ImportExportSelection::default()
+        };
+        let maximum_output_names = output_names(Protocol::Mongodb, &maximum_selection).unwrap();
+        let maximum_script = runtime
+            .block_on(prepare_mongodb(
+                &source,
+                &maximum_selection,
+                directory.path(),
+                &maximum_output_names,
+                37,
+            ))
+            .unwrap();
+        assert_eq!(
+            maximum_script
+                .matches("dump_collection --collection=")
+                .count(),
+            512
+        );
+        assert!(maximum_script.len() < 256 * 1024);
     }
 
     #[test]

@@ -383,7 +383,7 @@ pub(crate) struct StaleRemoteCredentialCleanup {
 
 #[derive(Debug)]
 pub(crate) struct StagedRemoteDump {
-    pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
     pub source_database: Option<String>,
     staging: RemoteStagingGuard,
     _permit: RemoteImportPermit,
@@ -414,15 +414,11 @@ pub(crate) async fn acquire_logical_dump(
         .await;
     let root = remote_staging_directory(state).await?;
     let mut staging = RemoteStagingGuard::new(root.clone());
-    let output_name = match protocol {
-        Protocol::Postgres => "source.postgres.sql",
-        Protocol::Mariadb => "source.mariadb.sql",
-        Protocol::Mysql => "source.mysql.sql",
-        Protocol::Mongodb => "source.mongodb.archive.gz",
-        Protocol::Clickhouse => "source.clickhouse.sql",
-        Protocol::Redis | Protocol::Qdrant => unreachable!(),
-    };
-    let output = root.join(output_name);
+    let output_names = logical::output_names(protocol, selection)?;
+    let outputs = output_names
+        .iter()
+        .map(|output_name| root.join(output_name))
+        .collect::<Vec<_>>();
     let helper_result = logical::run_helper(
         state,
         protocol,
@@ -430,7 +426,7 @@ pub(crate) async fn acquire_logical_dump(
         selection,
         target_username,
         &root,
-        output_name,
+        &output_names,
     )
     .await;
     let credential_cleanup = remove_remote_credential_files(&root).await;
@@ -450,6 +446,7 @@ pub(crate) async fn acquire_logical_dump(
         return Err(error);
     }
     if matches!(protocol, Protocol::Mariadb | Protocol::Mysql) {
+        let output = &outputs[0];
         let Some(source_database) = source.database.as_deref() else {
             staging.cleanup().await;
             return Err(ApiError::BadRequest(format!(
@@ -458,7 +455,7 @@ pub(crate) async fn acquire_logical_dump(
             )));
         };
         if let Err(error) = mysql_sql::rewrite_mysql_schema_qualifiers(
-            &output,
+            output,
             source_database,
             target_database,
             state.config.security.remote_import.max_staged_bytes,
@@ -470,6 +467,7 @@ pub(crate) async fn acquire_logical_dump(
         }
     }
     if protocol == Protocol::Clickhouse {
+        let output = &outputs[0];
         let Some(source_database) = source.database.as_deref() else {
             staging.cleanup().await;
             return Err(ApiError::BadRequest(
@@ -477,7 +475,7 @@ pub(crate) async fn acquire_logical_dump(
             ));
         };
         if let Err(error) = mysql_sql::rewrite_clickhouse_schema_qualifiers(
-            &output,
+            output,
             source_database,
             target_database,
             state.config.security.remote_import.max_staged_bytes,
@@ -488,17 +486,28 @@ pub(crate) async fn acquire_logical_dump(
             return Err(error);
         }
     }
-    if let Err(error) = validate_staged_file(
-        &output,
-        state.config.security.remote_import.max_staged_bytes,
-    )
-    .await
-    {
-        staging.cleanup().await;
-        return Err(error);
+    let max_staged_bytes = state.config.security.remote_import.max_staged_bytes;
+    let mut total_staged_bytes = 0_u64;
+    for output in &outputs {
+        let staged_bytes = match validate_staged_file(output, max_staged_bytes).await {
+            Ok(staged_bytes) => staged_bytes,
+            Err(error) => {
+                staging.cleanup().await;
+                return Err(error);
+            }
+        };
+        total_staged_bytes = match total_staged_bytes.checked_add(staged_bytes) {
+            Some(total) if total <= max_staged_bytes => total,
+            _ => {
+                staging.cleanup().await;
+                return Err(ApiError::BadRequest(format!(
+                    "remote database dumps exceed the node staging limit of {max_staged_bytes} bytes"
+                )));
+            }
+        };
     }
     Ok(StagedRemoteDump {
-        path: output,
+        paths: outputs,
         source_database: source.database.clone(),
         staging,
         _permit: permit,
@@ -854,7 +863,7 @@ async fn sync_recovery_file(path: &Path) -> Result<(), ApiError> {
     .map_err(|error| ApiError::Runtime(format!("failed to sync recovery data: {error}")))
 }
 
-async fn validate_staged_file(path: &Path, max_bytes: u64) -> Result<(), ApiError> {
+async fn validate_staged_file(path: &Path, max_bytes: u64) -> Result<u64, ApiError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
         ApiError::Runtime(format!(
             "remote database dump did not produce a readable artifact: {error}"
@@ -876,7 +885,7 @@ async fn validate_staged_file(path: &Path, max_bytes: u64) -> Result<(), ApiErro
             metadata.len()
         )));
     }
-    Ok(())
+    Ok(metadata.len())
 }
 
 #[derive(Debug)]

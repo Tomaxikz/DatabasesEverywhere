@@ -23,7 +23,7 @@ Choose a versioned release and install it. Do not automate installation from
 the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.3.0 # replace with the reviewed release
+DBEV_VERSION=v0.3.2 # replace with the reviewed release
 test "$(uname -m)" = x86_64
 sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
@@ -230,7 +230,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.3.0@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.3.2@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -769,10 +769,13 @@ cluster-aware migration tooling or a verified standalone source instead.
 Remote acquisition does not lock the source database. Quiesce source writes
 when a single point-in-time migration is required, especially for MongoDB,
 ClickHouse, Redis, and multi-collection Qdrant imports. MongoDB selective
-imports currently accept exactly one included collection; use a full import
-for multiple collections. As with artifact imports, also quiesce client writes
-to target objects being replaced: DBE serializes management jobs but cannot
-stop already-authorized database clients from issuing native writes.
+imports acquire each requested collection before changing the target, then
+apply all acquired archives under one rollback boundary. Because the source
+collection dumps are captured sequentially, quiesce source writes when the
+collections must represent one consistent point in time. As with artifact
+imports, also quiesce client writes to target objects being replaced: DBE
+serializes management jobs but cannot stop already-authorized database clients
+from issuing native writes.
 
 Remote TLS is verified by default. Plaintext requires both `"tls": false` and
 `security.remote_import.allow_plaintext: true`. Private RFC1918/ULA/CGNAT
