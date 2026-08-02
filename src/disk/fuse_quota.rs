@@ -424,10 +424,12 @@ fn secure_fuse_directory(path: &Path) -> Result<(), DiskLimitError> {
             path.display()
         )));
     }
-    // Rootless Podman setup may grant its trusted runtime group execute-only
-    // traversal through these daemon-owned directories. Keep that single bit
-    // while still removing directory listing, write, and all other access.
-    let mode = if stat.st_mode & Mode::XGRP.bits() != 0 {
+    // Rootless Podman setup grants its trusted runtime group execute-only
+    // traversal by setting the directory to exactly 0710. Preserve only that
+    // deliberate state; an ordinary mkdir affected by a permissive umask may
+    // start as 0755 or 0775 and must still be hardened to 0700.
+    let permissions = stat.st_mode & 0o777;
+    let mode = if permissions == (Mode::RWXU | Mode::XGRP).bits() {
         Mode::RWXU | Mode::XGRP
     } else {
         Mode::RWXU
@@ -921,6 +923,11 @@ mod tests {
     fn fuse_runtime_directories_are_private() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("fuse");
+
+        for path in [root.clone(), root.join("instances"), root.join("mounts")] {
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         ensure_private_fuse_directories(&root).unwrap();
 
