@@ -1,5 +1,3 @@
-This repository is still in development please do not use this in production yet
-
 # DatabasesEverywhere
 
 Hand out databases without handing out whole servers.
