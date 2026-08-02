@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.3.3 # replace with the reviewed release
+DBEV_VERSION=v0.4.0 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -268,7 +268,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.3.3@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.4.0@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
