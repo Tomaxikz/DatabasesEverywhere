@@ -40,7 +40,7 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck .github/ci/check.sh .github/ci/build-release-target.sh .githooks/pre-push
+        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
@@ -128,6 +128,45 @@ jobs:
       - name: Check and test Linux workspace
         run: bash .github/ci/check.sh test
 
+  podman_smoke:
+    name: Rootless Podman compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: global_lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: podman-smoke
+          cache-on-failure: false
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends podman uidmap
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          account="$(id -un)"
+          if ! grep -q "^${account}:" /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$account"
+          fi
+          if ! grep -q "^${account}:" /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$account"
+          fi
+
+      - name: Exercise the rootless Podman API
+        run: bash .github/ci/podman-smoke.sh
+
   documentation:
     name: Rust documentation
     runs-on: ubuntu-24.04
@@ -202,6 +241,7 @@ jobs:
     needs:
       - security_audit
       - tests
+      - podman_smoke
       - documentation
     strategy:
       fail-fast: false
@@ -276,6 +316,7 @@ jobs:
       - global_lint
       - security_audit
       - tests
+      - podman_smoke
       - documentation
       - codeql
       - release_build
@@ -285,6 +326,7 @@ jobs:
           GLOBAL_LINT_RESULT: ${{ needs.global_lint.result }}
           SECURITY_AUDIT_RESULT: ${{ needs.security_audit.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
+          PODMAN_SMOKE_RESULT: ${{ needs.podman_smoke.result }}
           DOCUMENTATION_RESULT: ${{ needs.documentation.result }}
           CODEQL_RESULT: ${{ needs.codeql.result }}
           RELEASE_BUILD_RESULT: ${{ needs.release_build.result }}
@@ -301,6 +343,7 @@ jobs:
             "global lint=$GLOBAL_LINT_RESULT" \
             "dependency security=$SECURITY_AUDIT_RESULT" \
             "Linux tests=$TESTS_RESULT" \
+            "rootless Podman compatibility=$PODMAN_SMOKE_RESULT" \
             "Rust documentation=$DOCUMENTATION_RESULT" \
             "CodeQL=$CODEQL_RESULT" \
             "release build=$RELEASE_BUILD_RESULT"

@@ -197,7 +197,7 @@ pub async fn import_redis(
     ));
     let temporary_acl =
         append_temporary_acl(&original_acl, &temporary_username, &temporary_password);
-    let preserve_acl_owner = !state.docker.uses_rootless_podman();
+    let preserve_acl_owner = true;
 
     let primary = redis_with_deadline(work_deadline, "target import", async {
         replace_acl_file(&paths, &temporary_acl, preserve_acl_owner).await?;
@@ -553,12 +553,7 @@ async fn rollback_redis_target(
         )));
     }
     replace_data_from_archive(paths.clone(), rollback).await?;
-    if !state.docker.uses_rootless_podman() {
-        paths
-            .reapply_data_owner()
-            .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    }
+    crate::api::import_export::reapply_instance_data_owner(state, paths).await?;
     lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
         .await
         .map(|_| ())

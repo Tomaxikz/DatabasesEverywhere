@@ -1,6 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use crate::{config::PathConfig, shared::ids::validate_instance_id};
+use crate::{
+    config::PathConfig,
+    shared::{
+        ids::validate_instance_id,
+        ownership::{HostOwner, chown_directory_recursive},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct RuntimePathStatus {
@@ -97,7 +103,12 @@ impl InstancePaths {
             ];
             tokio::task::spawn_blocking(move || {
                 for path in paths {
-                    chown_recursive(&path, owner)?;
+                    chown_directory_recursive(&path, owner).map_err(|source| {
+                        InstancePathError::Chown {
+                            path: path.display().to_string(),
+                            source,
+                        }
+                    })?;
                 }
                 Ok(())
             })
@@ -111,6 +122,39 @@ impl InstancePaths {
         }
     }
 
+    /// Makes only the paths mounted into rootless Podman containers belong to
+    /// the host account that owns the Podman service. Daemon-owned artifacts,
+    /// imports, exports, and backups remain root-private.
+    pub async fn apply_rootless_podman_owner(
+        &self,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), InstancePathError> {
+        if uid == 0 {
+            return Err(InstancePathError::InvalidRuntimeOwner);
+        }
+        let paths = vec![
+            self.data.clone(),
+            self.logs.clone(),
+            self.sockets.clone(),
+            self.runtime_config.clone(),
+        ];
+        let owner = HostOwner { uid, gid };
+        tokio::task::spawn_blocking(move || {
+            for path in paths {
+                chown_directory_recursive(&path, owner).map_err(|source| {
+                    InstancePathError::Chown {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
     /// Reapply the persistent data directory's existing owner after a
     /// physical restore has created replacement entries as the daemon user.
     pub async fn reapply_data_owner(&self) -> Result<(), InstancePathError> {
@@ -118,9 +162,14 @@ impl InstancePaths {
         {
             let owner = self.existing_data_owner().await?;
             let data = self.data.clone();
-            tokio::task::spawn_blocking(move || chown_recursive(&data, owner))
-                .await
-                .map_err(|error| InstancePathError::Task(error.to_string()))?
+            tokio::task::spawn_blocking(move || {
+                chown_directory_recursive(&data, owner).map_err(|source| InstancePathError::Chown {
+                    path: data.display().to_string(),
+                    source,
+                })
+            })
+            .await
+            .map_err(|error| InstancePathError::Task(error.to_string()))?
         }
 
         #[cfg(not(unix))]
@@ -129,13 +178,39 @@ impl InstancePaths {
         }
     }
 
+    pub async fn reapply_rootless_podman_data_owner(
+        &self,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), InstancePathError> {
+        if uid == 0 {
+            return Err(InstancePathError::InvalidRuntimeOwner);
+        }
+        let data = self.data.clone();
+        tokio::task::spawn_blocking(move || {
+            chown_directory_recursive(&data, HostOwner { uid, gid }).map_err(|source| {
+                InstancePathError::Chown {
+                    path: data.display().to_string(),
+                    source,
+                }
+            })
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
     #[cfg(unix)]
     pub async fn apply_socket_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
         let sockets = self.sockets.clone();
-        let owner = ContainerOwner { uid, gid };
-        tokio::task::spawn_blocking(move || chown_recursive(&sockets, owner))
-            .await
-            .map_err(|error| InstancePathError::Task(error.to_string()))?
+        let owner = HostOwner { uid, gid };
+        tokio::task::spawn_blocking(move || {
+            chown_directory_recursive(&sockets, owner).map_err(|source| InstancePathError::Chown {
+                path: sockets.display().to_string(),
+                source,
+            })
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
     }
 
     #[cfg(not(unix))]
@@ -144,7 +219,7 @@ impl InstancePaths {
     }
 
     #[cfg(unix)]
-    async fn desired_container_owner(&self) -> Result<Option<ContainerOwner>, InstancePathError> {
+    async fn desired_container_owner(&self) -> Result<Option<HostOwner>, InstancePathError> {
         if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
             return Ok(Some(owner));
         }
@@ -162,7 +237,7 @@ impl InstancePaths {
     }
 
     #[cfg(unix)]
-    async fn existing_data_owner(&self) -> Result<ContainerOwner, InstancePathError> {
+    async fn existing_data_owner(&self) -> Result<HostOwner, InstancePathError> {
         if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
             return Ok(owner);
         }
@@ -351,31 +426,24 @@ fn dir_status(path: &Path) -> Result<RuntimePathStatus, InstancePathError> {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ContainerOwner {
-    uid: u32,
-    gid: u32,
-}
-
-#[cfg(unix)]
 const DEFAULT_CONTAINER_UID: u32 = 1000;
 #[cfg(unix)]
 const DEFAULT_CONTAINER_GID: u32 = 1000;
 
 #[cfg(unix)]
-fn owner_from_env(uid_key: &str, gid_key: &str) -> Option<ContainerOwner> {
+fn owner_from_env(uid_key: &str, gid_key: &str) -> Option<HostOwner> {
     let uid = std::env::var(uid_key).ok()?.parse::<u32>().ok()?;
     let gid = std::env::var(gid_key).ok()?.parse::<u32>().ok()?;
     if uid == 0 {
         return None;
     }
-    Some(ContainerOwner { uid, gid })
+    Some(HostOwner { uid, gid })
 }
 
 #[cfg(unix)]
-fn default_owner_for(uid: u32, _gid: u32) -> Option<ContainerOwner> {
+fn default_owner_for(uid: u32, _gid: u32) -> Option<HostOwner> {
     if uid == 0 {
-        Some(ContainerOwner {
+        Some(HostOwner {
             uid: DEFAULT_CONTAINER_UID,
             gid: DEFAULT_CONTAINER_GID,
         })
@@ -385,115 +453,8 @@ fn default_owner_for(uid: u32, _gid: u32) -> Option<ContainerOwner> {
 }
 
 #[cfg(unix)]
-fn existing_owner_for(uid: u32, gid: u32) -> ContainerOwner {
-    default_owner_for(uid, gid).unwrap_or(ContainerOwner { uid, gid })
-}
-
-#[cfg(unix)]
-fn chown_recursive(path: &Path, owner: ContainerOwner) -> Result<(), InstancePathError> {
-    use rustix::fs::{Mode, OFlags, open};
-
-    let directory = match open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(directory) => directory,
-        Err(rustix::io::Errno::NOENT) => return Ok(()),
-        Err(error) => {
-            return Err(InstancePathError::ReadMetadata {
-                path: path.display().to_string(),
-                source: std::io::Error::from(error),
-            });
-        }
-    };
-    chown_directory_fd(&directory, path, owner)
-}
-
-#[cfg(unix)]
-fn chown_directory_fd(
-    directory: &impl std::os::fd::AsFd,
-    display_path: &Path,
-    owner: ContainerOwner,
-) -> Result<(), InstancePathError> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-    use rustix::{
-        fs::{AtFlags, Dir, FileType, Mode, OFlags, chownat, fchown, openat, statat},
-        process::{Gid, Uid},
-    };
-
-    let uid = Uid::from_raw(owner.uid);
-    let gid = Gid::from_raw(owner.gid);
-    fchown(directory, Some(uid), Some(gid)).map_err(|source| InstancePathError::Chown {
-        path: display_path.display().to_string(),
-        source: std::io::Error::from(source),
-    })?;
-
-    let mut entries = Dir::read_from(directory).map_err(|source| InstancePathError::ReadDir {
-        path: display_path.display().to_string(),
-        source: std::io::Error::from(source),
-    })?;
-    let mut names = Vec::<CString>::new();
-    for entry in &mut entries {
-        let entry = entry.map_err(|source| InstancePathError::ReadDir {
-            path: display_path.display().to_string(),
-            source: std::io::Error::from(source),
-        })?;
-        let name = entry.file_name();
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(name.to_owned());
-        }
-    }
-
-    for name in names {
-        let child_path = display_path.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-        let stat = match statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(rustix::io::Errno::NOENT) => continue,
-            Err(source) => {
-                return Err(InstancePathError::ReadMetadata {
-                    path: child_path.display().to_string(),
-                    source: std::io::Error::from(source),
-                });
-            }
-        };
-        match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Symlink => {}
-            FileType::Directory => {
-                let child = match openat(
-                    directory,
-                    &name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                ) {
-                    Ok(child) => child,
-                    Err(rustix::io::Errno::NOENT) => continue,
-                    Err(source) => {
-                        return Err(InstancePathError::ReadDir {
-                            path: child_path.display().to_string(),
-                            source: std::io::Error::from(source),
-                        });
-                    }
-                };
-                chown_directory_fd(&child, &child_path, owner)?;
-            }
-            _ => {
-                chownat(
-                    directory,
-                    &name,
-                    Some(uid),
-                    Some(gid),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(|source| InstancePathError::Chown {
-                    path: child_path.display().to_string(),
-                    source: std::io::Error::from(source),
-                })?;
-            }
-        }
-    }
-    Ok(())
+fn existing_owner_for(uid: u32, gid: u32) -> HostOwner {
+    default_owner_for(uid, gid).unwrap_or(HostOwner { uid, gid })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -538,6 +499,10 @@ pub enum InstancePathError {
     },
     #[error("instance path task failed: {0}")]
     Task(String),
+    #[error("rootless container runtime owner must not be uid 0")]
+    InvalidRuntimeOwner,
+    #[error("rootless Podman host uid/gid was not initialized")]
+    MissingRuntimeOwner,
     #[error("container user detection is only supported on unix")]
     UnsupportedContainerUser,
 }
@@ -574,7 +539,7 @@ mod tests {
     fn root_owned_paths_default_to_non_root_container_owner() {
         assert_eq!(
             default_owner_for(0, 0),
-            Some(ContainerOwner {
+            Some(HostOwner {
                 uid: DEFAULT_CONTAINER_UID,
                 gid: DEFAULT_CONTAINER_GID
             })
@@ -592,7 +557,7 @@ mod tests {
     fn physical_restore_reapplies_the_data_roots_existing_owner() {
         assert_eq!(
             existing_owner_for(1001, 1002),
-            ContainerOwner {
+            HostOwner {
                 uid: 1001,
                 gid: 1002
             }
@@ -611,12 +576,12 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("must-not-be-traversed"), b"outside").unwrap();
         symlink(&outside, managed.join("outside-link")).unwrap();
-        let owner = ContainerOwner {
+        let owner = HostOwner {
             uid: std::fs::metadata(&managed).unwrap().uid(),
             gid: std::fs::metadata(&managed).unwrap().gid(),
         };
 
-        chown_recursive(&managed, owner).unwrap();
+        chown_directory_recursive(&managed, owner).unwrap();
 
         assert_eq!(
             std::fs::read(outside.join("must-not-be-traversed")).unwrap(),

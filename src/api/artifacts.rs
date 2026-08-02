@@ -200,6 +200,7 @@ impl Drop for ArtifactDownloadPermit {
 struct DownloadStream {
     inner: ReaderStream<File>,
     _permit: ArtifactDownloadPermit,
+    cleanup: Option<PathBuf>,
 }
 
 impl Stream for DownloadStream {
@@ -208,6 +209,23 @@ impl Stream for DownloadStream {
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_next(context)
+    }
+}
+
+impl Drop for DownloadStream {
+    fn drop(&mut self) {
+        let Some(path) = self.cleanup.take() else {
+            return;
+        };
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to remove materialized backup download"
+            );
+        }
     }
 }
 
@@ -438,8 +456,7 @@ async fn create_download_url(
             verified_artifact_path_for_instance(state, name, instance_id).await?;
         }
         DownloadKind::Backup => {
-            crate::api::backups::verified_backup_path_for_instance(state, name, instance_id)
-                .await?;
+            crate::api::backups::ensure_backup_exists(state, instance_id, name).await?;
         }
     }
 
@@ -509,29 +526,39 @@ async fn download(
     {
         return Err(ApiError::Unauthorized);
     }
-    let path = match kind {
-        DownloadKind::Artifact => {
+    let (path, cleanup) = match kind {
+        DownloadKind::Artifact => (
             verified_artifact_path_for_instance(state, &claims.artifact, &claims.instance_id)
-                .await?
-        }
+                .await?,
+            None,
+        ),
         DownloadKind::Backup => {
-            crate::api::backups::verified_backup_path_for_instance(
+            let backup = crate::api::backups::materialize_backup_for_download(
                 state,
-                &claims.artifact,
                 &claims.instance_id,
+                &claims.artifact,
             )
-            .await?
+            .await?;
+            let cleanup = backup.temporary.then(|| backup.path.clone());
+            (backup.path, cleanup)
         }
     };
-    let file = File::open(&path)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => ApiError::NotFound,
-            _ => ApiError::Runtime(format!("failed to open artifact: {error}")),
-        })?;
+    let file = match File::open(&path).await {
+        Ok(file) => file,
+        Err(error) => {
+            if let Some(path) = cleanup.as_ref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            return Err(match error.kind() {
+                std::io::ErrorKind::NotFound => ApiError::NotFound,
+                _ => ApiError::Runtime(format!("failed to open artifact: {error}")),
+            });
+        }
+    };
     let stream = DownloadStream {
         inner: ReaderStream::with_capacity(file, DOWNLOAD_STREAM_BUFFER_BYTES),
         _permit: permit,
+        cleanup,
     };
     let body = Body::from_stream(stream);
     tracing::info!(

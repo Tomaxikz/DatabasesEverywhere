@@ -1,16 +1,15 @@
 use std::{
-    cmp::Reverse,
     path::{Path as FsPath, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use axum::extract::State;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::{
     api::{
-        api_response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
+        api_response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         artifacts::{ArtifactInfo, DeleteArtifactResponse},
         public_diagnostic::PublicDiagnostic,
         routes::AppState,
@@ -19,12 +18,18 @@ use crate::{
         },
     },
     auth::scopes,
+    backups::{
+        BackupBundle, BackupStorage, BackupStoreError, MaterializedBackup, StoredBackup,
+        build_manifest,
+        catalog::{BackupCatalog, BackupCatalogColumn},
+        new_backup_id,
+    },
     instances::metadata::{InstanceMetadata, InstanceStatus},
     jobs::import_export::{
         DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError,
         create_data_archive_with_policy,
     },
-    shared::{files::is_safe_flat_file_name, ids::validate_instance_id, protocol::Protocol},
+    shared::{ids::validate_instance_id, protocol::Protocol},
 };
 
 #[derive(Debug, Serialize)]
@@ -35,6 +40,8 @@ pub struct BackupStatusResponse {
     pub retention_keep_latest_per_instance: usize,
     pub retention_max_age_days: u64,
     pub redis_excluded: bool,
+    pub storage_driver: String,
+    pub browsing_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +64,52 @@ pub struct SkippedBackup {
     pub reason: PublicDiagnostic,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupContentsQuery {
+    pub object: Option<String>,
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupContentsResponse {
+    pub backup_id: String,
+    pub instance_id: String,
+    pub protocol: Protocol,
+    pub database_name: String,
+    pub captured_at: Option<String>,
+    pub consistency: Option<String>,
+    pub catalog_available: bool,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+    pub objects: Vec<BackupObjectSummary>,
+    pub selection: Option<BackupObjectSelection>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupObjectSummary {
+    pub id: String,
+    pub namespace: String,
+    pub name: String,
+    pub kind: String,
+    pub estimated_rows: Option<u64>,
+    pub columns: Vec<BackupCatalogColumn>,
+    pub captured_preview_rows: usize,
+    pub preview_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackupObjectSelection {
+    pub object_id: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub returned: usize,
+    pub total_captured: usize,
+    pub rows: Vec<serde_json::Value>,
+    pub truncated: bool,
+}
+
 pub async fn backup_status(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -69,6 +122,8 @@ pub async fn backup_status(
         retention_keep_latest_per_instance: state.config.backups.retention_keep_latest_per_instance,
         retention_max_age_days: state.config.backups.retention_max_age_days,
         redis_excluded: false,
+        storage_driver: state.config.backups.storage.driver.as_str().to_string(),
+        browsing_enabled: state.config.backups.browsing.enabled,
     }))
 }
 
@@ -79,9 +134,103 @@ pub async fn list_instance_backups(
 ) -> ApiResult<Vec<ArtifactInfo>> {
     auth.require_scope(scopes::BACKUPS_READ)?;
     ensure_instance_exists(&state, &instance_id).await?;
-    Ok(ApiResponse::ok(
-        read_instance_backups(&state, &instance_id).await?,
-    ))
+    let storage = backup_storage(&state)?;
+    let backups = storage
+        .list(&instance_id)
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .map(artifact_info)
+        .collect();
+    Ok(ApiResponse::ok(backups))
+}
+
+pub async fn browse_instance_backup(
+    State(state): State<AppState>,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<BackupContentsQuery>,
+) -> ApiResult<BackupContentsResponse> {
+    auth.require_scope(scopes::BACKUPS_READ)?;
+    let metadata = ensure_instance_exists(&state, &instance_id).await?;
+    let limit = query.limit.unwrap_or(25);
+    if limit == 0 || limit > 100 {
+        return Err(ApiError::BadRequest(
+            "limit must be between 1 and 100".to_string(),
+        ));
+    }
+    if query
+        .object
+        .as_ref()
+        .is_some_and(|object| object.len() > 1024)
+    {
+        return Err(ApiError::BadRequest(
+            "object is longer than 1024 bytes".to_string(),
+        ));
+    }
+
+    let storage = backup_storage(&state)?;
+    let backup = storage
+        .find(&instance_id, &backup_id)
+        .await
+        .map_err(store_error)?;
+    let bytes = storage
+        .read_catalog(
+            &instance_id,
+            &backup_id,
+            state.config.backups.browsing.max_catalog_bytes,
+            FsPath::new(&state.config.paths.tmp_root()),
+        )
+        .await
+        .map_err(store_error)?;
+    let Some(bytes) = bytes else {
+        return Ok(ApiResponse::ok(BackupContentsResponse {
+            backup_id,
+            instance_id,
+            protocol: backup.protocol.unwrap_or(metadata.protocol),
+            database_name: metadata.database.name,
+            captured_at: None,
+            consistency: None,
+            catalog_available: false,
+            truncated: false,
+            warnings: vec![
+                "this backup predates catalog capture or browsing was disabled when it was created"
+                    .to_string(),
+            ],
+            objects: Vec::new(),
+            selection: None,
+        }));
+    };
+    let catalog = BackupCatalog::decode_and_validate(&bytes, &instance_id, &backup_id)
+        .map_err(ApiError::Runtime)?;
+    let selection = select_catalog_object(&catalog, query.object.as_deref(), query.offset, limit)?;
+    let objects = catalog
+        .objects
+        .iter()
+        .map(|object| BackupObjectSummary {
+            id: object.id.clone(),
+            namespace: object.namespace.clone(),
+            name: object.name.clone(),
+            kind: object.kind.clone(),
+            estimated_rows: object.estimated_rows,
+            columns: object.columns.clone(),
+            captured_preview_rows: object.preview_rows.len(),
+            preview_truncated: object.preview_truncated,
+        })
+        .collect();
+    Ok(ApiResponse::ok(BackupContentsResponse {
+        backup_id,
+        instance_id,
+        protocol: catalog.protocol,
+        database_name: catalog.database_name,
+        captured_at: Some(catalog.captured_at),
+        consistency: Some(catalog.consistency),
+        catalog_available: true,
+        truncated: catalog.truncated,
+        warnings: catalog.warnings,
+        objects,
+        selection,
+    }))
 }
 
 pub async fn run_instance_backup(
@@ -110,7 +259,21 @@ pub async fn delete_instance_backup(
 ) -> ApiResult<DeleteArtifactResponse> {
     auth.require_scope(scopes::BACKUPS_WRITE)?;
     ensure_instance_exists(&state, &instance_id).await?;
-    delete_instance_backup_by_id(&state, &instance_id, backup_id).await
+    let storage = backup_storage(&state)?;
+    storage
+        .delete(&instance_id, &backup_id)
+        .await
+        .map_err(store_error)?;
+    tracing::info!(
+        event = "audit backup_deleted",
+        instance_id,
+        backup_id,
+        storage = storage.kind().as_str()
+    );
+    Ok(ApiResponse::ok(DeleteArtifactResponse {
+        id: backup_id,
+        deleted: true,
+    }))
 }
 
 pub async fn restore_instance_backup(
@@ -141,61 +304,56 @@ async fn restore_instance_backup_admitted(
     let _operation = state.instance_locks.lock(&instance_id).await;
     ensure_operation_can_start(&state)?;
     let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
-    let path = verified_backup_path_for_instance(&state, &backup_id, &instance_id).await?;
+    let storage = backup_storage(&state)?;
+    let materialized = storage
+        .materialize(
+            &instance_id,
+            &backup_id,
+            FsPath::new(&state.config.paths.tmp_root()),
+        )
+        .await
+        .map_err(store_error)?;
     let was_running = metadata.status == InstanceStatus::Running;
-    if was_running {
-        let _ = crate::api::instances::lifecycle_instance_locked(
+    if was_running
+        && let Err(error) = crate::api::instances::lifecycle_instance_locked(
             &state,
             &instance_id,
             crate::api::instances::LifecycleAction::Stop,
         )
-        .await?;
+        .await
+    {
+        materialized.cleanup().await;
+        return Err(error);
     }
     let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, &instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let mut result =
-        crate::api::import_export::replace_data_from_archive(paths.clone(), &path).await;
-    if result.is_ok() && !state.docker.uses_rootless_podman() {
-        result = paths
-            .reapply_data_owner()
-            .await
-            .map_err(|error| ApiError::Runtime(error.to_string()));
+        crate::api::import_export::replace_data_from_archive(paths.clone(), &materialized.path)
+            .await;
+    if result.is_ok() {
+        result = crate::api::import_export::reapply_instance_data_owner(&state, &paths).await;
     }
-    crate::api::import_export::finish_physical_operation(&state, &instance_id, was_running, result)
-        .await?;
+    let finished = crate::api::import_export::finish_physical_operation(
+        &state,
+        &instance_id,
+        was_running,
+        result,
+    )
+    .await;
+    materialized.cleanup().await;
+    finished?;
     tracing::info!(
         event = "audit backup_restored",
         instance_id,
         backup_id,
         reason,
+        storage = storage.kind().as_str(),
     );
     Ok(ApiResponse::ok(RestoreBackupResponse {
         instance_id,
         backup_id,
         restored: true,
     }))
-}
-
-async fn delete_instance_backup_by_id(
-    state: &AppState,
-    instance_id: &str,
-    backup_id: String,
-) -> ApiResult<DeleteArtifactResponse> {
-    let path = verified_backup_path_for_instance(state, &backup_id, instance_id).await?;
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => {
-            crate::api::artifacts::remove_checksum_sidecar(&path).await;
-            tracing::info!(event = "audit backup_deleted", instance_id, backup_id);
-            Ok(ApiResponse::ok(DeleteArtifactResponse {
-                id: backup_id,
-                deleted: true,
-            }))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::NotFound),
-        Err(error) => Err(ApiError::Runtime(format!(
-            "failed to delete backup: {error}"
-        ))),
-    }
 }
 
 pub(crate) async fn backup_instance(
@@ -215,16 +373,98 @@ async fn backup_instance_admitted(
     instance_id: String,
     _admission: ImportExportJobPermit,
 ) -> Result<ArtifactInfo, ApiError> {
-    let state = &state;
-    let instance_id = instance_id.as_str();
-    let _operation = state.instance_locks.lock(instance_id).await;
-    ensure_operation_can_start(state)?;
-    let metadata = crate::api::instances::reconcile_instance_locked(state, instance_id).await?;
+    let _operation = state.instance_locks.lock(&instance_id).await;
+    ensure_operation_can_start(&state)?;
+    let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
     validate_backup_eligible(&metadata)?;
-    let artifact_path = backup_artifact_path(state, &metadata.instance_id).await?;
+    let storage = backup_storage(&state)?;
+    let backup_id = new_backup_id();
+    let catalog = if state.config.backups.browsing.enabled {
+        Some(
+            BackupCatalog::capture(
+                &state.docker,
+                &metadata,
+                &backup_id,
+                &state.config.backups.browsing,
+            )
+            .await
+            .encode_bounded(state.config.backups.browsing.max_catalog_bytes)
+            .map_err(|error| {
+                ApiError::Runtime(format!("failed to encode backup catalog: {error}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    let backups_root = PathBuf::from(state.config.paths.backups_root());
+    let bundle = BackupBundle::create(&backups_root, &instance_id, &backup_id)
+        .await
+        .map_err(store_error)?;
+    if let Some(catalog) = catalog.as_deref()
+        && let Err(error) = bundle.write_catalog(catalog).await
+    {
+        bundle.cleanup().await;
+        return Err(store_error(error));
+    }
+
+    let result = create_physical_archive(&state, &metadata, &bundle.archive).await;
+    if let Err(error) = result {
+        bundle.cleanup().await;
+        return Err(error);
+    }
+    let manifest = match build_manifest(
+        backup_id.clone(),
+        instance_id.clone(),
+        metadata.protocol,
+        &bundle.archive,
+        catalog.is_some(),
+    )
+    .await
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            bundle.cleanup().await;
+            return Err(store_error(error));
+        }
+    };
+    if let Err(error) = bundle.write_metadata(&manifest).await {
+        bundle.cleanup().await;
+        return Err(store_error(error));
+    }
+    if let Err(error) = storage.commit(&bundle, &manifest).await {
+        bundle.cleanup().await;
+        return Err(store_error(error));
+    }
+    bundle.cleanup().await;
+    if let Err(error) = prune_instance_backups(&state, &storage, &instance_id).await {
+        tracing::warn!(
+            event = "audit backup_retention_failed",
+            instance_id,
+            backup_id,
+            %error,
+            "backup completed but retention could not be fully applied"
+        );
+    }
+    tracing::info!(
+        event = "audit backup_completed",
+        instance_id,
+        protocol = metadata.protocol.as_str(),
+        backup_id,
+        storage = storage.kind().as_str(),
+        catalog = manifest.catalog_available,
+    );
+    Ok(artifact_info(manifest))
+}
+
+async fn create_physical_archive(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    archive: &FsPath,
+) -> Result<(), ApiError> {
+    let instance_id = &metadata.instance_id;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = crate::api::instances::lifecycle_instance_locked(
+        crate::api::instances::lifecycle_instance_locked(
             state,
             instance_id,
             crate::api::instances::LifecycleAction::Stop,
@@ -238,7 +478,7 @@ async fn backup_instance_admitted(
     } else {
         DataArchiveSourcePolicy::Strict
     };
-    let result = create_data_archive_with_policy(paths.data, artifact_path.clone(), archive_policy)
+    let result = create_data_archive_with_policy(paths.data, archive.to_path_buf(), archive_policy)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()));
     if let Err(error) = &result {
@@ -251,16 +491,7 @@ async fn backup_instance_admitted(
         );
     }
     crate::api::import_export::finish_physical_operation(state, instance_id, was_running, result)
-        .await?;
-    prune_instance_backups(state, &metadata.instance_id).await?;
-    let backup = backup_info(&metadata.instance_id, artifact_path).await?;
-    tracing::info!(
-        event = "audit backup_completed",
-        instance_id,
-        protocol = metadata.protocol.as_str(),
-        backup_id = %backup.id,
-    );
-    Ok(backup)
+        .await
 }
 
 pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse {
@@ -298,7 +529,6 @@ pub fn start_scheduler(state: AppState) {
         tracing::info!("automatic backups disabled");
         return;
     }
-
     let interval = Duration::from_secs(state.config.backups.interval_minutes.saturating_mul(60));
     let run_on_startup = state.config.backups.run_on_startup;
     let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
@@ -306,6 +536,7 @@ pub fn start_scheduler(state: AppState) {
         tracing::info!(
             interval_minutes = state.config.backups.interval_minutes,
             run_on_startup,
+            storage = state.config.backups.storage.driver.as_str(),
             "automatic backups enabled"
         );
         if run_on_startup && !*shutdown.borrow() {
@@ -324,6 +555,156 @@ pub fn start_scheduler(state: AppState) {
             }
         }
     });
+}
+
+pub(crate) async fn materialize_backup_for_download(
+    state: &AppState,
+    instance_id: &str,
+    backup_id: &str,
+) -> Result<MaterializedBackup, ApiError> {
+    let storage = backup_storage(state)?;
+    storage
+        .materialize(
+            instance_id,
+            backup_id,
+            FsPath::new(&state.config.paths.tmp_root()),
+        )
+        .await
+        .map_err(store_error)
+}
+
+pub(crate) async fn ensure_backup_exists(
+    state: &AppState,
+    instance_id: &str,
+    backup_id: &str,
+) -> Result<(), ApiError> {
+    backup_storage(state)?
+        .find(instance_id, backup_id)
+        .await
+        .map(|_| ())
+        .map_err(store_error)
+}
+
+pub(crate) async fn purge_instance_backups(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<usize, ApiError> {
+    backup_storage(state)?
+        .delete_instance(instance_id)
+        .await
+        .map_err(store_error)
+}
+
+fn backup_storage(state: &AppState) -> Result<BackupStorage, ApiError> {
+    BackupStorage::from_config(&state.config).map_err(store_error)
+}
+
+async fn prune_instance_backups(
+    state: &AppState,
+    storage: &BackupStorage,
+    instance_id: &str,
+) -> Result<(), ApiError> {
+    let keep_latest = state.config.backups.retention_keep_latest_per_instance;
+    let max_age_seconds = state
+        .config
+        .backups
+        .retention_max_age_days
+        .saturating_mul(24 * 60 * 60);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut backups = storage.list(instance_id).await.map_err(store_error)?;
+    backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));
+    let mut deleted = 0_usize;
+    for (index, backup) in backups.into_iter().enumerate() {
+        let expired = max_age_seconds > 0
+            && now.saturating_sub(backup.created_at_unix)
+                > i64::try_from(max_age_seconds).unwrap_or(i64::MAX);
+        if index >= keep_latest || expired {
+            storage
+                .delete(instance_id, &backup.backup_id)
+                .await
+                .map_err(store_error)?;
+            deleted += 1;
+        }
+    }
+    tracing::info!(
+        event = "audit backup_retention_pruned",
+        instance_id,
+        keep_latest,
+        max_age_days = state.config.backups.retention_max_age_days,
+        deleted,
+        storage = storage.kind().as_str(),
+    );
+    Ok(())
+}
+
+fn select_catalog_object(
+    catalog: &BackupCatalog,
+    object_id: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<BackupObjectSelection>, ApiError> {
+    let Some(object_id) = object_id else {
+        if offset != 0 {
+            return Err(ApiError::BadRequest(
+                "offset requires an object selection".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+    let object = catalog
+        .objects
+        .iter()
+        .find(|object| object.id == object_id)
+        .ok_or(ApiError::NotFound)?;
+    let rows = object
+        .preview_rows
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Some(BackupObjectSelection {
+        object_id: object.id.clone(),
+        offset,
+        limit,
+        returned: rows.len(),
+        total_captured: object.preview_rows.len(),
+        rows,
+        truncated: object.preview_truncated
+            || offset.saturating_add(limit) < object.preview_rows.len(),
+    }))
+}
+
+fn artifact_info(backup: StoredBackup) -> ArtifactInfo {
+    ArtifactInfo {
+        id: backup.backup_id,
+        instance_id: backup.instance_id,
+        size_bytes: backup.size_bytes,
+        modified_at: backup.created_at,
+        sha256: backup.sha256,
+    }
+}
+
+fn validate_backup_eligible(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+    if metadata.status != InstanceStatus::Running {
+        return Err(ApiError::BadRequest(format!(
+            "instance is not running (status={:?})",
+            metadata.status
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_instance_exists(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<InstanceMetadata, ApiError> {
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)
 }
 
 fn admit_backup_operation(
@@ -363,292 +744,12 @@ async fn run_scheduled_backup_pass(state: &AppState) {
     );
 }
 
-async fn backup_info(instance_id: &str, path: PathBuf) -> Result<ArtifactInfo, ApiError> {
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to stat backup: {error}")))?;
-    let id = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ApiError::Runtime("invalid backup name".to_string()))?
-        .to_string();
-    Ok(ArtifactInfo {
-        id,
-        instance_id: instance_id.to_string(),
-        size_bytes: metadata.len(),
-        modified_at: crate::api::artifacts::system_time_rfc3339(
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        ),
-        sha256: crate::api::artifacts::sha256_file(path).await?,
-    })
-}
-
-fn validate_backup_eligible(metadata: &InstanceMetadata) -> Result<(), ApiError> {
-    if metadata.status != InstanceStatus::Running {
-        return Err(ApiError::BadRequest(format!(
-            "instance is not running (status={:?})",
-            metadata.status
-        )));
+fn store_error(error: BackupStoreError) -> ApiError {
+    match error {
+        BackupStoreError::InvalidBackupId => ApiError::BadRequest("invalid backup id".to_string()),
+        BackupStoreError::NotFound => ApiError::NotFound,
+        error => ApiError::Runtime(error.to_string()),
     }
-    Ok(())
-}
-
-async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    state
-        .instances
-        .get(instance_id)
-        .await
-        .map(|_| ())
-        .ok_or(ApiError::NotFound)
-}
-
-async fn read_instance_backups(
-    state: &AppState,
-    instance_id: &str,
-) -> Result<Vec<ArtifactInfo>, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let files = read_instance_backup_files(&backup_root(state).join(instance_id)).await?;
-    let mut backups = Vec::with_capacity(files.len());
-    for backup in files {
-        let metadata = tokio::fs::metadata(&backup.path)
-            .await
-            .map_err(|error| ApiError::Runtime(format!("failed to stat backup: {error}")))?;
-        backups.push(ArtifactInfo {
-            id: backup.name,
-            instance_id: instance_id.to_string(),
-            size_bytes: metadata.len(),
-            modified_at: crate::api::artifacts::system_time_rfc3339(backup.modified),
-            sha256: crate::api::artifacts::sha256_file(backup.path).await?,
-        });
-    }
-    backups.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
-    Ok(backups)
-}
-
-pub(crate) async fn verified_backup_path_for_instance(
-    state: &AppState,
-    name: &str,
-    instance_id: &str,
-) -> Result<PathBuf, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    validate_backup_name(name)?;
-    let path = backup_root(state).join(instance_id).join(name);
-    verify_backup_path(state, instance_id, &path).await
-}
-
-async fn backup_artifact_path(state: &AppState, instance_id: &str) -> Result<PathBuf, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let root = backup_root(state);
-    create_private_directory(&root, "backup root").await?;
-    let dir = root.join(instance_id);
-    create_private_directory(&dir, "backup instance directory").await?;
-    Ok(dir.join(format!("{}.physical.tar.gz", uuid::Uuid::new_v4())))
-}
-
-fn backup_root(state: &AppState) -> PathBuf {
-    PathBuf::from(state.config.paths.backups_root())
-}
-
-#[derive(Debug)]
-struct BackupFile {
-    path: PathBuf,
-    name: String,
-    modified: SystemTime,
-}
-
-async fn prune_instance_backups(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    let keep_latest = state.config.backups.retention_keep_latest_per_instance;
-    let max_age_days = state.config.backups.retention_max_age_days;
-    let dir = backup_root(state).join(instance_id);
-    let mut backups = read_instance_backup_files(&dir).await?;
-    backups.sort_by_key(|backup| Reverse(backup.modified));
-
-    let mut deleted = 0usize;
-    if max_age_days > 0 {
-        let max_age = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
-        let now = SystemTime::now();
-        let mut kept = Vec::with_capacity(backups.len());
-        for backup in backups {
-            let expired = now
-                .duration_since(backup.modified)
-                .map(|age| age > max_age)
-                .unwrap_or(false);
-            if expired {
-                delete_pruned_backup(&backup).await?;
-                deleted += 1;
-            } else {
-                kept.push(backup);
-            }
-        }
-        backups = kept;
-    }
-
-    if backups.len() > keep_latest {
-        let old_backups = backups.split_off(keep_latest);
-        for backup in old_backups {
-            delete_pruned_backup(&backup).await?;
-            deleted += 1;
-        }
-    }
-
-    tracing::info!(
-        event = "audit backup_retention_pruned",
-        instance_id,
-        keep_latest,
-        max_age_days,
-        deleted,
-    );
-    Ok(())
-}
-
-async fn read_instance_backup_files(dir: &FsPath) -> Result<Vec<BackupFile>, ApiError> {
-    match tokio::fs::symlink_metadata(dir).await {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(ApiError::Runtime(
-                "instance backup root must be a real directory".to_string(),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ApiError::Runtime(format!(
-                "failed to inspect backup directory {}: {error}",
-                dir.display()
-            )));
-        }
-    }
-    let mut entries = match tokio::fs::read_dir(dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ApiError::Runtime(format!(
-                "failed to read backup directory {}: {error}",
-                dir.display()
-            )));
-        }
-    };
-    let mut backups = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read backup entry: {error}")))?
-    {
-        let path = entry.path();
-        let metadata = tokio::fs::symlink_metadata(&path)
-            .await
-            .map_err(|error| ApiError::Runtime(format!("failed to stat backup entry: {error}")))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
-        }
-        if crate::api::artifacts::is_checksum_sidecar(&path) {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if validate_backup_name(name).is_err() {
-            continue;
-        }
-        let name = name.to_string();
-        backups.push(BackupFile {
-            path,
-            name,
-            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        });
-    }
-    Ok(backups)
-}
-
-async fn delete_pruned_backup(backup: &BackupFile) -> Result<(), ApiError> {
-    match tokio::fs::remove_file(&backup.path).await {
-        Ok(()) => {
-            crate::api::artifacts::remove_checksum_sidecar(&backup.path).await;
-            tracing::info!(event = "audit backup_retention_deleted", backup = %backup.name);
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ApiError::Runtime(format!(
-            "failed to delete old backup {}: {error}",
-            backup.path.display()
-        ))),
-    }
-}
-
-async fn verify_backup_path(
-    state: &AppState,
-    instance_id: &str,
-    path: &FsPath,
-) -> Result<PathBuf, ApiError> {
-    let root = backup_root(state).join(instance_id);
-    let root_metadata =
-        tokio::fs::symlink_metadata(&root)
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => ApiError::NotFound,
-                _ => ApiError::Runtime(format!("failed to inspect instance backup root: {error}")),
-            })?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err(ApiError::Runtime(
-            "instance backup root must be a real directory".to_string(),
-        ));
-    }
-    let root = tokio::fs::canonicalize(&root).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to resolve instance backup root: {error}"))
-    })?;
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => ApiError::NotFound,
-            _ => ApiError::Runtime(format!("failed to inspect backup: {error}")),
-        })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(ApiError::BadRequest(
-            "backup is not a regular file".to_string(),
-        ));
-    }
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to resolve backup: {error}")))?;
-    if !canonical.starts_with(&root) {
-        return Err(ApiError::BadRequest(
-            "backup resolves outside backup root".to_string(),
-        ));
-    }
-    Ok(canonical)
-}
-
-fn validate_backup_name(name: &str) -> Result<(), ApiError> {
-    if !is_safe_flat_file_name(name) {
-        Err(ApiError::BadRequest("invalid backup name".to_string()))
-    } else {
-        Ok(())
-    }
-}
-
-async fn create_private_directory(path: &FsPath, label: &str) -> Result<(), ApiError> {
-    tokio::fs::create_dir_all(path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create {label}: {error}")))?;
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to inspect {label}: {error}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ApiError::Runtime(format!(
-            "{label} must be a real directory"
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("failed to secure {label} permissions: {error}"))
-            })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -656,57 +757,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_names_reject_path_traversal() {
-        for name in ["../backup.tar.gz", "nested/backup.tar.gz", "", "."] {
-            assert!(validate_backup_name(name).is_err(), "{name}");
-        }
-        assert!(validate_backup_name("backup.physical.tar.gz").is_ok());
-    }
+    fn catalog_selection_is_bounded_and_object_scoped() {
+        let catalog = BackupCatalog {
+            schema_version: crate::backups::catalog::BACKUP_CATALOG_SCHEMA_VERSION,
+            backup_id: "one.physical.tar.gz".to_string(),
+            instance_id: "inst_one".to_string(),
+            protocol: Protocol::Postgres,
+            database_name: "app".to_string(),
+            captured_at: "2024-01-01T00:00:00Z".to_string(),
+            consistency: "test".to_string(),
+            truncated: false,
+            warnings: Vec::new(),
+            objects: vec![crate::backups::catalog::BackupCatalogObject {
+                id: "public.users".to_string(),
+                namespace: "public".to_string(),
+                name: "users".to_string(),
+                kind: "table".to_string(),
+                estimated_rows: Some(3),
+                columns: Vec::new(),
+                preview_rows: vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
+                preview_truncated: true,
+            }],
+        };
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn backup_reader_rejects_a_symlinked_instance_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let real = temp.path().join("real");
-        let link = temp.path().join("instance-1");
-        tokio::fs::create_dir(&real).await.unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let error = read_instance_backup_files(&link).await.unwrap_err();
-
-        assert!(error.to_string().contains("real directory"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn backup_reader_ignores_symlinked_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let instance_root = temp.path().join("instance-1");
-        tokio::fs::create_dir(&instance_root).await.unwrap();
-        let outside = temp.path().join("outside.physical.tar.gz");
-        tokio::fs::write(&outside, b"outside").await.unwrap();
-        std::os::unix::fs::symlink(&outside, instance_root.join("link.physical.tar.gz")).unwrap();
-
-        let backups = read_instance_backup_files(&instance_root).await.unwrap();
-
-        assert!(backups.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn private_backup_directory_overrides_process_umask_defaults() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("backups");
-
-        create_private_directory(&path, "test backups")
-            .await
+        let selection = select_catalog_object(&catalog, Some("public.users"), 1, 1)
+            .unwrap()
             .unwrap();
-
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        assert_eq!(selection.returned, 1);
+        assert_eq!(selection.rows[0]["id"], 2);
+        assert!(selection.truncated);
     }
 }

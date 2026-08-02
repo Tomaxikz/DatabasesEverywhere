@@ -105,7 +105,7 @@ impl ManagedContainerEvent {
         let action = match raw_action.as_str() {
             "start" | "restart" => ManagedContainerAction::Started,
             "stop" => ManagedContainerAction::Stopped,
-            "die" => ManagedContainerAction::Exited {
+            "die" | "died" => ManagedContainerAction::Exited {
                 exit_code: attributes
                     .get("exitCode")
                     .and_then(|exit_code| exit_code.parse().ok()),
@@ -154,6 +154,16 @@ mod tests {
             parsed.action,
             ManagedContainerAction::Exited { exit_code: None }
         );
+    }
+
+    #[test]
+    fn accepts_the_podman_compatibility_exit_spelling() {
+        assert!(matches!(
+            ManagedContainerEvent::from_message(event("died"))
+                .unwrap()
+                .action,
+            ManagedContainerAction::Exited { .. }
+        ));
     }
 
     #[test]

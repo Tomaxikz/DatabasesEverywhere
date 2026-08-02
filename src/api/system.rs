@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.6.0";
+pub const API_VERSION: &str = "0.7.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -170,5 +170,38 @@ mod tests {
                 .iter()
                 .any(|format| format.as_str() == Some("rar"))
         );
+    }
+
+    #[test]
+    fn openapi_advertises_backup_storage_and_catalog_browsing() {
+        let document: Value =
+            serde_yaml::from_str(include_str!("../../openapi.yml")).expect("valid OpenAPI YAML");
+        let status = &document["components"]["schemas"]["BackupStatusResponse"];
+        assert_eq!(
+            status["properties"]["storage_driver"]["enum"]
+                .as_sequence()
+                .expect("storage driver enum")
+                .len(),
+            3
+        );
+        let browse =
+            &document["paths"]["/api/instances/{instance_id}/backups/{backup_id}/contents"]["get"];
+        assert_eq!(browse["x-required-scope"].as_str(), Some("backups:read"));
+        assert_eq!(
+            browse["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str(),
+            Some("#/components/schemas/BackupContentsResponse")
+        );
+    }
+
+    #[test]
+    fn example_config_includes_valid_backup_driver_settings() {
+        let config: crate::config::Config =
+            serde_yaml::from_str(include_str!("../../config.example.yml"))
+                .expect("valid example config YAML");
+        assert_eq!(
+            config.backups.storage.driver,
+            crate::config::BackupStorageDriver::Local
+        );
+        assert!(config.backups.browsing.enabled);
     }
 }

@@ -267,6 +267,23 @@ pub(super) async fn reapply_instance_disk_limits(
         .map(|metadata| async move {
             let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
                 .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
+            if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
+                paths.create_dirs().await.with_context(|| {
+                    format!(
+                        "failed to create rootless Podman paths for {}",
+                        metadata.instance_id
+                    )
+                })?;
+                paths
+                    .apply_rootless_podman_owner(uid, gid)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to apply rootless Podman ownership for {}",
+                            metadata.instance_id
+                        )
+                    })?;
+            }
             if !disk_limiter
                 .instance_runtime_is_healthy(&paths.data)
                 .await

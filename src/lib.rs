@@ -8,6 +8,8 @@ pub mod api;
 #[cfg(target_os = "linux")]
 pub mod auth;
 #[cfg(target_os = "linux")]
+pub mod backups;
+#[cfg(target_os = "linux")]
 pub mod bench;
 #[cfg(target_os = "linux")]
 pub mod bins;

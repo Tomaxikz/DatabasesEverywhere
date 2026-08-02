@@ -141,22 +141,23 @@ fn rootless_podman_uses_protocol_specific_users() {
         "/run/user/1000/podman/podman.sock",
     );
 
-    assert_eq!(
-        runtime.rootless_podman_container_user(Protocol::Postgres),
-        Some("999:999")
-    );
-    assert_eq!(
-        runtime.rootless_podman_container_user(Protocol::Mariadb),
-        Some("999:999")
-    );
-    assert_eq!(
-        runtime.rootless_podman_container_user(Protocol::Mongodb),
-        Some("999:999")
-    );
-    assert_eq!(
-        runtime.rootless_podman_container_user(Protocol::Redis),
-        Some("0:0")
-    );
+    for protocol in [
+        Protocol::Postgres,
+        Protocol::Mariadb,
+        Protocol::Mysql,
+        Protocol::Mongodb,
+    ] {
+        assert_eq!(
+            runtime.rootless_podman_container_user(protocol),
+            Some("999:999")
+        );
+    }
+    for protocol in [Protocol::Redis, Protocol::Clickhouse, Protocol::Qdrant] {
+        assert_eq!(
+            runtime.rootless_podman_container_user(protocol),
+            Some("0:0")
+        );
+    }
 }
 
 #[test]
@@ -177,12 +178,27 @@ fn rootless_podman_sets_keep_id_for_postgres_like_images() {
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
     );
-    let body = runtime.create_body(&postgres_spec()).unwrap();
+    for protocol in [
+        Protocol::Postgres,
+        Protocol::Mariadb,
+        Protocol::Mysql,
+        Protocol::Mongodb,
+    ] {
+        let mut spec = postgres_spec();
+        spec.protocol = protocol;
+        let body = runtime.create_body(&spec).unwrap();
+        assert_eq!(
+            body.host_config.unwrap().userns_mode.as_deref(),
+            Some("keep-id:uid=999,gid=999")
+        );
+    }
 
-    assert_eq!(
-        body.host_config.unwrap().userns_mode.as_deref(),
-        Some("keep-id:uid=999,gid=999")
-    );
+    for protocol in [Protocol::Redis, Protocol::Clickhouse, Protocol::Qdrant] {
+        let mut spec = postgres_spec();
+        spec.protocol = protocol;
+        let body = runtime.create_body(&spec).unwrap();
+        assert_eq!(body.host_config.unwrap().userns_mode, None);
+    }
 }
 
 #[test]

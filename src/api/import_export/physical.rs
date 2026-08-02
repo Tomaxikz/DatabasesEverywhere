@@ -56,13 +56,27 @@ pub(super) async fn import_physical_archive(
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let mut result = replace_data_from_archive(paths.clone(), artifact_path).await;
-    if result.is_ok() && !state.docker.uses_rootless_podman() {
-        result = paths
-            .reapply_data_owner()
-            .await
-            .map_err(|error| ApiError::Runtime(error.to_string()));
+    if result.is_ok() {
+        result = reapply_instance_data_owner(state, &paths).await;
     }
     finish_physical_operation(state, instance_id, was_running, result).await
+}
+
+pub(crate) async fn reapply_instance_data_owner(
+    state: &AppState,
+    paths: &InstancePaths,
+) -> Result<(), ApiError> {
+    if let Some((uid, gid)) = state.docker.rootless_podman_host_owner() {
+        paths
+            .reapply_rootless_podman_data_owner(uid, gid)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))
+    } else {
+        paths
+            .reapply_data_owner()
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))
+    }
 }
 
 pub(crate) async fn replace_data_from_archive(

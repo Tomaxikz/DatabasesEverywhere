@@ -25,7 +25,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | Runtime | Status |
 | --- | --- |
 | Docker | Works |
-| Podman | In progress |
+| Podman | Works (rootful and rootless) |
 | systemd | Planned |
 
 ## Supported Databases
@@ -58,11 +58,12 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Install
 
-Official releases target x86-64 Linux with glibc 2.35 or newer. Choose a
-versioned release and install it to `/usr/local/bin`:
+Official releases target x86-64, ARM64, and RISC-V 64 Linux with glibc 2.35 or
+newer. Choose the artifact for your host from a versioned release and install
+it to `/usr/local/bin` (x86-64 example):
 
 ```bash
-sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/v0.3.2/dbev-x86_64-linux" -o /usr/local/bin/dbev
+sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/v0.3.3/dbev-x86_64-linux" -o /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
 ```
 
@@ -101,9 +102,10 @@ The daemon runs as root by default, matching other container-management agents.
 This gives it direct access to Docker or Podman, filesystem quotas, FUSE mounts,
 and managed database storage without service-account groups or sudoers rules.
 DBE still applies its restrictive process umask and validates managed paths in
-code. Setup substitutes `podman.socket` when Podman is configured and places a
-custom config path in `ExecStart`. Run `dbev --setup` again after changing those
-settings or installing a release with an updated unit.
+code. Podman may use the rootful system socket or an explicitly configured
+`/run/user/<uid>/podman/podman.sock`; setup enables lingering and the user
+socket for the latter. Run `dbev --setup` again after changing the engine,
+socket, config path, or installing a release with an updated unit.
 
 By default the daemon reads its config from:
 

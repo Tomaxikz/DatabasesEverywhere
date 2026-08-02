@@ -28,6 +28,8 @@ const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
     &["paths"],
     &["disk", "fuse_quota_binary"],
     &["disk", "fuse_quota_binary_sha256"],
+    &["backups", "storage", "kopia", "executable"],
+    &["backups", "storage", "kopia", "config_file"],
 ];
 
 #[derive(Debug, Serialize)]
@@ -280,6 +282,29 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_kopia_executable_and_repository_config_patches() {
+        for field in ["executable", "config_file"] {
+            let patch = serde_json::json!({
+                "backups": { "storage": { "kopia": { (field): "/tmp/attacker" } } }
+            });
+            assert!(reject_forbidden_paths(&patch).is_err());
+        }
+    }
+
+    #[test]
+    fn permits_non_executable_backup_storage_patches() {
+        let patch = serde_json::json!({
+            "backups": {
+                "storage": {
+                    "driver": "s3",
+                    "s3": { "bucket": "node-backups" }
+                }
+            }
+        });
+        reject_forbidden_paths(&patch).unwrap();
     }
 
     #[test]

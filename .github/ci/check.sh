@@ -6,7 +6,7 @@ if [ "$(uname -s)" != "Linux" ]; then
   exit 1
 fi
 
-repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$repository_root"
 
 section() {
@@ -16,6 +16,9 @@ section() {
 lint() {
   section "Locked Cargo manifests"
   cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+  section "Rust source size"
+  bash .github/ci/check-source-size.sh
 
   section "Rust formatting"
   cargo fmt --all -- --check

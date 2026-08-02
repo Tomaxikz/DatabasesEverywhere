@@ -212,6 +212,24 @@ impl DockerRuntime {
         cancellation: Arc<HelperCancellation>,
     ) -> Result<CommandOutput, DockerError> {
         let work_dir = run_unless_cancelled(&cancellation, validate_helper_spec(&spec)).await?;
+        if let Some((uid, gid)) = self.rootless_podman_host_owner() {
+            let owned_work_dir = work_dir.clone();
+            run_unless_cancelled(&cancellation, async move {
+                tokio::task::spawn_blocking(move || {
+                    crate::shared::ownership::chown_directory_recursive(
+                        &owned_work_dir,
+                        crate::shared::ownership::HostOwner { uid, gid },
+                    )
+                    .map_err(|source| DockerError::RemoteImportHelperIo {
+                        path: owned_work_dir.display().to_string(),
+                        source,
+                    })
+                })
+                .await
+                .map_err(|error| DockerError::RemoteImportHelperTask(error.to_string()))?
+            })
+            .await?;
+        }
         let initial_size = run_unless_cancelled(
             &cancellation,
             measure_work_directory(&work_dir, spec.max_output_bytes),
@@ -691,9 +709,24 @@ fn forbidden_helper_mount(path: &Path) -> bool {
         "/root",
         "/run/docker.sock",
         "/var/run/docker.sock",
+        "/run/podman/podman.sock",
+        "/var/run/podman/podman.sock",
     ]
     .iter()
     .any(|forbidden| path == Path::new(forbidden) || path.starts_with(forbidden))
+        || is_rootless_podman_socket(path)
+}
+
+fn is_rootless_podman_socket(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path.file_name().is_some_and(|name| name == "podman.sock")
+        && parent.file_name().is_some_and(|name| name == "podman")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|root| root == Path::new("/run/user"))
 }
 
 async fn measure_work_directory(path: &Path, stop_after: u64) -> Result<u64, DockerError> {

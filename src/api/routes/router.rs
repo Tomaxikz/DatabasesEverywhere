@@ -243,6 +243,10 @@ fn backup_routes() -> Router<AppState> {
             delete(backups::delete_instance_backup),
         )
         .route(
+            "/api/instances/{instance_id}/backups/{backup_id}/contents",
+            get(backups::browse_instance_backup),
+        )
+        .route(
             "/api/instances/{instance_id}/backups/{backup_id}/download",
             get(artifacts::download_backup).post(artifacts::create_backup_download),
         )

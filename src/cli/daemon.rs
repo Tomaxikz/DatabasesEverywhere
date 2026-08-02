@@ -52,6 +52,34 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         data_path = %config.paths.data,
         "disk limiter preflight ok"
     );
+    let backup_storage = crate::backups::BackupStorage::from_config(&config)
+        .context("failed to configure backup storage")?;
+    backup_storage
+        .preflight()
+        .await
+        .context("backup storage preflight failed")?;
+    let backups_root = config.paths.backups_root();
+    if crate::backups::cleanup_staging(Path::new(&backups_root))
+        .await
+        .context("failed to clean incomplete backup staging")?
+    {
+        tracing::info!("removed incomplete backup staging from an earlier daemon run");
+    }
+    let tmp_root = config.paths.tmp_root();
+    let removed_materialization_roots =
+        crate::backups::cleanup_materializations(Path::new(&tmp_root))
+            .await
+            .context("failed to clean incomplete backup materializations")?;
+    if removed_materialization_roots > 0 {
+        tracing::info!(
+            removed_materialization_roots,
+            "removed incomplete backup materializations from an earlier daemon run"
+        );
+    }
+    tracing::info!(
+        driver = backup_storage.kind().as_str(),
+        "backup storage preflight ok"
+    );
 
     let store = InstanceStore::default();
     let pool = sqlite::connect(std::path::Path::new(&config.paths.metadata_root()))
@@ -114,10 +142,19 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
 
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?;
+    docker
+        .refresh_engine_info()
+        .await
+        .context("failed to negotiate and validate the configured container engine")?;
     let docker_ping = docker
         .ping()
         .await
         .context("failed to ping container engine API")?;
+    prepare_rootless_podman_runtime_paths(&config, &docker)
+        .context("failed to prepare rootless Podman bind-mount paths")?;
+    reconcile::validate_configured_runtime(&manager, &docker)
+        .await
+        .context("configured container engine is incompatible with stored instances")?;
     let remote_import_helper_reconciliation = docker.reconcile_remote_import_helpers().await;
     match &remote_import_helper_reconciliation {
         Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
@@ -165,16 +202,13 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     remote_import_helper_reconciliation
         .context("failed to reconcile stale remote import helper containers")?;
-    if let Err(error) = docker.refresh_engine_info().await {
-        tracing::warn!(
-            %error,
-            "failed to read container engine info; using socket-derived engine capabilities"
-        );
-    }
     tracing::info!(
         engine = %docker.engine_name(),
         socket = %docker.socket_path(),
         rootless_podman = docker.uses_rootless_podman(),
+        engine_version = docker.engine_version().unwrap_or("unknown"),
+        engine_api_version = docker.engine_api_version().unwrap_or("unknown"),
+        cgroup_version = docker.cgroup_version().unwrap_or("unknown"),
         response = %docker_ping,
         "container engine api reachable"
     );

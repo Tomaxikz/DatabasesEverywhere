@@ -14,18 +14,56 @@ sudo apt install -y docker.io sudo curl fuse3
 sudo systemctl enable --now docker
 ```
 
-For Podman instead of Docker, install and enable the Podman API socket, then set `daemon.engine: podman` in `config.yml`. Only set `daemon.socket_path` if the default socket discovery doesn't find yours.
+Podman is supported through its Docker-compatible API in both rootful and
+rootless modes. For a rootful service, install Podman, set
+`daemon.engine: podman`, leave `daemon.socket_path` empty (or set it to
+`/run/podman/podman.sock`), then let setup validate and enable the system
+socket:
 
-Official releases contain only the x86-64 Linux daemon. Windows is not a
-supported target because the daemon depends on Linux container, filesystem,
-and Unix-socket facilities. The Linux artifact targets glibc 2.35 or newer.
-Choose a versioned release and install it. Do not automate installation from
-the mutable `latest` URL.
+```yaml
+daemon:
+  engine: podman
+  socket_path: /run/podman/podman.sock
+```
+
+For rootless Podman, choose the existing Linux account that will own the
+containers and configure its standard socket path explicitly:
+
+```yaml
+daemon:
+  engine: podman
+  socket_path: /run/user/1000/podman/podman.sock
+```
+
+Running `sudo dbev --setup` enables login lingering and that account's
+`podman.socket`, validates the socket owner and Podman identity, and prepares
+the private bind-mount paths without making them publicly readable. Rootless
+Podman requires cgroup v2 so DBE can preserve CPU, memory, and PID limits.
+Custom Podman socket paths are accepted but must be started and supervised by
+the operator. Do not switch an existing node between Docker and Podman while
+it still has managed instances; DBE refuses the mixed-runtime state rather
+than silently losing or recreating containers.
+
+With custom storage paths, every ancestor above a DBE-managed bind-mount root
+must already grant the selected rootless account execute-only traversal. Setup
+checks this explicitly and reports the first blocking directory; it never
+loosens permissions on unrelated parent directories.
+
+Official releases contain x86-64, ARM64, and RISC-V 64 Linux daemons. Windows
+is not a supported target because the daemon depends on Linux container,
+filesystem, and Unix-socket facilities. Linux artifacts target glibc 2.35 or
+newer. Choose a versioned release and the artifact matching your host. Do not
+automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.3.2 # replace with the reviewed release
-test "$(uname -m)" = x86_64
-sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-x86_64-linux" -o /usr/local/bin/dbev
+DBEV_VERSION=v0.3.3 # replace with the reviewed release
+case "$(uname -m)" in
+  x86_64) DBEV_ARCH=x86_64 ;;
+  aarch64|arm64) DBEV_ARCH=arm64 ;;
+  riscv64) DBEV_ARCH=riscv64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-${DBEV_ARCH}-linux" -o /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
 ```
 
@@ -181,9 +219,9 @@ rechecks host support for the automatically detected enforcement mode.
 FuseQuota uses a helper that's bundled into the binary. When automatic
 detection selects FuseQuota, `dbev` checks that `/dev/fuse` is usable and
 enables `user_allow_other` in `/etc/fuse.conf` on startup. The host
-still needs kernel FUSE support. The checked-in, hash-verified helper currently
-targets x86-64 Linux. Other architectures must build `dbev` from reviewed
-source, install a trusted helper, set its absolute path in
+still needs kernel FUSE support. Release binaries for x86-64, ARM64, and
+RISC-V 64 contain the matching checked and verified helper. A source build for
+another architecture must install a trusted helper, set its absolute path in
 `disk.fuse_quota_binary`, and set `disk.fuse_quota_binary_sha256` to the
 helper's lowercase SHA-256. External helpers must be root-owned, singly linked,
 executable regular files in root-owned directories that are not writable by
@@ -230,7 +268,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.3.2@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.3.3@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -253,9 +291,26 @@ backups:
   run_on_startup: false
   retention_keep_latest_per_instance: 7
   retention_max_age_days: 30
+  storage:
+    driver: local # local, s3, or kopia
+  browsing:
+    enabled: true
+    max_objects: 256
+    max_preview_objects: 32
+    preview_rows_per_object: 10
+    max_row_bytes: 4096
+    max_catalog_bytes: 1048576
 ```
 
-Retention is per instance: after each successful backup, the oldest files in that instance's backup directory get deleted until the limits are satisfied.
+Retention is per instance and is enforced through the selected storage driver.
+After each successful backup, the oldest owned backups are deleted until both
+limits are satisfied. `local` is the backwards-compatible default and stores
+archives below `paths.backups`; existing local archives remain readable.
+
+`paths.artifacts`, `paths.exports`, and `paths.imports` configure the local
+artifact staging roots independently from backup storage. Export artifacts must
+remain locally seekable because imports and recovery consume them directly.
+Backup archives may instead use S3 or Kopia as described in the Backups section.
 
 Changed your path layout later? Migrate:
 
@@ -348,7 +403,8 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.6.0` adds typed credential-based remote imports with
+version. Contract `0.7.0` adds pluggable local/S3/Kopia backup storage, storage
+status fields, and bounded backup-catalog browsing. Contract `0.6.0` adds typed credential-based remote imports with
 verified TLS, SSRF controls, per-protocol acquisition, merge/wipe modes, and
 rollback-first target handling. Contract `0.5.0` exposes the API rate-limit allowance and its
 credential-plus-peer-IP scope through `/api/system`. Contract `0.4.0` emits
@@ -552,8 +608,8 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 }
 ```
 
-CPU and memory fields are `null` when the container isn't running or Docker
-stats aren't available yet. Network counters are measured at DBE's authenticated
+CPU and memory fields are `null` when the container isn't running or container
+runtime stats aren't available yet. Network counters are measured at DBE's authenticated
 gateway-to-Unix-socket boundary because managed containers use
 `network_mode=none`; RX is traffic delivered to the database and TX is traffic
 returned by it. The counters start at zero on daemon boot. For continuous
@@ -623,7 +679,7 @@ Three related but different things — don't mix them up:
 
 - **Exports** are portable database-native dumps (`pg_dump` style). They are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs.
 - **Imports** load one of that instance's trusted local artifacts or acquire a native dump/snapshot directly from a typed remote source. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, helper images, commands, or connection URLs.
-- **Backups** are physical archives of the whole instance volume, stored under `paths.backups/<instance_id>/`. They're for disaster recovery on the same daemon, not portability.
+- **Backups** are physical archives of the whole instance volume. The local driver stores them under `paths.backups/<instance_id>/`; S3 and Kopia store them in the configured remote repository. They're for disaster recovery on the same daemon, not portability.
 
 ### Import/export jobs
 
@@ -789,12 +845,97 @@ multicast, reserved, and mixed public/private DNS answers are always rejected.
 | --- | --- | --- | --- |
 | GET | `/api/instances/{id}/backups` | backups:read | List only that instance's backups |
 | POST | `/api/instances/{id}/backups` | backups:write | Back up that instance now; returns the completed backup record |
+| GET | `/api/instances/{id}/backups/{backup_id}/contents` | backups:read | List the stored schema catalog, or select one object's bounded captured row preview with `?object=&offset=&limit=` |
 | POST | `/api/instances/{id}/backups/{backup_id}/restore` | recovery:admin | Restore the backup into its owning instance after explicit confirmation |
 | DELETE | `/api/instances/{id}/backups/{backup_id}` | backups:write | Delete one owned backup |
 | GET | `/api/admin/backups/status` | backups:admin | Node backup schedule and retention configuration |
 | POST | `/api/admin/backups/run` | backups:admin | Back up every eligible instance; returns `backups` and `skipped` |
 
-Backup list items are `{id, instance_id, size_bytes, modified_at, sha256}`. Host paths are never returned. A backup ID is resolved only below `paths.backups/<instance_id>/`; a backup from one instance cannot be restored, downloaded, or deleted through another instance's route.
+Backup list items remain `{id, instance_id, size_bytes, modified_at, sha256}`.
+Host paths and remote object keys are never returned. Every driver binds a
+backup to its instance ID; a backup from one instance cannot be restored,
+downloaded, browsed, or deleted through another instance's route.
+
+Storage driver behavior:
+
+- `local` atomically publishes the archive, catalog, and metadata under
+  `paths.backups/<instance_id>/`. It discovers pre-driver physical archives as
+  legacy backups, so switching to this release does not strand existing files.
+- `s3` uses direct SigV4-authenticated requests. Archives of 64 MiB and larger
+  use bounded-memory multipart uploads; the small metadata object is written
+  last, so incomplete uploads never appear in backup listings. Downloads and
+  restores stream to a mode-`0600` temporary file and verify the recorded size
+  and SHA-256 before use. AWS credentials may be set in config or supplied as
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional
+  `AWS_SESSION_TOKEN`. S3-compatible endpoints are supported with `endpoint`
+  and `path_style`; plaintext HTTP requires the explicit `allow_http` opt-in.
+- `kopia` snapshots one private bundle per backup, pins it against unrelated
+  Kopia retention policies, and tags it with the DBEV instance, backup ID,
+  protocol, size, hash, and creation time. Listing and retention use those
+  tags. Restore/download materializes only the archive
+  object and verifies it. Point `config_file` at an already connected Kopia
+  repository; when omitted it defaults to
+  `paths.backups/.kopia/repository.config`. The Kopia executable and repository
+  config must be root/daemon-owned real files and must not be writable by group
+  or others. Supply the repository password in config or the service's normal
+  `KOPIA_PASSWORD` environment.
+
+Changing `storage.driver` selects a different backup inventory; it does not
+migrate or combine backups from the previous driver. Migrate the repository
+separately or temporarily switch back to the old driver when an older backup
+must be restored. S3 and Kopia backups still use `paths.backups/.staging` while
+the stopped database volume is archived, and remote restores/downloads use
+`paths.tmp`, so both local filesystems need room for one complete backup.
+
+Treat the remote repository as production database storage. For S3, use TLS,
+least-privilege bucket credentials, bucket-side encryption and retention, and a
+lifecycle rule that aborts incomplete multipart uploads. Kopia encrypts its
+repository, but its config and repository password still need the same secret
+handling as database credentials.
+
+Example S3 selection (the full option set is in `config.example.yml`):
+
+```yaml
+backups:
+  storage:
+    driver: s3
+    s3:
+      bucket: customer-node-backups
+      region: eu-central-1
+      endpoint: ""       # leave empty for AWS
+      prefix: dbev
+      access_key_id: ""  # empty uses AWS_ACCESS_KEY_ID
+      secret_access_key: ""
+      session_token: ""
+      path_style: false
+      allow_http: false
+      request_timeout_seconds: 900
+      max_retries: 3
+```
+
+Example Kopia selection:
+
+```yaml
+backups:
+  storage:
+    driver: kopia
+    kopia:
+      executable: /usr/local/bin/kopia
+      config_file: /var/lib/dbev/backups/.kopia/repository.config
+      repository_password: ""
+      operation_timeout_seconds: 3600
+```
+
+When browsing is enabled, each new backup carries a size-bounded catalog
+captured immediately before its physical archive. PostgreSQL, MariaDB, MySQL,
+MongoDB, and ClickHouse catalogs contain object/schema information plus a
+configurable, truncated row preview. Redis and Qdrant are schema-less physical
+stores, so they return a descriptive object without record previews. This is a
+safe catalog view: the endpoint does not boot an untrusted clone or parse live
+database files. Existing backups return `catalog_available: false`. Row
+previews are database content and must be protected with the same access and
+encryption policy as the backup itself. Set `preview_rows_per_object: 0` to
+retain schema browsing without storing row previews.
 
 Backup restore follows the same destructive-action policy as artifact recovery
 and requires an audit reason:

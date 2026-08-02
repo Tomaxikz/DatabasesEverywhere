@@ -6,7 +6,7 @@ use std::{
 use bollard::models::HostConfig;
 
 use crate::{
-    config::DaemonConfig,
+    config::{DaemonConfig, DaemonEngine},
     runtime::socket_bridge::is_valid_bridge,
     shared::backend::{CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH},
 };
@@ -22,6 +22,8 @@ const FORBIDDEN_MOUNT_PREFIXES: &[&str] = &[
     "/sys",
     "/var/run/docker.sock",
     "/run/docker.sock",
+    "/var/run/podman/podman.sock",
+    "/run/podman/podman.sock",
 ];
 
 const ALLOWED_EXTRA_MOUNT_TARGETS: &[&str] =
@@ -56,16 +58,32 @@ impl Default for DockerSecurityPolicy {
 
 impl DockerSecurityPolicy {
     pub fn from_config(config: &DaemonConfig) -> Self {
+        Self::from_config_for_engine(config, config.engine)
+    }
+
+    pub fn from_config_for_engine(config: &DaemonConfig, engine: DaemonEngine) -> Self {
+        let mut security_opts = config
+            .container_security_opts
+            .iter()
+            .filter_map(|value| non_empty_string(value))
+            .collect::<Vec<_>>();
+        // Podman's SELinux labels cannot safely infer a shared label for the
+        // daemon's private bind mounts. DBE containers are network-isolated,
+        // capability-free, and mount only validated paths, so disabling label
+        // separation for these containers is the portable Podman default.
+        if engine == DaemonEngine::Podman
+            && !security_opts
+                .iter()
+                .any(|option| option.to_ascii_lowercase().starts_with("label="))
+        {
+            security_opts.push("label=disable".to_string());
+        }
         Self {
             read_only_rootfs: config.container_read_only_rootfs,
             userns_mode: non_empty_string(&config.container_userns_mode),
             seccomp_profile: non_empty_string(&config.container_seccomp_profile),
             apparmor_profile: non_empty_string(&config.container_apparmor_profile),
-            security_opts: config
-                .container_security_opts
-                .iter()
-                .filter_map(|value| non_empty_string(value))
-                .collect(),
+            security_opts,
             ..Default::default()
         }
     }
@@ -208,7 +226,24 @@ fn reject_forbidden_path(path: &Path) -> Result<(), DockerSecurityError> {
             });
         }
     }
+    if is_rootless_podman_socket(&path) {
+        return Err(DockerSecurityError::ForbiddenMount {
+            path: path.display().to_string(),
+        });
+    }
     Ok(())
+}
+
+fn is_rootless_podman_socket(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path.file_name().is_some_and(|name| name == "podman.sock")
+        && parent.file_name().is_some_and(|name| name == "podman")
+        && parent
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|root| root == Path::new("/run/user"))
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf, String> {
@@ -340,6 +375,50 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
+    }
+
+    #[test]
+    fn rejects_system_and_rootless_podman_socket_mounts() {
+        for path in [
+            "/run/podman/podman.sock",
+            "/run/user/1000/podman/podman.sock",
+        ] {
+            let mut spec = test_spec();
+            spec.data_path = PathBuf::from(path);
+
+            let error = DockerSecurityPolicy::default()
+                .validate_spec(&spec)
+                .unwrap_err();
+
+            assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
+        }
+    }
+
+    #[test]
+    fn podman_policy_adds_selinux_compatibility_without_overriding_an_explicit_label() {
+        let mut config = DaemonConfig {
+            engine: DaemonEngine::Podman,
+            ..DaemonConfig::default()
+        };
+        let automatic = DockerSecurityPolicy::from_config(&config);
+        assert!(
+            automatic
+                .security_opts
+                .iter()
+                .any(|value| value == "label=disable")
+        );
+
+        config.container_security_opts = vec!["label=type:dbev_t".to_string()];
+        let explicit = DockerSecurityPolicy::from_config(&config);
+        assert_eq!(explicit.security_opts, config.container_security_opts);
+
+        config.engine = DaemonEngine::Docker;
+        config.container_security_opts.clear();
+        assert!(
+            DockerSecurityPolicy::from_config(&config)
+                .security_opts
+                .is_empty()
+        );
     }
 
     #[test]

@@ -424,7 +424,15 @@ fn secure_fuse_directory(path: &Path) -> Result<(), DiskLimitError> {
             path.display()
         )));
     }
-    rustix::fs::fchmod(&directory, Mode::RWXU)
+    // Rootless Podman setup may grant its trusted runtime group execute-only
+    // traversal through these daemon-owned directories. Keep that single bit
+    // while still removing directory listing, write, and all other access.
+    let mode = if stat.st_mode & Mode::XGRP.bits() != 0 {
+        Mode::RWXU | Mode::XGRP
+    } else {
+        Mode::RWXU
+    };
+    rustix::fs::fchmod(&directory, mode)
         .map_err(std::io::Error::from)
         .map_err(|source| DiskLimitError::PathIo {
             path: path.display().to_string(),
@@ -919,6 +927,23 @@ mod tests {
         for path in [root.clone(), root.join("instances"), root.join("mounts")] {
             let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn fuse_runtime_directories_preserve_execute_only_runtime_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fuse");
+        for path in [root.clone(), root.join("instances"), root.join("mounts")] {
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o710)).unwrap();
+        }
+
+        ensure_private_fuse_directories(&root).unwrap();
+
+        for path in [root.clone(), root.join("instances"), root.join("mounts")] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o710);
         }
     }
 

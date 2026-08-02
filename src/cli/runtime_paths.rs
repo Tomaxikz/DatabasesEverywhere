@@ -17,7 +17,17 @@ pub(super) async fn ensure_instance_runtime_paths(
         "daemon boot instance paths prepared; persistent data retained and runtime socket directory cleared"
     );
 
-    if docker.rootless_podman_container_user(protocol).is_none() {
+    if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
+        paths.apply_rootless_podman_owner(uid, gid).await?;
+        tracing::info!(
+            instance_id,
+            protocol = %protocol,
+            uid,
+            gid,
+            runtime_sockets = %paths.sockets.display(),
+            "daemon boot bind-mount ownership applied for rootless Podman"
+        );
+    } else {
         if let Some((uid, gid)) = docker
             .configured_container_user(protocol, instance_id)
             .await
@@ -43,13 +53,6 @@ pub(super) async fn ensure_instance_runtime_paths(
             );
             paths.apply_container_owner().await?;
         }
-    } else {
-        tracing::info!(
-            instance_id,
-            protocol = %protocol,
-            runtime_sockets = %paths.sockets.display(),
-            "daemon boot rootless podman detected; runtime socket directory ownership handled by user namespace mapping"
-        );
     }
     let socket_status = paths.socket_dir_status().await?;
     tracing::info!(
@@ -62,6 +65,112 @@ pub(super) async fn ensure_instance_runtime_paths(
         socket_mode = ?socket_status.mode.map(|mode| format!("{mode:o}")),
         "daemon boot runtime socket directory verified"
     );
+    Ok(())
+}
+
+pub(super) fn prepare_rootless_podman_runtime_paths(
+    config: &Config,
+    docker: &DockerRuntime,
+) -> anyhow::Result<()> {
+    let Some((uid, gid)) = docker.rootless_podman_host_owner() else {
+        return Ok(());
+    };
+    anyhow::ensure!(uid != 0, "rootless Podman host uid must not be 0");
+
+    let metadata = PathBuf::from(config.paths.metadata_root());
+    let fuse = PathBuf::from(config.paths.fuse_root());
+    let tmp = PathBuf::from(config.paths.tmp_root());
+    let logs = PathBuf::from(&config.paths.logs);
+    let paths = std::collections::BTreeSet::from([
+        PathBuf::from(&config.paths.data),
+        PathBuf::from(config.paths.volumes_root()),
+        logs.clone(),
+        logs.join("instances"),
+        PathBuf::from(&config.paths.sockets),
+        metadata.clone(),
+        metadata.join("runtime"),
+        metadata.join("runtime/bin"),
+        metadata.join("runtime-configs"),
+        fuse.clone(),
+        fuse.join("instances"),
+        fuse.join("mounts"),
+        tmp.clone(),
+        tmp.join("remote-import"),
+    ]);
+    let daemon_uid = rustix::process::geteuid().as_raw();
+    for path in &paths {
+        create_runtime_directory_tree(path).with_context(|| {
+            format!(
+                "failed to create rootless Podman traversal path {}",
+                path.display()
+            )
+        })?;
+        harden_runtime_directory(path)?;
+        crate::shared::ownership::share_directory_for_traversal(path, daemon_uid, gid)
+            .with_context(|| {
+                format!(
+                    "failed to grant rootless Podman gid {gid} traversal access to {}",
+                    path.display()
+                )
+            })?;
+    }
+    for path in &paths {
+        validate_rootless_podman_ancestor_traversal(path, uid, gid)?;
+    }
+    tracing::info!(
+        uid,
+        gid,
+        "rootless Podman bind-mount path traversal prepared"
+    );
+    Ok(())
+}
+
+pub(super) fn validate_rootless_podman_ancestor_traversal(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for ancestor in path.ancestors().skip(1) {
+            let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+                format!(
+                    "failed to inspect rootless Podman bind-mount ancestor {}",
+                    ancestor.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!(
+                    "rootless Podman bind-mount ancestor {} must be a real directory",
+                    ancestor.display()
+                );
+            }
+            let mode = metadata.permissions().mode();
+            let execute_bit = if metadata.uid() == uid {
+                0o100
+            } else if metadata.gid() == gid {
+                0o010
+            } else {
+                0o001
+            };
+            if mode & execute_bit == 0 {
+                anyhow::bail!(
+                    "rootless Podman uid {uid}/gid {gid} cannot traverse bind-mount ancestor {} (owner {}:{}, mode {:04o}); grant that account execute-only traversal or use the default DBE paths",
+                    ancestor.display(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    mode & 0o7777
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+    }
     Ok(())
 }
 

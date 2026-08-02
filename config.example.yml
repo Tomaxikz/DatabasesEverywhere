@@ -104,6 +104,42 @@ backups:
   run_on_startup: false
   retention_keep_latest_per_instance: 7
   retention_max_age_days: 30
+  storage:
+    # local keeps backwards-compatible archives under paths.backups. Choose
+    # exactly one of local, s3, or kopia for this daemon. Changing drivers does
+    # not migrate or combine existing backup inventories. Remote drivers still
+    # stage one complete archive below paths.backups and restore via paths.tmp.
+    driver: local
+    s3:
+      bucket: ""
+      region: us-east-1
+      # Leave empty for AWS S3. S3-compatible endpoints must be full HTTP(S)
+      # URLs; HTTP additionally requires allow_http: true.
+      endpoint: ""
+      prefix: dbev
+      # Empty credentials fall back to AWS_ACCESS_KEY_ID,
+      # AWS_SECRET_ACCESS_KEY, and optional AWS_SESSION_TOKEN.
+      access_key_id: ""
+      secret_access_key: ""
+      session_token: ""
+      path_style: false
+      allow_http: false
+      request_timeout_seconds: 900
+      max_retries: 3
+    kopia:
+      executable: /usr/local/bin/kopia
+      # Empty uses paths.backups/.kopia/repository.config.
+      config_file: ""
+      # Empty lets Kopia use its normal password sources.
+      repository_password: ""
+      operation_timeout_seconds: 3600
+  browsing:
+    enabled: true
+    max_objects: 256
+    max_preview_objects: 32
+    preview_rows_per_object: 10
+    max_row_bytes: 4096
+    max_catalog_bytes: 1048576
 
 # Node-wide admission guard. Null maxima automatically use detected host
 # capacity minus the reserve. Set explicit maxima to make a smaller DB pool.
@@ -126,13 +162,17 @@ disk:
   fuse_quota_rescan_interval_seconds: 150
 
 daemon:
-  # docker or podman. Both use the Docker-compatible Bollard API.
+  # docker or podman. Both use the Docker-compatible container API.
   engine: docker
-  # Optional. Leave empty for default socket discovery.
+  # Optional. Docker uses its normal local socket when empty. A root-run Podman
+  # daemon uses /run/podman/podman.sock when this is empty.
+  # For a rootless service managed by dbev --setup, configure the exact
+  # standard path explicitly, for example /run/user/1000/podman/podman.sock.
   socket_path: ""
   # Database containers always use network_mode=none. The daemon reaches
   # each backend through its private, instance-specific Unix socket.
-  # Optional Docker HostConfig hardening knobs.
+  # Optional container HostConfig hardening knobs. Podman automatically gets
+  # label=disable unless an explicit label=... security option is supplied.
   container_read_only_rootfs: false
   container_userns_mode: ''
   container_seccomp_profile: ''

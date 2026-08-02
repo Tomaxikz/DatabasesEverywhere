@@ -329,7 +329,9 @@ pub(crate) use jobs::{
 #[allow(unused_imports)]
 pub(crate) use jobs::queue_export_instance_with_options;
 pub(crate) use logical::quarantine_after_uncertain_import;
-pub(crate) use physical::{finish_physical_operation, replace_data_from_archive};
+pub(crate) use physical::{
+    finish_physical_operation, reapply_instance_data_owner, replace_data_from_archive,
+};
 
 #[cfg(test)]
 mod tests;

@@ -9,15 +9,17 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     validate_setup_config_path(&config_path)?;
     require_existing_config(&config_path)?;
     let mut config = load_config(&config_path)?;
-    ensure_required_setup_commands()?;
+    ensure_required_setup_commands(&config.daemon)?;
     install_current_binary(Path::new(INSTALL_PATH))?;
     secure_config_permissions(&config_path)?;
     ensure_system_directories(&config_path)?;
     detect_and_log_disk_mode(&mut config)?;
     ensure_fuse_quota_host_config(&config)?;
     remove_obsolete_managed_sudoers()?;
+    prepare_configured_podman_socket(&config.daemon)?;
     validate_runtime_support(&config).await?;
-    write_systemd_service(&config_path, config.daemon.engine)?;
+    validate_configured_container_engine(&config).await?;
+    write_systemd_service(&config_path, &config.daemon)?;
     reload_systemd()?;
     println!("system setup complete");
     println!("config read from: {}", config_path.display());
@@ -57,12 +59,121 @@ pub(super) fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<(
     Ok(())
 }
 
-pub(super) fn ensure_required_setup_commands() -> anyhow::Result<()> {
-    for command in ["chown"] {
+pub(super) fn ensure_required_setup_commands(
+    config: &crate::config::DaemonConfig,
+) -> anyhow::Result<()> {
+    let mut commands = vec!["chown", "systemctl"];
+    if configured_rootless_podman_uid(config).is_some() {
+        commands.extend(["getent", "loginctl", "runuser"]);
+    }
+    for command in commands {
         if !command_exists(command)? {
             anyhow::bail!("required setup command {command} was not found");
         }
     }
+    Ok(())
+}
+
+fn configured_rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {
+    if config.engine != DaemonEngine::Podman {
+        return None;
+    }
+    config
+        .configured_socket_path()
+        .and_then(crate::runtime::docker::rootless_podman_uid_from_socket_path)
+}
+
+fn prepare_configured_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
+    if config.engine != DaemonEngine::Podman {
+        return Ok(());
+    }
+    if config.configured_socket_path().is_none()
+        || config.configured_socket_path() == Some("/run/podman/podman.sock")
+    {
+        run_setup_command("systemctl", &["enable", "--now", "podman.socket"])?;
+        println!("enabled rootful Podman API socket");
+        return Ok(());
+    }
+    let Some(uid) = configured_rootless_podman_uid(config) else {
+        println!(
+            "podman socket mode: externally managed custom socket; dbev will validate it but not control its lifecycle"
+        );
+        return Ok(());
+    };
+    let username = username_for_uid(uid)?;
+    run_setup_command("loginctl", &["enable-linger", &username])?;
+    let user_unit = format!("user@{uid}.service");
+    run_setup_command("systemctl", &["start", &user_unit])?;
+    let runtime = format!("XDG_RUNTIME_DIR=/run/user/{uid}");
+    let bus = format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus");
+    run_setup_command(
+        "runuser",
+        &[
+            "-u",
+            &username,
+            "--",
+            "env",
+            &runtime,
+            &bus,
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            "podman.socket",
+        ],
+    )?;
+    println!("enabled rootless Podman socket for {username} (uid {uid}) with login lingering");
+    Ok(())
+}
+
+fn username_for_uid(uid: u32) -> anyhow::Result<String> {
+    let uid_string = uid.to_string();
+    let output = StdCommand::new("getent")
+        .args(["passwd", &uid_string])
+        .output()
+        .context("failed to query the rootless Podman account")?;
+    if !output.status.success() {
+        anyhow::bail!("no local account exists for rootless Podman uid {uid}");
+    }
+    let line = String::from_utf8(output.stdout)
+        .context("rootless Podman account record was not valid UTF-8")?;
+    let fields = line.trim().split(':').collect::<Vec<_>>();
+    let username = fields.first().copied().unwrap_or_default();
+    let record_uid = fields.get(2).and_then(|value| value.parse::<u32>().ok());
+    if record_uid != Some(uid)
+        || username.is_empty()
+        || !username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("invalid local account record for rootless Podman uid {uid}");
+    }
+    Ok(username.to_string())
+}
+
+async fn validate_configured_container_engine(config: &Config) -> anyhow::Result<()> {
+    let mut runtime = DockerRuntime::new(&config.daemon, false)
+        .context("failed to connect to the configured container engine")?;
+    runtime
+        .refresh_engine_info()
+        .await
+        .context("failed to negotiate and validate the configured container engine")?;
+    runtime
+        .ping()
+        .await
+        .context("configured container engine did not answer ping")?;
+    prepare_rootless_podman_runtime_paths(config, &runtime)?;
+    println!(
+        "container engine ok: {} {} via {}{}",
+        runtime.engine_name(),
+        runtime.engine_version().unwrap_or("unknown"),
+        runtime.socket_path(),
+        if runtime.uses_rootless_podman() {
+            " (rootless)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -369,9 +480,9 @@ pub(super) fn remove_obsolete_managed_sudoers() -> anyhow::Result<()> {
 
 pub(super) fn write_systemd_service(
     config_path: &Path,
-    engine: DaemonEngine,
+    daemon: &crate::config::DaemonConfig,
 ) -> anyhow::Result<()> {
-    let contents = systemd_service_contents(config_path, engine);
+    let contents = systemd_service_contents(config_path, daemon);
     atomic_replace_setup_file(Path::new(SERVICE_PATH), 0o644, "systemd service", |file| {
         file.write_all(contents.as_bytes())
     })
@@ -379,22 +490,35 @@ pub(super) fn write_systemd_service(
     Ok(())
 }
 
-pub(super) fn systemd_service_contents(config_path: &Path, engine: DaemonEngine) -> String {
+pub(super) fn systemd_service_contents(
+    config_path: &Path,
+    daemon: &crate::config::DaemonConfig,
+) -> String {
     let exec_start = if config_path == Path::new(defaults::CONFIG_PATH) {
         INSTALL_PATH.to_string()
     } else {
         format!("{INSTALL_PATH} --config {}", config_path.display())
     };
-    let engine_unit = match engine {
-        DaemonEngine::Docker => "docker.service",
-        DaemonEngine::Podman => "podman.socket",
+    let engine_dependencies = match daemon.engine {
+        DaemonEngine::Docker => {
+            "After=docker.service\nRequires=docker.service\nPartOf=docker.service".to_string()
+        }
+        DaemonEngine::Podman => match configured_rootless_podman_uid(daemon) {
+            Some(uid) => format!(
+                "After=user@{uid}.service\nRequires=user@{uid}.service\nRequiresMountsFor=/run/user/{uid}"
+            ),
+            None if daemon.configured_socket_path().is_none()
+                || daemon.configured_socket_path() == Some("/run/podman/podman.sock") =>
+            {
+                "After=podman.socket\nRequires=podman.socket\nPartOf=podman.socket".to_string()
+            }
+            None => "After=network.target".to_string(),
+        },
     };
     format!(
         r#"[Unit]
 Description=DatabasesEverywhere
-After={engine_unit}
-Requires={engine_unit}
-PartOf={engine_unit}
+{engine_dependencies}
 
 [Service]
 User=root

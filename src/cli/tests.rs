@@ -235,7 +235,8 @@ fn setup_config_path_rejects_unit_file_metacharacters() {
 
 #[test]
 fn generated_systemd_service_runs_as_root_without_service_account_sandboxing() {
-    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), DaemonEngine::Docker);
+    let daemon = crate::config::DaemonConfig::default();
+    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
 
     assert!(unit.contains("User=root\n"));
     assert!(unit.contains("ExecStart=/usr/local/bin/dbev daemon\n"));
@@ -248,12 +249,66 @@ fn generated_systemd_service_runs_as_root_without_service_account_sandboxing() {
 
 #[test]
 fn generated_systemd_service_uses_selected_engine_and_custom_config() {
-    let unit = systemd_service_contents(Path::new("/srv/dbev/config.yml"), DaemonEngine::Podman);
+    let daemon = crate::config::DaemonConfig {
+        engine: DaemonEngine::Podman,
+        ..crate::config::DaemonConfig::default()
+    };
+    let unit = systemd_service_contents(Path::new("/srv/dbev/config.yml"), &daemon);
 
     assert!(unit.contains("After=podman.socket\n"));
     assert!(unit.contains("Requires=podman.socket\n"));
     assert!(unit.contains("PartOf=podman.socket\n"));
     assert!(unit.contains("ExecStart=/usr/local/bin/dbev --config /srv/dbev/config.yml daemon\n"));
+}
+
+#[test]
+fn generated_systemd_service_tracks_the_rootless_podman_user_manager() {
+    let daemon = crate::config::DaemonConfig {
+        engine: DaemonEngine::Podman,
+        socket_path: "/run/user/1001/podman/podman.sock".to_string(),
+        ..crate::config::DaemonConfig::default()
+    };
+
+    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
+
+    assert!(unit.contains("After=user@1001.service\n"));
+    assert!(unit.contains("Requires=user@1001.service\n"));
+    assert!(unit.contains("RequiresMountsFor=/run/user/1001\n"));
+    assert!(!unit.contains("Requires=podman.socket"));
+}
+
+#[test]
+fn generated_systemd_service_leaves_custom_podman_socket_lifecycle_external() {
+    let daemon = crate::config::DaemonConfig {
+        engine: DaemonEngine::Podman,
+        socket_path: "/srv/podman/api.sock".to_string(),
+        ..crate::config::DaemonConfig::default()
+    };
+
+    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
+
+    assert!(unit.contains("After=network.target\n"));
+    assert!(!unit.contains("Requires=podman.socket"));
+}
+
+#[test]
+fn rootless_podman_custom_paths_require_traversable_ancestors() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let managed = temp.path().join("managed");
+    fs::create_dir(&managed).unwrap();
+    let metadata = fs::metadata(temp.path()).unwrap();
+
+    validate_rootless_podman_ancestor_traversal(&managed, metadata.uid(), metadata.gid()).unwrap();
+    let error = validate_rootless_podman_ancestor_traversal(
+        &managed,
+        metadata.uid().saturating_add(1),
+        metadata.gid().saturating_add(1),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot traverse"));
 }
 
 #[test]

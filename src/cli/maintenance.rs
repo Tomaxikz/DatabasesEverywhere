@@ -16,8 +16,12 @@ pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
-    let docker = DockerRuntime::new(&config.daemon, false)
+    let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?;
+    docker
+        .refresh_engine_info()
+        .await
+        .context("failed to negotiate the container engine API")?;
     let removed = docker
         .remove_managed_containers()
         .await
@@ -206,8 +210,12 @@ impl<'a> PathMigrationPlan<'a> {
 }
 
 pub(super) async fn ensure_no_active_managed_containers(config: &Config) -> anyhow::Result<()> {
-    let docker = DockerRuntime::new(&config.daemon, false)
+    let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API for migration safety check")?;
+    docker
+        .refresh_engine_info()
+        .await
+        .context("failed to negotiate the container engine API for migration safety check")?;
     let active = docker
         .active_managed_container_count()
         .await

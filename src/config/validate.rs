@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    ApiSslConfig, ClickhouseConfig, Config, ListenerConfig, TlsConfig,
+    ApiSslConfig, BackupStorageDriver, ClickhouseConfig, Config, ListenerConfig, TlsConfig,
     path_policy::{HostPathPolicy, HostPathPolicyError},
 };
 use crate::shared::images::is_pinned_image_reference;
@@ -16,6 +16,7 @@ const MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 // configurable bound at or below it prevents a remote acquisition from
 // succeeding only to fail deterministically during target staging.
 const MAX_REMOTE_IMPORT_STAGED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_BACKUP_CATALOG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
@@ -101,6 +102,11 @@ pub enum ConfigValidationError {
     InvalidBackupInterval,
     #[error("backups.retention_keep_latest_per_instance must be greater than zero")]
     InvalidBackupRetentionKeepLatest,
+    #[error("backups.{field} is invalid: {message}")]
+    InvalidBackupConfig {
+        field: &'static str,
+        message: String,
+    },
     #[error("{field} must include a non-latest tag or valid sha256 digest: {image}")]
     InvalidImageReference { field: &'static str, image: String },
     #[error(
@@ -142,6 +148,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     if config.backups.retention_keep_latest_per_instance == 0 {
         return Err(ConfigValidationError::InvalidBackupRetentionKeepLatest);
     }
+    validate_backups(config)?;
 
     if let Some(socket_path) = config.daemon.configured_socket_path() {
         validate_absolute_path("daemon.socket_path", socket_path)?;
@@ -152,6 +159,154 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
 
     Ok(())
+}
+
+fn validate_backups(config: &Config) -> Result<(), ConfigValidationError> {
+    let browsing = &config.backups.browsing;
+    if browsing.max_objects == 0 || browsing.max_objects > 1_000 {
+        return invalid_backup("browsing.max_objects", "must be between 1 and 1000");
+    }
+    if browsing.max_preview_objects > browsing.max_objects {
+        return invalid_backup(
+            "browsing.max_preview_objects",
+            "must not exceed browsing.max_objects",
+        );
+    }
+    if browsing.preview_rows_per_object > 100 {
+        return invalid_backup("browsing.preview_rows_per_object", "must not exceed 100");
+    }
+    if !(256..=16 * 1024).contains(&browsing.max_row_bytes) {
+        return invalid_backup("browsing.max_row_bytes", "must be between 256 and 16384");
+    }
+    if !(64 * 1024..=MAX_BACKUP_CATALOG_BYTES).contains(&browsing.max_catalog_bytes) {
+        return invalid_backup(
+            "browsing.max_catalog_bytes",
+            "must be between 65536 and 1048576",
+        );
+    }
+
+    match config.backups.storage.driver {
+        BackupStorageDriver::Local => Ok(()),
+        BackupStorageDriver::S3 => validate_s3_backup(&config.backups.storage.s3),
+        BackupStorageDriver::Kopia => validate_kopia_backup(&config.backups.storage.kopia),
+    }
+}
+
+fn validate_s3_backup(s3: &crate::config::BackupS3Config) -> Result<(), ConfigValidationError> {
+    let bucket = s3.bucket.trim();
+    if bucket.len() < 3
+        || bucket.len() > 63
+        || bucket.starts_with('.')
+        || bucket.starts_with('-')
+        || bucket.ends_with('.')
+        || bucket.ends_with('-')
+        || !bucket.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+    {
+        return invalid_backup(
+            "storage.s3.bucket",
+            "must be a valid lowercase S3 bucket name",
+        );
+    }
+    if s3.region.trim().is_empty()
+        || !s3
+            .region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return invalid_backup("storage.s3.region", "contains unsupported characters");
+    }
+    validate_s3_prefix(&s3.prefix)?;
+    if s3.request_timeout_seconds == 0 || s3.request_timeout_seconds > 24 * 60 * 60 {
+        return invalid_backup(
+            "storage.s3.request_timeout_seconds",
+            "must be between 1 and 86400",
+        );
+    }
+    if s3.max_retries > 10 {
+        return invalid_backup("storage.s3.max_retries", "must not exceed 10");
+    }
+    if s3.access_key_id.trim().is_empty() != s3.secret_access_key.expose().trim().is_empty() {
+        return invalid_backup(
+            "storage.s3 credentials",
+            "access_key_id and secret_access_key must be configured together",
+        );
+    }
+    if !s3.endpoint.trim().is_empty() {
+        let endpoint = reqwest::Url::parse(s3.endpoint.trim()).map_err(|_| {
+            ConfigValidationError::InvalidBackupConfig {
+                field: "storage.s3.endpoint",
+                message: "must be a full HTTP(S) URL".to_string(),
+            }
+        })?;
+        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && s3.allow_http) {
+            return invalid_backup(
+                "storage.s3.endpoint",
+                "must use HTTPS unless allow_http is explicitly enabled",
+            );
+        }
+        if endpoint.host_str().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+        {
+            return invalid_backup(
+                "storage.s3.endpoint",
+                "must have a host and may not contain credentials, a query, or a fragment",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_s3_prefix(prefix: &str) -> Result<(), ConfigValidationError> {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if prefix.len() > 512
+        || prefix.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.contains('\\')
+                || part.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return invalid_backup(
+            "storage.s3.prefix",
+            "must contain only non-empty, normalized key segments",
+        );
+    }
+    Ok(())
+}
+
+fn validate_kopia_backup(
+    kopia: &crate::config::BackupKopiaConfig,
+) -> Result<(), ConfigValidationError> {
+    validate_absolute_path("backups.storage.kopia.executable", &kopia.executable)?;
+    if !kopia.config_file.trim().is_empty() {
+        validate_absolute_path("backups.storage.kopia.config_file", &kopia.config_file)?;
+    }
+    if kopia.operation_timeout_seconds == 0 || kopia.operation_timeout_seconds > 24 * 60 * 60 {
+        return invalid_backup(
+            "storage.kopia.operation_timeout_seconds",
+            "must be between 1 and 86400",
+        );
+    }
+    Ok(())
+}
+
+fn invalid_backup<T>(
+    field: &'static str,
+    message: impl Into<String>,
+) -> Result<T, ConfigValidationError> {
+    Err(ConfigValidationError::InvalidBackupConfig {
+        field,
+        message: message.into(),
+    })
 }
 
 fn validate_allocation(
@@ -927,6 +1082,40 @@ mod tests {
         let mut config = valid_config();
         config.daemon.socket_path = "/run/podman/podman.sock".to_string();
 
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn accepts_s3_backup_storage_with_configured_credentials() {
+        let mut config = valid_config();
+        config.backups.storage.driver = BackupStorageDriver::S3;
+        config.backups.storage.s3.bucket = "node-backups".to_string();
+        config.backups.storage.s3.region = "eu-central-1".to_string();
+        config.backups.storage.s3.access_key_id = "test-access-key".to_string();
+        config.backups.storage.s3.secret_access_key =
+            crate::config::SensitiveString("test-secret-key".to_string());
+
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn s3_plaintext_endpoint_requires_explicit_opt_in() {
+        let mut config = valid_config();
+        config.backups.storage.driver = BackupStorageDriver::S3;
+        config.backups.storage.s3.bucket = "node-backups".to_string();
+        config.backups.storage.s3.endpoint = "http://127.0.0.1:9000".to_string();
+        config.backups.storage.s3.access_key_id = "test-access-key".to_string();
+        config.backups.storage.s3.secret_access_key =
+            crate::config::SensitiveString("test-secret-key".to_string());
+
+        assert!(matches!(
+            validate_config(&config).unwrap_err(),
+            ConfigValidationError::InvalidBackupConfig {
+                field: "storage.s3.endpoint",
+                ..
+            }
+        ));
+        config.backups.storage.s3.allow_http = true;
         validate_config(&config).unwrap();
     }
 

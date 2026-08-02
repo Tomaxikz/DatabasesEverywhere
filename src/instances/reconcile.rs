@@ -3,13 +3,51 @@ use futures::StreamExt;
 use crate::{
     instances::{
         manager::InstanceManager,
-        metadata::{InstanceMetadata, InstanceStatus},
+        metadata::{InstanceMetadata, InstanceStatus, RuntimeKind},
     },
     runtime::docker::{DockerContainerStatus, DockerRuntime},
     shared::{backend::BackendEndpoint, time::now_rfc3339},
 };
 
 const RECONCILE_CONCURRENCY: usize = 8;
+
+pub async fn validate_configured_runtime(
+    manager: &InstanceManager,
+    docker: &DockerRuntime,
+) -> Result<(), anyhow::Error> {
+    let configured = RuntimeKind::from(docker.engine());
+    let mismatches = runtime_kind_mismatches(&manager.store().list().await, configured);
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to switch container engines while managed instances exist: daemon.engine={} but {} instance(s) belong to {} (examples: {}). Migrate or remove those instances with the original engine before changing daemon.engine",
+        configured.as_str(),
+        mismatches.len(),
+        mismatches[0].1.as_str(),
+        mismatches
+            .iter()
+            .take(5)
+            .map(|(instance_id, _)| instance_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn runtime_kind_mismatches(
+    instances: &[InstanceMetadata],
+    configured: RuntimeKind,
+) -> Vec<(String, RuntimeKind)> {
+    instances
+        .iter()
+        .filter(|metadata| runtime_kind_mismatch(metadata.runtime.kind, configured))
+        .map(|metadata| (metadata.instance_id.clone(), metadata.runtime.kind))
+        .collect()
+}
+
+fn runtime_kind_mismatch(actual: RuntimeKind, configured: RuntimeKind) -> bool {
+    actual != configured
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileSummary {
@@ -179,5 +217,17 @@ mod tests {
             classify_container_status(DockerContainerStatus::Failed),
             InstanceStatus::Failed
         );
+    }
+
+    #[test]
+    fn detects_engine_switches_before_reconciliation_can_mutate_status() {
+        assert!(runtime_kind_mismatch(
+            RuntimeKind::Docker,
+            RuntimeKind::Podman
+        ));
+        assert!(!runtime_kind_mismatch(
+            RuntimeKind::Podman,
+            RuntimeKind::Podman
+        ));
     }
 }
