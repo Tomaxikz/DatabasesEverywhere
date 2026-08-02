@@ -4,6 +4,7 @@ mod disk_probe;
 mod engine;
 mod events;
 mod inspection;
+mod podman_api;
 mod remote_import;
 mod security;
 mod spec;
@@ -679,8 +680,15 @@ impl DockerRuntime {
         memory_mib: u64,
     ) -> Result<CommandOutput, DockerError> {
         let name = self.container_name(protocol, instance_id)?;
-        let body = Self::update_limits_body(cpu_cores, memory_mib)?;
-        self.docker.update_container(&name, body).await?;
+        match self.engine {
+            DaemonEngine::Docker => {
+                let body = Self::update_limits_body(cpu_cores, memory_mib)?;
+                self.docker.update_container(&name, body).await?;
+            }
+            DaemonEngine::Podman => {
+                podman_api::update_limits(&self.socket_path, &name, cpu_cores, memory_mib).await?;
+            }
+        }
         Ok(CommandOutput::empty())
     }
 
@@ -1209,6 +1217,17 @@ pub enum DockerError {
     InvalidId(#[from] crate::shared::ids::IdError),
     #[error("docker api error: {0}")]
     Api(#[from] BollardError),
+    #[error("podman api {operation} request failed: {reason}")]
+    PodmanApiRequest {
+        operation: &'static str,
+        reason: String,
+    },
+    #[error("podman api {operation} failed with HTTP {status}: {message}")]
+    PodmanApiResponse {
+        operation: &'static str,
+        status: u16,
+        message: String,
+    },
     #[error(
         "container engine mismatch: daemon.engine is {configured}, but the configured socket reports {reported}"
     )]
@@ -1387,7 +1406,7 @@ impl DockerError {
             Self::Api(BollardError::DockerResponseServerError {
                 status_code: 404,
                 ..
-            })
+            }) | Self::PodmanApiResponse { status: 404, .. }
         )
     }
 
