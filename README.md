@@ -16,7 +16,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Major version upgrades
 - Per-database resource limits
 - Node-wide capacity and host-pressure metrics for panel schedulers
-- Node-wide memory and disk admission reserves to protect host availability
+- Node-wide memory and disk reserves to protect host availability
 
 ## Status
 
