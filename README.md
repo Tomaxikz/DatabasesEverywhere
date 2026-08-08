@@ -62,7 +62,7 @@ newer. Choose the artifact for your host from a versioned release and install
 it to `/usr/local/bin` (x86-64 example):
 
 ```bash
-sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/v0.4.0/dbev-x86_64-linux" -o /usr/local/bin/dbev
+sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/v0.4.1/dbev-x86_64-linux" -o /usr/local/bin/dbev
 sudo chmod +x /usr/local/bin/dbev
 ```
 
