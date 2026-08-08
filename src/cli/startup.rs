@@ -136,9 +136,22 @@ pub(super) fn log_tls_configuration(config: &Config) {
             log_tls_file("api tls client ca", &config.api.ssl.client_ca);
         }
     } else {
-        tracing::warn!(
-            "api tls disabled; use this only behind a trusted TLS reverse proxy or on a private network"
-        );
+        let host = config.api.host.trim();
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if loopback {
+            tracing::info!(
+                bind = %config.api.bind_addr(),
+                "api tls disabled on loopback"
+            );
+        } else {
+            tracing::warn!(
+                bind = %config.api.bind_addr(),
+                "api serves plaintext HTTP on a non-loopback interface; bearer tokens, credentials, requests, and responses are not protected from network interception"
+            );
+        }
     }
 
     if any_database_listener_tls_enabled(config) {

@@ -116,7 +116,7 @@ api:
   trusted_hosts: [node-api.example.com] # when different from `remote`
 ```
 
-Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. To expose DBE's native HTTPS server directly instead, use `api.host: 0.0.0.0`, enable `api.ssl`, and configure the panel node URL with the public HTTPS port.
+Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0` and configure `api.ssl` according to the node URL selected in the panel.
 
 `token` and `jwt_signing_key` are independent credentials and must each contain
 at least 32 random bytes. Generate them with a cryptographically secure secret
@@ -126,7 +126,7 @@ The template placeholders are deliberately rejected by `check-config`.
 For example, run `openssl rand -base64 32` twice and assign each output to one
 of the two fields.
 
-The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. Managed database containers remain network-isolated. Credential-based imports use short-lived, hardened acquisition helpers (or a bounded host client for Redis/Valkey/Qdrant) and never add a network interface to the target container.
+The API listener may run on loopback, behind a reverse proxy, or directly on a public interface using HTTP or native HTTPS, matching Wings. Plaintext non-loopback API binds emit a prominent warning because bearer tokens and request data are not encrypted. Database gateways may also use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit the same class of warning. Managed database containers remain network-isolated. Credential-based imports use short-lived, hardened acquisition helpers (or a bounded host client for Redis/Valkey/Qdrant) and never add a network interface to the target container.
 
 Database images may use ordinary versioned Docker Hub, GHCR, or other
 registry references. Bare references and the mutable `latest` tag are rejected;
@@ -336,7 +336,9 @@ sudo journalctl -u databases-everywhere -f
 
 `--setup` installs the root-run systemd unit, creates root-owned private
 directories, and removes the obsolete managed quota sudoers rule left by older
-releases.
+releases. If a legacy `/var/log/dbev` configuration has an unsafe shared parent,
+setup updates it to `/var/lib/dbev/logs` without changing `/var/log` or deleting
+legacy log files.
 Files end up here:
 
 ```text

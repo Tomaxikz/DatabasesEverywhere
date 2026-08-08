@@ -10,13 +10,13 @@ LABEL org.opencontainers.image.source="https://github.com/Tomaxikz/DatabasesEver
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates fuse3 \
     && rm -rf /var/lib/apt/lists/* \
-    && install -d -m 0700 /etc/databases-everywhere /var/lib/dbev/logs /run/dbev
+    && install -d -m 0700 /etc/databases-everywhere /var/lib/dbev/logs /var/log/dbev /run/dbev
 
 ARG TARGETPLATFORM
 
 COPY --chown=0:0 --chmod=0555 .docker/${TARGETPLATFORM#linux/}/dbev /usr/local/bin/dbev
 
-VOLUME ["/etc/databases-everywhere", "/var/lib/dbev", "/run/dbev"]
+VOLUME ["/etc/databases-everywhere", "/var/lib/dbev", "/var/log/dbev", "/run/dbev"]
 
 # Root is currently required only by the FuseQuota/SYS_ADMIN deployment. The
 # Docker socket remains a root-equivalent capability; use a dedicated host/VM.

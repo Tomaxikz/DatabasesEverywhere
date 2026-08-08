@@ -44,10 +44,6 @@ pub enum ConfigValidationError {
     InvalidApiHost { value: String },
     #[error("{field} bind address is invalid: {value}")]
     InvalidBind { field: &'static str, value: String },
-    #[error(
-        "public api bind {value} requires api.ssl.enabled=true with a valid certificate and key"
-    )]
-    PublicApiRequiresTls { value: String },
     #[error("{field} must be an absolute path: {value}")]
     RelativePath { field: &'static str, value: String },
     #[error("{field} must not contain parent directory segments: {value}")]
@@ -136,7 +132,6 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
     validate_api_tls(&config.api.ssl)?;
-    validate_api_exposure(config)?;
     validate_security(&config.security)?;
     validate_allocation(&config.allocation)?;
     validate_disk(&config.disk)?;
@@ -372,20 +367,6 @@ fn looks_like_placeholder(secret: &str) -> bool {
             .as_bytes()
             .first()
             .is_some_and(|first| normalized.bytes().all(|byte| byte == *first))
-}
-
-fn validate_api_exposure(config: &Config) -> Result<(), ConfigValidationError> {
-    let host = config.api.host.trim();
-    if host
-        .parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
-        || config.api.ssl.enabled
-    {
-        return Ok(());
-    }
-    Err(ConfigValidationError::PublicApiRequiresTls {
-        value: config.api.bind_addr(),
-    })
 }
 
 fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigValidationError> {
@@ -1020,14 +1001,10 @@ mod tests {
     }
 
     #[test]
-    fn public_api_requires_native_tls() {
+    fn accepts_public_api_with_plain_http_or_native_tls() {
         let mut config = valid_config();
         config.api.host = "0.0.0.0".to_string();
-
-        assert!(matches!(
-            validate_config(&config).unwrap_err(),
-            ConfigValidationError::PublicApiRequiresTls { .. }
-        ));
+        validate_config(&config).unwrap();
 
         let directory = tempfile::tempdir().unwrap();
         let certificate = directory.path().join("certificate.pem");
@@ -1041,15 +1018,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hostname_api_bind_without_native_tls() {
+    fn accepts_hostname_api_bind_without_native_tls() {
         for host in ["localhost", "dbe.internal"] {
             let mut config = valid_config();
             config.api.host = host.to_string();
 
-            assert!(matches!(
-                validate_config(&config).unwrap_err(),
-                ConfigValidationError::PublicApiRequiresTls { .. }
-            ));
+            validate_config(&config).unwrap();
         }
     }
 

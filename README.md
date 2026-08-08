@@ -129,21 +129,24 @@ Runtime data lives in:
 On daemon boot these runtime directories and their subdirectories are created
 automatically if missing. Compose installs still need
 `/etc/databases-everywhere/config.yml` in place before startup.
+During `--setup`, an old `/var/log/dbev` setting is moved to
+`/var/lib/dbev/logs` if the shared `/var/log` parent does not satisfy the
+runtime path safety policy. Existing legacy log files are left untouched.
 Every existing ancestor of a configured runtime path must be a real,
 non-symlink directory that is not writable by untrusted users. This prevents a
 local account from redirecting daemon-owned data while the service starts.
 
 The configuration requires two distinct secrets of at least 32 random bytes:
 `token` for API authentication and `jwt_signing_key` for WebSocket and download
-JWTs. The API may remain on loopback behind a reverse proxy or bind directly to
-a public interface when its native TLS certificate and key are enabled;
-cleartext public API binds are rejected. Database gateways may bind to
-non-loopback addresses with or without TLS and continue to enforce each
-database protocol's native credentials. Cleartext public gateways emit a
-startup warning because credentials, queries, and results are not protected
-from network interception. Remote imports use temporary acquisition workers;
-target database containers stay network-isolated. Daemon file logs rotate
-daily and retain the latest 14 files.
+JWTs. The API may use HTTP or HTTPS on loopback or public interfaces, matching
+Wings. Plaintext non-loopback binds emit a prominent startup warning because
+the API bearer token and request data can be intercepted. Database gateways may
+bind to non-loopback addresses with or without TLS and continue to enforce each
+database protocol's native credentials. Cleartext public gateways emit a startup
+warning because credentials, queries, and results are not protected from network
+interception. Remote imports use temporary acquisition workers; target database
+containers stay network-isolated. Daemon file logs rotate daily and retain the
+latest 14 files.
 
 ## Docs
 

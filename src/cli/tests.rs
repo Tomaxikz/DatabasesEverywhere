@@ -270,6 +270,42 @@ fn rejects_runtime_directory_owned_by_another_uid() {
 }
 
 #[test]
+fn setup_moves_legacy_logs_below_the_private_data_root_when_its_parent_is_unsafe() {
+    let temp = tempfile::tempdir().unwrap();
+    let unsafe_parent = temp.path().join("group-writable-logs");
+    fs::create_dir(&unsafe_parent).unwrap();
+    fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o775)).unwrap();
+    let legacy_logs = unsafe_parent.join("dbev");
+    let data = temp.path().join("private").join("dbev");
+    let mut config = Config {
+        uuid: "node-uuid".to_string(),
+        token_id: "token-id".to_string(),
+        token: "test-api-token-0123456789abcdef-01".to_string(),
+        jwt_signing_key: "test-jwt-signing-key-0123456789abcdef-02".to_string(),
+        remote: "https://panel.example.com".to_string(),
+        ..Default::default()
+    };
+    config.images.mongodb = "mongo:7.0.37".to_string();
+    config.paths.data = data.display().to_string();
+    config.paths.logs = legacy_logs.display().to_string();
+
+    let (migrated, replacement, error) = build_legacy_logs_migration(&config, &legacy_logs)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(replacement, data.join("logs").display().to_string());
+    assert_eq!(migrated.paths.logs, replacement);
+    assert!(error.contains("writable by group or others"));
+}
+
+#[test]
+fn default_logs_live_below_the_private_data_root() {
+    let paths = crate::config::PathConfig::default();
+
+    assert_eq!(paths.logs, format!("{}/logs", paths.data));
+}
+
+#[test]
 fn setup_config_path_rejects_unit_file_metacharacters() {
     assert!(validate_setup_config_path(Path::new("/etc/dbev/config.yml")).is_ok());
     assert!(validate_setup_config_path(Path::new("relative.yml")).is_err());

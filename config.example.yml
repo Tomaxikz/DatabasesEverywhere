@@ -52,8 +52,8 @@ qdrant:
   tls: false
 
 api:
-  # Keep 127.0.0.1 behind a reverse proxy. For direct public HTTPS, use
-  # 0.0.0.0 and enable the native TLS settings below.
+  # HTTP and HTTPS are both supported, matching Wings. Prefer native TLS or a
+  # trusted TLS reverse proxy outside isolated development/private networks.
   host: 127.0.0.1
   port: 8090
   # Hostnames accepted in the HTTP Host header in addition to `remote` and the

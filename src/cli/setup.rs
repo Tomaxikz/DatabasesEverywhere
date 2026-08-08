@@ -449,14 +449,32 @@ pub(super) async fn ensure_system_directories(config: &Config) -> anyhow::Result
 }
 
 fn migrate_unsafe_legacy_logs_path(config_path: &Path, config: &mut Config) -> anyhow::Result<()> {
-    if config.paths.logs != LEGACY_LOGS_PATH {
+    let Some((migrated, replacement, legacy_error)) =
+        build_legacy_logs_migration(config, Path::new(LEGACY_LOGS_PATH))?
+    else {
         return Ok(());
-    }
-
-    let legacy_error = match validate_runtime_path_ancestors(Path::new(LEGACY_LOGS_PATH), false) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
     };
+
+    persist_setup_config(config_path, &migrated)?;
+    *config = load_config(config_path).context("failed to reload migrated setup config")?;
+    println!(
+        "setup changed unsafe legacy log path {LEGACY_LOGS_PATH} to {replacement} ({legacy_error}); existing files in the legacy directory were left untouched"
+    );
+    Ok(())
+}
+
+pub(super) fn build_legacy_logs_migration(
+    config: &Config,
+    legacy_logs_path: &Path,
+) -> anyhow::Result<Option<(Config, String, String)>> {
+    if Path::new(&config.paths.logs) != legacy_logs_path {
+        return Ok(None);
+    }
+    let legacy_error = match validate_runtime_path_ancestors(legacy_logs_path, false) {
+        Ok(()) => return Ok(None),
+        Err(error) => format!("{error:#}"),
+    };
+
     let replacement = format!("{}/logs", config.paths.data.trim_end_matches('/'));
     let mut migrated = config.clone();
     migrated.paths.logs = replacement.clone();
@@ -464,16 +482,11 @@ fn migrate_unsafe_legacy_logs_path(config_path: &Path, config: &mut Config) -> a
         .context("the safe setup log-path replacement is not valid")?;
     validate_runtime_path_ancestors(Path::new(&replacement), false).with_context(|| {
         format!(
-            "legacy log path {LEGACY_LOGS_PATH} is unsafe ({legacy_error:#}); replacement {replacement} is also unsafe"
+            "legacy log path {} is unsafe ({legacy_error}); replacement {replacement} is also unsafe",
+            legacy_logs_path.display()
         )
     })?;
-
-    persist_setup_config(config_path, &migrated)?;
-    *config = load_config(config_path).context("failed to reload migrated setup config")?;
-    println!(
-        "setup changed unsafe legacy log path {LEGACY_LOGS_PATH} to {replacement}; existing files in the legacy directory were left untouched"
-    );
-    Ok(())
+    Ok(Some((migrated, replacement, legacy_error)))
 }
 
 fn persist_setup_config(config_path: &Path, config: &Config) -> anyhow::Result<()> {
