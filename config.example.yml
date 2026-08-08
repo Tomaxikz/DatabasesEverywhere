@@ -29,6 +29,11 @@ redis:
   bind: 127.0.0.1:6380
   tls: false
 
+valkey:
+  enabled: true
+  bind: 127.0.0.1:6381
+  tls: false
+
 mongodb:
   enabled: true
   bind: 127.0.0.1:27018
@@ -76,6 +81,7 @@ security:
     # headroom during startup than the lighter database images.
     clickhouse: 4096
     mysql: null
+    valkey: null
     qdrant: null
   remote_import:
     enabled: true
@@ -89,7 +95,7 @@ security:
     allowed_private_hosts: []
     max_concurrent_jobs: 4
     connect_timeout_seconds: 15
-    # Upper bound for an acquisition or target-operation phase. Redis and
+    # Upper bound for an acquisition or target-operation phase. Redis, Valkey, and
     # Qdrant additionally reserve part of one such window for rollback.
     operation_timeout_seconds: 900
     max_staged_bytes: 8589934592
@@ -182,6 +188,7 @@ daemon:
 images:
   postgres: "postgres:18.4"
   redis: "redis:8.8.0"
+  valkey: "valkey/valkey:9.1.1"
   mariadb: "mariadb:12.3.2"
   mysql: "mysql:8.4"
   # MongoDB 8.x is not compatible with Linux kernel 6.19+ / 7.x at the time
@@ -200,6 +207,8 @@ images:
       - "postgres:18.4"
     redis:
       - "redis:8.8.0"
+    valkey:
+      - "valkey/valkey:9.1.1"
     mariadb:
       - "mariadb:12.3.2"
     mysql:
@@ -219,7 +228,7 @@ paths:
   backups: /var/lib/dbev/backups
   sockets: /run/dbev/sockets
   locks: /run/dbev/locks
-  logs: /var/log/dbev
+  logs: /var/lib/dbev/logs
   artifacts: /var/lib/dbev/artifacts
   exports: /var/lib/dbev/artifacts/exports
   imports: /var/lib/dbev/artifacts/imports

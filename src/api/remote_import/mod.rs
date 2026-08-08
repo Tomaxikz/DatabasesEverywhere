@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub(crate) use qdrant::{cleanup_stale_qdrant_bridge, import_qdrant};
-pub(crate) use redis::import_redis;
+pub(crate) use redis::{import_redis, import_valkey};
 pub use security::RemoteEndpointRequest;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -175,17 +175,19 @@ pub(crate) async fn validate_remote_source(
                 ));
             }
         }
-        Protocol::Redis => {
+        Protocol::Redis | Protocol::Valkey => {
             if database.is_some() || authentication_database.is_some() || request.api_key.is_some()
             {
-                return Err(ApiError::BadRequest(
-                    "redis remote import accepts database_index instead of database".to_string(),
-                ));
+                return Err(ApiError::BadRequest(format!(
+                    "{} remote import accepts database_index instead of database",
+                    protocol.as_str()
+                )));
             }
             if username.is_some() && request.password.is_none() {
-                return Err(ApiError::BadRequest(
-                    "redis source.username requires source.password".to_string(),
-                ));
+                return Err(ApiError::BadRequest(format!(
+                    "{} source.username requires source.password",
+                    protocol.as_str()
+                )));
             }
         }
         Protocol::Qdrant => {
@@ -337,7 +339,7 @@ fn mysql_database_name(value: &str) -> bool {
 fn default_remote_port(protocol: Protocol, tls: bool) -> u16 {
     match protocol {
         Protocol::Postgres => 5432,
-        Protocol::Redis => {
+        Protocol::Redis | Protocol::Valkey => {
             if tls {
                 6380
             } else {
@@ -403,7 +405,10 @@ pub(crate) async fn acquire_logical_dump(
     target_username: &str,
     target_database: &str,
 ) -> Result<StagedRemoteDump, ApiError> {
-    if matches!(protocol, Protocol::Redis | Protocol::Qdrant) {
+    if matches!(
+        protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
         return Err(ApiError::BadRequest(format!(
             "{} does not use the logical remote dump path",
             protocol.as_str()
@@ -1057,6 +1062,7 @@ mod tests {
             "source-0.snapshot",
             "rollback-0.snapshot",
             "rollback.redis.tar.gz",
+            "rollback.valkey.tar.gz",
         ];
         for name in preserved {
             tokio::fs::write(job.join(name), b"recovery data")

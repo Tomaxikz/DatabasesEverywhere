@@ -4,7 +4,7 @@ use bollard::{models::EventMessage, query_parameters::EventsOptionsBuilder};
 use futures::{Stream, StreamExt};
 
 use crate::{
-    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, PROTOCOL_LABEL},
+    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
     runtime::docker::{DockerError, DockerRuntime},
     shared::protocol::Protocol,
 };
@@ -77,24 +77,34 @@ impl DockerRuntime {
             ("label".to_string(), vec![format!("{MANAGED_LABEL}=true")]),
         ]);
         let options = EventsOptionsBuilder::default().filters(&filters).build();
-        Box::pin(
-            self.docker
-                .events(Some(options))
-                .filter_map(|event| async move {
-                    match event {
-                        Ok(event) => ManagedContainerEvent::from_message(event).map(Ok),
-                        Err(error) => Some(Err(error.into())),
+        let expected_node_id = self.node_id.clone();
+        Box::pin(self.docker.events(Some(options)).filter_map(move |event| {
+            let expected_node_id = expected_node_id.clone();
+            async move {
+                match event {
+                    Ok(event) => {
+                        ManagedContainerEvent::from_message(event, expected_node_id.as_deref())
+                            .map(Ok)
                     }
-                }),
-        )
+                    Err(error) => Some(Err(error.into())),
+                }
+            }
+        }))
     }
 }
 
 impl ManagedContainerEvent {
-    fn from_message(message: EventMessage) -> Option<Self> {
+    fn from_message(message: EventMessage, expected_node_id: Option<&str>) -> Option<Self> {
         let raw_action = message.action?;
         let attributes = message.actor?.attributes?;
         if attributes.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
+            return None;
+        }
+        if let Some(expected_node_id) = expected_node_id
+            && attributes
+                .get(NODE_LABEL)
+                .is_some_and(|actual_node_id| actual_node_id != expected_node_id)
+        {
             return None;
         }
         let instance_id = attributes.get(INSTANCE_LABEL)?.trim();
@@ -110,7 +120,7 @@ impl ManagedContainerEvent {
                     .get("exitCode")
                     .and_then(|exit_code| exit_code.parse().ok()),
             },
-            "destroy" => ManagedContainerAction::Destroyed,
+            "destroy" | "remove" => ManagedContainerAction::Destroyed,
             "oom" => ManagedContainerAction::OutOfMemory,
             "pause" => ManagedContainerAction::Paused,
             "unpause" => ManagedContainerAction::Resumed,
@@ -146,7 +156,7 @@ mod tests {
 
     #[test]
     fn parses_managed_lifecycle_events() {
-        let parsed = ManagedContainerEvent::from_message(event("die")).unwrap();
+        let parsed = ManagedContainerEvent::from_message(event("die"), Some("node-a")).unwrap();
 
         assert_eq!(parsed.instance_id, "inst_pg_1");
         assert_eq!(parsed.protocol, Protocol::Postgres);
@@ -159,11 +169,21 @@ mod tests {
     #[test]
     fn accepts_the_podman_compatibility_exit_spelling() {
         assert!(matches!(
-            ManagedContainerEvent::from_message(event("died"))
+            ManagedContainerEvent::from_message(event("died"), None)
                 .unwrap()
                 .action,
             ManagedContainerAction::Exited { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_the_podman_container_removal_spelling() {
+        assert_eq!(
+            ManagedContainerEvent::from_message(event("remove"), None)
+                .unwrap()
+                .action,
+            ManagedContainerAction::Destroyed
+        );
     }
 
     #[test]
@@ -178,7 +198,7 @@ mod tests {
             .unwrap()
             .insert("exitCode".to_string(), "137".to_string());
 
-        let parsed = ManagedContainerEvent::from_message(failed).unwrap();
+        let parsed = ManagedContainerEvent::from_message(failed, None).unwrap();
 
         assert_eq!(
             parsed.action,
@@ -192,7 +212,9 @@ mod tests {
 
     #[test]
     fn ignores_health_and_unmanaged_events() {
-        assert!(ManagedContainerEvent::from_message(event("health_status: healthy")).is_none());
+        assert!(
+            ManagedContainerEvent::from_message(event("health_status: healthy"), None).is_none()
+        );
 
         let mut unmanaged = event("start");
         unmanaged
@@ -203,6 +225,21 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert(MANAGED_LABEL.to_string(), "false".to_string());
-        assert!(ManagedContainerEvent::from_message(unmanaged).is_none());
+        assert!(ManagedContainerEvent::from_message(unmanaged, None).is_none());
+    }
+
+    #[test]
+    fn ignores_events_owned_by_another_dbev_node() {
+        let mut foreign = event("start");
+        foreign
+            .actor
+            .as_mut()
+            .unwrap()
+            .attributes
+            .as_mut()
+            .unwrap()
+            .insert(NODE_LABEL.to_string(), "node-b".to_string());
+
+        assert!(ManagedContainerEvent::from_message(foreign, Some("node-a")).is_none());
     }
 }

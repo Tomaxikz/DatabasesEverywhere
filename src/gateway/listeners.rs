@@ -33,8 +33,8 @@ pub enum ListenerError {
     Io(#[from] std::io::Error),
     #[error("postgres routing failed: {0}")]
     Postgres(#[from] postgres::PostgresParseError),
-    #[error("redis routing failed: {0}")]
-    Redis(#[from] redis::RedisParseError),
+    #[error("RESP routing failed: {0}")]
+    Resp(#[from] redis::RedisParseError),
     #[error("mariadb routing failed: {0}")]
     Mariadb(#[from] mariadb::MariadbProxyError),
     #[error("mongodb routing failed: {0}")]
@@ -180,6 +180,29 @@ pub async fn run_redis_listener(
             shutdown,
         },
         handle_redis_client,
+    )
+    .await
+}
+
+pub async fn run_valkey_listener(
+    listener: TcpListener,
+    bind: &str,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+    limiter: GatewayConnectionLimiter,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), ListenerError> {
+    run_listener(
+        ListenerRuntime {
+            listener,
+            bind: bind.to_string(),
+            protocol: "valkey",
+            resolver,
+            tls,
+            limiter,
+            shutdown,
+        },
+        handle_valkey_client,
     )
     .await
 }
@@ -609,9 +632,35 @@ async fn handle_redis_client(
 ) -> Result<(), ListenerError> {
     let (client, target, initial) = client_handshake("redis", async move {
         let mut client = accept_direct_tls(client, tls).await?;
-        let (route, initial) = read_redis_initial_frame(&mut client).await?;
+        let (route, initial) = read_resp_initial_frame(&mut client).await?;
         let target = resolver
             .resolve_redis(&route.username)
+            .await
+            .ok_or(ListenerError::RouteNotFound)?;
+        Ok((client, target, initial))
+    })
+    .await?;
+
+    let instance_id = target.instance_id;
+    tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network)
+        .await
+        .map_err(|source| ListenerError::Backend {
+            instance_id,
+            source,
+        })?;
+    Ok(())
+}
+
+async fn handle_valkey_client(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+) -> Result<(), ListenerError> {
+    let (client, target, initial) = client_handshake("valkey", async move {
+        let mut client = accept_direct_tls(client, tls).await?;
+        let (route, initial) = read_resp_initial_frame(&mut client).await?;
+        let target = resolver
+            .resolve_valkey(&route.username)
             .await
             .ok_or(ListenerError::RouteNotFound)?;
         Ok((client, target, initial))
@@ -1006,7 +1055,7 @@ where
     }
 }
 
-async fn read_redis_initial_frame<S>(
+async fn read_resp_initial_frame<S>(
     client: &mut S,
 ) -> Result<(redis::RedisRoute, Vec<u8>), ListenerError>
 where

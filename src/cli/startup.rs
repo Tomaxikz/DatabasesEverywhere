@@ -26,6 +26,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
         default_pids_limit = config.security.pids_limit,
         postgres = ?config.security.pids_limits.postgres,
         redis = ?config.security.pids_limits.redis,
+        valkey = ?config.security.pids_limits.valkey,
         mariadb = ?config.security.pids_limits.mariadb,
         mysql = ?config.security.pids_limits.mysql,
         mongodb = ?config.security.pids_limits.mongodb,
@@ -36,6 +37,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
     tracing::info!(
         postgres = %config.images.postgres,
         redis = %config.images.redis,
+        valkey = %config.images.valkey,
         mariadb = %config.images.mariadb,
         mysql = %config.images.mysql,
         mongodb = %config.images.mongodb,
@@ -46,6 +48,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
     let mutable_images: Vec<&str> = [
         config.images.postgres.as_str(),
         config.images.redis.as_str(),
+        config.images.valkey.as_str(),
         config.images.mariadb.as_str(),
         config.images.mysql.as_str(),
         config.images.mongodb.as_str(),
@@ -171,6 +174,7 @@ pub(super) fn log_tls_file(label: &'static str, path: &str) {
 pub(super) fn any_database_listener_tls_enabled(config: &Config) -> bool {
     config.postgres.tls
         || config.redis.tls
+        || config.valkey.tls
         || config.mariadb.tls
         || config.mysql.tls
         || config.mongodb.tls
@@ -198,6 +202,12 @@ pub(super) fn log_gateway_listener_summary(config: &Config) {
         &config.redis.bind,
         config.redis.enabled,
         config.redis.tls,
+    );
+    log_listener(
+        "valkey",
+        &config.valkey.bind,
+        config.valkey.enabled,
+        config.valkey.tls,
     );
     log_listener(
         "mariadb",

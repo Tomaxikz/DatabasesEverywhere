@@ -79,6 +79,18 @@ impl InstanceStore {
             })
     }
 
+    pub async fn resolve_valkey(&self, username: &str) -> Option<RouteTarget> {
+        let state = self.inner.read().await;
+        let instance_id = state.valkey_routes.get(username)?;
+        state
+            .instances
+            .get(instance_id)
+            .map(|metadata| RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            })
+    }
+
     pub async fn resolve_mariadb(
         &self,
         username: &str,
@@ -164,6 +176,7 @@ struct InstanceState {
     clickhouse_routes: HashMap<(String, String), String>,
     qdrant_routes: HashMap<String, String>,
     redis_routes: HashMap<String, String>,
+    valkey_routes: HashMap<String, String>,
 }
 
 impl InstanceState {
@@ -194,6 +207,12 @@ impl InstanceState {
             }
             Protocol::Redis => {
                 self.redis_routes.insert(
+                    metadata.database.username.clone(),
+                    metadata.instance_id.clone(),
+                );
+            }
+            Protocol::Valkey => {
+                self.valkey_routes.insert(
                     metadata.database.username.clone(),
                     metadata.instance_id.clone(),
                 );
@@ -259,6 +278,8 @@ impl InstanceState {
         self.qdrant_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
         self.redis_routes
+            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
+        self.valkey_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
     }
 

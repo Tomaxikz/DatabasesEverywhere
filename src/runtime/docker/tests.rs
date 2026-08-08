@@ -18,7 +18,7 @@ fn create_body_does_not_publish_backend_ports_by_default() {
 
 #[test]
 fn create_body_includes_limits_labels_and_security() {
-    let runtime = test_runtime();
+    let runtime = test_runtime().with_node_id("node-test");
     let body = runtime.create_body(&postgres_spec()).unwrap();
     let host_config = body.host_config.unwrap();
     let labels = body.labels.unwrap();
@@ -36,6 +36,7 @@ fn create_body_includes_limits_labels_and_security() {
         labels.get("databases-everywhere.managed"),
         Some(&"true".to_string())
     );
+    assert_eq!(labels.get(NODE_LABEL), Some(&"node-test".to_string()));
     assert_eq!(host_config.privileged, Some(false));
     assert_eq!(host_config.cap_drop, Some(vec!["ALL".to_string()]));
     assert_eq!(
@@ -152,7 +153,12 @@ fn rootless_podman_uses_protocol_specific_users() {
             Some("999:999")
         );
     }
-    for protocol in [Protocol::Redis, Protocol::Clickhouse, Protocol::Qdrant] {
+    for protocol in [
+        Protocol::Redis,
+        Protocol::Valkey,
+        Protocol::Clickhouse,
+        Protocol::Qdrant,
+    ] {
         assert_eq!(
             runtime.rootless_podman_container_user(protocol),
             Some("0:0")
@@ -193,11 +199,19 @@ fn rootless_podman_sets_keep_id_for_postgres_like_images() {
         );
     }
 
-    for protocol in [Protocol::Redis, Protocol::Clickhouse, Protocol::Qdrant] {
+    for protocol in [
+        Protocol::Redis,
+        Protocol::Valkey,
+        Protocol::Clickhouse,
+        Protocol::Qdrant,
+    ] {
         let mut spec = postgres_spec();
         spec.protocol = protocol;
         let body = runtime.create_body(&spec).unwrap();
-        assert_eq!(body.host_config.unwrap().userns_mode, None);
+        assert_eq!(
+            body.host_config.unwrap().userns_mode.as_deref(),
+            Some("host")
+        );
     }
 }
 
@@ -272,11 +286,19 @@ fn managed_container_verification_requires_the_exact_ownership_tuple() {
         (PROTOCOL_LABEL.to_string(), "postgres".to_string()),
     ]);
 
-    verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test").unwrap();
+    verify_managed_instance_labels(
+        &labels,
+        container,
+        Protocol::Postgres,
+        "inst_test",
+        Some("node-a"),
+    )
+    .unwrap();
 
     labels.insert(PROTOCOL_LABEL.to_string(), "redis".to_string());
-    let error = verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test")
-        .unwrap_err();
+    let error =
+        verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test", None)
+            .unwrap_err();
     assert!(matches!(
         error,
         DockerError::UntrustedContainerNameCollision { .. }
@@ -284,9 +306,33 @@ fn managed_container_verification_requires_the_exact_ownership_tuple() {
 
     labels.remove(MANAGED_LABEL);
     assert!(
-        verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test")
+        verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test", None,)
             .is_err()
     );
+}
+
+#[test]
+fn managed_container_verification_rejects_a_different_node_owner() {
+    let labels = HashMap::from([
+        (MANAGED_LABEL.to_string(), "true".to_string()),
+        (INSTANCE_LABEL.to_string(), "inst_test".to_string()),
+        (PROTOCOL_LABEL.to_string(), "postgres".to_string()),
+        (NODE_LABEL.to_string(), "node-b".to_string()),
+    ]);
+
+    let error = verify_managed_instance_labels(
+        &labels,
+        "dbe-postgres-inst_test",
+        Protocol::Postgres,
+        "inst_test",
+        Some("node-a"),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        DockerError::UntrustedContainerNameCollision { .. }
+    ));
 }
 
 #[test]

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Protocol {
     Postgres,
     Redis,
+    Valkey,
     Mariadb,
     Mysql,
     Mongodb,
@@ -15,9 +16,10 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Postgres,
         Self::Redis,
+        Self::Valkey,
         Self::Mariadb,
         Self::Mysql,
         Self::Mongodb,
@@ -29,6 +31,7 @@ impl Protocol {
         match self {
             Self::Postgres => "postgres",
             Self::Redis => "redis",
+            Self::Valkey => "valkey",
             Self::Mariadb => "mariadb",
             Self::Mysql => "mysql",
             Self::Mongodb => "mongodb",
@@ -41,6 +44,7 @@ impl Protocol {
         match self {
             Self::Postgres => 5432,
             Self::Redis => 6379,
+            Self::Valkey => 6379,
             Self::Mariadb => 3306,
             Self::Mysql => 3306,
             Self::Mongodb => 27017,
@@ -63,6 +67,7 @@ impl FromStr for Protocol {
         match value {
             "postgres" | "postgresql" => Ok(Self::Postgres),
             "redis" => Ok(Self::Redis),
+            "valkey" => Ok(Self::Valkey),
             "mariadb" => Ok(Self::Mariadb),
             "mysql" => Ok(Self::Mysql),
             "mongodb" | "mongo" => Ok(Self::Mongodb),
@@ -92,5 +97,13 @@ mod tests {
         assert_ne!(Protocol::Mysql, Protocol::Mariadb);
         assert!(Protocol::ALL.contains(&Protocol::Mysql));
         assert_eq!(Protocol::Mysql.default_container_port(), 3306);
+    }
+
+    #[test]
+    fn valkey_is_a_distinct_first_class_protocol() {
+        assert_eq!("valkey".parse::<Protocol>().unwrap(), Protocol::Valkey);
+        assert_ne!(Protocol::Valkey, Protocol::Redis);
+        assert!(Protocol::ALL.contains(&Protocol::Valkey));
+        assert_eq!(Protocol::Valkey.default_container_port(), 6379);
     }
 }

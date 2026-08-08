@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.7.0
+  version: 0.8.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -17,7 +17,7 @@ components:
   schemas:
     Protocol:
       type: string
-      enum: [postgres, redis, mariadb, mysql, mongodb, clickhouse, qdrant]
+      enum: [postgres, redis, valkey, mariadb, mysql, mongodb, clickhouse, qdrant]
     LimitsRequest:
       type: object
       additionalProperties: false
@@ -187,11 +187,11 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, remote_import_enabled, postgres_enabled, redis_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
+      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, remote_import_enabled, postgres_enabled, redis_enabled, valkey_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.7.0}
+        api_version: {type: string, example: 0.8.0}
         api_readiness:
           type: string
           const: ready
@@ -221,6 +221,7 @@ components:
           description: Whether this node accepts credential-based remote import sources.
         postgres_enabled: {type: boolean}
         redis_enabled: {type: boolean}
+        valkey_enabled: {type: boolean}
         mariadb_enabled: {type: boolean}
         mysql_enabled: {type: boolean}
         mongodb_enabled: {type: boolean}
@@ -339,7 +340,7 @@ components:
           description: >-
             For credential imports, merge replaces source-named
             objects/keys/collections while preserving target-only data; wipe
-            clears the target database first. Redis and Qdrant artifact imports
+            clears the target database first. Redis, Valkey, and Qdrant artifact imports
             always replace the complete physical database, so mode does not
             change their behavior.
         selection:
@@ -367,7 +368,7 @@ components:
         archive_format:
           type: [string, "null"]
           enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
-          description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Qdrant physical archives.
+          description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Valkey/Qdrant physical archives.
     RemoteImportSource:
       type: object
       additionalProperties: false
@@ -397,18 +398,18 @@ components:
           minLength: 1
           maxLength: 256
           pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
-          description: Required for PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Omit for Redis and Qdrant. MariaDB/MySQL additionally allow at most 64 characters. MongoDB applies a 63-byte limit and rejects slash, backslash, dot, space, double quote, and dollar sign. ClickHouse additionally requires at most 128 ASCII letters, digits, underscores, or dashes.
+          description: Required for PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Omit for Redis, Valkey, and Qdrant. MariaDB/MySQL additionally allow at most 64 characters. MongoDB applies a 63-byte limit and rejects slash, backslash, dot, space, double quote, and dollar sign. ClickHouse additionally requires at most 128 ASCII letters, digits, underscores, or dashes.
         username:
           type: [string, "null"]
           minLength: 1
           maxLength: 256
           pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
-          description: Required for SQL/ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Optional with password for MongoDB and Redis ACL authentication.
+          description: Required for SQL/ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Optional with password for MongoDB, Redis, and Valkey ACL authentication.
         password:
           type: [string, "null"]
           format: password
           writeOnly: true
-          description: Source credentials are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis keeps it in process memory. SQL passwords cannot contain NUL, CR, or LF.
+          description: Source credentials are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis and Valkey keep it in process memory. SQL passwords cannot contain NUL, CR, or LF.
         authentication_database:
           type: [string, "null"]
           minLength: 1
@@ -419,7 +420,7 @@ components:
           type: [integer, "null"]
           minimum: 0
           maximum: 4294967295
-          description: Redis logical database index. Defaults to 0.
+          description: Redis or Valkey logical database index. Defaults to 0.
         api_key:
           type: [string, "null"]
           format: password
@@ -548,7 +549,7 @@ components:
       properties:
         name: {type: string}
         data_type: {type: string}
-        nullable: {type: boolean}
+        "nullable": {type: boolean}
         ordinal: {type: integer, minimum: 1}
     BackupObjectSummary:
       type: object
@@ -705,7 +706,7 @@ components:
         password:
           type: [string, "null"]
           format: password
-          description: Current tenant database password. Required for most protocols so DBE can recreate users after the container is rebuilt. Redis does not require it.
+          description: Current tenant database password. Required for most protocols so DBE can recreate users after the container is rebuilt. Redis and Valkey do not require it.
         major_upgrade:
           type: boolean
           default: false

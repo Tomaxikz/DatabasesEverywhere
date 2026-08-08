@@ -12,13 +12,13 @@ use tokio::time::Instant;
 use crate::{
     api::{
         api_response::ApiError,
-        import_export::replace_data_from_archive,
+        import_export::rollback_data_from_archive,
         instances::{LifecycleAction, lifecycle_instance_locked},
         routes::AppState,
     },
     instances::paths::InstancePaths,
     jobs::import_export::create_data_archive_bounded,
-    shared::protocol::Protocol,
+    shared::{backend::backend_socket_path, protocol::Protocol},
 };
 
 use super::{
@@ -86,7 +86,7 @@ async fn redis_with_deadline<T>(
 }
 
 fn redis_operation_timeout_error(phase: &'static str) -> ApiError {
-    ApiError::ServiceUnavailable(format!("remote redis import timed out during {phase}"))
+    ApiError::ServiceUnavailable(format!("remote RESP import timed out during {phase}"))
 }
 
 pub async fn import_redis(
@@ -94,6 +94,25 @@ pub async fn import_redis(
     instance_id: &str,
     source: &RemoteImportSource,
     mode: ImportMode,
+) -> Result<(), ApiError> {
+    import_resp(state, instance_id, source, mode, Protocol::Redis).await
+}
+
+pub async fn import_valkey(
+    state: &AppState,
+    instance_id: &str,
+    source: &RemoteImportSource,
+    mode: ImportMode,
+) -> Result<(), ApiError> {
+    import_resp(state, instance_id, source, mode, Protocol::Valkey).await
+}
+
+async fn import_resp(
+    state: &AppState,
+    instance_id: &str,
+    source: &RemoteImportSource,
+    mode: ImportMode,
+    target_protocol: Protocol,
 ) -> Result<(), ApiError> {
     let _permit = REMOTE_IMPORT_LIMITER
         .acquire(state.config.security.remote_import.max_concurrent_jobs)
@@ -128,10 +147,12 @@ pub async fn import_redis(
             .get(instance_id)
             .await
             .ok_or(ApiError::NotFound)?;
-        if metadata.protocol != Protocol::Redis {
-            return Err(ApiError::BadRequest(
-                "redis remote import requires a redis target instance".to_string(),
-            ));
+        if metadata.protocol != target_protocol {
+            return Err(ApiError::BadRequest(format!(
+                "{} remote import requires a {} target instance",
+                target_protocol.as_str(),
+                target_protocol.as_str()
+            )));
         }
         let paths = InstancePaths::new(&state.config.paths, instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -139,7 +160,12 @@ pub async fn import_redis(
         Ok((paths, staging))
     })
     .await?;
-    let rollback = staging.join("rollback.redis.tar.gz");
+    let rollback_file = match target_protocol {
+        Protocol::Redis => "rollback.redis.tar.gz",
+        Protocol::Valkey => "rollback.valkey.tar.gz",
+        _ => unreachable!("RESP import target is Redis or Valkey"),
+    };
+    let rollback = staging.join(rollback_file);
     let recovery_manifest = staging.join("recovery-manifest.json");
 
     if let Err(error) = redis_with_deadline(
@@ -167,12 +193,19 @@ pub async fn import_redis(
         )
         .await
         .map_err(|error| {
-            ApiError::Runtime(format!("failed to create redis rollback archive: {error}"))
+            ApiError::Runtime(format!("failed to create RESP rollback archive: {error}"))
         })?;
         validate_redis_rollback_archive(&rollback, policy.max_staged_bytes).await?;
         let original_acl = read_acl_file(&paths.data.join("users.acl")).await?;
         sync_recovery_file(&rollback).await?;
-        write_redis_recovery_manifest(&recovery_manifest, instance_id, mode).await?;
+        write_redis_recovery_manifest(
+            &recovery_manifest,
+            instance_id,
+            target_protocol,
+            rollback_file,
+            mode,
+        )
+        .await?;
         Ok(original_acl)
     })
     .await
@@ -201,8 +234,8 @@ pub async fn import_redis(
 
     let primary = redis_with_deadline(work_deadline, "target import", async {
         replace_acl_file(&paths, &temporary_acl, preserve_acl_owner).await?;
-        start_private_redis(state, instance_id, work_deadline).await?;
-        let socket = paths.sockets.join("redis.sock");
+        start_private_redis(state, instance_id, target_protocol, work_deadline).await?;
+        let socket = backend_socket_path(&paths.sockets, target_protocol);
         let target_io_timeout =
             remaining_redis_timeout(work_deadline, operation_timeout, "target connection")?;
         let target_connect_timeout = connect_timeout.min(target_io_timeout);
@@ -232,7 +265,7 @@ pub async fn import_redis(
         .await?;
         let source_info = remote.info_server().await.map_err(source_error)?;
         let target_info = target.info_server().await.map_err(target_error)?;
-        ensure_redis_versions_compatible(&source_info, &target_info)?;
+        ensure_redis_versions_compatible(target_protocol, &source_info, &target_info)?;
         if mode == ImportMode::Wipe {
             target.flushdb().await.map_err(target_error)?;
         }
@@ -269,7 +302,7 @@ pub async fn import_redis(
                     ),
                 };
                 return Err(ApiError::Runtime(format!(
-                    "redis import was applied, but its recovery commit marker could not be removed: {error}; {quarantine}; rollback staging was retained at {}",
+                    "{target_protocol} import was applied, but its recovery commit marker could not be removed: {error}; {quarantine}; rollback staging was retained at {}",
                     staging.display()
                 )));
             }
@@ -280,7 +313,7 @@ pub async fn import_redis(
             match redis_with_deadline(
                 operation_deadline,
                 "rollback",
-                rollback_redis_target(state, instance_id, &paths, &rollback),
+                rollback_redis_target(state, instance_id, target_protocol, &paths, &rollback),
             )
             .await
             {
@@ -305,7 +338,7 @@ pub async fn import_redis(
                             ),
                         };
                         return Err(ApiError::Runtime(format!(
-                            "redis remote import failed: {primary_error}; rollback succeeded, but recovery metadata could not be committed: {commit_error}; {quarantine}; staging was retained at {}",
+                            "{target_protocol} remote import failed: {primary_error}; rollback succeeded, but recovery metadata could not be committed: {commit_error}; {quarantine}; staging was retained at {}",
                             staging.display()
                         )));
                     }
@@ -325,7 +358,7 @@ pub async fn import_redis(
                         ),
                     };
                     Err(ApiError::Runtime(format!(
-                        "redis remote import failed: {primary_error}; rollback failed: {rollback_error}; {quarantine}; rollback archive retained at {}",
+                        "{target_protocol} remote import failed: {primary_error}; rollback failed: {rollback_error}; {quarantine}; rollback archive retained at {}",
                         rollback.display()
                     )))
                 }
@@ -337,29 +370,34 @@ pub async fn import_redis(
 async fn write_redis_recovery_manifest(
     path: &Path,
     instance_id: &str,
+    protocol: Protocol,
+    rollback_file: &'static str,
     mode: ImportMode,
 ) -> Result<(), ApiError> {
+    let recovery_kind = match protocol {
+        Protocol::Redis => "redis_remote_import",
+        Protocol::Valkey => "valkey_remote_import",
+        _ => unreachable!("RESP recovery target is Redis or Valkey"),
+    };
     let contents = serde_json::to_vec_pretty(&RedisRecoveryManifest {
         schema_version: 1,
-        recovery_kind: "redis_remote_import",
+        recovery_kind,
         instance_id,
-        protocol: "redis",
+        protocol: protocol.as_str(),
         import_mode: mode,
-        rollback_file: "rollback.redis.tar.gz",
+        rollback_file,
         created_at: crate::jobs::import_export::now_rfc3339(),
     })
     .map_err(|error| {
-        ApiError::Runtime(format!("failed to encode redis recovery manifest: {error}"))
+        ApiError::Runtime(format!("failed to encode RESP recovery manifest: {error}"))
     })?;
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         crate::shared::files::atomic_write_private(&path, &contents)
     })
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!("failed to write redis recovery manifest: {error}"))
-    })?
-    .map_err(|error| ApiError::Runtime(format!("failed to write redis recovery manifest: {error}")))
+    .map_err(|error| ApiError::Runtime(format!("failed to write RESP recovery manifest: {error}")))?
+    .map_err(|error| ApiError::Runtime(format!("failed to write RESP recovery manifest: {error}")))
 }
 
 async fn connect_redis_source(
@@ -403,12 +441,12 @@ async fn connect_redis_source(
 
 async fn validate_redis_rollback_archive(path: &Path, max_bytes: u64) -> Result<(), ApiError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to inspect redis rollback archive: {error}"))
+        ApiError::Runtime(format!("failed to inspect RESP rollback archive: {error}"))
     })?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
         let _ = tokio::fs::remove_file(path).await;
         return Err(ApiError::Runtime(
-            "redis rollback archive failed staging validation".to_string(),
+            "RESP rollback archive failed staging validation".to_string(),
         ));
     }
     Ok(())
@@ -450,7 +488,7 @@ async fn cleanup_redis_staging(staging: &Path) {
         tracing::warn!(
             path = %staging.display(),
             %error,
-            "failed to remove redis import staging directory"
+            "failed to remove RESP import staging directory"
         );
     }
 }
@@ -462,7 +500,7 @@ async fn cleanup_redis_staging_until(staging: &Path, deadline: Instant) {
     {
         tracing::warn!(
             path = %staging.display(),
-            "redis import staging cleanup exceeded the operation deadline and was retained"
+            "RESP import staging cleanup exceeded the operation deadline and was retained"
         );
     }
 }
@@ -506,34 +544,36 @@ fn redis_restore_expiration(
         value if value >= 0 => {
             let remaining_milliseconds = u64::try_from(value)
                 .map_err(|_| {
-                    ApiError::BadRequest("remote redis returned an invalid PTTL value".to_string())
+                    ApiError::BadRequest(
+                        "remote RESP source returned an invalid PTTL value".to_string(),
+                    )
                 })?
                 .max(1);
             let now_milliseconds = now
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| {
                     ApiError::Runtime(
-                        "system clock is before the Unix epoch; cannot preserve redis key expiration"
+                        "system clock is before the Unix epoch; cannot preserve RESP key expiration"
                             .to_string(),
                     )
                 })?
                 .as_millis();
             let now_milliseconds = u64::try_from(now_milliseconds).map_err(|_| {
                 ApiError::Runtime(
-                    "system clock is too large to preserve redis key expiration".to_string(),
+                    "system clock is too large to preserve RESP key expiration".to_string(),
                 )
             })?;
             let deadline = now_milliseconds
                 .checked_add(remaining_milliseconds)
                 .ok_or_else(|| {
-                    ApiError::BadRequest("remote redis key expiration is too large".to_string())
+                    ApiError::BadRequest("remote RESP key expiration is too large".to_string())
                 })?;
             Ok(Some(RedisRestoreExpiration::AbsoluteUnixMilliseconds(
                 deadline,
             )))
         }
         value => Err(ApiError::BadRequest(format!(
-            "remote redis returned invalid PTTL value {value}"
+            "remote RESP source returned invalid PTTL value {value}"
         ))),
     }
 }
@@ -541,37 +581,35 @@ fn redis_restore_expiration(
 async fn rollback_redis_target(
     state: &AppState,
     instance_id: &str,
+    protocol: Protocol,
     paths: &InstancePaths,
     rollback: &Path,
 ) -> Result<(), ApiError> {
-    if let Err(error) = state.docker.stop(Protocol::Redis, instance_id).await
+    if let Err(error) = state.docker.stop(protocol, instance_id).await
         && !error.is_not_running()
         && !error.is_not_found()
     {
         return Err(ApiError::Runtime(format!(
-            "failed to stop redis before rollback: {error}"
+            "failed to stop {protocol} before rollback: {error}"
         )));
     }
-    replace_data_from_archive(paths.clone(), rollback).await?;
-    crate::api::import_export::reapply_instance_data_owner(state, paths).await?;
-    lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
-        .await
-        .map(|_| ())
+    rollback_data_from_archive(state, instance_id, paths.clone(), rollback).await
 }
 
 async fn start_private_redis(
     state: &AppState,
     instance_id: &str,
+    protocol: Protocol,
     deadline: Instant,
 ) -> Result<(), ApiError> {
     redis_with_deadline(deadline, "private target startup", async {
         state
             .docker
-            .start(Protocol::Redis, instance_id)
+            .start(protocol, instance_id)
             .await
             .map_err(|error| {
                 ApiError::Runtime(format!(
-                    "failed to start private redis import target: {error}"
+                    "failed to start private {protocol} import target: {error}"
                 ))
             })?;
         let readiness_timeout = remaining_redis_timeout(
@@ -581,11 +619,11 @@ async fn start_private_redis(
         )?;
         state
             .docker
-            .wait_until_ready(Protocol::Redis, instance_id, readiness_timeout)
+            .wait_until_ready(protocol, instance_id, readiness_timeout)
             .await
             .map_err(|error| {
                 ApiError::Runtime(format!(
-                    "private redis import target was not ready: {error}"
+                    "private {protocol} import target was not ready: {error}"
                 ))
             })
             .map(|_| ())
@@ -595,16 +633,16 @@ async fn start_private_redis(
 
 async fn read_acl_file(path: &Path) -> Result<Vec<u8>, ApiError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to inspect managed redis ACL file: {error}"))
+        ApiError::Runtime(format!("failed to inspect managed RESP ACL file: {error}"))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
         return Err(ApiError::Runtime(
-            "managed redis ACL path is not a safe regular file".to_string(),
+            "managed RESP ACL path is not a safe regular file".to_string(),
         ));
     }
     tokio::fs::read(path)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read managed redis ACL: {error}")))
+        .map_err(|error| ApiError::Runtime(format!("failed to read managed RESP ACL: {error}")))
 }
 
 fn append_temporary_acl(original: &[u8], username: &str, password: &SecretString) -> Vec<u8> {
@@ -644,23 +682,23 @@ async fn replace_acl_file(
         options.mode(0o600);
     }
     let mut file = options.open(&temporary).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to create temporary redis ACL: {error}"))
+        ApiError::Runtime(format!("failed to create temporary RESP ACL: {error}"))
     })?;
     file.write_all(contents).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to write temporary redis ACL: {error}"))
+        ApiError::Runtime(format!("failed to write temporary RESP ACL: {error}"))
     })?;
     #[cfg(unix)]
     apply_acl_metadata(&file, metadata, preserve_owner).await?;
     #[cfg(not(unix))]
     let _ = preserve_owner;
     file.sync_all().await.map_err(|error| {
-        ApiError::Runtime(format!("failed to sync temporary redis ACL: {error}"))
+        ApiError::Runtime(format!("failed to sync temporary RESP ACL: {error}"))
     })?;
     drop(file);
     if let Err(error) = tokio::fs::rename(&temporary, &target).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(ApiError::Runtime(format!(
-            "failed to install temporary redis ACL: {error}"
+            "failed to install temporary RESP ACL: {error}"
         )));
     }
     Ok(())
@@ -684,17 +722,17 @@ async fn read_acl_metadata(path: &Path) -> Result<RedisAclMetadata, ApiError> {
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     let file = options.open(path).await.map_err(|error| {
         ApiError::Runtime(format!(
-            "failed to open managed redis ACL metadata safely: {error}"
+            "failed to open managed RESP ACL metadata safely: {error}"
         ))
     })?;
     let metadata = file.metadata().await.map_err(|error| {
         ApiError::Runtime(format!(
-            "failed to inspect managed redis ACL metadata: {error}"
+            "failed to inspect managed RESP ACL metadata: {error}"
         ))
     })?;
     if !metadata.is_file() {
         return Err(ApiError::Runtime(
-            "managed redis ACL path is not a safe regular file".to_string(),
+            "managed RESP ACL path is not a safe regular file".to_string(),
         ));
     }
     Ok(RedisAclMetadata {
@@ -715,7 +753,7 @@ async fn apply_acl_metadata(
     if preserve_owner {
         let current = file.metadata().await.map_err(|error| {
             ApiError::Runtime(format!(
-                "failed to inspect temporary redis ACL ownership: {error}"
+                "failed to inspect temporary RESP ACL ownership: {error}"
             ))
         })?;
         if current.uid() != metadata.uid || current.gid() != metadata.gid {
@@ -726,7 +764,7 @@ async fn apply_acl_metadata(
             )
             .map_err(|error| {
                 ApiError::Runtime(format!(
-                    "failed to preserve managed redis ACL ownership: {error}"
+                    "failed to preserve managed RESP ACL ownership: {error}"
                 ))
             })?;
         }
@@ -735,51 +773,138 @@ async fn apply_acl_metadata(
         .await
         .map_err(|error| {
             ApiError::Runtime(format!(
-                "failed to preserve managed redis ACL permissions: {error}"
+                "failed to preserve managed RESP ACL permissions: {error}"
             ))
         })
 }
 
 fn ensure_supported_redis_version(info: &[u8]) -> Result<(), ApiError> {
-    let version = parse_redis_version(info).ok_or_else(|| {
-        ApiError::BadRequest("remote redis INFO did not report a valid server version".to_string())
+    let server = parse_resp_server_version(info).ok_or_else(|| {
+        ApiError::BadRequest("remote RESP INFO did not report a valid server version".to_string())
     })?;
-    if version < (2, 6, 0) {
+    if server.family == RespServerFamily::Redis && server.version < (2, 6, 0) {
         return Err(ApiError::BadRequest(
-            "remote redis version does not support DUMP/RESTORE import".to_string(),
+            "remote Redis version does not support DUMP/RESTORE import".to_string(),
         ));
     }
     Ok(())
 }
 
-fn ensure_redis_versions_compatible(source: &[u8], target: &[u8]) -> Result<(), ApiError> {
-    let source = parse_redis_version(source).ok_or_else(|| {
-        ApiError::BadRequest("remote redis INFO did not report a valid server version".to_string())
+fn ensure_redis_versions_compatible(
+    target_protocol: Protocol,
+    source: &[u8],
+    target: &[u8],
+) -> Result<(), ApiError> {
+    let source = parse_resp_server_version(source).ok_or_else(|| {
+        ApiError::BadRequest("remote RESP INFO did not report a valid server version".to_string())
     })?;
-    let target = parse_redis_version(target).ok_or_else(|| {
-        ApiError::Runtime("managed redis INFO did not report a valid server version".to_string())
+    let target = parse_resp_server_version(target).ok_or_else(|| {
+        ApiError::Runtime("managed RESP INFO did not report a valid server version".to_string())
     })?;
-    if target < (5, 0, 0) {
-        return Err(ApiError::Runtime(
-            "managed redis target does not support expiration-preserving RESTORE ABSTTL"
-                .to_string(),
-        ));
-    }
-    if target < source {
-        return Err(ApiError::BadRequest(
-            "managed redis target must be the same or a newer version than the remote source for DUMP/RESTORE compatibility"
-                .to_string(),
-        ));
+
+    match target_protocol {
+        Protocol::Redis => {
+            if target.family != RespServerFamily::Redis {
+                return Err(ApiError::Runtime(
+                    "managed Redis target identified itself as Valkey".to_string(),
+                ));
+            }
+            if source.family != RespServerFamily::Redis {
+                return Err(ApiError::BadRequest(
+                    "Valkey-to-Redis remote import is not guaranteed to be serialization-compatible; import into a Valkey target instead"
+                        .to_string(),
+                ));
+            }
+            if target.version < (5, 0, 0) {
+                return Err(ApiError::Runtime(
+                    "managed Redis target does not support expiration-preserving RESTORE ABSTTL"
+                        .to_string(),
+                ));
+            }
+            if target.version < source.version {
+                return Err(ApiError::BadRequest(
+                    "managed Redis target must be the same or a newer version than the remote source for DUMP/RESTORE compatibility"
+                        .to_string(),
+                ));
+            }
+        }
+        Protocol::Valkey => {
+            if target.family != RespServerFamily::Valkey {
+                return Err(ApiError::Runtime(
+                    "managed Valkey target did not identify itself as Valkey".to_string(),
+                ));
+            }
+            match source.family {
+                RespServerFamily::Valkey if target.version < source.version => {
+                    return Err(ApiError::BadRequest(
+                        "managed Valkey target must be the same or a newer version than the remote Valkey source for DUMP/RESTORE compatibility"
+                            .to_string(),
+                    ));
+                }
+                RespServerFamily::Redis
+                    if source.version.0 > 7 || (source.version.0 == 7 && source.version.1 > 2) =>
+                {
+                    return Err(ApiError::BadRequest(
+                        "Valkey accepts Redis OSS persistence data only through version 7.2; use a Redis 7.2-or-older source or database-specific migration tooling"
+                            .to_string(),
+                    ));
+                }
+                RespServerFamily::Redis | RespServerFamily::Valkey => {}
+            }
+        }
+        _ => unreachable!("RESP import target is Redis or Valkey"),
     }
     Ok(())
 }
 
-fn parse_redis_version(info: &[u8]) -> Option<(u32, u32, u32)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RespServerFamily {
+    Redis,
+    Valkey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RespServerVersion {
+    family: RespServerFamily,
+    version: (u32, u32, u32),
+}
+
+fn parse_resp_server_version(info: &[u8]) -> Option<RespServerVersion> {
     let info = std::str::from_utf8(info).ok()?;
-    let version = info
+    let server_name = unique_info_value(info, "server_name:")?;
+    let valkey_version = unique_info_value(info, "valkey_version:")?;
+    let redis_version = unique_info_value(info, "redis_version:")?;
+    let identifies_as_valkey = server_name.is_some_and(|name| name.eq_ignore_ascii_case("valkey"))
+        || valkey_version.is_some();
+    if server_name.is_some_and(|name| !name.eq_ignore_ascii_case("valkey"))
+        && valkey_version.is_some()
+    {
+        return None;
+    }
+    let (family, version) = if identifies_as_valkey {
+        (RespServerFamily::Valkey, valkey_version?)
+    } else {
+        (RespServerFamily::Redis, redis_version?)
+    };
+    Some(RespServerVersion {
+        family,
+        version: parse_semver_triplet(version)?,
+    })
+}
+
+fn unique_info_value<'a>(info: &'a str, prefix: &str) -> Option<Option<&'a str>> {
+    let mut values = info
         .lines()
-        .find_map(|line| line.strip_prefix("redis_version:"))?
-        .trim();
+        .filter_map(|line| line.strip_prefix(prefix).map(str::trim));
+    let value = values.next();
+    if values.next().is_some() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_semver_triplet(version: &str) -> Option<(u32, u32, u32)> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -797,18 +922,18 @@ fn ensure_redis_standalone(info: &[u8], source: bool) -> Result<(), ApiError> {
     match parse_redis_cluster_enabled(info) {
         Some(false) => Ok(()),
         Some(true) if source => Err(ApiError::BadRequest(
-            "remote redis cluster mode is unsupported because SCAN on one endpoint can omit keys stored on other nodes; use a standalone source or Redis cluster migration tooling"
+            "remote RESP cluster mode is unsupported because SCAN on one endpoint can omit keys stored on other nodes; use a standalone source or cluster migration tooling"
                 .to_string(),
         )),
         Some(true) => Err(ApiError::Runtime(
-            "managed redis target unexpectedly has cluster mode enabled; remote key import requires a standalone target"
+            "managed RESP target unexpectedly has cluster mode enabled; remote key import requires a standalone target"
                 .to_string(),
         )),
         None if source => Err(ApiError::BadRequest(
-            "remote redis INFO cluster response is invalid".to_string(),
+            "remote RESP INFO cluster response is invalid".to_string(),
         )),
         None => Err(ApiError::Runtime(
-            "managed redis INFO cluster response is invalid".to_string(),
+            "managed RESP INFO cluster response is invalid".to_string(),
         )),
     }
 }
@@ -834,14 +959,14 @@ fn parse_redis_cluster_enabled(info: &[u8]) -> Option<bool> {
 
 fn source_error(error: RedisRespError) -> ApiError {
     ApiError::BadRequest(format!(
-        "remote redis source failed: {}",
+        "remote RESP source failed: {}",
         redis_error_summary(&error)
     ))
 }
 
 fn target_error(error: RedisRespError) -> ApiError {
     ApiError::Runtime(format!(
-        "managed redis import target failed: {}",
+        "managed RESP import target failed: {}",
         redis_error_summary(&error)
     ))
 }
@@ -907,15 +1032,22 @@ mod tests {
     #[test]
     fn redis_version_preflight_requires_a_compatible_absttl_target() {
         assert_eq!(
-            parse_redis_version(b"# Server\r\nredis_version:8.2.1\r\n"),
-            Some((8, 2, 1))
+            parse_resp_server_version(b"# Server\r\nredis_version:8.2.1\r\n"),
+            Some(RespServerVersion {
+                family: RespServerFamily::Redis,
+                version: (8, 2, 1),
+            })
         );
         assert_eq!(
-            parse_redis_version(b"redis_version:8.2.1-rc1\r\n"),
-            Some((8, 2, 1))
+            parse_resp_server_version(b"redis_version:8.2.1-rc1\r\n"),
+            Some(RespServerVersion {
+                family: RespServerFamily::Redis,
+                version: (8, 2, 1),
+            })
         );
         assert!(
             ensure_redis_versions_compatible(
+                Protocol::Redis,
                 b"redis_version:7.2.4\r\n",
                 b"redis_version:8.0.0\r\n"
             )
@@ -923,6 +1055,7 @@ mod tests {
         );
         assert!(
             ensure_redis_versions_compatible(
+                Protocol::Redis,
                 b"redis_version:8.0.1\r\n",
                 b"redis_version:8.0.0\r\n"
             )
@@ -932,12 +1065,53 @@ mod tests {
         );
         assert!(
             ensure_redis_versions_compatible(
+                Protocol::Redis,
                 b"redis_version:4.0.14\r\n",
                 b"redis_version:4.0.14\r\n"
             )
             .unwrap_err()
             .to_string()
             .contains("ABSTTL")
+        );
+    }
+
+    #[test]
+    fn valkey_version_preflight_uses_the_native_version_and_guards_redis_compatibility() {
+        let valkey_9 = b"server_name:valkey\r\nvalkey_version:9.1.1\r\nredis_version:7.2.4\r\n";
+        assert_eq!(
+            parse_resp_server_version(valkey_9),
+            Some(RespServerVersion {
+                family: RespServerFamily::Valkey,
+                version: (9, 1, 1),
+            })
+        );
+        assert!(
+            ensure_redis_versions_compatible(
+                Protocol::Valkey,
+                b"redis_version:7.2.4\r\n",
+                valkey_9,
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_redis_versions_compatible(
+                Protocol::Valkey,
+                b"redis_version:8.0.0\r\n",
+                valkey_9,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("through version 7.2")
+        );
+        assert!(
+            ensure_redis_versions_compatible(
+                Protocol::Redis,
+                valkey_9,
+                b"redis_version:8.0.0\r\n",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Valkey-to-Redis")
         );
     }
 
@@ -1029,7 +1203,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("remote redis import timed out during deadline test")
+                .contains("remote RESP import timed out during deadline test")
         );
     }
 

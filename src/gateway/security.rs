@@ -213,6 +213,23 @@ mod tests {
     }
 
     #[test]
+    fn cloned_limiters_share_per_ip_accounting_across_listeners() {
+        let first_listener = GatewayConnectionLimiter::new(1);
+        let second_listener = first_listener.clone();
+        let ip = "203.0.113.10".parse().unwrap();
+
+        let _permit = first_listener.try_acquire(ip).unwrap();
+
+        assert!(matches!(
+            second_listener.try_acquire(ip),
+            Err(GatewayConnectionRejection {
+                reason: GatewayConnectionRejectionReason::TooManyActive,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn groups_ipv6_addresses_by_64_bit_prefix() {
         let limiter = GatewayConnectionLimiter::new(2);
         let first = "2001:db8:1234:5678::1".parse().unwrap();

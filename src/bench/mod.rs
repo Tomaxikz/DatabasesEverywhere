@@ -989,7 +989,7 @@ paths:
   data: /var/lib/dbev
   sockets: /run/dbev/sockets
   locks: /run/dbev/locks
-  logs: /var/log/dbev
+  logs: /var/lib/dbev/logs
   artifacts: /var/lib/dbev/artifacts
 "#,
         )

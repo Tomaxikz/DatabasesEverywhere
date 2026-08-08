@@ -16,7 +16,10 @@ pub(super) async fn import_instance_source(
     match &options.source {
         ImportSourceOptions::Artifact(path)
             if options.mode == ImportMode::Wipe
-                && !matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant) =>
+                && !matches!(
+                    metadata.protocol,
+                    Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+                ) =>
         {
             import_logical_with_rollback(state, &metadata, path, options, None, None).await
         }
@@ -32,6 +35,7 @@ pub(super) async fn import_instance_source(
             }
             match metadata.protocol {
                 Protocol::Redis => import_redis(state, instance_id, source, options.mode).await,
+                Protocol::Valkey => import_valkey(state, instance_id, source, options.mode).await,
                 Protocol::Qdrant => {
                     import_qdrant(state, instance_id, source, &options.selection, options.mode)
                         .await
@@ -74,8 +78,10 @@ pub(super) async fn import_instance_source(
 pub(super) fn validate_logical_operation_eligible(
     metadata: &InstanceMetadata,
 ) -> Result<(), ApiError> {
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant)
-        || metadata.status == InstanceStatus::Running
+    if matches!(
+        metadata.protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) || metadata.status == InstanceStatus::Running
     {
         Ok(())
     } else {
@@ -96,7 +102,7 @@ pub(super) async fn import_instance_artifact(
 ) -> Result<(), ApiError> {
     let protocol = metadata.protocol;
     match protocol {
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             import_physical_archive(state, instance_id, protocol, artifact_path).await
         }
         protocol => {

@@ -32,7 +32,7 @@ use super::{
     security::DockerSecurityPolicy,
 };
 use crate::{
-    constants::docker::MANAGED_LABEL,
+    constants::docker::{MANAGED_LABEL, NODE_LABEL},
     shared::{logs::truncate_log_tail, redaction},
 };
 
@@ -211,6 +211,10 @@ impl DockerRuntime {
         spec: RemoteImportHelperSpec,
         cancellation: Arc<HelperCancellation>,
     ) -> Result<CommandOutput, DockerError> {
+        let node_id = self
+            .node_id
+            .as_deref()
+            .ok_or(DockerError::RuntimeNodeIdUnavailable)?;
         let work_dir = run_unless_cancelled(&cancellation, validate_helper_spec(&spec)).await?;
         if let Some((uid, gid)) = self.rootless_podman_host_owner() {
             let owned_work_dir = work_dir.clone();
@@ -252,7 +256,13 @@ impl DockerRuntime {
 
         let name = format!("{HELPER_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let mut cleanup = RemoteImportHelperCleanupGuard::new(self.docker.clone(), name.clone());
-        let body = remote_import_helper_body(&spec, &work_dir, &self.security);
+        let body = remote_import_helper_body(
+            &spec,
+            &work_dir,
+            &self.security,
+            self.uses_rootless_podman(),
+            node_id,
+        );
         // Once submitted, let the short Docker create call finish. Dropping an
         // in-flight request could race a 404 cleanup with a late server-side
         // creation and leave an unstarted orphan. Cancellation is observed
@@ -315,6 +325,10 @@ impl DockerRuntime {
     /// This prevents reconciliation from touching managed database containers
     /// or unrelated containers that happen to use a similar label or name.
     pub async fn reconcile_remote_import_helpers(&self) -> Result<usize, DockerError> {
+        let node_id = self
+            .node_id
+            .as_deref()
+            .ok_or(DockerError::RuntimeNodeIdUnavailable)?;
         let filters = HashMap::from([("label".to_string(), vec![format!("{HELPER_LABEL}=true")])]);
         let containers = self
             .docker
@@ -329,8 +343,11 @@ impl DockerRuntime {
         let mut removed = 0;
         let mut first_error = None;
         for container in containers {
-            if !is_owned_remote_import_helper(container.labels.as_ref(), container.names.as_deref())
-            {
+            if !is_owned_remote_import_helper(
+                container.labels.as_ref(),
+                container.names.as_deref(),
+                node_id,
+            ) {
                 continue;
             }
             let Some(id) = container.id else {
@@ -521,8 +538,11 @@ async fn force_remove_remote_import_helper(
 fn is_owned_remote_import_helper(
     labels: Option<&HashMap<String, String>>,
     names: Option<&[String]>,
+    expected_node_id: &str,
 ) -> bool {
     labels.and_then(|labels| labels.get(HELPER_LABEL).map(String::as_str)) == Some("true")
+        && labels.and_then(|labels| labels.get(NODE_LABEL).map(String::as_str))
+            == Some(expected_node_id)
         && names.is_some_and(|names| names.iter().any(|name| is_remote_import_helper_name(name)))
 }
 
@@ -541,6 +561,8 @@ fn remote_import_helper_body(
     spec: &RemoteImportHelperSpec,
     work_dir: &Path,
     security: &DockerSecurityPolicy,
+    rootless_podman: bool,
+    node_id: &str,
 ) -> ContainerCreateBody {
     let mut host_config = HostConfig {
         network_mode: Some("bridge".to_string()),
@@ -563,6 +585,11 @@ fn remote_import_helper_body(
         ..Default::default()
     };
     security.apply(&mut host_config);
+    if rootless_podman {
+        // The helper runs as container uid/gid 0 while its private work
+        // directory is owned by the rootless Podman service account.
+        host_config.userns_mode = Some("host".to_string());
+    }
 
     // These helper-specific limits are deliberately stricter than configurable
     // managed-database defaults.
@@ -606,6 +633,7 @@ fn remote_import_helper_body(
         labels: Some(HashMap::from([
             (HELPER_LABEL.to_string(), "true".to_string()),
             (MANAGED_LABEL.to_string(), "false".to_string()),
+            (NODE_LABEL.to_string(), node_id.to_string()),
         ])),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
@@ -832,8 +860,13 @@ mod tests {
             timeout: Duration::from_secs(900),
             max_output_bytes: 8 * 1024 * 1024 * 1024,
         };
-        let body =
-            remote_import_helper_body(&spec, &spec.work_dir, &DockerSecurityPolicy::default());
+        let body = remote_import_helper_body(
+            &spec,
+            &spec.work_dir,
+            &DockerSecurityPolicy::default(),
+            false,
+            "node-test",
+        );
         let labels = body.labels.as_ref().unwrap();
         let host = body.host_config.as_ref().unwrap();
         let mounts = host.mounts.as_ref().unwrap();
@@ -858,6 +891,10 @@ mod tests {
 
         assert_eq!(labels.get(HELPER_LABEL).map(String::as_str), Some("true"));
         assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("false"));
+        assert_eq!(
+            labels.get(NODE_LABEL).map(String::as_str),
+            Some("node-test")
+        );
         assert_eq!(host.network_mode.as_deref(), Some("bridge"));
         assert_ne!(host.network_mode.as_deref(), Some("host"));
         assert_eq!(host.nano_cpus, Some(1_000_000_000));
@@ -902,33 +939,73 @@ mod tests {
     }
 
     #[test]
+    fn rootless_podman_helper_overrides_incompatible_user_namespaces() {
+        let spec = RemoteImportHelperSpec {
+            image: "postgres:18.4".to_string(),
+            work_dir: PathBuf::from("/var/lib/dbev/tmp/import-job"),
+            script: "pg_dump --file=/work/source.sql".to_string(),
+            extra_hosts: Vec::new(),
+            timeout: Duration::from_secs(900),
+            max_output_bytes: 8 * 1024 * 1024 * 1024,
+        };
+        let security = DockerSecurityPolicy {
+            userns_mode: Some("keep-id".to_string()),
+            ..DockerSecurityPolicy::default()
+        };
+
+        let body = remote_import_helper_body(&spec, &spec.work_dir, &security, true, "node-test");
+
+        assert_eq!(
+            body.host_config.unwrap().userns_mode.as_deref(),
+            Some("host")
+        );
+    }
+
+    #[test]
     fn reconciliation_requires_the_exact_label_and_generated_name_shape() {
-        let labels = HashMap::from([(HELPER_LABEL.to_string(), "true".to_string())]);
+        let labels = HashMap::from([
+            (HELPER_LABEL.to_string(), "true".to_string()),
+            (NODE_LABEL.to_string(), "node-a".to_string()),
+        ]);
         let valid_names = vec!["/dbe-remote-import-0123456789abcdef0123456789abcdef".to_string()];
 
         assert!(is_owned_remote_import_helper(
             Some(&labels),
             Some(&valid_names),
+            "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(None, Some(&valid_names)));
+        assert!(!is_owned_remote_import_helper(
+            None,
+            Some(&valid_names),
+            "node-a"
+        ));
         assert!(!is_owned_remote_import_helper(
             Some(&HashMap::from([(
                 HELPER_LABEL.to_string(),
                 "false".to_string()
             )])),
             Some(&valid_names),
+            "node-a",
         ));
         assert!(!is_owned_remote_import_helper(
             Some(&labels),
             Some(&["/dbe-remote-import-not-a-uuid".to_string()]),
+            "node-a",
         ));
         assert!(!is_owned_remote_import_helper(
             Some(&labels),
             Some(&["/dbe-remote-import-0123456789ABCDEF0123456789ABCDEF".to_string()]),
+            "node-a",
         ));
         assert!(!is_owned_remote_import_helper(
             Some(&labels),
             Some(&["/unrelated-0123456789abcdef0123456789abcdef".to_string()]),
+            "node-a",
+        ));
+        assert!(!is_owned_remote_import_helper(
+            Some(&labels),
+            Some(&valid_names),
+            "node-b",
         ));
     }
 

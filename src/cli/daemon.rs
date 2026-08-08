@@ -141,7 +141,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
 
     let mut docker = DockerRuntime::new(&config.daemon, false)
-        .context("failed to connect to container engine API")?;
+        .context("failed to connect to container engine API")?
+        .with_node_id(config.uuid.clone());
     docker
         .refresh_engine_info()
         .await

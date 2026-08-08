@@ -80,8 +80,10 @@ pub(crate) async fn queue_export_instance_with_options(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant)
-        && options.archive_format != ExportArchiveFormat::Plain
+    if matches!(
+        metadata.protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) && options.archive_format != ExportArchiveFormat::Plain
     {
         return Err(ApiError::BadRequest(format!(
             "{} exports are already physical archives; omit archive_format",
@@ -501,7 +503,7 @@ pub(super) async fn export_instance_artifact(
         .ok_or(ApiError::NotFound)?;
     validate_logical_operation_eligible(&metadata)?;
     match metadata.protocol {
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             export_physical_archive(
                 state,
                 instance_id,

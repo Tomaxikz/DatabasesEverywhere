@@ -97,7 +97,10 @@ impl BackupCatalog {
         if policy.preview_rows_per_object > 0 && policy.max_preview_objects > 0 {
             capture_previews(docker, metadata, policy, &mut catalog).await;
         }
-        if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant) {
+        if matches!(
+            metadata.protocol,
+            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+        ) {
             catalog.warnings.push(format!(
                 "{} uses a physical, schema-less store; this catalog describes the backup but does not expose record previews",
                 metadata.protocol.as_str()
@@ -192,6 +195,7 @@ async fn capture_schema(
             parse_clickhouse_schema(&output)
         }
         Protocol::Redis => Ok(vec![schema_less_object(metadata, "keyspace")]),
+        Protocol::Valkey => Ok(vec![schema_less_object(metadata, "keyspace")]),
         Protocol::Qdrant => Ok(vec![schema_less_object(metadata, "collection_store")]),
     }
 }
@@ -202,7 +206,10 @@ async fn capture_previews(
     policy: &BackupBrowsingConfig,
     catalog: &mut BackupCatalog,
 ) {
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Qdrant) {
+    if matches!(
+        metadata.protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
         return;
     }
     let mut failures = 0_usize;
@@ -445,7 +452,7 @@ fn preview_script(
                 shell_quote(&query)
             ))
         }
-        Protocol::Redis | Protocol::Qdrant => None,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => None,
     }
 }
 

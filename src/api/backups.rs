@@ -327,17 +327,12 @@ async fn restore_instance_backup_admitted(
     }
     let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, &instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let mut result =
-        crate::api::import_export::replace_data_from_archive(paths.clone(), &materialized.path)
-            .await;
-    if result.is_ok() {
-        result = crate::api::import_export::reapply_instance_data_owner(&state, &paths).await;
-    }
-    let finished = crate::api::import_export::finish_physical_operation(
+    let finished = crate::api::import_export::restore_data_from_archive(
         &state,
         &instance_id,
+        paths,
+        &materialized.path,
         was_running,
-        result,
     )
     .await;
     materialized.cleanup().await;

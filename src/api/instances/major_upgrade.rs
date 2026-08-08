@@ -699,7 +699,7 @@ pub(super) fn replacement_validation_command(
         ),
         Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
         Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(
                 "{} major upgrade migration is not supported",
                 protocol
@@ -831,6 +831,9 @@ pub(super) fn ensure_major_upgrade_supported(protocol: Protocol) -> Result<(), A
         | Protocol::Clickhouse => Ok(()),
         Protocol::Redis => Err(ApiError::BadRequest(
             "redis major upgrades are blocked because Redis uses physical archive restore here; create a fresh Redis instance or use a dedicated Redis migration workflow".to_string(),
+        )),
+        Protocol::Valkey => Err(ApiError::BadRequest(
+            "valkey major upgrades are blocked because Valkey uses physical archive restore here; create a fresh Valkey instance or use a dedicated Valkey migration workflow".to_string(),
         )),
         Protocol::Qdrant => Err(ApiError::BadRequest(
             "qdrant major upgrades are blocked because Qdrant snapshot compatibility is version-specific; create a fresh Qdrant instance or use a dedicated Qdrant migration workflow".to_string(),

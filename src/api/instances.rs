@@ -964,10 +964,10 @@ async fn instance_image_update_spec(
     pids_limit: i64,
 ) -> Result<DockerInstanceSpec, ApiError> {
     let password = match metadata.protocol {
-        Protocol::Redis => password.unwrap_or_default(),
+        Protocol::Redis | Protocol::Valkey => password.unwrap_or_default(),
         _ => password.ok_or_else(|| {
             ApiError::BadRequest(
-                "password is required when recreating non-redis database containers".to_string(),
+                "password is required when recreating non-RESP database containers".to_string(),
             )
         })?,
     };
@@ -985,6 +985,13 @@ async fn instance_image_update_spec(
             paths.sockets.clone(),
         ),
         Protocol::Redis => databases::redis::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Valkey => databases::valkey::docker::instance_spec(
             &metadata.instance_id,
             image,
             container_data_path.clone(),
@@ -1079,6 +1086,7 @@ pub(crate) fn docker_error(error: DockerError) -> ApiError {
         error @ DockerError::UntrustedContainerNameCollision { .. } => {
             ApiError::Conflict(error.to_string())
         }
+        DockerError::ManagedContainerNotFound { .. } => ApiError::NotFound,
         DockerError::Api(BollardError::DockerResponseServerError {
             status_code: 404, ..
         }) => ApiError::NotFound,
@@ -1207,6 +1215,7 @@ mod tests {
         assert!(ensure_major_upgrade_supported(Protocol::Mysql).is_ok());
         assert!(ensure_major_upgrade_supported(Protocol::Mongodb).is_ok());
         assert!(ensure_major_upgrade_supported(Protocol::Redis).is_err());
+        assert!(ensure_major_upgrade_supported(Protocol::Valkey).is_err());
         assert!(ensure_major_upgrade_supported(Protocol::Qdrant).is_err());
     }
 
@@ -1254,6 +1263,13 @@ mod tests {
                 "Redis server v=8.8.0 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64\n"
             ),
             Some("8.8.0".to_string())
+        );
+        assert_eq!(
+            normalize_database_version(
+                Protocol::Valkey,
+                "Valkey server v=9.1.1 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64\n"
+            ),
+            Some("9.1.1".to_string())
         );
         assert_eq!(
             normalize_database_version(Protocol::Mongodb, "v8.3.4\n"),

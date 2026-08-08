@@ -3,6 +3,7 @@ use super::*;
 pub(super) const SERVICE_PATH: &str = "/etc/systemd/system/databases-everywhere.service";
 pub(super) const SUDOERS_PATH: &str = "/etc/sudoers.d/databases-everywhere";
 pub(super) const INSTALL_PATH: &str = "/usr/local/bin/dbev";
+const LEGACY_LOGS_PATH: &str = "/var/log/dbev";
 
 pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     ensure_root()?;
@@ -12,7 +13,8 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     ensure_required_setup_commands(&config.daemon)?;
     install_current_binary(Path::new(INSTALL_PATH))?;
     secure_config_permissions(&config_path)?;
-    ensure_system_directories(&config_path)?;
+    migrate_unsafe_legacy_logs_path(&config_path, &mut config)?;
+    ensure_system_directories(&config).await?;
     detect_and_log_disk_mode(&mut config)?;
     ensure_fuse_quota_host_config(&config)?;
     remove_obsolete_managed_sudoers()?;
@@ -439,17 +441,47 @@ pub(super) fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()
     Ok(())
 }
 
-pub(super) fn ensure_system_directories(config_path: &Path) -> anyhow::Result<()> {
-    let config = load_config(config_path)?;
-    let paths = configured_runtime_roots(&config);
-    for path in &paths {
-        fs::create_dir_all(path).with_context(|| format!("failed to create {path}"))?;
-        // Do not recursively change database files: container images use their
-        // own internal UIDs/GIDs, and the root-run daemon can manage them as-is.
-        run_setup_command("chown", &["root:root", path.as_str()])?;
-        harden_runtime_directory(Path::new(path))?;
-    }
+pub(super) async fn ensure_system_directories(config: &Config) -> anyhow::Result<()> {
+    ensure_runtime_directories(config)
+        .await
+        .context("failed to securely prepare configured runtime directories")?;
     Ok(())
+}
+
+fn migrate_unsafe_legacy_logs_path(config_path: &Path, config: &mut Config) -> anyhow::Result<()> {
+    if config.paths.logs != LEGACY_LOGS_PATH {
+        return Ok(());
+    }
+
+    let legacy_error = match validate_runtime_path_ancestors(Path::new(LEGACY_LOGS_PATH), false) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let replacement = format!("{}/logs", config.paths.data.trim_end_matches('/'));
+    let mut migrated = config.clone();
+    migrated.paths.logs = replacement.clone();
+    crate::config::validate::validate_config(&migrated)
+        .context("the safe setup log-path replacement is not valid")?;
+    validate_runtime_path_ancestors(Path::new(&replacement), false).with_context(|| {
+        format!(
+            "legacy log path {LEGACY_LOGS_PATH} is unsafe ({legacy_error:#}); replacement {replacement} is also unsafe"
+        )
+    })?;
+
+    persist_setup_config(config_path, &migrated)?;
+    *config = load_config(config_path).context("failed to reload migrated setup config")?;
+    println!(
+        "setup changed unsafe legacy log path {LEGACY_LOGS_PATH} to {replacement}; existing files in the legacy directory were left untouched"
+    );
+    Ok(())
+}
+
+fn persist_setup_config(config_path: &Path, config: &Config) -> anyhow::Result<()> {
+    let yaml = serde_yaml::to_string(config).context("failed to encode migrated setup config")?;
+    atomic_replace_setup_file(config_path, 0o600, "daemon config", |file| {
+        file.write_all(yaml.as_bytes())
+    })
+    .with_context(|| format!("failed to update config {}", config_path.display()))
 }
 
 pub(super) fn remove_obsolete_managed_sudoers() -> anyhow::Result<()> {

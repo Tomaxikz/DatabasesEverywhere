@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum GatewayListenerKind {
     Postgres,
     Redis,
+    Valkey,
     Mariadb,
     Mysql,
     Mongodb,
@@ -17,6 +18,7 @@ impl GatewayListenerKind {
         match self {
             Self::Postgres => "postgres",
             Self::Redis => "redis",
+            Self::Valkey => "valkey",
             Self::Mariadb => "mariadb",
             Self::Mysql => "mysql",
             Self::Mongodb => "mongodb",
@@ -40,7 +42,7 @@ impl PreparedGatewayListener {
         kind: GatewayListenerKind,
         bind: String,
         tls: Option<tokio_rustls::TlsAcceptor>,
-        connection_limit: u32,
+        limiter: GatewayConnectionLimiter,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(&bind)
             .await
@@ -50,7 +52,7 @@ impl PreparedGatewayListener {
             bind,
             listener,
             tls,
-            limiter: GatewayConnectionLimiter::new(connection_limit),
+            limiter,
         })
     }
 
@@ -73,6 +75,10 @@ impl PreparedGatewayListener {
             }
             GatewayListenerKind::Redis => {
                 listeners::run_redis_listener(listener, &bind, resolver, tls, limiter, shutdown)
+                    .await
+            }
+            GatewayListenerKind::Valkey => {
+                listeners::run_valkey_listener(listener, &bind, resolver, tls, limiter, shutdown)
                     .await
             }
             GatewayListenerKind::Mariadb => {
@@ -116,6 +122,7 @@ pub(super) async fn start_gateway_listeners(
     let connection_limit = config.security.db_connection_limit_per_minute;
     let expected = usize::from(config.postgres.enabled)
         + usize::from(config.redis.enabled)
+        + usize::from(config.valkey.enabled)
         + usize::from(config.mariadb.enabled)
         + usize::from(config.mysql.enabled)
         + usize::from(config.mongodb.enabled)
@@ -182,13 +189,14 @@ pub(super) async fn prepare_gateway_listeners(
     connection_limit: u32,
 ) -> anyhow::Result<Vec<PreparedGatewayListener>> {
     let mut prepared = Vec::new();
+    let limiter = GatewayConnectionLimiter::new(connection_limit);
     if config.postgres.enabled {
         prepared.push(
             PreparedGatewayListener::bind(
                 GatewayListenerKind::Postgres,
                 config.postgres.bind.clone(),
                 listener_tls(config.postgres.tls, config)?,
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -199,7 +207,18 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Redis,
                 config.redis.bind.clone(),
                 listener_tls(config.redis.tls, config)?,
-                connection_limit,
+                limiter.clone(),
+            )
+            .await?,
+        );
+    }
+    if config.valkey.enabled {
+        prepared.push(
+            PreparedGatewayListener::bind(
+                GatewayListenerKind::Valkey,
+                config.valkey.bind.clone(),
+                listener_tls(config.valkey.tls, config)?,
+                limiter.clone(),
             )
             .await?,
         );
@@ -210,7 +229,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Mariadb,
                 config.mariadb.bind.clone(),
                 listener_tls(config.mariadb.tls, config)?,
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -221,7 +240,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Mysql,
                 config.mysql.bind.clone(),
                 listener_tls(config.mysql.tls, config)?,
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -232,7 +251,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Mongodb,
                 config.mongodb.bind.clone(),
                 listener_tls(config.mongodb.tls, config)?,
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -244,7 +263,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Clickhouse,
                 config.clickhouse.bind.clone(),
                 tls.clone(),
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -253,7 +272,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::ClickhouseHttp,
                 config.clickhouse.http_bind.clone(),
                 tls,
-                connection_limit,
+                limiter.clone(),
             )
             .await?,
         );
@@ -264,7 +283,7 @@ pub(super) async fn prepare_gateway_listeners(
                 GatewayListenerKind::Qdrant,
                 config.qdrant.bind.clone(),
                 listener_tls(config.qdrant.tls, config)?,
-                connection_limit,
+                limiter,
             )
             .await?,
         );
@@ -312,7 +331,7 @@ pub(super) async fn serve_api(
         bind = %bind,
         configured_host = %config.api.host,
         port = config.api.port,
-        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        max_active_connections_per_ip = MAX_ACTIVE_API_CONNECTIONS_PER_IP,
         header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
         "api listener started"
     );
@@ -372,7 +391,7 @@ pub(super) async fn serve_api_tls(
         bind = %bind_addr,
         configured_host = %config.api.host,
         port = config.api.port,
-        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        max_active_connections_per_ip = MAX_ACTIVE_API_CONNECTIONS_PER_IP,
         header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
         tls_handshake_timeout_seconds = API_TLS_HANDSHAKE_TIMEOUT.as_secs(),
         "api tls listener started"

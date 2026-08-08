@@ -461,6 +461,7 @@ pub(super) fn database_version_script(protocol: Protocol) -> &'static str {
         Protocol::Mariadb => "mariadb --version 2>/dev/null || mysqld --version",
         Protocol::Mysql => "mysqld --version 2>/dev/null || mysql --version",
         Protocol::Redis => "redis-server --version",
+        Protocol::Valkey => "valkey-server --version",
         Protocol::Mongodb => "mongod --version | awk '/db version/ {print $3; exit}'",
         Protocol::Clickhouse => "clickhouse-server --version 2>/dev/null || clickhouse --version",
         Protocol::Qdrant => {
@@ -494,7 +495,7 @@ pub(super) fn normalize_database_version(protocol: Protocol, stdout: &str) -> Op
                     .and_then(|rest| rest.split([',', ' ']).next())
             })
             .unwrap_or(line),
-        Protocol::Redis => line
+        Protocol::Redis | Protocol::Valkey => line
             .split_whitespace()
             .find_map(|part| part.strip_prefix("v="))
             .unwrap_or(line),

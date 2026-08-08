@@ -1,4 +1,4 @@
-use std::{fmt, path::Path, time::Duration};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -24,6 +24,7 @@ const DEFAULT_MULTIPART_PART_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: u64 = 10_000;
 const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024_u64.pow(4);
 const MAX_LISTED_OBJECT_KEYS: usize = 100_000;
+const MAX_LIST_PAGES: usize = 1_024;
 
 #[derive(Clone)]
 pub struct S3BackupDriver {
@@ -780,7 +781,17 @@ impl S3BackupDriver {
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, BackupStoreError> {
         let mut keys = Vec::new();
         let mut continuation: Option<String> = None;
+        let mut seen_continuations = HashSet::new();
+        let mut pages = 0_usize;
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.config.request_timeout_seconds);
         loop {
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(BackupStoreError::Remote(format!(
+                    "S3 list objects exceeded its {MAX_LIST_PAGES}-page safety limit"
+                )));
+            }
             let mut query = vec![
                 ("encoding-type".to_string(), "url".to_string()),
                 ("list-type".to_string(), "2".to_string()),
@@ -790,11 +801,27 @@ impl S3BackupDriver {
             if let Some(token) = continuation.as_ref() {
                 query.push(("continuation-token".to_string(), token.clone()));
             }
-            let response = self.list_response_with_retry(&query).await?;
-            let body = response_bytes_bounded(response, MAX_LIST_BYTES, "list objects").await?;
+            let response = tokio::time::timeout_at(deadline, self.list_response_with_retry(&query))
+                .await
+                .map_err(|_| {
+                    BackupStoreError::Remote(
+                        "S3 list objects exceeded its overall request deadline".to_string(),
+                    )
+                })??;
+            let body = tokio::time::timeout_at(
+                deadline,
+                response_bytes_bounded(response, MAX_LIST_BYTES, "list objects"),
+            )
+            .await
+            .map_err(|_| {
+                BackupStoreError::Remote(
+                    "S3 list objects exceeded its overall request deadline".to_string(),
+                )
+            })??;
             let xml = std::str::from_utf8(&body).map_err(|_| {
                 BackupStoreError::Corrupt("S3 list response was not UTF-8 XML".to_string())
             })?;
+            let keys_before_page = keys.len();
             for value in xml_values(xml, "Key") {
                 keys.push(percent_decode(&xml_unescape(&value))?);
                 if keys.len() > MAX_LISTED_OBJECT_KEYS {
@@ -807,13 +834,25 @@ impl S3BackupDriver {
             if !truncated {
                 break;
             }
-            continuation =
-                xml_value(xml, "NextContinuationToken").map(|value| xml_unescape(&value));
-            if continuation.as_deref().is_none_or(str::is_empty) {
+            if keys.len() == keys_before_page {
+                return Err(BackupStoreError::Corrupt(
+                    "S3 list response made no progress on a truncated page".to_string(),
+                ));
+            }
+            let Some(next_continuation) = xml_value(xml, "NextContinuationToken")
+                .map(|value| xml_unescape(&value))
+                .filter(|token| !token.is_empty())
+            else {
                 return Err(BackupStoreError::Corrupt(
                     "S3 list response omitted its continuation token".to_string(),
                 ));
+            };
+            if !seen_continuations.insert(next_continuation.clone()) {
+                return Err(BackupStoreError::Corrupt(
+                    "S3 list response repeated its continuation token".to_string(),
+                ));
             }
+            continuation = Some(next_continuation);
         }
         Ok(keys)
     }
@@ -1296,7 +1335,7 @@ fn valid_multipart_etag(value: &str) -> bool {
 }
 
 async fn response_bytes_bounded(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     max_bytes: u64,
     operation: &str,
 ) -> Result<Bytes, BackupStoreError> {
@@ -1308,15 +1347,31 @@ async fn response_bytes_bounded(
             "S3 {operation} response exceeded its safety limit"
         )));
     }
-    let bytes = response.bytes().await.map_err(|error| {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
         BackupStoreError::Remote(format!("failed to read S3 {operation} response: {error}"))
-    })?;
-    if bytes.len() as u64 > max_bytes {
+    })? {
+        append_response_chunk_bounded(&mut bytes, &chunk, max_bytes, operation)?;
+    }
+    Ok(Bytes::from(bytes))
+}
+
+fn append_response_chunk_bounded(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: u64,
+    operation: &str,
+) -> Result<(), BackupStoreError> {
+    let prospective_size = u64::try_from(bytes.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(chunk.len() as u64);
+    if prospective_size > max_bytes {
         return Err(BackupStoreError::Corrupt(format!(
             "S3 {operation} response exceeded its safety limit"
         )));
     }
-    Ok(bytes)
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1356,5 +1411,15 @@ mod tests {
     #[test]
     fn multipart_etags_are_xml_escaped() {
         assert_eq!(xml_escape("\"a&b\""), "&quot;a&amp;b&quot;");
+    }
+
+    #[test]
+    fn bounded_response_chunks_reject_overflow_before_buffering_it() {
+        let mut bytes = vec![1_u8, 2];
+
+        let error = append_response_chunk_bounded(&mut bytes, &[3, 4], 3, "test").unwrap_err();
+
+        assert!(error.to_string().contains("exceeded its safety limit"));
+        assert_eq!(bytes, [1, 2]);
     }
 }

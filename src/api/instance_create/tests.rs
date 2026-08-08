@@ -121,6 +121,55 @@ async fn create_request_rejects_existing_redis_route_for_username() {
     );
 }
 
+#[tokio::test]
+async fn create_request_rejects_existing_valkey_route_for_username() {
+    let state = test_state(Config::default()).await;
+    state
+        .instances
+        .upsert(sample_metadata(
+            "inst_existing_valkey",
+            Protocol::Valkey,
+            "first_cache",
+            "shared_user",
+        ))
+        .await;
+    let mut request = create_request(Protocol::Valkey);
+    request.instance_id = "inst_new_valkey".to_string();
+    request.database = "second_cache".to_string();
+    request.username = "shared_user".to_string();
+
+    let error = reject_duplicate_instance(&state, &request)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ApiError::Conflict(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("valkey route already exists for username shared_user")
+    );
+}
+
+#[tokio::test]
+async fn redis_and_valkey_use_separate_route_namespaces() {
+    let state = test_state(Config::default()).await;
+    state
+        .instances
+        .upsert(sample_metadata(
+            "inst_existing_redis",
+            Protocol::Redis,
+            "cache",
+            "shared_user",
+        ))
+        .await;
+    let mut request = create_request(Protocol::Valkey);
+    request.instance_id = "inst_new_valkey".to_string();
+    request.database = "cache".to_string();
+    request.username = "shared_user".to_string();
+
+    reject_duplicate_instance(&state, &request).await.unwrap();
+}
+
 #[test]
 fn allocation_guard_rejects_a_projected_limit_over_the_node_pool() {
     let error = enforce_resource_allocation(

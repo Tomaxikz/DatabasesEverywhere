@@ -46,7 +46,7 @@ use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 
 use crate::{
     config::{DaemonConfig, DaemonEngine},
-    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
+    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
     runtime::docker::container_config::{
         bind_mount, cpu_to_nano, disabled_healthcheck, mib_to_bytes,
     },
@@ -99,6 +99,7 @@ pub struct DockerRuntime {
     engine_version: Option<String>,
     engine_api_version: Option<String>,
     cgroup_version: Option<String>,
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +131,7 @@ impl DockerRuntime {
             engine_version: None,
             engine_api_version: None,
             cgroup_version: None,
+            node_id: None,
         })
     }
 
@@ -158,7 +160,14 @@ impl DockerRuntime {
             engine_version: None,
             engine_api_version: None,
             cgroup_version: None,
+            node_id: None,
         }
+    }
+
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        let node_id = node_id.into();
+        self.node_id = (!node_id.trim().is_empty()).then_some(node_id);
+        self
     }
 
     pub fn engine(&self) -> DaemonEngine {
@@ -215,6 +224,15 @@ impl DockerRuntime {
             }
             _ => {}
         }
+        if self.engine == DaemonEngine::Podman {
+            let detected = version.version.as_deref().unwrap_or("unknown");
+            if !engine::is_supported_podman_version(detected) {
+                return Err(DockerError::UnsupportedPodmanVersion {
+                    detected: detected.to_string(),
+                    minimum: engine::MINIMUM_PODMAN_VERSION,
+                });
+            }
+        }
         self.docker = negotiated;
         self.engine_version = version.version;
         self.engine_api_version = version.api_version;
@@ -264,7 +282,7 @@ impl DockerRuntime {
             Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
                 "999:999"
             }
-            Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => "0:0",
+            Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => "0:0",
         })
     }
 
@@ -299,6 +317,9 @@ impl DockerRuntime {
             (INSTANCE_LABEL.to_string(), spec.instance_id.clone()),
             (PROTOCOL_LABEL.to_string(), spec.protocol.to_string()),
         ]);
+        if let Some(node_id) = &self.node_id {
+            labels.insert(NODE_LABEL.to_string(), node_id.clone());
+        }
         if let Some(project_id) = &spec.project_id {
             labels.insert(PROJECT_LABEL.to_string(), project_id.clone());
         }
@@ -357,7 +378,9 @@ impl DockerRuntime {
             Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
                 Some("keep-id:uid=999,gid=999")
             }
-            Protocol::Redis | Protocol::Clickhouse | Protocol::Qdrant => None,
+            Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
+                Some("host")
+            }
         }
     }
 
@@ -571,7 +594,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         self.docker
             .start_container(&name, None::<StartContainerOptions>)
             .await?;
@@ -583,7 +608,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         self.docker
             .stop_container(&name, None::<StopContainerOptions>)
             .await?;
@@ -595,7 +622,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         self.docker.restart_container(&name, None).await?;
         Ok(CommandOutput::empty())
     }
@@ -605,7 +634,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         self.docker
             .kill_container(
                 &name,
@@ -622,7 +653,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         self.docker
             .remove_container(
                 &name,
@@ -640,36 +673,14 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let response = self.docker.inspect_container(&name, None).await?;
         Ok(CommandOutput {
             stdout: serde_json::to_string(&response)?,
             stderr: String::new(),
         })
-    }
-
-    /// Returns the exact protocol-qualified container name when it belongs to
-    /// the requested DBE instance. A same-name container without the complete
-    /// ownership label tuple is treated as an untrusted collision.
-    pub async fn verified_managed_container_name(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-    ) -> Result<Option<String>, DockerError> {
-        let container = self.container_name(protocol, instance_id)?;
-        let response = match self.docker.inspect_container(&container, None).await {
-            Ok(response) => response,
-            Err(BollardError::DockerResponseServerError {
-                status_code: 404, ..
-            }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let labels = response
-            .config
-            .and_then(|config| config.labels)
-            .unwrap_or_default();
-        verify_managed_instance_labels(&labels, &container, protocol, instance_id)?;
-        Ok(Some(container))
     }
 
     pub async fn update_limits(
@@ -679,7 +690,9 @@ impl DockerRuntime {
         cpu_cores: f64,
         memory_mib: u64,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         match self.engine {
             DaemonEngine::Docker => {
                 let body = Self::update_limits_body(cpu_cores, memory_mib)?;
@@ -740,7 +753,9 @@ impl DockerRuntime {
         log_failure: bool,
         timeout: Duration,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let operation = command
             .first()
             .map(|program| format!("{program} [arguments redacted]"))
@@ -964,7 +979,9 @@ impl DockerRuntime {
         host_path: &Path,
         container_path: &str,
     ) -> Result<(), DockerError> {
-        let container = self.container_name(protocol, instance_id)?;
+        let container = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let (container_parent, container_file_name) = container_file_parts(container_path)?;
         let metadata = tokio::fs::symlink_metadata(host_path)
             .await
@@ -1064,7 +1081,9 @@ impl DockerRuntime {
         max_bytes: u64,
     ) -> Result<(), DockerError> {
         let max_bytes = max_bytes.min(MAX_CONTAINER_TRANSFER_BYTES);
-        let container = self.container_name(protocol, instance_id)?;
+        let container = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let (_, expected_file_name) = container_file_parts(container_path)?;
         let async_deadline = tokio::time::Instant::now() + FILE_TRANSFER_TIMEOUT;
         let blocking_deadline = Instant::now() + FILE_TRANSFER_TIMEOUT;
@@ -1196,10 +1215,17 @@ fn verify_managed_instance_labels(
     container: &str,
     protocol: Protocol,
     instance_id: &str,
+    expected_node_id: Option<&str>,
 ) -> Result<(), DockerError> {
+    let node_matches = expected_node_id.is_none_or(|expected| {
+        labels
+            .get(NODE_LABEL)
+            .is_none_or(|actual| actual == expected)
+    });
     let is_expected = labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
         && labels.get(INSTANCE_LABEL).map(String::as_str) == Some(instance_id)
-        && labels.get(PROTOCOL_LABEL).map(String::as_str) == Some(protocol.as_str());
+        && labels.get(PROTOCOL_LABEL).map(String::as_str) == Some(protocol.as_str())
+        && node_matches;
     if is_expected {
         Ok(())
     } else {
@@ -1248,6 +1274,11 @@ pub enum DockerError {
         "rootless Podman requires cgroup v2 so DBE CPU, memory, and PID limits remain enforceable"
     )]
     RootlessPodmanRequiresCgroupV2,
+    #[error("unsupported Podman version {detected}; DBE requires Podman {minimum} or newer")]
+    UnsupportedPodmanVersion {
+        detected: String,
+        minimum: &'static str,
+    },
     #[error("docker security policy rejected spec: {0}")]
     Security(#[from] security::DockerSecurityError),
     #[error("invalid container resource limits: {0}")]
@@ -1275,6 +1306,15 @@ pub enum DockerError {
         instance_id: String,
         protocol: String,
     },
+    #[error("managed container for instance {instance_id} and protocol {protocol} was not found")]
+    ManagedContainerNotFound {
+        instance_id: String,
+        protocol: String,
+    },
+    #[error("managed container {container} did not report an immutable container id")]
+    ManagedContainerIdUnavailable { container: String },
+    #[error("DBE node ownership identity is unavailable for this container operation")]
+    RuntimeNodeIdUnavailable,
     #[error("file transfer failed for {path}: {source}")]
     FileTransferIo {
         path: String,
@@ -1407,6 +1447,7 @@ impl DockerError {
                 status_code: 404,
                 ..
             }) | Self::PodmanApiResponse { status: 404, .. }
+                | Self::ManagedContainerNotFound { .. }
         )
     }
 

@@ -69,10 +69,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum RedisProvisionError {
     #[error(
-        "redis username may only contain ascii letters, digits, _, -, ., and @ and may not be dbe_health"
+        "database ACL username may only contain ascii letters, digits, _, -, ., and @ and may not be dbe_health"
     )]
     InvalidUsername,
-    #[error("failed to write redis acl file {path}: {source}")]
+    #[error("failed to write database ACL file {path}: {source}")]
     WriteAcl {
         path: String,
         #[source]

@@ -98,6 +98,9 @@ fn allows_only_supported_import_artifact_extensions() {
         "instance-1.redis.tar.gz"
     )));
     assert!(artifact_has_allowed_extension(FsPath::new(
+        "instance-1.valkey.tar.gz"
+    )));
+    assert!(artifact_has_allowed_extension(FsPath::new(
         "instance-1.mongodb.archive.gz"
     )));
     assert!(artifact_has_allowed_extension(FsPath::new(
@@ -128,6 +131,9 @@ fn recovery_restore_is_destructive_and_infers_only_real_wrapper_formats() {
 
     let redis_physical = ImportOptions::recovery_restore("export.redis.tar.gz", Protocol::Redis);
     assert_eq!(redis_physical.archive_format, None);
+
+    let valkey_physical = ImportOptions::recovery_restore("export.valkey.tar.gz", Protocol::Valkey);
+    assert_eq!(valkey_physical.archive_format, None);
 }
 
 #[test]

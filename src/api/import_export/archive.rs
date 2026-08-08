@@ -338,6 +338,7 @@ pub(super) fn dump_candidate_suffixes(protocol: Protocol) -> &'static [&'static 
     match protocol {
         Protocol::Postgres => &[".postgres.sql", ".pgsql.sql", ".sql"],
         Protocol::Redis => &[".redis.tar.gz", ".tar.gz"],
+        Protocol::Valkey => &[".valkey.tar.gz", ".tar.gz"],
         Protocol::Mariadb => &[".mariadb.sql", ".mysql.sql", ".sql"],
         Protocol::Mysql => &[".mysql.sql", ".sql"],
         Protocol::Mongodb => &[".mongodb.archive.gz", ".archive.gz"],

@@ -33,6 +33,7 @@ pub(super) fn dump_extension(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Postgres => "postgres.sql",
         Protocol::Redis => "redis.tar.gz",
+        Protocol::Valkey => "valkey.tar.gz",
         Protocol::Mariadb => "mariadb.sql",
         Protocol::Mysql => "mysql.sql",
         Protocol::Mongodb => "mongodb.archive.gz",

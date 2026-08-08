@@ -50,6 +50,14 @@ impl RouteResolver {
         )
     }
 
+    pub(crate) async fn resolve_valkey(&self, username: &str) -> Option<ResolvedRoute> {
+        let target = self.store.resolve_valkey(username).await?;
+        Some(
+            self.resolve_target(target.instance_id, target.endpoint)
+                .await,
+        )
+    }
+
     pub(crate) async fn resolve_mariadb(
         &self,
         username: &str,

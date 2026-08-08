@@ -126,7 +126,7 @@ The template placeholders are deliberately rejected by `check-config`.
 For example, run `openssl rand -base64 32` twice and assign each output to one
 of the two fields.
 
-The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. Managed database containers remain network-isolated. Credential-based imports use short-lived, hardened acquisition helpers (or a bounded host client for Redis/Qdrant) and never add a network interface to the target container.
+The API listener may run on loopback behind a reverse proxy or directly on a public interface using its native TLS server. Non-loopback API binds require `api.ssl.enabled: true` with a valid certificate and key; cleartext public API exposure is rejected. Database gateways may use public binds with or without TLS and continue to enforce the database protocols' native credentials. Cleartext public gateways emit a warning because their traffic is not encrypted. Managed database containers remain network-isolated. Credential-based imports use short-lived, hardened acquisition helpers (or a bounded host client for Redis/Valkey/Qdrant) and never add a network interface to the target container.
 
 Database images may use ordinary versioned Docker Hub, GHCR, or other
 registry references. Bare references and the mutable `latest` tag are rejected;
@@ -137,6 +137,7 @@ desired:
 images:
   postgres: "postgres:18.4"
   redis: "redis:8.8.0"
+  valkey: "valkey/valkey:9.1.1"
   mariadb: "mariadb:12.3.2"
   mysql: "mysql:8.4"
   mongodb: "mongo:8.3.4"
@@ -145,6 +146,7 @@ images:
   allowed:
     postgres: ["postgres:18.4"]
     redis: ["redis:8.8.0"]
+    valkey: ["valkey/valkey:9.1.1"]
     mariadb: ["mariadb:12.3.2"]
     mysql: ["mysql:8.4"]
     mongodb: ["mongo:8.3.4", "mongo:7.0.37"]
@@ -244,7 +246,7 @@ paths:
   backups: /var/lib/dbev/backups
   sockets: /run/dbev/sockets
   locks: /run/dbev/locks
-  logs: /var/log/dbev
+  logs: /var/lib/dbev/logs
   artifacts: /var/lib/dbev/artifacts
   exports: /var/lib/dbev/artifacts/exports
   imports: /var/lib/dbev/artifacts/imports
@@ -341,7 +343,7 @@ Files end up here:
 /etc/databases-everywhere/config.yml
 /usr/local/bin/dbev
 /var/lib/dbev
-/var/log/dbev
+/var/lib/dbev/logs
 /run/dbev
 ```
 
@@ -403,7 +405,9 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.7.0` adds pluggable local/S3/Kopia backup storage, storage
+version. Contract `0.8.0` adds Valkey as a first-class protocol with an isolated
+RESP gateway, lifecycle, imports, exports, backups, and capability reporting.
+Contract `0.7.0` adds pluggable local/S3/Kopia backup storage, storage
 status fields, and bounded backup-catalog browsing. Contract `0.6.0` adds typed credential-based remote imports with
 verified TLS, SSRF controls, per-protocol acquisition, merge/wipe modes, and
 rollback-first target handling. Contract `0.5.0` exposes the API rate-limit allowance and its
@@ -459,7 +463,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `valkey`, `mongodb`, `clickhouse`, `qdrant`.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
@@ -554,7 +558,7 @@ PATCH /api/instances/{id}/image
 { "image": "postgres:18.4", "password": "the-instance-password" }
 ```
 
-This pulls the image, deletes the old container, and recreates it on the same data volume. `password` is required for everything except Redis (the container needs it to re-provision the user). Images must be pinned — a non-`latest` tag or a `@sha256:` digest; bare `postgres` or `postgres:latest` gets a `400`.
+This pulls the image, deletes the old container, and recreates it on the same data volume. `password` is required for everything except Redis and Valkey (their ACL file is retained on the volume). Images must be pinned — a non-`latest` tag or a `@sha256:` digest; bare `postgres` or `postgres:latest` gets a `400`.
 
 The requested image must also be allowed in `images.allowed.<protocol>`. The configured default image at `images.<protocol>` is always implicitly allowed. Keep the allowlist short and admin-controlled; do not pass arbitrary user input here.
 
@@ -569,7 +573,7 @@ PATCH /api/instances/{id}/image
 }
 ```
 
-For Postgres, MariaDB, MySQL, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
+For Postgres, MariaDB, MySQL, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis, Valkey, and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
 
 The response includes `strategy`:
 
@@ -719,7 +723,7 @@ Export body (all optional — empty body means a full plain dump):
 }
 ```
 
-`archive_format` is `plain`, `gzip`, or `bzip2`. Omit it for Redis and Qdrant,
+`archive_format` is `plain`, `gzip`, or `bzip2`. Omit it for Redis, Valkey, and Qdrant,
 whose exports are already physical archives.
 
 Export/import formats:
@@ -732,10 +736,11 @@ Export/import formats:
 | MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump or gzip/tar/zip-wrapped archive |
 | ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
+| Valkey | `.valkey.tar.gz` physical archive | Full physical archive only |
 | Qdrant | `.qdrant.tar.gz` physical archive | Full physical archive only |
 
-Redis and Qdrant artifact exports are full physical volume archives and are not
-selective. Remote Redis imports copy binary-safe DUMP/RESTORE records; remote
+Redis, Valkey, and Qdrant artifact exports are full physical volume archives and are not
+selective. Remote Redis and Valkey imports copy binary-safe DUMP/RESTORE records; remote
 Qdrant imports use collection snapshots. The target database container remains
 in `network_mode=none` for every protocol.
 
@@ -770,10 +775,10 @@ Import directly from credentials (the target instance determines the protocol):
 
 For credential imports, `merge` replaces source-named
 objects/keys/collections and preserves target-only data; `wipe` clears the
-target first. Redis and Qdrant artifact imports are different: those archives
+target first. Redis, Valkey, and Qdrant artifact imports are different: those archives
 always replace the complete physical database, so `mode` does not change their
 behavior. PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse use their native
-dump tools in a one-shot helper. Redis uses binary-safe
+dump tools in a one-shot helper. Redis and Valkey use binary-safe
 SCAN/DUMP/PTTL/RESTORE, and Qdrant uses collection snapshots.
 
 Credential values are not stored in durable job records or job metadata.
@@ -782,7 +787,7 @@ required secret to a mode-`0600`, job-private temporary credential file, then
 removes it immediately after the helper exits. After an unclean daemon stop,
 startup removes known credential files and deletes generated staging that has
 no durable recovery manifest; manifest-backed rollback data is retained.
-Redis and Qdrant credentials remain in process memory. A failed
+Redis, Valkey, and Qdrant credentials remain in process memory. A failed
 credential-based import must therefore be submitted again; the recovery retry
 endpoint cannot replay it.
 
@@ -817,14 +822,14 @@ automatic rollback cannot complete. Qdrant snapshot imports require the same
 major and minor version; the target cannot have an older patch release than
 the source.
 
-Credential imports reject Redis Cluster and distributed Qdrant endpoints.
+Credential imports reject Redis/Valkey Cluster and distributed Qdrant endpoints.
 SCAN and a Qdrant collection snapshot are node-local in those topologies and
 could otherwise produce a silently partial migration. Use the database's
 cluster-aware migration tooling or a verified standalone source instead.
 
 Remote acquisition does not lock the source database. Quiesce source writes
 when a single point-in-time migration is required, especially for MongoDB,
-ClickHouse, Redis, and multi-collection Qdrant imports. MongoDB selective
+ClickHouse, Redis, Valkey, and multi-collection Qdrant imports. MongoDB selective
 imports acquire each requested collection before changing the target, then
 apply all acquired archives under one rollback boundary. Because the source
 collection dumps are captured sequentially, quiesce source writes when the
@@ -929,7 +934,7 @@ backups:
 When browsing is enabled, each new backup carries a size-bounded catalog
 captured immediately before its physical archive. PostgreSQL, MariaDB, MySQL,
 MongoDB, and ClickHouse catalogs contain object/schema information plus a
-configurable, truncated row preview. Redis and Qdrant are schema-less physical
+configurable, truncated row preview. Redis, Valkey, and Qdrant are schema-less physical
 stores, so they return a descriptive object without record previews. This is a
 safe catalog view: the endpoint does not boot an untrusted clone or parse live
 database files. Existing backups return `catalog_available: false`. Row
@@ -1201,7 +1206,7 @@ sudo dbev --config /etc/databases-everywhere/config.yml \
 `--bench-import-export` is explicit destructive authorization. It queues a full
 native export, waits for it to succeed, then imports that fresh artifact back
 into the named instance. Logical imports are not transactional and may leave a
-partially modified database if the native client fails. Redis and Qdrant stop
+partially modified database if the native client fails. Redis, Valkey, and Qdrant stop
 temporarily for their physical-volume import. Never target customer data; use
 a disposable performance instance with representative data. After a successful
 re-import the benchmark deletes only the export artifact it created. Add

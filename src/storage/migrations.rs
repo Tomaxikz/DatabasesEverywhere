@@ -59,4 +59,53 @@ mod tests {
         .await;
         assert!(restart_conflict.is_err());
     }
+
+    #[tokio::test]
+    async fn legacy_valkey_username_duplicates_are_quarantined_before_unique_index() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE instance_metadata (
+                instance_id TEXT PRIMARY KEY NOT NULL,
+                protocol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                database_name TEXT NOT NULL,
+                database_username TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX uq_instance_metadata_protocol_database
+                ON instance_metadata(protocol, database_username, database_name)
+                WHERE protocol NOT IN ('redis', 'qdrant')
+                  AND status <> 'quarantined';
+            INSERT INTO instance_metadata VALUES
+                ('inst_a', 'valkey', 'running', 'cache_a', 'shared', '{"status":"running"}'),
+                ('inst_b', 'valkey', 'stopped', 'cache_b', 'shared', '{"status":"stopped"}');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260808120000_add_valkey_route_uniqueness.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows =
+            sqlx::query("SELECT instance_id, status FROM instance_metadata ORDER BY instance_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows[0].get::<String, _>("status"), "running");
+        assert_eq!(rows[1].get::<String, _>("status"), "quarantined");
+
+        let restart_conflict = sqlx::query(
+            "UPDATE instance_metadata SET status = 'running' WHERE instance_id = 'inst_b'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(restart_conflict.is_err());
+    }
 }

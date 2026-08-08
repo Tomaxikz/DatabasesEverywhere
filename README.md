@@ -6,7 +6,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 
 ## Features
 
-- 7 supported databases
+- 8 supported databases
 - Database imports
 - Database exports
 - Database backups
@@ -34,6 +34,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | MariaDB | Works | MySQL/MariaDB TCP |
 | MySQL | Works | MySQL TCP |
 | Redis | Works | RESP |
+| Valkey | Works | RESP |
 | MongoDB | Works | MongoDB wire protocol |
 | ClickHouse | Works | Native TCP and HTTP |
 | Qdrant | Works | gRPC |
@@ -48,7 +49,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Disk enforcement via FuseQuota when your host doesn't have native project quotas.
 - Automatic per-boot filesystem detection selects native quotas when available
   and otherwise selects FuseQuota; there is no manual disk-mode switch.
-- Native logical dumps for SQL/document stores and physical archive exports for Redis/Qdrant.
+- Native logical dumps for SQL/document stores and physical archive exports for Redis/Valkey/Qdrant.
 - Physical backups and restores.
 - Signed artifact downloads.
 - WebSocket monitoring for instance status and resource usage.
@@ -121,7 +122,7 @@ Runtime data lives in:
 
 ```text
 /var/lib/dbev
-/var/log/dbev
+/var/lib/dbev/logs
 /run/dbev
 ```
 

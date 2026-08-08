@@ -495,6 +495,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_metadata_rejects_duplicate_valkey_usernames() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool);
+        let mut first = sample_metadata();
+        first.protocol = Protocol::Valkey;
+        let mut duplicate = first.clone();
+        duplicate.instance_id = "inst_other".to_string();
+        duplicate.database.name = "another_database".to_string();
+        duplicate.runtime.container_name = "dbe-valkey-inst_other".to_string();
+
+        repository.upsert(&first).await.unwrap();
+
+        assert!(repository.upsert(&duplicate).await.is_err());
+    }
+
+    #[tokio::test]
     async fn durable_metadata_rejects_duplicate_qdrant_route_keys() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();

@@ -6,7 +6,7 @@ pub mod defaults {
     pub const DATA_PATH: &str = "/var/lib/dbev";
     pub const SOCKETS_PATH: &str = "/run/dbev/sockets";
     pub const LOCKS_PATH: &str = "/run/dbev/locks";
-    pub const LOGS_PATH: &str = "/var/log/dbev";
+    pub const LOGS_PATH: &str = "/var/lib/dbev/logs";
     pub const ARTIFACTS_PATH: &str = "/var/lib/dbev/artifacts";
 }
 
@@ -16,6 +16,7 @@ pub mod docker {
     pub const INSTANCE_LABEL: &str = "databases-everywhere.instance_id";
     pub const PROTOCOL_LABEL: &str = "databases-everywhere.protocol";
     pub const PROJECT_LABEL: &str = "databases-everywhere.project";
+    pub const NODE_LABEL: &str = "databases-everywhere.node_id";
 }
 
 pub mod jwt {
@@ -28,6 +29,7 @@ pub mod ports {
     pub const MARIADB: u16 = 3307;
     pub const MYSQL: u16 = 3308;
     pub const REDIS: u16 = 6380;
+    pub const VALKEY: u16 = 6381;
     pub const MONGODB: u16 = 27017;
     pub const CLICKHOUSE: u16 = 9000;
     pub const CLICKHOUSE_HTTP: u16 = 8123;

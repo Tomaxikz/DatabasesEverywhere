@@ -14,7 +14,7 @@ use crate::{
         public_diagnostic::PublicDiagnostic,
         remote_import::{
             ImportMode, RemoteImportRequest, RemoteImportSource, acquire_logical_dump,
-            import_qdrant, import_redis, validate_remote_source,
+            import_qdrant, import_redis, import_valkey, validate_remote_source,
         },
         routes::AppState,
         security_policy::ApiRequestContext,
@@ -243,7 +243,10 @@ impl ImportOptions {
 }
 
 fn recovery_archive_format(path: &FsPath, protocol: Protocol) -> Option<String> {
-    if matches!(protocol, Protocol::Redis | Protocol::Qdrant) {
+    if matches!(
+        protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
         return None;
     }
     let filename = path
@@ -330,7 +333,7 @@ pub(crate) use jobs::{
 pub(crate) use jobs::queue_export_instance_with_options;
 pub(crate) use logical::quarantine_after_uncertain_import;
 pub(crate) use physical::{
-    finish_physical_operation, reapply_instance_data_owner, replace_data_from_archive,
+    finish_physical_operation, restore_data_from_archive, rollback_data_from_archive,
 };
 
 #[cfg(test)]

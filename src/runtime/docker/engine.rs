@@ -7,6 +7,7 @@ use crate::shared::ownership::HostOwner;
 
 const API_TIMEOUT_SECONDS: u64 = 120;
 const PODMAN_SYSTEM_SOCKET: &str = "/run/podman/podman.sock";
+pub const MINIMUM_PODMAN_VERSION: &str = "4.3.0";
 const PODMAN_COMPAT_API_VERSION: &ClientVersion = &ClientVersion {
     major_version: 1,
     minor_version: 40,
@@ -86,6 +87,20 @@ pub fn reports_podman(version: &SystemVersion) -> bool {
                 .map(|component| component.name.as_str()),
         )
         .any(|name| name.to_ascii_lowercase().contains("podman"))
+}
+
+pub fn is_supported_podman_version(version: &str) -> bool {
+    parse_version_triplet(version).is_some_and(|version| version >= (4, 3, 0))
+}
+
+fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
+    let core = version.split(['-', '+']).next()?;
+    let mut components = core.split('.');
+    let major = components.next()?.parse().ok()?;
+    let minor = components.next()?.parse().ok()?;
+    let patch = components.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
 pub fn podman_socket_owner(path: &str) -> std::io::Result<HostOwner> {
@@ -200,5 +215,14 @@ mod tests {
         };
         assert!(reports_podman(&component));
         assert!(!reports_podman(&SystemVersion::default()));
+    }
+
+    #[test]
+    fn enforces_the_minimum_supported_podman_version() {
+        assert!(!is_supported_podman_version("4.2.9"));
+        assert!(is_supported_podman_version("4.3.0"));
+        assert!(is_supported_podman_version("v4.3.1-dev"));
+        assert!(is_supported_podman_version("5.6"));
+        assert!(!is_supported_podman_version("unknown"));
     }
 }

@@ -14,6 +14,34 @@ use crate::{
     shared::{backend::BackendEndpoint, limits::InstanceLimits},
 };
 
+#[test]
+fn api_connection_admission_is_per_ip_and_releases_capacity() {
+    let limiter = Arc::new(ApiConnectionLimiter::new(2));
+    let first_ip: IpAddr = "192.0.2.10".parse().unwrap();
+    let second_ip: IpAddr = "192.0.2.11".parse().unwrap();
+
+    let first = limiter.try_acquire(first_ip).unwrap();
+    let second = limiter.try_acquire(first_ip).unwrap();
+    assert!(limiter.try_acquire(first_ip).is_none());
+    let other_peer = limiter.try_acquire(second_ip).unwrap();
+
+    drop(first);
+    assert!(limiter.try_acquire(first_ip).is_some());
+    drop(second);
+    drop(other_peer);
+}
+
+#[test]
+fn api_connection_admission_normalizes_ipv4_mapped_addresses() {
+    let limiter = Arc::new(ApiConnectionLimiter::new(1));
+    let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
+    let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
+
+    let _permit = limiter.try_acquire(ipv4).unwrap();
+
+    assert!(limiter.try_acquire(mapped).is_none());
+}
+
 #[tokio::test]
 async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal() {
     let temp = tempfile::tempdir().unwrap();
@@ -123,6 +151,22 @@ fn recovery_scan_accepts_only_canonical_generated_names() {
     assert!(!is_canonical_uuid_file_name(std::ffi::OsStr::new(
         "00000000000040008000000000000001"
     )));
+}
+
+#[test]
+fn retained_valkey_recovery_manifests_are_protocol_bound() {
+    assert!(recovery_kind_matches_protocol(
+        "valkey_remote_import",
+        Protocol::Valkey
+    ));
+    assert!(!recovery_kind_matches_protocol(
+        "valkey_remote_import",
+        Protocol::Redis
+    ));
+    assert!(!recovery_kind_matches_protocol(
+        "redis_remote_import",
+        Protocol::Valkey
+    ));
 }
 
 #[test]

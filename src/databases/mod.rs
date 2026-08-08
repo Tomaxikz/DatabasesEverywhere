@@ -5,3 +5,4 @@ pub mod mysql;
 pub mod postgres;
 pub mod qdrant;
 pub mod redis;
+pub mod valkey;

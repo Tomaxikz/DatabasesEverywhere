@@ -14,7 +14,10 @@ pub(super) async fn validate_import_source(
                     "artifact import requires source.artifact_id".to_string(),
                 ));
             }
-            if matches!(target_protocol, Protocol::Redis | Protocol::Qdrant) {
+            if matches!(
+                target_protocol,
+                Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+            ) {
                 ensure_full_selection(target_protocol, &options.selection)?;
                 if options.archive_format.is_some() {
                     return Err(ApiError::BadRequest(format!(
@@ -165,6 +168,11 @@ pub(super) fn validate_selection(
         Protocol::Redis => {
             return Err(ApiError::NotImplemented(
                 "redis selective import/export requires a logical key dump format and is not implemented yet".to_string(),
+            ));
+        }
+        Protocol::Valkey => {
+            return Err(ApiError::NotImplemented(
+                "valkey selective import/export requires a logical key dump format and is not implemented yet".to_string(),
             ));
         }
         Protocol::Qdrant => {
@@ -521,6 +529,11 @@ printf '%s\n' '-- DatabasesEverywhere ClickHouse logical dump' > "$out"
                 "redis uses physical archive export".to_string(),
             ));
         }
+        Protocol::Valkey => {
+            return Err(ApiError::BadRequest(
+                "valkey uses physical archive export".to_string(),
+            ));
+        }
         Protocol::Qdrant => {
             return Err(ApiError::NotImplemented(
                 "qdrant snapshot export is not implemented yet".to_string(),
@@ -656,7 +669,7 @@ clickhouse-client \
 done
 "#
         .to_string(),
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(
                 "{} does not use the logical wipe path",
                 metadata.protocol.as_str()
@@ -814,6 +827,11 @@ clickhouse-client \
         Protocol::Redis => {
             return Err(ApiError::BadRequest(
                 "redis uses physical archive import".to_string(),
+            ));
+        }
+        Protocol::Valkey => {
+            return Err(ApiError::BadRequest(
+                "valkey uses physical archive import".to_string(),
             ));
         }
         Protocol::Qdrant => {

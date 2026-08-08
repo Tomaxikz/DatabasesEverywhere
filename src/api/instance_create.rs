@@ -246,6 +246,16 @@ async fn create_instance_from_validated_request(
                 .await
                 .map_err(|error| fail_bad_request(state, &request.instance_id, error))?;
         }
+        Protocol::Valkey => {
+            state.install_progress.stage(
+                &request.instance_id,
+                "provision",
+                "writing Valkey ACL configuration",
+            );
+            databases::valkey::provision::write_acl_file(&paths.data, &request.username, &password)
+                .await
+                .map_err(|error| fail_bad_request(state, &request.instance_id, error))?;
+        }
         Protocol::Postgres
         | Protocol::Mariadb
         | Protocol::Mysql
@@ -301,6 +311,13 @@ async fn create_instance_from_validated_request(
             paths.sockets.clone(),
         ),
         Protocol::Redis => databases::redis::docker::instance_spec(
+            &request.instance_id,
+            &image,
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Valkey => databases::valkey::docker::instance_spec(
             &request.instance_id,
             &image,
             container_data_path.clone(),
@@ -1014,6 +1031,7 @@ fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
     match protocol {
         Protocol::Postgres => &state.config.images.postgres,
         Protocol::Redis => &state.config.images.redis,
+        Protocol::Valkey => &state.config.images.valkey,
         Protocol::Mariadb => &state.config.images.mariadb,
         Protocol::Mysql => &state.config.images.mysql,
         Protocol::Mongodb => &state.config.images.mongodb,
@@ -1082,7 +1100,7 @@ async fn reject_duplicate_instance(
             metadata.protocol == request.protocol
                 && metadata.route_key_sha256.as_deref() == Some(route_key_sha256.as_str())
         }
-        Protocol::Redis => {
+        Protocol::Redis | Protocol::Valkey => {
             metadata.protocol == request.protocol && metadata.database.username == request.username
         }
     });
@@ -1311,6 +1329,7 @@ fn public_port(state: &AppState, protocol: Protocol) -> u16 {
     let bind = match protocol {
         Protocol::Postgres => &state.config.postgres.bind,
         Protocol::Redis => &state.config.redis.bind,
+        Protocol::Valkey => &state.config.valkey.bind,
         Protocol::Mariadb => &state.config.mariadb.bind,
         Protocol::Mysql => &state.config.mysql.bind,
         Protocol::Mongodb => &state.config.mongodb.bind,
@@ -1327,6 +1346,7 @@ pub(crate) fn protocol_pids_limit(state: &AppState, protocol: Protocol) -> i64 {
     match protocol {
         Protocol::Postgres => overrides.postgres,
         Protocol::Redis => overrides.redis,
+        Protocol::Valkey => overrides.valkey,
         Protocol::Mariadb => overrides.mariadb,
         Protocol::Mysql => overrides.mysql,
         Protocol::Mongodb => overrides.mongodb,

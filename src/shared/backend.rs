@@ -14,6 +14,7 @@ const POSTGRES_SOCKET_FILENAME: &str = ".s.PGSQL.5432";
 const MARIADB_SOCKET_FILENAME: &str = "mysqld.sock";
 const MYSQL_SOCKET_FILENAME: &str = "mysqld.sock";
 const REDIS_SOCKET_FILENAME: &str = "redis.sock";
+const VALKEY_SOCKET_FILENAME: &str = "valkey.sock";
 const MONGODB_SOCKET_FILENAME: &str = "mongodb-27017.sock";
 const CLICKHOUSE_NATIVE_SOCKET_FILENAME: &str = "clickhouse-native.sock";
 const CLICKHOUSE_HTTP_SOCKET_FILENAME: &str = "clickhouse-http.sock";
@@ -41,9 +42,11 @@ pub fn container_backend_socket_path(protocol: Protocol) -> String {
         Protocol::Postgres => POSTGRES_SOCKET_DIRECTORY,
         Protocol::Mariadb => MARIADB_SOCKET_DIRECTORY,
         Protocol::Mysql => MYSQL_SOCKET_DIRECTORY,
-        Protocol::Redis | Protocol::Mongodb | Protocol::Clickhouse | Protocol::Qdrant => {
-            CONTAINER_SOCKET_DIRECTORY
-        }
+        Protocol::Redis
+        | Protocol::Valkey
+        | Protocol::Mongodb
+        | Protocol::Clickhouse
+        | Protocol::Qdrant => CONTAINER_SOCKET_DIRECTORY,
     };
     format!("{directory}/{}", socket_filename(protocol))
 }
@@ -62,6 +65,7 @@ fn socket_filename(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Postgres => POSTGRES_SOCKET_FILENAME,
         Protocol::Redis => REDIS_SOCKET_FILENAME,
+        Protocol::Valkey => VALKEY_SOCKET_FILENAME,
         Protocol::Mariadb => MARIADB_SOCKET_FILENAME,
         Protocol::Mysql => MYSQL_SOCKET_FILENAME,
         Protocol::Mongodb => MONGODB_SOCKET_FILENAME,
@@ -97,6 +101,10 @@ mod tests {
         assert_eq!(
             container_backend_socket_path(Protocol::Redis),
             "/run/dbev/redis.sock"
+        );
+        assert_eq!(
+            container_backend_socket_path(Protocol::Valkey),
+            "/run/dbev/valkey.sock"
         );
     }
 

@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.7.0";
+pub const API_VERSION: &str = "0.8.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -36,6 +36,7 @@ pub struct SystemResponse {
     pub remote_import_enabled: bool,
     pub postgres_enabled: bool,
     pub redis_enabled: bool,
+    pub valkey_enabled: bool,
     pub mariadb_enabled: bool,
     pub mysql_enabled: bool,
     pub mongodb_enabled: bool,
@@ -75,6 +76,7 @@ pub async fn system(
         remote_import_enabled: state.config.security.remote_import.enabled,
         postgres_enabled: state.config.postgres.enabled,
         redis_enabled: state.config.redis.enabled,
+        valkey_enabled: state.config.valkey.enabled,
         mariadb_enabled: state.config.mariadb.enabled,
         mysql_enabled: state.config.mysql.enabled,
         mongodb_enabled: state.config.mongodb.enabled,
@@ -117,6 +119,7 @@ mod tests {
         let schemas = &document["components"]["schemas"];
         let system = &schemas["SystemResponse"];
         assert!(system["properties"]["remote_import_enabled"].is_mapping());
+        assert!(system["properties"]["valkey_enabled"].is_mapping());
         assert!(
             system["required"]
                 .as_sequence()

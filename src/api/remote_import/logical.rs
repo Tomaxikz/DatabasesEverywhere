@@ -63,7 +63,7 @@ pub(super) async fn run_helper(
         Protocol::Clickhouse => {
             prepare_clickhouse(source, selection, work_dir, connect_timeout_seconds).await?
         }
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(
                 "{} cannot be acquired as a logical dump",
                 protocol.as_str()
@@ -115,7 +115,7 @@ pub(super) fn output_names(
                     .collect()
             }
         }
-        Protocol::Redis | Protocol::Qdrant => {
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(
                 "{} cannot be acquired as a logical dump",
                 protocol.as_str()

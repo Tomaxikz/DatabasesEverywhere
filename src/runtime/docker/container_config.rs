@@ -33,6 +33,9 @@ pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
         Protocol::Redis => {
             "redis-cli -s /run/dbev/redis.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
         }
+        Protocol::Valkey => {
+            "valkey-cli -s /run/dbev/valkey.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
+        }
         Protocol::Mariadb => {
             "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" >/dev/null"
         }

@@ -131,6 +131,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_listener("mariadb", &config.mariadb, &config.tls)?;
     validate_listener("mysql", &config.mysql, &config.tls)?;
     validate_listener("redis", &config.redis, &config.tls)?;
+    validate_listener("valkey", &config.valkey, &config.tls)?;
     validate_listener("mongodb", &config.mongodb, &config.tls)?;
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
@@ -391,6 +392,7 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
     for (field, image) in [
         ("images.postgres", images.postgres.as_str()),
         ("images.redis", images.redis.as_str()),
+        ("images.valkey", images.valkey.as_str()),
         ("images.mariadb", images.mariadb.as_str()),
         ("images.mysql", images.mysql.as_str()),
         ("images.mongodb", images.mongodb.as_str()),
@@ -405,6 +407,7 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
             images.allowed.postgres.as_slice(),
         ),
         ("images.allowed.redis", images.allowed.redis.as_slice()),
+        ("images.allowed.valkey", images.allowed.valkey.as_slice()),
         ("images.allowed.mariadb", images.allowed.mariadb.as_slice()),
         ("images.allowed.mysql", images.allowed.mysql.as_slice()),
         ("images.allowed.mongodb", images.allowed.mongodb.as_slice()),
@@ -593,6 +596,7 @@ fn validate_security(
     for (field, value) in [
         ("pids_limits.postgres", security.pids_limits.postgres),
         ("pids_limits.redis", security.pids_limits.redis),
+        ("pids_limits.valkey", security.pids_limits.valkey),
         ("pids_limits.mariadb", security.pids_limits.mariadb),
         ("pids_limits.mysql", security.pids_limits.mysql),
         ("pids_limits.mongodb", security.pids_limits.mongodb),
@@ -1006,6 +1010,8 @@ mod tests {
         config.postgres.bind = "0.0.0.0:5432".to_string();
         config.mariadb.bind = "0.0.0.0:3306".to_string();
         config.redis.bind = "0.0.0.0:6379".to_string();
+        config.valkey.enabled = true;
+        config.valkey.bind = "0.0.0.0:6381".to_string();
         config.mongodb.bind = "0.0.0.0:27017".to_string();
         config.clickhouse.bind = "0.0.0.0:9000".to_string();
         config.clickhouse.http_bind = "0.0.0.0:8123".to_string();

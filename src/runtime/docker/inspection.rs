@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use bollard::{
     container::LogOutput,
+    errors::Error as BollardError,
     models::ContainerStatsResponse,
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
@@ -22,12 +23,81 @@ use crate::{
 const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl DockerRuntime {
+    /// Returns the exact protocol-qualified container name when it belongs to
+    /// the requested DBE instance. A same-name container without the complete
+    /// ownership label tuple is treated as an untrusted collision.
+    pub async fn verified_managed_container_name(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        if self
+            .verified_managed_container_id(protocol, instance_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(container))
+    }
+
+    pub(crate) async fn verified_managed_container_id(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        let response = match self.docker.inspect_container(&container, None).await {
+            Ok(response) => response,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let labels = response
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        super::verify_managed_instance_labels(
+            &labels,
+            &container,
+            protocol,
+            instance_id,
+            self.node_id.as_deref(),
+        )?;
+        let id = response
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| DockerError::ManagedContainerIdUnavailable {
+                container: container.clone(),
+            })?;
+        Ok(Some(id))
+    }
+
+    pub(super) async fn required_managed_container_id(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<String, DockerError> {
+        self.verified_managed_container_id(protocol, instance_id)
+            .await?
+            .ok_or_else(|| DockerError::ManagedContainerNotFound {
+                instance_id: instance_id.to_string(),
+                protocol: protocol.as_str().to_string(),
+            })
+    }
+
     pub async fn inspect_instance(
         &self,
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<DockerInstanceInspection, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let response = self.docker.inspect_container(&name, None).await?;
         let state = response.state;
         let health = state
@@ -144,7 +214,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let response = self.docker.inspect_container(&name, None).await?;
         Ok(response
             .config
@@ -158,7 +230,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let response = self.docker.inspect_container(&name, None).await?;
         Ok(response
             .config
@@ -173,7 +247,9 @@ impl DockerRuntime {
         instance_id: &str,
         tail: Option<usize>,
     ) -> Result<CommandOutput, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let tail = tail.unwrap_or(200).clamp(1, 2_000).to_string();
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -203,13 +279,15 @@ impl DockerRuntime {
         Ok(CommandOutput { stdout, stderr })
     }
 
-    pub fn follow_logs(
+    pub async fn follow_logs(
         &self,
         protocol: Protocol,
         instance_id: &str,
         tail: Option<usize>,
     ) -> Result<mpsc::Receiver<Result<CommandOutput, DockerError>>, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let docker = self.docker.clone();
         let tail = tail.unwrap_or(100).clamp(1, 2_000).to_string();
         let (tx, rx) = mpsc::channel(128);
@@ -257,7 +335,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<ContainerStatsResponse, DockerError> {
-        let name = self.container_name(protocol, instance_id)?;
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
         let mut stream = self.docker.stats(
             &name,
             Some(

@@ -217,7 +217,10 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
         if identity.schema_version != 1
             || !matches!(
                 identity.recovery_kind.as_str(),
-                "logical_remote_import" | "redis_remote_import" | "qdrant_remote_import"
+                "logical_remote_import"
+                    | "redis_remote_import"
+                    | "valkey_remote_import"
+                    | "qdrant_remote_import"
             )
         {
             anyhow::bail!(
@@ -412,8 +415,12 @@ pub(super) fn is_canonical_uuid(value: &str) -> bool {
 
 pub(super) fn recovery_kind_matches_protocol(kind: &str, protocol: Protocol) -> bool {
     match kind {
-        "logical_remote_import" => !matches!(protocol, Protocol::Redis | Protocol::Qdrant),
+        "logical_remote_import" => !matches!(
+            protocol,
+            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+        ),
         "redis_remote_import" => protocol == Protocol::Redis,
+        "valkey_remote_import" => protocol == Protocol::Valkey,
         "qdrant_remote_import" => protocol == Protocol::Qdrant,
         _ => false,
     }

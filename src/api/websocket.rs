@@ -406,6 +406,7 @@ async fn stream_logs(
     let mut logs = match state
         .docker
         .follow_logs(metadata.protocol, &metadata.instance_id, tail)
+        .await
     {
         Ok(logs) => logs,
         Err(error) => {

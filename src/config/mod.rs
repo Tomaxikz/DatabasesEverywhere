@@ -22,6 +22,7 @@ pub struct Config {
     pub mariadb: ListenerConfig,
     pub mysql: ListenerConfig,
     pub redis: ListenerConfig,
+    pub valkey: ListenerConfig,
     pub mongodb: ListenerConfig,
     pub clickhouse: ClickhouseConfig,
     pub qdrant: ListenerConfig,
@@ -50,6 +51,7 @@ impl Default for Config {
             mariadb: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::MARIADB)),
             mysql: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MYSQL)),
             redis: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::REDIS)),
+            valkey: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::VALKEY)),
             mongodb: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MONGODB)),
             clickhouse: ClickhouseConfig::disabled(
                 format!("127.0.0.1:{}", ports::CLICKHOUSE),
@@ -367,6 +369,7 @@ impl Default for RemoteImportSecurityConfig {
 pub struct PidsLimitConfig {
     pub postgres: Option<i64>,
     pub redis: Option<i64>,
+    pub valkey: Option<i64>,
     pub mariadb: Option<i64>,
     pub mysql: Option<i64>,
     pub mongodb: Option<i64>,
@@ -379,6 +382,7 @@ impl Default for PidsLimitConfig {
         Self {
             postgres: None,
             redis: None,
+            valkey: None,
             mariadb: None,
             mysql: None,
             mongodb: None,
@@ -831,6 +835,7 @@ impl DiskLimitMode {
 pub struct ImageConfig {
     pub postgres: String,
     pub redis: String,
+    pub valkey: String,
     pub mariadb: String,
     pub mysql: String,
     pub mongodb: String,
@@ -844,6 +849,7 @@ impl Default for ImageConfig {
         Self {
             postgres: "postgres:18.4".to_string(),
             redis: "redis:8.8.0".to_string(),
+            valkey: "valkey/valkey:9.1.1".to_string(),
             mariadb: "mariadb:12.3.2".to_string(),
             mysql: "mysql:8.4".to_string(),
             mongodb: "mongo:7.0.37".to_string(),
@@ -859,6 +865,7 @@ impl Default for ImageConfig {
 pub struct ImageAllowlistConfig {
     pub postgres: Vec<String>,
     pub redis: Vec<String>,
+    pub valkey: Vec<String>,
     pub mariadb: Vec<String>,
     pub mysql: Vec<String>,
     pub mongodb: Vec<String>,
@@ -871,6 +878,7 @@ impl ImageConfig {
         match protocol {
             crate::shared::protocol::Protocol::Postgres => &self.postgres,
             crate::shared::protocol::Protocol::Redis => &self.redis,
+            crate::shared::protocol::Protocol::Valkey => &self.valkey,
             crate::shared::protocol::Protocol::Mariadb => &self.mariadb,
             crate::shared::protocol::Protocol::Mysql => &self.mysql,
             crate::shared::protocol::Protocol::Mongodb => &self.mongodb,
@@ -884,6 +892,7 @@ impl ImageConfig {
         let mut allowed = match protocol {
             crate::shared::protocol::Protocol::Postgres => self.allowed.postgres.iter(),
             crate::shared::protocol::Protocol::Redis => self.allowed.redis.iter(),
+            crate::shared::protocol::Protocol::Valkey => self.allowed.valkey.iter(),
             crate::shared::protocol::Protocol::Mariadb => self.allowed.mariadb.iter(),
             crate::shared::protocol::Protocol::Mysql => self.allowed.mysql.iter(),
             crate::shared::protocol::Protocol::Mongodb => self.allowed.mongodb.iter(),
