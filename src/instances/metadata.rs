@@ -14,6 +14,14 @@ pub struct InstanceMetadata {
     pub instance_id: String,
     pub protocol: Protocol,
     pub status: InstanceStatus,
+    /// Durable operator intent, kept separate from the observed runtime status.
+    ///
+    /// This is loaded from the normalized SQLite column by `InstanceRepository`
+    /// and deliberately omitted from API JSON to preserve the public response
+    /// shape. Runtime reconciliation may change `status`, but must never infer or
+    /// overwrite this value from a transient container state.
+    #[serde(skip)]
+    pub(crate) desired_state: DesiredInstanceState,
     pub public: PublicEndpoint,
     pub backend: BackendEndpoint,
     pub runtime: RuntimeMetadata,
@@ -30,6 +38,11 @@ pub struct InstanceMetadata {
     pub mysql_root_password: Option<String>,
     #[serde(default, skip_serializing)]
     pub mongodb_root_password: Option<String>,
+    /// Current tenant credential used only for daemon-managed maintenance and
+    /// rollback. The repository encrypts it separately from public metadata,
+    /// and API serialization always omits it.
+    #[serde(default, skip_serializing)]
+    pub tenant_password: Option<String>,
     pub limits: InstanceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<InstanceImageStatus>,
@@ -37,6 +50,30 @@ pub struct InstanceMetadata {
     pub database_version: Option<InstanceDatabaseVersion>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DesiredInstanceState {
+    #[default]
+    Running,
+    Stopped,
+}
+
+impl DesiredInstanceState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "stopped" => Some(Self::Stopped),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

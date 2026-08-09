@@ -101,12 +101,79 @@ async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal(
     );
 }
 
+#[tokio::test]
+async fn retained_physical_restore_workspace_quarantines_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(&temp.path().join("metadata"))
+        .await
+        .unwrap();
+    let repository = InstanceRepository::new(pool);
+    let manager = InstanceManager::new(InstanceStore::default(), repository.clone());
+    manager.upsert(recovery_test_metadata()).await.unwrap();
+
+    let volumes = temp.path().join("volumes");
+    tokio::fs::create_dir_all(
+        volumes
+            .join(".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001/previous-data"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        quarantine_retained_physical_restore_workspaces(&manager, &volumes)
+            .await
+            .unwrap(),
+        1
+    );
+    let reloaded = InstanceManager::new(InstanceStore::default(), repository);
+    reloaded.load_from_storage().await.unwrap();
+    let metadata = reloaded.store().get("inst_recovery").await.unwrap();
+    assert_eq!(metadata.status, InstanceStatus::Quarantined);
+    assert_eq!(
+        metadata.desired_state,
+        crate::instances::metadata::DesiredInstanceState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn physical_restore_recovery_scan_does_not_follow_workspace_symlinks() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(&temp.path().join("metadata"))
+        .await
+        .unwrap();
+    let repository = InstanceRepository::new(pool);
+    let manager = InstanceManager::new(InstanceStore::default(), repository);
+    manager.upsert(recovery_test_metadata()).await.unwrap();
+
+    let volumes = temp.path().join("volumes");
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(&volumes).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    symlink(
+        &elsewhere,
+        volumes.join(".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        quarantine_retained_physical_restore_workspaces(&manager, &volumes)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        manager.store().get("inst_recovery").await.unwrap().status,
+        InstanceStatus::Running
+    );
+}
+
 fn recovery_test_metadata() -> InstanceMetadata {
     InstanceMetadata {
         schema_version: SCHEMA_VERSION,
         instance_id: "inst_recovery".to_string(),
         protocol: Protocol::Postgres,
         status: InstanceStatus::Running,
+        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
         public: PublicEndpoint {
             host: "db.example.com".to_string(),
             port: 5433,
@@ -129,12 +196,26 @@ fn recovery_test_metadata() -> InstanceMetadata {
         mysql_native_password_sha1_stage2: None,
         mysql_root_password: None,
         mongodb_root_password: None,
+        tenant_password: None,
         limits: InstanceLimits::default(),
         image: None,
         database_version: None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     }
+}
+
+#[tokio::test]
+async fn desired_stopped_instances_are_never_published_to_gateways() {
+    let store = InstanceStore::default();
+    let mut metadata = recovery_test_metadata();
+    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+    store.upsert(metadata.clone()).await;
+    assert!(store.resolve_postgres("app", "app_db").await.is_none());
+
+    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Running;
+    store.upsert(metadata).await;
+    assert!(store.resolve_postgres("app", "app_db").await.is_some());
 }
 
 #[test]
@@ -151,6 +232,19 @@ fn recovery_scan_accepts_only_canonical_generated_names() {
     assert!(!is_canonical_uuid_file_name(std::ffi::OsStr::new(
         "00000000000040008000000000000001"
     )));
+    assert_eq!(
+        physical_restore_workspace_instance_id(std::ffi::OsStr::new(
+            ".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001"
+        ))
+        .as_deref(),
+        Some("inst_recovery")
+    );
+    assert!(
+        physical_restore_workspace_instance_id(std::ffi::OsStr::new(
+            ".dbe-restore-inst_recovery-not-a-uuid"
+        ))
+        .is_none()
+    );
 }
 
 #[test]
@@ -171,16 +265,32 @@ fn retained_valkey_recovery_manifests_are_protocol_bound() {
 
 #[test]
 fn daemon_boot_preserves_running_containers() {
-    assert_eq!(managed_boot_action(InstanceStatus::Running), None);
+    use crate::instances::metadata::DesiredInstanceState;
+
     assert_eq!(
-        managed_boot_action(InstanceStatus::Failed),
+        managed_boot_action(InstanceStatus::Running, DesiredInstanceState::Running),
+        None
+    );
+    assert_eq!(
+        managed_boot_action(InstanceStatus::Failed, DesiredInstanceState::Running),
         Some(ManagedBootAction::Restart)
     );
     assert_eq!(
-        managed_boot_action(InstanceStatus::Stopped),
+        managed_boot_action(InstanceStatus::Stopped, DesiredInstanceState::Running),
         Some(ManagedBootAction::Start)
     );
-    assert_eq!(managed_boot_action(InstanceStatus::Booting), None);
+    assert_eq!(
+        managed_boot_action(InstanceStatus::Stopped, DesiredInstanceState::Stopped),
+        None
+    );
+    assert_eq!(
+        managed_boot_action(InstanceStatus::Failed, DesiredInstanceState::Stopped),
+        None
+    );
+    assert_eq!(
+        managed_boot_action(InstanceStatus::Booting, DesiredInstanceState::Running),
+        None
+    );
 }
 
 #[test]

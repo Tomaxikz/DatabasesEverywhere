@@ -640,6 +640,7 @@ async fn create_instance_from_validated_request(
         instance_id: request.instance_id,
         protocol: request.protocol,
         status: InstanceStatus::Running,
+        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
         public: PublicEndpoint {
             host: request.public_host,
             port: request
@@ -665,6 +666,7 @@ async fn create_instance_from_validated_request(
             .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
         mysql_root_password,
         mongodb_root_password,
+        tenant_password: Some(request.password),
         limits,
         image: None,
         database_version: None,

@@ -455,13 +455,14 @@ fn test_runtime_with_engine(
     engine: crate::config::DaemonEngine,
     socket_path: &str,
 ) -> DockerRuntime {
-    DockerRuntime::with_client(
-        Docker::connect_with_local_defaults().unwrap(),
+    let mut config = crate::config::DaemonConfig {
         engine,
-        socket_path,
-        true,
-        DockerSecurityPolicy::default(),
-    )
+        ..Default::default()
+    };
+    if socket_path != "auto" {
+        config.socket_path = socket_path.to_string();
+    }
+    DockerRuntime::offline_for_tests(&config, true)
 }
 
 fn postgres_spec() -> DockerInstanceSpec {

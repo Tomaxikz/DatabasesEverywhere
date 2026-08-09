@@ -149,6 +149,7 @@ pub(super) async fn quarantine_interrupted_job_instances(
             continue;
         };
         metadata.status = InstanceStatus::Quarantined;
+        metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
         metadata.updated_at = crate::jobs::import_export::now_rfc3339();
         manager
             .upsert(metadata.clone())
@@ -163,6 +164,114 @@ pub(super) async fn quarantine_interrupted_job_instances(
         );
     }
     Ok(quarantined)
+}
+
+pub(super) async fn quarantine_retained_physical_restore_workspaces(
+    manager: &InstanceManager,
+    volumes_root: &Path,
+) -> anyhow::Result<usize> {
+    const MAX_SCANNED_ENTRIES: usize = 4096;
+
+    let mut entries = match tokio::fs::read_dir(volumes_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to scan physical restore workspaces below {}",
+                    volumes_root.display()
+                )
+            });
+        }
+    };
+    let mut scanned = 0_usize;
+    let mut quarantined = 0_usize;
+    let mut seen_instances = std::collections::HashSet::new();
+    while let Some(entry) = entries.next_entry().await.with_context(|| {
+        format!(
+            "failed while scanning physical restore workspaces below {}",
+            volumes_root.display()
+        )
+    })? {
+        scanned += 1;
+        if scanned > MAX_SCANNED_ENTRIES {
+            anyhow::bail!(
+                "volumes root {} exceeds the {}-entry physical restore recovery scan safety limit",
+                volumes_root.display(),
+                MAX_SCANNED_ENTRIES
+            );
+        }
+        let Some(instance_id) = physical_restore_workspace_instance_id(&entry.file_name()) else {
+            continue;
+        };
+        let file_type = entry.file_type().await.with_context(|| {
+            format!(
+                "failed to inspect physical restore workspace {}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            tracing::warn!(
+                event = "audit unsafe_physical_restore_workspace_ignored",
+                path = %entry.path().display(),
+                %instance_id,
+                "ignored a generated physical restore workspace name that is not a real directory"
+            );
+            continue;
+        }
+        if !seen_instances.insert(instance_id.clone()) {
+            continue;
+        }
+        tracing::error!(
+            event = "audit retained_physical_restore_workspace",
+            path = %entry.path().display(),
+            %instance_id,
+            "an interrupted physical restore left rollback state beside the instance volume; quarantining its target"
+        );
+        let Some(mut instance) = manager.store().get(&instance_id).await else {
+            tracing::warn!(
+                path = %entry.path().display(),
+                %instance_id,
+                "physical restore workspace references missing instance metadata"
+            );
+            continue;
+        };
+        let already_safe = instance.status == InstanceStatus::Quarantined
+            && instance.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped;
+        if already_safe {
+            continue;
+        }
+        instance.status = InstanceStatus::Quarantined;
+        instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        instance.updated_at = crate::jobs::import_export::now_rfc3339();
+        manager.upsert(instance).await.with_context(|| {
+            format!("failed to persist physical restore recovery quarantine for {instance_id}")
+        })?;
+        quarantined += 1;
+    }
+    Ok(quarantined)
+}
+
+pub(super) fn physical_restore_workspace_instance_id(name: &std::ffi::OsStr) -> Option<String> {
+    const PREFIX: &str = ".dbe-restore-";
+    const UUID_LENGTH: usize = 36;
+
+    let name = name.to_str()?;
+    let value = name.strip_prefix(PREFIX)?;
+    if value.len() <= UUID_LENGTH
+        || value.as_bytes().get(value.len() - UUID_LENGTH - 1) != Some(&b'-')
+    {
+        return None;
+    }
+    let split = value.len() - UUID_LENGTH - 1;
+    let instance_id = &value[..split];
+    let uuid = &value[split + 1..];
+    let parsed = uuid::Uuid::parse_str(uuid).ok()?;
+    if parsed.hyphenated().to_string() != uuid {
+        return None;
+    }
+    crate::shared::ids::validate_instance_id(instance_id).ok()?;
+    Some(instance_id.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +379,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
         }
         if instance.status != InstanceStatus::Quarantined {
             instance.status = InstanceStatus::Quarantined;
+            instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
             instance.updated_at = crate::jobs::import_export::now_rfc3339();
             manager.upsert(instance).await.with_context(|| {
                 format!(

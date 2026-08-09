@@ -57,8 +57,9 @@ use crate::{
     disk::DiskLimiter,
     instances::paths::InstancePaths,
     instances::{
-        metadata::InstanceDatabaseVersion, metadata::InstanceImageStatus,
-        metadata::InstanceMetadata, metadata::InstanceStatus, reconcile,
+        metadata::DesiredInstanceState, metadata::InstanceDatabaseVersion,
+        metadata::InstanceImageStatus, metadata::InstanceMetadata, metadata::InstanceStatus,
+        reconcile,
     },
     runtime::docker::{
         DockerContainerStatus, DockerError, DockerInstanceInspection, DockerInstanceSpec,
@@ -139,6 +140,12 @@ pub async fn update_instance_image(
                 .to_string(),
         ));
     }
+    if metadata.desired_state == DesiredInstanceState::Stopped {
+        return Err(ApiError::Conflict(
+            "stopped instances cannot be updated in place; start the instance before updating its image"
+                .to_string(),
+        ));
+    }
     ensure_image_allowed(&state, metadata.protocol, &image)?;
     let current_image = state
         .docker
@@ -206,13 +213,19 @@ pub async fn update_instance_image(
     let container_data_path = disk_limiter
         .container_data_path(&paths.data)
         .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
-    let requested_password = request.password.clone();
+    // The encrypted credential is authoritative once present. The optional
+    // request field remains a compatibility fallback for legacy metadata that
+    // predates encrypted tenant credential storage.
+    let effective_password = metadata
+        .tenant_password
+        .clone()
+        .or_else(|| request.password.clone());
     let mut spec = instance_image_update_spec(
         &metadata,
         &paths,
         container_data_path,
         &image,
-        request.password.map(SecretString::from),
+        effective_password.clone().map(SecretString::from),
         protocol_pids_limit(&state, metadata.protocol),
     )
     .await
@@ -272,7 +285,7 @@ pub async fn update_instance_image(
         .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     }
     if metadata.protocol == Protocol::Mariadb {
-        let password = requested_password.as_deref().ok_or_else(|| {
+        let password = effective_password.as_deref().ok_or_else(|| {
             fail_image_update_api(
                 &state,
                 &metadata.instance_id,
@@ -307,7 +320,7 @@ pub async fn update_instance_image(
         .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     }
     if metadata.protocol == Protocol::Mysql {
-        let password = requested_password.as_deref().ok_or_else(|| {
+        let password = effective_password.as_deref().ok_or_else(|| {
             fail_image_update_api(
                 &state,
                 &metadata.instance_id,
@@ -350,18 +363,21 @@ pub async fn update_instance_image(
         backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)
             .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     if metadata.protocol == Protocol::Mariadb
-        && let Some(password) = requested_password.as_deref()
+        && let Some(password) = effective_password.as_deref()
     {
         metadata.mariadb_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
         );
     }
     if metadata.protocol == Protocol::Mysql
-        && let Some(password) = requested_password.as_deref()
+        && let Some(password) = effective_password.as_deref()
     {
         metadata.mysql_native_password_sha1_stage2 = Some(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
         );
+    }
+    if effective_password.is_some() {
+        metadata.tenant_password = effective_password;
     }
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
@@ -418,6 +434,7 @@ pub async fn delete_instance(
     )?;
 
     metadata.status = deletion_status(metadata.status);
+    metadata.desired_state = DesiredInstanceState::Stopped;
     metadata.updated_at = now_rfc3339();
     state
         .manager
@@ -690,6 +707,32 @@ pub(crate) async fn lifecycle_instance(
     action: LifecycleAction,
 ) -> ApiResult<InstanceMetadata> {
     let _operation = state.instance_locks.lock(instance_id).await;
+    let mut metadata = state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    if metadata.status == InstanceStatus::Quarantined
+        && matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
+    {
+        return Err(ApiError::Conflict(
+            "instance is quarantined for fail-closed safety; inspect job history and logs, then repair, recover, or delete it before attempting to start it"
+                .to_string(),
+        ));
+    }
+    let desired_state = match action {
+        LifecycleAction::Start | LifecycleAction::Restart => DesiredInstanceState::Running,
+        LifecycleAction::Stop | LifecycleAction::Kill => DesiredInstanceState::Stopped,
+    };
+    if metadata.desired_state != desired_state {
+        metadata.desired_state = desired_state;
+        metadata.updated_at = now_rfc3339();
+        state.manager.upsert(metadata).await.map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to persist requested lifecycle state before applying it: {error}"
+            ))
+        })?;
+    }
     lifecycle_instance_locked(state, instance_id, action).await
 }
 

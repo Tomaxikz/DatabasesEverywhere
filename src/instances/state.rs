@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::RwLock;
 
-use super::metadata::{InstanceMetadata, InstanceStatus};
+use super::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
 use crate::shared::{backend::BackendEndpoint, protocol::Protocol};
 
 #[derive(Debug, Clone)]
@@ -190,7 +190,9 @@ impl InstanceState {
 
     fn upsert(&mut self, metadata: InstanceMetadata) {
         self.remove_routes_for(&metadata.instance_id);
-        if metadata.status != InstanceStatus::Running {
+        if metadata.status != InstanceStatus::Running
+            || metadata.desired_state != DesiredInstanceState::Running
+        {
             self.instances
                 .insert(metadata.instance_id.clone(), metadata);
             return;

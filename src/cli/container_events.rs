@@ -171,6 +171,29 @@ pub(super) async fn reconcile_managed_container_state(
         return Ok(());
     }
 
+    if metadata.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped {
+        let previous_status = metadata.status;
+        let reconciled = reconcile::reconcile_one(metadata, &state.docker).await;
+        let current_status = reconciled.status;
+        state.manager.upsert(reconciled.clone()).await?;
+        state
+            .instance_runtime_cache
+            .remove(&reconciled.instance_id)
+            .await;
+        state.resource_cache.remove(&reconciled.instance_id).await;
+        if let Some(event) = event {
+            tracing::info!(
+                instance_id = %reconciled.instance_id,
+                protocol = %reconciled.protocol,
+                action = event.action.as_str(),
+                previous_status = previous_status.as_str(),
+                current_status = current_status.as_str(),
+                "enforced durable stopped state after a managed container lifecycle event"
+            );
+        }
+        return Ok(());
+    }
+
     let previous_status = metadata.status;
     let activation_readiness_error = if event.as_ref().is_some_and(|event| {
         event.action.activates_container() && previous_status != InstanceStatus::Running

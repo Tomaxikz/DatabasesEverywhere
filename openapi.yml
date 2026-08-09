@@ -715,7 +715,7 @@ components:
           minLength: 1
           maxLength: 4096
           pattern: '^[^\u0000\r\n]+$'
-          description: New tenant database password or, for Qdrant, API key. It is applied to the database and replacement container but is never returned or stored in instance metadata.
+          description: New tenant database password or, for Qdrant, API key. It is never returned; DBE stores it only in its encrypted private credential repository for rollback and future managed recreation.
     ResetInstancePasswordResponse:
       type: object
       additionalProperties: false
@@ -725,8 +725,7 @@ components:
           $ref: "#/components/schemas/Instance"
         restarted:
           type: boolean
-          const: true
-          description: Credential rotation recreates the managed container on its existing data volume.
+          description: True only when immutable startup credentials require container recreation (ClickHouse, Qdrant, and one-time migration of legacy Redis/Valkey instances without a stored encrypted credential); false for native in-place rotation.
     UpdateInstanceImageRequest:
       type: object
       additionalProperties: false
@@ -739,7 +738,7 @@ components:
         password:
           type: [string, "null"]
           format: password
-          description: Current tenant database password. Required for most protocols so DBE can recreate users after the container is rebuilt. Redis and Valkey do not require it.
+          description: Current tenant database password. Used only as a compatibility fallback for legacy instances that predate encrypted tenant credential storage; current instances use their protected stored credential.
         major_upgrade:
           type: boolean
           default: false

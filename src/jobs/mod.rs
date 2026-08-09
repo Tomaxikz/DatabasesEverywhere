@@ -217,6 +217,10 @@ pub mod import_export {
             self.accepting.load(Ordering::Acquire)
         }
 
+        pub fn active_count(&self) -> usize {
+            self.active_jobs.load(Ordering::Acquire)
+        }
+
         pub fn close_admission(&self) {
             let _admitted = lock_unpoisoned(&self.admitted_by_instance);
             self.accepting.store(false, Ordering::Release);

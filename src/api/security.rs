@@ -16,7 +16,7 @@ use axum::{
     response::Response,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     api::{api_response::ApiError, routes::AppState, security_policy::websocket_token},
@@ -37,6 +37,7 @@ pub struct ApiRateLimiter {
     inner: Arc<[Mutex<RateLimitShard>; API_RATE_LIMIT_SHARDS]>,
     consumed_websocket_jtis: Arc<Mutex<HashMap<String, i64>>>,
     active_websockets: Arc<Semaphore>,
+    websocket_drain: Arc<Notify>,
     active_requests: Arc<Semaphore>,
     request_capacity_logged: Arc<AtomicBool>,
     max_requests: u32,
@@ -56,6 +57,7 @@ impl ApiRateLimiter {
             })),
             consumed_websocket_jtis: Arc::default(),
             active_websockets: Arc::new(Semaphore::new(MAX_ACTIVE_WEBSOCKETS)),
+            websocket_drain: Arc::default(),
             active_requests: Arc::new(Semaphore::new(MAX_ACTIVE_API_REQUESTS)),
             request_capacity_logged: Arc::new(AtomicBool::new(false)),
             max_requests: max_requests.max(1),
@@ -70,6 +72,10 @@ impl ApiRateLimiter {
         let connection = Arc::clone(&self.active_websockets)
             .try_acquire_owned()
             .map_err(|_| WebSocketAdmissionError::ConnectionCapacity)?;
+        let connection = WebSocketConnectionPermit {
+            _connection: connection,
+            drain_notify: Arc::clone(&self.websocket_drain),
+        };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if expires_at <= now {
             return Err(WebSocketAdmissionError::Expired);
@@ -84,9 +90,7 @@ impl ApiRateLimiter {
             return Err(WebSocketAdmissionError::TokenCapacity);
         }
         consumed.insert(jti.to_string(), expires_at);
-        Ok(WebSocketConnectionPermit {
-            _connection: connection,
-        })
+        Ok(connection)
     }
 
     fn admit_request(&self) -> Result<ApiRequestPermit, ApiError> {
@@ -166,11 +170,39 @@ impl ApiRateLimiter {
             RateLimitDecision::Rejected { should_log }
         }
     }
+
+    pub(crate) fn active_websocket_count(&self) -> usize {
+        MAX_ACTIVE_WEBSOCKETS.saturating_sub(self.active_websockets.available_permits())
+    }
+
+    pub(crate) fn active_request_count(&self) -> usize {
+        MAX_ACTIVE_API_REQUESTS.saturating_sub(self.active_requests.available_permits())
+    }
+
+    pub(crate) async fn wait_for_websocket_drain(&self, deadline: Duration) -> bool {
+        let drained = async {
+            loop {
+                let notified = self.websocket_drain.notified();
+                if self.active_websocket_count() == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(deadline, drained).await.is_ok()
+    }
 }
 
 #[derive(Debug)]
 pub struct WebSocketConnectionPermit {
     _connection: OwnedSemaphorePermit,
+    drain_notify: Arc<Notify>,
+}
+
+impl Drop for WebSocketConnectionPermit {
+    fn drop(&mut self) {
+        self.drain_notify.notify_waiters();
+    }
 }
 
 #[derive(Debug)]
@@ -670,6 +702,28 @@ mod tests {
                 .unwrap_err(),
             WebSocketAdmissionError::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_connections_are_counted_and_can_be_drained() {
+        let limiter = ApiRateLimiter::default();
+        let expiration = time::OffsetDateTime::now_utc().unix_timestamp() + 60;
+        let permit = limiter
+            .admit_websocket("drainable-jti", expiration)
+            .await
+            .unwrap();
+        assert_eq!(limiter.active_websocket_count(), 1);
+
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(permit);
+        });
+        assert!(
+            limiter
+                .wait_for_websocket_drain(Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(limiter.active_websocket_count(), 0);
     }
 
     #[test]

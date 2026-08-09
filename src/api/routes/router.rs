@@ -1,12 +1,22 @@
-use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    ops::Deref,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
-    middleware,
+    extract::{DefaultBodyLimit, Request, State},
+    http::Method,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::{
@@ -75,22 +85,87 @@ impl Deref for AppState {
 #[derive(Debug, Clone)]
 pub struct DaemonShutdown {
     sender: watch::Sender<bool>,
+    accepting_mutations: Arc<AtomicBool>,
+    active_mutations: Arc<AtomicUsize>,
+    mutation_drain: Arc<Notify>,
+}
+
+#[derive(Debug)]
+struct MutationPermit {
+    active: Arc<AtomicUsize>,
+    drain: Arc<Notify>,
 }
 
 impl Default for DaemonShutdown {
     fn default() -> Self {
         let (sender, _) = watch::channel(false);
-        Self { sender }
+        Self {
+            sender,
+            accepting_mutations: Arc::new(AtomicBool::new(true)),
+            active_mutations: Arc::default(),
+            mutation_drain: Arc::default(),
+        }
     }
 }
 
 impl DaemonShutdown {
     pub fn trigger(&self) {
+        self.accepting_mutations.store(false, Ordering::Release);
         self.sender.send_replace(true);
     }
 
     pub fn subscribe(&self) -> watch::Receiver<bool> {
         self.sender.subscribe()
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    fn try_admit_mutation(&self) -> Option<MutationPermit> {
+        if !self.accepting_mutations.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_mutations.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting_mutations.load(Ordering::Acquire) {
+            release_mutation(&self.active_mutations, &self.mutation_drain);
+            return None;
+        }
+        Some(MutationPermit {
+            active: Arc::clone(&self.active_mutations),
+            drain: Arc::clone(&self.mutation_drain),
+        })
+    }
+
+    pub fn active_mutation_count(&self) -> usize {
+        self.active_mutations.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_mutation_drain(&self, deadline: Duration) -> bool {
+        let drained = async {
+            loop {
+                let notified = self.mutation_drain.notified();
+                if self.active_mutation_count() == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(deadline, drained).await.is_ok()
+    }
+}
+
+impl Drop for MutationPermit {
+    fn drop(&mut self) {
+        release_mutation(&self.active, &self.drain);
+    }
+}
+
+fn release_mutation(active: &AtomicUsize, drain: &Notify) {
+    let previous = active.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "active API mutation count underflow");
+    if previous == 1 {
+        drain.notify_waiters();
     }
 }
 
@@ -113,6 +188,10 @@ pub fn build_router(state: AppState) -> Router {
             state.config.security.api_body_limit_bytes,
         ))
         .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(60)))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_mutating_request,
+        ))
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -127,6 +206,26 @@ pub fn build_router(state: AppState) -> Router {
             crate::api::security::rate_limit,
         ))
         .with_state(state)
+}
+
+async fn track_mutating_request(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !matches!(
+        request.method(),
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    ) {
+        return next.run(request).await;
+    }
+    let Some(_mutation) = state.daemon_shutdown.try_admit_mutation() else {
+        return crate::api::api_response::ApiError::ServiceUnavailable(
+            "daemon shutdown is in progress".to_string(),
+        )
+        .into_response();
+    };
+    next.run(request).await
 }
 
 fn system_routes() -> Router<AppState> {
@@ -412,6 +511,26 @@ mod tests {
         assert_eq!(json_body(response).await["code"], "bad_request");
     }
 
+    #[tokio::test]
+    async fn shutdown_closes_mutation_admission_and_drains_existing_work() {
+        let shutdown = DaemonShutdown::default();
+        let mutation = shutdown.try_admit_mutation().unwrap();
+        assert_eq!(shutdown.active_mutation_count(), 1);
+        shutdown.trigger();
+        assert!(shutdown.try_admit_mutation().is_none());
+
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(mutation);
+        });
+        assert!(
+            shutdown
+                .wait_for_mutation_drain(Duration::from_secs(1))
+                .await
+        );
+        assert_eq!(shutdown.active_mutation_count(), 0);
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -437,7 +556,7 @@ mod tests {
             instances,
             manager,
             instance_locks: crate::instances::locks::InstanceLocks::default(),
-            docker: DockerRuntime::new(&Default::default(), false).unwrap(),
+            docker: DockerRuntime::offline_for_tests(&Default::default(), false),
             import_export_jobs: ImportExportJobs::default(),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),

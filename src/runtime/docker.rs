@@ -28,9 +28,7 @@ use std::{
 
 use bollard::{
     Docker, body_try_stream,
-    container::LogOutput,
     errors::Error as BollardError,
-    exec::{CreateExecOptions, StartExecOptions, StartExecResults},
     models::{ContainerCreateBody, ContainerUpdateBody, HostConfig, SystemInfoCgroupVersionEnum},
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
@@ -55,18 +53,13 @@ use crate::{
         backend::SOCKET_BRIDGE_CONTAINER_PATH,
         ids::sanitize_docker_suffix,
         limits::{ResourceLimitError, validate_runtime_limits},
-        logs::truncate_log_tail,
         ownership::HostOwner,
         protocol::Protocol,
-        redaction,
     },
 };
 
 const MAX_CONTAINER_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL: usize = 1024 * 1024;
-const DOCKER_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const DOCKER_EXEC_RECOVERY_STEP_TIMEOUT: Duration = Duration::from_secs(30);
-const DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const EXEC_OUTPUT_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\n";
 
@@ -133,6 +126,21 @@ impl DockerRuntime {
             cgroup_version: None,
             node_id: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests(config: &DaemonConfig, enforce_disk_limits: bool) -> Self {
+        let connection = DaemonEngineConnection::from_config(config);
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("the fixed offline Docker test endpoint must be a valid HTTP URL");
+        Self::with_client(
+            docker,
+            connection.engine,
+            connection.socket_path_for_logs(),
+            enforce_disk_limits,
+            DockerSecurityPolicy::from_config_for_engine(config, connection.engine),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -705,273 +713,6 @@ impl DockerRuntime {
         Ok(CommandOutput::empty())
     }
 
-    pub async fn exec(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        command: Vec<String>,
-    ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_failure_logging(protocol, instance_id, command, true, DOCKER_EXEC_TIMEOUT)
-            .await
-    }
-
-    pub async fn exec_with_timeout(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        command: Vec<String>,
-        timeout: Duration,
-    ) -> Result<CommandOutput, DockerError> {
-        if timeout.is_zero() {
-            return Err(DockerError::InvalidExecTimeout);
-        }
-        self.exec_with_failure_logging(protocol, instance_id, command, true, timeout)
-            .await
-    }
-
-    pub(crate) async fn exec_readiness_probe(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        script: &str,
-    ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_failure_logging(
-            protocol,
-            instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-            false,
-            DOCKER_EXEC_TIMEOUT,
-        )
-        .await
-    }
-
-    async fn exec_with_failure_logging(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        command: Vec<String>,
-        log_failure: bool,
-        timeout: Duration,
-    ) -> Result<CommandOutput, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
-            .await?;
-        let operation = command
-            .first()
-            .map(|program| format!("{program} [arguments redacted]"))
-            .unwrap_or_else(|| "[empty command]".to_string());
-        let exec = self
-            .docker
-            .create_exec(
-                &name,
-                CreateExecOptions {
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    cmd: Some(command),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        let started = match tokio::time::timeout_at(
-            deadline,
-            self.docker.start_exec(&exec.id, None::<StartExecOptions>),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                self.recover_timed_out_exec(protocol, instance_id, &name, &operation, timeout)
-                    .await?;
-                return Err(DockerError::ExecTimedOut {
-                    container: name,
-                    operation,
-                    timeout_seconds: timeout.as_secs(),
-                });
-            }
-        };
-
-        let mut stdout = CappedExecOutput::default();
-        let mut stderr = CappedExecOutput::default();
-        match started {
-            StartExecResults::Attached { mut output, .. } => {
-                let drain = async {
-                    while let Some(chunk) = output.next().await {
-                        match chunk? {
-                            LogOutput::StdOut { message } => stdout.append(&message),
-                            LogOutput::StdErr { message } => stderr.append(&message),
-                            LogOutput::Console { message } => stdout.append(&message),
-                            LogOutput::StdIn { .. } => {}
-                        }
-                    }
-                    Ok::<(), BollardError>(())
-                };
-                match tokio::time::timeout_at(deadline, drain).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        self.recover_timed_out_exec(
-                            protocol,
-                            instance_id,
-                            &name,
-                            &operation,
-                            timeout,
-                        )
-                        .await?;
-                        return Err(DockerError::ExecTimedOut {
-                            container: name,
-                            operation,
-                            timeout_seconds: timeout.as_secs(),
-                        });
-                    }
-                }
-            }
-            StartExecResults::Detached => {}
-        }
-
-        let inspect = self.docker.inspect_exec(&exec.id).await?;
-        let exit_code = inspect.exit_code.unwrap_or_default();
-        let output = CommandOutput {
-            stdout: stdout.into_string(),
-            stderr: stderr.into_string(),
-        };
-        if exit_code == 0 {
-            Ok(output)
-        } else {
-            let failure_output = if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            };
-            let failure_output =
-                truncate_log_tail(&redaction::redact_connection_url(failure_output), 4_000);
-            if log_failure {
-                tracing::warn!(
-                    container = %name,
-                    %operation,
-                    exit_code,
-                    %failure_output,
-                    "docker exec failed"
-                );
-            }
-            Err(DockerError::ExecFailed {
-                container: name,
-                operation,
-                exit_code,
-                failure_output,
-            })
-        }
-    }
-
-    async fn recover_timed_out_exec(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        container: &str,
-        operation: &str,
-        timeout: Duration,
-    ) -> Result<(), DockerError> {
-        tracing::warn!(
-            %container,
-            %operation,
-            timeout_seconds = timeout.as_secs(),
-            "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
-        );
-        match tokio::time::timeout(
-            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
-            self.docker.kill_container(
-                container,
-                Some(KillContainerOptions {
-                    signal: "SIGKILL".to_string(),
-                }),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => {
-                return Err(exec_recovery_error(container, operation, source));
-            }
-            Err(_) => {
-                return Err(exec_recovery_error(
-                    container,
-                    operation,
-                    format!(
-                        "container kill exceeded {} seconds",
-                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
-                    ),
-                ));
-            }
-        }
-
-        match tokio::time::timeout(
-            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
-            self.docker
-                .start_container(container, None::<StartContainerOptions>),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => {
-                return Err(exec_recovery_error(container, operation, source));
-            }
-            Err(_) => {
-                return Err(exec_recovery_error(
-                    container,
-                    operation,
-                    format!(
-                        "container restart exceeded {} seconds",
-                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
-                    ),
-                ));
-            }
-        }
-
-        Box::pin(self.wait_until_ready(
-            protocol,
-            instance_id,
-            DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT,
-        ))
-        .await
-        .map_err(|error| exec_recovery_error(container, operation, error))?;
-        tracing::info!(
-            %container,
-            %operation,
-            "managed container recovered after docker exec timeout"
-        );
-        Ok(())
-    }
-
-    pub async fn exec_shell(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        script: &str,
-    ) -> Result<CommandOutput, DockerError> {
-        self.exec(
-            protocol,
-            instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-        )
-        .await
-    }
-
-    pub async fn exec_shell_with_timeout(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        script: &str,
-        timeout: Duration,
-    ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_timeout(
-            protocol,
-            instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-            timeout,
-        )
-        .await
-    }
-
     pub async fn upload_file(
         &self,
         protocol: Protocol,
@@ -1195,18 +936,6 @@ fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<Strin
             "size".to_string(),
             format!("{}m", disk_mib),
         )]))
-    }
-}
-
-fn exec_recovery_error(
-    container: &str,
-    operation: &str,
-    reason: impl std::fmt::Display,
-) -> DockerError {
-    DockerError::ExecRecoveryFailed {
-        container: container.to_string(),
-        operation: operation.to_string(),
-        reason: reason.to_string(),
     }
 }
 

@@ -20,6 +20,7 @@ use super::{
     security::{
         GatewayConnectionLimiter, GatewayConnectionRejection, GatewayConnectionRejectionReason,
     },
+    supervisor::GatewayConnectionTracker,
     tunnel,
 };
 use crate::{
@@ -136,6 +137,7 @@ struct ListenerRuntime {
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 }
 
 pub async fn run_postgres_listener(
@@ -145,6 +147,7 @@ pub async fn run_postgres_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -155,6 +158,7 @@ pub async fn run_postgres_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_postgres_client,
     )
@@ -168,6 +172,7 @@ pub async fn run_redis_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -178,6 +183,7 @@ pub async fn run_redis_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_redis_client,
     )
@@ -191,6 +197,7 @@ pub async fn run_valkey_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -201,6 +208,7 @@ pub async fn run_valkey_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_valkey_client,
     )
@@ -214,6 +222,7 @@ pub async fn run_mariadb_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -224,6 +233,7 @@ pub async fn run_mariadb_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_mariadb_client,
     )
@@ -237,6 +247,7 @@ pub async fn run_mysql_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -247,6 +258,7 @@ pub async fn run_mysql_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_mysql_client,
     )
@@ -260,6 +272,7 @@ pub async fn run_mongodb_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -270,6 +283,7 @@ pub async fn run_mongodb_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_mongodb_client,
     )
@@ -283,6 +297,7 @@ pub async fn run_clickhouse_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -293,6 +308,7 @@ pub async fn run_clickhouse_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_clickhouse_client,
     )
@@ -306,6 +322,7 @@ pub async fn run_clickhouse_http_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -316,6 +333,7 @@ pub async fn run_clickhouse_http_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_clickhouse_http_client,
     )
@@ -329,6 +347,7 @@ pub async fn run_qdrant_listener(
     tls: Option<TlsAcceptor>,
     limiter: GatewayConnectionLimiter,
     shutdown: watch::Receiver<bool>,
+    connections: GatewayConnectionTracker,
 ) -> Result<(), ListenerError> {
     run_listener(
         ListenerRuntime {
@@ -339,6 +358,7 @@ pub async fn run_qdrant_listener(
             tls,
             limiter,
             shutdown,
+            connections,
         },
         handle_qdrant_client,
     )
@@ -358,6 +378,7 @@ where
         tls,
         limiter,
         mut shutdown,
+        connections,
     } = runtime;
     tracing::info!(
         bind,
@@ -413,12 +434,31 @@ where
         };
         let resolver = resolver.clone();
         let tls = tls.clone();
+        let Some(connection) = connections.try_track() else {
+            continue;
+        };
+        let mut force_shutdown = connections.subscribe_force_shutdown();
         tokio::spawn(async move {
-            let _permits = (global_permit, ip_permit);
-            if let Err(error) = handler(client, resolver, tls).await {
-                log_connection_failure(protocol, peer, &error);
+            let _permits = (global_permit, ip_permit, connection);
+            tokio::select! {
+                result = handler(client, resolver, tls) => {
+                    if let Err(error) = result {
+                        log_connection_failure(protocol, peer, &error);
+                    }
+                }
+                _ = wait_for_connection_shutdown(&mut force_shutdown) => {
+                    tracing::debug!(%peer, protocol, "database connection closed for daemon shutdown");
+                }
             }
         });
+    }
+}
+
+async fn wait_for_connection_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
     }
 }
 

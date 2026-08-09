@@ -1387,6 +1387,7 @@ mod node_summary_tests {
             instance_id: instance_id.to_string(),
             protocol: Protocol::Mysql,
             status,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
             public: PublicEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: 3308,
@@ -1409,6 +1410,7 @@ mod node_summary_tests {
             mysql_native_password_sha1_stage2: None,
             mysql_root_password: None,
             mongodb_root_password: None,
+            tenant_password: None,
             limits,
             image: None,
             database_version: None,

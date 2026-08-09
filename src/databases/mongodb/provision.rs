@@ -69,10 +69,10 @@ pub fn update_user_password_from_env_script(
         r#"
 const database = {database};
 const username = {username};
-const password = process.env.DBE_MONGO_PASSWORD;
+const password = process.env.DBE_ROTATED_PASSWORD;
 
 if (typeof password !== "string" || password.length === 0) {{
-  throw new Error("DBE_MONGO_PASSWORD is unavailable");
+  throw new Error("DBE_ROTATED_PASSWORD is unavailable");
 }}
 db = db.getSiblingDB(database);
 db.updateUser(username, {{ pwd: password }});
@@ -164,7 +164,7 @@ mod tests {
         let script = update_user_password_from_env_script("mongo_1", "app_mongo_1").unwrap();
 
         assert!(script.contains("db.updateUser"));
-        assert!(script.contains("process.env.DBE_MONGO_PASSWORD"));
+        assert!(script.contains("process.env.DBE_ROTATED_PASSWORD"));
         assert!(!script.contains("secret"));
     }
 

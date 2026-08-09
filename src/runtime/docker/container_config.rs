@@ -37,13 +37,13 @@ pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
             "valkey-cli -s /run/dbev/valkey.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
         }
         Protocol::Mariadb => {
-            "tenant_password=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\"; MYSQL_PWD=\"$tenant_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'SELECT 1' >/dev/null"
+            "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null"
         }
         Protocol::Mysql => {
             "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null"
         }
         Protocol::Mongodb => {
-            "mongosh --quiet -u \"$DBE_MONGO_USER\" -p \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.adminCommand({ ping: 1 })' >/dev/null"
+            "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval 'db.adminCommand({ ping: 1 })' >/dev/null"
         }
         Protocol::Clickhouse => {
             "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null"
@@ -77,12 +77,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mariadb_readiness_requires_an_authenticated_query() {
+    fn mariadb_readiness_uses_the_stable_internal_admin() {
         let script = startup_readiness_script(Protocol::Mariadb);
 
-        assert!(script.contains("DBE_MARIADB_PASSWORD"));
-        assert!(script.contains("MARIADB_PASSWORD"));
+        assert!(script.contains("DBE_MARIADB_ROOT_PASSWORD"));
+        assert!(!script.contains("DBE_MARIADB_PASSWORD:-"));
         assert!(script.contains("SELECT 1"));
         assert!(!script.contains("mariadb-admin ping"));
+    }
+
+    #[test]
+    fn mongodb_readiness_uses_the_stable_internal_admin() {
+        let script = startup_readiness_script(Protocol::Mongodb);
+
+        assert!(script.contains("DBE_MONGO_ROOT_USER"));
+        assert!(script.contains("DBE_MONGO_ROOT_PASSWORD"));
+        assert!(!script.contains("DBE_MONGO_PASSWORD\""));
     }
 }

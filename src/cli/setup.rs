@@ -573,7 +573,7 @@ ExecStart={exec_start} daemon
 KillMode=process
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=21min
+TimeoutStopSec=4min30s
 LimitNOFILE=1048576:1048576
 
 [Install]

@@ -403,6 +403,7 @@ pub(crate) async fn quarantine_after_uncertain_import(
         .await
         .ok_or(ApiError::NotFound)?;
     metadata.status = InstanceStatus::Quarantined;
+    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
     metadata.updated_at = crate::jobs::import_export::now_rfc3339();
 
     // Remove gateway routes synchronously in memory before any Docker or SQLite wait. Existing

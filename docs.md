@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.4.5 # replace with the reviewed release
+DBEV_VERSION=v0.4.6 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -169,8 +169,9 @@ gateway; do not substitute MySQL 9.x, where that plugin was removed. MySQL
 containers have `network_mode=none`, expose only a per-instance Unix socket,
 and never return tenant passwords through metadata or API responses. Runtime
 secrets required by an image remain confined to its isolated container
-configuration; DBE encrypts maintenance credentials and routing verifiers in
-the metadata store. Enable the database gateway's native TLS whenever the
+configuration; DBE encrypts tenant and maintenance credentials plus routing
+verifiers in the private metadata store and never serializes them in API
+responses. Enable the database gateway's native TLS whenever the
 listener crosses an untrusted network.
 
 Keep CPU, memory, and disk reservations inside the node's safe capacity:
@@ -277,7 +278,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.4.5@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.4.6@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -474,6 +475,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 ```
 
 `status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `valkey`, `mongodb`, `clickhouse`, `qdrant`.
+Power actions also persist an internal desired state without adding a field to the API response. Explicitly stopped or killed instances remain stopped across daemon and container-engine restarts; desired-running instances are reattached when already running and are started only when the runtime reports them stopped or failed. Quarantined instances are always desired-stopped and never enter gateway routing.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
 `database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
 
@@ -487,7 +489,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 | POST | `/api/instances/{id}/power` | instances:write | Unified power API: `{ "action": "start" | "stop" | "restart" | "kill" }` |
 | POST | `/api/instances/{id}/reconcile` | instances:write | Re-sync stored status with the runtime |
 | PATCH | `/api/instances/{id}/limits` | instances:write | Update CPU/memory/disk limits |
-| PATCH | `/api/instances/{id}/password` | instances:write | Atomically rotate the tenant password/API key, restart, validate, and roll back on failure |
+| PATCH | `/api/instances/{id}/password` | instances:write | Atomically rotate the tenant password/API key in place where supported, validate, and roll back on failure; `restarted` reports the limited recreation fallback |
 | PATCH | `/api/instances/{id}/image` | instances:write | Move to a new image (recreates container) |
 | GET | `/api/instances/{id}/resources` | resources:read | Live resource report |
 | GET | `/api/admin/resources` | resources:admin | Resource reports for everything |
@@ -569,7 +571,7 @@ PATCH /api/instances/{id}/image
 { "image": "postgres:18.4", "password": "the-instance-password" }
 ```
 
-This pulls the image, deletes the old container, and recreates it on the same data volume. `password` is required for everything except Redis and Valkey (their ACL file is retained on the volume). Images must be pinned — a non-`latest` tag or a `@sha256:` digest; bare `postgres` or `postgres:latest` gets a `400`.
+This pulls the image, deletes the old container, and recreates it on the same data volume. Current instances use the tenant credential from DBE's encrypted private metadata. The optional `password` field remains a compatibility fallback for legacy instances created before that credential was stored. Images must be pinned — a non-`latest` tag or a `@sha256:` digest; bare `postgres` or `postgres:latest` gets a `400`.
 
 The requested image must also be allowed in `images.allowed.<protocol>`. The configured default image at `images.<protocol>` is always implicitly allowed. Keep the allowlist short and admin-controlled; do not pass arbitrary user input here.
 
@@ -1128,11 +1130,13 @@ The API listener becomes available after critical metadata, crash-recovery,
 container-engine, socket-isolation, and disk checks complete. Existing managed database
 containers then auto-start in a lock-protected, bounded-concurrent background
 phase, so a slow or broken container does not hold node heartbeat or management
-endpoints offline. FuseQuota shutdown uses the same bounded concurrency for
-container stops and safe unmounts, reducing normal service restart time without
-skipping graceful active-job draining. API connections, including monitoring
-WebSockets, receive up to 10 seconds to drain before they are closed, so a
-long-lived client cannot hold `systemctl restart` open indefinitely.
+endpoints offline. A daemon restart does not stop database containers or unmount
+healthy FuseQuota filesystems. Shutdown closes mutation admission, gives active
+API mutations up to 60 seconds and durable jobs or creations up to three minutes
+to finish, and then bounds API connection draining to 10 seconds. WebSockets
+receive close code 1012, while database gateway connections get a five-second
+natural drain followed by a two-second forced proxy close. A long-lived client
+therefore cannot hold `systemctl restart` open indefinitely.
 Heartbeat reports management API liveness only. It always returns
 `{"status":"ok"}` once an authenticated request reaches the handler, regardless
 of database instance or gateway state. Clients should use each instance's status
@@ -1149,6 +1153,8 @@ Instances created by older builds with a bridge-network or `docker_tcp` backend 
 If a legacy database contains duplicate route identities, startup preserves the deterministic first claimant and marks every other claimant `quarantined`. Quarantined containers are stopped before gateways open and cannot be started or restarted; their metadata and data remain available for inspection and explicit deletion.
 
 An unclean daemon exit while an import/export job is durably `running` also quarantines the affected instance on the next startup. The container is stopped before gateways open, preventing a possibly orphaned dump or restore process from racing new work. Queued jobs that never started are marked failed without quarantining their instances. Inspect the failed job and database integrity, then recover or repair the quarantined instance offline.
+
+Physical restores keep the previous data in a private sibling workspace until the replacement validates. Startup performs a bounded, non-symlink-following scan for retained generated restore workspaces and quarantines the matching instance before reconciliation, even if the job record was already made terminal.
 
 If creation cleanup was interrupted, a normal retry fails closed rather than reusing orphaned files with new credentials. After preserving any required data, retry the create request with `"purge_stale_resources": true` to explicitly and irreversibly remove that instance ID's orphaned container and paths before creation.
 

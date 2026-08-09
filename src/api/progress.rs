@@ -119,6 +119,10 @@ impl InstallProgressStore {
         self.accepting.store(false, Ordering::Release);
     }
 
+    pub fn active_creation_count(&self) -> usize {
+        self.active_creations.load(Ordering::Acquire)
+    }
+
     pub async fn wait_for_creation_drain(&self, deadline: Duration) -> bool {
         let drained = async {
             loop {

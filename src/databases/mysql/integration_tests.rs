@@ -122,6 +122,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             instance_id: "inst_mysql_integration".to_string(),
             protocol: Protocol::Mysql,
             status: InstanceStatus::Running,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
             public: PublicEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: 0,
@@ -146,6 +147,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             )),
             mysql_root_password: Some(ROOT_PASSWORD.to_string()),
             mongodb_root_password: None,
+            tenant_password: Some(TENANT_PASSWORD.to_string()),
             limits: InstanceLimits::default(),
             image: None,
             database_version: None,
@@ -156,6 +158,9 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let gateway_supervisor = crate::gateway::supervisor::GatewaySupervisor::new();
+    assert!(gateway_supervisor.begin(1));
+    let connections = gateway_supervisor.connection_tracker();
     let bind = address.to_string();
     let gateway = tokio::spawn(async move {
         run_mysql_listener(
@@ -165,6 +170,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             None,
             GatewayConnectionLimiter::default(),
             shutdown_rx,
+            connections,
         )
         .await
     });

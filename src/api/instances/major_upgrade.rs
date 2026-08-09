@@ -9,12 +9,12 @@ pub(super) async fn update_instance_image_by_major_migration(
 ) -> Result<UpdateInstanceImageResponse, ApiError> {
     ensure_major_upgrade_supported(metadata.protocol)
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
-    let password = password.ok_or_else(|| {
+    let password = metadata.tenant_password.clone().or(password).ok_or_else(|| {
         fail_image_update_api(
             state,
             &metadata.instance_id,
             ApiError::BadRequest(
-                "password is required for major upgrade migration because DBE does not store tenant database passwords".to_string(),
+                "password is required for major upgrade migration of legacy instances without a stored encrypted tenant credential".to_string(),
             ),
         )
     })?;
@@ -102,6 +102,7 @@ pub(super) async fn update_instance_image_by_major_migration(
             crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
         );
     }
+    metadata.tenant_password = Some(password.clone());
 
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();

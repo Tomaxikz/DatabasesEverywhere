@@ -79,8 +79,12 @@ use startup::*;
 #[cfg(all(test, unix))]
 mod tests;
 
-const IMPORT_EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const ACTIVE_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const API_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const WEBSOCKET_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const GATEWAY_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_API_CONNECTIONS_PER_IP: usize = 256;

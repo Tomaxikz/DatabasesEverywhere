@@ -191,7 +191,7 @@ mod tests {
             instances: store,
             manager,
             instance_locks: crate::instances::locks::InstanceLocks::default(),
-            docker: DockerRuntime::new(&Default::default(), false).unwrap(),
+            docker: DockerRuntime::offline_for_tests(&Default::default(), false),
             import_export_jobs: ImportExportJobs::default(),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),

@@ -288,65 +288,116 @@ pub(super) async fn reapply_instance_disk_limits(
     let instances = manager.store().list().await;
     let outcomes = futures::stream::iter(instances)
         .map(|metadata| async move {
-            let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
-                .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
-            if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
-                paths.create_dirs().await.with_context(|| {
-                    format!(
-                        "failed to create rootless Podman paths for {}",
-                        metadata.instance_id
-                    )
-                })?;
-                paths
-                    .apply_rootless_podman_owner(uid, gid)
-                    .await
-                    .with_context(|| {
+            let outcome = async {
+                let paths = InstancePaths::new(&config.paths, &metadata.instance_id).with_context(
+                    || format!("failed to build paths for {}", metadata.instance_id),
+                )?;
+                if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
+                    paths.create_dirs().await.with_context(|| {
                         format!(
-                            "failed to apply rootless Podman ownership for {}",
+                            "failed to create rootless Podman paths for {}",
                             metadata.instance_id
                         )
                     })?;
-            }
-            if !disk_limiter
-                .instance_runtime_is_healthy(&paths.data)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to inspect disk-limit runtime for {}",
-                        metadata.instance_id
-                    )
-                })?
-            {
-                match docker.stop(metadata.protocol, &metadata.instance_id).await {
-                    Ok(_) => tracing::warn!(
-                        instance_id = %metadata.instance_id,
-                        protocol = %metadata.protocol,
-                        "stopped managed instance to recover an unavailable disk-limit runtime"
-                    ),
-                    Err(error) if error.is_not_found() || error.is_not_running() => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
+                    paths
+                        .apply_rootless_podman_owner(uid, gid)
+                        .await
+                        .with_context(|| {
                             format!(
-                                "failed to stop {} before recovering its disk-limit runtime",
+                                "failed to apply rootless Podman ownership for {}",
                                 metadata.instance_id
                             )
-                        });
+                        })?;
+                }
+                if !disk_limiter
+                    .instance_runtime_is_healthy(&paths.data)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to inspect disk-limit runtime for {}",
+                            metadata.instance_id
+                        )
+                    })?
+                {
+                    match docker.stop(metadata.protocol, &metadata.instance_id).await {
+                        Ok(_) => tracing::warn!(
+                            instance_id = %metadata.instance_id,
+                            protocol = %metadata.protocol,
+                            "stopped managed instance to recover an unavailable disk-limit runtime"
+                        ),
+                        Err(error) if error.is_not_found() || error.is_not_running() => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "failed to stop {} before recovering its disk-limit runtime",
+                                    metadata.instance_id
+                                )
+                            });
+                        }
                     }
                 }
+                disk_limiter
+                    .apply_instance_limit(
+                        &metadata.instance_id,
+                        &paths.data,
+                        metadata.limits.disk_mib,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to apply disk limit for {}", metadata.instance_id)
+                    })?;
+                Ok::<(), anyhow::Error>(())
             }
-            disk_limiter
-                .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
-                .await
-                .with_context(|| {
-                    format!("failed to apply disk limit for {}", metadata.instance_id)
-                })?;
-            Ok::<(), anyhow::Error>(())
+            .await;
+            (metadata, outcome)
         })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
-    for outcome in outcomes {
-        outcome?;
+    let mut failed = 0_usize;
+    for (mut metadata, outcome) in outcomes {
+        let Err(error) = outcome else {
+            continue;
+        };
+        failed += 1;
+        tracing::error!(
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "instance disk-limit reconciliation failed; isolating this instance and continuing daemon boot"
+        );
+        let stop_failed = match docker.stop(metadata.protocol, &metadata.instance_id).await {
+            Ok(_) => false,
+            Err(error) if error.is_not_found() || error.is_not_running() => false,
+            Err(stop_error) => {
+                tracing::error!(
+                    event = "audit disk_limit_recovery_stop_failed",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    %stop_error,
+                    "failed to stop an instance whose disk-limit runtime could not be reconciled; quarantining it fail-closed"
+                );
+                true
+            }
+        };
+        if stop_failed {
+            metadata.status = InstanceStatus::Quarantined;
+            metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        } else if metadata.desired_state
+            == crate::instances::metadata::DesiredInstanceState::Stopped
+        {
+            metadata.status = InstanceStatus::Stopped;
+        } else {
+            metadata.status = InstanceStatus::Failed;
+        }
+        metadata.updated_at = now_rfc3339();
+        manager.upsert(metadata).await?;
+    }
+    if failed > 0 {
+        tracing::warn!(
+            failed,
+            "one or more instance disk limits could not be reconciled; affected instances were isolated while daemon startup continues"
+        );
     }
     Ok(())
 }
@@ -369,10 +420,20 @@ pub(super) async fn start_known_instances_on_boot(
     let mut running = 0_usize;
     let mut stopped = 0_usize;
     let mut failed = 0_usize;
+    let mut errors = 0_usize;
 
     for outcome in outcomes {
-        let Some(status) = outcome? else {
-            continue;
+        let status = match outcome {
+            Ok(Some(status)) => status,
+            Ok(None) => continue,
+            Err(error) => {
+                errors += 1;
+                tracing::error!(
+                    %error,
+                    "managed instance failed background activation during daemon boot; continuing with other instances"
+                );
+                continue;
+            }
         };
         attempted += 1;
         match status {
@@ -389,6 +450,7 @@ pub(super) async fn start_known_instances_on_boot(
         running,
         stopped,
         failed,
+        errors,
         concurrency = MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
         "daemon boot managed instance auto-start complete"
     );
@@ -402,7 +464,7 @@ pub(super) async fn start_known_instance_on_boot(
     instance_locks: &crate::instances::locks::InstanceLocks,
     snapshot: crate::instances::metadata::InstanceMetadata,
 ) -> anyhow::Result<Option<InstanceStatus>> {
-    let Some(snapshot_action) = managed_boot_action(snapshot.status) else {
+    let Some(snapshot_action) = managed_boot_action(snapshot.status, snapshot.desired_state) else {
         return Ok(None);
     };
 
@@ -410,7 +472,7 @@ pub(super) async fn start_known_instance_on_boot(
     let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
         return Ok(None);
     };
-    let Some(action) = managed_boot_action(metadata.status) else {
+    let Some(action) = managed_boot_action(metadata.status, metadata.desired_state) else {
         return Ok(None);
     };
     if action != snapshot_action {
@@ -431,7 +493,6 @@ pub(super) async fn start_known_instance_on_boot(
     );
 
     let mut boot_failed = false;
-    let mut startup_readiness_failed = false;
     if let Err(error) =
         ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
             .await
@@ -444,63 +505,78 @@ pub(super) async fn start_known_instance_on_boot(
             "failed to prepare managed instance runtime directories during daemon boot; skipping container start"
         );
     } else {
-        let activation = match action {
-            ManagedBootAction::Start => {
-                docker.start(metadata.protocol, &metadata.instance_id).await
-            }
-            ManagedBootAction::Restart => {
-                docker
-                    .restart(metadata.protocol, &metadata.instance_id)
-                    .await
-            }
-        };
-        match activation {
-            Ok(_) => {
-                if let Err(error) = docker
-                    .wait_until_ready(
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        Duration::from_secs(180),
-                    )
-                    .await
-                {
+        let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
+            .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
+        if let Err(error) =
+            DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
+                .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+                .await
+        {
+            boot_failed = true;
+            tracing::warn!(
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "failed to prepare managed instance disk limit during daemon boot; skipping container activation"
+            );
+        } else {
+            let activation = match action {
+                ManagedBootAction::Start => {
+                    docker.start(metadata.protocol, &metadata.instance_id).await
+                }
+                ManagedBootAction::Restart => {
+                    docker
+                        .restart(metadata.protocol, &metadata.instance_id)
+                        .await
+                }
+            };
+            match activation {
+                Ok(_) => {
+                    if let Err(error) = docker
+                        .wait_until_ready(
+                            metadata.protocol,
+                            &metadata.instance_id,
+                            Duration::from_secs(180),
+                        )
+                        .await
+                    {
+                        boot_failed = true;
+                        log_boot_container_failure(
+                            docker,
+                            metadata.protocol,
+                            &metadata.instance_id,
+                            "managed instance did not become ready during daemon boot",
+                            error.to_string(),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
                     boot_failed = true;
-                    startup_readiness_failed = true;
                     log_boot_container_failure(
                         docker,
                         metadata.protocol,
                         &metadata.instance_id,
-                        "managed instance did not become ready during daemon boot",
+                        "failed to activate managed instance during daemon boot",
                         error.to_string(),
                     )
                     .await;
                 }
             }
-            Err(error) => {
-                boot_failed = true;
-                log_boot_container_failure(
-                    docker,
-                    metadata.protocol,
-                    &metadata.instance_id,
-                    "failed to activate managed instance during daemon boot",
-                    error.to_string(),
-                )
-                .await;
-            }
         }
     }
 
-    if startup_readiness_failed
+    if boot_failed
         && let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
         && !error.is_not_running()
         && !error.is_not_found()
     {
         tracing::error!(
-            event = "audit boot_readiness_cleanup_failed",
+            event = "audit boot_activation_cleanup_failed",
             instance_id = %metadata.instance_id,
             protocol = %metadata.protocol,
             %error,
-            "database failed startup readiness during daemon boot and could not be stopped"
+            "database activation failed during daemon boot and the container could not be stopped"
         );
     }
 
@@ -529,7 +605,13 @@ impl ManagedBootAction {
     }
 }
 
-pub(super) fn managed_boot_action(status: InstanceStatus) -> Option<ManagedBootAction> {
+pub(super) fn managed_boot_action(
+    status: InstanceStatus,
+    desired_state: crate::instances::metadata::DesiredInstanceState,
+) -> Option<ManagedBootAction> {
+    if desired_state == crate::instances::metadata::DesiredInstanceState::Stopped {
+        return None;
+    }
     match status {
         InstanceStatus::Stopped => Some(ManagedBootAction::Start),
         InstanceStatus::Failed => Some(ManagedBootAction::Restart),

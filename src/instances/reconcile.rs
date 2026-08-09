@@ -3,7 +3,7 @@ use futures::StreamExt;
 use crate::{
     instances::{
         manager::InstanceManager,
-        metadata::{InstanceMetadata, InstanceStatus, RuntimeKind},
+        metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, RuntimeKind},
     },
     runtime::docker::{DockerContainerStatus, DockerRuntime},
     shared::{backend::BackendEndpoint, time::now_rfc3339},
@@ -65,21 +65,13 @@ pub async fn reconcile_all(
 ) -> Result<ReconcileSummary, anyhow::Error> {
     let instances = manager.store().list().await;
     let outcomes = futures::stream::iter(instances)
-        .map(|metadata| async move {
-            if metadata.status == InstanceStatus::Quarantined {
-                stop_quarantined_instance(&metadata, docker).await?;
-                Ok::<_, anyhow::Error>(metadata)
-            } else {
-                Ok(reconcile_metadata(metadata, docker).await)
-            }
-        })
+        .map(|metadata| reconcile_one(metadata, docker))
         .buffer_unordered(RECONCILE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
     let mut summary = ReconcileSummary::default();
 
-    for outcome in outcomes {
-        let reconciled = outcome?;
+    for reconciled in outcomes {
         summary.checked += 1;
         match reconciled.status {
             InstanceStatus::Booting => summary.booting += 1,
@@ -100,13 +92,34 @@ pub async fn reconcile_one(
     docker: &DockerRuntime,
 ) -> InstanceMetadata {
     if metadata.status == InstanceStatus::Quarantined {
-        return metadata;
+        metadata.desired_state = DesiredInstanceState::Stopped;
+    }
+    if metadata.desired_state == DesiredInstanceState::Stopped
+        || metadata.status == InstanceStatus::Quarantined
+    {
+        if let Err(error) = stop_inactive_instance(&metadata, docker).await {
+            tracing::error!(
+                %error,
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                desired_state = metadata.desired_state.as_str(),
+                "failed to enforce inactive instance state during reconciliation"
+            );
+            if metadata.status != InstanceStatus::Quarantined {
+                metadata.status = InstanceStatus::Failed;
+                metadata.updated_at = now_rfc3339();
+            }
+            return metadata;
+        }
+        if metadata.status == InstanceStatus::Quarantined {
+            return metadata;
+        }
     }
     metadata.updated_at = now_rfc3339();
     reconcile_metadata(metadata, docker).await
 }
 
-async fn stop_quarantined_instance(
+async fn stop_inactive_instance(
     metadata: &InstanceMetadata,
     docker: &DockerRuntime,
 ) -> Result<(), anyhow::Error> {
@@ -124,10 +137,12 @@ async fn stop_quarantined_instance(
                 .stop(metadata.protocol, &metadata.instance_id)
                 .await?;
             tracing::warn!(
-                event = "audit quarantined_instance_stopped",
+                event = "audit inactive_instance_stopped",
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
-                "stopped a quarantined instance before opening gateways"
+                desired_state = metadata.desired_state.as_str(),
+                quarantined = metadata.status == InstanceStatus::Quarantined,
+                "stopped an instance whose durable desired state is inactive"
             );
         }
         Ok(_) => {}
@@ -168,6 +183,7 @@ async fn reconcile_metadata(
                     "quarantined instance that does not satisfy network-none socket isolation; recreate it before reopening gateways"
                 );
                 metadata.status = InstanceStatus::Quarantined;
+                metadata.desired_state = DesiredInstanceState::Stopped;
                 metadata.updated_at = now_rfc3339();
                 return metadata;
             }

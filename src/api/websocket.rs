@@ -90,11 +90,9 @@ async fn stream_monitoring(
     tokio::pin!(expiration);
     loop {
         tokio::select! {
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    close_shutdown_socket(&mut socket).await;
-                    break;
-                }
+            _ = wait_for_daemon_shutdown(&mut shutdown) => {
+                close_shutdown_socket(&mut socket).await;
+                break;
             }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
@@ -374,6 +372,11 @@ async fn admit_websocket(
     state: &AppState,
     claims: &Claims,
 ) -> Result<WebSocketConnectionPermit, ApiError> {
+    if state.daemon_shutdown.is_triggered() {
+        return Err(ApiError::ServiceUnavailable(
+            "daemon shutdown is in progress".to_string(),
+        ));
+    }
     match state
         .api_rate_limiter
         .admit_websocket(&claims.jti, claims.exp)
@@ -403,11 +406,17 @@ async fn stream_logs(
 ) {
     let mut shutdown = state.daemon_shutdown.subscribe();
     let expiration_deadline = jwt_expiration_deadline(jwt_exp);
-    let mut logs = match state
+    let follow_logs = state
         .docker
-        .follow_logs(metadata.protocol, &metadata.instance_id, tail)
-        .await
-    {
+        .follow_logs(metadata.protocol, &metadata.instance_id, tail);
+    let logs_result = tokio::select! {
+        _ = wait_for_daemon_shutdown(&mut shutdown) => {
+            close_shutdown_socket(&mut socket).await;
+            return;
+        }
+        result = follow_logs => result,
+    };
+    let mut logs = match logs_result {
         Ok(logs) => logs,
         Err(error) => {
             let message = LogSnapshot {
@@ -430,12 +439,9 @@ async fn stream_logs(
     tokio::pin!(expiration);
     loop {
         let message = tokio::select! {
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    close_shutdown_socket(&mut socket).await;
-                    break;
-                }
-                continue;
+            _ = wait_for_daemon_shutdown(&mut shutdown) => {
+                close_shutdown_socket(&mut socket).await;
+                break;
             }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
@@ -537,12 +543,18 @@ async fn stream_import_export(
     let mut events = state.import_export_jobs.subscribe();
     let mut shutdown = state.daemon_shutdown.subscribe();
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
-    let Ok(snapshot) = complete_before(
+    let snapshot = complete_before(
         expiration_deadline,
         import_export_snapshot(&state, &instance_id, &query, &claims),
-    )
-    .await
-    else {
+    );
+    let snapshot = tokio::select! {
+        _ = wait_for_daemon_shutdown(&mut shutdown) => {
+            close_shutdown_socket(&mut socket).await;
+            return;
+        }
+        snapshot = snapshot => snapshot,
+    };
+    let Ok(snapshot) = snapshot else {
         close_expired_socket(&mut socket).await;
         return;
     };
@@ -561,11 +573,9 @@ async fn stream_import_export(
     let mut awaiting_pong = false;
     loop {
         tokio::select! {
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    close_shutdown_socket(&mut socket).await;
-                    break;
-                }
+            _ = wait_for_daemon_shutdown(&mut shutdown) => {
+                close_shutdown_socket(&mut socket).await;
+                break;
             }
             _ = &mut expiration => {
                 close_expired_socket(&mut socket).await;
@@ -786,20 +796,32 @@ async fn close_unresponsive_socket(socket: &mut WebSocket) {
 }
 
 async fn close_shutdown_socket(socket: &mut WebSocket) {
-    close_socket(socket, "server restarting").await;
+    close_socket_with_code(socket, close_code::RESTART, "server restarting").await;
 }
 
 async fn close_socket(socket: &mut WebSocket, reason: &'static str) {
+    close_socket_with_code(socket, close_code::POLICY, reason).await;
+}
+
+async fn close_socket_with_code(socket: &mut WebSocket, code: u16, reason: &'static str) {
     let close_deadline = Instant::now() + Duration::from_secs(1);
     let _ = send_message_before(
         socket,
         Message::Close(Some(CloseFrame {
-            code: close_code::POLICY,
+            code,
             reason: reason.into(),
         })),
         close_deadline,
     )
     .await;
+}
+
+async fn wait_for_daemon_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn send_json_before<T: Serialize>(

@@ -60,6 +60,7 @@ impl PreparedGatewayListener {
         self,
         resolver: RouteResolver,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        connections: crate::gateway::supervisor::GatewayConnectionTracker,
     ) -> Result<(), listeners::ListenerError> {
         let Self {
             kind,
@@ -70,44 +71,112 @@ impl PreparedGatewayListener {
         } = self;
         match kind {
             GatewayListenerKind::Postgres => {
-                listeners::run_postgres_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_postgres_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Redis => {
-                listeners::run_redis_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_redis_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Valkey => {
-                listeners::run_valkey_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_valkey_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Mariadb => {
-                listeners::run_mariadb_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_mariadb_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Mysql => {
-                listeners::run_mysql_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_mysql_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Mongodb => {
-                listeners::run_mongodb_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_mongodb_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
             GatewayListenerKind::Clickhouse => {
                 listeners::run_clickhouse_listener(
-                    listener, &bind, resolver, tls, limiter, shutdown,
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
                 )
                 .await
             }
             GatewayListenerKind::ClickhouseHttp => {
                 listeners::run_clickhouse_http_listener(
-                    listener, &bind, resolver, tls, limiter, shutdown,
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
                 )
                 .await
             }
             GatewayListenerKind::Qdrant => {
-                listeners::run_qdrant_listener(listener, &bind, resolver, tls, limiter, shutdown)
-                    .await
+                listeners::run_qdrant_listener(
+                    listener,
+                    &bind,
+                    resolver,
+                    tls,
+                    limiter,
+                    shutdown,
+                    connections,
+                )
+                .await
             }
         }
     }
@@ -149,8 +218,9 @@ pub(super) async fn start_gateway_listeners(
         let protocol = listener.kind.as_str();
         let resolver = resolver.clone();
         let shutdown = supervisor.subscribe_shutdown();
+        let connections = supervisor.connection_tracker();
         listeners.spawn(async move {
-            let result = listener.run(resolver, shutdown).await;
+            let result = listener.run(resolver, shutdown, connections).await;
             (protocol, result)
         });
     }
@@ -308,6 +378,7 @@ pub(super) async fn serve_api(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    api_rate_limiter: crate::api::security::ApiRateLimiter,
     daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
@@ -318,6 +389,7 @@ pub(super) async fn serve_api(
             router,
             import_export_jobs,
             install_progress,
+            api_rate_limiter,
             daemon_shutdown,
             gateway_supervisor,
         )
@@ -345,6 +417,7 @@ pub(super) async fn serve_api(
         shutdown_signal(
             import_export_jobs,
             install_progress,
+            api_rate_limiter,
             daemon_shutdown,
             gateway_supervisor,
         )
@@ -368,6 +441,7 @@ pub(super) async fn serve_api_tls(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    api_rate_limiter: crate::api::security::ApiRateLimiter,
     daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
@@ -402,6 +476,7 @@ pub(super) async fn serve_api_tls(
         shutdown_signal(
             import_export_jobs,
             install_progress,
+            api_rate_limiter,
             daemon_shutdown,
             gateway_supervisor,
         )
@@ -499,17 +574,88 @@ pub(super) fn rustls_config_with_client_ca(
 pub(super) async fn shutdown_signal(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
+    api_rate_limiter: crate::api::security::ApiRateLimiter,
     daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) {
     let signal = wait_for_termination_signal().await;
+    let active_api_requests = api_rate_limiter.active_request_count();
+    let active_websockets = api_rate_limiter.active_websocket_count();
+    let active_mutations = daemon_shutdown.active_mutation_count();
+    let active_gateway_connections = gateway_supervisor.active_connections();
+    let active_import_export_jobs = import_export_jobs.active_count();
+    let active_instance_creations = install_progress.active_creation_count();
     daemon_shutdown.trigger();
     import_export_jobs.close_admission();
     install_progress.close_creation_admission();
     gateway_supervisor.shutdown();
     tracing::info!(
         signal,
-        "shutdown signal received; background operation admission closed"
+        phase = "admission_closed",
+        active_api_requests,
+        active_websockets,
+        active_mutations,
+        active_gateway_connections,
+        active_import_export_jobs,
+        active_instance_creations,
+        "shutdown signal received; new mutations and background operations are no longer accepted"
+    );
+
+    let (mutations_drained, websocket_drained, gateway_drain) = tokio::join!(
+        daemon_shutdown.wait_for_mutation_drain(API_MUTATION_DRAIN_TIMEOUT),
+        api_rate_limiter.wait_for_websocket_drain(WEBSOCKET_DRAIN_TIMEOUT),
+        gateway_supervisor.drain_connections(
+            GATEWAY_CONNECTION_DRAIN_TIMEOUT,
+            GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT,
+        ),
+    );
+    if mutations_drained {
+        tracing::info!(phase = "mutation_drain", "active API mutations drained");
+    } else {
+        tracing::warn!(
+            phase = "mutation_drain",
+            remaining = daemon_shutdown.active_mutation_count(),
+            timeout_seconds = API_MUTATION_DRAIN_TIMEOUT.as_secs(),
+            "timed out waiting for active API mutations; the API connection deadline will now apply"
+        );
+    }
+    if websocket_drained {
+        tracing::info!(
+            phase = "websocket_drain",
+            active_at_start = active_websockets,
+            "websocket clients received the restart close frame"
+        );
+    } else {
+        tracing::warn!(
+            phase = "websocket_drain",
+            remaining = api_rate_limiter.active_websocket_count(),
+            timeout_seconds = WEBSOCKET_DRAIN_TIMEOUT.as_secs(),
+            "websocket close deadline elapsed"
+        );
+    }
+    if gateway_drain.gracefully_drained {
+        tracing::info!(
+            phase = "gateway_drain",
+            active_at_start = gateway_drain.active_at_start,
+            "database gateway connections drained"
+        );
+    } else if gateway_drain.remaining == 0 {
+        tracing::info!(
+            phase = "gateway_drain",
+            active_at_start = gateway_drain.active_at_start,
+            "database gateway drain deadline elapsed; remaining proxy connections were closed"
+        );
+    } else {
+        tracing::warn!(
+            phase = "gateway_drain",
+            active_at_start = gateway_drain.active_at_start,
+            remaining = gateway_drain.remaining,
+            "database gateway tasks did not exit before the forced-close deadline"
+        );
+    }
+    tracing::info!(
+        phase = "network_drain_complete",
+        "network shutdown drain complete; managed database containers remain running"
     );
 }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
-    instances::metadata::{InstanceMetadata, SCHEMA_VERSION},
+    instances::metadata::{DesiredInstanceState, InstanceMetadata, SCHEMA_VERSION},
     shared::backend::BackendEndpoint,
     storage::secrets::{SecretStore, SecretStoreError},
 };
@@ -34,11 +34,13 @@ impl InstanceRepository {
             r#"
             SELECT
                 instance_metadata.metadata_json,
+                instance_metadata.desired_state,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
                 instance_route_auth.mysql_native_password_sha1_stage2,
                 instance_route_auth.mysql_root_password,
-                instance_route_auth.mongodb_root_password
+                instance_route_auth.mongodb_root_password,
+                instance_route_auth.tenant_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
                 ON instance_route_auth.instance_id = instance_metadata.instance_id
@@ -52,6 +54,7 @@ impl InstanceRepository {
             .map(|row| {
                 let metadata_json: String = row.try_get("metadata_json")?;
                 let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
+                self.load_desired_state(&mut metadata, &row)?;
                 self.load_route_auth(&mut metadata, &row)?;
                 validate_metadata_schema(&metadata)?;
                 Ok(metadata)
@@ -67,11 +70,13 @@ impl InstanceRepository {
             r#"
             SELECT
                 instance_metadata.metadata_json,
+                instance_metadata.desired_state,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
                 instance_route_auth.mysql_native_password_sha1_stage2,
                 instance_route_auth.mysql_root_password,
-                instance_route_auth.mongodb_root_password
+                instance_route_auth.mongodb_root_password,
+                instance_route_auth.tenant_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
                 ON instance_route_auth.instance_id = instance_metadata.instance_id
@@ -89,6 +94,7 @@ impl InstanceRepository {
 
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
+        self.load_desired_state(&mut metadata, &row)?;
         self.load_route_auth(&mut metadata, &row)?;
         validate_metadata_schema(&metadata)?;
         Ok(Some(metadata))
@@ -125,6 +131,11 @@ impl InstanceRepository {
             &metadata.instance_id,
             metadata.mongodb_root_password.as_deref(),
         )?;
+        let tenant_password = self.protect_route_secret(
+            "tenant_password",
+            &metadata.instance_id,
+            metadata.tenant_password.as_deref(),
+        )?;
         let mut transaction = self.pool.begin().await?;
 
         sqlx::query(
@@ -134,6 +145,7 @@ impl InstanceRepository {
                 schema_version,
                 protocol,
                 status,
+                desired_state,
                 public_host,
                 public_port,
                 backend_kind,
@@ -150,11 +162,12 @@ impl InstanceRepository {
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(instance_id) DO UPDATE SET
                 schema_version = excluded.schema_version,
                 protocol = excluded.protocol,
                 status = excluded.status,
+                desired_state = excluded.desired_state,
                 public_host = excluded.public_host,
                 public_port = excluded.public_port,
                 backend_kind = excluded.backend_kind,
@@ -176,6 +189,7 @@ impl InstanceRepository {
         .bind(i64::from(metadata.schema_version))
         .bind(metadata.protocol.to_string())
         .bind(metadata.status.as_str())
+        .bind(metadata.desired_state.as_str())
         .bind(&metadata.public.host)
         .bind(i64::from(metadata.public.port))
         .bind(backend.kind)
@@ -199,6 +213,7 @@ impl InstanceRepository {
             || metadata.mysql_native_password_sha1_stage2.is_some()
             || metadata.mysql_root_password.is_some()
             || metadata.mongodb_root_password.is_some()
+            || metadata.tenant_password.is_some()
         {
             sqlx::query(
                 r#"
@@ -209,15 +224,17 @@ impl InstanceRepository {
                     mysql_native_password_sha1_stage2,
                     mysql_root_password,
                     mongodb_root_password,
+                    tenant_password,
                     updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     mariadb_native_password_sha1_stage2 = excluded.mariadb_native_password_sha1_stage2,
                     mariadb_root_password = excluded.mariadb_root_password,
                     mysql_native_password_sha1_stage2 = excluded.mysql_native_password_sha1_stage2,
                     mysql_root_password = excluded.mysql_root_password,
                     mongodb_root_password = excluded.mongodb_root_password,
+                    tenant_password = excluded.tenant_password,
                     updated_at = excluded.updated_at
                 "#,
             )
@@ -227,6 +244,7 @@ impl InstanceRepository {
             .bind(&mysql_native_password_sha1_stage2)
             .bind(&mysql_root_password)
             .bind(&mongodb_root_password)
+            .bind(&tenant_password)
             .bind(&metadata.updated_at)
             .execute(&mut *transaction)
             .await?;
@@ -238,6 +256,21 @@ impl InstanceRepository {
         }
 
         transaction.commit().await?;
+        Ok(())
+    }
+
+    fn load_desired_state(
+        &self,
+        metadata: &mut InstanceMetadata,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<(), RepositoryError> {
+        let value: String = row.try_get("desired_state")?;
+        metadata.desired_state = DesiredInstanceState::parse(&value).ok_or_else(|| {
+            RepositoryError::InvalidDesiredState {
+                instance_id: metadata.instance_id.clone(),
+                value,
+            }
+        })?;
         Ok(())
     }
 
@@ -255,6 +288,7 @@ impl InstanceRepository {
                 || metadata.mysql_native_password_sha1_stage2.is_some()
                 || metadata.mysql_root_password.is_some()
                 || metadata.mongodb_root_password.is_some()
+                || metadata.tenant_password.is_some()
         }) {
             self.upsert(metadata).await?;
             rewritten += 1;
@@ -291,6 +325,11 @@ impl InstanceRepository {
             "mongodb_root_password",
             &metadata.instance_id,
             row.try_get("mongodb_root_password")?,
+        )?;
+        metadata.tenant_password = self.unprotect_route_secret(
+            "tenant_password",
+            &metadata.instance_id,
+            row.try_get("tenant_password")?,
         )?;
         Ok(())
     }
@@ -393,6 +432,8 @@ pub enum RepositoryError {
     Secrets(#[from] SecretStoreError),
     #[error("metadata schema version {actual} is not supported")]
     UnsupportedSchema { actual: u32 },
+    #[error("instance {instance_id} has unsupported desired state {value:?}")]
+    InvalidDesiredState { instance_id: String, value: String },
 }
 
 #[cfg(test)]
@@ -430,6 +471,34 @@ mod tests {
         let metadata = repository.get("missing").await.unwrap();
 
         assert!(metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn persists_desired_state_outside_public_metadata_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::new(pool.clone());
+        let mut metadata = sample_metadata();
+        metadata.desired_state = DesiredInstanceState::Stopped;
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let (desired_state, metadata_json): (String, String) = sqlx::query_as(
+            "SELECT desired_state, metadata_json FROM instance_metadata WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(desired_state, "stopped");
+        assert!(!metadata_json.contains("desired_state"));
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(loaded.desired_state, DesiredInstanceState::Stopped);
+        assert!(
+            !serde_json::to_string(&loaded)
+                .unwrap()
+                .contains("desired_state")
+        );
     }
 
     #[tokio::test]
@@ -643,6 +712,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_repository_stores_tenant_password_outside_public_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.tenant_password = Some("current-tenant-password".to_string());
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let raw: String = sqlx::query_scalar(
+            "SELECT tenant_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_encrypted(&raw));
+        assert!(!raw.contains("current-tenant-password"));
+
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.tenant_password.as_deref(),
+            Some("current-tenant-password")
+        );
+        let public_json = serde_json::to_string(&loaded).unwrap();
+        assert!(!public_json.contains("tenant_password"));
+        assert!(!public_json.contains("current-tenant-password"));
+    }
+
+    #[tokio::test]
     async fn encrypted_repository_rewrites_legacy_plaintext_route_auth() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
@@ -677,6 +776,7 @@ mod tests {
             instance_id: "inst_abc".to_string(),
             protocol: Protocol::Postgres,
             status: InstanceStatus::Running,
+            desired_state: DesiredInstanceState::Running,
             public: PublicEndpoint {
                 host: "db.example.com".to_string(),
                 port: 5433,
@@ -699,6 +799,7 @@ mod tests {
             mysql_native_password_sha1_stage2: None,
             mysql_root_password: None,
             mongodb_root_password: None,
+            tenant_password: None,
             limits: InstanceLimits::default(),
             image: None,
             database_version: None,

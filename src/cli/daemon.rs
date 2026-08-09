@@ -127,6 +127,17 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "quarantined instances with mutating import jobs interrupted by an unclean shutdown"
         );
     }
+    let volumes_root = config.paths.volumes_root();
+    let quarantined_physical_restore_instances =
+        quarantine_retained_physical_restore_workspaces(&manager, Path::new(&volumes_root))
+            .await
+            .context("failed to quarantine instances with retained physical restore workspaces")?;
+    if quarantined_physical_restore_instances > 0 {
+        tracing::warn!(
+            quarantined_physical_restore_instances,
+            "quarantined instances with retained physical restore rollback state"
+        );
+    }
     let quarantined_recovery_instances = quarantine_retained_import_recovery_manifests(
         &manager,
         Path::new(&config.paths.tmp_root()),
@@ -276,30 +287,70 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         build_router(state.clone()),
         shutdown_jobs.clone(),
         shutdown_creations.clone(),
-        daemon_shutdown,
-        gateway_supervisor,
+        state.api_rate_limiter.clone(),
+        daemon_shutdown.clone(),
+        gateway_supervisor.clone(),
     )
     .await;
+    let shutdown_started = std::time::Instant::now();
+    daemon_shutdown.trigger();
     shutdown_jobs.close_admission();
     shutdown_creations.close_creation_admission();
+    gateway_supervisor.shutdown();
+    tracing::info!(
+        phase = "background_stop",
+        api_server_error = server_result.is_err(),
+        active_import_export_jobs = shutdown_jobs.active_count(),
+        active_instance_creations = shutdown_creations.active_creation_count(),
+        active_mutations = daemon_shutdown.active_mutation_count(),
+        active_websockets = state.api_rate_limiter.active_websocket_count(),
+        active_gateway_connections = gateway_supervisor.active_connections(),
+        "API listener stopped; shutting down daemon-owned background tasks"
+    );
     managed_container_events.abort();
     let _ = managed_container_events.await;
     managed_runtime_boot.abort();
     let _ = managed_runtime_boot.await;
-    let (jobs_drained, creations_drained) = tokio::join!(
-        shutdown_jobs.wait_for_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
-        shutdown_creations.wait_for_creation_drain(IMPORT_EXPORT_DRAIN_TIMEOUT),
+    let (jobs_drained, creations_drained, mutations_drained, websocket_drained, gateway_drain) = tokio::join!(
+        shutdown_jobs.wait_for_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
+        shutdown_creations.wait_for_creation_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
+        daemon_shutdown.wait_for_mutation_drain(API_MUTATION_DRAIN_TIMEOUT),
+        state
+            .api_rate_limiter
+            .wait_for_websocket_drain(WEBSOCKET_DRAIN_TIMEOUT),
+        gateway_supervisor.drain_connections(
+            GATEWAY_CONNECTION_DRAIN_TIMEOUT,
+            GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT,
+        ),
+    );
+    tracing::info!(
+        phase = "drain_complete",
+        elapsed_ms = shutdown_started.elapsed().as_millis(),
+        jobs_drained,
+        creations_drained,
+        mutations_drained,
+        websocket_drained,
+        gateway_connections_at_start = gateway_drain.active_at_start,
+        gateway_connections_remaining = gateway_drain.remaining,
+        gateway_connections_gracefully_drained = gateway_drain.gracefully_drained,
+        "daemon shutdown drain finished; managed database containers were not stopped"
     );
     if !jobs_drained {
         anyhow::bail!(
             "timed out after {} seconds waiting for import/export jobs to finish safely",
-            IMPORT_EXPORT_DRAIN_TIMEOUT.as_secs()
+            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
         );
     }
     if !creations_drained {
         anyhow::bail!(
             "timed out after {} seconds waiting for instance creations to finish safely",
-            IMPORT_EXPORT_DRAIN_TIMEOUT.as_secs()
+            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
+        );
+    }
+    if !mutations_drained {
+        anyhow::bail!(
+            "timed out after {} seconds waiting for active API mutations to finish",
+            API_MUTATION_DRAIN_TIMEOUT.as_secs()
         );
     }
     tracing::info!("active import/export jobs drained");
