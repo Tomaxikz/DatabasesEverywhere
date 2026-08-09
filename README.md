@@ -58,12 +58,21 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 ## Install
 
 Official releases target x86-64, ARM64, and RISC-V 64 Linux with glibc 2.35 or
-newer. Choose the artifact for your host from a versioned release and install
-it to `/usr/local/bin` (x86-64 example):
+newer. This installs the latest release and automatically selects the artifact
+for the host architecture:
 
 ```bash
-sudo curl --fail --location "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/v0.4.1/dbev-x86_64-linux" -o /usr/local/bin/dbev
-sudo chmod +x /usr/local/bin/dbev
+case "$(uname -m)" in
+  x86_64|amd64) DBEV_ARCH=x86_64 ;;
+  aarch64|arm64) DBEV_ARCH=arm64 ;;
+  riscv64) DBEV_ARCH=riscv64 ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+sudo curl --fail --location \
+  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-${DBEV_ARCH}-linux" \
+  -o /usr/local/bin/dbev
+sudo chmod 0755 /usr/local/bin/dbev
 ```
 
 Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
