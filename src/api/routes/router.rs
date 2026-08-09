@@ -54,6 +54,7 @@ pub struct AppStateData {
     pub install_progress: crate::api::progress::InstallProgressStore,
     pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
     pub resource_cache: crate::api::resources::ResourceCache,
+    pub soft_disk_limiter: crate::disk::soft::SoftDiskLimiter,
     pub monitoring_cache: crate::api::websocket::MonitoringSnapshotCache,
     pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
     pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
@@ -422,6 +423,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_origin_policy_rejects_same_host_on_the_wrong_scheme() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/heartbeat")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::ORIGIN, "http://panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["code"], "host_not_allowed");
+    }
+
+    #[tokio::test]
     async fn heartbeat_is_independent_of_gateway_readiness() {
         let state = test_state().await;
         state
@@ -562,6 +582,7 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
             monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),

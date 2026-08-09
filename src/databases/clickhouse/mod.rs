@@ -1,5 +1,8 @@
 pub mod docker;
 
+#[cfg(test)]
+mod integration_tests;
+
 pub mod config {
     #[derive(Debug, Clone)]
     pub struct ClickhouseInstanceConfig {

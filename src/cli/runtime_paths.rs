@@ -606,7 +606,7 @@ pub(super) async fn validate_runtime_support(config: &Config) -> anyhow::Result<
 }
 
 pub(super) fn detect_and_log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
-    let detection = crate::disk::detect_disk_mode(&config.paths)
+    let detection = crate::disk::detect_disk_mode(&config.paths, config.disk.selection)
         .context("failed to inspect configured filesystems for disk-limit selection")?;
     for filesystem in &detection.filesystems {
         tracing::info!(

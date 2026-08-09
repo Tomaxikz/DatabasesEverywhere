@@ -494,11 +494,14 @@ fn peer_rate_limit_key(group: PeerGroup) -> RateLimitKey {
 fn peer_rate_limit_group(peer: Option<SocketAddr>) -> PeerGroup {
     match peer.map(|address| address.ip()) {
         Some(IpAddr::V4(address)) => PeerGroup::V4(address.octets()),
-        Some(IpAddr::V6(address)) => {
-            let mut prefix = [0_u8; 8];
-            prefix.copy_from_slice(&address.octets()[..8]);
-            PeerGroup::V6(prefix)
-        }
+        Some(IpAddr::V6(address)) => address.to_ipv4_mapped().map_or_else(
+            || {
+                let mut prefix = [0_u8; 8];
+                prefix.copy_from_slice(&address.octets()[..8]);
+                PeerGroup::V6(prefix)
+            },
+            |address| PeerGroup::V4(address.octets()),
+        ),
         None => PeerGroup::Unknown,
     }
 }
@@ -621,6 +624,17 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_peers_use_their_ipv4_bucket() {
+        let ipv4 = peer_rate_limit_group(Some("192.0.2.7:5000".parse().unwrap()));
+        let mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.7]:5000".parse().unwrap()));
+        let other_mapped = peer_rate_limit_group(Some("[::ffff:192.0.2.8]:5000".parse().unwrap()));
+
+        assert_eq!(mapped, ipv4);
+        assert_ne!(mapped, other_mapped);
+        assert!(matches!(mapped, PeerGroup::V4([192, 0, 2, 7])));
+    }
+
+    #[test]
     fn unauthenticated_peer_key_cardinality_is_bounded() {
         let keys = (0..10_000_u32)
             .map(|index| {
@@ -635,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_windows_are_independent_and_log_only_the_first_rejection() {
+    async fn request_rate_windows_are_per_credential_and_peer_and_log_once() {
         let limiter = ApiRateLimiter::new(2);
         let first_peer = RateLimitIdentity {
             key: RateLimitKey::Authenticated {
@@ -648,7 +662,10 @@ mod tests {
         let second_peer = RateLimitIdentity {
             key: RateLimitKey::Authenticated {
                 kind: CredentialKind::Api,
-                fingerprint: [2; 32],
+                // The same credential from a different transport peer retains
+                // its own minute bucket. Global pre-request socket admission
+                // is enforced separately by the API listener.
+                fingerprint: [1; 32],
                 peer: PeerGroup::V4([192, 0, 2, 2]),
             },
             trusted: true,

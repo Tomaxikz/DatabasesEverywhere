@@ -304,6 +304,9 @@ async fn restore_instance_backup_admitted(
     let _operation = state.instance_locks.lock(&instance_id).await;
     ensure_operation_can_start(&state)?;
     let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
+    let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, &instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    crate::api::import_export::verify_physical_data_replacement(&state, &metadata, &paths)?;
     let storage = backup_storage(&state)?;
     let materialized = storage
         .materialize(
@@ -325,8 +328,6 @@ async fn restore_instance_backup_admitted(
         materialized.cleanup().await;
         return Err(error);
     }
-    let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, &instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let finished = crate::api::import_export::restore_data_from_archive(
         &state,
         &instance_id,

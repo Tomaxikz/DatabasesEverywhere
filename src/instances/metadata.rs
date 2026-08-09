@@ -22,6 +22,11 @@ pub struct InstanceMetadata {
     /// overwrite this value from a transient container state.
     #[serde(skip)]
     pub(crate) desired_state: DesiredInstanceState,
+    /// Durable restart hysteresis owned exclusively by the predictive disk
+    /// limiter. It lives in a normalized SQLite column and is omitted from
+    /// public instance JSON to preserve the API shape.
+    #[serde(skip)]
+    pub(crate) disk_limit_blocked: bool,
     pub public: PublicEndpoint,
     pub backend: BackendEndpoint,
     pub runtime: RuntimeMetadata,

@@ -48,10 +48,6 @@ impl SecretStore {
         instance_id: &str,
         value: &str,
     ) -> Result<String, SecretStoreError> {
-        if value.starts_with(PREFIX) {
-            return Ok(value.to_string());
-        }
-
         let rng = SystemRandom::new();
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rng.fill(&mut nonce_bytes)
@@ -271,5 +267,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(plaintext, "secret");
+    }
+
+    #[test]
+    fn encrypts_plaintext_even_when_it_starts_with_the_ciphertext_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::open_or_create(dir.path()).unwrap();
+        let plaintext = "dbev1:chosen-by-the-user";
+
+        let encrypted = store
+            .encrypt("tenant_password", "inst_prefix", plaintext)
+            .unwrap();
+
+        assert!(is_encrypted(&encrypted));
+        assert_ne!(encrypted, plaintext);
+        assert_eq!(
+            store
+                .decrypt("tenant_password", "inst_prefix", &encrypted)
+                .unwrap(),
+            plaintext
+        );
     }
 }

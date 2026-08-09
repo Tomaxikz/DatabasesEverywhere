@@ -72,6 +72,14 @@ async fn create_request_rejects_unlisted_image_override_before_pull() {
     assert!(error.to_string().contains("is not allowed"));
 }
 
+#[test]
+fn qdrant_creation_resolves_fuse_fallback_to_soft_scanner() {
+    let limiter = crate::disk::DiskLimiter::new(crate::config::DiskConfig::default())
+        .for_protocol(Protocol::Qdrant);
+
+    assert_eq!(limiter.mode(), crate::config::DiskLimitMode::SoftScanner);
+}
+
 #[tokio::test]
 async fn create_request_allows_same_database_name_for_a_distinct_route_user() {
     let state = test_state(Config::default()).await;
@@ -294,6 +302,7 @@ fn sample_metadata(
         protocol,
         status: InstanceStatus::Running,
         desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        disk_limit_blocked: false,
         public: PublicEndpoint {
             host: "127.0.0.1".to_string(),
             port: 5432,
@@ -343,6 +352,7 @@ async fn test_state(config: Config) -> AppState {
         install_progress: crate::api::progress::InstallProgressStore::default(),
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::resources::ResourceCache::default(),
+        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
         monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),

@@ -11,6 +11,7 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
+    task::JoinSet,
     time::{Duration, timeout},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
@@ -582,6 +583,7 @@ fn expected_client_failure(error: &ListenerError) -> bool {
         | ListenerError::Clickhouse(clickhouse::ClickhouseParseError::IncompleteHttpRequest) => {
             true
         }
+        ListenerError::Qdrant(error) if error.is_stream_local() => true,
         ListenerError::Backend {
             source: tunnel::TunnelError::Tunnel(error),
             ..
@@ -1024,37 +1026,108 @@ async fn handle_qdrant_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (mut server, mut backend) = client_handshake("qdrant", async move {
-        let client = accept_direct_tls(client, tls).await?;
-        let mut server = qdrant::server_handshake(client).await?;
-        let Some(first_request) = server.accept().await else {
-            return Err(qdrant::QdrantProxyError::MissingApiKey.into());
-        };
-        let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
-        let api_key = qdrant::api_key_from_request(&request)?;
-        let route_key_sha256 = qdrant::route_key_sha256(&api_key);
-        let target = resolver
-            .resolve_qdrant(&route_key_sha256)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
-        let backend_stream = tunnel::connect_backend(&target.endpoint)
-            .await
-            .map_err(|source| ListenerError::Backend {
-                instance_id: target.instance_id,
-                source,
-            })?;
-        let backend_stream = tunnel::MeteredBackend::new(backend_stream, target.network);
-        let mut backend = qdrant::client_handshake(backend_stream).await?;
-        qdrant::proxy_request(request, respond, &mut backend).await?;
-        Ok((server, backend))
-    })
-    .await?;
+    let (mut server, backend, first_request, first_respond) =
+        client_handshake("qdrant", async move {
+            let client = accept_direct_tls(client, tls).await?;
+            let mut server = qdrant::server_handshake(client).await?;
+            let Some(first_request) = server.accept().await else {
+                return Err(qdrant::QdrantProxyError::MissingApiKey.into());
+            };
+            let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
+            let api_key = qdrant::api_key_from_request(&request)?;
+            let route_key_sha256 = qdrant::route_key_sha256(&api_key);
+            let target = resolver
+                .resolve_qdrant(&route_key_sha256)
+                .await
+                .ok_or(ListenerError::RouteNotFound)?;
+            let backend_stream =
+                tunnel::connect_backend(&target.endpoint)
+                    .await
+                    .map_err(|source| ListenerError::Backend {
+                        instance_id: target.instance_id,
+                        source,
+                    })?;
+            let backend_stream = tunnel::MeteredBackend::new(backend_stream, target.network);
+            let backend = qdrant::client_handshake(backend_stream).await?;
+            Ok((server, backend, request, respond))
+        })
+        .await?;
 
-    while let Some(next_request) = server.accept().await {
-        let (request, respond) = next_request.map_err(qdrant::QdrantProxyError::from)?;
-        qdrant::proxy_request(request, respond, &mut backend).await?;
+    let mut requests = JoinSet::new();
+    spawn_qdrant_request(&mut requests, first_request, first_respond, &backend);
+
+    loop {
+        tokio::select! {
+            next_request = server.accept() => {
+                let Some(next_request) = next_request else {
+                    requests.abort_all();
+                    while requests.join_next().await.is_some() {}
+                    return Ok(());
+                };
+                let (request, respond) = match next_request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let error = qdrant::QdrantProxyError::from(error);
+                        if error.is_stream_local() {
+                            tracing::debug!(
+                                event = "qdrant_rpc_stream_reset_before_dispatch",
+                                %error,
+                                "qdrant rpc stream reset without closing the multiplexed connection"
+                            );
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                spawn_qdrant_request(&mut requests, request, respond, &backend);
+            }
+            completed = requests.join_next(), if !requests.is_empty() => {
+                let Some(completed) = completed else {
+                    continue;
+                };
+                let (stream_id, result) = completed
+                    .map_err(|error| IoError::other(format!(
+                        "qdrant proxy request task failed: {error}"
+                    )))?;
+                handle_qdrant_stream_result(Some(stream_id), result)?;
+            }
+        }
     }
-    Ok(())
+}
+
+fn handle_qdrant_stream_result(
+    stream_id: Option<h2::StreamId>,
+    result: Result<(), qdrant::QdrantProxyError>,
+) -> Result<(), ListenerError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_stream_local() => {
+            tracing::debug!(
+                event = "qdrant_rpc_stream_reset",
+                stream_id = ?stream_id,
+                %error,
+                "qdrant rpc stream ended without closing the multiplexed connection"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn spawn_qdrant_request(
+    requests: &mut JoinSet<(h2::StreamId, Result<(), qdrant::QdrantProxyError>)>,
+    request: http::Request<h2::RecvStream>,
+    respond: h2::server::SendResponse<bytes::Bytes>,
+    backend: &h2::client::SendRequest<bytes::Bytes>,
+) {
+    let stream_id = request.body().stream_id();
+    let mut backend = backend.clone();
+    requests.spawn(async move {
+        (
+            stream_id,
+            qdrant::proxy_request(request, respond, &mut backend).await,
+        )
+    });
 }
 
 fn clickhouse_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, ListenerError> {
@@ -1181,6 +1254,36 @@ mod tests {
         assert!(!expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::InvalidNativeHello
         )));
+    }
+
+    #[test]
+    fn qdrant_stream_local_failures_do_not_close_the_multiplexed_connection() {
+        assert!(
+            handle_qdrant_stream_result(
+                None,
+                Err(qdrant::QdrantProxyError::InactivityTimeout { timeout_secs: 60 }),
+            )
+            .is_ok()
+        );
+        assert!(
+            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::OutboundStreamClosed),)
+                .is_ok()
+        );
+        assert!(
+            handle_qdrant_stream_result(
+                None,
+                Err(qdrant::QdrantProxyError::StreamReset {
+                    reason: h2::Reason::CANCEL,
+                }),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::MissingApiKey)),
+            Err(ListenerError::Qdrant(
+                qdrant::QdrantProxyError::MissingApiKey
+            ))
+        ));
     }
 
     #[tokio::test]

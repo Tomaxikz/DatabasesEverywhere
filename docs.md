@@ -114,6 +114,7 @@ api:
   host: 127.0.0.1
   port: 8090
   trusted_hosts: [node-api.example.com] # when different from `remote`
+  trusted_origins: [] # extra exact browser origins, if any
 ```
 
 Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0` and configure `api.ssl` according to the node URL selected in the panel.
@@ -199,22 +200,47 @@ independently for deliberate test-node overcommit, but production nodes should
 leave every guard enabled. Stopped and failed instances remain allocated until
 deleted.
 
-Disk enforcement is selected automatically on every daemon boot. DBE inspects
-every configured path and logs its backing mount, source, filesystem type, and
-mount options. The filesystem backing `paths.volumes` determines enforcement:
-Btrfs qgroups, ZFS refquotas, and project-quota-enabled XFS/ext4/f2fs mounts use
-native quotas; other filesystems use FuseQuota. There is deliberately no
-`disk.mode` setting and no unenforced fallback.
+Disk enforcement is resolved on every daemon boot. DBE inspects every
+configured path and logs its backing mount, source, filesystem type, and mount
+options. In the default `auto` mode, Btrfs qgroups, ZFS refquotas, and
+project-quota-enabled XFS/ext4/f2fs mounts use native hard quotas; other
+filesystems use FuseQuota. Qdrant is the exception: because Qdrant does not
+consider FUSE safe for persistent vector storage, it uses native storage plus
+the predictive soft scanner whenever a native quota is unavailable.
 
 Use this disk section:
 
 ```yaml
 disk:
+  mode: auto
   fuse_quota_binary: embedded
   fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
   project_id_base: 200000
+  soft_scanner:
+    scan_interval_seconds: 15
+    max_concurrent_scans: 2
+    max_entries_per_scan: 1000000
+    scan_timeout_seconds: 30
+    max_consecutive_scan_failures: 3
+    safety_reserve_mib: 64
+    recovery_percent: 85
+    shutdown_grace_seconds: 30
 ```
+
+`disk.mode` accepts `auto`, `project_quota`, `fuse_quota`, and
+`soft_scanner`. The legacy value `none` is accepted as an alias for
+`soft_scanner`; it does not disable enforcement. A scanner-enforced instance
+reports `disk_enforced: false`, `disk_enforcement_method: "soft_scanner"`, and
+`enforcement_strength: "soft"` so callers can distinguish predictive
+stop/kill enforcement from a hard write-time quota.
+
+Changing between a raw-data mode and FuseQuota cannot mutate an existing
+container's bind mount. DBE detects that mismatch, stops the affected instance
+fail-closed, and refuses to relabel or restart it until it is safely migrated
+or recreated. Legacy Qdrant-on-Fuse instances receive a rollback-safe migration
+to native storage during boot when their encrypted credentials and immutable
+image identity are available.
 
 For native XFS or ext4 project quotas, DBE allocates from a bounded range of
 at most 1,000,000 consecutive IDs starting at `project_id_base`. Reserve that
@@ -224,7 +250,8 @@ range exclusively for DBE on the host. XFS mode rejects conflicting entries in
 The native systemd service runs as root, so it can configure project quotas and
 FUSE mounts directly without a sudoers rule or a writable-filesystem override.
 Rerun `--setup` after changing the filesystem or its quota mount options so DBE
-rechecks host support for the automatically detected enforcement mode.
+rechecks host support for the selected enforcement mode. Detailed host setup
+and verification instructions are in [Disk limits](docs/disk-limits.md).
 
 FuseQuota uses a helper that's bundled into the binary. When automatic
 detection selects FuseQuota, `dbev` checks that `/dev/fuse` is usable and
@@ -241,8 +268,8 @@ field, and builds never download executable code automatically.
 The generated systemd unit uses `KillMode=process`, so FuseQuota helpers and
 their mounts survive normal daemon restarts. DBE reconnects to healthy helpers
 on boot without interrupting their containers. If an individual helper is
-missing or stale after a crash or host reboot, DBE stops only that instance,
-rebuilds its quota mount, and starts the instance again.
+missing or stale after a crash or host reboot, DBE isolates only the affected
+instance while restoring a truthful, usable enforcement path.
 
 Recommended paths:
 
@@ -375,15 +402,19 @@ Authorization: Bearer <token>
 The config token has the `*` scope, so it can do everything. Things to know:
 
 - Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is a temporary download URL returned by the download endpoint; it carries its own short-lived JWT.
-- The request `Host` must match `remote`, a concrete `api.host`, or an entry in `api.trusted_hosts`. Add the daemon/reverse-proxy hostname there when it differs from the panel hostname. If an `Origin` header is present, it is checked independently against the browser-origin allow-list derived from `remote`. A mismatch in either value returns `401`.
+- The request `Host` must match `remote`, a concrete `api.host`, or an entry in `api.trusted_hosts`. Add the daemon/reverse-proxy hostname there when it differs from the panel hostname. If an `Origin` header is present, it is checked independently against the exact browser-origin allow-list made from `remote` plus `api.trusted_origins`; scheme, hostname, and effective port must all match (for example, implicit HTTPS port 443 equals explicit `:443`). A mismatch in either value returns `401`. Existing configs remain valid because `trusted_origins` defaults to an empty list.
 - Rate limit: 600 requests per minute per authenticated credential and
   transport-peer IP by default. IPv6 peers share a `/64`. Exceed it and you get
   `429`.
 - Request bodies are capped at `security.api_body_limit_bytes`.
-- The listener caps active connections at 2048 and in-flight requests at 1024,
-  allows 30 seconds for HTTP headers and TLS handshakes, and aborts a request
-  body after 60 seconds without another frame. These inactivity limits do not
-  impose a 60-second total upload duration.
+- The listener caps active TCP/TLS/header connections at 2048 node-wide and
+  256 per IPv4 address or native IPv6 `/64` (including idle pre-request
+  connections), and caps in-flight requests at 1024. IPv4-mapped IPv6 peers
+  retain their individual IPv4 identity. This transport admission ceiling is
+  separate from the per-credential-and-peer request-rate quota. It allows 30
+  seconds for HTTP headers and 10 seconds for a TLS handshake, and aborts a
+  request body after 60 seconds without another frame. These inactivity limits
+  do not impose a 60-second total upload duration.
 
 WebSockets don't use the node token directly — see [WebSockets](#websockets).
 
@@ -620,7 +651,7 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
   "cpu": { "configured_cores": 1.0, "usage_percent": 12.5 },
   "memory": { "configured_mib": 2048, "usage_bytes": 104857600, "limit_bytes": 2147483648 },
   "disk": { "configured_mib": 10240, "limit_bytes": 10737418240, "used_bytes": 52428800,
-            "enforced": true, "enforcement_method": "fuse_quota" },
+            "enforced": true, "enforcement_method": "fuse_quota", "enforcement_strength": "hard" },
   "network": { "rx_bytes": 1234, "tx_bytes": 5678 }
 }
 ```
@@ -631,6 +662,13 @@ gateway-to-Unix-socket boundary because managed containers use
 `network_mode=none`; RX is traffic delivered to the database and TX is traffic
 returned by it. The counters start at zero on daemon boot. For continuous
 monitoring use the WebSocket instead of polling this.
+
+Soft-scanner reports additionally expose nullable `scanner_logical_bytes`,
+`scanner_physical_bytes`, current and peak `scanner_growth_bytes_per_second`,
+`scanner_predicted_seconds_to_limit`, stop and recovery thresholds,
+`scanner_restart_blocked`, and `scanner_sample_age_seconds`. These fields let a
+panel show prediction and recovery state without presenting a soft stop as a
+kernel quota.
 
 `GET /api/admin/resources/summary` (scope: `resources:admin`) is the
 node-scheduler view. It reports limits reserved by every managed instance,

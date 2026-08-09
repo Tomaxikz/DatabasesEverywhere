@@ -160,6 +160,7 @@ pub struct ApiConfig {
     pub host: String,
     pub port: u16,
     pub trusted_hosts: Vec<String>,
+    pub trusted_origins: Vec<String>,
     pub ssl: ApiSslConfig,
 }
 
@@ -169,20 +170,29 @@ impl Default for ApiConfig {
             host: "127.0.0.1".to_string(),
             port: ports::API,
             trusted_hosts: Vec::new(),
+            trusted_origins: Vec::new(),
             ssl: ApiSslConfig::default(),
         }
     }
 }
 
 impl Config {
-    pub fn cors_allowed_hosts(&self) -> Vec<String> {
-        let mut hosts = Vec::new();
-        push_url_host(&mut hosts, &self.remote);
-        hosts
+    pub fn cors_allowed_origins(&self) -> Vec<String> {
+        let mut origins = Vec::new();
+        if let Some(origin) = url_origin(&self.remote) {
+            push_unique(&mut origins, &origin);
+        }
+        for origin in &self.api.trusted_origins {
+            if let Some(origin) = normalize_http_origin(origin) {
+                push_unique(&mut origins, &origin);
+            }
+        }
+        origins
     }
 
     pub fn request_allowed_hosts(&self) -> Vec<String> {
-        let mut hosts = self.cors_allowed_hosts();
+        let mut hosts = Vec::new();
+        push_url_host(&mut hosts, &self.remote);
         for host in &self.api.trusted_hosts {
             push_unique(&mut hosts, host.trim());
         }
@@ -228,17 +238,67 @@ fn push_url_host(hosts: &mut Vec<String>, value: &str) {
 }
 
 pub(crate) fn url_host(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    let uri = value.trim().parse::<http::Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
         return None;
     }
-    let rest = trimmed.split_once("://")?.1;
-    let host = rest.split('/').next().unwrap_or(rest).trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.trim_end_matches('/').to_ascii_lowercase())
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
     }
+    if authority.port_u16().is_none() && authority.as_str() != authority.host() {
+        return None;
+    }
+    let host = authority.host().trim_matches(['[', ']']);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Canonicalizes an HTTP(S) origin as scheme + host + effective port.
+/// Explicit origin values may omit the default port and may carry one trailing
+/// slash, but paths, queries, fragments, and user information are rejected.
+pub(crate) fn normalize_http_origin(value: &str) -> Option<String> {
+    let uri = value.trim().parse::<http::Uri>().ok()?;
+    if uri.query().is_some() || !matches!(uri.path(), "" | "/") {
+        return None;
+    }
+    canonical_uri_origin(&uri)
+}
+
+fn url_origin(value: &str) -> Option<String> {
+    let uri = value.trim().parse::<http::Uri>().ok()?;
+    canonical_uri_origin(&uri)
+}
+
+fn canonical_uri_origin(uri: &http::Uri) -> Option<String> {
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = match authority.port_u16() {
+        Some(port) => port,
+        None if authority.as_str() == authority.host() => default_port,
+        None => return None,
+    };
+    let rendered_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(format!("{scheme}://{rendered_host}:{port}"))
 }
 
 pub(crate) fn normalize_remote_import_host(value: &str) -> Option<String> {
@@ -623,29 +683,39 @@ impl DaemonEngine {
 pub struct DiskConfig {
     #[serde(skip)]
     pub mode: DiskLimitMode,
+    /// Operator selection. `auto` prefers native filesystem quotas and falls
+    /// back to FuseQuota; Qdrant is always resolved to the soft scanner when
+    /// that fallback would otherwise be FUSE-backed.
+    #[serde(rename = "mode")]
+    pub selection: DiskLimitSelection,
     pub project_id_base: u32,
     pub fuse_quota_binary: String,
     pub fuse_quota_binary_sha256: String,
     pub fuse_quota_rescan_interval_seconds: u64,
+    pub soft_scanner: SoftDiskScannerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DiskFileConfig {
+    mode: DiskLimitSelection,
     project_id_base: u32,
     fuse_quota_binary: String,
     fuse_quota_binary_sha256: String,
     fuse_quota_rescan_interval_seconds: u64,
+    soft_scanner: SoftDiskScannerConfig,
 }
 
 impl Default for DiskFileConfig {
     fn default() -> Self {
         let defaults = DiskConfig::default();
         Self {
+            mode: defaults.selection,
             project_id_base: defaults.project_id_base,
             fuse_quota_binary: defaults.fuse_quota_binary,
             fuse_quota_binary_sha256: defaults.fuse_quota_binary_sha256,
             fuse_quota_rescan_interval_seconds: defaults.fuse_quota_rescan_interval_seconds,
+            soft_scanner: defaults.soft_scanner,
         }
     }
 }
@@ -658,10 +728,12 @@ impl<'de> Deserialize<'de> for DiskConfig {
         let file = DiskFileConfig::deserialize(deserializer)?;
         Ok(Self {
             mode: DiskLimitMode::default(),
+            selection: file.mode,
             project_id_base: file.project_id_base,
             fuse_quota_binary: file.fuse_quota_binary,
             fuse_quota_binary_sha256: file.fuse_quota_binary_sha256,
             fuse_quota_rescan_interval_seconds: file.fuse_quota_rescan_interval_seconds,
+            soft_scanner: file.soft_scanner,
         })
     }
 }
@@ -823,10 +895,12 @@ impl Default for DiskConfig {
     fn default() -> Self {
         Self {
             mode: DiskLimitMode::FuseQuota,
+            selection: DiskLimitSelection::Auto,
             project_id_base: 200_000,
             fuse_quota_binary: "embedded".to_string(),
             fuse_quota_binary_sha256: String::new(),
             fuse_quota_rescan_interval_seconds: 150,
+            soft_scanner: SoftDiskScannerConfig::default(),
         }
     }
 }
@@ -844,8 +918,65 @@ mod disk_config_tests {
 
         let yaml = serde_yaml::to_string(&disk).unwrap();
 
-        assert!(!yaml.contains("mode:"));
+        assert!(yaml.contains("mode: auto"));
+        assert!(!yaml.contains("host_filesystem_quota"));
         assert!(yaml.contains("project_id_base:"));
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskLimitSelection {
+    /// Prefer native quotas; fall back to FuseQuota for compatible databases.
+    #[default]
+    Auto,
+    /// Force the FuseQuota fallback for compatible databases.
+    FuseQuota,
+    /// Scanner-enforced soft limits. `none` is accepted as a compatibility
+    /// alias, but API metadata deliberately calls the active mechanism a
+    /// soft scanner rather than implying that limits are disabled.
+    #[serde(alias = "none")]
+    SoftScanner,
+    /// Require a supported native filesystem quota implementation.
+    ProjectQuota,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SoftDiskScannerConfig {
+    /// Maximum delay between complete directory scans.
+    pub scan_interval_seconds: u64,
+    /// Concurrent directory walks across all instances.
+    pub max_concurrent_scans: usize,
+    /// Per-instance entry bound for a single walk.
+    pub max_entries_per_scan: usize,
+    /// Per-instance wall-clock budget for a single walk.
+    pub scan_timeout_seconds: u64,
+    /// Stop an active instance after this many consecutive scans cannot
+    /// produce a trustworthy measurement. This prevents scanner bounds or
+    /// filesystem errors from becoming a fail-open bypass.
+    pub max_consecutive_scan_failures: u8,
+    /// Minimum reserve used to absorb writes during detection and shutdown.
+    pub safety_reserve_mib: u64,
+    /// Clear a restart block only below this percentage of the configured
+    /// limit. This hysteresis prevents stop/start oscillation.
+    pub recovery_percent: u8,
+    /// Graceful shutdown deadline before SIGKILL fallback.
+    pub shutdown_grace_seconds: u64,
+}
+
+impl Default for SoftDiskScannerConfig {
+    fn default() -> Self {
+        Self {
+            scan_interval_seconds: 15,
+            max_concurrent_scans: 2,
+            max_entries_per_scan: 1_000_000,
+            scan_timeout_seconds: 30,
+            max_consecutive_scan_failures: 3,
+            safety_reserve_mib: 64,
+            recovery_percent: 85,
+            shutdown_grace_seconds: 30,
+        }
     }
 }
 
@@ -854,17 +985,35 @@ pub enum DiskLimitMode {
     #[default]
     FuseQuota,
     ProjectQuota,
+    SoftScanner,
 }
 
 impl DiskLimitMode {
+    /// This legacy API bit means a hard write-time filesystem limit. The soft
+    /// scanner remains active enforcement, but is intentionally reported as
+    /// non-hard so callers do not mistake it for quota isolation.
     pub fn enforced(self) -> bool {
-        true
+        self != Self::SoftScanner
     }
 
     pub fn method(self) -> &'static str {
         match self {
             Self::FuseQuota => "fuse_quota",
             Self::ProjectQuota => "host_filesystem_quota",
+            Self::SoftScanner => "soft_scanner",
+        }
+    }
+
+    pub fn from_persisted_method(method: &str) -> Option<Self> {
+        match method {
+            "fuse_quota" => Some(Self::FuseQuota),
+            "soft_scanner" => Some(Self::SoftScanner),
+            "host_filesystem_quota"
+            | "host_xfs_project_quota"
+            | "host_linux_project_quota"
+            | "host_btrfs_qgroup"
+            | "host_zfs_refquota" => Some(Self::ProjectQuota),
+            _ => None,
         }
     }
 }

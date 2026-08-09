@@ -17,7 +17,8 @@ pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
     let mut docker = DockerRuntime::new(&config.daemon, false)
-        .context("failed to connect to container engine API")?;
+        .context("failed to connect to container engine API")?
+        .with_node_id(config.uuid.clone());
     docker
         .refresh_engine_info()
         .await
@@ -211,7 +212,8 @@ impl<'a> PathMigrationPlan<'a> {
 
 pub(super) async fn ensure_no_active_managed_containers(config: &Config) -> anyhow::Result<()> {
     let mut docker = DockerRuntime::new(&config.daemon, false)
-        .context("failed to connect to container engine API for migration safety check")?;
+        .context("failed to connect to container engine API for migration safety check")?
+        .with_node_id(config.uuid.clone());
     docker
         .refresh_engine_info()
         .await

@@ -1,4 +1,5 @@
 mod major_upgrade;
+mod normal_image_update;
 mod password;
 mod runtime_info;
 
@@ -16,6 +17,7 @@ use runtime_info::{
 };
 
 use major_upgrade::*;
+use normal_image_update::*;
 pub use password::{
     ResetInstancePasswordRequest, ResetInstancePasswordResponse, reset_instance_password,
 };
@@ -68,6 +70,9 @@ use crate::{
     shared::{protocol::Protocol, redaction, time::now_rfc3339},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+
+const IMAGE_UPDATE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+const IMAGE_UPDATE_FAIL_CLOSED_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn reconcile_instance(
     State(state): State<AppState>,
@@ -205,7 +210,24 @@ pub async fn update_instance_image(
         .await
         .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
     let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_protocol(metadata.protocol);
+    disk_limiter
+        .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+        .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
+    if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
+        != Some(disk_limiter.mode())
+    {
+        return Err(fail_image_update_api(
+            &state,
+            &metadata.instance_id,
+            ApiError::Conflict(format!(
+                "instance currently uses {} disk enforcement but this node selects {}; restart dbev to reconcile or safely migrate it before recreating the image",
+                metadata.limits.disk_enforcement_method,
+                disk_limiter.mode().method(),
+            )),
+        ));
+    }
     disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
@@ -220,18 +242,55 @@ pub async fn update_instance_image(
         .tenant_password
         .clone()
         .or_else(|| request.password.clone());
+    let rollback_image = state
+        .docker
+        .container_immutable_image_id(metadata.protocol, &metadata.instance_id)
+        .await
+        .map_err(docker_error)
+        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?
+        .ok_or_else(|| {
+            fail_image_update_api(
+                &state,
+                &metadata.instance_id,
+                ApiError::Conflict(
+                    "the current container image ID could not be captured; refusing a destructive image replacement without an exact rollback image"
+                        .to_string(),
+                ),
+            )
+        })?;
+    let project_id = state
+        .docker
+        .container_project_id(metadata.protocol, &metadata.instance_id)
+        .await
+        .map_err(docker_error)
+        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     let mut spec = instance_image_update_spec(
         &metadata,
         &paths,
-        container_data_path,
+        container_data_path.clone(),
         &image,
         effective_password.clone().map(SecretString::from),
         protocol_pids_limit(&state, metadata.protocol),
     )
     .await
     .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    let mut rollback_spec = instance_image_update_spec(
+        &metadata,
+        &paths,
+        container_data_path,
+        &rollback_image,
+        effective_password.clone().map(SecretString::from),
+        protocol_pids_limit(&state, metadata.protocol),
+    )
+    .await
+    .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+    let mut rollback_metadata = metadata.clone();
+    rollback_metadata.runtime.network_mode = "none".to_string();
     metadata.runtime.network_mode = "none".to_string();
-    spec.user = Some(container_user);
+    for container_spec in [&mut spec, &mut rollback_spec] {
+        container_spec.user = Some(container_user.clone());
+        container_spec.project_id.clone_from(&project_id);
+    }
     let progress = state.install_progress.clone();
     let progress_instance_id = metadata.instance_id.clone();
     let pull_progress = move |event| progress.docker_pull(&progress_instance_id, event);
@@ -261,131 +320,124 @@ pub async fn update_instance_image(
             ));
         }
     }
-    launch_container_from_spec(
-        &state,
-        &spec,
-        metadata.protocol,
-        &metadata.instance_id,
-        &pull_progress,
-        true,
-        || async { Ok(()) },
-    )
-    .await
-    .map_err(|error| {
-        fail_image_update_api(&state, &metadata.instance_id, error.into_api_error())
-    })?;
-    if metadata.protocol == Protocol::Postgres {
-        provision_postgres_tenant_role(
+    let replacement_result: Result<(), ApiError> = async {
+        launch_container_from_spec(
             &state,
+            &spec,
+            metadata.protocol,
             &metadata.instance_id,
-            &metadata.database.name,
-            &metadata.database.username,
+            &pull_progress,
+            true,
+            || async { Ok(()) },
         )
         .await
-        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
-    }
-    if metadata.protocol == Protocol::Mariadb {
-        let password = effective_password.as_deref().ok_or_else(|| {
-            fail_image_update_api(
+        .map_err(|error| error.into_api_error())?;
+        if metadata.protocol == Protocol::Postgres {
+            provision_postgres_tenant_role(
                 &state,
                 &metadata.instance_id,
+                &metadata.database.name,
+                &metadata.database.username,
+            )
+            .await?;
+        }
+        if metadata.protocol == Protocol::Mariadb {
+            let password = effective_password.as_deref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "password is required when recreating mariadb database containers".to_string(),
-                ),
-            )
-        })?;
-        let root_password = metadata.mariadb_root_password.as_deref().ok_or_else(|| {
-            fail_image_update_api(
-                &state,
-                &metadata.instance_id,
+                )
+            })?;
+            let root_password = metadata.mariadb_root_password.as_deref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "mariadb internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                ),
-            )
-        })?;
-        state.install_progress.stage(
-            &metadata.instance_id,
-            "provision",
-            "re-provisioning MariaDB user",
-        );
-        provision_mariadb_tenant_user(
-            &state,
-            &metadata.instance_id,
-            &metadata.database.name,
-            &metadata.database.username,
-            password,
-            root_password,
-        )
-        .await
-        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
-    }
-    if metadata.protocol == Protocol::Mysql {
-        let password = effective_password.as_deref().ok_or_else(|| {
-            fail_image_update_api(
+                )
+            })?;
+            state.install_progress.stage(
+                &metadata.instance_id,
+                "provision",
+                "re-provisioning MariaDB user",
+            );
+            provision_mariadb_tenant_user(
                 &state,
                 &metadata.instance_id,
+                &metadata.database.name,
+                &metadata.database.username,
+                password,
+                root_password,
+            )
+            .await?;
+        }
+        if metadata.protocol == Protocol::Mysql {
+            let password = effective_password.as_deref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "password is required when recreating mysql database containers".to_string(),
-                ),
-            )
-        })?;
-        let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
-            fail_image_update_api(
-                &state,
-                &metadata.instance_id,
+                )
+            })?;
+            let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
                 ApiError::BadRequest(
                     "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                ),
+                )
+            })?;
+            state.install_progress.stage(
+                &metadata.instance_id,
+                "provision",
+                "re-provisioning MySQL user",
+            );
+            provision_mysql_tenant_user(
+                &state,
+                &metadata.instance_id,
+                &metadata.database.name,
+                &metadata.database.username,
+                password,
+                root_password,
             )
-        })?;
+            .await?;
+        }
         state.install_progress.stage(
             &metadata.instance_id,
-            "provision",
-            "re-provisioning MySQL user",
+            "backend",
+            "resolving backend endpoint",
         );
-        provision_mysql_tenant_user(
+        metadata.backend =
+            backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)?;
+        if metadata.protocol == Protocol::Mariadb
+            && let Some(password) = effective_password.as_deref()
+        {
+            metadata.mariadb_native_password_sha1_stage2 = Some(
+                crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+            );
+        }
+        if metadata.protocol == Protocol::Mysql
+            && let Some(password) = effective_password.as_deref()
+        {
+            metadata.mysql_native_password_sha1_stage2 = Some(
+                crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+            );
+        }
+        if effective_password.is_some() {
+            metadata.tenant_password.clone_from(&effective_password);
+        }
+        metadata.status = InstanceStatus::Running;
+        metadata.limits.disk_enforced = disk_limiter.mode().enforced();
+        metadata.updated_at = now_rfc3339();
+        state
+            .manager
+            .upsert(metadata.clone())
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = replacement_result {
+        let error = rollback_normal_image_update_or_quarantine(
             &state,
-            &metadata.instance_id,
-            &metadata.database.name,
-            &metadata.database.username,
-            password,
-            root_password,
+            &rollback_metadata,
+            &rollback_spec,
+            error,
         )
-        .await
-        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
+        .await;
+        return Err(fail_image_update_api(&state, &metadata.instance_id, error));
     }
-    state.install_progress.stage(
-        &metadata.instance_id,
-        "backend",
-        "resolving backend endpoint",
-    );
-    metadata.backend =
-        backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)
-            .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
-    if metadata.protocol == Protocol::Mariadb
-        && let Some(password) = effective_password.as_deref()
-    {
-        metadata.mariadb_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-        );
-    }
-    if metadata.protocol == Protocol::Mysql
-        && let Some(password) = effective_password.as_deref()
-    {
-        metadata.mysql_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-        );
-    }
-    if effective_password.is_some() {
-        metadata.tenant_password = effective_password;
-    }
-    metadata.status = InstanceStatus::Running;
-    metadata.updated_at = now_rfc3339();
-    state
-        .manager
-        .upsert(metadata.clone())
-        .await
-        .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -476,6 +528,7 @@ pub async fn delete_instance(
         .delete(&metadata.instance_id)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    state.soft_disk_limiter.remove(&metadata.instance_id).await;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -534,17 +587,51 @@ pub async fn update_instance_limits(
     } else {
         None
     };
-    if let Some(paths) = paths.as_ref()
-        && let Err(error) =
-            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-                .update_instance_limit(&metadata.instance_id, &paths.data, limits.disk_mib)
-                .await
-    {
-        let rollback =
-            rollback_disk_limit(&state, &metadata, paths, previous_limits.disk_mib).await;
-        return Err(ApiError::Runtime(format!(
-            "failed to update disk limit: {error}; rollback: {rollback}"
-        )));
+    let effective_disk_limiter =
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
+    if let Some(paths) = paths.as_ref() {
+        effective_disk_limiter
+            .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+            .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        if crate::config::DiskLimitMode::from_persisted_method(
+            &metadata.limits.disk_enforcement_method,
+        ) != Some(effective_disk_limiter.mode())
+        {
+            return Err(ApiError::Conflict(format!(
+                "instance currently uses {} disk enforcement but this node selects {}; restart dbev to reconcile or safely recreate/migrate the container before changing its disk limit",
+                metadata.limits.disk_enforcement_method,
+                effective_disk_limiter.mode().method(),
+            )));
+        }
+        let expected_data_source = effective_disk_limiter
+            .container_data_path(&paths.data)
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        match state
+            .docker
+            .verify_container_data_bind(
+                metadata.protocol,
+                &metadata.instance_id,
+                &expected_data_source,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch { .. }) => {
+                return Err(ApiError::Conflict(error.to_string()));
+            }
+            Err(error) => return Err(docker_error(error)),
+        }
+        if let Err(error) = effective_disk_limiter
+            .update_instance_limit(&metadata.instance_id, &paths.data, limits.disk_mib)
+            .await
+        {
+            let rollback =
+                rollback_disk_limit(&state, &metadata, paths, previous_limits.disk_mib).await;
+            return Err(ApiError::Runtime(format!(
+                "failed to update disk limit: {error}; rollback: {rollback}"
+            )));
+        }
     }
 
     if let Err(error) = state
@@ -573,8 +660,33 @@ pub async fn update_instance_limits(
     metadata.limits.cpu_cores = limits.cpu_cores;
     metadata.limits.memory_mib = limits.memory_mib;
     metadata.limits.disk_mib = limits.disk_mib;
-    metadata.limits.disk_enforced = state.config.disk.mode.enforced();
-    metadata.limits.disk_enforcement_method = state.config.disk.mode.method().to_string();
+    if disk_changed {
+        let effective_disk_mode = effective_disk_limiter.mode();
+        metadata.limits.disk_enforced = effective_disk_mode.enforced();
+        if effective_disk_mode == crate::config::DiskLimitMode::SoftScanner
+            && metadata.disk_limit_blocked
+            && limits.disk_mib > previous_limits.disk_mib
+        {
+            if let Some(paths) = paths.as_ref()
+                && state
+                    .soft_disk_limiter
+                    .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+                        instance_id: metadata.instance_id.clone(),
+                        created_at: metadata.created_at.clone(),
+                        protocol: metadata.protocol,
+                        data_path: paths.data.clone(),
+                        limit_bytes: limits.disk_mib.saturating_mul(1024 * 1024),
+                        durable_blocked: true,
+                    })
+                    .await
+                    .is_ok()
+            {
+                metadata.disk_limit_blocked = false;
+            }
+        } else if effective_disk_mode != crate::config::DiskLimitMode::SoftScanner {
+            metadata.disk_limit_blocked = false;
+        }
+    }
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
         let rollback = rollback_instance_limits(
@@ -593,6 +705,12 @@ pub async fn update_instance_limits(
         .instance_runtime_cache
         .remove(&metadata.instance_id)
         .await;
+    if metadata.limits.disk_enforcement_method != "soft_scanner"
+        && !(metadata.protocol == Protocol::Qdrant
+            && metadata.limits.disk_enforcement_method == "fuse_quota")
+    {
+        state.soft_disk_limiter.remove(&metadata.instance_id).await;
+    }
 
     tracing::info!(
         event = "audit instance_limits_updated",
@@ -630,6 +748,7 @@ async fn rollback_instance_limits(
         && let Some(paths) = paths
         && let Err(error) =
             DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+                .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
                 .update_instance_limit(&metadata.instance_id, &paths.data, previous.disk_mib)
                 .await
     {
@@ -646,6 +765,7 @@ async fn rollback_disk_limit(
 ) -> String {
     let failures =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
             .update_instance_limit(&metadata.instance_id, &paths.data, disk_mib)
             .await
             .err()
@@ -712,6 +832,7 @@ pub(crate) async fn lifecycle_instance(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    let mut metadata_changed = false;
     if metadata.status == InstanceStatus::Quarantined
         && matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
     {
@@ -720,6 +841,64 @@ pub(crate) async fn lifecycle_instance(
                 .to_string(),
         ));
     }
+    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
+        let disk_limiter =
+            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+                .for_persisted_protocol(
+                    metadata.protocol,
+                    &metadata.limits.disk_enforcement_method,
+                );
+        disk_limiter
+            .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+            .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        ensure_limiter_matches_persisted_method(&disk_limiter, &metadata)?;
+        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        let expected_data_source = disk_limiter
+            .container_data_path(&paths.data)
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        match state
+            .docker
+            .verify_container_data_bind(
+                metadata.protocol,
+                &metadata.instance_id,
+                &expected_data_source,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch { .. }) => {
+                return Err(ApiError::Conflict(format!(
+                    "{error}; repair/recreate the managed container before starting it"
+                )));
+            }
+            Err(error) => return Err(docker_error(error)),
+        }
+        let scanner_required = crate::disk::soft::SoftDiskLimiter::enforcement_required(
+            state.config.disk.mode,
+            metadata.protocol,
+        ) || (metadata.protocol == Protocol::Qdrant
+            && metadata.limits.disk_enforcement_method == "fuse_quota");
+        if scanner_required {
+            let snapshot = state
+                .soft_disk_limiter
+                .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+                    instance_id: metadata.instance_id.clone(),
+                    created_at: metadata.created_at.clone(),
+                    protocol: metadata.protocol,
+                    data_path: paths.data,
+                    limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
+                    durable_blocked: metadata.disk_limit_blocked,
+                })
+                .await
+                .map_err(ApiError::Conflict)?;
+            if metadata.disk_limit_blocked && !snapshot.blocked {
+                metadata.disk_limit_blocked = false;
+                metadata.updated_at = now_rfc3339();
+                metadata_changed = true;
+            }
+        }
+    }
     let desired_state = match action {
         LifecycleAction::Start | LifecycleAction::Restart => DesiredInstanceState::Running,
         LifecycleAction::Stop | LifecycleAction::Kill => DesiredInstanceState::Stopped,
@@ -727,6 +906,9 @@ pub(crate) async fn lifecycle_instance(
     if metadata.desired_state != desired_state {
         metadata.desired_state = desired_state;
         metadata.updated_at = now_rfc3339();
+        metadata_changed = true;
+    }
+    if metadata_changed {
         state.manager.upsert(metadata).await.map_err(|error| {
             ApiError::Runtime(format!(
                 "failed to persist requested lifecycle state before applying it: {error}"
@@ -736,12 +918,28 @@ pub(crate) async fn lifecycle_instance(
     lifecycle_instance_locked(state, instance_id, action).await
 }
 
+fn ensure_limiter_matches_persisted_method(
+    limiter: &DiskLimiter,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
+        == Some(limiter.mode())
+    {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(format!(
+        "instance currently uses {} disk enforcement but this node selects {}; restart dbev to reconcile or safely recreate/migrate it before activation",
+        metadata.limits.disk_enforcement_method,
+        limiter.mode().method(),
+    )))
+}
+
 pub(crate) async fn lifecycle_instance_locked(
     state: &AppState,
     instance_id: &str,
     action: LifecycleAction,
 ) -> ApiResult<InstanceMetadata> {
-    let metadata = state
+    let mut metadata = state
         .instances
         .get(instance_id)
         .await
@@ -774,13 +972,80 @@ pub(crate) async fn lifecycle_instance_locked(
             if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
                 let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
                     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-                DiskLimiter::with_fuse_root(
+                let disk_limiter = DiskLimiter::with_fuse_root(
                     state.config.disk.clone(),
                     state.config.paths.fuse_root(),
                 )
-                .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
-                .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                .for_persisted_protocol(
+                    metadata.protocol,
+                    &metadata.limits.disk_enforcement_method,
+                );
+                disk_limiter
+                    .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+                    .map_err(|error| ApiError::Conflict(error.to_string()))?;
+                ensure_limiter_matches_persisted_method(&disk_limiter, &metadata)?;
+                let expected_data_source = disk_limiter
+                    .container_data_path(&paths.data)
+                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                match state
+                    .docker
+                    .verify_container_data_bind(
+                        metadata.protocol,
+                        &metadata.instance_id,
+                        &expected_data_source,
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(
+                        error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch {
+                            ..
+                        },
+                    ) => {
+                        return Err(ApiError::Conflict(error.to_string()));
+                    }
+                    Err(error) => return Err(docker_error(error)),
+                }
+                let scanner_required = crate::disk::soft::SoftDiskLimiter::enforcement_required(
+                    state.config.disk.mode,
+                    metadata.protocol,
+                ) || (metadata.protocol == Protocol::Qdrant
+                    && metadata.limits.disk_enforcement_method == "fuse_quota");
+                if scanner_required {
+                    let snapshot = state
+                        .soft_disk_limiter
+                        .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+                            instance_id: metadata.instance_id.clone(),
+                            created_at: metadata.created_at.clone(),
+                            protocol: metadata.protocol,
+                            data_path: paths.data.clone(),
+                            limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
+                            durable_blocked: metadata.disk_limit_blocked,
+                        })
+                        .await
+                        .map_err(ApiError::Conflict)?;
+                    if metadata.disk_limit_blocked && !snapshot.blocked {
+                        metadata.disk_limit_blocked = false;
+                        metadata.updated_at = now_rfc3339();
+                        state
+                            .manager
+                            .upsert(metadata.clone())
+                            .await
+                            .map_err(|error| {
+                                ApiError::Runtime(format!(
+                                    "failed to clear recovered disk-limit block: {error}"
+                                ))
+                            })?;
+                    }
+                }
+                disk_limiter
+                    .apply_instance_limit(
+                        &metadata.instance_id,
+                        &paths.data,
+                        metadata.limits.disk_mib,
+                    )
+                    .await
+                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
             }
             match action {
                 LifecycleAction::Start => {
@@ -910,6 +1175,7 @@ async fn rollback_lifecycle_runtime(
     };
     match result {
         Ok(_) => "completed".to_string(),
+        Err(error) if !should_be_running && error.is_not_running() => "completed".to_string(),
         Err(error) => {
             tracing::error!(
                 event = "audit lifecycle_rollback_failed",
@@ -928,7 +1194,14 @@ pub(crate) async fn purge_instance_paths(
 ) -> Result<(), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+    let disk_limiter =
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+    let disk_limiter = if let Some(metadata) = state.instances.get(instance_id).await {
+        disk_limiter.for_persisted_method(&metadata.limits.disk_enforcement_method)
+    } else {
+        disk_limiter
+    };
+    disk_limiter
         .purge_instance_data(&paths.data)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
@@ -957,6 +1230,15 @@ pub(crate) async fn purge_instance_paths(
                 "failed to discover retained instance volumes: {error}"
             ))
         })?;
+    // Retained major-upgrade/restore volumes can themselves be Btrfs
+    // subvolumes or ZFS datasets. Remove their native quota object before the
+    // generic filesystem cleanup; `remove_dir_all` cannot delete those roots.
+    for retained_volume in &retained_volumes {
+        disk_limiter
+            .purge_instance_data(retained_volume)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    }
     purge_paths.extend(retained_volumes);
     for path in purge_paths {
         cleanup_path_if_exists(&path).await?;
@@ -1148,191 +1430,5 @@ pub(crate) fn docker_error(error: DockerError) -> ApiError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn retained_instance_volume_paths_are_scoped_to_the_exact_instance() {
-        let root = tempfile::tempdir().unwrap();
-        let data_path = root.path().join("inst_customer_db");
-        let old_upgrade = root
-            .path()
-            .join(".dbe-major-upgrade-old-inst_customer_db-550e8400-e29b-41d4-a716-446655440000");
-        let failed_restore = root
-            .path()
-            .join(".dbe-restore-inst_customer_db-550e8400-e29b-41d4-a716-446655440001");
-        let unrelated = root.path().join(
-            ".dbe-major-upgrade-old-inst_customer_db-other-550e8400-e29b-41d4-a716-446655440002",
-        );
-        tokio::fs::create_dir(&old_upgrade).await.unwrap();
-        tokio::fs::create_dir(&failed_restore).await.unwrap();
-        tokio::fs::create_dir(&unrelated).await.unwrap();
-
-        let mut paths = retained_instance_volume_paths(&data_path).await.unwrap();
-        paths.sort();
-        let mut expected = vec![old_upgrade, failed_restore];
-        expected.sort();
-
-        assert_eq!(paths, expected);
-    }
-
-    #[test]
-    fn deletion_preserves_quarantine_to_avoid_claiming_a_duplicate_route() {
-        assert_eq!(
-            deletion_status(InstanceStatus::Quarantined),
-            InstanceStatus::Quarantined
-        );
-        assert_eq!(
-            deletion_status(InstanceStatus::Running),
-            InstanceStatus::Deleting
-        );
-        assert_eq!(
-            deletion_status(InstanceStatus::Deleting),
-            InstanceStatus::Deleting
-        );
-    }
-
-    #[test]
-    fn parses_major_version_from_common_image_tags() {
-        assert_eq!(image_major_version("mongo:7.0.37"), Some(7));
-        assert_eq!(
-            image_major_version("docker.io/library/postgres:18.4"),
-            Some(18)
-        );
-        assert_eq!(
-            image_major_version("registry.example.com:5000/db/mariadb:12.3.2"),
-            Some(12)
-        );
-        assert_eq!(image_major_version("mysql:8.4"), Some(8));
-    }
-
-    #[test]
-    fn rejects_unpinned_images_for_existing_instance_updates() {
-        assert!(image_major_version("mongo:latest").is_none());
-        assert!(image_major_version("mongo@sha256:abc").is_none());
-        assert!(image_major_version("mongo").is_none());
-    }
-
-    #[test]
-    fn parses_major_version_values() {
-        assert_eq!(parse_major_version_value("8.3"), Some(8));
-        assert_eq!(parse_major_version_value("v7.0"), None);
-        assert_eq!(parse_major_version_value("latest"), None);
-    }
-
-    #[test]
-    fn classifies_major_version_changes() {
-        let change =
-            classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:8.3.4").unwrap();
-        assert_eq!(change, ImageVersionChange::Major);
-
-        let change =
-            classify_image_update(Protocol::Postgres, "postgres:18.3", "postgres:18.4").unwrap();
-        assert_eq!(change, ImageVersionChange::SameMajorOrUnknown);
-    }
-
-    #[test]
-    fn requires_parseable_tags_for_different_existing_images() {
-        let error =
-            classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:latest").unwrap_err();
-        assert!(error.to_string().contains("cannot compare requested image"));
-    }
-
-    #[test]
-    fn major_upgrade_path_blocks_downgrades() {
-        let error = validate_major_upgrade_path(Protocol::Postgres, 18, 17).unwrap_err();
-        assert!(error.to_string().contains("downgrade is blocked"));
-    }
-
-    #[test]
-    fn mongodb_major_upgrade_path_blocks_skipped_versions() {
-        let error = validate_major_upgrade_path(Protocol::Mongodb, 6, 8).unwrap_err();
-        assert!(error.to_string().contains("cannot skip versions"));
-
-        assert!(validate_major_upgrade_path(Protocol::Mongodb, 7, 8).is_ok());
-    }
-
-    #[test]
-    fn non_mongodb_dump_upgrade_path_allows_skipped_versions() {
-        assert!(validate_major_upgrade_path(Protocol::Postgres, 14, 18).is_ok());
-    }
-
-    #[test]
-    fn major_migration_support_is_limited_to_logical_dump_protocols() {
-        assert!(ensure_major_upgrade_supported(Protocol::Postgres).is_ok());
-        assert!(ensure_major_upgrade_supported(Protocol::Mysql).is_ok());
-        assert!(ensure_major_upgrade_supported(Protocol::Mongodb).is_ok());
-        assert!(ensure_major_upgrade_supported(Protocol::Redis).is_err());
-        assert!(ensure_major_upgrade_supported(Protocol::Valkey).is_err());
-        assert!(ensure_major_upgrade_supported(Protocol::Qdrant).is_err());
-    }
-
-    #[test]
-    fn replacement_validation_uses_managed_database_unix_sockets() {
-        let postgres =
-            replacement_validation_command(Protocol::Postgres, "app_user", "app_db").unwrap();
-        assert!(postgres.contains("-h /var/run/postgresql"));
-        assert!(!postgres.contains("-h 127.0.0.1"));
-
-        let mariadb =
-            replacement_validation_command(Protocol::Mariadb, "app_user", "app_db").unwrap();
-        assert!(mariadb.contains("--protocol=socket"));
-        assert!(mariadb.contains("--socket=/run/mysqld/mysqld.sock"));
-        assert!(!mariadb.contains("-h 127.0.0.1"));
-
-        let mysql = replacement_validation_command(Protocol::Mysql, "app_user", "app_db").unwrap();
-        assert!(mysql.contains("--protocol=socket"));
-        assert!(mysql.contains("--socket=/var/run/mysqld/mysqld.sock"));
-    }
-
-    #[test]
-    fn normalizes_database_version_outputs() {
-        assert_eq!(
-            normalize_database_version(Protocol::Postgres, "postgres (PostgreSQL) 18.4\n"),
-            Some("18.4".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(
-                Protocol::Mariadb,
-                "mariadb  Ver 15.1 Distrib 12.3.2-MariaDB, for Linux (x86_64)\n"
-            ),
-            Some("12.3.2-MariaDB".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(
-                Protocol::Mysql,
-                "mysqld  Ver 8.4.6 for Linux on x86_64 (MySQL Community Server - GPL)\n"
-            ),
-            Some("8.4.6".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(
-                Protocol::Redis,
-                "Redis server v=8.8.0 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64\n"
-            ),
-            Some("8.8.0".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(
-                Protocol::Valkey,
-                "Valkey server v=9.1.1 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64\n"
-            ),
-            Some("9.1.1".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(Protocol::Mongodb, "v8.3.4\n"),
-            Some("8.3.4".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(
-                Protocol::Clickhouse,
-                "ClickHouse server version 25.8.25.37 (official build).\n"
-            ),
-            Some("25.8.25.37".to_string())
-        );
-        assert_eq!(
-            normalize_database_version(Protocol::Qdrant, "qdrant 1.18.2\n"),
-            Some("1.18.2".to_string())
-        );
-    }
-}
+#[path = "instances/tests.rs"]
+mod tests;

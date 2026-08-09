@@ -15,7 +15,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
         api_host = %config.api.host,
         api_port = config.api.port,
         remote = %config.remote,
-        cors_allowed_hosts = ?config.cors_allowed_hosts(),
+        cors_allowed_origins = ?config.cors_allowed_origins(),
         body_limit_bytes = config.security.api_body_limit_bytes,
         api_rate_limit_per_minute = config.security.api_rate_limit_per_minute,
         "api configuration"
@@ -309,7 +309,37 @@ pub(super) async fn reapply_instance_disk_limits(
                             )
                         })?;
                 }
-                if !disk_limiter
+                let legacy_qdrant_fuse_retained = if metadata.protocol == Protocol::Qdrant {
+                    !migrate_legacy_qdrant_fuse_storage(
+                        config,
+                        docker,
+                        disk_limiter,
+                        &metadata,
+                        &paths,
+                    )
+                    .await?
+                } else {
+                    false
+                };
+                let effective_limiter = if legacy_qdrant_fuse_retained {
+                    // Migration was deliberately deferred or rolled back. The
+                    // existing container is still bound to FuseQuota, even if
+                    // the operator has since selected soft/native enforcement.
+                    disk_limiter.legacy_fuse_limiter()
+                } else {
+                    disk_limiter.for_protocol(metadata.protocol)
+                };
+                effective_limiter.validate_persisted_method_transition(
+                    &metadata.limits.disk_enforcement_method,
+                )?;
+                ensure_container_uses_effective_disk_path(
+                    docker,
+                    &metadata,
+                    &paths,
+                    &effective_limiter,
+                )
+                .await?;
+                if !effective_limiter
                     .instance_runtime_is_healthy(&paths.data)
                     .await
                     .with_context(|| {
@@ -336,7 +366,7 @@ pub(super) async fn reapply_instance_disk_limits(
                         }
                     }
                 }
-                disk_limiter
+                let enforcement = effective_limiter
                     .apply_instance_limit(
                         &metadata.instance_id,
                         &paths.data,
@@ -346,7 +376,10 @@ pub(super) async fn reapply_instance_disk_limits(
                     .with_context(|| {
                         format!("failed to apply disk limit for {}", metadata.instance_id)
                     })?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<(crate::config::DiskLimitMode, crate::disk::DiskEnforcement), anyhow::Error>((
+                    effective_limiter.mode(),
+                    enforcement,
+                ))
             }
             .await;
             (metadata, outcome)
@@ -356,9 +389,18 @@ pub(super) async fn reapply_instance_disk_limits(
         .await;
     let mut failed = 0_usize;
     for (mut metadata, outcome) in outcomes {
-        let Err(error) = outcome else {
+        if let Ok((_effective_mode, enforcement)) = outcome.as_ref() {
+            if metadata.limits.disk_enforced != enforcement.enforced
+                || metadata.limits.disk_enforcement_method != enforcement.method
+            {
+                metadata.limits.disk_enforced = enforcement.enforced;
+                metadata.limits.disk_enforcement_method = enforcement.method.clone();
+                metadata.updated_at = now_rfc3339();
+                manager.upsert(metadata).await?;
+            }
             continue;
-        };
+        }
+        let error = outcome.expect_err("disk-limit error checked above");
         failed += 1;
         tracing::error!(
             instance_id = %metadata.instance_id,
@@ -380,16 +422,7 @@ pub(super) async fn reapply_instance_disk_limits(
                 true
             }
         };
-        if stop_failed {
-            metadata.status = InstanceStatus::Quarantined;
-            metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-        } else if metadata.desired_state
-            == crate::instances::metadata::DesiredInstanceState::Stopped
-        {
-            metadata.status = InstanceStatus::Stopped;
-        } else {
-            metadata.status = InstanceStatus::Failed;
-        }
+        isolate_disk_reconciliation_failure(&mut metadata, stop_failed);
         metadata.updated_at = now_rfc3339();
         manager.upsert(metadata).await?;
     }
@@ -400,6 +433,307 @@ pub(super) async fn reapply_instance_disk_limits(
         );
     }
     Ok(())
+}
+
+pub(super) fn isolate_disk_reconciliation_failure(
+    metadata: &mut crate::instances::metadata::InstanceMetadata,
+    stop_failed: bool,
+) {
+    // A Failed+desired-running instance is automatically retried later in the
+    // same boot. Persist explicit stopped intent for every reconciliation or
+    // bind-source failure so activation cannot immediately bypass the mode we
+    // failed to establish.
+    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+    metadata.status = if stop_failed {
+        InstanceStatus::Quarantined
+    } else {
+        InstanceStatus::Failed
+    };
+}
+
+async fn ensure_container_uses_effective_disk_path(
+    docker: &DockerRuntime,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    paths: &InstancePaths,
+    effective_limiter: &DiskLimiter,
+) -> anyhow::Result<()> {
+    let expected_source = effective_limiter.container_data_path(&paths.data)?;
+    match docker
+        .verify_container_data_bind(metadata.protocol, &metadata.instance_id, &expected_source)
+        .await
+    {
+        Ok(()) => Ok(()),
+        // A missing container can be recreated later with the selected mode.
+        // There is no running bind source that could bypass enforcement.
+        Err(error) if error.is_not_found() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Move a pre-exclusion Qdrant instance from its FuseQuota bind source to the
+/// raw backing directory. Every destructive runtime step has a remount/recreate
+/// rollback; the backing data directory is never renamed or deleted.
+async fn migrate_legacy_qdrant_fuse_storage(
+    config: &Config,
+    docker: &DockerRuntime,
+    disk_limiter: &DiskLimiter,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    paths: &InstancePaths,
+) -> anyhow::Result<bool> {
+    let legacy_mount = disk_limiter.legacy_fuse_container_path(&paths.data)?;
+    let legacy_mount_present = disk_limiter.legacy_fuse_mount_is_present(&paths.data)?;
+    let bound_source = match docker
+        .container_bind_source(metadata.protocol, &metadata.instance_id, "/dbe-qdrant")
+        .await
+    {
+        Ok(source) => source,
+        Err(error) if error.is_not_found() => None,
+        Err(error) => return Err(error.into()),
+    };
+    if !legacy_qdrant_container_uses_fuse(bound_source.as_deref(), &legacy_mount) {
+        if legacy_mount_present {
+            disk_limiter.teardown_legacy_fuse_mount(&paths.data).await?;
+            tracing::info!(
+                event = "audit qdrant_stale_fuse_mount_removed",
+                instance_id = %metadata.instance_id,
+                bound_source = bound_source.as_ref().map(|path| path.display().to_string()),
+                legacy_mount = %legacy_mount.display(),
+                "removed a stale legacy Qdrant FuseQuota mount without recreating a container that did not use it"
+            );
+        }
+        return Ok(true);
+    }
+    let migration_target_mode = disk_limiter.mode_for_protocol(metadata.protocol);
+    if !qdrant_fuse_migration_target_is_safe(migration_target_mode) {
+        tracing::error!(
+            event = "audit qdrant_fuse_migration_deferred",
+            instance_id = %metadata.instance_id,
+            target_mode = migration_target_mode.method(),
+            "legacy Qdrant FuseQuota storage cannot be adopted transactionally by a native project-quota backend; temporarily select disk.mode=soft_scanner to migrate it to raw storage, or use a backup/create/import migration"
+        );
+        return Ok(false);
+    }
+    let Some(api_key) = metadata.tenant_password.clone() else {
+        tracing::error!(
+            event = "audit qdrant_fuse_migration_deferred",
+            instance_id = %metadata.instance_id,
+            "legacy Qdrant FuseQuota mount was retained because encrypted tenant credential metadata is unavailable; reset the instance password, then restart dbev to retry safe migration"
+        );
+        return Ok(false);
+    };
+    let image = match docker
+        .container_immutable_image_id(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(Some(image)) => image,
+        Ok(None) => {
+            tracing::error!(
+                event = "audit qdrant_fuse_migration_deferred",
+                instance_id = %metadata.instance_id,
+                "legacy Qdrant FuseQuota mount was retained because its immutable container image ID is unavailable"
+            );
+            return Ok(false);
+        }
+        Err(error) if error.is_not_found() => {
+            tracing::error!(
+                event = "audit qdrant_fuse_migration_deferred",
+                instance_id = %metadata.instance_id,
+                "legacy Qdrant FuseQuota mount was retained because its managed container is missing"
+            );
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let inspection = docker
+        .inspect_instance(metadata.protocol, &metadata.instance_id)
+        .await?;
+    let (stop_existing, should_run) =
+        qdrant_migration_runtime_actions(inspection.status, metadata.desired_state);
+    let container_user = crate::api::instance_create::prepare_instance_container_user(
+        docker,
+        paths,
+        metadata.protocol,
+    )
+    .await?;
+    let project_id = docker
+        .container_project_id(metadata.protocol, &metadata.instance_id)
+        .await?;
+    let raw_spec = qdrant_migration_spec(
+        config,
+        metadata,
+        paths,
+        QdrantMigrationContainer {
+            data_path: paths.data.clone(),
+            image: &image,
+            api_key: &api_key,
+            container_user: &container_user,
+            project_id: project_id.clone(),
+        },
+    );
+    let legacy_spec = qdrant_migration_spec(
+        config,
+        metadata,
+        paths,
+        QdrantMigrationContainer {
+            data_path: legacy_mount,
+            image: &image,
+            api_key: &api_key,
+            container_user: &container_user,
+            project_id,
+        },
+    );
+
+    if stop_existing {
+        docker
+            .stop(metadata.protocol, &metadata.instance_id)
+            .await?;
+    }
+
+    let migration = async {
+        // Deletion is part of the rollback-covered transaction. An engine
+        // response can be lost after it removed the container; either outcome
+        // is safe because rollback tolerates not-found and recreates exactly
+        // the immutable image/spec captured above.
+        docker
+            .delete(metadata.protocol, &metadata.instance_id)
+            .await?;
+        disk_limiter.teardown_legacy_fuse_mount(&paths.data).await?;
+        disk_limiter
+            .for_protocol(metadata.protocol)
+            .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+            .await?;
+        docker.create(&raw_spec).await?;
+        if should_run {
+            docker
+                .start(metadata.protocol, &metadata.instance_id)
+                .await?;
+            docker
+                .wait_until_ready(
+                    metadata.protocol,
+                    &metadata.instance_id,
+                    Duration::from_secs(120),
+                )
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(migration_error) = migration {
+        let rollback = async {
+            match docker
+                .delete(metadata.protocol, &metadata.instance_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is_not_found() => {}
+                Err(error) => return Err(anyhow::Error::from(error)),
+            }
+            disk_limiter
+                .apply_legacy_fuse_limit(&paths.data, metadata.limits.disk_mib)
+                .await?;
+            docker.create(&legacy_spec).await?;
+            if should_run {
+                docker
+                    .start(metadata.protocol, &metadata.instance_id)
+                    .await?;
+                docker
+                    .wait_until_ready(
+                        metadata.protocol,
+                        &metadata.instance_id,
+                        Duration::from_secs(120),
+                    )
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match rollback {
+            Ok(()) => {
+                tracing::error!(
+                    event = "audit qdrant_fuse_migration_rolled_back",
+                    instance_id = %metadata.instance_id,
+                    error = %migration_error,
+                    "Qdrant migration to native storage failed; restored its previous FuseQuota container and retained truthful hard-enforcement metadata"
+                );
+                return Ok(false);
+            }
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "Qdrant FuseQuota migration failed ({migration_error}) and rollback failed ({rollback_error})"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        event = "audit qdrant_fuse_migration_completed",
+        instance_id = %metadata.instance_id,
+        running = should_run,
+        "migrated legacy Qdrant storage from FuseQuota to raw filesystem storage governed by the selected non-FUSE enforcement"
+    );
+    Ok(true)
+}
+
+pub(super) fn qdrant_migration_runtime_actions(
+    observed: DockerContainerStatus,
+    desired: crate::instances::metadata::DesiredInstanceState,
+) -> (bool, bool) {
+    let stop_existing = matches!(
+        observed,
+        DockerContainerStatus::Running | DockerContainerStatus::Starting
+    );
+    let start_replacement = desired == crate::instances::metadata::DesiredInstanceState::Running;
+    (stop_existing, start_replacement)
+}
+
+pub(super) fn qdrant_fuse_migration_target_is_safe(mode: crate::config::DiskLimitMode) -> bool {
+    mode != crate::config::DiskLimitMode::ProjectQuota
+}
+
+pub(super) fn legacy_qdrant_container_uses_fuse(
+    bound_source: Option<&Path>,
+    legacy_mount: &Path,
+) -> bool {
+    bound_source == Some(legacy_mount)
+}
+
+pub(super) struct QdrantMigrationContainer<'a> {
+    pub(super) data_path: PathBuf,
+    pub(super) image: &'a str,
+    pub(super) api_key: &'a str,
+    pub(super) container_user: &'a str,
+    pub(super) project_id: Option<String>,
+}
+
+pub(super) fn qdrant_migration_spec(
+    config: &Config,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    paths: &InstancePaths,
+    container: QdrantMigrationContainer<'_>,
+) -> crate::runtime::docker::DockerInstanceSpec {
+    let mut spec = crate::databases::qdrant::docker::instance_spec(
+        &metadata.instance_id,
+        container.image,
+        secrecy::SecretString::from(container.api_key.to_string()),
+        container.data_path,
+        paths.logs.clone(),
+        paths.sockets.clone(),
+        paths.socket_bridge_binary.clone(),
+    );
+    spec.project_id = container.project_id;
+    spec.user = Some(container.container_user.to_string());
+    spec.cpu_cores = metadata.limits.cpu_cores;
+    spec.memory_mib = metadata.limits.memory_mib;
+    spec.disk_mib = metadata.limits.disk_mib;
+    spec.pids_limit = Some(
+        config
+            .security
+            .pids_limits
+            .qdrant
+            .unwrap_or(config.security.pids_limit),
+    );
+    spec
 }
 
 pub(super) async fn start_known_instances_on_boot(
@@ -469,7 +803,7 @@ pub(super) async fn start_known_instance_on_boot(
     };
 
     let _operation = instance_locks.lock(&snapshot.instance_id).await;
-    let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
+    let Some(mut metadata) = manager.store().get(&snapshot.instance_id).await else {
         return Ok(None);
     };
     let Some(action) = managed_boot_action(metadata.status, metadata.desired_state) else {
@@ -493,6 +827,8 @@ pub(super) async fn start_known_instance_on_boot(
     );
 
     let mut boot_failed = false;
+    let mut disk_blocked = false;
+    let mut disk_bind_blocked = false;
     if let Err(error) =
         ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
             .await
@@ -507,10 +843,76 @@ pub(super) async fn start_known_instance_on_boot(
     } else {
         let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
             .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
-        if let Err(error) =
+        let disk_limiter =
             DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
-                .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+                .for_persisted_protocol(
+                    metadata.protocol,
+                    &metadata.limits.disk_enforcement_method,
+                );
+        let expected_data_source = disk_limiter.container_data_path(&paths.data)?;
+        if let Err(error) = docker
+            .verify_container_data_bind(
+                metadata.protocol,
+                &metadata.instance_id,
+                &expected_data_source,
+            )
+            .await
+        {
+            boot_failed = true;
+            disk_bind_blocked = true;
+            tracing::error!(
+                event = "audit disk_limit_bind_boot_blocked",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "refused to activate an instance whose container data bind does not match the selected disk enforcement"
+            );
+        }
+        let scanner_required = crate::disk::soft::SoftDiskLimiter::enforcement_required(
+            config.disk.mode,
+            metadata.protocol,
+        ) || (metadata.protocol == Protocol::Qdrant
+            && metadata.limits.disk_enforcement_method == "fuse_quota");
+        if !disk_bind_blocked && scanner_required {
+            let soft_limiter =
+                crate::disk::soft::SoftDiskLimiter::new(config.disk.soft_scanner.clone());
+            match soft_limiter
+                .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+                    instance_id: metadata.instance_id.clone(),
+                    created_at: metadata.created_at.clone(),
+                    protocol: metadata.protocol,
+                    data_path: paths.data.clone(),
+                    limit_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024),
+                    durable_blocked: metadata.disk_limit_blocked,
+                })
                 .await
+            {
+                Ok(snapshot) => {
+                    if metadata.disk_limit_blocked && !snapshot.blocked {
+                        metadata.disk_limit_blocked = false;
+                        metadata.updated_at = now_rfc3339();
+                    }
+                }
+                Err(error) => {
+                    boot_failed = true;
+                    disk_blocked = true;
+                    metadata.disk_limit_blocked = true;
+                    tracing::error!(
+                        event = "audit soft_disk_boot_blocked",
+                        instance_id = %metadata.instance_id,
+                        protocol = %metadata.protocol,
+                        %error,
+                        "refused to activate an instance whose data is above the soft disk threshold or could not be measured safely"
+                    );
+                }
+            }
+        }
+        if disk_bind_blocked || disk_blocked {
+            // The preflight already emitted an actionable audit event and the
+            // durable stopped state is persisted below.
+        } else if let Err(error) = disk_limiter
+            .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+            .await
         {
             boot_failed = true;
             tracing::warn!(
@@ -581,7 +983,15 @@ pub(super) async fn start_known_instance_on_boot(
     }
 
     let mut reconciled = reconcile::reconcile_one(metadata, docker).await;
-    if boot_failed {
+    if disk_bind_blocked {
+        reconciled.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        reconciled.status = InstanceStatus::Failed;
+        reconciled.updated_at = now_rfc3339();
+    } else if disk_blocked {
+        reconciled.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        reconciled.status = InstanceStatus::Stopped;
+        reconciled.updated_at = now_rfc3339();
+    } else if boot_failed {
         reconciled.status = InstanceStatus::Failed;
         reconciled.updated_at = now_rfc3339();
     }

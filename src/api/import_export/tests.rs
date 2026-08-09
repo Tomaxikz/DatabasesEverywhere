@@ -214,6 +214,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         protocol: Protocol::Mysql,
         status: InstanceStatus::Running,
         desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        disk_limit_blocked: false,
         public: PublicEndpoint {
             host: "db.example.com".to_string(),
             port: 3308,
@@ -696,6 +697,7 @@ fn test_state_with_store(
         install_progress: crate::api::progress::InstallProgressStore::default(),
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::resources::ResourceCache::default(),
+        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
         monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         instance_locks: crate::instances::locks::InstanceLocks::default(),

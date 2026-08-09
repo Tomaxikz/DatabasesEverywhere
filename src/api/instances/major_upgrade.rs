@@ -18,6 +18,23 @@ pub(super) async fn update_instance_image_by_major_migration(
             ),
         )
     })?;
+    let previous_metadata = metadata.clone();
+    let rollback_image = state
+        .docker
+        .container_immutable_image_id(metadata.protocol, &metadata.instance_id)
+        .await
+        .map_err(docker_error)
+        .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?
+        .ok_or_else(|| {
+            fail_image_update_api(
+                state,
+                &metadata.instance_id,
+                ApiError::Conflict(
+                    "the source container image ID could not be captured; refusing a destructive major upgrade without an exact rollback image"
+                        .to_string(),
+                ),
+            )
+        })?;
     state
         .install_progress
         .begin_major_upgrade(&metadata.instance_id, metadata.protocol, &image);
@@ -41,7 +58,7 @@ pub(super) async fn update_instance_image_by_major_migration(
         .map_err(|error| fail_image_update_bad_request(state, &metadata.instance_id, error))?;
     let rollback = MajorUpgradeRollback {
         metadata: metadata.clone(),
-        old_image: current_image.clone(),
+        old_image: rollback_image,
         password: password.clone(),
         paths: paths.clone(),
     };
@@ -56,61 +73,166 @@ pub(super) async fn update_instance_image_by_major_migration(
         "cutover",
         "validated replacement; stopping old container for final cutover",
     );
-    let old_volume_backup = old_volume_backup_path(&paths.data)?;
-    stop_and_delete_container(state, metadata.protocol, &metadata.instance_id)
-        .await
+    let old_volume_backup = old_volume_backup_path(&paths.data)
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
-    rename_path(&paths.data, &old_volume_backup)
-        .await
-        .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
-    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-        .purge_instance_data(&paths.data)
-        .await
-        .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
     if let Err(error) =
-        move_staged_replacement_into_place(state, &metadata, &paths, &staged, &image, &password)
-            .await
+        stop_and_delete_container(state, metadata.protocol, &metadata.instance_id).await
     {
-        let rollback_error = rollback
-            .restore(state, &old_volume_backup)
-            .await
-            .err()
-            .map(|rollback_error| rollback_error.to_string());
-        let message = match rollback_error {
-            Some(rollback_error) => {
-                format!("major upgrade failed: {error}; rollback also failed: {rollback_error}")
-            }
-            None => format!("major upgrade failed and old container was restored: {error}"),
-        };
-        return Err(fail_image_update_runtime(
+        return Err(fail_major_upgrade_with_rollback(
             state,
-            &metadata.instance_id,
-            message,
-        ));
+            &previous_metadata,
+            rollback,
+            &old_volume_backup,
+            MajorUpgradeRollbackLocation::OriginalDataInPlace,
+            &staged,
+            error,
+        )
+        .await);
     }
-    metadata.backend =
-        backend_endpoint_for_instance(state, metadata.protocol, &metadata.instance_id)
-            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
-    metadata.runtime.network_mode = "none".to_string();
-    if metadata.protocol == Protocol::Mariadb {
-        metadata.mariadb_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
-        );
-    }
-    if metadata.protocol == Protocol::Mysql {
-        metadata.mysql_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
-        );
-    }
-    metadata.tenant_password = Some(password.clone());
-
-    metadata.status = InstanceStatus::Running;
-    metadata.updated_at = now_rfc3339();
-    state
-        .manager
-        .upsert(metadata.clone())
+    if let Err(error) = rename_path(&paths.data, &old_volume_backup).await {
+        let location = match classify_major_upgrade_rollback_location(
+            &paths.data,
+            &old_volume_backup,
+        )
         .await
-        .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
+        {
+            Ok(location) => location,
+            Err(location_error) => {
+                cleanup_staged_after_failed_major_upgrade(state, &staged).await;
+                let quarantine = quarantine_after_image_update_uncertainty(
+                    state,
+                    &previous_metadata,
+                    "major-upgrade volume rename outcome is uncertain",
+                )
+                .await;
+                return Err(fail_image_update_runtime(
+                    state,
+                    &metadata.instance_id,
+                    format!(
+                        "failed to move the old volume into rollback staging ({error}) and its location could not be proven ({location_error}); {}",
+                        image_update_quarantine_summary(&quarantine)
+                    ),
+                ));
+            }
+        };
+        return Err(fail_major_upgrade_with_rollback(
+            state,
+            &previous_metadata,
+            rollback,
+            &old_volume_backup,
+            location,
+            &staged,
+            ApiError::Runtime(format!(
+                "failed to move the old volume into rollback staging: {error}"
+            )),
+        )
+        .await);
+    }
+    let cutover_result: Result<(), ApiError> = async {
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
+            .purge_instance_data(&paths.data)
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        move_staged_replacement_into_place(state, &metadata, &paths, &staged, &image, &password)
+            .await?;
+        metadata.backend =
+            backend_endpoint_for_instance(state, metadata.protocol, &metadata.instance_id)?;
+        metadata.runtime.network_mode = "none".to_string();
+        if metadata.protocol == Protocol::Mariadb {
+            metadata.mariadb_native_password_sha1_stage2 = Some(
+                crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
+            );
+        }
+        if metadata.protocol == Protocol::Mysql {
+            metadata.mysql_native_password_sha1_stage2 = Some(
+                crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
+            );
+        }
+        metadata.tenant_password = Some(password.clone());
+        metadata.status = InstanceStatus::Running;
+        metadata.updated_at = now_rfc3339();
+        Ok(())
+    }
+    .await;
+    if let Err(error) = cutover_result {
+        return Err(fail_major_upgrade_with_rollback(
+            state,
+            &previous_metadata,
+            rollback,
+            &old_volume_backup,
+            MajorUpgradeRollbackLocation::OldVolumeBackup,
+            &staged,
+            error,
+        )
+        .await);
+    }
+    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+        let commit_error = error.to_string();
+        match resolve_major_upgrade_commit(state, &previous_metadata, &metadata).await {
+            MajorUpgradeCommitResolution::Committed => {
+                // `InstanceManager` updates the route store only after the
+                // repository returns `Ok`. Rebuild that in-memory side of the
+                // commit after verifying SQLite contains the intended row.
+                state.instances.upsert(metadata.clone()).await;
+                tracing::warn!(
+                    event = "audit instance_major_upgrade_commit_ack_lost",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    error = %commit_error,
+                    "major-upgrade metadata was durably committed despite a failed commit acknowledgement"
+                );
+            }
+            MajorUpgradeCommitResolution::NotCommitted => {
+                let rollback_error = run_major_upgrade_rollback(
+                    rollback,
+                    state,
+                    &old_volume_backup,
+                    MajorUpgradeRollbackLocation::OldVolumeBackup,
+                )
+                .await
+                .err()
+                .map(|rollback_error| rollback_error.to_string());
+                let message = if let Some(rollback_error) = rollback_error {
+                    let quarantine = quarantine_after_image_update_uncertainty(
+                        state,
+                        &previous_metadata,
+                        "major-upgrade metadata was not committed and rollback failed",
+                    )
+                    .await;
+                    format!(
+                        "failed to persist major-upgrade metadata ({commit_error}); rollback also failed ({rollback_error}); {}",
+                        image_update_quarantine_summary(&quarantine)
+                    )
+                } else {
+                    format!(
+                        "failed to persist major-upgrade metadata ({commit_error}); durable metadata was unchanged and the old container was restored"
+                    )
+                };
+                return Err(fail_image_update_runtime(
+                    state,
+                    &metadata.instance_id,
+                    message,
+                ));
+            }
+            MajorUpgradeCommitResolution::Uncertain(reason) => {
+                let quarantine = quarantine_after_image_update_uncertainty(
+                    state,
+                    &previous_metadata,
+                    "major-upgrade metadata commit could not be classified",
+                )
+                .await;
+                return Err(fail_image_update_runtime(
+                    state,
+                    &metadata.instance_id,
+                    format!(
+                        "major-upgrade runtime cutover completed, but metadata persistence returned {commit_error} and durable commit state is uncertain ({reason}); {}; the old volume backup was retained",
+                        image_update_quarantine_summary(&quarantine)
+                    ),
+                ));
+            }
+        }
+    }
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -153,6 +275,178 @@ pub(super) async fn update_instance_image_by_major_migration(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MajorUpgradeCommitResolution {
+    Committed,
+    NotCommitted,
+    Uncertain(String),
+}
+
+async fn resolve_major_upgrade_commit(
+    state: &AppState,
+    previous: &InstanceMetadata,
+    intended: &InstanceMetadata,
+) -> MajorUpgradeCommitResolution {
+    match state.manager.get_persisted(&intended.instance_id).await {
+        Ok(Some(persisted)) => classify_major_upgrade_commit(&persisted, previous, intended),
+        Ok(None) => MajorUpgradeCommitResolution::Uncertain(
+            "the durable instance metadata row is missing".to_string(),
+        ),
+        Err(error) => MajorUpgradeCommitResolution::Uncertain(format!(
+            "the durable metadata read failed: {error}"
+        )),
+    }
+}
+
+pub(super) fn classify_major_upgrade_commit(
+    persisted: &InstanceMetadata,
+    previous: &InstanceMetadata,
+    intended: &InstanceMetadata,
+) -> MajorUpgradeCommitResolution {
+    if durable_instance_metadata_matches(persisted, intended) {
+        MajorUpgradeCommitResolution::Committed
+    } else if durable_instance_metadata_matches(persisted, previous) {
+        MajorUpgradeCommitResolution::NotCommitted
+    } else {
+        MajorUpgradeCommitResolution::Uncertain(format!(
+            "durable metadata has update marker {:?}, expected committed marker {:?} or previous marker {:?}",
+            persisted.updated_at, intended.updated_at, previous.updated_at
+        ))
+    }
+}
+
+fn durable_instance_metadata_matches(left: &InstanceMetadata, right: &InstanceMetadata) -> bool {
+    left.schema_version == right.schema_version
+        && left.instance_id == right.instance_id
+        && left.protocol == right.protocol
+        && left.status == right.status
+        && left.desired_state == right.desired_state
+        && left.disk_limit_blocked == right.disk_limit_blocked
+        && left.public.host == right.public.host
+        && left.public.port == right.public.port
+        && left.backend == right.backend
+        && left.runtime.kind == right.runtime.kind
+        && left.runtime.container_name == right.runtime.container_name
+        && left.runtime.network_mode == right.runtime.network_mode
+        && left.database.name == right.database.name
+        && left.database.username == right.database.username
+        && left.route_key_sha256 == right.route_key_sha256
+        && left.mariadb_native_password_sha1_stage2 == right.mariadb_native_password_sha1_stage2
+        && left.mariadb_root_password == right.mariadb_root_password
+        && left.mysql_native_password_sha1_stage2 == right.mysql_native_password_sha1_stage2
+        && left.mysql_root_password == right.mysql_root_password
+        && left.mongodb_root_password == right.mongodb_root_password
+        && left.tenant_password == right.tenant_password
+        && left.limits.cpu_cores.to_bits() == right.limits.cpu_cores.to_bits()
+        && left.limits.memory_mib == right.limits.memory_mib
+        && left.limits.disk_mib == right.limits.disk_mib
+        && left.limits.disk_enforced == right.limits.disk_enforced
+        && left.limits.disk_enforcement_method == right.limits.disk_enforcement_method
+        && left.created_at == right.created_at
+        && left.updated_at == right.updated_at
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MajorUpgradeRollbackLocation {
+    OriginalDataInPlace,
+    OldVolumeBackup,
+}
+
+pub(super) async fn classify_major_upgrade_rollback_location(
+    data_path: &std::path::Path,
+    old_volume_backup: &std::path::Path,
+) -> Result<MajorUpgradeRollbackLocation, ApiError> {
+    let data_exists = path_exists(data_path).await?;
+    let backup_exists = path_exists(old_volume_backup).await?;
+    match (data_exists, backup_exists) {
+        (true, false) => Ok(MajorUpgradeRollbackLocation::OriginalDataInPlace),
+        (false, true) => Ok(MajorUpgradeRollbackLocation::OldVolumeBackup),
+        (true, true) => Err(ApiError::Runtime(format!(
+            "both the original data path {} and rollback backup {} exist",
+            data_path.display(),
+            old_volume_backup.display()
+        ))),
+        (false, false) => Err(ApiError::Runtime(format!(
+            "neither the original data path {} nor rollback backup {} exists",
+            data_path.display(),
+            old_volume_backup.display()
+        ))),
+    }
+}
+
+async fn path_exists(path: &std::path::Path) -> Result<bool, ApiError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ApiError::Runtime(format!(
+            "failed to inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+async fn fail_major_upgrade_with_rollback(
+    state: &AppState,
+    previous_metadata: &InstanceMetadata,
+    rollback: MajorUpgradeRollback,
+    old_volume_backup: &std::path::Path,
+    location: MajorUpgradeRollbackLocation,
+    staged: &StagedMajorUpgrade,
+    original_error: ApiError,
+) -> ApiError {
+    cleanup_staged_after_failed_major_upgrade(state, staged).await;
+    let original_message = original_error.to_string();
+    let rollback_error = run_major_upgrade_rollback(rollback, state, old_volume_backup, location)
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let message = if let Some(rollback_error) = rollback_error {
+        let quarantine = quarantine_after_image_update_uncertainty(
+            state,
+            previous_metadata,
+            "major-upgrade cutover rollback failed",
+        )
+        .await;
+        format!(
+            "major upgrade failed ({original_message}); rollback also failed ({rollback_error}); {}",
+            image_update_quarantine_summary(&quarantine)
+        )
+    } else {
+        format!("major upgrade failed and the old container was restored: {original_message}")
+    };
+    fail_image_update_runtime(state, &previous_metadata.instance_id, message)
+}
+
+async fn cleanup_staged_after_failed_major_upgrade(state: &AppState, staged: &StagedMajorUpgrade) {
+    cleanup_temporary_replacement(
+        state,
+        staged.metadata.protocol,
+        &staged.metadata.limits.disk_enforcement_method,
+        &staged.metadata.instance_id,
+        &staged.paths,
+    )
+    .await;
+}
+
+async fn run_major_upgrade_rollback(
+    rollback: MajorUpgradeRollback,
+    state: &AppState,
+    old_volume_backup: &std::path::Path,
+    location: MajorUpgradeRollbackLocation,
+) -> Result<(), ApiError> {
+    tokio::time::timeout(
+        IMAGE_UPDATE_ROLLBACK_TIMEOUT,
+        rollback.restore(state, old_volume_backup, location),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::Runtime(format!(
+            "major-upgrade rollback exceeded its {} second deadline",
+            IMAGE_UPDATE_ROLLBACK_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
 pub(super) async fn precheck_major_upgrade(
     state: &AppState,
     metadata: &InstanceMetadata,
@@ -165,6 +459,12 @@ pub(super) async fn precheck_major_upgrade(
         "checking major upgrade compatibility",
     );
     ensure_major_upgrade_supported(metadata.protocol)?;
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+        .for_persisted_method(&metadata.limits.disk_enforcement_method)
+        .verify_major_upgrade_directory_cutover(&paths.data)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let inspection = state
         .docker
         .inspect_instance(metadata.protocol, &metadata.instance_id)
@@ -307,7 +607,8 @@ pub(super) async fn create_empty_replacement_and_import(
         .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
 
     let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
     let disk = disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
@@ -441,6 +742,7 @@ pub(super) async fn create_staged_replacement_and_import(
     cleanup_temporary_replacement(
         state,
         metadata.protocol,
+        &metadata.limits.disk_enforcement_method,
         &temporary_instance_id,
         &staged_paths,
     )
@@ -474,6 +776,7 @@ pub(super) async fn create_staged_replacement_and_import(
             cleanup_temporary_replacement(
                 state,
                 metadata.protocol,
+                &metadata.limits.disk_enforcement_method,
                 &temporary_instance_id,
                 &staged_paths,
             )
@@ -498,8 +801,12 @@ pub(super) async fn move_staged_replacement_into_place(
     )
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    // Only detach transient runtime state before moving the validated volume.
+    // `purge_instance_data` is deliberately destructive for Btrfs subvolumes
+    // and ZFS datasets and would erase the imported replacement here.
     DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-        .purge_instance_data(&staged.paths.data)
+        .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
+        .teardown_instance_mount(&staged.paths.data)
         .await
         .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
     cleanup_path_if_exists(&paths.data).await?;
@@ -525,22 +832,46 @@ impl MajorUpgradeRollback {
         self,
         state: &AppState,
         old_volume_backup: &std::path::Path,
+        location: MajorUpgradeRollbackLocation,
     ) -> Result<(), ApiError> {
         tracing::warn!(
             event = "audit instance_major_upgrade_rollback_started",
             instance_id = %self.metadata.instance_id,
             protocol = %self.metadata.protocol,
         );
-        let _ =
-            stop_and_delete_container(state, self.metadata.protocol, &self.metadata.instance_id)
-                .await;
-        let disk_limiter =
-            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
-        let _ = disk_limiter.purge_instance_data(&self.paths.data).await;
-        cleanup_path_if_exists(&self.paths.data).await?;
-        rename_path(old_volume_backup, &self.paths.data)
-            .await
-            .map_err(|error| ApiError::Runtime(format!("failed to restore old volume: {error}")))?;
+        stop_and_delete_container(state, self.metadata.protocol, &self.metadata.instance_id)
+            .await?;
+        if location == MajorUpgradeRollbackLocation::OldVolumeBackup {
+            let disk_limiter = DiskLimiter::with_fuse_root(
+                state.config.disk.clone(),
+                state.config.paths.fuse_root(),
+            )
+            .for_persisted_protocol(
+                self.metadata.protocol,
+                &self.metadata.limits.disk_enforcement_method,
+            );
+            disk_limiter
+                .purge_instance_data(&self.paths.data)
+                .await
+                .map_err(|error| {
+                    ApiError::Runtime(format!(
+                        "failed to tear down replacement data before rollback: {error}"
+                    ))
+                })?;
+            cleanup_path_if_exists(&self.paths.data).await?;
+            rename_path(old_volume_backup, &self.paths.data)
+                .await
+                .map_err(|error| {
+                    ApiError::Runtime(format!("failed to restore old volume: {error}"))
+                })?;
+        } else if classify_major_upgrade_rollback_location(&self.paths.data, old_volume_backup)
+            .await?
+            != MajorUpgradeRollbackLocation::OriginalDataInPlace
+        {
+            return Err(ApiError::Runtime(
+                "old volume moved while an in-place rollback was starting".to_string(),
+            ));
+        }
         create_empty_replacement_and_import_without_import(
             state,
             &self.metadata,
@@ -574,7 +905,8 @@ pub(super) async fn create_empty_replacement_and_import_without_import(
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
     let disk = disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
@@ -633,13 +965,31 @@ pub(super) fn temporary_major_upgrade_instance_id(instance_id: &str) -> String {
 pub(super) async fn cleanup_temporary_replacement(
     state: &AppState,
     protocol: Protocol,
+    disk_enforcement_method: &str,
     instance_id: &str,
     paths: &InstancePaths,
 ) {
-    let _ = stop_and_delete_container(state, protocol, instance_id).await;
+    if let Err(error) = stop_and_delete_container(state, protocol, instance_id).await {
+        tracing::error!(
+            instance_id,
+            %protocol,
+            %error,
+            "temporary major-upgrade container could not be removed; retaining its data rather than mutating a potentially live backing path"
+        );
+        return;
+    }
     let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
-    let _ = disk_limiter.purge_instance_data(&paths.data).await;
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_protocol(protocol, disk_enforcement_method);
+    if let Err(error) = disk_limiter.purge_instance_data(&paths.data).await {
+        tracing::error!(
+            instance_id,
+            %protocol,
+            %error,
+            "temporary major-upgrade disk teardown failed; retaining its paths for operator recovery"
+        );
+        return;
+    }
     let _ = cleanup_path_if_exists(&paths.data).await;
     cleanup_temporary_side_paths(paths).await;
 }
@@ -717,7 +1067,7 @@ pub(super) async fn stop_and_delete_container(
 ) -> Result<(), ApiError> {
     match state.docker.stop(protocol, instance_id).await {
         Ok(_) => {}
-        Err(error) if error.is_not_found() => {}
+        Err(error) if error.is_not_found() || error.is_not_running() => {}
         Err(error) => return Err(docker_error(error)),
     }
     match state.docker.delete(protocol, instance_id).await {

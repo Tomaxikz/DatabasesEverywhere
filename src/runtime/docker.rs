@@ -74,6 +74,7 @@ pub struct DockerInstanceInspection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerContainerStatus {
     Running,
+    Created,
     Starting,
     Stopped,
     Failed,
@@ -625,6 +626,28 @@ impl DockerRuntime {
         Ok(CommandOutput::empty())
     }
 
+    pub async fn stop_with_timeout(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutput, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let seconds = i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX).max(1);
+        self.docker
+            .stop_container(
+                &name,
+                Some(StopContainerOptions {
+                    signal: None,
+                    t: Some(seconds),
+                }),
+            )
+            .await?;
+        Ok(CommandOutput::empty())
+    }
+
     pub async fn restart(
         &self,
         protocol: Protocol,
@@ -873,7 +896,11 @@ impl DockerRuntime {
     }
 
     pub async fn remove_managed_containers(&self) -> Result<usize, DockerError> {
-        let filters = HashMap::from([("label".to_string(), vec![format!("{MANAGED_LABEL}=true")])]);
+        let node_id = self
+            .node_id
+            .as_deref()
+            .ok_or(DockerError::RuntimeNodeIdUnavailable)?;
+        let filters = managed_container_filters(node_id);
         let containers = self
             .docker
             .list_containers(Some(
@@ -886,6 +913,9 @@ impl DockerRuntime {
 
         let mut removed = 0;
         for container in containers {
+            if !is_owned_managed_container(container.labels.as_ref(), node_id) {
+                continue;
+            }
             let Some(id) = container.id else {
                 continue;
             };
@@ -904,7 +934,11 @@ impl DockerRuntime {
     }
 
     pub async fn active_managed_container_count(&self) -> Result<usize, DockerError> {
-        let filters = HashMap::from([("label".to_string(), vec![format!("{MANAGED_LABEL}=true")])]);
+        let node_id = self
+            .node_id
+            .as_deref()
+            .ok_or(DockerError::RuntimeNodeIdUnavailable)?;
+        let filters = managed_container_filters(node_id);
         let containers = self
             .docker
             .list_containers(Some(
@@ -914,7 +948,10 @@ impl DockerRuntime {
                     .build(),
             ))
             .await?;
-        Ok(containers.len())
+        Ok(containers
+            .iter()
+            .filter(|container| is_owned_managed_container(container.labels.as_ref(), node_id))
+            .count())
     }
 
     pub async fn remove_network(&self) -> Result<(), DockerError> {
@@ -926,6 +963,21 @@ impl DockerRuntime {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn managed_container_filters(node_id: &str) -> HashMap<String, Vec<String>> {
+    HashMap::from([(
+        "label".to_string(),
+        vec![
+            format!("{MANAGED_LABEL}=true"),
+            format!("{NODE_LABEL}={node_id}"),
+        ],
+    )])
+}
+
+fn is_owned_managed_container(labels: Option<&HashMap<String, String>>, node_id: &str) -> bool {
+    labels.and_then(|labels| labels.get(MANAGED_LABEL).map(String::as_str)) == Some("true")
+        && labels.and_then(|labels| labels.get(NODE_LABEL).map(String::as_str)) == Some(node_id)
 }
 
 fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
@@ -1039,6 +1091,15 @@ pub enum DockerError {
     ManagedContainerNotFound {
         instance_id: String,
         protocol: String,
+    },
+    #[error(
+        "managed container {instance_id} data bind mismatch at {destination}: expected {expected_source}, actual {actual_source}; recreate or migrate the container before using the selected disk-limit mode"
+    )]
+    DiskBindSourceMismatch {
+        instance_id: String,
+        destination: String,
+        expected_source: String,
+        actual_source: String,
     },
     #[error("managed container {container} did not report an immutable container id")]
     ManagedContainerIdUnavailable { container: String },

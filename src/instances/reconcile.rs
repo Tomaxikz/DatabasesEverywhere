@@ -5,7 +5,7 @@ use crate::{
         manager::InstanceManager,
         metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, RuntimeKind},
     },
-    runtime::docker::{DockerContainerStatus, DockerRuntime},
+    runtime::docker::{DockerContainerStatus, DockerError, DockerRuntime},
     shared::{backend::BackendEndpoint, time::now_rfc3339},
 };
 
@@ -133,23 +133,32 @@ async fn stop_inactive_instance(
                 DockerContainerStatus::Running | DockerContainerStatus::Starting
             ) =>
         {
-            docker
-                .stop(metadata.protocol, &metadata.instance_id)
-                .await?;
-            tracing::warn!(
-                event = "audit inactive_instance_stopped",
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
-                desired_state = metadata.desired_state.as_str(),
-                quarantined = metadata.status == InstanceStatus::Quarantined,
-                "stopped an instance whose durable desired state is inactive"
-            );
+            match docker.stop(metadata.protocol, &metadata.instance_id).await {
+                Ok(_) => tracing::warn!(
+                    event = "audit inactive_instance_stopped",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    desired_state = metadata.desired_state.as_str(),
+                    quarantined = metadata.status == InstanceStatus::Quarantined,
+                    "stopped an instance whose durable desired state is inactive"
+                ),
+                Err(error) if inactive_stop_error_is_benign(&error) => tracing::debug!(
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    "inactive instance container was already not running"
+                ),
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(_) => {}
         Err(error) if error.is_not_found() => {}
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn inactive_stop_error_is_benign(error: &DockerError) -> bool {
+    error.is_not_running()
 }
 
 async fn reconcile_metadata(
@@ -205,6 +214,10 @@ async fn reconcile_metadata(
 pub fn classify_container_status(status: DockerContainerStatus) -> InstanceStatus {
     match status {
         DockerContainerStatus::Running => InstanceStatus::Running,
+        // `created` means the replacement exists but has never been started.
+        // Classifying it as stopped lets durable desired-running boot recovery
+        // issue the missing start instead of stranding it as Booting forever.
+        DockerContainerStatus::Created => InstanceStatus::Stopped,
         DockerContainerStatus::Starting => InstanceStatus::Booting,
         DockerContainerStatus::Stopped => InstanceStatus::Stopped,
         DockerContainerStatus::Failed => InstanceStatus::Failed,
@@ -220,6 +233,10 @@ mod tests {
         assert_eq!(
             classify_container_status(DockerContainerStatus::Starting),
             InstanceStatus::Booting
+        );
+        assert_eq!(
+            classify_container_status(DockerContainerStatus::Created),
+            InstanceStatus::Stopped
         );
         assert_eq!(
             classify_container_status(DockerContainerStatus::Running),
@@ -245,5 +262,15 @@ mod tests {
             RuntimeKind::Podman,
             RuntimeKind::Podman
         ));
+    }
+
+    #[test]
+    fn created_container_stop_response_satisfies_inactive_reconciliation() {
+        let error = DockerError::Api(bollard::errors::Error::DockerResponseServerError {
+            status_code: 304,
+            message: "container is already stopped".to_string(),
+        });
+
+        assert!(inactive_stop_error_is_benign(&error));
     }
 }

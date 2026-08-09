@@ -52,6 +52,17 @@ impl Protocol {
             Self::Qdrant => 6334,
         }
     }
+
+    pub fn container_data_target(self) -> &'static str {
+        match self {
+            Self::Postgres => "/var/lib/postgresql",
+            Self::Redis | Self::Valkey => "/data",
+            Self::Mariadb | Self::Mysql => "/var/lib/mysql",
+            Self::Mongodb => "/data/db",
+            Self::Clickhouse => "/var/lib/clickhouse",
+            Self::Qdrant => "/dbe-qdrant",
+        }
+    }
 }
 
 impl fmt::Display for Protocol {

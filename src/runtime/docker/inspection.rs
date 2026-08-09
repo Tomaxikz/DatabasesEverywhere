@@ -111,7 +111,8 @@ impl DockerRuntime {
             .and_then(|state| state.status)
             .map(|status| match status.as_ref() {
                 "running" => DockerContainerStatus::Running,
-                "created" | "restarting" => DockerContainerStatus::Starting,
+                "created" => DockerContainerStatus::Created,
+                "restarting" => DockerContainerStatus::Starting,
                 "paused" | "exited" | "stopping" => DockerContainerStatus::Stopped,
                 _ => DockerContainerStatus::Failed,
             })
@@ -194,7 +195,7 @@ impl DockerRuntime {
                         readiness_error: last_readiness_error,
                     });
                 }
-                DockerContainerStatus::Starting => {}
+                DockerContainerStatus::Created | DockerContainerStatus::Starting => {}
             }
 
             if Instant::now() >= deadline {
@@ -241,6 +242,68 @@ impl DockerRuntime {
             .and_then(|config| config.image)
             .map(|image| image.trim().to_string())
             .filter(|image| !image.is_empty()))
+    }
+
+    /// Return the immutable image ID backing a managed container. Internal
+    /// safety migrations use this rather than a mutable tag so recreation
+    /// cannot silently switch database versions between stop and create.
+    pub async fn container_immutable_image_id(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(response
+            .image
+            .map(|image| image.trim().to_string())
+            .filter(|image| !image.is_empty()))
+    }
+
+    pub async fn container_bind_source(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        destination: &str,
+    ) -> Result<Option<std::path::PathBuf>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(response
+            .mounts
+            .unwrap_or_default()
+            .into_iter()
+            .find(|mount| mount.destination.as_deref() == Some(destination))
+            .and_then(|mount| mount.source.map(std::path::PathBuf::from)))
+    }
+
+    /// Fail closed when an existing managed container is not actually bound
+    /// to the data source selected by the effective disk-limit mode. Merely
+    /// preparing a quota mount cannot protect a container that still uses the
+    /// old raw path (or vice versa).
+    pub async fn verify_container_data_bind(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        expected_source: &std::path::Path,
+    ) -> Result<(), DockerError> {
+        let actual_source = self
+            .container_bind_source(protocol, instance_id, protocol.container_data_target())
+            .await?;
+        if actual_source.as_deref() == Some(expected_source) {
+            return Ok(());
+        }
+        Err(DockerError::DiskBindSourceMismatch {
+            instance_id: instance_id.to_string(),
+            destination: protocol.container_data_target().to_string(),
+            expected_source: expected_source.display().to_string(),
+            actual_source: actual_source
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<missing>".to_string()),
+        })
     }
 
     /// Returns the original image reference only when it still resolves to the

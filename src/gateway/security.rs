@@ -157,6 +157,9 @@ impl GatewayPeer {
         match ip {
             IpAddr::V4(address) => Self::V4(address.octets()),
             IpAddr::V6(address) => {
+                if let Some(address) = address.to_ipv4_mapped() {
+                    return Self::V4(address.octets());
+                }
                 let mut prefix = [0_u8; 8];
                 prefix.copy_from_slice(&address.octets()[..8]);
                 Self::V6Prefix64(prefix)
@@ -244,6 +247,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_uses_the_native_ipv4_identity() {
+        let native = GatewayPeer::from_ip("203.0.113.10".parse().unwrap());
+        let mapped = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
+
+        assert_eq!(native, mapped);
+    }
+
+    #[test]
+    fn distinct_ipv4_mapped_peers_do_not_share_an_ipv6_prefix_bucket() {
+        let first = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
+        let second = GatewayPeer::from_ip("::ffff:203.0.113.11".parse().unwrap());
+
+        assert_ne!(first, second);
     }
 
     #[test]

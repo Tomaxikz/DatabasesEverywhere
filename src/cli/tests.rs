@@ -16,7 +16,7 @@ use crate::{
 
 #[test]
 fn api_connection_admission_is_per_ip_and_releases_capacity() {
-    let limiter = Arc::new(ApiConnectionLimiter::new(2));
+    let limiter = Arc::new(ApiConnectionLimiter::new(3, 2));
     let first_ip: IpAddr = "192.0.2.10".parse().unwrap();
     let second_ip: IpAddr = "192.0.2.11".parse().unwrap();
 
@@ -33,13 +33,37 @@ fn api_connection_admission_is_per_ip_and_releases_capacity() {
 
 #[test]
 fn api_connection_admission_normalizes_ipv4_mapped_addresses() {
-    let limiter = Arc::new(ApiConnectionLimiter::new(1));
+    let limiter = Arc::new(ApiConnectionLimiter::new(2, 1));
     let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
     let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
 
     let _permit = limiter.try_acquire(ipv4).unwrap();
 
     assert!(limiter.try_acquire(mapped).is_none());
+}
+
+#[test]
+fn api_connection_admission_groups_ipv6_peers_by_64_bit_prefix() {
+    let limiter = Arc::new(ApiConnectionLimiter::new(3, 1));
+    let first: IpAddr = "2001:db8:1234:5678::1".parse().unwrap();
+    let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse().unwrap();
+    let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse().unwrap();
+
+    let _first = limiter.try_acquire(first).unwrap();
+
+    assert!(limiter.try_acquire(same_prefix).is_none());
+    assert!(limiter.try_acquire(other_prefix).is_some());
+}
+
+#[test]
+fn api_connection_admission_enforces_and_releases_global_capacity() {
+    let limiter = Arc::new(ApiConnectionLimiter::new(2, 2));
+    let first = limiter.try_acquire("192.0.2.10".parse().unwrap()).unwrap();
+    let _second = limiter.try_acquire("192.0.2.11".parse().unwrap()).unwrap();
+
+    assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_none());
+    drop(first);
+    assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_some());
 }
 
 #[tokio::test]
@@ -174,6 +198,7 @@ fn recovery_test_metadata() -> InstanceMetadata {
         protocol: Protocol::Postgres,
         status: InstanceStatus::Running,
         desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        disk_limit_blocked: false,
         public: PublicEndpoint {
             host: "db.example.com".to_string(),
             port: 5433,
@@ -291,6 +316,153 @@ fn daemon_boot_preserves_running_containers() {
         managed_boot_action(InstanceStatus::Booting, DesiredInstanceState::Running),
         None
     );
+    assert_eq!(
+        managed_boot_action(
+            reconcile::classify_container_status(DockerContainerStatus::Created),
+            DesiredInstanceState::Running,
+        ),
+        Some(ManagedBootAction::Start),
+        "a crash after create-before-start must be recovered on the next boot"
+    );
+}
+
+#[test]
+fn startup_resolves_qdrant_away_from_the_fuse_fallback() {
+    let limiter = DiskLimiter::new(crate::config::DiskConfig::default());
+
+    assert_eq!(
+        limiter.mode_for_protocol(Protocol::Qdrant),
+        crate::config::DiskLimitMode::SoftScanner
+    );
+    assert_eq!(
+        limiter.mode_for_protocol(Protocol::Postgres),
+        crate::config::DiskLimitMode::FuseQuota
+    );
+}
+
+#[test]
+fn stale_qdrant_fuse_mount_does_not_trigger_container_recreation() {
+    let legacy = Path::new("/var/lib/dbev/fuse/instances/qdrant");
+
+    assert!(legacy_qdrant_container_uses_fuse(Some(legacy), legacy));
+    assert!(!legacy_qdrant_container_uses_fuse(
+        Some(Path::new("/var/lib/dbev/volumes/qdrant")),
+        legacy,
+    ));
+    assert!(!legacy_qdrant_container_uses_fuse(None, legacy));
+}
+
+#[test]
+fn qdrant_fuse_migration_follows_durable_power_intent() {
+    use crate::instances::metadata::DesiredInstanceState;
+
+    assert_eq!(
+        qdrant_migration_runtime_actions(
+            DockerContainerStatus::Stopped,
+            DesiredInstanceState::Running,
+        ),
+        (false, true),
+        "a desired-running instance must start its replacement even when the old container was stopped"
+    );
+    assert_eq!(
+        qdrant_migration_runtime_actions(
+            DockerContainerStatus::Running,
+            DesiredInstanceState::Stopped,
+        ),
+        (true, false),
+        "a desired-stopped instance must stop an unexpectedly live old container without starting its replacement"
+    );
+}
+
+#[test]
+fn qdrant_fuse_migration_defers_native_quota_adoption_before_runtime_mutation() {
+    assert!(!qdrant_fuse_migration_target_is_safe(
+        crate::config::DiskLimitMode::ProjectQuota
+    ));
+    assert!(qdrant_fuse_migration_target_is_safe(
+        crate::config::DiskLimitMode::SoftScanner
+    ));
+}
+
+#[test]
+fn retained_qdrant_fuse_uses_truthful_mode_even_when_soft_is_selected() {
+    let disk = crate::config::DiskConfig {
+        mode: crate::config::DiskLimitMode::SoftScanner,
+        ..crate::config::DiskConfig::default()
+    };
+    let limiter = DiskLimiter::new(disk);
+
+    assert_eq!(
+        limiter.legacy_fuse_limiter().mode(),
+        crate::config::DiskLimitMode::FuseQuota
+    );
+    assert_eq!(limiter.legacy_fuse_limiter().mode().method(), "fuse_quota");
+    assert!(limiter.legacy_fuse_limiter().mode().enforced());
+}
+
+#[test]
+fn disk_mode_transition_failure_is_durably_stopped() {
+    let mut metadata = recovery_test_metadata();
+    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Running;
+
+    isolate_disk_reconciliation_failure(&mut metadata, false);
+
+    assert_eq!(
+        metadata.desired_state,
+        crate::instances::metadata::DesiredInstanceState::Stopped
+    );
+    assert_eq!(metadata.status, InstanceStatus::Failed);
+}
+
+#[test]
+fn qdrant_fuse_migration_preserves_container_project_grouping() {
+    let config = Config::default();
+    let mut metadata = recovery_test_metadata();
+    metadata.protocol = Protocol::Qdrant;
+    let paths = InstancePaths::new(&config.paths, &metadata.instance_id).unwrap();
+
+    let spec = qdrant_migration_spec(
+        &config,
+        &metadata,
+        &paths,
+        QdrantMigrationContainer {
+            data_path: paths.data.clone(),
+            image: "sha256:0123456789abcdef",
+            api_key: "tenant-key",
+            container_user: "1000:1000",
+            project_id: Some("panel-project".to_string()),
+        },
+    );
+
+    assert_eq!(spec.project_id.as_deref(), Some("panel-project"));
+}
+
+#[test]
+fn queued_soft_disk_decision_is_stale_after_a_limit_increase() {
+    let mut metadata = recovery_test_metadata();
+    metadata.protocol = Protocol::Qdrant;
+    metadata.limits.disk_mib = 100;
+    metadata.limits.disk_enforcement_method = "soft_scanner".to_string();
+    let target = crate::disk::soft::SoftDiskTarget {
+        instance_id: metadata.instance_id.clone(),
+        created_at: metadata.created_at.clone(),
+        protocol: metadata.protocol,
+        data_path: PathBuf::from("/var/lib/dbev/volumes/inst_recovery"),
+        limit_bytes: 100 * 1024 * 1024,
+        durable_blocked: false,
+    };
+    assert!(soft_disk_target_is_current(
+        &metadata,
+        &target,
+        crate::config::DiskLimitMode::SoftScanner,
+    ));
+
+    metadata.limits.disk_mib = 200;
+    assert!(!soft_disk_target_is_current(
+        &metadata,
+        &target,
+        crate::config::DiskLimitMode::SoftScanner,
+    ));
 }
 
 #[test]

@@ -27,6 +27,7 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -65,6 +66,7 @@ mod maintenance;
 mod runtime_paths;
 mod server;
 mod setup;
+mod soft_disk_limiter;
 mod startup;
 
 use boot_recovery::*;
@@ -74,6 +76,7 @@ use maintenance::*;
 use runtime_paths::*;
 use server::*;
 use setup::*;
+use soft_disk_limiter::*;
 use startup::*;
 
 #[cfg(all(test, unix))]
@@ -87,7 +90,8 @@ const GATEWAY_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_ACTIVE_API_CONNECTIONS_PER_IP: usize = 256;
+const MAX_ACTIVE_API_CONNECTIONS: usize = 2_048;
+const MAX_ACTIVE_API_CONNECTIONS_PER_PEER: usize = 256;
 const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
 const CONTAINER_EVENT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CONTAINER_EVENT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -102,7 +106,10 @@ impl<A> ApiConnectionAcceptor<A> {
     fn new(inner: A) -> Self {
         Self {
             inner,
-            limiter: Arc::new(ApiConnectionLimiter::new(MAX_ACTIVE_API_CONNECTIONS_PER_IP)),
+            limiter: Arc::new(ApiConnectionLimiter::new(
+                MAX_ACTIVE_API_CONNECTIONS,
+                MAX_ACTIVE_API_CONNECTIONS_PER_PEER,
+            )),
         }
     }
 }
@@ -131,7 +138,7 @@ where
                 return Box::pin(async {
                     Err(io::Error::new(
                         ErrorKind::WouldBlock,
-                        "API per-IP connection capacity reached",
+                        "API connection admission capacity reached",
                     ))
                 });
             }
@@ -158,30 +165,36 @@ struct AdmittedApiStream<S> {
 
 #[derive(Debug)]
 struct ApiConnectionLimiter {
+    global: Arc<Semaphore>,
     active: Mutex<HashMap<IpAddr, usize>>,
-    max_active_per_ip: usize,
+    max_active_per_peer: usize,
 }
 
 impl ApiConnectionLimiter {
-    fn new(max_active_per_ip: usize) -> Self {
+    fn new(max_active: usize, max_active_per_peer: usize) -> Self {
         Self {
+            global: Arc::new(Semaphore::new(max_active.max(1))),
             active: Mutex::new(HashMap::new()),
-            max_active_per_ip: max_active_per_ip.max(1),
+            max_active_per_peer: max_active_per_peer.max(1),
         }
     }
 
     fn try_acquire(self: &Arc<Self>, peer_ip: IpAddr) -> Option<ApiConnectionPermit> {
+        // Acquire global capacity before entering the per-peer map. The owned
+        // permit is released automatically if the peer bucket is already full.
+        let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
         let peer_ip = canonical_peer_ip(peer_ip);
         let mut active = self
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = active.entry(peer_ip).or_default();
-        if *count >= self.max_active_per_ip {
+        if *count >= self.max_active_per_peer {
             return None;
         }
         *count += 1;
         Some(ApiConnectionPermit {
+            _global: global,
             limiter: Arc::clone(self),
             peer_ip,
         })
@@ -190,6 +203,7 @@ impl ApiConnectionLimiter {
 
 #[derive(Debug)]
 struct ApiConnectionPermit {
+    _global: OwnedSemaphorePermit,
     limiter: Arc<ApiConnectionLimiter>,
     peer_ip: IpAddr,
 }
@@ -213,7 +227,14 @@ impl Drop for ApiConnectionPermit {
 
 fn canonical_peer_ip(peer_ip: IpAddr) -> IpAddr {
     match peer_ip {
-        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or_else(
+            || {
+                let mut prefix = ipv6.octets();
+                prefix[8..].fill(0);
+                IpAddr::V6(prefix.into())
+            },
+            IpAddr::V4,
+        ),
         ipv4 => ipv4,
     }
 }

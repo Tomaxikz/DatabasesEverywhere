@@ -362,7 +362,8 @@ async fn create_instance_from_validated_request(
         .install_progress
         .stage(&request.instance_id, "disk_limit", "applying disk limit");
     let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_protocol(request.protocol);
     let disk = disk_limiter
         .apply_instance_limit(&request.instance_id, &paths.data, limits.disk_mib)
         .await
@@ -641,6 +642,7 @@ async fn create_instance_from_validated_request(
         protocol: request.protocol,
         status: InstanceStatus::Running,
         desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        disk_limit_blocked: false,
         public: PublicEndpoint {
             host: request.public_host,
             port: request
@@ -688,6 +690,9 @@ async fn create_instance_from_validated_request(
                 "created container but failed to persist instance metadata: {error}"
             ))
         })?;
+    // IDs are normally unique, but clear any in-memory scanner history before
+    // publishing a newly created instance defensively.
+    state.soft_disk_limiter.remove(&metadata.instance_id).await;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -1350,6 +1355,7 @@ impl<'a> CreateFailureCleanup<'a> {
                 );
             } else {
                 self.state.instances.remove(&self.instance_id).await;
+                self.state.soft_disk_limiter.remove(&self.instance_id).await;
             }
         }
 

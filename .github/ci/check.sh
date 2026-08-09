@@ -25,6 +25,12 @@ lint() {
 
   section "Strict Clippy"
   cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  section "Static helper formatting"
+  cargo fmt --manifest-path tools/helper-packer/Cargo.toml -- --check
+
+  section "Static helper Clippy"
+  cargo clippy --manifest-path tools/helper-packer/Cargo.toml --all-targets --locked -- -D warnings
 }
 
 test_all() {
@@ -33,6 +39,9 @@ test_all() {
 
   section "Complete Linux test suite"
   cargo test --workspace --locked
+
+  section "Static helper tests"
+  cargo test --manifest-path tools/helper-packer/Cargo.toml --all-targets --locked
 }
 
 case "${1:-pre-push}" in

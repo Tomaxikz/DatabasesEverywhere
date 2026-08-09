@@ -102,6 +102,10 @@ jobs:
             exit 1
           fi
           cargo audit --no-yanked -D warnings
+          (
+            cd tools/helper-packer
+            cargo audit --no-yanked -D warnings
+          )
 
   tests:
     name: Linux tests

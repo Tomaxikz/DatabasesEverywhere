@@ -194,6 +194,26 @@ pub(super) async fn reconcile_managed_container_state(
         return Ok(());
     }
 
+    if let Some(event) = event.as_ref()
+        && event.action.deactivates_container()
+    {
+        let current_container_id = state
+            .docker
+            .verified_managed_container_id(metadata.protocol, &metadata.instance_id)
+            .await?;
+        if event_targets_superseded_container(event, current_container_id.as_deref()) {
+            tracing::debug!(
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                action = event.action.as_str(),
+                event_container_id = event.container_id.as_deref().unwrap_or("unknown"),
+                current_container_id = current_container_id.as_deref().unwrap_or("unknown"),
+                "ignored a delayed teardown event emitted by a replaced managed container"
+            );
+            return Ok(());
+        }
+    }
+
     let previous_status = metadata.status;
     let activation_readiness_error = if event.as_ref().is_some_and(|event| {
         event.action.activates_container() && previous_status != InstanceStatus::Running
@@ -285,4 +305,105 @@ pub(super) async fn reconcile_managed_container_state(
         }
     }
     Ok(())
+}
+
+fn event_targets_superseded_container(
+    event: &ManagedContainerEvent,
+    current_container_id: Option<&str>,
+) -> bool {
+    event.action.deactivates_container()
+        && event
+            .container_id
+            .as_deref()
+            .zip(current_container_id)
+            .is_some_and(|(event_id, current_id)| !container_ids_match(event_id, current_id))
+}
+
+fn container_ids_match(left: &str, right: &str) -> bool {
+    let left = left.trim().strip_prefix("sha256:").unwrap_or(left.trim());
+    let right = right.trim().strip_prefix("sha256:").unwrap_or(right.trim());
+    left == right
+        || (left.len().min(right.len()) >= 12
+            && (left.starts_with(right) || right.starts_with(left)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::docker::ManagedContainerAction;
+
+    fn event(
+        protocol: Protocol,
+        action: ManagedContainerAction,
+        container_id: Option<&str>,
+    ) -> ManagedContainerEvent {
+        ManagedContainerEvent {
+            container_id: container_id.map(str::to_string),
+            instance_id: "inst_password_rotation".to_string(),
+            protocol,
+            action,
+        }
+    }
+
+    #[test]
+    fn password_recreation_teardown_events_targeting_the_old_container_are_superseded() {
+        for protocol in [
+            Protocol::Redis,
+            Protocol::Valkey,
+            Protocol::Clickhouse,
+            Protocol::Qdrant,
+        ] {
+            for action in [
+                ManagedContainerAction::Exited {
+                    exit_code: Some(137),
+                },
+                ManagedContainerAction::Destroyed,
+            ] {
+                let event = event(protocol, action, Some("old-container-id"));
+                assert!(event_targets_superseded_container(
+                    &event,
+                    Some("new-container-id")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_failure_from_the_current_container_is_not_suppressed() {
+        let event = event(
+            Protocol::Redis,
+            ManagedContainerAction::Exited {
+                exit_code: Some(137),
+            },
+            Some("0123456789abcdef"),
+        );
+
+        assert!(!event_targets_superseded_container(
+            &event,
+            Some("0123456789abcdef")
+        ));
+        assert!(!event_targets_superseded_container(
+            &event,
+            Some("0123456789abcdef0123456789abcdef")
+        ));
+    }
+
+    #[test]
+    fn missing_identity_and_activation_events_keep_normal_reconciliation() {
+        let unidentified = event(Protocol::Qdrant, ManagedContainerAction::Destroyed, None);
+        let activation = event(
+            Protocol::Qdrant,
+            ManagedContainerAction::Started,
+            Some("old-container-id"),
+        );
+
+        assert!(!event_targets_superseded_container(
+            &unidentified,
+            Some("new-container-id")
+        ));
+        assert!(!event_targets_superseded_container(
+            &activation,
+            Some("new-container-id")
+        ));
+    }
 }

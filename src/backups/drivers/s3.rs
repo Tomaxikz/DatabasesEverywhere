@@ -823,7 +823,7 @@ impl S3BackupDriver {
             })?;
             let keys_before_page = keys.len();
             for value in xml_values(xml, "Key") {
-                keys.push(percent_decode(&xml_unescape(&value))?);
+                keys.push(decode_listed_key_in_prefix(&value, prefix)?);
                 if keys.len() > MAX_LISTED_OBJECT_KEYS {
                     return Err(BackupStoreError::Remote(format!(
                         "S3 backup prefix contains more than {MAX_LISTED_OBJECT_KEYS} objects"
@@ -1281,6 +1281,19 @@ fn percent_decode(value: &str) -> Result<String, BackupStoreError> {
         .map_err(|_| BackupStoreError::Corrupt("S3 returned a non-UTF-8 object key".to_string()))
 }
 
+fn decode_listed_key_in_prefix(
+    encoded_key: &str,
+    requested_prefix: &str,
+) -> Result<String, BackupStoreError> {
+    let key = percent_decode(&xml_unescape(encoded_key))?;
+    if !key.starts_with(requested_prefix) {
+        return Err(BackupStoreError::Corrupt(
+            "S3 list response returned an object outside the requested backup prefix".to_string(),
+        ));
+    }
+    Ok(key)
+}
+
 fn hex_digit(byte: u8) -> Result<u8, BackupStoreError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -1399,6 +1412,21 @@ mod tests {
             "<ListBucketResult><Contents><Key>dbev/a%20b%2Bc</Key></Contents></ListBucketResult>";
         let key = percent_decode(&xml_values(xml, "Key")[0]).unwrap();
         assert_eq!(key, "dbev/a b+c");
+    }
+
+    #[test]
+    fn listed_s3_keys_must_remain_inside_the_requested_instance_prefix() {
+        assert_eq!(
+            decode_listed_key_in_prefix("dbev/instances/a/backup", "dbev/instances/a/").unwrap(),
+            "dbev/instances/a/backup"
+        );
+        let error = decode_listed_key_in_prefix("dbev/instances/b/backup", "dbev/instances/a/")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the requested backup prefix")
+        );
     }
 
     #[test]

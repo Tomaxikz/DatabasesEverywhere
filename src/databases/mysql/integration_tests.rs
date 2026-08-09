@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::provision::tenant_user_sql;
+use super::provision::{reset_tenant_password_sql, tenant_user_sql};
 use crate::{
     gateway::{
         listeners::run_mysql_listener, resolver::RouteResolver, security::GatewayConnectionLimiter,
@@ -25,6 +25,7 @@ const IMAGE: &str = "mysql:8.4";
 const DATABASE: &str = "integration_db";
 const TENANT: &str = "integration_user";
 const TENANT_PASSWORD: &str = "integration-tenant-password";
+const ROTATED_TENANT_PASSWORD: &str = "integration-rotated-password";
 const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -69,6 +70,92 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
         "CREATE TABLE restore_test (id INT PRIMARY KEY, value VARCHAR(32)); INSERT INTO restore_test VALUES (1, 'before')",
     );
     assert_success(&create, "tenant table creation");
+
+    assert_eq!(
+        query_mysql(
+            &name,
+            ROOT_PASSWORD,
+            "root",
+            "mysql",
+            "SELECT @@GLOBAL.log_bin"
+        ),
+        "1",
+        "the regression fixture must exercise a binlog-enabled MySQL server"
+    );
+    let binlog_before_rotation = query_mysql(
+        &name,
+        ROOT_PASSWORD,
+        "root",
+        "mysql",
+        "SHOW BINARY LOG STATUS",
+    );
+
+    // Model a runtime command that mutates the account and then reports a
+    // failure. Password reset must still be recoverable from the persisted
+    // verifier even though the caller cannot infer whether ALTER USER ran.
+    let mut failing_rotation_sql = reset_tenant_password_sql(
+        TENANT,
+        &native_password_sha1_stage2_hex(ROTATED_TENANT_PASSWORD),
+    )
+    .unwrap();
+    failing_rotation_sql.push_str("\nSELECT * FROM `dbev_missing_schema`.`dbev_missing_table`;\n");
+    let failed_rotation = exec_with_input(
+        &name,
+        ROOT_PASSWORD,
+        &["mysql", "--protocol=socket", "-uroot"],
+        failing_rotation_sql.as_bytes(),
+    );
+    assert!(
+        !failed_rotation.status.success(),
+        "the injected post-rotation failure unexpectedly succeeded"
+    );
+    assert_success(
+        &exec_mysql(&name, ROTATED_TENANT_PASSWORD, TENANT, DATABASE, "SELECT 1"),
+        "credential mutation before the injected failure",
+    );
+
+    let rollback_sql =
+        reset_tenant_password_sql(TENANT, &native_password_sha1_stage2_hex(TENANT_PASSWORD))
+            .unwrap();
+    let rollback = exec_with_input(
+        &name,
+        ROOT_PASSWORD,
+        &["mysql", "--protocol=socket", "-uroot"],
+        rollback_sql.as_bytes(),
+    );
+    assert_success(&rollback, "password rotation rollback");
+    assert_success(
+        &exec_mysql(&name, TENANT_PASSWORD, TENANT, DATABASE, "SELECT 1"),
+        "restored tenant credential",
+    );
+    assert!(
+        !exec_mysql(&name, ROTATED_TENANT_PASSWORD, TENANT, DATABASE, "SELECT 1",)
+            .status
+            .success(),
+        "replacement credential remained valid after rollback"
+    );
+    assert_eq!(
+        query_mysql(
+            &name,
+            ROOT_PASSWORD,
+            "root",
+            "mysql",
+            "SELECT @@GLOBAL.log_bin"
+        ),
+        "1",
+        "password rotation must not disable binary logging globally"
+    );
+    assert_eq!(
+        query_mysql(
+            &name,
+            ROOT_PASSWORD,
+            "root",
+            "mysql",
+            "SHOW BINARY LOG STATUS",
+        ),
+        binlog_before_rotation,
+        "DBEV account maintenance must not append password material to the binary log"
+    );
 
     let dump = Command::new("docker")
         .args([
@@ -123,6 +210,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             protocol: Protocol::Mysql,
             status: InstanceStatus::Running,
             desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            disk_limit_blocked: false,
             public: PublicEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: 0,
@@ -305,6 +393,15 @@ fn exec_mysql(name: &str, password: &str, user: &str, database: &str, sql: &str)
         ])
         .output()
         .expect("run MySQL query")
+}
+
+fn query_mysql(name: &str, password: &str, user: &str, database: &str, sql: &str) -> String {
+    let output = exec_mysql(name, password, user, database, sql);
+    assert_success(&output, "MySQL query");
+    String::from_utf8(output.stdout)
+        .expect("MySQL query output is UTF-8")
+        .trim()
+        .to_string()
 }
 
 fn exec_with_input(name: &str, password: &str, command: &[&str], input: &[u8]) -> Output {

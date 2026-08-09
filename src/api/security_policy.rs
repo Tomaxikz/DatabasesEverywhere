@@ -21,14 +21,14 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HostPolicy {
     request_hosts: Arc<HashSet<String>>,
-    origin_hosts: Arc<HashSet<String>>,
+    allowed_origins: Arc<HashSet<String>>,
 }
 
 impl HostPolicy {
     pub fn from_config(config: &Config) -> Self {
         Self {
             request_hosts: normalized_hosts(config.request_allowed_hosts()),
-            origin_hosts: normalized_hosts(config.cors_allowed_hosts()),
+            allowed_origins: Arc::new(config.cors_allowed_origins().into_iter().collect()),
         }
     }
 
@@ -37,13 +37,13 @@ impl HostPolicy {
     }
 
     fn allows_origin(&self, origin: &str) -> bool {
-        allowed_hosts::origin_host(origin)
-            .map(|host| self.origin_hosts.contains(&host))
+        crate::config::normalize_http_origin(origin)
+            .map(|origin| self.allowed_origins.contains(&origin))
             .unwrap_or(false)
     }
 
     fn is_complete(&self) -> bool {
-        !self.request_hosts.is_empty() && !self.origin_hosts.is_empty()
+        !self.request_hosts.is_empty() && !self.allowed_origins.is_empty()
     }
 }
 
@@ -365,7 +365,7 @@ mod tests {
     fn validates_host_and_origin_independently() {
         let policy = HostPolicy {
             request_hosts: normalized_hosts(vec!["panel.example.com".to_string()]),
-            origin_hosts: normalized_hosts(vec!["panel.example.com".to_string()]),
+            allowed_origins: Arc::new(HashSet::from(["https://panel.example.com:443".to_string()])),
         };
         let uri = "/api/system".parse().unwrap();
         let mut headers = HeaderMap::new();
@@ -385,5 +385,24 @@ mod tests {
             validate_allowed_request_hosts(&headers, &uri, &policy),
             Err(ApiError::HostNotAllowed)
         ));
+    }
+
+    #[test]
+    fn origin_policy_matches_scheme_host_and_effective_port() {
+        let mut config = Config {
+            remote: "https://panel.example.com/app".to_string(),
+            ..Config::default()
+        };
+        config.api.trusted_origins = vec!["http://localhost:3000/".to_string()];
+        let policy = HostPolicy::from_config(&config);
+
+        assert!(policy.allows_origin("https://panel.example.com"));
+        assert!(policy.allows_origin("https://PANEL.example.com:443"));
+        assert!(policy.allows_origin("http://localhost:3000"));
+        assert!(!policy.allows_origin("http://panel.example.com"));
+        assert!(!policy.allows_origin("https://panel.example.com:444"));
+        assert!(!policy.allows_origin("https://localhost:3000"));
+        assert!(!policy.allows_origin("http://localhost"));
+        assert!(!policy.allows_origin("https://panel.example.com/path"));
     }
 }

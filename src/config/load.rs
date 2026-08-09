@@ -74,7 +74,11 @@ paths:
         assert_eq!(config.images.postgres, "postgres:18.4");
         assert_eq!(config.images.mongodb, "mongo:7.0.37");
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
-        assert_eq!(config.cors_allowed_hosts(), vec!["panel.example.com"]);
+        assert!(config.api.trusted_origins.is_empty());
+        assert_eq!(
+            config.cors_allowed_origins(),
+            vec!["https://panel.example.com:443"]
+        );
     }
 
     #[test]
@@ -131,7 +135,7 @@ paths:
     }
 
     #[test]
-    fn rejects_removed_manual_disk_mode() {
+    fn accepts_explicit_disk_fallback_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");
         std::fs::write(
@@ -155,9 +159,12 @@ paths:
         )
         .unwrap();
 
-        let error = load_config(&path).unwrap_err();
+        let config = load_config(&path).unwrap();
 
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
+        assert_eq!(
+            config.disk.selection,
+            crate::config::DiskLimitSelection::FuseQuota
+        );
     }
 
     #[test]
@@ -241,18 +248,22 @@ paths:
     }
 
     #[test]
-    fn rejects_removed_api_trusted_origins_field() {
+    fn loads_explicit_api_trusted_origins_without_breaking_legacy_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");
         std::fs::write(
             &path,
             r#"
 api:
+  host: 127.0.0.1
+  port: 8090
   trusted_origins:
-    - https://panel.example.com
+    - http://localhost:3000
+remote: https://panel.example.com
 uuid: node-uuid
 token_id: token-id
-token: secret-token
+token: test-api-token-0123456789abcdef-01
+jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
 paths:
   data: /var/lib/databases-everywhere
   sockets: /run/databases-everywhere
@@ -262,8 +273,11 @@ paths:
         )
         .unwrap();
 
-        let error = load_config(&path).unwrap_err();
+        let config = load_config(&path).unwrap();
 
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
+        assert_eq!(
+            config.cors_allowed_origins(),
+            vec!["https://panel.example.com:443", "http://localhost:3000"]
+        );
     }
 }

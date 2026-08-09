@@ -35,6 +35,7 @@ impl InstanceRepository {
             SELECT
                 instance_metadata.metadata_json,
                 instance_metadata.desired_state,
+                instance_metadata.disk_limit_blocked,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
                 instance_route_auth.mysql_native_password_sha1_stage2,
@@ -55,6 +56,7 @@ impl InstanceRepository {
                 let metadata_json: String = row.try_get("metadata_json")?;
                 let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
                 self.load_desired_state(&mut metadata, &row)?;
+                self.load_disk_limit_blocked(&mut metadata, &row)?;
                 self.load_route_auth(&mut metadata, &row)?;
                 validate_metadata_schema(&metadata)?;
                 Ok(metadata)
@@ -71,6 +73,7 @@ impl InstanceRepository {
             SELECT
                 instance_metadata.metadata_json,
                 instance_metadata.desired_state,
+                instance_metadata.disk_limit_blocked,
                 instance_route_auth.mariadb_native_password_sha1_stage2,
                 instance_route_auth.mariadb_root_password,
                 instance_route_auth.mysql_native_password_sha1_stage2,
@@ -95,6 +98,7 @@ impl InstanceRepository {
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
         self.load_desired_state(&mut metadata, &row)?;
+        self.load_disk_limit_blocked(&mut metadata, &row)?;
         self.load_route_auth(&mut metadata, &row)?;
         validate_metadata_schema(&metadata)?;
         Ok(Some(metadata))
@@ -146,6 +150,7 @@ impl InstanceRepository {
                 protocol,
                 status,
                 desired_state,
+                disk_limit_blocked,
                 public_host,
                 public_port,
                 backend_kind,
@@ -162,12 +167,13 @@ impl InstanceRepository {
                 created_at,
                 updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
             ON CONFLICT(instance_id) DO UPDATE SET
                 schema_version = excluded.schema_version,
                 protocol = excluded.protocol,
                 status = excluded.status,
                 desired_state = excluded.desired_state,
+                disk_limit_blocked = excluded.disk_limit_blocked,
                 public_host = excluded.public_host,
                 public_port = excluded.public_port,
                 backend_kind = excluded.backend_kind,
@@ -190,6 +196,7 @@ impl InstanceRepository {
         .bind(metadata.protocol.to_string())
         .bind(metadata.status.as_str())
         .bind(metadata.desired_state.as_str())
+        .bind(metadata.disk_limit_blocked)
         .bind(&metadata.public.host)
         .bind(i64::from(metadata.public.port))
         .bind(backend.kind)
@@ -271,6 +278,15 @@ impl InstanceRepository {
                 value,
             }
         })?;
+        Ok(())
+    }
+
+    fn load_disk_limit_blocked(
+        &self,
+        metadata: &mut InstanceMetadata,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<(), RepositoryError> {
+        metadata.disk_limit_blocked = row.try_get("disk_limit_blocked")?;
         Ok(())
     }
 
@@ -357,15 +373,24 @@ impl InstanceRepository {
         instance_id: &str,
         value: Option<String>,
     ) -> Result<Option<String>, RepositoryError> {
-        value
-            .map(|value| {
-                self.secrets
-                    .as_ref()
-                    .map(|secrets| secrets.decrypt(field, instance_id, &value))
-                    .unwrap_or(Ok(value))
-            })
-            .transpose()
-            .map_err(RepositoryError::Secrets)
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let Some(secrets) = self.secrets.as_ref() else {
+            return Ok(Some(value));
+        };
+
+        match secrets.decrypt(field, instance_id, &value) {
+            Ok(value) => Ok(Some(value)),
+            Err(source @ SecretStoreError::InvalidCiphertext) => {
+                Err(RepositoryError::InvalidProtectedSecret {
+                    instance_id: instance_id.to_string(),
+                    field: field.to_string(),
+                    source,
+                })
+            }
+            Err(error) => Err(RepositoryError::Secrets(error)),
+        }
     }
 
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {
@@ -430,6 +455,15 @@ pub enum RepositoryError {
     Json(#[from] serde_json::Error),
     #[error("metadata secret storage failed: {0}")]
     Secrets(#[from] SecretStoreError),
+    #[error(
+        "instance {instance_id} field {field} contains an invalid or ambiguous protected secret; refusing to interpret it as plaintext"
+    )]
+    InvalidProtectedSecret {
+        instance_id: String,
+        field: String,
+        #[source]
+        source: SecretStoreError,
+    },
     #[error("metadata schema version {actual} is not supported")]
     UnsupportedSchema { actual: u32 },
     #[error("instance {instance_id} has unsupported desired state {value:?}")]
@@ -480,24 +514,34 @@ mod tests {
         let repository = InstanceRepository::new(pool.clone());
         let mut metadata = sample_metadata();
         metadata.desired_state = DesiredInstanceState::Stopped;
+        metadata.disk_limit_blocked = true;
 
         repository.upsert(&metadata).await.unwrap();
 
-        let (desired_state, metadata_json): (String, String) = sqlx::query_as(
-            "SELECT desired_state, metadata_json FROM instance_metadata WHERE instance_id = ?1",
+        let (desired_state, disk_limit_blocked, metadata_json): (String, bool, String) =
+            sqlx::query_as(
+            "SELECT desired_state, disk_limit_blocked, metadata_json FROM instance_metadata WHERE instance_id = ?1",
         )
         .bind("inst_abc")
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(desired_state, "stopped");
+        assert!(disk_limit_blocked);
         assert!(!metadata_json.contains("desired_state"));
+        assert!(!metadata_json.contains("disk_limit_blocked"));
         let loaded = repository.get("inst_abc").await.unwrap().unwrap();
         assert_eq!(loaded.desired_state, DesiredInstanceState::Stopped);
+        assert!(loaded.disk_limit_blocked);
         assert!(
             !serde_json::to_string(&loaded)
                 .unwrap()
                 .contains("desired_state")
+        );
+        assert!(
+            !serde_json::to_string(&loaded)
+                .unwrap()
+                .contains("disk_limit_blocked")
         );
     }
 
@@ -717,7 +761,10 @@ mod tests {
         let pool = sqlite::connect(dir.path()).await.unwrap();
         let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
         let mut metadata = sample_metadata();
-        metadata.tenant_password = Some("current-tenant-password".to_string());
+        // A caller-controlled secret may legitimately begin with the storage
+        // envelope marker. It must still be encrypted rather than mistaken
+        // for an already protected repository value.
+        metadata.tenant_password = Some("dbev1:current-tenant-password".to_string());
 
         repository.upsert(&metadata).await.unwrap();
 
@@ -729,16 +776,97 @@ mod tests {
         .await
         .unwrap();
         assert!(is_encrypted(&raw));
+        assert_ne!(raw, "dbev1:current-tenant-password");
         assert!(!raw.contains("current-tenant-password"));
 
         let loaded = repository.get("inst_abc").await.unwrap().unwrap();
         assert_eq!(
             loaded.tenant_password.as_deref(),
-            Some("current-tenant-password")
+            Some("dbev1:current-tenant-password")
         );
         let public_json = serde_json::to_string(&loaded).unwrap();
         assert!(!public_json.contains("tenant_password"));
-        assert!(!public_json.contains("current-tenant-password"));
+        assert!(!public_json.contains("dbev1:current-tenant-password"));
+    }
+
+    #[tokio::test]
+    async fn encrypted_repository_rejects_ambiguous_prefixed_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let plain_repository = InstanceRepository::new(pool.clone());
+        let mut metadata = sample_metadata();
+        let ambiguous = "dbev1:chosen-by-the-user";
+        metadata.tenant_password = Some(ambiguous.to_string());
+        plain_repository.upsert(&metadata).await.unwrap();
+
+        let encrypted_repository = InstanceRepository::encrypted(pool, dir.path()).unwrap();
+        let error = encrypted_repository.get("inst_abc").await.unwrap_err();
+
+        assert_invalid_protected_secret(error, "tenant_password", ambiguous);
+    }
+
+    #[tokio::test]
+    async fn encrypted_repository_rejects_corrupted_ciphertext_without_plaintext_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.tenant_password = Some("secret-before-corruption".to_string());
+        repository.upsert(&metadata).await.unwrap();
+
+        let raw: String = sqlx::query_scalar(
+            "SELECT tenant_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut corrupted = raw.into_bytes();
+        let ciphertext_offset = corrupted.iter().rposition(|byte| *byte == b':').unwrap() + 1;
+        corrupted[ciphertext_offset] = if corrupted[ciphertext_offset] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let corrupted = String::from_utf8(corrupted).unwrap();
+        sqlx::query("UPDATE instance_route_auth SET tenant_password = ?1 WHERE instance_id = ?2")
+            .bind(&corrupted)
+            .bind("inst_abc")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = repository.get("inst_abc").await.unwrap_err();
+        assert_invalid_protected_secret(error, "tenant_password", &corrupted);
+    }
+
+    #[tokio::test]
+    async fn encrypted_repository_rejects_ciphertext_bound_to_the_wrong_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.tenant_password = Some("field-bound-secret".to_string());
+        repository.upsert(&metadata).await.unwrap();
+
+        let raw: String = sqlx::query_scalar(
+            "SELECT tenant_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE instance_route_auth SET mongodb_root_password = ?1, tenant_password = NULL WHERE instance_id = ?2",
+        )
+        .bind(&raw)
+        .bind("inst_abc")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = repository.get("inst_abc").await.unwrap_err();
+        assert_invalid_protected_secret(error, "mongodb_root_password", &raw);
     }
 
     #[tokio::test]
@@ -770,6 +898,28 @@ mod tests {
         assert!(!raw.contains("legacy-plain-root"));
     }
 
+    fn assert_invalid_protected_secret(
+        error: RepositoryError,
+        expected_field: &str,
+        protected_value: &str,
+    ) {
+        let message = error.to_string();
+        assert!(message.contains("inst_abc"));
+        assert!(message.contains(expected_field));
+        assert!(!message.contains(protected_value));
+        match error {
+            RepositoryError::InvalidProtectedSecret {
+                instance_id,
+                field,
+                source: SecretStoreError::InvalidCiphertext,
+            } => {
+                assert_eq!(instance_id, "inst_abc");
+                assert_eq!(field, expected_field);
+            }
+            error => panic!("unexpected repository error: {error}"),
+        }
+    }
+
     fn sample_metadata() -> InstanceMetadata {
         InstanceMetadata {
             schema_version: SCHEMA_VERSION,
@@ -777,6 +927,7 @@ mod tests {
             protocol: Protocol::Postgres,
             status: InstanceStatus::Running,
             desired_state: DesiredInstanceState::Running,
+            disk_limit_blocked: false,
             public: PublicEndpoint {
                 host: "db.example.com".to_string(),
                 port: 5433,

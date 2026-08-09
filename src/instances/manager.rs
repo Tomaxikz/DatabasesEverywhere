@@ -38,6 +38,17 @@ impl InstanceManager {
         Ok(())
     }
 
+    /// Read the durable metadata directly instead of consulting the in-memory
+    /// route store. Mutation recovery uses this after an SQLite commit returns
+    /// an error: the transaction may have committed even though its
+    /// acknowledgement was lost, while the store is updated only on `Ok`.
+    pub async fn get_persisted(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<InstanceMetadata>, RepositoryError> {
+        self.repository.get(instance_id).await
+    }
+
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {
         let deleted = self.repository.delete(instance_id).await?;
         if deleted {

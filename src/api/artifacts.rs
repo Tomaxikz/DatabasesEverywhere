@@ -164,11 +164,14 @@ impl DownloadPeer {
     fn from_socket(peer: Option<SocketAddr>) -> Self {
         match peer.map(|address| address.ip()) {
             Some(IpAddr::V4(address)) => Self::V4(address.octets()),
-            Some(IpAddr::V6(address)) => {
-                let mut prefix = [0_u8; 8];
-                prefix.copy_from_slice(&address.octets()[..8]);
-                Self::V6Prefix64(prefix)
-            }
+            Some(IpAddr::V6(address)) => address.to_ipv4_mapped().map_or_else(
+                || {
+                    let mut prefix = [0_u8; 8];
+                    prefix.copy_from_slice(&address.octets()[..8]);
+                    Self::V6Prefix64(prefix)
+                },
+                |address| Self::V4(address.octets()),
+            ),
             None => Self::Unknown,
         }
     }
@@ -928,6 +931,23 @@ mod tests {
     }
 
     #[test]
+    fn download_admission_maps_ipv4_mapped_ipv6_to_the_ipv4_peer() {
+        let tickets = ArtifactDownloadTickets::default();
+        let ipv4 = Some("192.0.2.10:5000".parse().unwrap());
+        let mapped = Some("[::ffff:192.0.2.10]:5000".parse().unwrap());
+        let permits = (0..MAX_ACTIVE_DOWNLOADS_PER_PEER)
+            .map(|_| tickets.admit_download(ipv4).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            tickets.admit_download(mapped),
+            Err(ApiError::RateLimited)
+        ));
+        drop(permits);
+        assert!(tickets.admit_download(mapped).is_ok());
+    }
+
+    #[test]
     fn download_streams_are_bounded_node_wide() {
         let tickets = ArtifactDownloadTickets::default();
         let permits = (0..MAX_ACTIVE_DOWNLOADS)
@@ -1132,6 +1152,7 @@ mod tests {
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: ArtifactDownloadTickets::default(),
             resource_cache: crate::api::resources::ResourceCache::default(),
+            soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
             monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
             instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
@@ -1146,6 +1167,7 @@ mod tests {
             protocol: Protocol::Postgres,
             status: InstanceStatus::Running,
             desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            disk_limit_blocked: false,
             public: PublicEndpoint {
                 host: "db.example.com".to_string(),
                 port: 5434,

@@ -808,13 +808,25 @@ components:
             limit_bytes: {type: [integer, "null"]}
         disk:
           type: object
-          required: [configured_mib, limit_bytes, used_bytes, enforced, enforcement_method]
+          required: [configured_mib, limit_bytes, used_bytes, enforced, enforcement_method, enforcement_strength]
           properties:
             configured_mib: {type: integer}
             limit_bytes: {type: integer}
             used_bytes: {type: integer}
             enforced: {type: boolean}
             enforcement_method: {type: string}
+            enforcement_strength:
+              type: string
+              enum: [hard, soft, none]
+            scanner_logical_bytes: {type: integer}
+            scanner_physical_bytes: {type: integer}
+            scanner_growth_bytes_per_second: {type: number}
+            scanner_peak_growth_bytes_per_second: {type: number}
+            scanner_predicted_seconds_to_limit: {type: integer}
+            scanner_stop_threshold_bytes: {type: integer}
+            scanner_recovery_threshold_bytes: {type: integer}
+            scanner_restart_blocked: {type: boolean}
+            scanner_sample_age_seconds: {type: integer}
         network:
           type: object
           required: [rx_bytes, tx_bytes]

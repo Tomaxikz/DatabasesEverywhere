@@ -42,6 +42,10 @@ pub enum ConfigValidationError {
     InvalidRemoteUrl,
     #[error("api.host must be a host or IP address, not a URL/path: {value}")]
     InvalidApiHost { value: String },
+    #[error(
+        "api.trusted_origins must contain only HTTP(S) origins without paths, queries, or credentials: {value}"
+    )]
+    InvalidApiOrigin { value: String },
     #[error("{field} bind address is invalid: {value}")]
     InvalidBind { field: &'static str, value: String },
     #[error("{field} must be an absolute path: {value}")]
@@ -92,6 +96,8 @@ pub enum ConfigValidationError {
         "disk.fuse_quota_binary_sha256 must be the lowercase 64-character SHA-256 of the configured external helper"
     )]
     InvalidFuseQuotaBinarySha256,
+    #[error("disk.soft_scanner.{field} is outside the supported range")]
+    InvalidSoftDiskScanner { field: &'static str },
     #[error("artifacts.retention_keep_latest must be greater than zero")]
     InvalidArtifactRetention,
     #[error("backups.interval_minutes must be greater than zero")]
@@ -497,6 +503,44 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
             return Err(ConfigValidationError::InvalidFuseQuotaBinarySha256);
         }
     }
+    let scanner = &disk.soft_scanner;
+    for (field, value, maximum) in [
+        (
+            "scan_interval_seconds",
+            scanner.scan_interval_seconds,
+            3_600,
+        ),
+        ("scan_timeout_seconds", scanner.scan_timeout_seconds, 3_600),
+        (
+            "shutdown_grace_seconds",
+            scanner.shutdown_grace_seconds,
+            300,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            return Err(ConfigValidationError::InvalidSoftDiskScanner { field });
+        }
+    }
+    if scanner.max_concurrent_scans == 0 || scanner.max_concurrent_scans > 64 {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "max_concurrent_scans",
+        });
+    }
+    if scanner.max_entries_per_scan == 0 || scanner.max_entries_per_scan > 10_000_000 {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "max_entries_per_scan",
+        });
+    }
+    if scanner.max_consecutive_scan_failures == 0 || scanner.max_consecutive_scan_failures > 10 {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "max_consecutive_scan_failures",
+        });
+    }
+    if !(1..=99).contains(&scanner.recovery_percent) {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "recovery_percent",
+        });
+    }
     Ok(())
 }
 
@@ -665,6 +709,13 @@ fn validate_api_hosts(config: &Config) -> Result<(), ConfigValidationError> {
 
     for host in &config.api.trusted_hosts {
         validate_api_host(host)?;
+    }
+    for origin in &config.api.trusted_origins {
+        if super::normalize_http_origin(origin).is_none() {
+            return Err(ConfigValidationError::InvalidApiOrigin {
+                value: origin.to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -1217,7 +1268,10 @@ mod tests {
         validate_config(&config).unwrap();
 
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
-        assert_eq!(config.cors_allowed_hosts(), vec!["panel.example.com"]);
+        assert_eq!(
+            config.cors_allowed_origins(),
+            vec!["https://panel.example.com:443"]
+        );
         assert_eq!(
             config.request_allowed_hosts(),
             vec!["panel.example.com", "127.0.0.1"]
@@ -1236,6 +1290,48 @@ mod tests {
                 .request_allowed_hosts()
                 .contains(&"node.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn accepts_and_normalizes_explicit_browser_origins() {
+        let mut config = valid_config();
+        config.api.trusted_origins = vec![
+            "http://localhost:3000/".to_string(),
+            "https://PANEL.example.com:443".to_string(),
+        ];
+
+        validate_config(&config).unwrap();
+
+        assert_eq!(
+            config.cors_allowed_origins(),
+            vec!["https://panel.example.com:443", "http://localhost:3000"]
+        );
+        assert!(
+            !config
+                .request_allowed_hosts()
+                .contains(&"localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_trusted_origins_with_paths_or_unsupported_schemes() {
+        for origin in [
+            "https://panel.example.com/path",
+            "https://panel.example.com?query=1",
+            "ftp://panel.example.com",
+            "https://user@panel.example.com",
+            "https://panel.example.com:not-a-port",
+            "https://panel.example.com:99999",
+            "panel.example.com",
+        ] {
+            let mut config = valid_config();
+            config.api.trusted_origins = vec![origin.to_string()];
+
+            assert!(matches!(
+                validate_config(&config),
+                Err(ConfigValidationError::InvalidApiOrigin { .. })
+            ));
+        }
     }
 
     #[test]

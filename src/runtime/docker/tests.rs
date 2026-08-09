@@ -336,6 +336,30 @@ fn managed_container_verification_rejects_a_different_node_owner() {
 }
 
 #[test]
+fn destructive_managed_container_selection_is_scoped_to_one_node() {
+    let owned = HashMap::from([
+        (MANAGED_LABEL.to_string(), "true".to_string()),
+        (NODE_LABEL.to_string(), "node-a".to_string()),
+    ]);
+    let other_node = HashMap::from([
+        (MANAGED_LABEL.to_string(), "true".to_string()),
+        (NODE_LABEL.to_string(), "node-b".to_string()),
+    ]);
+    let filters = managed_container_filters("node-a");
+
+    assert_eq!(
+        filters.get("label"),
+        Some(&vec![
+            format!("{MANAGED_LABEL}=true"),
+            format!("{NODE_LABEL}=node-a"),
+        ])
+    );
+    assert!(is_owned_managed_container(Some(&owned), "node-a"));
+    assert!(!is_owned_managed_container(Some(&other_node), "node-a"));
+    assert!(!is_owned_managed_container(None, "node-a"));
+}
+
+#[test]
 fn container_download_does_not_delete_an_existing_target() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("dump.sql");

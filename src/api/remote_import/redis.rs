@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use crate::{
     api::{
         api_response::ApiError,
-        import_export::rollback_data_from_archive,
+        import_export::{rollback_data_from_archive, verify_physical_data_replacement},
         instances::{LifecycleAction, lifecycle_instance_locked},
         routes::AppState,
     },
@@ -156,6 +156,7 @@ async fn import_resp(
         }
         let paths = InstancePaths::new(&state.config.paths, instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        verify_physical_data_replacement(state, &metadata, &paths)?;
         let staging = remote_staging_directory(state).await?;
         Ok((paths, staging))
     })

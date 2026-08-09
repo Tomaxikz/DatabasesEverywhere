@@ -60,6 +60,10 @@ api:
   # concrete bind host. Add the daemon/reverse-proxy hostname when it differs
   # from the panel hostname. Ports are ignored during host comparison.
   trusted_hosts: []
+  # Additional browser origins allowed for CORS and WebSocket upgrades.
+  # Unlike trusted_hosts, these are exact HTTP(S) origins: scheme, hostname,
+  # and effective port must all match. `remote` is always included.
+  trusted_origins: []
   ssl:
     enabled: false
     cert: ''
@@ -160,6 +164,11 @@ allocation:
   reserved_disk_mib: 2048
 
 disk:
+  # auto prefers native project quotas, then FuseQuota. Qdrant uses the soft
+  # scanner whenever native quotas are unavailable because FUSE is unsafe for
+  # its persistent storage. Other choices: project_quota, fuse_quota,
+  # soft_scanner (`none` remains an alias for soft_scanner).
+  mode: auto
   # DBE detects native XFS, Btrfs, ZFS, ext4, or f2fs quota support from the
   # filesystem backing paths.volumes. It falls back to FuseQuota automatically.
   # Native quota modes allocate at most 1,000,000 consecutive IDs from this
@@ -170,6 +179,15 @@ disk:
   fuse_quota_binary: embedded
   fuse_quota_binary_sha256: ""
   fuse_quota_rescan_interval_seconds: 150
+  soft_scanner:
+    scan_interval_seconds: 15
+    max_concurrent_scans: 2
+    max_entries_per_scan: 1000000
+    scan_timeout_seconds: 30
+    max_consecutive_scan_failures: 3
+    safety_reserve_mib: 64
+    recovery_percent: 85
+    shutdown_grace_seconds: 30
 
 daemon:
   # docker or podman. Both use the Docker-compatible container API.

@@ -10,7 +10,6 @@ use axum::extract::State;
 use http::HeaderValue;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::time::{Instant, sleep};
 
 use super::{docker_error, instance_image_update_spec};
@@ -60,19 +59,34 @@ struct PreviousCredential {
 
 struct ResetExecution<'a> {
     paths: &'a InstancePaths,
+    credential_data_path: &'a std::path::Path,
     new_spec: &'a DockerInstanceSpec,
     new_password: &'a SecretString,
-    new_verifier: Option<&'a str>,
-    previous: &'a PreviousCredential,
-    credential_changed: Arc<AtomicBool>,
 }
 
 struct RollbackContext<'a> {
     paths: &'a InstancePaths,
+    credential_data_path: &'a std::path::Path,
     old_spec: &'a DockerInstanceSpec,
+    previous: &'a PreviousCredential,
+}
+
+struct InPlaceResetContext<'a> {
+    state: &'a AppState,
+    metadata: &'a InstanceMetadata,
+    paths: &'a InstancePaths,
+    credential_data_path: &'a std::path::Path,
     new_password: &'a SecretString,
     previous: &'a PreviousCredential,
-    credential_changed: bool,
+}
+
+enum PasswordMetadataCommitResolution {
+    Committed,
+    Previous,
+    Uncertain {
+        reason: String,
+        persisted: Option<Box<InstanceMetadata>>,
+    },
 }
 
 pub async fn reset_instance_password(
@@ -111,8 +125,11 @@ pub async fn reset_instance_password(
         {
             Ok(result) => result,
             Err(error) => {
+                let mut quarantine_summary =
+                    "the instance metadata was unavailable for quarantine".to_string();
                 if let Some(metadata) = recovery_state.instances.get(&worker_instance_id).await {
-                    quarantine_instance(&recovery_state, &metadata).await;
+                    let quarantine = quarantine_instance(&recovery_state, &metadata).await;
+                    quarantine_summary = password_quarantine_summary(&quarantine);
                 }
                 tracing::error!(
                     event = "audit instance_password_reset_worker_failed",
@@ -120,9 +137,9 @@ pub async fn reset_instance_password(
                     %error,
                     "password reset worker failed unexpectedly"
                 );
-                Err(ApiError::Runtime(
-                    "password reset worker failed unexpectedly; the instance was quarantined and must be repaired or recovered before retrying".to_string(),
-                ))
+                Err(ApiError::Runtime(format!(
+                    "password reset worker failed unexpectedly; {quarantine_summary}; repair or recover it before retrying"
+                )))
             }
         };
         drop(permit);
@@ -149,10 +166,31 @@ async fn reset_instance_password_inner(
     require_resettable_instance(&state, &metadata).await?;
     ensure_qdrant_route_is_available(&state, &metadata, &new_password).await?;
 
-    let previous = capture_previous_credential(&state, &metadata).await?;
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    // Existing instances must keep using the bind source recorded in durable
+    // metadata. In particular, RESP ACL files must be read and replaced
+    // through a live FuseQuota mount rather than by mutating its raw backing
+    // directory behind the helper's cache.
+    let disk_limiter =
+        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+            .for_persisted_method(&metadata.limits.disk_enforcement_method);
+    let credential_data_path = disk_limiter
+        .container_data_path(&paths.data)
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let previous = capture_previous_credential(&state, &metadata, &credential_data_path).await?;
     if !requires_container_recreation(metadata.protocol, &previous) {
-        return reset_password_in_place(&state, metadata, &new_password, &previous).await;
+        return reset_password_in_place(
+            &state,
+            metadata,
+            &paths,
+            &credential_data_path,
+            &new_password,
+            &previous,
+        )
+        .await;
     }
+    let previous_metadata = metadata.clone();
     let image = state
         .docker
         .container_recreation_image(metadata.protocol, &metadata.instance_id)
@@ -169,10 +207,6 @@ async fn reset_instance_password_inner(
         .container_project_id(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(docker_error)?;
-    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
     disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
@@ -209,19 +243,22 @@ async fn reset_instance_password_inner(
         spec.project_id.clone_from(&project_id);
     }
 
+    let recreation_started = Instant::now();
+    tracing::info!(
+        event = "audit instance_password_reset_recreation_started",
+        instance_id = %metadata.instance_id,
+        protocol = %metadata.protocol,
+        "recreating instance to apply its startup-managed credential"
+    );
     delete_managed_container(&state, metadata.protocol, &metadata.instance_id).await?;
-    let credential_changed = Arc::new(AtomicBool::new(false));
-    let new_verifier = native_password_verifier(metadata.protocol, &new_password);
     let result = perform_password_reset(
         &state,
         &metadata,
         ResetExecution {
             paths: &paths,
+            credential_data_path: &credential_data_path,
             new_spec: &new_spec,
             new_password: &new_password,
-            new_verifier: new_verifier.as_deref(),
-            previous: &previous,
-            credential_changed: Arc::clone(&credential_changed),
         },
     )
     .await;
@@ -232,10 +269,9 @@ async fn reset_instance_password_inner(
             &metadata,
             RollbackContext {
                 paths: &paths,
+                credential_data_path: &credential_data_path,
                 old_spec: &old_spec,
-                new_password: &new_password,
                 previous: &previous,
-                credential_changed: credential_changed.load(Ordering::Acquire),
             },
             error,
         )
@@ -246,24 +282,55 @@ async fn reset_instance_password_inner(
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
-        return rollback_or_fail(
-            &state,
-            &metadata,
-            RollbackContext {
-                paths: &paths,
-                old_spec: &old_spec,
-                new_password: &new_password,
-                previous: &previous,
-                credential_changed: credential_changed.load(Ordering::Acquire),
-            },
-            ApiError::Runtime(format!(
-                "failed to persist rotated instance authentication: {error}"
-            )),
-        )
-        .await;
+        let commit_error = error.to_string();
+        match resolve_password_metadata_commit(&state, &previous_metadata, &metadata).await {
+            PasswordMetadataCommitResolution::Committed => {
+                state.instances.upsert(metadata.clone()).await;
+                tracing::warn!(
+                    event = "audit instance_password_reset_commit_ack_lost",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    error = %commit_error,
+                    "password reset metadata was durably committed despite a failed commit acknowledgement"
+                );
+            }
+            PasswordMetadataCommitResolution::Previous => {
+                return rollback_or_fail(
+                    &state,
+                    &previous_metadata,
+                    RollbackContext {
+                        paths: &paths,
+                        credential_data_path: &credential_data_path,
+                        old_spec: &old_spec,
+                        previous: &previous,
+                    },
+                    ApiError::Runtime(format!(
+                        "failed to persist rotated instance authentication: {commit_error}"
+                    )),
+                )
+                .await;
+            }
+            PasswordMetadataCommitResolution::Uncertain { reason, persisted } => {
+                return fail_password_metadata_commit_uncertain(
+                    &state,
+                    &metadata,
+                    persisted.as_deref(),
+                    &commit_error,
+                    &reason,
+                )
+                .await;
+            }
+        }
     }
 
     invalidate_password_caches(&state, &metadata).await;
+    tracing::info!(
+        event = "audit instance_password_reset_recreation_ready",
+        instance_id = %metadata.instance_id,
+        protocol = %metadata.protocol,
+        elapsed_ms = recreation_started.elapsed().as_millis(),
+        "recreated instance is ready with its replacement credential"
+    );
     tracing::info!(
         event = "audit instance_password_reset",
         instance_id = %metadata.instance_id,
@@ -290,55 +357,149 @@ fn requires_container_recreation(protocol: Protocol, previous: &PreviousCredenti
     }
 }
 
+async fn resolve_password_metadata_commit(
+    state: &AppState,
+    previous: &InstanceMetadata,
+    intended: &InstanceMetadata,
+) -> PasswordMetadataCommitResolution {
+    match state.manager.get_persisted(&intended.instance_id).await {
+        Ok(Some(persisted)) => classify_password_metadata_commit(persisted, previous, intended),
+        Ok(None) => PasswordMetadataCommitResolution::Uncertain {
+            reason: "the durable instance metadata row is missing".to_string(),
+            persisted: None,
+        },
+        Err(error) => PasswordMetadataCommitResolution::Uncertain {
+            reason: format!("the durable metadata read failed: {error}"),
+            persisted: None,
+        },
+    }
+}
+
+fn classify_password_metadata_commit(
+    persisted: InstanceMetadata,
+    previous: &InstanceMetadata,
+    intended: &InstanceMetadata,
+) -> PasswordMetadataCommitResolution {
+    match super::major_upgrade::classify_major_upgrade_commit(&persisted, previous, intended) {
+        super::major_upgrade::MajorUpgradeCommitResolution::Committed => {
+            PasswordMetadataCommitResolution::Committed
+        }
+        super::major_upgrade::MajorUpgradeCommitResolution::NotCommitted => {
+            PasswordMetadataCommitResolution::Previous
+        }
+        super::major_upgrade::MajorUpgradeCommitResolution::Uncertain(reason) => {
+            PasswordMetadataCommitResolution::Uncertain {
+                reason,
+                persisted: Some(Box::new(persisted)),
+            }
+        }
+    }
+}
+
+async fn fail_password_metadata_commit_uncertain(
+    state: &AppState,
+    intended: &InstanceMetadata,
+    persisted: Option<&InstanceMetadata>,
+    commit_error: &str,
+    reason: &str,
+) -> ApiResult<ResetInstancePasswordResponse> {
+    let quarantine_basis = persisted.unwrap_or(intended);
+    let quarantine = quarantine_instance(state, quarantine_basis).await;
+    let quarantine_summary = password_quarantine_summary(&quarantine);
+    tracing::error!(
+        event = "audit instance_password_reset_commit_uncertain",
+        instance_id = %intended.instance_id,
+        protocol = %intended.protocol,
+        error = %commit_error,
+        %reason,
+        "password reset runtime completed but durable metadata could not be classified; instance was quarantined without attempting a credential rollback"
+    );
+    Err(ApiError::Runtime(format!(
+        "password reset runtime completed, but metadata persistence failed ({commit_error}) and durable commit state is uncertain ({reason}); {quarantine_summary}"
+    )))
+}
+
 async fn reset_password_in_place(
     state: &AppState,
     mut metadata: InstanceMetadata,
+    paths: &InstancePaths,
+    credential_data_path: &std::path::Path,
     new_password: &SecretString,
     previous: &PreviousCredential,
 ) -> ApiResult<ResetInstancePasswordResponse> {
-    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let previous_metadata = metadata.clone();
     let new_verifier = native_password_verifier(metadata.protocol, new_password);
     let credential_changed = Arc::new(AtomicBool::new(false));
-    if let Err(error) = perform_in_place_password_reset(
-        state,
-        &metadata,
-        &paths,
-        new_password,
-        new_verifier.as_deref(),
-        previous,
-        Arc::clone(&credential_changed),
-    )
-    .await
     {
-        return rollback_in_place_or_fail(
+        let context = InPlaceResetContext {
             state,
-            &metadata,
-            &paths,
+            metadata: &previous_metadata,
+            paths,
+            credential_data_path,
             new_password,
             previous,
-            credential_changed.load(Ordering::Acquire),
-            error,
+        };
+        if let Err(error) = perform_in_place_password_reset(
+            &context,
+            new_verifier.as_deref(),
+            Arc::clone(&credential_changed),
         )
-        .await;
+        .await
+        {
+            return rollback_in_place_or_fail(
+                &context,
+                credential_changed.load(Ordering::Acquire),
+                error,
+            )
+            .await;
+        }
     }
 
     apply_new_route_auth(&mut metadata, new_password);
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
-        return rollback_in_place_or_fail(
-            state,
-            &metadata,
-            &paths,
-            new_password,
-            previous,
-            credential_changed.load(Ordering::Acquire),
-            ApiError::Runtime(format!(
-                "failed to persist rotated instance authentication: {error}"
-            )),
-        )
-        .await;
+        let commit_error = error.to_string();
+        match resolve_password_metadata_commit(state, &previous_metadata, &metadata).await {
+            PasswordMetadataCommitResolution::Committed => {
+                state.instances.upsert(metadata.clone()).await;
+                tracing::warn!(
+                    event = "audit instance_password_reset_commit_ack_lost",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    error = %commit_error,
+                    "password reset metadata was durably committed despite a failed commit acknowledgement"
+                );
+            }
+            PasswordMetadataCommitResolution::Previous => {
+                let context = InPlaceResetContext {
+                    state,
+                    metadata: &previous_metadata,
+                    paths,
+                    credential_data_path,
+                    new_password,
+                    previous,
+                };
+                return rollback_in_place_or_fail(
+                    &context,
+                    credential_changed.load(Ordering::Acquire),
+                    ApiError::Runtime(format!(
+                        "failed to persist rotated instance authentication: {commit_error}"
+                    )),
+                )
+                .await;
+            }
+            PasswordMetadataCommitResolution::Uncertain { reason, persisted } => {
+                return fail_password_metadata_commit_uncertain(
+                    state,
+                    &metadata,
+                    persisted.as_deref(),
+                    &commit_error,
+                    &reason,
+                )
+                .await;
+            }
+        }
     }
 
     invalidate_password_caches(state, &metadata).await;
@@ -448,6 +609,7 @@ async fn ensure_qdrant_route_is_available(
 async fn capture_previous_credential(
     state: &AppState,
     metadata: &InstanceMetadata,
+    credential_data_path: &std::path::Path,
 ) -> Result<PreviousCredential, ApiError> {
     let mut previous = PreviousCredential {
         environment: metadata
@@ -491,10 +653,7 @@ async fn capture_previous_credential(
         )));
     }
     if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
-        let path = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?
-            .data
-            .join("users.acl");
+        let path = credential_data_path.join("users.acl");
         previous.acl = Some(
             tokio::task::spawn_blocking(move || {
                 read_private_regular_file_bounded(&path, MAX_ACL_FILE_BYTES)
@@ -552,30 +711,30 @@ fn native_password_verifier(protocol: Protocol, password: &SecretString) -> Opti
 }
 
 async fn perform_in_place_password_reset(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-    paths: &InstancePaths,
-    new_password: &SecretString,
+    context: &InPlaceResetContext<'_>,
     new_verifier: Option<&str>,
-    previous: &PreviousCredential,
     credential_changed: Arc<AtomicBool>,
 ) -> Result<(), ApiError> {
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
+    if matches!(
+        context.metadata.protocol,
+        Protocol::Redis | Protocol::Valkey
+    ) {
         write_resp_acl(
-            metadata.protocol,
-            &paths.data,
-            &metadata.database.username,
-            new_password,
+            context.metadata.protocol,
+            context.credential_data_path,
+            &context.metadata.database.username,
+            context.new_password,
         )
         .await?;
-        paths
+        context
+            .paths
             .reapply_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         activate_resp_acl(
-            state,
-            metadata,
-            previous.environment.as_ref().ok_or_else(|| {
+            context.state,
+            context.metadata,
+            context.previous.environment.as_ref().ok_or_else(|| {
                 ApiError::Conflict(
                     "the current RESP credential is unavailable for live ACL rotation".to_string(),
                 )
@@ -585,43 +744,36 @@ async fn perform_in_place_password_reset(
         credential_changed.store(true, Ordering::Release);
     } else {
         rotate_database_password_to_container_environment(
-            state,
-            metadata,
+            context.state,
+            context.metadata,
             new_verifier,
-            None,
-            Some(new_password),
+            Some(context.new_password),
         )
         .await?;
         credential_changed.store(true, Ordering::Release);
     }
-    validate_rotated_credential(state, metadata, new_password).await
+    validate_rotated_credential(context.state, context.metadata, context.new_password).await
 }
 
 async fn rollback_in_place_or_fail(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-    paths: &InstancePaths,
-    new_password: &SecretString,
-    previous: &PreviousCredential,
+    context: &InPlaceResetContext<'_>,
     credential_changed: bool,
     original_error: ApiError,
 ) -> ApiResult<ResetInstancePasswordResponse> {
     let original_message = original_error.to_string();
-    let rollback = rollback_in_place_password_reset(
-        state,
-        metadata,
-        paths,
-        new_password,
-        previous,
-        credential_changed,
-    )
-    .await;
+    let rollback = rollback_in_place_password_reset(context, credential_changed).await;
     match rollback {
         Ok(()) => {
+            context
+                .state
+                .instances
+                .upsert(context.metadata.clone())
+                .await;
+            invalidate_password_caches(context.state, context.metadata).await;
             tracing::warn!(
                 event = "audit instance_password_reset_rolled_back",
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
+                instance_id = %context.metadata.instance_id,
+                protocol = %context.metadata.protocol,
                 error = %original_message,
                 "in-place password reset failed and the previous credential was restored"
             );
@@ -629,48 +781,49 @@ async fn rollback_in_place_or_fail(
         }
         Err(rollback_error) => {
             let rollback_message = rollback_error.to_string();
-            quarantine_instance(state, metadata).await;
+            let quarantine = quarantine_instance(context.state, context.metadata).await;
+            let quarantine_summary = password_quarantine_summary(&quarantine);
             tracing::error!(
                 event = "audit instance_password_reset_rollback_failed",
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
+                instance_id = %context.metadata.instance_id,
+                protocol = %context.metadata.protocol,
                 error = %original_message,
                 rollback_error = %rollback_message,
                 "in-place password reset and rollback both failed"
             );
             Err(ApiError::Runtime(format!(
-                "password reset failed ({original_message}) and rollback failed ({rollback_message}); instance was quarantined"
+                "password reset failed ({original_message}) and rollback failed ({rollback_message}); {quarantine_summary}"
             )))
         }
     }
 }
 
 async fn rollback_in_place_password_reset(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-    paths: &InstancePaths,
-    new_password: &SecretString,
-    previous: &PreviousCredential,
+    context: &InPlaceResetContext<'_>,
     credential_changed: bool,
 ) -> Result<(), ApiError> {
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
-        let acl = previous.acl.as_deref().ok_or_else(|| {
+    if matches!(
+        context.metadata.protocol,
+        Protocol::Redis | Protocol::Valkey
+    ) {
+        let acl = context.previous.acl.as_deref().ok_or_else(|| {
             ApiError::Runtime("previous RESP ACL was not captured for rollback".to_string())
         })?;
-        restore_resp_acl(metadata.protocol, &paths.data, acl).await?;
-        paths
+        restore_resp_acl(context.metadata.protocol, context.credential_data_path, acl).await?;
+        context
+            .paths
             .reapply_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        let previous_password = previous.environment.as_ref().ok_or_else(|| {
+        let previous_password = context.previous.environment.as_ref().ok_or_else(|| {
             ApiError::Runtime("previous RESP credential was not captured for rollback".to_string())
         })?;
         let (first_password, fallback_password) = if credential_changed {
-            (new_password, previous_password)
+            (context.new_password, previous_password)
         } else {
-            (previous_password, new_password)
+            (previous_password, context.new_password)
         };
-        if activate_resp_acl(state, metadata, first_password)
+        if activate_resp_acl(context.state, context.metadata, first_password)
             .await
             .is_err()
         {
@@ -678,17 +831,16 @@ async fn rollback_in_place_password_reset(
             // recovered the exec by restarting the container. Try the other
             // known credential so rollback remains deterministic in either
             // state.
-            activate_resp_acl(state, metadata, fallback_password).await?;
+            activate_resp_acl(context.state, context.metadata, fallback_password).await?;
         }
         return Ok(());
     }
 
     rotate_database_password_to_container_environment(
-        state,
-        metadata,
-        previous.native_password_verifier.as_deref(),
-        (metadata.protocol == Protocol::Clickhouse).then_some(new_password),
-        previous.environment.as_ref(),
+        context.state,
+        context.metadata,
+        context.previous.native_password_verifier.as_deref(),
+        context.previous.environment.as_ref(),
     )
     .await
 }
@@ -737,7 +889,7 @@ async fn perform_password_reset(
     if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
         write_resp_acl(
             metadata.protocol,
-            &execution.paths.data,
+            execution.credential_data_path,
             &metadata.database.username,
             execution.new_password,
         )
@@ -747,11 +899,15 @@ async fn perform_password_reset(
             .reapply_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        execution.credential_changed.store(true, Ordering::Release);
     }
 
     let no_progress = |_event| {};
-    let changed_after_start = Arc::clone(&execution.credential_changed);
+    // Every protocol reaching this path gets its credential from material
+    // prepared before startup: Redis/Valkey read the rewritten ACL, while
+    // ClickHouse/Qdrant read immutable container configuration. In particular,
+    // the ClickHouse image creates an XML-backed user that cannot be changed
+    // with ALTER USER. The launch readiness probe authenticates with the new
+    // container environment before this function can return success.
     launch_container_from_spec(
         state,
         execution.new_spec,
@@ -759,23 +915,7 @@ async fn perform_password_reset(
         &metadata.instance_id,
         &no_progress,
         false,
-        || async {
-            if !matches!(
-                metadata.protocol,
-                Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-            ) {
-                rotate_database_password_to_container_environment(
-                    state,
-                    metadata,
-                    execution.new_verifier,
-                    execution.previous.environment.as_ref(),
-                    Some(execution.new_password),
-                )
-                .await?;
-                changed_after_start.store(true, Ordering::Release);
-            }
-            Ok(())
-        },
+        || async { Ok(()) },
     )
     .await
     .map_err(|error| error.into_api_error())?;
@@ -787,10 +927,9 @@ async fn rotate_database_password_to_container_environment(
     state: &AppState,
     metadata: &InstanceMetadata,
     native_password_verifier: Option<&str>,
-    clickhouse_current_password: Option<&SecretString>,
-    clickhouse_target_password: Option<&SecretString>,
+    target_password: Option<&SecretString>,
 ) -> Result<(), ApiError> {
-    wait_for_rotation_admin(state, metadata, clickhouse_current_password).await?;
+    wait_for_rotation_admin(state, metadata).await?;
     let script = match metadata.protocol {
         Protocol::Postgres => postgres_rotation_script(&metadata.database.username),
         Protocol::Mariadb => mysql_family_rotation_script(
@@ -810,25 +949,16 @@ async fn rotate_database_password_to_container_environment(
             })?,
         )?,
         Protocol::Mongodb => mongodb_rotation_script(metadata)?,
-        Protocol::Clickhouse => clickhouse_rotation_script(
-            &metadata.database.username,
-            clickhouse_target_password.ok_or_else(|| {
-                ApiError::Runtime("replacement clickhouse credential is missing".to_string())
-            })?,
-        ),
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => return Ok(()),
+        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
+            return Err(ApiError::Runtime(format!(
+                "{} credentials are managed through recreated startup configuration, not live SQL",
+                metadata.protocol
+            )));
+        }
     };
-    let mut environment = Vec::with_capacity(2);
-    if let Some(password) = clickhouse_target_password {
+    let mut environment = Vec::with_capacity(1);
+    if let Some(password) = target_password {
         environment.push(("DBE_ROTATED_PASSWORD", password));
-    }
-    if metadata.protocol == Protocol::Clickhouse {
-        environment.push((
-            "DBE_CURRENT_PASSWORD",
-            clickhouse_current_password.ok_or_else(|| {
-                ApiError::Runtime("current clickhouse credential is missing".to_string())
-            })?,
-        ));
     }
     state
         .docker
@@ -849,7 +979,6 @@ async fn rotate_database_password_to_container_environment(
 async fn wait_for_rotation_admin(
     state: &AppState,
     metadata: &InstanceMetadata,
-    clickhouse_current_password: Option<&SecretString>,
 ) -> Result<(), ApiError> {
     let command = match metadata.protocol {
         Protocol::Postgres => {
@@ -859,22 +988,23 @@ async fn wait_for_rotation_admin(
         Protocol::Mariadb => "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null".to_string(),
         Protocol::Mysql => "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null".to_string(),
         Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval 'db.adminCommand({ ping: 1 }).ok' >/dev/null".to_string(),
-        Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$DBE_CURRENT_PASSWORD\" --query 'SELECT 1' >/dev/null".to_string(),
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => return Ok(()),
+        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
+            return Err(ApiError::Runtime(format!(
+                "{} does not support live password rotation",
+                metadata.protocol
+            )));
+        }
     };
     let deadline = Instant::now() + ROTATION_READINESS_TIMEOUT;
     let mut last_error = String::new();
     while Instant::now() < deadline {
-        let environment = clickhouse_current_password
-            .map(|password| vec![("DBE_CURRENT_PASSWORD", password)])
-            .unwrap_or_default();
         match tokio::time::timeout(
             Duration::from_secs(5),
             state.docker.exec_readiness_probe_with_secret_env(
                 metadata.protocol,
                 &metadata.instance_id,
                 &command,
-                &environment,
+                &[],
             ),
         )
         .await
@@ -914,7 +1044,7 @@ fn mysql_family_rotation_script(
                 .map_err(|error| ApiError::Runtime(error.to_string()))?
         }
         Protocol::Mysql => {
-            databases::mysql::provision::tenant_user_sql(database, username, verifier)
+            databases::mysql::provision::reset_tenant_password_sql(username, verifier)
                 .map_err(|error| ApiError::Runtime(error.to_string()))?
         }
         _ => {
@@ -944,19 +1074,6 @@ fn mongodb_rotation_script(metadata: &InstanceMetadata) -> Result<String, ApiErr
         "set -eu\nmongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval {}\n",
         sh_quote(&javascript)
     ))
-}
-
-fn clickhouse_rotation_script(username: &str, target_password: &SecretString) -> String {
-    let username = format!("`{}`", username.replace('`', "``"));
-    let password_hash = format!(
-        "{:x}",
-        Sha256::digest(target_password.expose_secret().as_bytes())
-    );
-    let query = format!("ALTER USER {username} IDENTIFIED WITH sha256_hash BY '{password_hash}'");
-    format!(
-        "set -eu\nclickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$DBE_CURRENT_PASSWORD\" --query {}\n",
-        sh_quote(&query),
-    )
 }
 
 async fn validate_rotated_credential(
@@ -1061,14 +1178,15 @@ async fn rollback_or_fail(
         state,
         metadata,
         rollback.paths,
+        rollback.credential_data_path,
         rollback.old_spec,
-        rollback.new_password,
         rollback.previous,
-        rollback.credential_changed,
     )
     .await
     {
         Ok(()) => {
+            state.instances.upsert(metadata.clone()).await;
+            invalidate_password_caches(state, metadata).await;
             tracing::warn!(
                 event = "audit instance_password_reset_rolled_back",
                 instance_id = %metadata.instance_id,
@@ -1080,7 +1198,8 @@ async fn rollback_or_fail(
         }
         Err(rollback_error) => {
             let rollback_message = rollback_error.to_string();
-            quarantine_instance(state, metadata).await;
+            let quarantine = quarantine_instance(state, metadata).await;
+            let quarantine_summary = password_quarantine_summary(&quarantine);
             tracing::error!(
                 event = "audit instance_password_reset_rollback_failed",
                 instance_id = %metadata.instance_id,
@@ -1090,7 +1209,7 @@ async fn rollback_or_fail(
                 "instance password reset and rollback both failed"
             );
             Err(ApiError::Runtime(format!(
-                "password reset failed ({original_message}) and rollback failed ({rollback_message}); instance was quarantined"
+                "password reset failed ({original_message}) and rollback failed ({rollback_message}); {quarantine_summary}"
             )))
         }
     }
@@ -1100,17 +1219,16 @@ async fn rollback_password_reset(
     state: &AppState,
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
+    credential_data_path: &std::path::Path,
     old_spec: &DockerInstanceSpec,
-    new_password: &SecretString,
     previous: &PreviousCredential,
-    credential_changed: bool,
 ) -> Result<(), ApiError> {
     delete_managed_container(state, metadata.protocol, &metadata.instance_id).await?;
     if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
         let acl = previous.acl.as_deref().ok_or_else(|| {
             ApiError::Runtime("previous RESP ACL was not captured for rollback".to_string())
         })?;
-        restore_resp_acl(metadata.protocol, &paths.data, acl).await?;
+        restore_resp_acl(metadata.protocol, credential_data_path, acl).await?;
         paths
             .reapply_data_owner()
             .await
@@ -1118,6 +1236,9 @@ async fn rollback_password_reset(
     }
 
     let no_progress = |_event| {};
+    // The old spec (and restored RESP ACL above) is the rollback. Its normal
+    // launch readiness probe authenticates with the old credential, so a
+    // rollback cannot be reported as successful while authentication is stale.
     launch_container_from_spec(
         state,
         old_spec,
@@ -1125,92 +1246,11 @@ async fn rollback_password_reset(
         &metadata.instance_id,
         &no_progress,
         false,
-        || async {
-            if metadata.protocol == Protocol::Clickhouse {
-                let previous_password = previous.environment.as_ref().ok_or_else(|| {
-                    ApiError::Runtime(
-                        "previous clickhouse credential was not captured for rollback".to_string(),
-                    )
-                })?;
-                if wait_for_clickhouse_credential_state(
-                    state,
-                    metadata,
-                    previous_password,
-                    new_password,
-                )
-                .await?
-                    == ClickhouseCredentialState::Replacement
-                {
-                    rotate_database_password_to_container_environment(
-                        state,
-                        metadata,
-                        None,
-                        Some(new_password),
-                        Some(previous_password),
-                    )
-                    .await?;
-                }
-            } else if credential_changed
-                && !matches!(
-                    metadata.protocol,
-                    Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-                )
-            {
-                rotate_database_password_to_container_environment(
-                    state,
-                    metadata,
-                    previous.native_password_verifier.as_deref(),
-                    (metadata.protocol == Protocol::Clickhouse).then_some(new_password),
-                    previous.environment.as_ref(),
-                )
-                .await?;
-            }
-            Ok(())
-        },
+        || async { Ok(()) },
     )
     .await
     .map_err(|error| error.into_api_error())?;
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClickhouseCredentialState {
-    Previous,
-    Replacement,
-}
-
-async fn wait_for_clickhouse_credential_state(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-    previous_password: &SecretString,
-    replacement_password: &SecretString,
-) -> Result<ClickhouseCredentialState, ApiError> {
-    let command = "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$DBE_CURRENT_PASSWORD\" --query 'SELECT 1' >/dev/null";
-    let deadline = Instant::now() + ROTATION_READINESS_TIMEOUT;
-    let mut last_error = String::new();
-    while Instant::now() < deadline {
-        for (state_name, password) in [
-            (ClickhouseCredentialState::Previous, previous_password),
-            (ClickhouseCredentialState::Replacement, replacement_password),
-        ] {
-            let environment = [("DBE_CURRENT_PASSWORD", password)];
-            let probe = state.docker.exec_readiness_probe_with_secret_env(
-                metadata.protocol,
-                &metadata.instance_id,
-                command,
-                &environment,
-            );
-            match tokio::time::timeout(Duration::from_secs(5), probe).await {
-                Ok(Ok(_)) => return Ok(state_name),
-                Ok(Err(error)) => last_error = error.to_string(),
-                Err(_) => last_error = "credential probe exceeded 5 seconds".to_string(),
-            }
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    Err(ApiError::Runtime(format!(
-        "clickhouse did not accept either known credential during rollback: {last_error}"
-    )))
 }
 
 async fn delete_managed_container(
@@ -1262,36 +1302,69 @@ async fn invalidate_password_caches(state: &AppState, metadata: &InstanceMetadat
     state.monitoring_cache.invalidate().await;
 }
 
-async fn quarantine_instance(state: &AppState, metadata: &InstanceMetadata) {
+async fn quarantine_instance(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
     // Persist fail-closed intent before touching the runtime. If the process
     // crashes after this commit, boot reconciliation still refuses to restart
     // or route an instance whose active credential is uncertain.
     let quarantined = quarantined_metadata(metadata);
-    if let Err(error) = state.manager.upsert(quarantined).await {
+    // Remove routes in this process before waiting on SQLite or Docker. Even
+    // when durable quarantine fails, an uncertain credential must never stay
+    // reachable through the gateway for the remainder of this daemon run.
+    state.instances.upsert(quarantined.clone()).await;
+    let persistence_error = state.manager.upsert(quarantined).await.err().map(|error| {
         tracing::error!(
             instance_id = %metadata.instance_id,
             error = %error,
             "failed to persist quarantine after password reset rollback failure; runtime stop will still be attempted"
         );
-    }
-    if let Err(error) = state
+        format!("failed to persist password-reset quarantine: {error}")
+    });
+    let runtime_error = match state
         .docker
         .stop(metadata.protocol, &metadata.instance_id)
         .await
-        && !error.is_not_found()
     {
-        tracing::error!(
-            instance_id = %metadata.instance_id,
-            %error,
-            "failed to stop instance while quarantining an uncertain password rotation"
-        );
-    }
+        Ok(_) => None,
+        Err(error) if error.is_not_found() || error.is_not_running() => None,
+        Err(error) => {
+            tracing::error!(
+                instance_id = %metadata.instance_id,
+                %error,
+                "failed to stop instance while quarantining an uncertain password rotation"
+            );
+            Some(format!(
+                "failed to stop password-reset quarantine target: {error}"
+            ))
+        }
+    };
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
         .await;
     state.resource_cache.remove(&metadata.instance_id).await;
     state.monitoring_cache.invalidate().await;
+
+    let failures = [persistence_error, runtime_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Runtime(failures.join("; ")))
+    }
+}
+
+fn password_quarantine_summary(result: &Result<(), ApiError>) -> String {
+    match result {
+        Ok(()) => "the instance was stopped and quarantined".to_string(),
+        Err(error) => format!(
+            "gateway routes were removed, but complete shutdown or durable quarantine failed: {error}"
+        ),
+    }
 }
 
 fn quarantined_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
@@ -1303,139 +1376,4 @@ fn quarantined_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn password_validation_rejects_empty_multiline_and_oversized_secrets() {
-        assert!(validate_password(Protocol::Postgres, &SecretString::from("")).is_err());
-        assert!(
-            validate_password(Protocol::Postgres, &SecretString::from("line1\nline2")).is_err()
-        );
-        assert!(
-            validate_password(
-                Protocol::Postgres,
-                &SecretString::from("x".repeat(MAX_PASSWORD_CHARACTERS + 1)),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn mariadb_rollback_uses_the_persisted_native_verifier_not_stale_environment() {
-        assert!(credential_environment_keys(Protocol::Mariadb).is_empty());
-    }
-
-    #[test]
-    fn qdrant_password_must_be_a_valid_header_value() {
-        assert!(validate_password(Protocol::Qdrant, &SecretString::from("valid-api-key")).is_ok());
-        assert!(validate_password(Protocol::Qdrant, &SecretString::from("invalid\u{7f}")).is_err());
-    }
-
-    #[test]
-    fn clickhouse_rotation_sends_only_the_new_password_hash_in_sql() {
-        let script = clickhouse_rotation_script("app_user", &SecretString::from("new-secret"));
-
-        assert!(script.contains("IDENTIFIED WITH sha256_hash"));
-        assert!(!script.contains("new-secret"));
-    }
-
-    #[test]
-    fn route_auth_updates_only_protocol_specific_hidden_material() {
-        let mut metadata = test_metadata(Protocol::Qdrant);
-        apply_new_route_auth(&mut metadata, &SecretString::from("new-key"));
-
-        assert_eq!(
-            metadata.route_key_sha256.as_deref(),
-            Some(crate::protocols::qdrant::route_key_sha256("new-key").as_str())
-        );
-        assert!(metadata.mariadb_native_password_sha1_stage2.is_none());
-        assert_eq!(metadata.tenant_password.as_deref(), Some("new-key"));
-    }
-
-    #[test]
-    fn only_immutable_or_legacy_protocol_credentials_require_recreation() {
-        let current_resp = PreviousCredential {
-            environment: Some(SecretString::from("current-password")),
-            acl: Some(b"user dbe_health on nopass -@all +ping\n".to_vec()),
-            ..PreviousCredential::default()
-        };
-        let legacy_resp = PreviousCredential {
-            acl: Some(b"user dbe_health on nopass -@all +ping\n".to_vec()),
-            ..PreviousCredential::default()
-        };
-
-        assert!(!requires_container_recreation(
-            Protocol::Postgres,
-            &current_resp
-        ));
-        assert!(!requires_container_recreation(
-            Protocol::Mongodb,
-            &current_resp
-        ));
-        assert!(!requires_container_recreation(
-            Protocol::Redis,
-            &current_resp
-        ));
-        assert!(requires_container_recreation(Protocol::Redis, &legacy_resp));
-        assert!(requires_container_recreation(
-            Protocol::Clickhouse,
-            &current_resp
-        ));
-        assert!(requires_container_recreation(
-            Protocol::Qdrant,
-            &current_resp
-        ));
-    }
-
-    #[test]
-    fn uncertain_rotation_is_quarantined_and_stopped_for_boot() {
-        let metadata = test_metadata(Protocol::Mongodb);
-
-        let quarantined = quarantined_metadata(&metadata);
-
-        assert_eq!(quarantined.status, InstanceStatus::Quarantined);
-        assert_eq!(
-            quarantined.desired_state,
-            crate::instances::metadata::DesiredInstanceState::Stopped
-        );
-    }
-
-    fn test_metadata(protocol: Protocol) -> InstanceMetadata {
-        InstanceMetadata {
-            schema_version: crate::instances::metadata::SCHEMA_VERSION,
-            instance_id: "inst_password_test".to_string(),
-            protocol,
-            status: InstanceStatus::Running,
-            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
-            public: crate::instances::metadata::PublicEndpoint {
-                host: "db.example.test".to_string(),
-                port: 1234,
-            },
-            backend: crate::shared::backend::BackendEndpoint::UnixSocket {
-                socket_path: "/run/dbev/test.sock".to_string(),
-            },
-            runtime: crate::instances::metadata::RuntimeMetadata {
-                kind: crate::instances::metadata::RuntimeKind::Docker,
-                container_name: "dbe-test".to_string(),
-                network_mode: "none".to_string(),
-            },
-            database: crate::instances::metadata::DatabaseIdentity {
-                name: "app_db".to_string(),
-                username: "app_user".to_string(),
-            },
-            route_key_sha256: None,
-            mariadb_native_password_sha1_stage2: None,
-            mariadb_root_password: None,
-            mysql_native_password_sha1_stage2: None,
-            mysql_root_password: None,
-            mongodb_root_password: None,
-            tenant_password: None,
-            limits: crate::shared::limits::InstanceLimits::default(),
-            image: None,
-            database_version: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
-    }
-}
+mod tests;

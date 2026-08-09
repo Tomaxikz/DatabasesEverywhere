@@ -48,14 +48,28 @@ pub(super) async fn import_physical_archive(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    let paths = InstancePaths::new(&state.config.paths, instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    verify_physical_data_replacement(state, &metadata, &paths)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
         let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
-
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     restore_data_from_archive(state, instance_id, paths, artifact_path, was_running).await
+}
+
+pub(crate) fn verify_physical_data_replacement(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    paths: &InstancePaths,
+) -> Result<(), ApiError> {
+    crate::disk::DiskLimiter::with_fuse_root(
+        state.config.disk.clone(),
+        state.config.paths.fuse_root(),
+    )
+    .for_persisted_method(&metadata.limits.disk_enforcement_method)
+    .verify_physical_data_replacement(&paths.data)
+    .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
 pub(crate) async fn reapply_instance_data_owner(
@@ -168,9 +182,51 @@ async fn restore_data_from_archive_with_policy(
     should_be_running: bool,
     recover_current_after_preparation_failure: bool,
 ) -> Result<(), ApiError> {
+    let metadata = state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    verify_physical_data_replacement(state, &metadata, &paths)?;
+    let disk_limiter = persisted_physical_disk_limiter(state, &metadata);
+    let detached_fuse = physical_replacement_requires_mount_detach(&disk_limiter);
+    if detached_fuse
+        && let Err(detach_error) = disk_limiter.teardown_instance_mount(&paths.data).await
+    {
+        let recovery = recover_detached_physical_runtime(
+            state,
+            &metadata,
+            &paths,
+            should_be_running,
+            &disk_limiter,
+        )
+        .await;
+        return Err(physical_recovery_error(
+            ApiError::Runtime(format!(
+                "failed to detach FuseQuota before physical data replacement: {detach_error}"
+            )),
+            recovery,
+            "the original runtime",
+        ));
+    }
     let replacement = match prepare_data_replacement(paths.clone(), artifact_path).await {
         Ok(replacement) => replacement,
         Err(failure) if failure.original_restored && recover_current_after_preparation_failure => {
+            if detached_fuse {
+                let recovery = recover_detached_physical_runtime(
+                    state,
+                    &metadata,
+                    &paths,
+                    should_be_running,
+                    &disk_limiter,
+                )
+                .await;
+                return Err(physical_recovery_error(
+                    failure.error,
+                    recovery,
+                    "the original runtime",
+                ));
+            }
             return finish_physical_operation(
                 state,
                 instance_id,
@@ -204,6 +260,54 @@ async fn restore_data_from_archive_with_policy(
             )
             .await
         }
+    }
+}
+
+fn persisted_physical_disk_limiter(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> crate::disk::DiskLimiter {
+    crate::disk::DiskLimiter::with_fuse_root(
+        state.config.disk.clone(),
+        state.config.paths.fuse_root(),
+    )
+    .for_persisted_method(&metadata.limits.disk_enforcement_method)
+}
+
+fn physical_replacement_requires_mount_detach(limiter: &crate::disk::DiskLimiter) -> bool {
+    limiter.mode() == crate::config::DiskLimitMode::FuseQuota
+}
+
+async fn recover_detached_physical_runtime(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    paths: &InstancePaths,
+    should_be_running: bool,
+    limiter: &crate::disk::DiskLimiter,
+) -> Result<(), ApiError> {
+    if should_be_running {
+        return lifecycle_instance_locked(state, &metadata.instance_id, LifecycleAction::Start)
+            .await
+            .map(|_| ());
+    }
+
+    limiter
+        .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+        .await
+        .map(|_| ())
+        .map_err(|error| ApiError::Runtime(error.to_string()))
+}
+
+fn physical_recovery_error(
+    primary: ApiError,
+    recovery: Result<(), ApiError>,
+    recovery_subject: &str,
+) -> ApiError {
+    match recovery {
+        Ok(()) => primary,
+        Err(recovery_error) => ApiError::Runtime(format!(
+            "{primary}; failed to recover {recovery_subject}: {recovery_error}"
+        )),
     }
 }
 
@@ -381,6 +485,7 @@ async fn validate_replaced_instance(
         state.config.disk.clone(),
         state.config.paths.fuse_root(),
     )
+    .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
     .apply_instance_limit(instance_id, &paths.data, metadata.limits.disk_mib)
     .await
     .map_err(|error| ApiError::Runtime(error.to_string()))?;
@@ -417,6 +522,21 @@ async fn rollback_rejected_replacement(
             replacement.backup_dir.display()
         )));
     }
+    let metadata = state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    let disk_limiter = persisted_physical_disk_limiter(state, &metadata);
+    let detached_fuse = physical_replacement_requires_mount_detach(&disk_limiter);
+    if detached_fuse
+        && let Err(detach_error) = disk_limiter.teardown_instance_mount(&paths.data).await
+    {
+        return Err(ApiError::Runtime(format!(
+            "physical restore failed: {primary_error}; rejected database was stopped, but its FuseQuota mount could not be detached before rollback: {detach_error}; previous data was retained at {}",
+            replacement.backup_dir.display()
+        )));
+    }
     if let Err(rollback_error) = replacement.rollback().await {
         return Err(ApiError::Runtime(format!(
             "physical restore failed: {primary_error}; rollback failed: {rollback_error}"
@@ -428,7 +548,10 @@ async fn rollback_rejected_replacement(
         )));
     }
 
-    let recovery = if should_be_running {
+    let recovery = if detached_fuse {
+        recover_detached_physical_runtime(state, &metadata, paths, should_be_running, &disk_limiter)
+            .await
+    } else if should_be_running {
         lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
             .await
             .map(|_| ())
@@ -489,6 +612,38 @@ pub(super) fn preserve_primary_error(
 #[cfg(test)]
 mod transaction_tests {
     use super::*;
+
+    #[test]
+    fn raw_physical_replacement_detaches_only_fuse_runtime() {
+        for (mode, expected) in [
+            (crate::config::DiskLimitMode::FuseQuota, true),
+            (crate::config::DiskLimitMode::ProjectQuota, false),
+            (crate::config::DiskLimitMode::SoftScanner, false),
+        ] {
+            let limiter = crate::disk::DiskLimiter::new(crate::config::DiskConfig {
+                mode,
+                ..crate::config::DiskConfig::default()
+            });
+            assert_eq!(
+                physical_replacement_requires_mount_detach(&limiter),
+                expected,
+                "unexpected mount-detach policy for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_mount_recovery_is_reported_with_the_primary_failure() {
+        let error = physical_recovery_error(
+            ApiError::Runtime("replacement failed".to_string()),
+            Err(ApiError::Runtime("remount failed".to_string())),
+            "the original runtime",
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("replacement failed"));
+        assert!(message.contains("remount failed"));
+    }
 
     #[tokio::test]
     async fn pending_replacement_rolls_previous_data_back_into_place() {

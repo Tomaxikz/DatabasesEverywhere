@@ -160,4 +160,41 @@ mod tests {
             assert_eq!(rows.get(instance_id).map(String::as_str), Some("stopped"));
         }
     }
+
+    #[tokio::test]
+    async fn disk_limit_block_migration_does_not_conflate_operator_stops() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE instance_metadata (
+                instance_id TEXT PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL
+            );
+            INSERT INTO instance_metadata VALUES
+                ('running', 'running'),
+                ('stopped', 'stopped'),
+                ('failed', 'failed');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260809190000_add_disk_limit_blocked.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let blocked = sqlx::query("SELECT disk_limit_blocked FROM instance_metadata")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            blocked
+                .iter()
+                .all(|row| !row.get::<bool, _>("disk_limit_blocked"))
+        );
+    }
 }

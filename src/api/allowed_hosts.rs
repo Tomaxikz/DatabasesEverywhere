@@ -15,11 +15,13 @@ pub fn request_host_with_uri(headers: &HeaderMap, uri: Option<&Uri>) -> Option<S
         })
 }
 
-pub fn origin_is_allowed(origin: &str, allowed_hosts: &[String]) -> bool {
-    let Some(host) = origin_host(origin) else {
+pub fn origin_is_allowed(origin: &str, allowed_origins: &[String]) -> bool {
+    let Some(origin) = crate::config::normalize_http_origin(origin) else {
         return false;
     };
-    host_is_allowed(&host, allowed_hosts)
+    allowed_origins.iter().any(|allowed| {
+        crate::config::normalize_http_origin(allowed).as_deref() == Some(origin.as_str())
+    })
 }
 
 pub fn host_is_allowed(host: &str, allowed_hosts: &[String]) -> bool {
@@ -28,12 +30,6 @@ pub fn host_is_allowed(host: &str, allowed_hosts: &[String]) -> bool {
         .iter()
         .map(|allowed| normalize_host(allowed))
         .any(|allowed| allowed == host)
-}
-
-pub(crate) fn origin_host(origin: &str) -> Option<String> {
-    let rest = origin.split_once("://")?.1;
-    let host = rest.split('/').next().unwrap_or(rest);
-    Some(normalize_host(host))
 }
 
 pub(crate) fn normalize_host(host: &str) -> String {
@@ -54,16 +50,26 @@ mod tests {
 
     #[test]
     fn allows_origin_when_host_matches() {
-        let allowed = vec!["panel.example.com".to_string()];
+        let allowed = vec!["https://panel.example.com".to_string()];
 
         assert!(origin_is_allowed("https://panel.example.com", &allowed));
+        assert!(origin_is_allowed("https://panel.example.com:443", &allowed));
     }
 
     #[test]
-    fn rejects_origin_when_host_does_not_match() {
-        let allowed = vec!["panel.example.com".to_string()];
+    fn rejects_origin_when_scheme_or_port_does_not_match() {
+        let allowed = vec!["https://panel.example.com".to_string()];
 
         assert!(!origin_is_allowed("https://other.example.com", &allowed));
+        assert!(!origin_is_allowed("http://panel.example.com", &allowed));
+        assert!(!origin_is_allowed(
+            "https://panel.example.com:8443",
+            &allowed
+        ));
+        assert!(!origin_is_allowed(
+            "https://panel.example.com:99999",
+            &allowed
+        ));
     }
 
     #[test]

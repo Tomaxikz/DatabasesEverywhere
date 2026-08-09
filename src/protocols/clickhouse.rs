@@ -99,10 +99,9 @@ pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, Cli
             database = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("authorization")
             && username.is_none()
-            && value.len() >= 6
-            && value[..6].eq_ignore_ascii_case("basic ")
+            && let Some(encoded) = basic_authorization_payload(value)?
         {
-            username = Some(basic_auth_username(&value[6..])?);
+            username = Some(basic_auth_username(encoded)?);
         }
     }
 
@@ -134,6 +133,23 @@ fn basic_auth_username(value: &str) -> Result<String, ClickhouseParseError> {
         .split_once(':')
         .ok_or(ClickhouseParseError::InvalidHttpBasicAuth)?;
     Ok(username.to_string())
+}
+
+fn basic_authorization_payload(value: &str) -> Result<Option<&str>, ClickhouseParseError> {
+    // HTTP authentication scheme names and base64 credentials are ASCII.
+    // Checking that invariant before examining a fixed-width prefix avoids
+    // slicing through a multi-byte UTF-8 code point supplied by a hostile
+    // Authorization header.
+    if !value.is_ascii() {
+        return Err(ClickhouseParseError::InvalidHttpBasicAuth);
+    }
+    let Some(prefix) = value.as_bytes().get(..6) else {
+        return Ok(None);
+    };
+    if !prefix.eq_ignore_ascii_case(b"basic ") {
+        return Ok(None);
+    }
+    Ok(value.get(6..))
 }
 
 fn query_value(target: &str, key: &str) -> Option<String> {
@@ -297,6 +313,26 @@ mod tests {
 
         assert_eq!(route.username, "app");
         assert_eq!(route.database, "analytics_one");
+    }
+
+    #[test]
+    fn rejects_non_ascii_authorization_without_panicking_on_utf8_boundary() {
+        // The sixth byte falls in the middle of the second multi-byte code
+        // point. The old fixed string slice panicked before returning an error.
+        let request = "GET /?database=analytics HTTP/1.1\r\nAuthorization: 💣€\r\n\r\n";
+
+        let error = parse_http_initial_route(request.as_bytes()).unwrap_err();
+
+        assert!(matches!(error, ClickhouseParseError::InvalidHttpBasicAuth));
+    }
+
+    #[test]
+    fn rejects_non_ascii_text_after_a_basic_scheme() {
+        let request = "GET /?database=analytics HTTP/1.1\r\nAuthorization: Basic sécret\r\n\r\n";
+
+        let error = parse_http_initial_route(request.as_bytes()).unwrap_err();
+
+        assert!(matches!(error, ClickhouseParseError::InvalidHttpBasicAuth));
     }
 
     #[test]

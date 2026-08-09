@@ -108,7 +108,9 @@ jobs:
   security-audit:
     name: Security audit
     runs-on: ubuntu-24.04
-    needs: release-gate
+    needs:
+      - release-gate
+      - release-quality
     permissions:
       contents: read
     steps:
@@ -136,6 +138,38 @@ jobs:
             exit 1
           fi
           cargo audit --no-yanked -D warnings
+          (
+            cd tools/helper-packer
+            cargo audit --no-yanked -D warnings
+          )
+
+  release-quality:
+    name: Release lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: release-gate
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-quality
+          cache-on-failure: false
+
+      - name: Run locked release checks
+        run: bash .github/ci/check.sh pre-push
 
   build:
     name: Build dbev-${{ matrix.asset_arch }}-linux

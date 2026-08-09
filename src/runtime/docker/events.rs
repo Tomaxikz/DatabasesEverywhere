@@ -61,6 +61,10 @@ impl ManagedContainerAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedContainerEvent {
+    /// Engine identity of the container which emitted the event. This lets
+    /// reconciliation distinguish delayed teardown events for a replaced
+    /// container from a failure of the currently managed container.
+    pub container_id: Option<String>,
     pub instance_id: String,
     pub protocol: Protocol,
     pub action: ManagedContainerAction,
@@ -96,7 +100,12 @@ impl DockerRuntime {
 impl ManagedContainerEvent {
     fn from_message(message: EventMessage, expected_node_id: Option<&str>) -> Option<Self> {
         let raw_action = message.action?;
-        let attributes = message.actor?.attributes?;
+        let actor = message.actor?;
+        let container_id = actor
+            .id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let attributes = actor.attributes?;
         if attributes.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
             return None;
         }
@@ -127,6 +136,7 @@ impl ManagedContainerEvent {
             _ => return None,
         };
         Some(Self {
+            container_id,
             instance_id: instance_id.to_string(),
             protocol,
             action,
@@ -143,12 +153,12 @@ mod tests {
         EventMessage {
             action: Some(action.to_string()),
             actor: Some(EventActor {
+                id: Some("container-old".to_string()),
                 attributes: Some(HashMap::from([
                     (MANAGED_LABEL.to_string(), "true".to_string()),
                     (INSTANCE_LABEL.to_string(), "inst_pg_1".to_string()),
                     (PROTOCOL_LABEL.to_string(), "postgres".to_string()),
                 ])),
-                ..Default::default()
             }),
             ..Default::default()
         }
@@ -159,6 +169,7 @@ mod tests {
         let parsed = ManagedContainerEvent::from_message(event("die"), Some("node-a")).unwrap();
 
         assert_eq!(parsed.instance_id, "inst_pg_1");
+        assert_eq!(parsed.container_id.as_deref(), Some("container-old"));
         assert_eq!(parsed.protocol, Protocol::Postgres);
         assert_eq!(
             parsed.action,
@@ -208,6 +219,20 @@ mod tests {
         );
         assert!(parsed.action.indicates_unexpected_failure());
         assert!(parsed.action.deactivates_container());
+    }
+
+    #[test]
+    fn preserves_events_when_an_engine_omits_the_actor_id() {
+        let mut unidentified = event("die");
+        unidentified.actor.as_mut().unwrap().id = None;
+
+        let parsed = ManagedContainerEvent::from_message(unidentified, None).unwrap();
+
+        assert!(parsed.container_id.is_none());
+        assert_eq!(
+            parsed.action,
+            ManagedContainerAction::Exited { exit_code: None }
+        );
     }
 
     #[test]

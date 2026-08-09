@@ -403,7 +403,8 @@ pub(super) async fn serve_api(
         bind = %bind,
         configured_host = %config.api.host,
         port = config.api.port,
-        max_active_connections_per_ip = MAX_ACTIVE_API_CONNECTIONS_PER_IP,
+        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        max_active_connections_per_peer = MAX_ACTIVE_API_CONNECTIONS_PER_PEER,
         header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
         "api listener started"
     );
@@ -465,7 +466,8 @@ pub(super) async fn serve_api_tls(
         bind = %bind_addr,
         configured_host = %config.api.host,
         port = config.api.port,
-        max_active_connections_per_ip = MAX_ACTIVE_API_CONNECTIONS_PER_IP,
+        max_active_connections = MAX_ACTIVE_API_CONNECTIONS,
+        max_active_connections_per_peer = MAX_ACTIVE_API_CONNECTIONS_PER_PEER,
         header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
         tls_handshake_timeout_seconds = API_TLS_HANDSHAKE_TIMEOUT.as_secs(),
         "api tls listener started"

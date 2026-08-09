@@ -17,13 +17,18 @@ git config core.hooksPath .githooks
 ```
 
 The hook runs formatting, strict Clippy, the explicit Linux-target check, and
-the complete test suite. A failed check stops the push. Git's `--no-verify`
+the complete test suite for both the daemon workspace and the separately
+locked static-helper packer. A failed check stops the push. Git's `--no-verify`
 option remains available for an intentional emergency bypass.
 
 GitHub Actions runs `Global lint` first. Only after it passes do dependency
 auditing, Linux tests, documentation checks, CodeQL, and the release build run.
 Configure the `main` branch ruleset to require the single `CI gate` status;
 that gate fails when any required stage fails or is skipped.
+
+The release workflow independently repeats the locked lint and test gate and
+audits both Cargo lockfiles before it builds publishable artifacts. A release
+therefore cannot rely on a separate CI run that is still pending or failed.
 
 ## Release notes
 

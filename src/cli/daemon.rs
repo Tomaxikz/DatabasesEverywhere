@@ -230,7 +230,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     );
     let disk_limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());
     disk_limiter
-        .verify_startup(std::path::Path::new(&config.paths.data))
+        .verify_startup(std::path::Path::new(&volumes_root))
         .await
         .context("failed to verify disk limiter support")?;
     reapply_instance_disk_limits(&config, &manager, &docker, &disk_limiter)
@@ -269,12 +269,16 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         install_progress,
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::resources::ResourceCache::default(),
+        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(
+            config.disk.soft_scanner.clone(),
+        ),
         monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
     });
     crate::api::resources::start_resource_sampler(state.clone());
+    let soft_disk_limits = tokio::spawn(monitor_soft_disk_limits(state.clone()));
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
     );
@@ -309,6 +313,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     );
     managed_container_events.abort();
     let _ = managed_container_events.await;
+    soft_disk_limits.abort();
+    let _ = soft_disk_limits.await;
     managed_runtime_boot.abort();
     let _ = managed_runtime_boot.await;
     let (jobs_drained, creations_drained, mutations_drained, websocket_drained, gateway_drain) = tokio::join!(
