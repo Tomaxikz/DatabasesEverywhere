@@ -9,7 +9,7 @@ use crate::{
         images::{ensure_image_allowed, validate_image},
         instance_requests::{CreateInstanceRequest, limits_from_request, validate_create_request},
         instances::docker_error,
-        resources::{mib_to_bytes, read_host_disk, read_host_memory},
+        resources::{mib_to_bytes, read_host_cpu_cores, read_host_disk, read_host_memory},
         routes::AppState,
         security_policy::DestructiveActionPolicy,
     },
@@ -78,13 +78,7 @@ pub(crate) async fn enforce_node_allocation_policy(
     requested: &crate::shared::limits::InstanceLimits,
     previous: Option<&crate::shared::limits::InstanceLimits>,
 ) -> Result<(), ApiError> {
-    let instances = state.instances.list().await;
-    let allocated_memory_bytes = instances.iter().fold(0_u64, |total, metadata| {
-        total.saturating_add(mib_to_bytes(metadata.limits.memory_mib))
-    });
-    let allocated_disk_bytes = instances.iter().fold(0_u64, |total, metadata| {
-        total.saturating_add(mib_to_bytes(metadata.limits.disk_mib))
-    });
+    let previous_cpu_cores = previous.map(|limits| limits.cpu_cores).unwrap_or_default();
     let previous_memory_bytes = previous
         .map(|limits| mib_to_bytes(limits.memory_mib))
         .unwrap_or_default();
@@ -93,46 +87,127 @@ pub(crate) async fn enforce_node_allocation_policy(
         .unwrap_or_default();
     let requested_memory_bytes = mib_to_bytes(requested.memory_mib);
     let requested_disk_bytes = mib_to_bytes(requested.disk_mib);
+    let allocation = &state.config.allocation;
+    let check_cpu =
+        allocation.prevent_cpu_overallocation && requested.cpu_cores > previous_cpu_cores;
+    let check_memory =
+        allocation.prevent_memory_overallocation && requested_memory_bytes > previous_memory_bytes;
+    let check_disk =
+        allocation.prevent_disk_overallocation && requested_disk_bytes > previous_disk_bytes;
+
+    // Decreases are always safe, and disabled guards must not retain hidden
+    // host-probe failure modes or overhead.
+    if !check_cpu && !check_memory && !check_disk {
+        return Ok(());
+    }
+
+    let instances = state.instances.list().await;
+    let allocated_cpu_cores = check_cpu.then(|| {
+        instances
+            .iter()
+            .map(|metadata| metadata.limits.cpu_cores)
+            .sum::<f64>()
+    });
+    let allocated_memory_bytes = check_memory.then(|| {
+        instances.iter().fold(0_u64, |total, metadata| {
+            total.saturating_add(mib_to_bytes(metadata.limits.memory_mib))
+        })
+    });
+    let allocated_disk_bytes = check_disk.then(|| {
+        instances.iter().fold(0_u64, |total, metadata| {
+            total.saturating_add(mib_to_bytes(metadata.limits.disk_mib))
+        })
+    });
     let volumes_root = state.config.paths.volumes_root();
-    let (host_memory, host_disk) = tokio::join!(read_host_memory(), read_host_disk(&volumes_root),);
-    let host_memory = host_memory.map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to sample host memory for allocation admission: {error}"
-        ))
-    })?;
-    let host_disk = host_disk.map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to sample host disk for allocation admission: {error}"
-        ))
-    })?;
-    let memory_limit_bytes = state
-        .config
-        .allocation
-        .effective_memory_limit_bytes(host_memory.total_bytes);
-    let disk_limit_bytes = state
-        .config
-        .allocation
-        .effective_disk_limit_bytes(host_disk.total_bytes);
+    let (host_cpu_cores, host_memory, host_disk) = tokio::join!(
+        async {
+            if check_cpu {
+                read_host_cpu_cores().await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        async {
+            if check_memory {
+                read_host_memory().await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+        async {
+            if check_disk {
+                read_host_disk(&volumes_root).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+    );
 
-    enforce_resource_allocation(
-        "memory",
+    if let (Some(allocated), Some(total)) = (
+        allocated_cpu_cores,
+        host_cpu_cores.map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to sample host CPU for allocation admission: {error}"
+            ))
+        })?,
+    ) {
+        enforce_cpu_allocation(allocated, previous_cpu_cores, requested.cpu_cores, total)?;
+    }
+    if let (Some(allocated), Some(host)) = (
         allocated_memory_bytes,
-        previous_memory_bytes,
-        requested_memory_bytes,
-        memory_limit_bytes,
-        host_memory.available_bytes,
-        state.config.allocation.reserved_memory_bytes(),
-    )?;
-    enforce_resource_allocation(
-        "disk",
+        host_memory.map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to sample host memory for allocation admission: {error}"
+            ))
+        })?,
+    ) {
+        enforce_resource_allocation(
+            "memory",
+            allocated,
+            previous_memory_bytes,
+            requested_memory_bytes,
+            allocation.effective_memory_limit_bytes(host.total_bytes),
+            host.available_bytes,
+            allocation.reserved_memory_bytes(),
+        )?;
+    }
+    if let (Some(allocated), Some(host)) = (
         allocated_disk_bytes,
-        previous_disk_bytes,
-        requested_disk_bytes,
-        disk_limit_bytes,
-        host_disk.available_bytes,
-        state.config.allocation.reserved_disk_bytes(),
-    )?;
+        host_disk.map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to sample host disk for allocation admission: {error}"
+            ))
+        })?,
+    ) {
+        enforce_resource_allocation(
+            "disk",
+            allocated,
+            previous_disk_bytes,
+            requested_disk_bytes,
+            allocation.effective_disk_limit_bytes(host.total_bytes),
+            host.available_bytes,
+            allocation.reserved_disk_bytes(),
+        )?;
+    }
 
+    Ok(())
+}
+
+fn enforce_cpu_allocation(
+    allocated_cores: f64,
+    previous_cores: f64,
+    requested_cores: f64,
+    host_cores: u64,
+) -> Result<(), ApiError> {
+    if requested_cores <= previous_cores {
+        return Ok(());
+    }
+    let projected_cores = (allocated_cores - previous_cores).max(0.0) + requested_cores;
+    if projected_cores > host_cores as f64 {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "node CPU allocation capacity exhausted: projected allocation {projected_cores:.2} cores exceeds the detected {host_cores}-core capacity"
+        )));
+    }
     Ok(())
 }
 
@@ -724,7 +799,7 @@ pub(crate) async fn provision_mariadb_tenant_user(
     let sql = databases::mariadb::provision::tenant_user_sql(database, username, &verifier)
         .map_err(|error| fail_bad_request(state, instance_id, error))?;
     let script = format!(
-        "set -eu\nexport MYSQL_PWD={}\nprintf %s {} | mariadb --protocol=socket -uroot\n",
+        "set -eu\nexport MYSQL_PWD={}\nprintf %s {} | mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -uroot\n",
         sh_quote(root_password),
         sh_quote(&sql)
     );
@@ -889,7 +964,7 @@ async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Resu
         state,
         Protocol::Mariadb,
         instance_id,
-        "mariadb-admin ping --protocol=socket -u root -p\"$MARIADB_ROOT_PASSWORD\"",
+        "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null",
         Duration::from_secs(120),
     )
     .await

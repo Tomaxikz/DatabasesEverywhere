@@ -26,7 +26,7 @@ case "$rust_target:$asset_arch" in
     helper_target="aarch64-unknown-linux-musl"
     helper_linker="rust-lld"
     fusequota_arch="aarch64"
-    fusequota_sha256="fbaf45180b04d6eb8b451ba23eac2dbb62334ee25b5aba203868671b46a5434c"
+    fusequota_sha256="afd429f034458e0f3fe200cf74f91f82813a7395378174ba8985ce988492f740"
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
     export CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
     export CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
@@ -39,7 +39,7 @@ case "$rust_target:$asset_arch" in
     helper_target="riscv64gc-unknown-linux-musl"
     helper_uses_zig=true
     fusequota_arch="riscv64"
-    fusequota_sha256="66fda6a162918d1ee7727a564cc4aa7debec2ea8e077f9d4f6a88456592767f4"
+    fusequota_sha256="ab3b6c84dc905abf8b358f93e5b3eb9d2d8b8d3d0a542971cfa27414c5c34109"
     export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="riscv64-linux-gnu-gcc"
     export CC_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-gcc"
     export CXX_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-g++"
@@ -81,7 +81,7 @@ if [ -n "$helper_target" ]; then
   fi
 
   curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
-    "https://github.com/calagopus/fusequota/releases/download/795d0fe/fusequota-${fusequota_arch}-linux" \
+    "https://github.com/calagopus/fusequota/releases/download/f939851/fusequota-${fusequota_arch}-linux" \
     --output "$fusequota_executable"
   printf '%s  %s\n' "$fusequota_sha256" "$fusequota_executable" |
     sha256sum --check --strict

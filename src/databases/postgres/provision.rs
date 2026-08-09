@@ -16,6 +16,13 @@ pub fn restrict_tenant_role_sql(username: &str) -> String {
     )
 }
 
+pub fn reset_tenant_password_sql(username: &str) -> String {
+    format!(
+        "ALTER ROLE {} PASSWORD :'tenant_password';",
+        quote_ident(username),
+    )
+}
+
 pub fn tenant_role_state_sql(username: &str) -> String {
     format!(
         "SELECT oid::text || ':' || (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)::int::text FROM pg_roles WHERE rolname = {};",
@@ -62,6 +69,13 @@ mod tests {
         assert!(sql.contains("NOCREATEROLE"));
         assert!(sql.contains("NOINHERIT"));
         assert!(sql.contains("NOBYPASSRLS"));
+    }
+
+    #[test]
+    fn password_reset_uses_a_psql_variable_instead_of_interpolating_the_secret() {
+        let sql = reset_tenant_password_sql("app_user");
+
+        assert_eq!(sql, "ALTER ROLE \"app_user\" PASSWORD :'tenant_password';");
     }
 
     #[test]

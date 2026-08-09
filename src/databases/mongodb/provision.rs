@@ -55,6 +55,33 @@ db.createUser({{
     ))
 }
 
+/// Builds a tenant password rotation script which reads the replacement
+/// password from the managed container environment. Keeping the password out
+/// of generated JavaScript also keeps it out of diagnostics and test output.
+pub fn update_user_password_from_env_script(
+    database: &str,
+    username: &str,
+) -> Result<String, MongodbProvisionError> {
+    validate_identifier("database", database)?;
+    validate_identifier("username", username)?;
+
+    Ok(format!(
+        r#"
+const database = {database};
+const username = {username};
+const password = process.env.DBE_MONGO_PASSWORD;
+
+if (typeof password !== "string" || password.length === 0) {{
+  throw new Error("DBE_MONGO_PASSWORD is unavailable");
+}}
+db = db.getSiblingDB(database);
+db.updateUser(username, {{ pwd: password }});
+"#,
+        database = serde_json::to_string(database)?,
+        username = serde_json::to_string(username)?,
+    ))
+}
+
 pub fn create_root_user_script(
     username: &str,
     password: &str,
@@ -130,6 +157,15 @@ mod tests {
         assert!(script.contains("getSiblingDB(\"admin\")"));
         assert!(script.contains("root"));
         assert!(script.contains("dbe_root"));
+    }
+
+    #[test]
+    fn password_update_reads_the_secret_from_the_container_environment() {
+        let script = update_user_password_from_env_script("mongo_1", "app_mongo_1").unwrap();
+
+        assert!(script.contains("db.updateUser"));
+        assert!(script.contains("process.env.DBE_MONGO_PASSWORD"));
+        assert!(!script.contains("secret"));
     }
 
     #[test]

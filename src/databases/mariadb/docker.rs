@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
@@ -19,6 +19,14 @@ pub fn instance_spec(
     logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
+    // The official image accepts precomputed native-password hashes. Supplying
+    // the exact verifier avoids version-dependent plaintext initialization and
+    // guarantees that DBE's gateway verifier matches the database account.
+    // DBE-prefixed plaintext values remain in the isolated container
+    // configuration for daemon maintenance commands and are never returned by
+    // the API.
+    let password_hash = docker_native_password_hash(password.expose_secret());
+    let root_password_hash = docker_native_password_hash(root_password.expose_secret());
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
         protocol: Protocol::Mariadb,
@@ -51,16 +59,31 @@ pub fn instance_spec(
                 value: SecretString::from(username.to_string()),
             },
             DockerEnv {
-                key: "MARIADB_PASSWORD".to_string(),
+                key: "MARIADB_PASSWORD_HASH".to_string(),
+                value: SecretString::from(password_hash),
+            },
+            DockerEnv {
+                key: "MARIADB_ROOT_PASSWORD_HASH".to_string(),
+                value: SecretString::from(root_password_hash),
+            },
+            DockerEnv {
+                key: "DBE_MARIADB_PASSWORD".to_string(),
                 value: password,
             },
             DockerEnv {
-                key: "MARIADB_ROOT_PASSWORD".to_string(),
+                key: "DBE_MARIADB_ROOT_PASSWORD".to_string(),
                 value: root_password,
             },
         ],
         command: vec!["--skip-networking=ON".to_string()],
     }
+}
+
+fn docker_native_password_hash(password: &str) -> String {
+    format!(
+        "*{}",
+        crate::protocols::mariadb::native_password_sha1_stage2_hex(password).to_ascii_uppercase()
+    )
 }
 
 #[cfg(test)]
@@ -86,5 +109,22 @@ mod tests {
         assert_eq!(spec.extra_mounts[0].target, "/run/mysqld");
         assert_eq!(spec.command, ["--skip-networking=ON"]);
         assert!(spec.socket_bridges.is_empty());
+        let env = spec
+            .env
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry.value.expose_secret()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env["MARIADB_PASSWORD_HASH"],
+            docker_native_password_hash("secret")
+        );
+        assert_eq!(
+            env["MARIADB_ROOT_PASSWORD_HASH"],
+            docker_native_password_hash("root-secret")
+        );
+        assert_eq!(env["DBE_MARIADB_PASSWORD"], "secret");
+        assert_eq!(env["DBE_MARIADB_ROOT_PASSWORD"], "root-secret");
+        assert!(!env.contains_key("MARIADB_PASSWORD"));
+        assert!(!env.contains_key("MARIADB_ROOT_PASSWORD"));
     }
 }

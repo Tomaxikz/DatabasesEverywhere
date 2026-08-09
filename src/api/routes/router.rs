@@ -171,6 +171,10 @@ fn instance_routes() -> Router<AppState> {
             "/api/instances/{instance_id}/limits",
             patch(instance_api::update_instance_limits),
         )
+        .route(
+            "/api/instances/{instance_id}/password",
+            patch(instance_api::reset_instance_password),
+        )
 }
 
 fn resource_routes() -> Router<AppState> {

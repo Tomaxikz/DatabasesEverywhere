@@ -147,9 +147,13 @@ backups:
     max_row_bytes: 4096
     max_catalog_bytes: 1048576
 
-# Node-wide admission guard. Null maxima automatically use detected host
-# capacity minus the reserve. Set explicit maxima to make a smaller DB pool.
+# Node-wide admission guards. Keep these enabled in production. They may be
+# disabled independently for deliberate test-node overcommit. Null maxima use
+# detected host capacity minus the reserve; explicit maxima make a smaller pool.
 allocation:
+  prevent_cpu_overallocation: true
+  prevent_memory_overallocation: true
+  prevent_disk_overallocation: true
   max_memory_mib: null
   max_disk_mib: null
   reserved_memory_mib: 512

@@ -223,6 +223,24 @@ fn allocation_guard_allows_decreases_while_node_is_over_capacity() {
 }
 
 #[test]
+fn cpu_allocation_guard_rejects_projected_overcommit() {
+    let error = enforce_cpu_allocation(7.5, 0.0, 1.0, 8).unwrap_err();
+
+    assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("projected allocation 8.50 cores")
+    );
+    assert!(error.to_string().contains("detected 8-core capacity"));
+}
+
+#[test]
+fn cpu_allocation_guard_allows_decreases_while_overcommitted() {
+    enforce_cpu_allocation(12.0, 4.0, 2.0, 8).unwrap();
+}
+
+#[test]
 fn postgres_provisioning_uses_internal_admin_and_tenant_secret_env() {
     let script = postgres_tenant_provision_script("app_db", "tenant_user");
 

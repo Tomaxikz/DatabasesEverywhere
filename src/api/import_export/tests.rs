@@ -333,6 +333,9 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     }
     assert!(mariadb_export.contains("-u \"$MARIADB_USER\""));
     assert!(mariadb_import.contains("-u \"$MARIADB_USER\""));
+    assert!(mariadb_export.contains("DBE_MARIADB_PASSWORD"));
+    assert!(mariadb_import.contains("DBE_MARIADB_PASSWORD"));
+    assert!(mariadb_wipe.contains("DBE_MARIADB_ROOT_PASSWORD"));
     assert!(mariadb_wipe.contains("-u root"));
     assert!(mariadb_wipe.contains("SELECT @@character_set_database, @@collation_database"));
     assert!(mariadb_wipe.contains("CHARACTER SET $1 COLLATE $2"));

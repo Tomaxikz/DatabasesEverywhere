@@ -359,9 +359,23 @@ paths:
 
         apply_config_patch(&path, serde_json::json!({"api": {"port": 9090}})).unwrap();
         apply_config_patch(&path, serde_json::json!({"debug": true})).unwrap();
+        apply_config_patch(
+            &path,
+            serde_json::json!({
+                "allocation": {
+                    "prevent_cpu_overallocation": false,
+                    "prevent_memory_overallocation": false,
+                    "prevent_disk_overallocation": false
+                }
+            }),
+        )
+        .unwrap();
 
         let config = load_config(&path).unwrap();
         assert_eq!(config.api.port, 9090);
         assert!(config.debug);
+        assert!(!config.allocation.prevent_cpu_overallocation);
+        assert!(!config.allocation.prevent_memory_overallocation);
+        assert!(!config.allocation.prevent_disk_overallocation);
     }
 }

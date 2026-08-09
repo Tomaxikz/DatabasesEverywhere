@@ -23,11 +23,25 @@ struct FuseQuotaPaths {
     socket_path: PathBuf,
 }
 
+#[derive(Debug)]
+struct FuseControlResponse {
+    lines: Vec<String>,
+    peer_pid: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NofileLimits {
+    current: Option<u64>,
+    maximum: Option<u64>,
+}
+
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CONTROL_COMMAND_BYTES: usize = 256;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CONTROL_RESPONSE_LINES: usize = 64;
 const MAX_CONTROL_RESPONSE_LINE_BYTES: usize = 1024;
+const MINIMUM_FUSEQUOTA_NOFILE: u64 = 65_536;
+const TARGET_FUSEQUOTA_NOFILE: u64 = 1_048_576;
 const UNMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -115,13 +129,13 @@ pub(super) async fn apply_with_root(
 
     let expected_owner = path_owner(data_path).await?;
 
-    if send_command(
+    if let Ok(response) = send_command_detailed(
         &paths.socket_path,
         &format!("set quota = {}", mib_to_bytes(disk_mib)),
     )
     .await
-    .is_ok()
     {
+        ensure_helper_nofile_limit(response.peer_pid).await?;
         if mount_owner_matches(&paths.mount_path, expected_owner).await {
             return Ok(paths.mount_path);
         }
@@ -251,17 +265,31 @@ pub(super) async fn runtime_is_healthy(
     if !mount_owner_matches(&paths.mount_path, expected_owner).await {
         return Ok(false);
     }
-    Ok(send_command(&paths.socket_path, "get quota_used")
-        .await
-        .is_ok())
+    let response = match send_command_detailed(&paths.socket_path, "get quota_used").await {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+    if let Err(error) = ensure_helper_nofile_limit(response.peer_pid).await {
+        tracing::warn!(
+            mount_path = %paths.mount_path.display(),
+            helper_pid = response.peer_pid,
+            %error,
+            "fusequota helper has an unsafe open-file limit; its mount will be recreated"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     let started = Instant::now();
     let mut last_error = String::new();
     while started.elapsed() < Duration::from_secs(10) {
-        match send_command(socket_path, "get quota_used").await {
-            Ok(_) => return Ok(()),
+        match send_command_detailed(socket_path, "get quota_used").await {
+            Ok(response) => {
+                ensure_helper_nofile_limit(response.peer_pid).await?;
+                return Ok(());
+            }
             Err(error) => {
                 last_error = error.to_string();
                 sleep(Duration::from_millis(200)).await;
@@ -275,6 +303,15 @@ async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
 }
 
 async fn send_command(socket_path: &Path, command: &str) -> Result<Vec<String>, DiskLimitError> {
+    send_command_detailed(socket_path, command)
+        .await
+        .map(|response| response.lines)
+}
+
+async fn send_command_detailed(
+    socket_path: &Path,
+    command: &str,
+) -> Result<FuseControlResponse, DiskLimitError> {
     if command.len() > MAX_CONTROL_COMMAND_BYTES || command.contains(['\r', '\n']) {
         return Err(DiskLimitError::FuseSocket(
             "invalid fusequota control command".to_string(),
@@ -298,7 +335,7 @@ async fn send_command(socket_path: &Path, command: &str) -> Result<Vec<String>, 
 async fn send_command_bounded(
     socket_path: &Path,
     command: &str,
-) -> Result<Vec<String>, DiskLimitError> {
+) -> Result<FuseControlResponse, DiskLimitError> {
     let mut stream =
         UnixStream::connect(socket_path)
             .await
@@ -320,6 +357,12 @@ async fn send_command_bounded(
             peer.uid()
         )));
     }
+    let peer_pid = peer.pid().filter(|pid| *pid > 0).ok_or_else(|| {
+        DiskLimitError::FuseSocket(format!(
+            "fusequota control peer at {} did not expose a valid process id",
+            socket_path.display()
+        ))
+    })?;
 
     stream
         .write_all(format!("{command}\n").as_bytes())
@@ -380,7 +423,107 @@ async fn send_command_bounded(
         )));
     }
 
-    Ok(lines)
+    Ok(FuseControlResponse { lines, peer_pid })
+}
+
+async fn ensure_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
+    let limits_path = PathBuf::from(format!("/proc/{peer_pid}/limits"));
+    let contents = tokio::fs::read_to_string(&limits_path)
+        .await
+        .map_err(|source| DiskLimitError::PathIo {
+            path: limits_path.display().to_string(),
+            source,
+        })?;
+    let before = parse_nofile_limits(&contents).map_err(DiskLimitError::FuseSocket)?;
+    let desired_current = desired_nofile_current(before.maximum)?;
+    if nofile_at_least(before.current, desired_current) {
+        return Ok(());
+    }
+
+    let pid = rustix::process::Pid::from_raw(peer_pid).ok_or_else(|| {
+        DiskLimitError::FuseSocket(format!(
+            "fusequota control peer exposed invalid process id {peer_pid}"
+        ))
+    })?;
+    rustix::process::prlimit(
+        Some(pid),
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(desired_current),
+            maximum: before.maximum,
+        },
+    )
+    .map_err(|source| {
+        DiskLimitError::FuseSocket(format!(
+            "failed to raise RLIMIT_NOFILE for fusequota process {peer_pid}: {}",
+            std::io::Error::from(source)
+        ))
+    })?;
+
+    let contents = tokio::fs::read_to_string(&limits_path)
+        .await
+        .map_err(|source| DiskLimitError::PathIo {
+            path: limits_path.display().to_string(),
+            source,
+        })?;
+    let after = parse_nofile_limits(&contents).map_err(DiskLimitError::FuseSocket)?;
+    if !nofile_at_least(after.current, desired_current) {
+        return Err(DiskLimitError::FuseSocket(format!(
+            "fusequota process {peer_pid} kept RLIMIT_NOFILE below {desired_current} after repair"
+        )));
+    }
+    tracing::info!(
+        helper_pid = peer_pid,
+        old_soft_limit = ?before.current,
+        new_soft_limit = ?after.current,
+        hard_limit = ?after.maximum,
+        "raised fusequota open-file limit"
+    );
+    Ok(())
+}
+
+fn desired_nofile_current(maximum: Option<u64>) -> Result<u64, DiskLimitError> {
+    let desired = maximum
+        .map(|maximum| maximum.min(TARGET_FUSEQUOTA_NOFILE))
+        .unwrap_or(TARGET_FUSEQUOTA_NOFILE);
+    if desired < MINIMUM_FUSEQUOTA_NOFILE {
+        return Err(DiskLimitError::FuseSocket(format!(
+            "fusequota hard RLIMIT_NOFILE {desired} is below the required minimum {MINIMUM_FUSEQUOTA_NOFILE}; run dbev --setup to install the managed systemd limits"
+        )));
+    }
+    Ok(desired)
+}
+
+fn nofile_at_least(current: Option<u64>, required: u64) -> bool {
+    current.is_none_or(|current| current >= required)
+}
+
+fn parse_nofile_limits(contents: &str) -> Result<NofileLimits, String> {
+    let values = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .ok_or_else(|| "process limits did not contain Max open files".to_string())?
+        .split_whitespace()
+        .take(2)
+        .map(parse_nofile_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != 2 {
+        return Err("process Max open files limit was incomplete".to_string());
+    }
+    Ok(NofileLimits {
+        current: values[0],
+        maximum: values[1],
+    })
+}
+
+fn parse_nofile_value(value: &str) -> Result<Option<u64>, String> {
+    if value == "unlimited" {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("invalid open-file limit {value:?}: {error}"))
 }
 
 fn ensure_private_fuse_directories(fuse_root: &Path) -> Result<(), DiskLimitError> {
@@ -897,6 +1040,43 @@ mod tests {
     fn parses_quota_used_response() {
         let lines = vec!["quota_used = 12345".to_string(), "OK".to_string()];
         assert_eq!(parse_quota_used_response(&lines).unwrap(), 12345);
+    }
+
+    #[test]
+    fn parses_numeric_and_unlimited_open_file_limits() {
+        let numeric = "Limit                     Soft Limit           Hard Limit           Units\n\
+                       Max open files            1024                 524288               files\n";
+        assert_eq!(
+            parse_nofile_limits(numeric).unwrap(),
+            NofileLimits {
+                current: Some(1024),
+                maximum: Some(524_288),
+            }
+        );
+
+        let unlimited =
+            "Max open files            unlimited            unlimited            files\n";
+        assert_eq!(
+            parse_nofile_limits(unlimited).unwrap(),
+            NofileLimits {
+                current: None,
+                maximum: None,
+            }
+        );
+    }
+
+    #[test]
+    fn helper_open_file_target_uses_the_safe_available_ceiling() {
+        assert_eq!(desired_nofile_current(Some(524_288)).unwrap(), 524_288);
+        assert_eq!(
+            desired_nofile_current(Some(2_000_000)).unwrap(),
+            TARGET_FUSEQUOTA_NOFILE
+        );
+        assert_eq!(
+            desired_nofile_current(None).unwrap(),
+            TARGET_FUSEQUOTA_NOFILE
+        );
+        assert!(desired_nofile_current(Some(1024)).is_err());
     }
 
     #[test]

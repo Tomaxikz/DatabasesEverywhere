@@ -167,29 +167,36 @@ The supported MySQL baseline is the official `mysql:8.4` LTS image. DBE enables
 the compatibility authentication plugin required by its credential-routing
 gateway; do not substitute MySQL 9.x, where that plugin was removed. MySQL
 containers have `network_mode=none`, expose only a per-instance Unix socket,
-and persist no tenant password in their container environment. DBE encrypts the
-maintenance credential and routing verifier in the metadata store. Enable the
-database gateway's native TLS whenever the listener crosses an untrusted
-network.
+and never return tenant passwords through metadata or API responses. Runtime
+secrets required by an image remain confined to its isolated container
+configuration; DBE encrypts maintenance credentials and routing verifiers in
+the metadata store. Enable the database gateway's native TLS whenever the
+listener crosses an untrusted network.
 
-Keep memory and disk headroom outside the database allocation pool:
+Keep CPU, memory, and disk reservations inside the node's safe capacity:
 
 ```yaml
 allocation:
+  prevent_cpu_overallocation: true
+  prevent_memory_overallocation: true
+  prevent_disk_overallocation: true
   max_memory_mib: null
   max_disk_mib: null
   reserved_memory_mib: 512
   reserved_disk_mib: 2048
 ```
 
-When a maximum is `null`, DBE uses the detected physical capacity minus its
-reserve. An explicit maximum can make the database pool smaller, but cannot
-override the safety reserve. New instances and memory/disk limit increases are
-rejected when either their projected allocations exceed the pool or the host's
-actual available capacity would fall inside the reserve. Decreases are always
-allowed. CPU remains a scheduling signal and per-instance runtime limit; it is
-not part of node admission because CPU contention slows work without making the
-host unbootable. Stopped and failed instances remain allocated until deleted.
+All three `prevent_*_overallocation` guards default to `true`, including when an
+older config omits them. CPU-limit reservations may not exceed the detected host
+core count. When a memory or disk maximum is `null`, DBE uses detected physical
+capacity minus its reserve. An explicit maximum can make the database pool
+smaller but cannot override the safety reserve. New instances and limit
+increases are rejected when their projected allocation exceeds an enabled
+resource pool; memory and disk also require the configured reserve to remain
+actually available. Decreases are always allowed. A guard can be set to `false`
+independently for deliberate test-node overcommit, but production nodes should
+leave every guard enabled. Stopped and failed instances remain allocated until
+deleted.
 
 Disk enforcement is selected automatically on every daemon boot. DBE inspects
 every configured path and logs its backing mount, source, filesystem type, and
@@ -330,13 +337,14 @@ development cleanup commands.
 
 ```bash
 sudo dbev --setup
-sudo systemctl enable --now databases-everywhere
 sudo journalctl -u databases-everywhere -f
 ```
 
 `--setup` installs the root-run systemd unit, creates root-owned private
-directories, and removes the obsolete managed quota sudoers rule left by older
-releases. If a legacy `/var/log/dbev` configuration has an unsafe shared parent,
+directories, enables and starts or restarts the service, and removes the
+obsolete managed quota sudoers rule left by older releases. Restarting during
+an upgrade makes updated resource limits take effect immediately. If a legacy
+`/var/log/dbev` configuration has an unsafe shared parent,
 setup updates it to `/var/lib/dbev/logs` without changing `/var/log` or deleting
 legacy log files.
 Files end up here:
@@ -479,6 +487,7 @@ An instance = one database container. The `InstanceMetadata` object you get back
 | POST | `/api/instances/{id}/power` | instances:write | Unified power API: `{ "action": "start" | "stop" | "restart" | "kill" }` |
 | POST | `/api/instances/{id}/reconcile` | instances:write | Re-sync stored status with the runtime |
 | PATCH | `/api/instances/{id}/limits` | instances:write | Update CPU/memory/disk limits |
+| PATCH | `/api/instances/{id}/password` | instances:write | Atomically rotate the tenant password/API key, restart, validate, and roll back on failure |
 | PATCH | `/api/instances/{id}/image` | instances:write | Move to a new image (recreates container) |
 | GET | `/api/instances/{id}/resources` | resources:read | Live resource report |
 | GET | `/api/admin/resources` | resources:admin | Resource reports for everything |
@@ -673,7 +682,10 @@ backing `paths.volumes`. Host usage includes DBE plus every other process on the
 server. Managed CPU or memory usage is `null` if a running/booting container
 could not be sampled; the endpoint does not return a misleading partial sum.
 `allocation_limit_bytes` and `reserved_bytes` expose the daemon's authoritative
-memory/disk admission policy. Poll this endpoint every 10–30 seconds for
+memory/disk admission policy, while CPU admission uses `total_cores`. The
+current guard switches are returned by `GET /api/system` as
+`prevent_cpu_overallocation`, `prevent_memory_overallocation`, and
+`prevent_disk_overallocation`. Poll this endpoint every 10–30 seconds for
 placement decisions and use allocation pressure as the primary scheduling
 signal, with host pressure as a secondary signal. The panel's check is only an
 optimization: it must handle a capacity rejection because host availability can

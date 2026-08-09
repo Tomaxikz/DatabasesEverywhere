@@ -433,7 +433,7 @@ mariadb-dump \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u "$MARIADB_USER" \
-  -p"$MARIADB_PASSWORD" \
+  -p"${{DBE_MARIADB_PASSWORD:-${{MARIADB_PASSWORD:-}}}}" \
   --single-transaction --quick --routines --events --triggers \
   --hex-blob --add-drop-table{database_definition}{filters} \
   > {output_path}
@@ -573,13 +573,13 @@ DBEV_SQL
         .to_string(),
         Protocol::Mariadb if database_definition_in_dump => r#"set -eu
 mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"$MARIADB_ROOT_PASSWORD" \
+  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
   -e "DROP DATABASE IF EXISTS \`$MARIADB_DATABASE\`;"
 "#
         .to_string(),
         Protocol::Mariadb => r#"set -eu
 settings=$(mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"$MARIADB_ROOT_PASSWORD" \
+  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
   --batch --skip-column-names "$MARIADB_DATABASE" \
   -e 'SELECT @@character_set_database, @@collation_database')
 set -- $settings
@@ -596,7 +596,7 @@ case "$2" in ''|*[!A-Za-z0-9_]*)
   exit 43
 ;; esac
 mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"$MARIADB_ROOT_PASSWORD" \
+  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
   -e "DROP DATABASE IF EXISTS \`$MARIADB_DATABASE\`; CREATE DATABASE \`$MARIADB_DATABASE\` CHARACTER SET $1 COLLATE $2;"
 "#
         .to_string(),
@@ -746,7 +746,7 @@ mariadb \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u root \
-  -p"$MARIADB_ROOT_PASSWORD" \
+  -p"${{DBE_MARIADB_ROOT_PASSWORD:-${{MARIADB_ROOT_PASSWORD:-}}}}" \
   < {input_path}
 "#
         ),
@@ -756,7 +756,7 @@ mariadb \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u "$MARIADB_USER" \
-  -p"$MARIADB_PASSWORD" \
+  -p"${{DBE_MARIADB_PASSWORD:-${{MARIADB_PASSWORD:-}}}}" \
   "$MARIADB_DATABASE" \
   < {input_path}
 "#

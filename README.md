@@ -70,8 +70,10 @@ Write your config at `/etc/databases-everywhere/config.yml`, then run setup:
 
 ```bash
 sudo dbev --setup
-sudo systemctl enable --now databases-everywhere
 ```
+
+Setup installs the current binary and systemd unit, enables the service, and
+starts or restarts it so managed resource limits take effect immediately.
 
 For the default Docker and FuseQuota configuration, `dbev --setup` writes the
 following complete unit to
@@ -91,7 +93,7 @@ KillMode=process
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=21min
-LimitNOFILE=1048576
+LimitNOFILE=1048576:1048576
 
 [Install]
 WantedBy=multi-user.target

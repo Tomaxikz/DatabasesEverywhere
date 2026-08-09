@@ -3,6 +3,8 @@ use std::path::Path;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
+use crate::shared::files::atomic_write_private;
+
 pub async fn write_acl_file(
     data_path: &Path,
     username: &str,
@@ -12,28 +14,29 @@ pub async fn write_acl_file(
 
     let password_hash = sha256_hex(password.expose_secret().as_bytes());
     let acl = redis_acl(username, &password_hash);
-    let path = data_path.join("users.acl");
+    replace_acl_file(data_path, acl.into_bytes()).await
+}
 
-    tokio::fs::write(&path, acl)
+/// Restores previously captured ACL bytes during a failed credential
+/// rotation. The destination is replaced without following a container-made
+/// symlink and is durably committed before the database is restarted.
+pub async fn restore_acl_file(data_path: &Path, acl: &[u8]) -> Result<(), RedisProvisionError> {
+    replace_acl_file(data_path, acl.to_vec()).await
+}
+
+async fn replace_acl_file(data_path: &Path, contents: Vec<u8>) -> Result<(), RedisProvisionError> {
+    let path = data_path.join("users.acl");
+    let write_path = path.clone();
+    tokio::task::spawn_blocking(move || atomic_write_private(&write_path, &contents))
         .await
+        .map_err(|error| RedisProvisionError::WriteAcl {
+            path: path.display().to_string(),
+            source: std::io::Error::other(error),
+        })?
         .map_err(|source| RedisProvisionError::WriteAcl {
             path: path.display().to_string(),
             source,
-        })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .await
-            .map_err(|source| RedisProvisionError::WriteAcl {
-                path: path.display().to_string(),
-                source,
-            })?;
-    }
-
-    Ok(())
+        })
 }
 
 fn validate_acl_username(username: &str) -> Result<(), RedisProvisionError> {
@@ -122,5 +125,28 @@ mod tests {
             sha256_hex(b"test-password"),
             "c638833f69bbfb3c267afa0a74434812436b8f08a81fd263c6be6871de4f1265"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acl_replacement_does_not_follow_the_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        let acl = directory.path().join("users.acl");
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, &acl).unwrap();
+
+        write_acl_file(
+            directory.path(),
+            "app_user",
+            &SecretString::from("new-password"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(acl).unwrap().is_symlink());
     }
 }

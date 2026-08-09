@@ -7,12 +7,14 @@ use bollard::{
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
 use futures::{StreamExt, TryStreamExt};
+use secrecy::SecretString;
 use tokio::{
     sync::mpsc,
     time::{Instant, sleep},
 };
 
 use crate::{
+    constants::docker::PROJECT_LABEL,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
         container_config::startup_readiness_script,
@@ -241,6 +243,86 @@ impl DockerRuntime {
             .filter(|image| !image.is_empty()))
     }
 
+    /// Returns the original image reference only when it still resolves to the
+    /// exact image backing the managed container. This prevents a non-upgrade
+    /// recreation from silently pulling or switching to a retagged image.
+    pub async fn container_recreation_image(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        let Some(reference) = response
+            .config
+            .and_then(|config| config.image)
+            .map(|image| image.trim().to_string())
+            .filter(|image| !image.is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(container_image_id) = response
+            .image
+            .map(|image| image.trim().to_string())
+            .filter(|image| !image.is_empty())
+        else {
+            return Ok(None);
+        };
+        let resolved = match self.docker.inspect_image(&reference).await {
+            Ok(image) => image,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let resolves_to_current_image = resolved
+            .id
+            .as_deref()
+            .is_some_and(|resolved_id| resolved_id == container_image_id);
+        Ok(resolves_to_current_image.then_some(reference))
+    }
+
+    /// Reads one configured environment value without serializing or logging
+    /// the rest of the container configuration.
+    pub async fn container_environment_value(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        key: &str,
+    ) -> Result<Option<SecretString>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(response
+            .config
+            .and_then(|config| config.env)
+            .as_deref()
+            .and_then(|environment| environment_value(environment, key))
+            .map(SecretString::from))
+    }
+
+    /// Preserves the optional project ownership label across a same-image
+    /// container recreation.
+    pub async fn container_project_id(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<String>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        Ok(response
+            .config
+            .and_then(|config| config.labels)
+            .and_then(|labels| labels.get(PROJECT_LABEL).cloned())
+            .map(|project_id| project_id.trim().to_string())
+            .filter(|project_id| !project_id.is_empty()))
+    }
+
     pub async fn logs(
         &self,
         protocol: Protocol,
@@ -348,5 +430,31 @@ impl DockerRuntime {
             ),
         );
         Ok(stream.next().await.ok_or(DockerError::EmptyStatsStream)??)
+    }
+}
+
+fn environment_value(environment: &[String], key: &str) -> Option<String> {
+    environment.iter().find_map(|entry| {
+        let (entry_key, value) = entry.split_once('=')?;
+        (entry_key == key).then(|| value.to_string())
+    })
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::environment_value;
+
+    #[test]
+    fn reads_an_exact_environment_key_and_preserves_equals_in_the_value() {
+        let environment = vec![
+            "PASSWORD_EXTRA=wrong".to_string(),
+            "PASSWORD=correct=with=equals".to_string(),
+        ];
+
+        assert_eq!(
+            environment_value(&environment, "PASSWORD").as_deref(),
+            Some("correct=with=equals")
+        );
+        assert_eq!(environment_value(&environment, "MISSING"), None);
     }
 }

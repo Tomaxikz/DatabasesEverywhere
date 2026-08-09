@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.8.0
+  version: 0.10.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -187,11 +187,11 @@ components:
     SystemResponse:
       type: object
       additionalProperties: false
-      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, remote_import_enabled, postgres_enabled, redis_enabled, valkey_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
+      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, prevent_cpu_overallocation, prevent_memory_overallocation, prevent_disk_overallocation, remote_import_enabled, postgres_enabled, redis_enabled, valkey_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, gateways]
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.8.0}
+        api_version: {type: string, example: 0.10.0}
         api_readiness:
           type: string
           const: ready
@@ -216,6 +216,15 @@ components:
         database_backend_transport: {type: string, const: unix_socket}
         daemon_disk_limits_enforced: {type: boolean}
         disk_mode: {type: string}
+        prevent_cpu_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission prevents configured CPU reservations from exceeding detected host cores.
+        prevent_memory_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission enforces the configured memory pool and reserve.
+        prevent_disk_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission enforces the configured disk pool and reserve.
         remote_import_enabled:
           type: boolean
           description: Whether this node accepts credential-based remote import sources.
@@ -694,6 +703,30 @@ components:
           enum: [start, stop, restart, kill]
         instance:
           $ref: "#/components/schemas/Instance"
+    ResetInstancePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\u0000\r\n]+$'
+          description: New tenant database password or, for Qdrant, API key. It is applied to the database and replacement container but is never returned or stored in instance metadata.
+    ResetInstancePasswordResponse:
+      type: object
+      additionalProperties: false
+      required: [instance, restarted]
+      properties:
+        instance:
+          $ref: "#/components/schemas/Instance"
+        restarted:
+          type: boolean
+          const: true
+          description: Credential rotation recreates the managed container on its existing data volume.
     UpdateInstanceImageRequest:
       type: object
       additionalProperties: false
@@ -891,7 +924,7 @@ paths:
   /api/system/config:
     patch:
       summary: Merge a validated config patch into the daemon config file.
-      description: Writes config.yml and returns restart_required=true. Refuses uuid, token_id, and token edits.
+      description: Writes config.yml and returns restart_required=true. Refuses uuid, token_id, and token edits. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
       x-required-scope: config:admin
       requestBody:
         required: true
@@ -1070,6 +1103,34 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Instance"
+        "503":
+          description: An enabled CPU, memory, or disk allocation guard rejected a limit increase. Limit decreases remain allowed.
+  /api/instances/{instance_id}/password:
+    patch:
+      summary: Reset an instance tenant password or API key.
+      description: Atomically rotates the database credential, recreates the managed container with its current image and existing data, validates the replacement credential, and attempts to restore the previous credential if any step fails. The instance must be running and experiences a brief connection interruption.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetInstancePasswordRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Credential reset result. The password is never included.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResetInstancePasswordResponse"
   /api/instances/{instance_id}/reconcile:
     post:
       summary: Reconcile stored instance status with the container runtime.

@@ -521,6 +521,10 @@ async fn read_host_cpu() -> Result<HostCpuSample, std::io::Error> {
     parse_host_cpu(&contents)
 }
 
+pub(crate) async fn read_host_cpu_cores() -> Result<u64, std::io::Error> {
+    Ok(read_host_cpu().await?.cores)
+}
+
 fn parse_host_cpu(contents: &str) -> Result<HostCpuSample, std::io::Error> {
     let aggregate = contents
         .lines()

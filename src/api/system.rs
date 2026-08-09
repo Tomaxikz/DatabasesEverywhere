@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.8.0";
+pub const API_VERSION: &str = "0.10.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -33,6 +33,9 @@ pub struct SystemResponse {
     pub database_backend_transport: &'static str,
     pub daemon_disk_limits_enforced: bool,
     pub disk_mode: &'static str,
+    pub prevent_cpu_overallocation: bool,
+    pub prevent_memory_overallocation: bool,
+    pub prevent_disk_overallocation: bool,
     pub remote_import_enabled: bool,
     pub postgres_enabled: bool,
     pub redis_enabled: bool,
@@ -73,6 +76,9 @@ pub async fn system(
         database_backend_transport: "unix_socket",
         daemon_disk_limits_enforced: state.config.disk.mode.enforced(),
         disk_mode: state.config.disk.mode.method(),
+        prevent_cpu_overallocation: state.config.allocation.prevent_cpu_overallocation,
+        prevent_memory_overallocation: state.config.allocation.prevent_memory_overallocation,
+        prevent_disk_overallocation: state.config.allocation.prevent_disk_overallocation,
         remote_import_enabled: state.config.security.remote_import.enabled,
         postgres_enabled: state.config.postgres.enabled,
         redis_enabled: state.config.redis.enabled,
@@ -120,6 +126,20 @@ mod tests {
         let system = &schemas["SystemResponse"];
         assert!(system["properties"]["remote_import_enabled"].is_mapping());
         assert!(system["properties"]["valkey_enabled"].is_mapping());
+        for field in [
+            "prevent_cpu_overallocation",
+            "prevent_memory_overallocation",
+            "prevent_disk_overallocation",
+        ] {
+            assert!(system["properties"][field].is_mapping());
+            assert!(
+                system["required"]
+                    .as_sequence()
+                    .expect("SystemResponse required array")
+                    .iter()
+                    .any(|required| required.as_str() == Some(field))
+            );
+        }
         assert!(
             system["required"]
                 .as_sequence()
@@ -197,6 +217,30 @@ mod tests {
     }
 
     #[test]
+    fn openapi_advertises_password_reset_without_response_credentials() {
+        let document: Value =
+            serde_yaml::from_str(include_str!("../../openapi.yml")).expect("valid OpenAPI YAML");
+        let operation = &document["paths"]["/api/instances/{instance_id}/password"]["patch"];
+        assert_eq!(
+            operation["x-required-scope"].as_str(),
+            Some(crate::auth::scopes::INSTANCES_WRITE)
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ResetInstancePasswordRequest"]["properties"]
+                ["password"]["writeOnly"]
+                .as_bool(),
+            Some(true)
+        );
+        let response_properties =
+            document["components"]["schemas"]["ResetInstancePasswordResponse"]["properties"]
+                .as_mapping()
+                .expect("password-reset response properties");
+        assert_eq!(response_properties.len(), 2);
+        assert!(response_properties.contains_key(Value::String("instance".to_string())));
+        assert!(response_properties.contains_key(Value::String("restarted".to_string())));
+    }
+
+    #[test]
     fn example_config_includes_valid_backup_driver_settings() {
         let config: crate::config::Config =
             serde_yaml::from_str(include_str!("../../config.example.yml"))
@@ -206,5 +250,8 @@ mod tests {
             crate::config::BackupStorageDriver::Local
         );
         assert!(config.backups.browsing.enabled);
+        assert!(config.allocation.prevent_cpu_overallocation);
+        assert!(config.allocation.prevent_memory_overallocation);
+        assert!(config.allocation.prevent_disk_overallocation);
     }
 }

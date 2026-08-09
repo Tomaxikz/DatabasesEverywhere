@@ -1,7 +1,9 @@
 pub mod docker;
 
 pub mod provision {
-    pub use crate::databases::redis::provision::{RedisProvisionError, write_acl_file};
+    pub use crate::databases::redis::provision::{
+        RedisProvisionError, restore_acl_file, write_acl_file,
+    };
 }
 
 pub mod config {

@@ -334,7 +334,7 @@ fn mysql_schema_script(mysql: bool, max_objects: usize) -> String {
     let command = if mysql {
         "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root --database=\"$MYSQL_DATABASE\""
     } else {
-        "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" --database=\"$MARIADB_DATABASE\""
+        "MYSQL_PWD=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" --database=\"$MARIADB_DATABASE\""
     };
     format!(
         r#"set -eu
@@ -425,7 +425,7 @@ fn preview_script(
             let command = if protocol == Protocol::Mysql {
                 "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root \"$MYSQL_DATABASE\""
             } else {
-                "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\""
+                "MYSQL_PWD=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\""
             };
             Some(format!(
                 "set -eu\n{command} --batch --raw --skip-column-names -e {}\n",

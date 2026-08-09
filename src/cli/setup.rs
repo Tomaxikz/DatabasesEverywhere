@@ -3,6 +3,7 @@ use super::*;
 pub(super) const SERVICE_PATH: &str = "/etc/systemd/system/databases-everywhere.service";
 pub(super) const SUDOERS_PATH: &str = "/etc/sudoers.d/databases-everywhere";
 pub(super) const INSTALL_PATH: &str = "/usr/local/bin/dbev";
+const SERVICE_UNIT: &str = "databases-everywhere.service";
 const LEGACY_LOGS_PATH: &str = "/var/log/dbev";
 
 pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
@@ -23,6 +24,7 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     validate_configured_container_engine(&config).await?;
     write_systemd_service(&config_path, &config.daemon)?;
     reload_systemd()?;
+    enable_and_restart_systemd_service()?;
     println!("system setup complete");
     println!("config read from: {}", config_path.display());
     println!("node uuid: {}", config.uuid);
@@ -35,7 +37,7 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
             config.api.port
         );
     }
-    println!("start with: systemctl enable --now databases-everywhere");
+    println!("service: enabled and started ({SERVICE_UNIT})");
     Ok(())
 }
 
@@ -572,7 +574,7 @@ KillMode=process
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=21min
-LimitNOFILE=1048576
+LimitNOFILE=1048576:1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -584,6 +586,15 @@ pub(super) fn reload_systemd() -> anyhow::Result<()> {
     if command_exists("systemctl")? {
         run_setup_command("systemctl", &["daemon-reload"])?;
     }
+    Ok(())
+}
+
+pub(super) fn enable_and_restart_systemd_service() -> anyhow::Result<()> {
+    run_setup_command("systemctl", &["enable", SERVICE_UNIT])?;
+    // `enable --now` leaves an already-running service on its old resource
+    // limits. An explicit restart makes setup upgrades apply LimitNOFILE and
+    // lets daemon startup repair surviving per-instance FuseQuota helpers.
+    run_setup_command("systemctl", &["restart", SERVICE_UNIT])?;
     Ok(())
 }
 

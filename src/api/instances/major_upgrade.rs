@@ -317,7 +317,7 @@ pub(super) async fn create_empty_replacement_and_import(
         paths,
         container_data_path,
         image,
-        Some(password.to_string()),
+        Some(secrecy::SecretString::from(password.to_string())),
         protocol_pids_limit(state, metadata.protocol),
     )
     .await
@@ -584,7 +584,7 @@ pub(super) async fn create_empty_replacement_and_import_without_import(
         paths,
         container_data_path,
         image,
-        Some(password.to_string()),
+        Some(secrecy::SecretString::from(password.to_string())),
         protocol_pids_limit(state, metadata.protocol),
     )
     .await?;
@@ -691,7 +691,7 @@ pub(super) fn replacement_validation_command(
 ) -> Result<String, ApiError> {
     let command = match protocol {
         Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h /var/run/postgresql -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
-        Protocol::Mariadb => "mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" \"$MARIADB_DATABASE\" -e 'select 1' >/dev/null".to_string(),
+        Protocol::Mariadb => "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'select 1' >/dev/null".to_string(),
         Protocol::Mysql => format!(
             "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
             crate::shared::shell::sh_quote(username),

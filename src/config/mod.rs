@@ -669,6 +669,16 @@ impl<'de> Deserialize<'de> for DiskConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AllocationConfig {
+    /// Reject CPU-limit reservations that would allocate more cores than the
+    /// daemon host exposes. Disable only when deliberate CPU overcommit is
+    /// acceptable.
+    pub prevent_cpu_overallocation: bool,
+    /// Reject memory-limit reservations that exceed the configured safe pool
+    /// or consume the host memory reserve.
+    pub prevent_memory_overallocation: bool,
+    /// Reject disk-limit reservations that exceed the configured safe pool or
+    /// consume the host disk reserve.
+    pub prevent_disk_overallocation: bool,
     /// Optional hard reservation ceiling. When omitted, physical memory minus
     /// `reserved_memory_mib` is used.
     pub max_memory_mib: Option<u64>,
@@ -687,6 +697,9 @@ pub struct AllocationConfig {
 impl Default for AllocationConfig {
     fn default() -> Self {
         Self {
+            prevent_cpu_overallocation: true,
+            prevent_memory_overallocation: true,
+            prevent_disk_overallocation: true,
             max_memory_mib: None,
             max_disk_mib: None,
             reserved_memory_mib: 512,
@@ -740,6 +753,32 @@ fn mib_to_bytes_saturating(mib: u64) -> u64 {
 #[cfg(test)]
 mod allocation_config_tests {
     use super::*;
+
+    #[test]
+    fn overallocation_prevention_defaults_to_enabled() {
+        let allocation = AllocationConfig::default();
+
+        assert!(allocation.prevent_cpu_overallocation);
+        assert!(allocation.prevent_memory_overallocation);
+        assert!(allocation.prevent_disk_overallocation);
+    }
+
+    #[test]
+    fn legacy_allocation_config_enables_new_guards() {
+        let allocation: AllocationConfig = serde_yaml::from_str(
+            r#"
+max_memory_mib: null
+max_disk_mib: null
+reserved_memory_mib: 512
+reserved_disk_mib: 2048
+"#,
+        )
+        .unwrap();
+
+        assert!(allocation.prevent_cpu_overallocation);
+        assert!(allocation.prevent_memory_overallocation);
+        assert!(allocation.prevent_disk_overallocation);
+    }
 
     #[test]
     fn automatic_pool_keeps_the_reserve_outside_allocations() {

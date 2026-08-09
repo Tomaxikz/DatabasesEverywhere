@@ -321,6 +321,7 @@ fn generated_systemd_service_runs_as_root_without_service_account_sandboxing() {
     assert!(unit.contains("User=root\n"));
     assert!(unit.contains("ExecStart=/usr/local/bin/dbev daemon\n"));
     assert!(unit.contains("KillMode=process\n"));
+    assert!(unit.contains("LimitNOFILE=1048576:1048576\n"));
     assert!(unit.contains("PartOf=docker.service\n"));
     assert!(!unit.contains("SupplementaryGroups="));
     assert!(!unit.contains("ProtectSystem="));

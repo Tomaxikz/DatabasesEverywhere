@@ -37,7 +37,7 @@ pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
             "valkey-cli -s /run/dbev/valkey.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
         }
         Protocol::Mariadb => {
-            "mariadb-admin ping --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" -p\"$MARIADB_PASSWORD\" >/dev/null"
+            "tenant_password=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\"; MYSQL_PWD=\"$tenant_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'SELECT 1' >/dev/null"
         }
         Protocol::Mysql => {
             "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null"
@@ -70,4 +70,19 @@ pub fn mib_to_bytes(memory_mib: u64) -> Option<i64> {
     memory_mib
         .checked_mul(1024 * 1024)
         .and_then(|bytes| i64::try_from(bytes).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mariadb_readiness_requires_an_authenticated_query() {
+        let script = startup_readiness_script(Protocol::Mariadb);
+
+        assert!(script.contains("DBE_MARIADB_PASSWORD"));
+        assert!(script.contains("MARIADB_PASSWORD"));
+        assert!(script.contains("SELECT 1"));
+        assert!(!script.contains("mariadb-admin ping"));
+    }
 }

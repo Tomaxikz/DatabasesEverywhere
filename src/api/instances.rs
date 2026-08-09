@@ -1,4 +1,5 @@
 mod major_upgrade;
+mod password;
 mod runtime_info;
 
 #[cfg(test)]
@@ -15,6 +16,9 @@ use runtime_info::{
 };
 
 use major_upgrade::*;
+pub use password::{
+    ResetInstancePasswordRequest, ResetInstancePasswordResponse, reset_instance_password,
+};
 
 use axum::extract::State;
 use bollard::errors::Error as BollardError;
@@ -208,7 +212,7 @@ pub async fn update_instance_image(
         &paths,
         container_data_path,
         &image,
-        request.password,
+        request.password.map(SecretString::from),
         protocol_pids_limit(&state, metadata.protocol),
     )
     .await
@@ -960,18 +964,19 @@ async fn instance_image_update_spec(
     paths: &InstancePaths,
     container_data_path: std::path::PathBuf,
     image: &str,
-    password: Option<String>,
+    password: Option<SecretString>,
     pids_limit: i64,
 ) -> Result<DockerInstanceSpec, ApiError> {
     let password = match metadata.protocol {
-        Protocol::Redis | Protocol::Valkey => password.unwrap_or_default(),
+        Protocol::Redis | Protocol::Valkey => {
+            password.unwrap_or_else(|| SecretString::from(String::new()))
+        }
         _ => password.ok_or_else(|| {
             ApiError::BadRequest(
                 "password is required when recreating non-RESP database containers".to_string(),
             )
         })?,
     };
-    let password = SecretString::from(password);
 
     let mut spec = match metadata.protocol {
         Protocol::Postgres => databases::postgres::docker::instance_spec(
