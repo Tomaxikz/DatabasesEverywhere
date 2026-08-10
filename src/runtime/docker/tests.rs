@@ -17,6 +17,21 @@ fn create_body_does_not_publish_backend_ports_by_default() {
 }
 
 #[test]
+fn clickhouse_uses_a_loopback_resolvable_hostname_with_network_disabled() {
+    let runtime = test_runtime();
+    let mut spec = postgres_spec();
+    spec.protocol = Protocol::Clickhouse;
+
+    let body = runtime.create_body(&spec).unwrap();
+
+    assert_eq!(body.hostname.as_deref(), Some("localhost"));
+    assert_eq!(
+        body.host_config.unwrap().network_mode.as_deref(),
+        Some("none")
+    );
+}
+
+#[test]
 fn create_body_includes_limits_labels_and_security() {
     let runtime = test_runtime().with_node_id("node-test");
     let body = runtime.create_body(&postgres_spec()).unwrap();

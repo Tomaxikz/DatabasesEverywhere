@@ -43,6 +43,8 @@ pub struct InstanceMetadata {
     pub mysql_root_password: Option<String>,
     #[serde(default, skip_serializing)]
     pub mongodb_root_password: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub postgres_admin_password: Option<String>,
     /// Current tenant credential used only for daemon-managed maintenance and
     /// rollback. The repository encrypts it separately from public metadata,
     /// and API serialization always omits it.

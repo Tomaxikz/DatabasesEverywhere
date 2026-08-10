@@ -16,13 +16,11 @@ pub fn instance_spec(
     database: &str,
     username: &str,
     password: SecretString,
+    admin_password: SecretString,
     data_path: PathBuf,
     logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
-    let bootstrap_password =
-        SecretString::from(format!("dbe-admin-{}", uuid::Uuid::new_v4().simple()));
-
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
         protocol: Protocol::Postgres,
@@ -56,7 +54,13 @@ pub fn instance_spec(
             },
             DockerEnv {
                 key: "POSTGRES_PASSWORD".to_string(),
-                value: bootstrap_password,
+                value: admin_password,
+            },
+            DockerEnv {
+                key: "POSTGRES_INITDB_ARGS".to_string(),
+                value: SecretString::from(
+                    "--auth-local=scram-sha-256 --auth-host=scram-sha-256".to_string(),
+                ),
             },
             DockerEnv {
                 key: "DBE_POSTGRES_USER".to_string(),
@@ -71,6 +75,8 @@ pub fn instance_spec(
             "postgres".to_string(),
             "-c".to_string(),
             "listen_addresses=".to_string(),
+            "-c".to_string(),
+            "password_encryption=scram-sha-256".to_string(),
         ],
     }
 }
@@ -89,6 +95,7 @@ mod tests {
             "pg_1",
             "app_pg_1",
             SecretString::from("secret"),
+            SecretString::from("admin-secret"),
             PathBuf::from("/tmp/data"),
             PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
@@ -96,12 +103,26 @@ mod tests {
 
         assert_eq!(spec.data_target, "/var/lib/postgresql");
         assert_eq!(spec.extra_mounts[0].target, "/var/run/postgresql");
-        assert_eq!(spec.command, ["postgres", "-c", "listen_addresses="]);
+        assert_eq!(
+            spec.command,
+            [
+                "postgres",
+                "-c",
+                "listen_addresses=",
+                "-c",
+                "password_encryption=scram-sha-256"
+            ]
+        );
         assert_eq!(env_value(&spec, "POSTGRES_USER"), INTERNAL_ADMIN_USERNAME);
         assert_eq!(env_value(&spec, "POSTGRES_DB"), "pg_1");
         assert_eq!(env_value(&spec, "DBE_POSTGRES_USER"), "app_pg_1");
         assert_eq!(env_value(&spec, "DBE_POSTGRES_PASSWORD"), "secret");
+        assert_eq!(env_value(&spec, "POSTGRES_PASSWORD"), "admin-secret");
         assert_ne!(env_value(&spec, "POSTGRES_PASSWORD"), "secret");
+        assert_eq!(
+            env_value(&spec, "POSTGRES_INITDB_ARGS"),
+            "--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+        );
         assert!(spec.socket_bridges.is_empty());
     }
 

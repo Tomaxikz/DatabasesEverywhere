@@ -3,6 +3,8 @@ use super::*;
 pub(super) const SERVICE_PATH: &str = "/etc/systemd/system/databases-everywhere.service";
 pub(super) const SUDOERS_PATH: &str = "/etc/sudoers.d/databases-everywhere";
 pub(super) const INSTALL_PATH: &str = "/usr/local/bin/dbev";
+const MEMORY_OVERCOMMIT_SYSCTL_PATH: &str = "/etc/sysctl.d/99-dbev-memory.conf";
+const MEMORY_OVERCOMMIT_PROC_PATH: &str = "/proc/sys/vm/overcommit_memory";
 const SERVICE_UNIT: &str = "databases-everywhere.service";
 const LEGACY_LOGS_PATH: &str = "/var/log/dbev";
 
@@ -16,6 +18,7 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     secure_config_permissions(&config_path)?;
     migrate_unsafe_legacy_logs_path(&config_path, &mut config)?;
     ensure_system_directories(&config).await?;
+    ensure_memory_overcommit_host_config()?;
     detect_and_log_disk_mode(&mut config)?;
     ensure_fuse_quota_host_config(&config)?;
     remove_obsolete_managed_sudoers()?;
@@ -66,7 +69,7 @@ pub(super) fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<(
 pub(super) fn ensure_required_setup_commands(
     config: &crate::config::DaemonConfig,
 ) -> anyhow::Result<()> {
-    let mut commands = vec!["chown", "systemctl"];
+    let mut commands = vec!["chown", "sysctl", "systemctl"];
     if configured_rootless_podman_uid(config).is_some() {
         commands.extend(["getent", "loginctl", "runuser"]);
     }
@@ -76,6 +79,44 @@ pub(super) fn ensure_required_setup_commands(
         }
     }
     Ok(())
+}
+
+pub(super) fn ensure_memory_overcommit_host_config() -> anyhow::Result<()> {
+    let path = Path::new(MEMORY_OVERCOMMIT_SYSCTL_PATH);
+    atomic_replace_setup_file(path, 0o644, "DBEV memory sysctl configuration", |file| {
+        file.write_all(memory_overcommit_sysctl_contents().as_bytes())
+    })?;
+    run_setup_command("sysctl", &["-w", "vm.overcommit_memory=1"])?;
+    let effective = fs::read_to_string(MEMORY_OVERCOMMIT_PROC_PATH)
+        .context("failed to verify vm.overcommit_memory")?;
+    if effective.trim() != "1" {
+        anyhow::bail!(
+            "vm.overcommit_memory remained {} after setup",
+            effective.trim()
+        );
+    }
+    println!("memory host config ok: vm.overcommit_memory=1");
+    Ok(())
+}
+
+pub(super) fn warn_if_memory_overcommit_disabled() {
+    match fs::read_to_string(MEMORY_OVERCOMMIT_PROC_PATH) {
+        Ok(value) if value.trim() == "1" => {}
+        Ok(value) => tracing::warn!(
+            event = "memory_overcommit_disabled",
+            effective = value.trim(),
+            "vm.overcommit_memory should be 1; Redis/Valkey background persistence may fail. Run dbev --setup to apply the managed host setting"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            event = "memory_overcommit_status_unavailable",
+            "could not verify vm.overcommit_memory"
+        ),
+    }
+}
+
+pub(super) fn memory_overcommit_sysctl_contents() -> &'static str {
+    "# Managed by DatabasesEverywhere --setup.\nvm.overcommit_memory = 1\n"
 }
 
 fn configured_rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {

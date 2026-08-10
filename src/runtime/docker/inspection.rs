@@ -228,6 +228,30 @@ impl DockerRuntime {
             .filter(|user| !user.is_empty()))
     }
 
+    pub(crate) async fn postgres_bootstrap_credentials(
+        &self,
+        instance_id: &str,
+    ) -> Result<(String, SecretString), DockerError> {
+        let name = self
+            .required_managed_container_id(Protocol::Postgres, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        let environment = response
+            .config
+            .and_then(|config| config.env)
+            .unwrap_or_default();
+        let username = unique_environment_value(&environment, "POSTGRES_USER", instance_id)?;
+        let password = unique_environment_value(&environment, "POSTGRES_PASSWORD", instance_id)?;
+        if username.trim().is_empty() || password.is_empty() {
+            return Err(DockerError::PostgresAuthHardeningFailed {
+                instance_id: instance_id.to_string(),
+                reason: "the managed container has an empty PostgreSQL bootstrap credential"
+                    .to_string(),
+            });
+        }
+        Ok((username, SecretString::from(password)))
+    }
+
     pub async fn container_image(
         &self,
         protocol: Protocol,
@@ -496,6 +520,30 @@ impl DockerRuntime {
     }
 }
 
+fn unique_environment_value(
+    environment: &[String],
+    key: &str,
+    instance_id: &str,
+) -> Result<String, DockerError> {
+    let prefix = format!("{key}=");
+    let mut values = environment
+        .iter()
+        .filter_map(|entry| entry.strip_prefix(&prefix));
+    let value = values
+        .next()
+        .ok_or_else(|| DockerError::PostgresAuthHardeningFailed {
+            instance_id: instance_id.to_string(),
+            reason: format!("the managed container is missing {key}"),
+        })?;
+    if values.next().is_some() {
+        return Err(DockerError::PostgresAuthHardeningFailed {
+            instance_id: instance_id.to_string(),
+            reason: format!("the managed container contains duplicate {key} entries"),
+        });
+    }
+    Ok(value.to_string())
+}
+
 fn environment_value(environment: &[String], key: &str) -> Option<String> {
     environment.iter().find_map(|entry| {
         let (entry_key, value) = entry.split_once('=')?;
@@ -505,7 +553,7 @@ fn environment_value(environment: &[String], key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod environment_tests {
-    use super::environment_value;
+    use super::{environment_value, unique_environment_value};
 
     #[test]
     fn reads_an_exact_environment_key_and_preserves_equals_in_the_value() {
@@ -519,5 +567,38 @@ mod environment_tests {
             Some("correct=with=equals")
         );
         assert_eq!(environment_value(&environment, "MISSING"), None);
+    }
+
+    #[test]
+    fn protected_environment_lookup_rejects_missing_and_duplicate_values_without_leaking_them() {
+        let missing = unique_environment_value(&[], "POSTGRES_PASSWORD", "inst_pg")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("POSTGRES_PASSWORD"));
+        assert!(!missing.contains("secret"));
+
+        let duplicate = unique_environment_value(
+            &[
+                "POSTGRES_PASSWORD=first-secret".to_string(),
+                "POSTGRES_PASSWORD=second-secret".to_string(),
+            ],
+            "POSTGRES_PASSWORD",
+            "inst_pg",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(duplicate.contains("duplicate POSTGRES_PASSWORD"));
+        assert!(!duplicate.contains("first-secret"));
+        assert!(!duplicate.contains("second-secret"));
+
+        assert_eq!(
+            unique_environment_value(
+                &["POSTGRES_PASSWORD=value=with=equals".to_string()],
+                "POSTGRES_PASSWORD",
+                "inst_pg",
+            )
+            .unwrap(),
+            "value=with=equals"
+        );
     }
 }

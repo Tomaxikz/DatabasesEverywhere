@@ -66,6 +66,29 @@ fn api_connection_admission_enforces_and_releases_global_capacity() {
     assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_some());
 }
 
+#[test]
+fn cli_parses_offline_protected_secret_repair() {
+    let cli = Cli::try_parse_from([
+        "dbev",
+        "repair-protected-secret",
+        "--instance-id",
+        "inst_recovery",
+        "--field",
+        "tenant-password",
+        "--confirm-legacy-plaintext",
+    ])
+    .unwrap();
+
+    assert!(matches!(
+        cli.command,
+        Some(super::Command::RepairProtectedSecret {
+            instance_id,
+            field: ProtectedSecretField::TenantPassword,
+            confirm_legacy_plaintext: true,
+        }) if instance_id == "inst_recovery"
+    ));
+}
+
 #[tokio::test]
 async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal() {
     let temp = tempfile::tempdir().unwrap();
@@ -221,6 +244,7 @@ fn recovery_test_metadata() -> InstanceMetadata {
         mysql_native_password_sha1_stage2: None,
         mysql_root_password: None,
         mongodb_root_password: None,
+        postgres_admin_password: None,
         tenant_password: None,
         limits: InstanceLimits::default(),
         image: None,
@@ -415,6 +439,20 @@ fn disk_mode_transition_failure_is_durably_stopped() {
 }
 
 #[test]
+fn disk_reconciliation_never_downgrades_an_existing_quarantine() {
+    let mut metadata = recovery_test_metadata();
+    metadata.status = InstanceStatus::Quarantined;
+
+    isolate_disk_reconciliation_failure(&mut metadata, false);
+
+    assert_eq!(metadata.status, InstanceStatus::Quarantined);
+    assert_eq!(
+        metadata.desired_state,
+        crate::instances::metadata::DesiredInstanceState::Stopped
+    );
+}
+
+#[test]
 fn qdrant_fuse_migration_preserves_container_project_grouping() {
     let config = Config::default();
     let mut metadata = recovery_test_metadata();
@@ -593,6 +631,14 @@ fn setup_config_path_rejects_unit_file_metacharacters() {
     assert!(validate_setup_config_path(Path::new("relative.yml")).is_err());
     assert!(validate_setup_config_path(Path::new("/etc/dbev/../config.yml")).is_err());
     assert!(validate_setup_config_path(Path::new("/etc/dbev/config\nExecStart=evil")).is_err());
+}
+
+#[test]
+fn managed_memory_sysctl_enables_overcommit_persistently() {
+    assert_eq!(
+        memory_overcommit_sysctl_contents(),
+        "# Managed by DatabasesEverywhere --setup.\nvm.overcommit_memory = 1\n"
+    );
 }
 
 #[test]

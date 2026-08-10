@@ -78,19 +78,25 @@ fn clickhouse_rotation_uses_recreated_startup_configuration() {
 
 #[test]
 fn mysql_rotation_bypasses_binlogging_without_reprovisioning_the_tenant() {
-    let script = mysql_family_rotation_script(
-        Protocol::Mysql,
-        "app_db",
-        "app_user",
-        "0123456789abcdef0123456789abcdef01234567",
-    )
-    .unwrap();
+    let script = mysql_rotation_script("app_user").unwrap();
 
     assert!(script.contains("SET SESSION sql_log_bin = 0;"));
+    assert!(script.contains("DBE_ROTATED_PASSWORD_B64"));
+    assert!(script.contains("caching_sha2_password"));
     assert!(script.contains("ALTER USER `app_user`"));
     assert!(!script.contains("CREATE DATABASE"));
     assert!(!script.contains("CREATE USER"));
     assert!(!script.contains("GRANT ALL PRIVILEGES"));
+}
+
+#[test]
+fn postgres_rotation_authenticates_with_the_protected_internal_admin() {
+    let script = postgres_rotation_script("app_user");
+
+    assert!(script.contains("PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\""));
+    assert!(script.contains("DBE_ROTATED_PASSWORD"));
+    assert!(!script.contains("PGPASSWORD=\"$POSTGRES_PASSWORD\""));
+    assert!(!script.contains(" peer "));
 }
 
 #[test]
@@ -211,6 +217,7 @@ fn test_metadata(protocol: Protocol) -> InstanceMetadata {
         mysql_native_password_sha1_stage2: None,
         mysql_root_password: None,
         mongodb_root_password: None,
+        postgres_admin_password: None,
         tenant_password: None,
         limits: crate::shared::limits::InstanceLimits::default(),
         image: None,

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     future::Future,
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind, IsTerminal, Read, Write},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     pin::Pin,
@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use hyper_util::rt::TokioTimer;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use secrecy::SecretString;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -52,10 +53,13 @@ use crate::{
     jobs::import_export::ImportExportJobs,
     runtime::docker::{DockerContainerStatus, DockerRuntime, ManagedContainerEvent},
     shared::{
-        images::has_sha256_digest, logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
+        ids::validate_instance_id, images::has_sha256_digest, logs::truncate_log_tail,
+        protocol::Protocol, time::now_rfc3339,
     },
     storage::{
-        import_export_jobs::ImportExportJobRepository, repositories::InstanceRepository, sqlite,
+        import_export_jobs::ImportExportJobRepository,
+        repositories::{InstanceRepository, ProtectedSecretField},
+        sqlite,
     },
 };
 
@@ -305,6 +309,14 @@ enum Command {
     },
     DevClean,
     ResetMetadata,
+    RepairProtectedSecret {
+        #[arg(long)]
+        instance_id: String,
+        #[arg(long)]
+        field: ProtectedSecretField,
+        #[arg(long)]
+        confirm_legacy_plaintext: bool,
+    },
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -344,6 +356,13 @@ pub async fn run() -> anyhow::Result<()> {
         Command::MigratePaths { dry_run, force } => migrate_paths(cli.config, dry_run, force).await,
         Command::DevClean => dev_clean(cli.config).await,
         Command::ResetMetadata => reset_metadata(cli.config).await,
+        Command::RepairProtectedSecret {
+            instance_id,
+            field,
+            confirm_legacy_plaintext,
+        } => {
+            repair_protected_secret(cli.config, instance_id, field, confirm_legacy_plaintext).await
+        }
     }
 }
 

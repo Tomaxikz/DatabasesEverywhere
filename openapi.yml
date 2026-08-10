@@ -66,6 +66,11 @@ components:
         password:
           type: string
           format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\u0000\r\n]+$'
+          description: Tenant database password or, for Qdrant, API key. DBE rejects NUL and line-break characters; Qdrant keys must also be valid HTTP header values.
         public_host:
           type: string
           example: db.example.com

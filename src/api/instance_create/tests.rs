@@ -248,31 +248,6 @@ fn cpu_allocation_guard_allows_decreases_while_overcommitted() {
     enforce_cpu_allocation(12.0, 4.0, 2.0, 8).unwrap();
 }
 
-#[test]
-fn postgres_provisioning_uses_internal_admin_and_tenant_secret_env() {
-    let script = postgres_tenant_provision_script("app_db", "tenant_user");
-
-    assert!(script.contains("BEGIN;"));
-    assert!(script.contains("CREATE ROLE \"tenant_user\" LOGIN"));
-    assert!(script.contains("\"tenant_user\" LOGIN NOSUPERUSER"));
-    assert!(script.contains("ALTER DATABASE \"app_db\""));
-    assert!(script.contains("COMMIT;"));
-    assert_eq!(script.matches("| psql").count(), 1);
-    assert!(script.contains("DBE_POSTGRES_PASSWORD"));
-    assert!(script.contains("legacy_bootstrap_superuser"));
-    assert!(!script.contains("dbe_admin_test"));
-}
-
-#[test]
-fn postgres_hardening_rejects_legacy_bootstrap_tenants() {
-    let script = postgres_tenant_hardening_script("tenant_user");
-
-    assert!(script.contains("10:*"));
-    assert!(script.contains("legacy_bootstrap_superuser"));
-    assert!(script.contains("missing_tenant_role"));
-    assert!(script.contains("already_restricted"));
-}
-
 fn create_request(protocol: Protocol) -> CreateInstanceRequest {
     CreateInstanceRequest {
         instance_id: "inst_test_pg".to_string(),
@@ -325,6 +300,7 @@ fn sample_metadata(
         mysql_native_password_sha1_stage2: None,
         mysql_root_password: None,
         mongodb_root_password: None,
+        postgres_admin_password: None,
         tenant_password: None,
         limits: crate::shared::limits::InstanceLimits::default(),
         image: None,

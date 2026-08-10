@@ -215,10 +215,26 @@ pub(super) async fn reconcile_managed_container_state(
     }
 
     let previous_status = metadata.status;
-    let activation_readiness_error = if event.as_ref().is_some_and(|event| {
-        event.action.activates_container() && previous_status != InstanceStatus::Running
-    }) {
-        state
+    let activation_observed = if previous_status == InstanceStatus::Running {
+        false
+    } else if let Some(event) = event.as_ref() {
+        event.action.activates_container()
+    } else {
+        match state
+            .docker
+            .inspect_instance(metadata.protocol, &metadata.instance_id)
+            .await
+        {
+            Ok(inspection) => matches!(
+                inspection.status,
+                DockerContainerStatus::Running | DockerContainerStatus::Starting
+            ),
+            Err(error) if error.is_not_found() => false,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let activation_error = if activation_observed {
+        match state
             .docker
             .wait_until_ready(
                 metadata.protocol,
@@ -226,11 +242,14 @@ pub(super) async fn reconcile_managed_container_state(
                 Duration::from_secs(120),
             )
             .await
-            .err()
+        {
+            Ok(_) => harden_activated_instance_auth(state, &metadata).await.err(),
+            Err(error) => Some(error.to_string()),
+        }
     } else {
         None
     };
-    if activation_readiness_error.is_some()
+    if activation_error.is_some()
         && let Err(error) = state
             .docker
             .stop(metadata.protocol, &metadata.instance_id)
@@ -259,7 +278,7 @@ pub(super) async fn reconcile_managed_container_state(
         && event
             .as_ref()
             .is_some_and(|event| event.action.deactivates_container());
-    if activation_readiness_error.is_some() || unexpected_failure || preserve_failure {
+    if activation_error.is_some() || unexpected_failure || preserve_failure {
         reconciled.status = InstanceStatus::Failed;
         reconciled.updated_at = now_rfc3339();
     }
@@ -272,7 +291,7 @@ pub(super) async fn reconcile_managed_container_state(
     state.resource_cache.remove(&reconciled.instance_id).await;
 
     if let Some(event) = event {
-        if let Some(readiness_error) = activation_readiness_error {
+        if let Some(readiness_error) = activation_error {
             tracing::error!(
                 event = "audit managed_container_startup_readiness_failed",
                 instance_id = %reconciled.instance_id,
@@ -281,7 +300,7 @@ pub(super) async fn reconcile_managed_container_state(
                 previous_status = previous_status.as_str(),
                 current_status = current_status.as_str(),
                 error = %readiness_error,
-                "managed database container activation did not become ready and was stopped"
+                "managed database container activation failed readiness or authentication hardening and was stopped"
             );
         } else if unexpected_failure {
             tracing::error!(
@@ -305,6 +324,51 @@ pub(super) async fn reconcile_managed_container_state(
         }
     }
     Ok(())
+}
+
+async fn harden_activated_instance_auth(
+    state: &AppState,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> Result<(), String> {
+    match metadata.protocol {
+        Protocol::Postgres => {
+            let password = metadata.tenant_password.as_deref().ok_or_else(|| {
+                "the encrypted PostgreSQL tenant credential is missing".to_string()
+            })?;
+            let admin_password = metadata.postgres_admin_password.as_deref().ok_or_else(|| {
+                "the encrypted PostgreSQL administrator credential is missing".to_string()
+            })?;
+            crate::databases::postgres::hardening::harden_instance_auth(
+                &state.docker,
+                &metadata.instance_id,
+                &metadata.database.username,
+                &secrecy::SecretString::from(password.to_string()),
+                &secrecy::SecretString::from(admin_password.to_string()),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }
+        Protocol::Mysql => {
+            let password = metadata
+                .tenant_password
+                .as_deref()
+                .ok_or_else(|| "the encrypted MySQL tenant credential is missing".to_string())?;
+            let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
+                "the encrypted MySQL maintenance credential is missing".to_string()
+            })?;
+            crate::api::instance_create::harden_mysql_tenant_auth(
+                state,
+                &metadata.instance_id,
+                &metadata.database.username,
+                password,
+                root_password,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn event_targets_superseded_container(

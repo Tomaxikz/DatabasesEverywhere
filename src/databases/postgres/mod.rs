@@ -1,4 +1,5 @@
 pub mod docker;
+pub mod hardening;
 pub mod provision;
 
 pub mod config {
@@ -14,8 +15,7 @@ pub mod credentials {
 }
 
 pub mod health {
-    pub const HEALTH_COMMAND: &str =
-        "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null";
+    pub const HEALTH_COMMAND: &str = "psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null";
 }
 
 pub mod logs {

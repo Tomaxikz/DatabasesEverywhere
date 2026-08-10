@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use secrecy::SecretString;
 use tokio::sync::RwLock;
 
 use super::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
@@ -16,6 +17,7 @@ pub struct MariadbRouteTarget {
     pub instance_id: String,
     pub endpoint: BackendEndpoint,
     pub native_password_sha1_stage2: Option<String>,
+    pub tenant_password: Option<SecretString>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +107,10 @@ impl InstanceStore {
             instance_id: metadata.instance_id.clone(),
             endpoint: metadata.backend.clone(),
             native_password_sha1_stage2: metadata.mariadb_native_password_sha1_stage2.clone(),
+            tenant_password: metadata
+                .tenant_password
+                .as_ref()
+                .map(|password| SecretString::from(password.clone())),
         })
     }
 
@@ -122,6 +128,10 @@ impl InstanceStore {
             instance_id: metadata.instance_id.clone(),
             endpoint: metadata.backend.clone(),
             native_password_sha1_stage2: metadata.mysql_native_password_sha1_stage2.clone(),
+            tenant_password: metadata
+                .tenant_password
+                .as_ref()
+                .map(|password| SecretString::from(password.clone())),
         })
     }
 

@@ -336,6 +336,7 @@ fn durable_instance_metadata_matches(left: &InstanceMetadata, right: &InstanceMe
         && left.mysql_native_password_sha1_stage2 == right.mysql_native_password_sha1_stage2
         && left.mysql_root_password == right.mysql_root_password
         && left.mongodb_root_password == right.mongodb_root_password
+        && left.postgres_admin_password == right.postgres_admin_password
         && left.tenant_password == right.tenant_password
         && left.limits.cpu_cores.to_bits() == right.limits.cpu_cores.to_bits()
         && left.limits.memory_mib == right.limits.memory_mib
@@ -669,6 +670,12 @@ pub(super) async fn create_empty_replacement_and_import(
             &metadata.instance_id,
             &metadata.database.name,
             &metadata.database.username,
+            password,
+            metadata.postgres_admin_password.as_deref().ok_or_else(|| {
+                ApiError::Conflict(
+                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before a major upgrade".to_string(),
+                )
+            })?,
         )
         .await
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;

@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::extract::State;
-use http::HeaderValue;
+use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, sleep};
@@ -19,6 +19,7 @@ use crate::{
         instance_create::{
             launch_container_from_spec, prepare_instance_container_user, protocol_pids_limit,
         },
+        instance_requests::validate_database_password,
         routes::AppState,
         security_policy::ApiRequestContext,
     },
@@ -33,7 +34,9 @@ use crate::{
     },
 };
 
-const MAX_PASSWORD_CHARACTERS: usize = 4 * 1024;
+#[cfg(test)]
+use crate::api::instance_requests::MAX_PASSWORD_CHARACTERS;
+
 const MAX_ACL_FILE_BYTES: u64 = 64 * 1024;
 const ROTATION_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const PASSWORD_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -517,31 +520,7 @@ async fn reset_password_in_place(
 }
 
 fn validate_password(protocol: Protocol, password: &SecretString) -> Result<(), ApiError> {
-    let password = password.expose_secret();
-    if password.is_empty() {
-        return Err(ApiError::BadRequest(
-            "password must not be empty".to_string(),
-        ));
-    }
-    if password.chars().count() > MAX_PASSWORD_CHARACTERS {
-        return Err(ApiError::BadRequest(format!(
-            "password must not exceed {MAX_PASSWORD_CHARACTERS} characters"
-        )));
-    }
-    if password
-        .bytes()
-        .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
-    {
-        return Err(ApiError::BadRequest(
-            "password must contain no NUL bytes or line breaks".to_string(),
-        ));
-    }
-    if protocol == Protocol::Qdrant && HeaderValue::from_str(password).is_err() {
-        return Err(ApiError::BadRequest(
-            "qdrant password contains characters that are invalid in an API-key header".to_string(),
-        ));
-    }
-    Ok(())
+    validate_database_password(protocol, password.expose_secret())
 }
 
 async fn require_resettable_instance(
@@ -940,14 +919,7 @@ async fn rotate_database_password_to_container_environment(
                 ApiError::Runtime("mariadb replacement verifier is missing".to_string())
             })?,
         )?,
-        Protocol::Mysql => mysql_family_rotation_script(
-            metadata.protocol,
-            &metadata.database.name,
-            &metadata.database.username,
-            native_password_verifier.ok_or_else(|| {
-                ApiError::Runtime("mysql replacement verifier is missing".to_string())
-            })?,
-        )?,
+        Protocol::Mysql => mysql_rotation_script(&metadata.database.username)?,
         Protocol::Mongodb => mongodb_rotation_script(metadata)?,
         Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
             return Err(ApiError::Runtime(format!(
@@ -956,9 +928,37 @@ async fn rotate_database_password_to_container_environment(
             )));
         }
     };
-    let mut environment = Vec::with_capacity(1);
+    let mysql_password_b64 = if metadata.protocol == Protocol::Mysql {
+        target_password.map(|password| {
+            SecretString::from(
+                base64::engine::general_purpose::STANDARD
+                    .encode(password.expose_secret().as_bytes()),
+            )
+        })
+    } else {
+        None
+    };
+    let postgres_admin_password = if metadata.protocol == Protocol::Postgres {
+        Some(SecretString::from(
+            metadata.postgres_admin_password.clone().ok_or_else(|| {
+                ApiError::Conflict(
+                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before rotating its password"
+                        .to_string(),
+                )
+            })?,
+        ))
+    } else {
+        None
+    };
+    let mut environment = Vec::with_capacity(3);
     if let Some(password) = target_password {
         environment.push(("DBE_ROTATED_PASSWORD", password));
+    }
+    if let Some(password_b64) = mysql_password_b64.as_ref() {
+        environment.push(("DBE_ROTATED_PASSWORD_B64", password_b64));
+    }
+    if let Some(admin_password) = postgres_admin_password.as_ref() {
+        environment.push(("DBE_POSTGRES_ADMIN_PASSWORD", admin_password));
     }
     state
         .docker
@@ -980,9 +980,21 @@ async fn wait_for_rotation_admin(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<(), ApiError> {
+    let postgres_admin_password = if metadata.protocol == Protocol::Postgres {
+        Some(SecretString::from(
+            metadata.postgres_admin_password.clone().ok_or_else(|| {
+                ApiError::Conflict(
+                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before rotating its password"
+                        .to_string(),
+                )
+            })?,
+        ))
+    } else {
+        None
+    };
     let command = match metadata.protocol {
         Protocol::Postgres => {
-            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null"
+            "test \"$(cat /proc/1/comm)\" = postgres && PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null"
                 .to_string()
         }
         Protocol::Mariadb => "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null".to_string(),
@@ -997,6 +1009,10 @@ async fn wait_for_rotation_admin(
     };
     let deadline = Instant::now() + ROTATION_READINESS_TIMEOUT;
     let mut last_error = String::new();
+    let environment = postgres_admin_password
+        .as_ref()
+        .map(|password| vec![("DBE_POSTGRES_ADMIN_PASSWORD", password)])
+        .unwrap_or_default();
     while Instant::now() < deadline {
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -1004,7 +1020,7 @@ async fn wait_for_rotation_admin(
                 metadata.protocol,
                 &metadata.instance_id,
                 &command,
-                &[],
+                &environment,
             ),
         )
         .await
@@ -1027,7 +1043,7 @@ async fn wait_for_rotation_admin(
 fn postgres_rotation_script(username: &str) -> String {
     let sql = databases::postgres::provision::reset_tenant_password_sql(username);
     format!(
-        "set -eu\nprintf %s {} | psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -v tenant_password=\"$DBE_ROTATED_PASSWORD\"\n",
+        "set -eu\n{{ printf '%s\\n' '\\getenv tenant_password DBE_ROTATED_PASSWORD'; printf '%s\\n' {}; }} | PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1\n",
         sh_quote(&sql)
     )
 }
@@ -1041,10 +1057,6 @@ fn mysql_family_rotation_script(
     let sql = match protocol {
         Protocol::Mariadb => {
             databases::mariadb::provision::tenant_user_sql(database, username, verifier)
-                .map_err(|error| ApiError::Runtime(error.to_string()))?
-        }
-        Protocol::Mysql => {
-            databases::mysql::provision::reset_tenant_password_sql(username, verifier)
                 .map_err(|error| ApiError::Runtime(error.to_string()))?
         }
         _ => {
@@ -1061,6 +1073,18 @@ fn mysql_family_rotation_script(
     Ok(format!(
         "set -eu\nprintf %s {} | {command}\n",
         sh_quote(&sql)
+    ))
+}
+
+fn mysql_rotation_script(username: &str) -> Result<String, ApiError> {
+    let sql = databases::mysql::provision::reset_tenant_password_sql(username);
+    let (before_password, after_password) =
+        databases::mysql::provision::password_sql_fragments(&sql)
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    Ok(format!(
+        "set -eu\n{{ printf %s {}; printf %s \"$DBE_ROTATED_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
+        sh_quote(before_password),
+        sh_quote(after_password),
     ))
 }
 

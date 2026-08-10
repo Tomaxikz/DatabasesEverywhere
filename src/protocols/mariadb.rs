@@ -1,4 +1,5 @@
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -48,6 +49,12 @@ pub enum MariadbProxyError {
     MissingNativePasswordVerifier,
     #[error("mysql native password verifier is invalid")]
     InvalidNativePasswordVerifier,
+    #[error("mysql backend password is unavailable; reset or recreate the legacy instance")]
+    MissingBackendPassword,
+    #[error("mysql caching_sha2_password full authentication requires a private Unix socket")]
+    InsecureBackendFullAuthentication,
+    #[error("mysql backend password contains a NUL byte")]
+    InvalidBackendPassword,
     #[error("mysql password authentication failed")]
     AuthenticationFailed,
     #[error("mysql backend requested unsupported auth plugin: {0}")]
@@ -58,6 +65,12 @@ pub enum MariadbProxyError {
 pub struct MysqlPacket {
     pub sequence: u8,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachingSha2Continuation {
+    FastAuthenticationComplete,
+    FullAuthenticationRequired,
 }
 
 pub async fn send_gateway_handshake<S>(
@@ -209,6 +222,7 @@ pub fn backend_handshake_response(
     route: &MariadbRoute,
     gateway_seed: &[u8],
     native_password_sha1_stage2_hex: &str,
+    backend_password: Option<&str>,
 ) -> Result<Vec<u8>, MariadbProxyError> {
     // Authenticate the public client before trusting any backend response. This
     // is required even when MySQL advertises caching_sha2_password first and
@@ -236,10 +250,10 @@ pub fn backend_handshake_response(
             native_password_sha1_stage2_hex,
         )?
     } else {
-        // The account is provisioned with mysql_native_password. An empty
-        // response to MySQL's default greeting causes the server to send the
-        // account-specific AuthSwitchRequest, which is handled below.
-        Vec::new()
+        caching_sha2_password_token(
+            backend_password.ok_or(MariadbProxyError::MissingBackendPassword)?,
+            &handshake.auth_seed,
+        )
     };
     let capabilities = CLIENT_LONG_PASSWORD
         | CLIENT_LONG_FLAG
@@ -271,19 +285,45 @@ pub fn backend_auth_switch_response(
     route: &MariadbRoute,
     gateway_seed: &[u8],
     native_password_sha1_stage2_hex: &str,
+    backend_password: Option<&str>,
 ) -> Result<Vec<u8>, MariadbProxyError> {
-    if handshake.auth_plugin != NATIVE_PASSWORD_PLUGIN {
-        return Err(MariadbProxyError::UnsupportedBackendAuth(
+    match handshake.auth_plugin.as_str() {
+        NATIVE_PASSWORD_PLUGIN => native_password_token_from_client_token(
+            &route.auth_response,
+            gateway_seed,
+            &handshake.auth_seed,
+            native_password_sha1_stage2_hex,
+        ),
+        CACHING_SHA2_PASSWORD_PLUGIN => backend_password
+            .map(|password| caching_sha2_password_token(password, &handshake.auth_seed))
+            .ok_or(MariadbProxyError::MissingBackendPassword),
+        _ => Err(MariadbProxyError::UnsupportedBackendAuth(
             handshake.auth_plugin.clone(),
-        ));
+        )),
     }
+}
 
-    native_password_token_from_client_token(
-        &route.auth_response,
-        gateway_seed,
-        &handshake.auth_seed,
-        native_password_sha1_stage2_hex,
-    )
+pub fn caching_sha2_continuation(
+    payload: &[u8],
+) -> Result<Option<CachingSha2Continuation>, MariadbProxyError> {
+    if payload.first() != Some(&0x01) {
+        return Ok(None);
+    }
+    match payload {
+        [0x01, 0x03] => Ok(Some(CachingSha2Continuation::FastAuthenticationComplete)),
+        [0x01, 0x04] => Ok(Some(CachingSha2Continuation::FullAuthenticationRequired)),
+        _ => Err(MariadbProxyError::MalformedPacket),
+    }
+}
+
+pub fn caching_sha2_plaintext_password(password: &str) -> Result<Vec<u8>, MariadbProxyError> {
+    if password.as_bytes().contains(&0) {
+        return Err(MariadbProxyError::InvalidBackendPassword);
+    }
+    let mut payload = Vec::with_capacity(password.len() + 1);
+    payload.extend_from_slice(password.as_bytes());
+    payload.push(0);
+    Ok(payload)
 }
 
 pub fn ok_packet() -> Vec<u8> {
@@ -355,6 +395,23 @@ pub fn native_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
     stage_1
         .iter()
         .zip(stage_3.iter())
+        .map(|(left, right)| left ^ right)
+        .collect()
+}
+
+pub fn caching_sha2_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
+    if password.is_empty() {
+        return Vec::new();
+    }
+    let stage_1 = Sha256::digest(password.as_bytes());
+    let stage_2 = Sha256::digest(stage_1);
+    let stage_3 = Sha256::digest(stage_2);
+    let mut challenge = Sha256::new();
+    challenge.update(stage_3);
+    challenge.update(seed);
+    stage_1
+        .iter()
+        .zip(challenge.finalize())
         .map(|(left, right)| left ^ right)
         .collect()
 }
@@ -664,17 +721,19 @@ mod tests {
         };
 
         let response =
-            backend_handshake_response(&handshake, &route, &gateway_seed, &stage_2).unwrap();
+            backend_handshake_response(&handshake, &route, &gateway_seed, &stage_2, Some(password))
+                .unwrap();
         let mut offset = 4 + 4 + 1 + 23;
         assert_eq!(
             read_null_string(&response, &mut offset).unwrap(),
             route.username
         );
+        let auth_length = response[offset] as usize;
         assert_eq!(
-            response[offset], 0,
-            "initial caching_sha2 response must be empty"
+            auth_length, 32,
+            "caching_sha2 must send its SHA-256 challenge response"
         );
-        offset += 1;
+        offset += 1 + auth_length;
         assert_eq!(
             read_null_string(&response, &mut offset).unwrap(),
             route.database
@@ -705,9 +764,47 @@ mod tests {
                 &route,
                 &gateway_seed,
                 &native_password_sha1_stage2_hex(password),
+                Some(password),
             ),
             Err(MariadbProxyError::AuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn caching_sha2_backend_auth_requires_the_encrypted_tenant_secret() {
+        let password = "mysql-password-1";
+        let gateway_seed = new_gateway_auth_seed();
+        let route = MariadbRoute {
+            username: "app_mysql_1".to_string(),
+            database: "mysql_1".to_string(),
+            auth_response: native_password_token(password, &gateway_seed),
+        };
+        let handshake = BackendHandshake {
+            auth_seed: b"backend-seed-1234567".to_vec(),
+            auth_plugin: CACHING_SHA2_PASSWORD_PLUGIN.to_string(),
+        };
+
+        assert!(matches!(
+            backend_handshake_response(
+                &handshake,
+                &route,
+                &gateway_seed,
+                &native_password_sha1_stage2_hex(password),
+                None,
+            ),
+            Err(MariadbProxyError::MissingBackendPassword)
+        ));
+    }
+
+    #[test]
+    fn caching_sha2_backend_token_matches_the_protocol_formula() {
+        assert_eq!(
+            hex_encode(&caching_sha2_password_token(
+                "mysql-password-1",
+                b"backend-seed-1234567"
+            )),
+            "4141deb9019891a46b7ddaedf713ead1e092243ec1a2f6c3eac1567210e980e4"
+        );
     }
 
     #[test]
@@ -730,10 +827,39 @@ mod tests {
             &route,
             &gateway_seed,
             &native_password_sha1_stage2_hex(password),
+            Some(password),
         )
         .unwrap();
 
         assert_eq!(response, native_password_token(password, backend_seed));
+    }
+
+    #[test]
+    fn caching_sha2_full_auth_payload_is_nul_terminated() {
+        assert_eq!(
+            caching_sha2_plaintext_password("secret").unwrap(),
+            b"secret\0"
+        );
+        assert!(matches!(
+            caching_sha2_plaintext_password("bad\0secret"),
+            Err(MariadbProxyError::InvalidBackendPassword)
+        ));
+    }
+
+    #[test]
+    fn parses_only_documented_caching_sha2_continuations() {
+        assert_eq!(
+            caching_sha2_continuation(&[1, 3]).unwrap(),
+            Some(CachingSha2Continuation::FastAuthenticationComplete)
+        );
+        assert_eq!(
+            caching_sha2_continuation(&[1, 4]).unwrap(),
+            Some(CachingSha2Continuation::FullAuthenticationRequired)
+        );
+        assert!(matches!(
+            caching_sha2_continuation(&[1, 9]),
+            Err(MariadbProxyError::MalformedPacket)
+        ));
     }
 
     #[test]

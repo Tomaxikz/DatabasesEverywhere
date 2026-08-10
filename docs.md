@@ -378,6 +378,22 @@ The daemon and mutating maintenance commands hold an exclusive lock under
 `paths.locks`; stop the service before running migrations, metadata reset, or
 development cleanup commands.
 
+If startup reports `protected_secret_recovery_required`, the affected instance
+is preserved but quarantined while other instances and the API continue to
+start. For a password that was stored by an old release as plaintext beginning
+with `dbev1:`, stop the daemon and rewrap the exact known value from stdin:
+
+```bash
+read -rsp 'Exact known value: ' DBEV_REPAIR_SECRET
+printf '%s' "$DBEV_REPAIR_SECRET" | sudo dbev --config /etc/databases-everywhere/config.yml repair-protected-secret --instance-id INSTANCE_ID --field tenant-password --confirm-legacy-plaintext
+unset DBEV_REPAIR_SECRET
+```
+
+The command never accepts the secret as an argument, repairs one named field,
+and leaves the instance stopped. A mismatch changes nothing. For genuine
+ciphertext corruption or a lost `metadata.key`, restore the key/database backup
+instead of reinterpreting ciphertext as plaintext.
+
 ### Setup and start
 
 ```bash

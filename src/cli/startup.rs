@@ -444,7 +444,7 @@ pub(super) fn isolate_disk_reconciliation_failure(
     // bind-source failure so activation cannot immediately bypass the mode we
     // failed to establish.
     metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-    metadata.status = if stop_failed {
+    metadata.status = if metadata.status == InstanceStatus::Quarantined || stop_failed {
         InstanceStatus::Quarantined
     } else {
         InstanceStatus::Failed

@@ -75,7 +75,14 @@ pub fn instance_spec(
                 value: root_password,
             },
         ],
-        command: vec!["--skip-networking=ON".to_string()],
+        command: vec![
+            "--skip-networking=ON".to_string(),
+            "--skip-name-resolve".to_string(),
+            "--skip-log-bin".to_string(),
+            "--wsrep-on=OFF".to_string(),
+            "--wsrep-node-address=127.0.0.1".to_string(),
+            "--wsrep-node-incoming-address=127.0.0.1".to_string(),
+        ],
     }
 }
 
@@ -107,7 +114,15 @@ mod tests {
         assert_eq!(spec.protocol, Protocol::Mariadb);
         assert_eq!(spec.data_target, "/var/lib/mysql");
         assert_eq!(spec.extra_mounts[0].target, "/run/mysqld");
-        assert_eq!(spec.command, ["--skip-networking=ON"]);
+        assert!(spec.command.iter().any(|arg| arg == "--skip-networking=ON"));
+        assert!(spec.command.iter().any(|arg| arg == "--skip-name-resolve"));
+        assert!(spec.command.iter().any(|arg| arg == "--skip-log-bin"));
+        assert!(spec.command.iter().any(|arg| arg == "--wsrep-on=OFF"));
+        assert!(
+            spec.command
+                .iter()
+                .any(|arg| arg == "--wsrep-node-address=127.0.0.1")
+        );
         assert!(spec.socket_bridges.is_empty());
         let env = spec
             .env

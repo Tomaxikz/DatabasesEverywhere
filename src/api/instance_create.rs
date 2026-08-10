@@ -1,5 +1,6 @@
 use std::{future::Future, time::Duration};
 
+use base64::Engine;
 use secrecy::SecretString;
 use tokio::time::sleep;
 
@@ -16,14 +17,13 @@ use crate::{
     databases,
     disk::DiskLimiter,
     instances::{
-        manager::InstanceManager,
         metadata::{
             DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
             RuntimeMetadata, SCHEMA_VERSION,
         },
         paths::InstancePaths,
     },
-    runtime::docker::{DockerError, DockerImagePullProgress, DockerInstanceSpec, DockerRuntime},
+    runtime::docker::{DockerImagePullProgress, DockerInstanceSpec, DockerRuntime},
     shared::{
         backend::BackendEndpoint, logs::summarize_failure_logs, protocol::Protocol, redaction,
         shell::sh_quote, time::now_rfc3339,
@@ -303,6 +303,8 @@ async fn create_instance_from_validated_request(
         .await
         .map_err(|error| fail_runtime(state, &request.instance_id, error))?;
     let password = SecretString::from(request.password.clone());
+    let postgres_admin_password = (request.protocol == Protocol::Postgres)
+        .then(|| format!("dbe-admin-{}", uuid::Uuid::new_v4().simple()));
     let mariadb_root_password = (request.protocol == Protocol::Mariadb)
         .then(|| format!("dbe-root-{}", uuid::Uuid::new_v4()));
     let mysql_root_password =
@@ -382,6 +384,13 @@ async fn create_instance_from_validated_request(
             &request.database,
             &request.username,
             password,
+            SecretString::from(postgres_admin_password.clone().ok_or_else(|| {
+                fail_runtime(
+                    state,
+                    &request.instance_id,
+                    "internal PostgreSQL administrator password was not generated",
+                )
+            })?),
             container_data_path.clone(),
             paths.logs.clone(),
             paths.sockets.clone(),
@@ -606,6 +615,14 @@ async fn create_instance_from_validated_request(
             &request.instance_id,
             &request.database,
             &request.username,
+            &request.password,
+            postgres_admin_password.as_deref().ok_or_else(|| {
+                fail_runtime(
+                    state,
+                    &request.instance_id,
+                    "internal PostgreSQL administrator password was not generated",
+                )
+            })?,
         )
         .await
         {
@@ -668,6 +685,7 @@ async fn create_instance_from_validated_request(
             .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
         mysql_root_password,
         mongodb_root_password,
+        postgres_admin_password,
         tenant_password: Some(request.password),
         limits,
         image: None,
@@ -827,20 +845,98 @@ pub(crate) async fn provision_mysql_tenant_user(
     root_password: &str,
 ) -> Result<(), ApiError> {
     wait_for_mysql_localhost(state, instance_id).await?;
-    let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
-    let sql = databases::mysql::provision::tenant_user_sql(database, username, &verifier)
-        .map_err(|error| fail_bad_request(state, instance_id, error))?;
+    let sql = databases::mysql::provision::tenant_user_sql(database, username);
+    execute_mysql_protected_sql(state, instance_id, &sql, password, root_password).await
+}
+
+pub(crate) async fn harden_mysql_tenant_auth(
+    state: &AppState,
+    instance_id: &str,
+    username: &str,
+    password: &str,
+    root_password: &str,
+) -> Result<(), ApiError> {
+    wait_for_mysql_localhost(state, instance_id).await?;
+    let sql = databases::mysql::provision::reset_tenant_password_sql(username);
+    execute_mysql_protected_sql(state, instance_id, &sql, password, root_password).await
+}
+
+async fn execute_mysql_protected_sql(
+    state: &AppState,
+    instance_id: &str,
+    sql: &str,
+    password: &str,
+    root_password: &str,
+) -> Result<(), ApiError> {
+    let (before_password, after_password) =
+        databases::mysql::provision::password_sql_fragments(sql)
+            .map_err(|error| fail_runtime(state, instance_id, error))?;
     let script = format!(
-        "set -eu\nexport MYSQL_PWD={}\nprintf %s {} | mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
-        sh_quote(root_password),
-        sh_quote(&sql)
+        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$DBE_MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
+        sh_quote(before_password),
+        sh_quote(after_password),
     );
+    let password_b64 =
+        SecretString::from(base64::engine::general_purpose::STANDARD.encode(password.as_bytes()));
+    let root_password = SecretString::from(root_password.to_string());
     state
         .docker
-        .exec_shell(Protocol::Mysql, instance_id, &script)
+        .exec_shell_with_secret_env(
+            Protocol::Mysql,
+            instance_id,
+            &script,
+            &[
+                ("DBE_PASSWORD_B64", &password_b64),
+                ("DBE_MYSQL_ROOT_PASSWORD", &root_password),
+            ],
+        )
         .await
         .map_err(|error| fail_runtime(state, instance_id, error))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MysqlAuthHardeningSummary {
+    pub checked: usize,
+}
+
+pub(crate) async fn harden_mysql_accounts_on_boot(
+    state: &AppState,
+) -> Result<MysqlAuthHardeningSummary, ApiError> {
+    let instances = state.manager.store().list().await;
+    let mut checked = 0;
+    for snapshot in instances {
+        if snapshot.protocol != Protocol::Mysql {
+            continue;
+        }
+        let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
+        let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
+            continue;
+        };
+        if metadata.protocol != Protocol::Mysql || metadata.status != InstanceStatus::Running {
+            continue;
+        }
+        let password = metadata.tenant_password.as_deref().ok_or_else(|| {
+            ApiError::Conflict(
+                "the encrypted MySQL tenant credential is missing; reset or recreate this legacy instance before opening its gateway".to_string(),
+            )
+        })?;
+        let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
+            ApiError::Conflict(
+                "the encrypted MySQL maintenance credential is missing; recreate this legacy instance before opening its gateway".to_string(),
+            )
+        })?;
+        harden_mysql_tenant_auth(
+            state,
+            &metadata.instance_id,
+            &metadata.database.username,
+            password,
+            root_password,
+        )
+        .await?;
+        checked += 1;
+    }
+    Ok(MysqlAuthHardeningSummary { checked })
 }
 
 pub(crate) async fn provision_postgres_tenant_role(
@@ -848,117 +944,37 @@ pub(crate) async fn provision_postgres_tenant_role(
     instance_id: &str,
     database: &str,
     tenant_username: &str,
+    tenant_password: &str,
+    admin_password: &str,
 ) -> Result<(), ApiError> {
-    let script = postgres_tenant_provision_script(database, tenant_username);
-    let output = state
-        .docker
-        .exec_shell(Protocol::Postgres, instance_id, &script)
-        .await
-        .map_err(|error| fail_runtime(state, instance_id, error))?;
-    match output.stdout.lines().last() {
-        Some("provisioned") => Ok(()),
-        Some("legacy_bootstrap_superuser") => Err(fail_runtime(
-            state,
-            instance_id,
-            DockerError::LegacyPostgresBootstrapSuperuser {
-                instance_id: instance_id.to_string(),
-                username: tenant_username.to_string(),
-            },
-        )),
-        _ => Err(fail_runtime(
-            state,
-            instance_id,
-            DockerError::UnexpectedPostgresProvisioningOutput {
-                instance_id: instance_id.to_string(),
-            },
-        )),
-    }
+    databases::postgres::hardening::provision_tenant_role(
+        &state.docker,
+        instance_id,
+        database,
+        tenant_username,
+        &SecretString::from(tenant_password.to_string()),
+        &SecretString::from(admin_password.to_string()),
+    )
+    .await
+    .map_err(|error| fail_runtime(state, instance_id, error))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PostgresRoleHardeningSummary {
-    pub checked: usize,
-    pub hardened: usize,
-}
-
-pub(crate) async fn harden_postgres_roles_on_boot(
-    manager: &InstanceManager,
-    docker: &DockerRuntime,
-    instance_locks: &crate::instances::locks::InstanceLocks,
-) -> Result<PostgresRoleHardeningSummary, DockerError> {
-    let instances = manager.store().list().await;
-    let mut checked = 0_usize;
-    let mut hardened = 0_usize;
-    for snapshot in instances {
-        if snapshot.protocol != Protocol::Postgres {
-            continue;
-        }
-        let _operation = instance_locks.lock(&snapshot.instance_id).await;
-        let Some(metadata) = manager.store().get(&snapshot.instance_id).await else {
-            continue;
-        };
-        if metadata.protocol != Protocol::Postgres || metadata.status != InstanceStatus::Running {
-            continue;
-        }
-        checked += 1;
-        if ensure_postgres_tenant_role_restricted(
-            docker,
-            &metadata.instance_id,
-            &metadata.database.username,
-        )
-        .await?
-        {
-            hardened += 1;
-        }
-    }
-    Ok(PostgresRoleHardeningSummary { checked, hardened })
-}
-
-async fn ensure_postgres_tenant_role_restricted(
-    docker: &DockerRuntime,
+pub(crate) async fn harden_postgres_instance_auth(
+    state: &AppState,
     instance_id: &str,
     tenant_username: &str,
-) -> Result<bool, DockerError> {
-    let script = postgres_tenant_hardening_script(tenant_username);
-    let output = docker
-        .exec_shell(Protocol::Postgres, instance_id, &script)
-        .await?;
-    match output.stdout.lines().last() {
-        Some("hardened") => Ok(true),
-        Some("already_restricted") => Ok(false),
-        Some("legacy_bootstrap_superuser") => Err(DockerError::LegacyPostgresBootstrapSuperuser {
-            instance_id: instance_id.to_string(),
-            username: tenant_username.to_string(),
-        }),
-        Some("missing_tenant_role") => Err(DockerError::MissingPostgresTenantRole {
-            instance_id: instance_id.to_string(),
-            username: tenant_username.to_string(),
-        }),
-        _ => Err(DockerError::UnexpectedPostgresProvisioningOutput {
-            instance_id: instance_id.to_string(),
-        }),
-    }
-}
-
-fn postgres_tenant_provision_script(database: &str, tenant_username: &str) -> String {
-    let role_state = databases::postgres::provision::tenant_role_state_sql(tenant_username);
-    let provision_role =
-        databases::postgres::provision::provision_tenant_role_sql(database, tenant_username);
-    format!(
-        "set -eu\nadmin_user=$POSTGRES_USER\nif ! psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null 2>&1; then\n  admin_user=${{DBE_POSTGRES_USER:-$POSTGRES_USER}}\nfi\nrole_state=$(psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atq -c {})\ncase \"$role_state\" in\n  10:*) printf 'legacy_bootstrap_superuser\\n'; exit 0 ;;\nesac\nprintf %s {} | psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -v tenant_password=\"$DBE_POSTGRES_PASSWORD\"\nprintf 'provisioned\\n'\n",
-        sh_quote(&role_state),
-        sh_quote(&provision_role),
+    tenant_password: &str,
+    admin_password: &str,
+) -> Result<bool, ApiError> {
+    databases::postgres::hardening::harden_instance_auth(
+        &state.docker,
+        instance_id,
+        tenant_username,
+        &SecretString::from(tenant_password.to_string()),
+        &SecretString::from(admin_password.to_string()),
     )
-}
-
-fn postgres_tenant_hardening_script(tenant_username: &str) -> String {
-    let role_state = databases::postgres::provision::tenant_role_state_sql(tenant_username);
-    let restrict_role = databases::postgres::provision::restrict_tenant_role_sql(tenant_username);
-    format!(
-        "set -eu\nadmin_user=$POSTGRES_USER\nif ! psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null 2>&1; then\n  admin_user=${{DBE_POSTGRES_USER:-$POSTGRES_USER}}\nfi\nrole_state=$(psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -Atq -c {})\ncase \"$role_state\" in\n  '') printf 'missing_tenant_role\\n' ;;\n  10:*) printf 'legacy_bootstrap_superuser\\n' ;;\n  *:1) printf %s {} | psql -U \"$admin_user\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1; printf 'hardened\\n' ;;\n  *) printf 'already_restricted\\n' ;;\nesac\n",
-        sh_quote(&role_state),
-        sh_quote(&restrict_role),
-    )
+    .await
+    .map_err(|error| fail_runtime(state, instance_id, error))
 }
 
 async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
@@ -971,7 +987,7 @@ async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Resu
         state,
         Protocol::Mariadb,
         instance_id,
-        "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null",
+        "test \"$(cat /proc/1/comm)\" = mariadbd || exit 1; root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null",
         Duration::from_secs(120),
     )
     .await

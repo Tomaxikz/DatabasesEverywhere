@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine;
+
 use super::provision::{reset_tenant_password_sql, tenant_user_sql};
 use crate::{
     gateway::{
@@ -30,18 +32,13 @@ const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker, mysql:8.4, and the mariadb CLI"]
-async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
+async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() {
     let name = format!("dbev-mysql-test-{}", uuid::Uuid::new_v4().simple());
     let socket_root = tempfile::tempdir().unwrap();
     let container = TestContainer::start(&name, socket_root.path());
     wait_until_ready(&name);
 
-    let sql = tenant_user_sql(
-        DATABASE,
-        TENANT,
-        &native_password_sha1_stage2_hex(TENANT_PASSWORD),
-    )
-    .unwrap();
+    let sql = materialize_password(tenant_user_sql(DATABASE, TENANT), TENANT_PASSWORD);
     let provision = exec_with_input(
         &name,
         ROOT_PASSWORD,
@@ -59,7 +56,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
     );
     assert_eq!(
         String::from_utf8_lossy(&plugin.stdout).trim(),
-        "mysql_native_password"
+        "caching_sha2_password"
     );
 
     let create = exec_mysql(
@@ -79,25 +76,12 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             "mysql",
             "SELECT @@GLOBAL.log_bin"
         ),
-        "1",
-        "the regression fixture must exercise a binlog-enabled MySQL server"
-    );
-    let binlog_before_rotation = query_mysql(
-        &name,
-        ROOT_PASSWORD,
-        "root",
-        "mysql",
-        "SHOW BINARY LOG STATUS",
+        "0",
+        "DBEV disables unused binary logging for its isolated single-node MySQL containers"
     );
 
-    // Model a runtime command that mutates the account and then reports a
-    // failure. Password reset must still be recoverable from the persisted
-    // verifier even though the caller cannot infer whether ALTER USER ran.
-    let mut failing_rotation_sql = reset_tenant_password_sql(
-        TENANT,
-        &native_password_sha1_stage2_hex(ROTATED_TENANT_PASSWORD),
-    )
-    .unwrap();
+    let mut failing_rotation_sql =
+        materialize_password(reset_tenant_password_sql(TENANT), ROTATED_TENANT_PASSWORD);
     failing_rotation_sql.push_str("\nSELECT * FROM `dbev_missing_schema`.`dbev_missing_table`;\n");
     let failed_rotation = exec_with_input(
         &name,
@@ -114,9 +98,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
         "credential mutation before the injected failure",
     );
 
-    let rollback_sql =
-        reset_tenant_password_sql(TENANT, &native_password_sha1_stage2_hex(TENANT_PASSWORD))
-            .unwrap();
+    let rollback_sql = materialize_password(reset_tenant_password_sql(TENANT), TENANT_PASSWORD);
     let rollback = exec_with_input(
         &name,
         ROOT_PASSWORD,
@@ -142,19 +124,8 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             "mysql",
             "SELECT @@GLOBAL.log_bin"
         ),
-        "1",
-        "password rotation must not disable binary logging globally"
-    );
-    assert_eq!(
-        query_mysql(
-            &name,
-            ROOT_PASSWORD,
-            "root",
-            "mysql",
-            "SHOW BINARY LOG STATUS",
-        ),
-        binlog_before_rotation,
-        "DBEV account maintenance must not append password material to the binary log"
+        "0",
+        "password rotation must leave binary logging disabled"
     );
 
     let dump = Command::new("docker")
@@ -235,6 +206,7 @@ async fn mysql_84_provisions_native_tenant_and_round_trips_logical_dump() {
             )),
             mysql_root_password: Some(ROOT_PASSWORD.to_string()),
             mongodb_root_password: None,
+            postgres_admin_password: None,
             tenant_password: Some(TENANT_PASSWORD.to_string()),
             limits: InstanceLimits::default(),
             image: None,
@@ -331,13 +303,23 @@ impl TestContainer {
                 "--env",
                 &format!("MYSQL_DATABASE={DATABASE}"),
                 IMAGE,
-                "--mysql-native-password=ON",
+                "--skip-networking=ON",
+                "--skip-name-resolve",
+                "--skip-mysqlx",
+                "--skip-log-bin",
             ])
             .output()
             .expect("start MySQL test container");
         assert_success(&output, "start MySQL test container");
         Self(name.to_string())
     }
+}
+
+fn materialize_password(sql: String, password: &str) -> String {
+    sql.replace(
+        super::provision::PASSWORD_B64_PLACEHOLDER,
+        &base64::engine::general_purpose::STANDARD.encode(password.as_bytes()),
+    )
 }
 
 impl Drop for TestContainer {

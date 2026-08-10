@@ -353,6 +353,7 @@ impl DockerRuntime {
 
         Ok(ContainerCreateBody {
             image: Some(spec.image.clone()),
+            hostname: (spec.protocol == Protocol::Clickhouse).then(|| "localhost".to_string()),
             user: spec.user.clone(),
             working_dir: spec.working_dir.clone(),
             entrypoint: spec.entrypoint.clone(),
@@ -1211,6 +1212,8 @@ pub enum DockerError {
     },
     #[error("PostgreSQL provisioning returned no recognized result for instance {instance_id}")]
     UnexpectedPostgresProvisioningOutput { instance_id: String },
+    #[error("PostgreSQL authentication hardening failed for instance {instance_id}: {reason}")]
+    PostgresAuthHardeningFailed { instance_id: String, reason: String },
     #[error(
         "docker exec timed out after {timeout_seconds} seconds in {container}: {operation}; the container was restarted to cancel the command"
     )]

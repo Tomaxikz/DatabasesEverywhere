@@ -28,7 +28,7 @@ pub fn disabled_healthcheck() -> HealthConfig {
 pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Postgres => {
-            "psql -X -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null"
+            "test \"$(cat /proc/1/comm)\" = postgres || exit 1; if PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null 2>&1; then exit 0; fi; pg_isready -q -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""
         }
         Protocol::Redis => {
             "redis-cli -s /run/dbev/redis.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
@@ -37,7 +37,7 @@ pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
             "valkey-cli -s /run/dbev/valkey.sock --user dbe_health -a healthcheck --no-auth-warning ping >/dev/null"
         }
         Protocol::Mariadb => {
-            "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null"
+            "test \"$(cat /proc/1/comm)\" = mariadbd || exit 1; root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null"
         }
         Protocol::Mysql => {
             "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null"
@@ -46,7 +46,7 @@ pub fn startup_readiness_script(protocol: Protocol) -> &'static str {
             "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval 'db.adminCommand({ ping: 1 })' >/dev/null"
         }
         Protocol::Clickhouse => {
-            "clickhouse-client --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null"
+            "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null"
         }
         Protocol::Qdrant => {
             "/opt/dbev/dbev-socket-bridge __socket-bridge-healthcheck 127.0.0.1:6334"
@@ -93,5 +93,23 @@ mod tests {
         assert!(script.contains("DBE_MONGO_ROOT_USER"));
         assert!(script.contains("DBE_MONGO_ROOT_PASSWORD"));
         assert!(!script.contains("DBE_MONGO_PASSWORD\""));
+    }
+
+    #[test]
+    fn clickhouse_readiness_never_resolves_the_container_hostname() {
+        let script = startup_readiness_script(Protocol::Clickhouse);
+
+        assert!(script.contains("--host 127.0.0.1"));
+    }
+
+    #[test]
+    fn postgres_readiness_allows_boot_hardening_to_repair_legacy_auth() {
+        let script = startup_readiness_script(Protocol::Postgres);
+
+        assert!(script.contains("-h /var/run/postgresql"));
+        assert!(script.contains("/proc/1/comm"));
+        assert!(script.contains("PGPASSWORD=\"$POSTGRES_PASSWORD\""));
+        assert!(script.contains("pg_isready"));
+        assert!(!script.contains("if psql"));
     }
 }

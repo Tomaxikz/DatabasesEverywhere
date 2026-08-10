@@ -8,6 +8,12 @@ use crate::{
     storage::secrets::{SecretStore, SecretStoreError},
 };
 
+mod protected_secrets;
+
+pub use protected_secrets::{
+    DaemonInstanceLoad, ProtectedSecretField, ProtectedSecretIncident, ProtectedSecretRepair,
+};
+
 #[derive(Debug, Clone)]
 pub struct InstanceRepository {
     pool: SqlitePool,
@@ -41,6 +47,7 @@ impl InstanceRepository {
                 instance_route_auth.mysql_native_password_sha1_stage2,
                 instance_route_auth.mysql_root_password,
                 instance_route_auth.mongodb_root_password,
+                instance_route_auth.postgres_admin_password,
                 instance_route_auth.tenant_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
@@ -79,6 +86,7 @@ impl InstanceRepository {
                 instance_route_auth.mysql_native_password_sha1_stage2,
                 instance_route_auth.mysql_root_password,
                 instance_route_auth.mongodb_root_password,
+                instance_route_auth.postgres_admin_password,
                 instance_route_auth.tenant_password
             FROM instance_metadata
             LEFT JOIN instance_route_auth
@@ -135,12 +143,24 @@ impl InstanceRepository {
             &metadata.instance_id,
             metadata.mongodb_root_password.as_deref(),
         )?;
+        let postgres_admin_password = self.protect_route_secret(
+            "postgres_admin_password",
+            &metadata.instance_id,
+            metadata.postgres_admin_password.as_deref(),
+        )?;
         let tenant_password = self.protect_route_secret(
             "tenant_password",
             &metadata.instance_id,
             metadata.tenant_password.as_deref(),
         )?;
         let mut transaction = self.pool.begin().await?;
+        let preserve_route_auth = sqlx::query_scalar::<_, bool>(
+            "SELECT protected_secret_recovery_required FROM instance_metadata WHERE instance_id = ?1",
+        )
+        .bind(&metadata.instance_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or(false);
 
         sqlx::query(
             r#"
@@ -215,12 +235,14 @@ impl InstanceRepository {
             .execute(&mut *transaction)
             .await?;
 
-        if metadata.mariadb_native_password_sha1_stage2.is_some()
-            || metadata.mariadb_root_password.is_some()
-            || metadata.mysql_native_password_sha1_stage2.is_some()
-            || metadata.mysql_root_password.is_some()
-            || metadata.mongodb_root_password.is_some()
-            || metadata.tenant_password.is_some()
+        if !preserve_route_auth
+            && (metadata.mariadb_native_password_sha1_stage2.is_some()
+                || metadata.mariadb_root_password.is_some()
+                || metadata.mysql_native_password_sha1_stage2.is_some()
+                || metadata.mysql_root_password.is_some()
+                || metadata.mongodb_root_password.is_some()
+                || metadata.postgres_admin_password.is_some()
+                || metadata.tenant_password.is_some())
         {
             sqlx::query(
                 r#"
@@ -231,16 +253,18 @@ impl InstanceRepository {
                     mysql_native_password_sha1_stage2,
                     mysql_root_password,
                     mongodb_root_password,
+                    postgres_admin_password,
                     tenant_password,
                     updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(instance_id) DO UPDATE SET
                     mariadb_native_password_sha1_stage2 = excluded.mariadb_native_password_sha1_stage2,
                     mariadb_root_password = excluded.mariadb_root_password,
                     mysql_native_password_sha1_stage2 = excluded.mysql_native_password_sha1_stage2,
                     mysql_root_password = excluded.mysql_root_password,
                     mongodb_root_password = excluded.mongodb_root_password,
+                    postgres_admin_password = excluded.postgres_admin_password,
                     tenant_password = excluded.tenant_password,
                     updated_at = excluded.updated_at
                 "#,
@@ -251,11 +275,12 @@ impl InstanceRepository {
             .bind(&mysql_native_password_sha1_stage2)
             .bind(&mysql_root_password)
             .bind(&mongodb_root_password)
+            .bind(&postgres_admin_password)
             .bind(&tenant_password)
             .bind(&metadata.updated_at)
             .execute(&mut *transaction)
             .await?;
-        } else {
+        } else if !preserve_route_auth {
             sqlx::query("DELETE FROM instance_route_auth WHERE instance_id = ?1")
                 .bind(&metadata.instance_id)
                 .execute(&mut *transaction)
@@ -304,6 +329,7 @@ impl InstanceRepository {
                 || metadata.mysql_native_password_sha1_stage2.is_some()
                 || metadata.mysql_root_password.is_some()
                 || metadata.mongodb_root_password.is_some()
+                || metadata.postgres_admin_password.is_some()
                 || metadata.tenant_password.is_some()
         }) {
             self.upsert(metadata).await?;
@@ -341,6 +367,11 @@ impl InstanceRepository {
             "mongodb_root_password",
             &metadata.instance_id,
             row.try_get("mongodb_root_password")?,
+        )?;
+        metadata.postgres_admin_password = self.unprotect_route_secret(
+            "postgres_admin_password",
+            &metadata.instance_id,
+            row.try_get("postgres_admin_password")?,
         )?;
         metadata.tenant_password = self.unprotect_route_secret(
             "tenant_password",
@@ -464,10 +495,29 @@ pub enum RepositoryError {
         #[source]
         source: SecretStoreError,
     },
+    #[error("encrypted metadata storage is required for protected-secret repair")]
+    EncryptedRepositoryRequired,
+    #[error("instance {0} does not exist")]
+    InstanceNotFound(String),
+    #[error("instance {instance_id} has no stored value for protected field {field}")]
+    ProtectedSecretMissing { instance_id: String, field: String },
+    #[error("instance {instance_id} field {field} already contains valid protected ciphertext")]
+    ProtectedSecretAlreadyValid { instance_id: String, field: String },
+    #[error(
+        "the supplied plaintext does not exactly match the ambiguous stored value for instance {instance_id} field {field}"
+    )]
+    ProtectedSecretPlaintextMismatch { instance_id: String, field: String },
     #[error("metadata schema version {actual} is not supported")]
     UnsupportedSchema { actual: u32 },
     #[error("instance {instance_id} has unsupported desired state {value:?}")]
     InvalidDesiredState { instance_id: String, value: String },
+    #[error(
+        "instance metadata identity mismatch: durable row {durable_instance_id} embeds {embedded_instance_id}"
+    )]
+    MetadataIdentityMismatch {
+        durable_instance_id: String,
+        embedded_instance_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -790,6 +840,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_repository_stores_postgres_admin_password_outside_public_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.protocol = Protocol::Postgres;
+        metadata.postgres_admin_password = Some("internal-postgres-admin-secret".to_string());
+
+        repository.upsert(&metadata).await.unwrap();
+
+        let raw: String = sqlx::query_scalar(
+            "SELECT postgres_admin_password FROM instance_route_auth WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(is_encrypted(&raw));
+        assert!(!raw.contains("internal-postgres-admin-secret"));
+
+        let loaded = repository.get("inst_abc").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.postgres_admin_password.as_deref(),
+            Some("internal-postgres-admin-secret")
+        );
+        let public_json = serde_json::to_string(&loaded).unwrap();
+        assert!(!public_json.contains("postgres_admin_password"));
+        assert!(!public_json.contains("internal-postgres-admin-secret"));
+    }
+
+    #[tokio::test]
     async fn encrypted_repository_rejects_ambiguous_prefixed_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
@@ -950,6 +1031,7 @@ mod tests {
             mysql_native_password_sha1_stage2: None,
             mysql_root_password: None,
             mongodb_root_password: None,
+            postgres_admin_password: None,
             tenant_password: None,
             limits: InstanceLimits::default(),
             image: None,

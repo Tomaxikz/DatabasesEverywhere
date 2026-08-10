@@ -15,7 +15,7 @@ pub mod credentials {
 }
 
 pub mod health {
-    pub const HEALTH_COMMAND: &str = "clickhouse-client --query 'SELECT 1'";
+    pub const HEALTH_COMMAND: &str = "clickhouse-client --host 127.0.0.1 --query 'SELECT 1'";
 }
 
 pub mod protocol {

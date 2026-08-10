@@ -1,62 +1,75 @@
+pub const PASSWORD_B64_PLACEHOLDER: &str = "__DBEV_PASSWORD_B64__";
+
 #[derive(Debug, thiserror::Error)]
 pub enum MysqlProvisionError {
-    #[error("native password verifier must be 40 hexadecimal characters")]
-    InvalidNativePasswordVerifier,
+    #[error("MySQL password SQL template is missing its protected placeholder")]
+    MissingPasswordPlaceholder,
 }
 
-pub fn tenant_user_sql(
-    database: &str,
-    username: &str,
-    native_password_sha1_stage2_hex: &str,
-) -> Result<String, MysqlProvisionError> {
+pub fn tenant_user_sql(database: &str, username: &str) -> String {
     let database = quote_identifier(database);
     let username = quote_identifier(username);
-    let native_password_hash = native_password_hash(native_password_sha1_stage2_hex)?;
+    let account = format!("{username}@'%' ");
+    let create = quote_sql_string(&format!(
+        "CREATE USER IF NOT EXISTS {account}IDENTIFIED WITH caching_sha2_password BY "
+    ));
+    let alter = quote_sql_string(&format!(
+        "ALTER USER {account}IDENTIFIED WITH caching_sha2_password BY "
+    ));
 
-    Ok(format!(
+    format!(
         r#"
 SET SESSION sql_log_bin = 0;
+SET SESSION sql_log_off = 1;
 CREATE DATABASE IF NOT EXISTS {database};
-CREATE USER IF NOT EXISTS {username}@'%' IDENTIFIED WITH mysql_native_password AS '{native_password_hash}';
-ALTER USER {username}@'%' IDENTIFIED WITH mysql_native_password AS '{native_password_hash}';
+SET @dbev_password = CONVERT(FROM_BASE64('{PASSWORD_B64_PLACEHOLDER}') USING utf8mb4);
+SET @dbev_create = CONCAT({create}, QUOTE(@dbev_password));
+PREPARE dbev_statement FROM @dbev_create;
+EXECUTE dbev_statement;
+DEALLOCATE PREPARE dbev_statement;
+SET @dbev_alter = CONCAT({alter}, QUOTE(@dbev_password));
+PREPARE dbev_statement FROM @dbev_alter;
+EXECUTE dbev_statement;
+DEALLOCATE PREPARE dbev_statement;
 GRANT ALL PRIVILEGES ON {database}.* TO {username}@'%';
+SET @dbev_password = NULL;
+SET @dbev_create = NULL;
+SET @dbev_alter = NULL;
 "#
-    ))
+    )
 }
 
-pub fn reset_tenant_password_sql(
-    username: &str,
-    native_password_sha1_stage2_hex: &str,
-) -> Result<String, MysqlProvisionError> {
+pub fn reset_tenant_password_sql(username: &str) -> String {
     let username = quote_identifier(username);
-    let native_password_hash = native_password_hash(native_password_sha1_stage2_hex)?;
-
-    Ok(format!(
+    let alter = quote_sql_string(&format!(
+        "ALTER USER {username}@'%' IDENTIFIED WITH caching_sha2_password BY "
+    ));
+    format!(
         r#"
 SET SESSION sql_log_bin = 0;
-ALTER USER {username}@'%' IDENTIFIED WITH mysql_native_password AS '{native_password_hash}';
+SET SESSION sql_log_off = 1;
+SET @dbev_password = CONVERT(FROM_BASE64('{PASSWORD_B64_PLACEHOLDER}') USING utf8mb4);
+SET @dbev_alter = CONCAT({alter}, QUOTE(@dbev_password));
+PREPARE dbev_statement FROM @dbev_alter;
+EXECUTE dbev_statement;
+DEALLOCATE PREPARE dbev_statement;
+SET @dbev_password = NULL;
+SET @dbev_alter = NULL;
 "#
-    ))
+    )
 }
 
-fn native_password_hash(
-    native_password_sha1_stage2_hex: &str,
-) -> Result<String, MysqlProvisionError> {
-    if native_password_sha1_stage2_hex.len() != 40
-        || !native_password_sha1_stage2_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(MysqlProvisionError::InvalidNativePasswordVerifier);
-    }
-    Ok(format!(
-        "*{}",
-        native_password_sha1_stage2_hex.to_ascii_uppercase()
-    ))
+pub fn password_sql_fragments(sql: &str) -> Result<(&str, &str), MysqlProvisionError> {
+    sql.split_once(PASSWORD_B64_PLACEHOLDER)
+        .ok_or(MysqlProvisionError::MissingPasswordPlaceholder)
 }
 
 fn quote_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
+}
+
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -64,59 +77,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provisions_only_the_requested_database_without_plaintext_password() {
-        let sql = tenant_user_sql(
-            "app_db",
-            "app_user",
-            "0123456789abcdef0123456789abcdef01234567",
-        )
-        .unwrap();
+    fn provisions_with_caching_sha2_without_embedding_plaintext() {
+        let sql = tenant_user_sql("app_db", "app_user");
 
         assert!(sql.contains("CREATE DATABASE IF NOT EXISTS `app_db`"));
-        assert!(sql.contains("IDENTIFIED WITH mysql_native_password AS"));
+        assert!(sql.contains("IDENTIFIED WITH caching_sha2_password BY"));
         assert!(sql.contains("GRANT ALL PRIVILEGES ON `app_db`.*"));
-        assert!(sql.contains("*0123456789ABCDEF0123456789ABCDEF01234567"));
+        assert!(sql.contains(PASSWORD_B64_PLACEHOLDER));
+        assert!(!sql.contains("mysql_native_password"));
     }
 
     #[test]
-    fn disables_binary_logging_before_account_ddl() {
-        let sql = tenant_user_sql(
-            "app_db",
-            "app_user",
-            "0123456789abcdef0123456789abcdef01234567",
-        )
-        .unwrap();
-
+    fn disables_logs_before_materializing_the_password() {
+        let sql = tenant_user_sql("app_db", "app_user");
         let disable_binlog = sql.find("SET SESSION sql_log_bin = 0;").unwrap();
-        let create_database = sql.find("CREATE DATABASE").unwrap();
-        let create_user = sql.find("CREATE USER").unwrap();
-        let alter_user = sql.find("ALTER USER").unwrap();
-        let grant = sql.find("GRANT ALL PRIVILEGES").unwrap();
+        let disable_general_log = sql.find("SET SESSION sql_log_off = 1;").unwrap();
+        let password = sql.find("SET @dbev_password").unwrap();
 
-        assert!(disable_binlog < create_database);
-        assert!(disable_binlog < create_user);
-        assert!(disable_binlog < alter_user);
-        assert!(disable_binlog < grant);
+        assert!(disable_binlog < password);
+        assert!(disable_general_log < password);
     }
 
     #[test]
-    fn password_reset_disables_binary_logging_and_only_alters_the_existing_user() {
-        let sql = reset_tenant_password_sql("app_user", "0123456789abcdef0123456789abcdef01234567")
-            .unwrap();
+    fn reset_only_alters_the_existing_user() {
+        let sql = reset_tenant_password_sql("app_user");
 
-        assert!(sql.trim_start().starts_with("SET SESSION sql_log_bin = 0;"));
-        assert!(sql.contains(
-            "ALTER USER `app_user`@'%' IDENTIFIED WITH mysql_native_password AS \
-             '*0123456789ABCDEF0123456789ABCDEF01234567';"
-        ));
+        assert!(sql.contains("IDENTIFIED WITH caching_sha2_password BY"));
         assert!(!sql.contains("CREATE DATABASE"));
         assert!(!sql.contains("CREATE USER"));
         assert!(!sql.contains("GRANT "));
     }
 
     #[test]
-    fn rejects_invalid_native_password_verifier() {
-        assert!(tenant_user_sql("db", "user", "not-a-hash").is_err());
-        assert!(reset_tenant_password_sql("user", "not-a-hash").is_err());
+    fn splits_the_single_protected_password_placeholder() {
+        let sql = tenant_user_sql("app_db", "app_user");
+        let (before, after) = password_sql_fragments(&sql).unwrap();
+
+        assert!(!before.contains(PASSWORD_B64_PLACEHOLDER));
+        assert!(!after.contains(PASSWORD_B64_PLACEHOLDER));
+        assert_eq!(sql.matches(PASSWORD_B64_PLACEHOLDER).count(), 1);
     }
 }

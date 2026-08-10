@@ -1,3 +1,4 @@
+use secrecy::ExposeSecret;
 use std::{
     collections::HashMap,
     future::Future,
@@ -832,6 +833,11 @@ async fn prepare_mysql_wire_tunnel(
             source,
         })?;
     let mut backend = tunnel::MeteredBackend::new(backend, target.network);
+    let backend_is_unix = matches!(&target.endpoint, BackendEndpoint::UnixSocket { .. });
+    let backend_password = target
+        .tenant_password
+        .as_ref()
+        .map(|password| password.expose_secret());
     let backend_handshake_packet = mariadb::read_packet(&mut backend).await?;
     let mut backend_handshake =
         mariadb::parse_backend_handshake(&backend_handshake_packet.payload)?;
@@ -840,6 +846,7 @@ async fn prepare_mysql_wire_tunnel(
         &route,
         &gateway_seed,
         native_password_sha1_stage2,
+        backend_password,
     ) {
         Ok(payload) => payload,
         Err(error) => {
@@ -858,6 +865,7 @@ async fn prepare_mysql_wire_tunnel(
             &route,
             &gateway_seed,
             native_password_sha1_stage2,
+            backend_password,
         ) {
             Ok(payload) => payload,
             Err(error) => {
@@ -873,6 +881,33 @@ async fn prepare_mysql_wire_tunnel(
         )
         .await?;
         backend_response = mariadb::read_packet(&mut backend).await?;
+    }
+
+    if backend_handshake.auth_plugin == "caching_sha2_password"
+        && let Some(continuation) = mariadb::caching_sha2_continuation(&backend_response.payload)?
+    {
+        match continuation {
+            mariadb::CachingSha2Continuation::FastAuthenticationComplete => {
+                backend_response = mariadb::read_packet(&mut backend).await?;
+            }
+            mariadb::CachingSha2Continuation::FullAuthenticationRequired => {
+                if !backend_is_unix {
+                    return Err(
+                        mariadb::MariadbProxyError::InsecureBackendFullAuthentication.into(),
+                    );
+                }
+                let password =
+                    backend_password.ok_or(mariadb::MariadbProxyError::MissingBackendPassword)?;
+                let payload = mariadb::caching_sha2_plaintext_password(password)?;
+                mariadb::write_packet(
+                    &mut backend,
+                    backend_response.sequence.wrapping_add(1),
+                    &payload,
+                )
+                .await?;
+                backend_response = mariadb::read_packet(&mut backend).await?;
+            }
+        }
     }
 
     if mariadb::packet_is_error(&backend_response.payload) {

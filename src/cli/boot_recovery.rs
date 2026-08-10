@@ -40,7 +40,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
-    let postgres_role_hardening = match crate::api::instance_create::harden_postgres_roles_on_boot(
+    let postgres_role_hardening = match crate::databases::postgres::hardening::harden_on_boot(
         &state.manager,
         &state.docker,
         &state.instance_locks,
@@ -51,7 +51,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         Err(error) => {
             tracing::error!(
                 %error,
-                "legacy PostgreSQL role hardening failed; API remains available and database gateways remain closed"
+                "PostgreSQL authentication hardening failed; API remains available and database gateways remain closed"
             );
             state
                 .gateway_supervisor
@@ -62,7 +62,32 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
     tracing::info!(
         checked = postgres_role_hardening.checked,
         hardened = postgres_role_hardening.hardened,
-        "legacy PostgreSQL role hardening complete"
+        "PostgreSQL role and local authentication hardening complete"
+    );
+    if !state.import_export_jobs.is_accepting() {
+        return;
+    }
+
+    let mysql_auth_hardening = match crate::api::instance_create::harden_mysql_accounts_on_boot(
+        &state,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "MySQL authentication migration failed; API remains available and database gateways remain closed"
+            );
+            state
+                .gateway_supervisor
+                .fail_and_stop("mysql authentication migration failed");
+            return;
+        }
+    };
+    tracing::info!(
+        checked = mysql_auth_hardening.checked,
+        "MySQL caching_sha2_password migration complete"
     );
     if !state.import_export_jobs.is_accepting() {
         return;

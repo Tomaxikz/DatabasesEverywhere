@@ -7,6 +7,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .context("failed to create runtime directories")?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
+    warn_if_memory_overcommit_disabled();
     detect_and_log_disk_mode(&mut config)?;
     let config = Arc::new(config);
     let socket_bridge_helper = crate::runtime::socket_bridge::install_helper(&config.paths)

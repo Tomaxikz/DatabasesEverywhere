@@ -3,6 +3,7 @@ use crate::{
     instances::state::{InstanceStore, MariadbRouteTarget},
     shared::backend::BackendEndpoint,
 };
+use secrecy::SecretString;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedRoute {
@@ -16,6 +17,7 @@ pub(crate) struct ResolvedMariadbRoute {
     pub instance_id: String,
     pub endpoint: BackendEndpoint,
     pub native_password_sha1_stage2: Option<String>,
+    pub tenant_password: Option<SecretString>,
     pub network: NetworkCounter,
 }
 
@@ -127,6 +129,7 @@ impl RouteResolver {
             instance_id: target.instance_id,
             endpoint: target.endpoint,
             native_password_sha1_stage2: target.native_password_sha1_stage2,
+            tenant_password: target.tenant_password,
             network,
         }
     }

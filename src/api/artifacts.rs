@@ -1190,6 +1190,7 @@ mod tests {
             mysql_native_password_sha1_stage2: None,
             mysql_root_password: None,
             mongodb_root_password: None,
+            postgres_admin_password: None,
             tenant_password: None,
             limits: InstanceLimits::default(),
             image: None,

@@ -49,11 +49,11 @@ pub fn instance_spec(
                 value: root_password,
             },
         ],
-        // The gateway terminates public TLS and authenticates clients itself. The
-        // database is reachable only through its per-instance Unix socket.
         command: vec![
             "--skip-networking=ON".to_string(),
-            "--mysql-native-password=ON".to_string(),
+            "--skip-name-resolve".to_string(),
+            "--skip-mysqlx".to_string(),
+            "--skip-log-bin".to_string(),
         ],
     }
 }
@@ -79,7 +79,12 @@ mod tests {
         assert_eq!(spec.extra_mounts[0].target, "/var/run/mysqld");
         assert_eq!(
             spec.command,
-            ["--skip-networking=ON", "--mysql-native-password=ON"]
+            [
+                "--skip-networking=ON",
+                "--skip-name-resolve",
+                "--skip-mysqlx",
+                "--skip-log-bin"
+            ]
         );
         assert!(spec.socket_bridges.is_empty());
         assert!(spec.env.iter().all(|env| env.key != "MYSQL_PASSWORD"));

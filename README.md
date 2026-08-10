@@ -83,7 +83,10 @@ sudo dbev --setup
 ```
 
 Setup installs the current binary and systemd unit, enables the service, and
-starts or restarts it so managed resource limits take effect immediately.
+starts or restarts it so managed resource limits take effect immediately. It
+also installs `/etc/sysctl.d/99-dbev-memory.conf` and applies
+`vm.overcommit_memory=1`, which Redis and Valkey require for reliable
+background persistence.
 
 For the default Docker and FuseQuota configuration, `dbev --setup` writes the
 following complete unit to
@@ -113,7 +116,11 @@ The daemon runs as root by default, matching other container-management agents.
 This gives it direct access to Docker or Podman, filesystem quotas, FUSE mounts,
 and managed database storage without service-account groups or sudoers rules.
 DBE still applies its restrictive process umask and validates managed paths in
-code. Podman may use the rootful system socket or an explicitly configured
+code. Database containers have no container network, use private Unix sockets
+or loopback bridges, and enable their native authentication. PostgreSQL local
+connections are SCRAM-authenticated except for the peer-mapped internal
+maintenance role; MySQL tenant accounts use `caching_sha2_password`. Podman may
+use the rootful system socket or an explicitly configured
 `/run/user/<uid>/podman/podman.sock`; setup enables lingering and the user
 socket for the latter. Run `dbev --setup` again after changing the engine,
 socket, config path, or installing a release with an updated unit.

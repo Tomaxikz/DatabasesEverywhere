@@ -30,6 +30,7 @@ fn sample_lifecycle_metadata() -> InstanceMetadata {
         mysql_native_password_sha1_stage2: None,
         mysql_root_password: None,
         mongodb_root_password: None,
+        postgres_admin_password: None,
         tenant_password: Some("old-password".to_string()),
         limits: crate::shared::limits::InstanceLimits::default(),
         image: None,

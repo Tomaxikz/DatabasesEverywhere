@@ -239,6 +239,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         ),
         mysql_root_password: Some("internal-root-password".to_string()),
         mongodb_root_password: None,
+        postgres_admin_password: None,
         tenant_password: None,
         limits: InstanceLimits::default(),
         image: None,

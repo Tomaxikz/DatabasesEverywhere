@@ -5,7 +5,7 @@ pub fn provision_tenant_role_sql(database: &str, username: &str) -> String {
     let username_literal = quote_literal(username);
 
     format!(
-        "BEGIN;\nSET LOCAL log_min_error_statement = PANIC;\nSELECT {create_role_statement}\nWHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {username_literal})\n\\gexec\nALTER ROLE {username_identifier} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'tenant_password';\nREVOKE ALL ON DATABASE {database_identifier} FROM PUBLIC;\nALTER DATABASE {database_identifier} OWNER TO {username_identifier};\nCOMMIT;"
+        "BEGIN;\nSET LOCAL log_min_error_statement = PANIC;\nSET LOCAL password_encryption = 'scram-sha-256';\nSELECT {create_role_statement}\nWHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {username_literal})\n\\gexec\nALTER ROLE {username_identifier} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'tenant_password';\nREVOKE ALL ON DATABASE {database_identifier} FROM PUBLIC;\nALTER DATABASE {database_identifier} OWNER TO {username_identifier};\nCOMMIT;"
     )
 }
 
@@ -18,7 +18,7 @@ pub fn restrict_tenant_role_sql(username: &str) -> String {
 
 pub fn reset_tenant_password_sql(username: &str) -> String {
     format!(
-        "ALTER ROLE {} PASSWORD :'tenant_password';",
+        "SET password_encryption = 'scram-sha-256';\nALTER ROLE {} PASSWORD :'tenant_password';",
         quote_ident(username),
     )
 }
@@ -75,7 +75,8 @@ mod tests {
     fn password_reset_uses_a_psql_variable_instead_of_interpolating_the_secret() {
         let sql = reset_tenant_password_sql("app_user");
 
-        assert_eq!(sql, "ALTER ROLE \"app_user\" PASSWORD :'tenant_password';");
+        assert!(sql.starts_with("SET password_encryption = 'scram-sha-256';"));
+        assert!(sql.ends_with("ALTER ROLE \"app_user\" PASSWORD :'tenant_password';"));
     }
 
     #[test]

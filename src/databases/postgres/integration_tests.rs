@@ -9,6 +9,7 @@ use super::provision::provision_tenant_role_sql;
 
 const IMAGE: &str = "postgres:18.4";
 const ADMIN: &str = "dbe_admin";
+const ADMIN_PASSWORD: &str = "integration-admin-password";
 const DATABASE: &str = "integration_db";
 const TENANT: &str = "integration_user";
 const TENANT_PASSWORD: &str = "integration-tenant-password";
@@ -24,18 +25,14 @@ fn postgres_18_provisions_a_restricted_database_owner() {
         .args([
             "exec",
             "-i",
+            "-e",
+            &format!("PGPASSWORD={ADMIN_PASSWORD}"),
+            "-e",
+            &format!("DBE_TENANT_PASSWORD={TENANT_PASSWORD}"),
             &name,
-            "psql",
-            "-X",
-            "-U",
-            ADMIN,
-            "-d",
-            DATABASE,
-            "-At",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-v",
-            &format!("tenant_password={TENANT_PASSWORD}"),
+            "sh",
+            "-c",
+            "{ printf '%s\n' '\\getenv tenant_password DBE_TENANT_PASSWORD'; cat; } | psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -At -v ON_ERROR_STOP=1",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -53,6 +50,35 @@ fn postgres_18_provisions_a_restricted_database_owner() {
         output.status.success(),
         "tenant provisioning failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    let hardened = run_hardening(&name);
+    assert!(
+        hardened.status.success(),
+        "PostgreSQL hardening failed: {}",
+        String::from_utf8_lossy(&hardened.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&hardened.stdout).lines().last(),
+        Some("already_hardened")
+    );
+    let repeated = run_hardening(&name);
+    assert!(repeated.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&repeated.stdout).lines().last(),
+        Some("already_hardened")
+    );
+
+    install_legacy_peer_rule(&name);
+    let repaired = run_hardening(&name);
+    assert!(
+        repaired.status.success(),
+        "PostgreSQL peer-rule repair failed: {}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&repaired.stdout).lines().last(),
+        Some("hardened")
     );
 
     assert_eq!(
@@ -97,6 +123,38 @@ fn postgres_18_provisions_a_restricted_database_owner() {
         String::from_utf8_lossy(&tenant.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&tenant.stdout).trim(), TENANT);
+    assert_eq!(
+        exec_psql(
+            &name,
+            ADMIN,
+            "SELECT rolpassword LIKE 'SCRAM-SHA-256$%' FROM pg_authid WHERE rolname = 'integration_user'",
+        ),
+        "t"
+    );
+
+    let rejected = Command::new("docker")
+        .args([
+            "exec",
+            "-e",
+            "PGPASSWORD=definitely-wrong",
+            &name,
+            "psql",
+            "-X",
+            "-h",
+            "/var/run/postgresql",
+            "-U",
+            TENANT,
+            "-d",
+            DATABASE,
+            "-Atqc",
+            "SELECT 1",
+        ])
+        .output()
+        .expect("attempt a wrong-password tenant connection");
+    assert!(
+        !rejected.status.success(),
+        "PostgreSQL accepted a wrong password"
+    );
 
     drop(container);
 }
@@ -115,10 +173,19 @@ impl TestContainer {
                 "--env",
                 &format!("POSTGRES_USER={ADMIN}"),
                 "--env",
-                "POSTGRES_PASSWORD=integration-admin-password",
+                &format!("POSTGRES_PASSWORD={ADMIN_PASSWORD}"),
                 "--env",
                 &format!("POSTGRES_DB={DATABASE}"),
+                "--env",
+                &format!("DBE_POSTGRES_USER={TENANT}"),
+                "--env",
+                "POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256",
                 IMAGE,
+                "postgres",
+                "-c",
+                "listen_addresses=",
+                "-c",
+                "password_encryption=scram-sha-256",
             ])
             .output()
             .expect("start PostgreSQL test container");
@@ -129,6 +196,53 @@ impl TestContainer {
         );
         Self(name.to_string())
     }
+}
+
+fn run_hardening(name: &str) -> std::process::Output {
+    Command::new("docker")
+        .args([
+            "exec",
+            "-e",
+            &format!("DBE_TENANT_PASSWORD={TENANT_PASSWORD}"),
+            "-e",
+            &format!("DBE_POSTGRES_ADMIN_PASSWORD={ADMIN_PASSWORD}"),
+            "-e",
+            "DBE_INVALID_PASSWORD=definitely-wrong",
+            name,
+            "sh",
+            "-c",
+            &super::hardening::hardening_script(TENANT),
+        ])
+        .output()
+        .expect("run PostgreSQL local-auth hardening")
+}
+
+fn install_legacy_peer_rule(name: &str) {
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            name,
+            "sh",
+            "-c",
+            r#"set -eu
+hba="$PGDATA/pg_hba.conf"
+tmp=$(mktemp "${hba}.test.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+awk '$1 != "local" { print }' "$hba" >"$tmp"
+printf '%s\n' 'local all dbe_admin peer map=dbev_admin' 'local all all scram-sha-256' >>"$tmp"
+chmod --reference="$hba" "$tmp"
+mv -f "$tmp" "$hba"
+trap - EXIT
+kill -HUP 1
+sleep 1"#,
+        ])
+        .output()
+        .expect("install legacy PostgreSQL peer rule");
+    assert!(
+        output.status.success(),
+        "failed to install legacy PostgreSQL peer rule: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 impl Drop for TestContainer {
@@ -144,7 +258,20 @@ fn wait_until_ready(name: &str) {
     while Instant::now() < deadline {
         if Command::new("docker")
             .args([
-                "exec", name, "psql", "-X", "-U", ADMIN, "-d", DATABASE, "-Atqc", "SELECT 1",
+                "exec",
+                "-e",
+                &format!("PGPASSWORD={ADMIN_PASSWORD}"),
+                name,
+                "psql",
+                "-X",
+                "-h",
+                "/var/run/postgresql",
+                "-U",
+                ADMIN,
+                "-d",
+                DATABASE,
+                "-Atqc",
+                "SELECT 1",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -162,7 +289,20 @@ fn wait_until_ready(name: &str) {
 fn exec_psql(name: &str, user: &str, sql: &str) -> String {
     let output = Command::new("docker")
         .args([
-            "exec", name, "psql", "-X", "-U", user, "-d", DATABASE, "-Atqc", sql,
+            "exec",
+            "-e",
+            &format!("PGPASSWORD={ADMIN_PASSWORD}"),
+            name,
+            "psql",
+            "-X",
+            "-h",
+            "/var/run/postgresql",
+            "-U",
+            user,
+            "-d",
+            DATABASE,
+            "-Atqc",
+            sql,
         ])
         .output()
         .expect("run PostgreSQL query");

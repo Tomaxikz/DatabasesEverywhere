@@ -38,7 +38,8 @@ use crate::{
         images::{ensure_image_allowed, validate_image},
         instance_create::{
             backend_endpoint_for_instance, create_instance_from_request,
-            enforce_node_allocation_policy, launch_container_from_spec,
+            enforce_node_allocation_policy, harden_mysql_tenant_auth,
+            harden_postgres_instance_auth, launch_container_from_spec,
             prepare_instance_container_user, protocol_pids_limit, provision_mariadb_tenant_user,
             provision_mongodb_tenant_user, provision_mysql_tenant_user,
             provision_postgres_tenant_role, requested_or_configured_image,
@@ -333,11 +334,20 @@ pub async fn update_instance_image(
         .await
         .map_err(|error| error.into_api_error())?;
         if metadata.protocol == Protocol::Postgres {
-            provision_postgres_tenant_role(
+            harden_postgres_instance_auth(
                 &state,
                 &metadata.instance_id,
-                &metadata.database.name,
                 &metadata.database.username,
+                effective_password.as_deref().ok_or_else(|| {
+                    ApiError::Conflict(
+                        "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before replacing its image".to_string(),
+                    )
+                })?,
+                metadata.postgres_admin_password.as_deref().ok_or_else(|| {
+                    ApiError::Conflict(
+                        "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before replacing its image".to_string(),
+                    )
+                })?,
             )
             .await?;
         }
@@ -1090,13 +1100,56 @@ pub(crate) async fn lifecycle_instance_locked(
                 return Err(docker_error(error));
             }
             if metadata.protocol == Protocol::Postgres {
-                provision_postgres_tenant_role(
+                let Some(password) = metadata.tenant_password.as_deref() else {
+                    startup_readiness_failed = true;
+                    return Err(ApiError::Conflict(
+                        "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
+                    ));
+                };
+                let Some(admin_password) = metadata.postgres_admin_password.as_deref() else {
+                    startup_readiness_failed = true;
+                    return Err(ApiError::Conflict(
+                        "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before starting it".to_string(),
+                    ));
+                };
+                if let Err(error) = harden_postgres_instance_auth(
                     state,
                     &metadata.instance_id,
-                    &metadata.database.name,
                     &metadata.database.username,
+                    password,
+                    admin_password,
                 )
-                .await?;
+                .await
+                {
+                    startup_readiness_failed = true;
+                    return Err(error);
+                }
+            }
+            if metadata.protocol == Protocol::Mysql {
+                let Some(password) = metadata.tenant_password.as_deref() else {
+                    startup_readiness_failed = true;
+                    return Err(ApiError::Conflict(
+                        "the encrypted MySQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
+                    ));
+                };
+                let Some(root_password) = metadata.mysql_root_password.as_deref() else {
+                    startup_readiness_failed = true;
+                    return Err(ApiError::Conflict(
+                        "the encrypted MySQL maintenance credential is missing; recreate this legacy instance before starting it".to_string(),
+                    ));
+                };
+                if let Err(error) = harden_mysql_tenant_auth(
+                    state,
+                    &metadata.instance_id,
+                    &metadata.database.username,
+                    password,
+                    root_password,
+                )
+                .await
+                {
+                    startup_readiness_failed = true;
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -1310,6 +1363,11 @@ async fn instance_image_update_spec(
             &metadata.database.name,
             &metadata.database.username,
             password,
+            SecretString::from(metadata.postgres_admin_password.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before recreation".to_string(),
+                )
+            })?),
             container_data_path.clone(),
             paths.logs.clone(),
             paths.sockets.clone(),

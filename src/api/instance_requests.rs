@@ -1,3 +1,4 @@
+use http::HeaderValue;
 use serde::Deserialize;
 
 use crate::{
@@ -11,6 +12,8 @@ use crate::{
         protocol::Protocol,
     },
 };
+
+pub(crate) const MAX_PASSWORD_CHARACTERS: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,11 +46,7 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     validate_database_name(&request.database)?;
     validate_username(&request.username)?;
-    if request.password.is_empty() {
-        return Err(ApiError::BadRequest(
-            "password must not be empty".to_string(),
-        ));
-    }
+    validate_database_password(request.protocol, &request.password)?;
     if request.public_host.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "public_host must not be empty".to_string(),
@@ -67,6 +66,36 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
                 )
             })?;
         DestructiveActionPolicy::authorize("stale resource purge", confirmation)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_database_password(
+    protocol: Protocol,
+    password: &str,
+) -> Result<(), ApiError> {
+    if password.is_empty() {
+        return Err(ApiError::BadRequest(
+            "password must not be empty".to_string(),
+        ));
+    }
+    if password.chars().count() > MAX_PASSWORD_CHARACTERS {
+        return Err(ApiError::BadRequest(format!(
+            "password must not exceed {MAX_PASSWORD_CHARACTERS} characters"
+        )));
+    }
+    if password
+        .bytes()
+        .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+    {
+        return Err(ApiError::BadRequest(
+            "password must contain no NUL bytes or line breaks".to_string(),
+        ));
+    }
+    if protocol == Protocol::Qdrant && HeaderValue::from_str(password).is_err() {
+        return Err(ApiError::BadRequest(
+            "qdrant password contains characters that are invalid in an API-key header".to_string(),
+        ));
     }
     Ok(())
 }
@@ -233,6 +262,21 @@ mod tests {
         assert!(validate_username("root").is_err());
         assert!(validate_username("dbe_admin").is_err());
         assert!(validate_username("dbe_health").is_err());
+    }
+
+    #[test]
+    fn create_password_validation_rejects_unsafe_values_for_every_protocol() {
+        for protocol in Protocol::ALL {
+            assert!(validate_database_password(protocol, "").is_err());
+            assert!(validate_database_password(protocol, "line\nbreak").is_err());
+            assert!(validate_database_password(protocol, "nul\0byte").is_err());
+            assert!(
+                validate_database_password(protocol, &"x".repeat(MAX_PASSWORD_CHARACTERS + 1))
+                    .is_err()
+            );
+        }
+        assert!(validate_database_password(Protocol::Qdrant, "bad\u{7f}header").is_err());
+        assert!(validate_database_password(Protocol::Postgres, "valid password").is_ok());
     }
 
     #[test]

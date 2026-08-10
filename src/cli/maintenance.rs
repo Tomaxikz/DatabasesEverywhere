@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
+
 pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
@@ -56,6 +58,82 @@ pub(super) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
 
     println!("removed {removed} sqlite metadata files");
     Ok(())
+}
+
+pub(super) async fn repair_protected_secret(
+    config_path: PathBuf,
+    instance_id: String,
+    field: ProtectedSecretField,
+    confirm_legacy_plaintext: bool,
+) -> anyhow::Result<()> {
+    if !confirm_legacy_plaintext {
+        anyhow::bail!(
+            "refusing recovery without --confirm-legacy-plaintext; this command is only for a known legacy plaintext value that begins with dbev1:"
+        );
+    }
+    validate_instance_id(&instance_id)?;
+    let config = load_config(&config_path)?;
+    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
+    init_configured_logging(&config)?;
+    let known_plaintext = read_protected_secret_from_stdin()?;
+    let metadata_root = config.paths.metadata_root();
+    let pool = sqlite::connect(Path::new(&metadata_root))
+        .await
+        .context("failed to initialize sqlite storage")?;
+    let repository = InstanceRepository::encrypted(pool, Path::new(&metadata_root))
+        .context("failed to initialize encrypted metadata secret storage")?;
+    let repaired = repository
+        .repair_ambiguous_protected_secret(&instance_id, field, &known_plaintext)
+        .await
+        .context("protected-secret repair failed")?;
+
+    if repaired.remaining_fields.is_empty() {
+        println!(
+            "repaired {field} for {instance_id}; the instance remains stopped until explicitly started"
+        );
+    } else {
+        let remaining = repaired
+            .remaining_fields
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "repaired {field} for {instance_id}; the instance remains quarantined because these fields still require repair: {remaining}"
+        );
+    }
+    Ok(())
+}
+
+fn read_protected_secret_from_stdin() -> anyhow::Result<SecretString> {
+    if io::stdin().is_terminal() {
+        anyhow::bail!(
+            "refusing to echo a secret in an interactive terminal; pipe the exact known plaintext to stdin"
+        );
+    }
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(MAX_PROTECTED_SECRET_STDIN_BYTES + 2)
+        .read_to_end(&mut bytes)
+        .context("failed to read protected secret from stdin")?;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() as u64 > MAX_PROTECTED_SECRET_STDIN_BYTES {
+        anyhow::bail!("protected secret input exceeds {MAX_PROTECTED_SECRET_STDIN_BYTES} bytes");
+    }
+    if bytes.is_empty()
+        || bytes.contains(&b'\0')
+        || bytes.contains(&b'\n')
+        || bytes.contains(&b'\r')
+    {
+        anyhow::bail!("protected secret input is empty or contains a forbidden control character");
+    }
+    let value = String::from_utf8(bytes).context("protected secret input must be valid UTF-8")?;
+    Ok(SecretString::from(value))
 }
 
 pub(super) async fn migrate_paths(
