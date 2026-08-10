@@ -1,6 +1,28 @@
 //! HTTP handlers and durable import/export job orchestration.
 
 use super::{files::*, logical::*, physical::*, protocol::*, *};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
+mod supervision;
+use supervision::{
+    block_uncertain_upload, spawn_export_job_supervisor, spawn_import_job_supervisor,
+};
+
+pub(super) const MAX_REPLAY_OPTIONS_BYTES: usize = 64 * 1024;
+const IMPORT_WORKER_QUEUED: u8 = 0;
+const IMPORT_WORKER_RUNNING: u8 = 1;
+const IMPORT_WORKER_FINISHED: u8 = 2;
+const MAX_ENQUEUE_READBACK_DELAY_MS: u64 = 1_000;
+
+fn fixed_scheduler_capacity_error() -> ApiError {
+    ApiError::Conflict(
+        "the estimated operation exceeds a fixed dynamic import/export scheduler budget; increase the configured dynamic memory, I/O, or CPU budget, reduce the operation size, or use a deliberate manual concurrency limit"
+            .to_string(),
+    )
+}
 
 pub async fn export_instance(
     State(state): State<AppState>,
@@ -73,13 +95,15 @@ pub(crate) async fn import_default_artifact_into_metadata(
 pub(crate) async fn queue_export_instance_with_options(
     state: &AppState,
     instance_id: &str,
-    options: ExportOptions,
+    mut options: ExportOptions,
 ) -> ApiResult<ImportExportJobResponse> {
     let metadata = state
         .instances
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    options.archive_format =
+        normalized_export_archive_format(metadata.protocol, options.archive_format);
     if matches!(
         metadata.protocol,
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
@@ -102,25 +126,28 @@ pub(crate) async fn queue_export_instance_with_options(
         selection: options.selection.clone(),
         archive_format: options.archive_format,
     })?;
-    let (job, admission) = enqueue_job(
-        state,
-        metadata.instance_id.clone(),
-        ImportExportAction::Export,
-        Some(artifact_path.display().to_string()),
-        Some(replay_options),
-    )
-    .await?;
-
-    tokio::spawn(run_export_job(
-        state.clone(),
-        job.job_id.clone(),
-        metadata.instance_id,
-        artifact_path,
-        options,
-        admission,
-    ));
-
-    audit_import_export(&job, "queued");
+    let owned_state = state.clone();
+    let supervisor = tokio::spawn(async move {
+        let (job, admission) = enqueue_job(
+            &owned_state,
+            metadata.instance_id.clone(),
+            ImportExportAction::Export,
+            Some(artifact_path.display().to_string()),
+            Some(replay_options),
+        )
+        .await?;
+        spawn_export_job_supervisor(
+            owned_state,
+            job.job_id.clone(),
+            metadata.instance_id,
+            artifact_path,
+            options,
+            admission,
+        );
+        audit_import_export(&job, "queued");
+        Ok::<_, ApiError>(job)
+    });
+    let job = await_enqueue_supervisor(supervisor).await?;
     Ok(accepted_job_response(job).await)
 }
 
@@ -137,6 +164,14 @@ pub(crate) async fn queue_import_instance(
     let mut options =
         harden_import_options(state, &metadata.instance_id, metadata.protocol, options).await?;
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Import)?;
+    let resolved_source_database = super::uploads::resolve_upload_source_database_catalog(
+        state,
+        &metadata.instance_id,
+        &options.source,
+        options.source_database.as_deref(),
+    )
+    .await?;
+    options.source_database = resolved_source_database;
     super::uploads::validate_upload_selection_capability(
         state,
         &metadata.instance_id,
@@ -144,52 +179,26 @@ pub(crate) async fn queue_import_instance(
         &options.selection,
     )
     .await?;
-    let (staging_permit, upload_staging) =
-        if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
-            match upload_logical_staging_budget(state, &metadata, options.mode)? {
-                Some(budget) => {
-                    let root = logical_staging_root(state).await?;
-                    let permit = state
-                        .import_uploads
-                        .acquire_staging(&root, budget.reservation_bytes)
-                        .await?;
-                    (
-                        Some(permit),
-                        Some(UploadStagingBudget::Logical {
-                            budget,
-                            target_created_at: metadata.created_at.clone(),
-                            disk_mib: metadata.limits.disk_mib,
-                        }),
-                    )
-                }
-                None => match upload_physical_staging_bytes(&metadata)? {
-                    Some(bytes) => {
-                        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-                            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-                        let data_parent = paths.data.parent().ok_or_else(|| {
-                            ApiError::Runtime(
-                                "physical import data directory has no parent".to_string(),
-                            )
-                        })?;
-                        let permit = state
-                            .import_uploads
-                            .acquire_staging_on_existing_root(data_parent, bytes)
-                            .await?;
-                        (
-                            Some(permit),
-                            Some(UploadStagingBudget::Physical {
-                                extracted_bytes: bytes,
-                                target_created_at: metadata.created_at.clone(),
-                                disk_mib: metadata.limits.disk_mib,
-                            }),
-                        )
-                    }
-                    None => (None, None),
-                },
-            }
-        } else {
-            (None, None)
-        };
+    let upload_staging = if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
+        let prepared_bytes = upload_prepared_reservation_bytes(state, &options).await;
+        match upload_logical_staging_budget(state, &metadata, options.mode, prepared_bytes)? {
+            Some(budget) => Some(UploadStagingBudget::Logical {
+                budget,
+                target_created_at: metadata.created_at.clone(),
+                disk_mib: metadata.limits.disk_mib,
+            }),
+            None => match upload_physical_staging_bytes(&metadata)? {
+                Some(bytes) => Some(UploadStagingBudget::Physical {
+                    extracted_bytes: bytes,
+                    target_created_at: metadata.created_at.clone(),
+                    disk_mib: metadata.limits.disk_mib,
+                }),
+                None => None,
+            },
+        }
+    } else {
+        None
+    };
     options.upload_staging = upload_staging;
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
@@ -219,82 +228,67 @@ pub(crate) async fn queue_import_instance(
         )?),
         ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => None,
     };
-    let (job, admission) = enqueue_job(
-        state,
-        metadata.instance_id.clone(),
-        ImportExportAction::Import,
-        artifact_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        replay_options,
-    )
-    .await?;
-
-    if let ImportSourceOptions::Upload { upload_id, .. } = &options.source {
-        let claimed = match state
-            .import_uploads
-            .repository()
-            .claim_ready_for_job(
+    let remote_admission = if matches!(&options.source, ImportSourceOptions::Remote(_)) {
+        Some(
+            try_admit_remote_job(
                 &metadata.instance_id,
-                upload_id,
-                &job.job_id,
-                &crate::jobs::import_export::now_rfc3339(),
+                state.config.security.remote_import.max_concurrent_jobs,
             )
-            .await
-        {
-            Ok(claimed) => claimed,
-            Err(error) => {
-                close_unclaimed_upload_job(
-                    state,
-                    &job.job_id,
-                    "upload_storage",
-                    "the temporary import upload claim could not be persisted",
-                )
-                .await;
-                if let Err(release_error) = state
-                    .import_uploads
-                    .repository()
-                    .release_claim_after_failed_job(
-                        &metadata.instance_id,
-                        upload_id,
-                        &job.job_id,
-                        "upload claim acknowledgement was uncertain; submit the import again",
-                        &crate::jobs::import_export::now_rfc3339(),
-                    )
-                    .await
-                {
-                    tracing::error!(job_id = job.job_id, %release_error, "failed to reconcile an uncertain upload claim");
-                }
-                return Err(ApiError::Runtime(format!(
-                    "failed to claim import upload: {error}"
-                )));
-            }
-        };
-        if !claimed {
-            close_unclaimed_upload_job(
-                state,
-                &job.job_id,
-                "upload_conflict",
-                "the temporary import upload is no longer ready",
-            )
-            .await;
-            return Err(ApiError::Conflict(
-                "the temporary import upload changed before the job could claim it".to_string(),
-            ));
-        }
-    }
-
-    tokio::spawn(run_import_job(
-        state.clone(),
-        job.job_id.clone(),
-        metadata.instance_id,
-        options,
-        admission,
-        staging_permit,
-    ));
-
-    audit_import_export(&job, "queued");
+            .ok_or(ApiError::RateLimited)?,
+        )
+    } else {
+        None
+    };
+    let owned_state = state.clone();
+    let supervisor = tokio::spawn(async move {
+        let (job, admission) = enqueue_job(
+            &owned_state,
+            metadata.instance_id.clone(),
+            ImportExportAction::Import,
+            artifact_path.map(|path| path.display().to_string()),
+            replay_options,
+        )
+        .await?;
+        spawn_import_job_supervisor(
+            owned_state,
+            job.job_id.clone(),
+            metadata.instance_id,
+            options,
+            admission,
+            remote_admission,
+        );
+        audit_import_export(&job, "queued");
+        Ok::<_, ApiError>(job)
+    });
+    let job = await_enqueue_supervisor(supervisor).await?;
     Ok(accepted_job_response(job).await)
+}
+
+async fn await_enqueue_supervisor(
+    supervisor: tokio::task::JoinHandle<Result<ImportExportJob, ApiError>>,
+) -> Result<ImportExportJob, ApiError> {
+    supervisor.await.map_err(|error| {
+        ApiError::Runtime(format!("import/export enqueue supervisor failed: {error}"))
+    })?
+}
+
+async fn upload_prepared_reservation_bytes(state: &AppState, options: &ImportOptions) -> u64 {
+    let maximum = state.config.artifacts.import_upload_max_bytes;
+    let ImportSourceOptions::Upload { path, .. } = &options.source else {
+        return maximum;
+    };
+    // Container formats may expand up to the validated extraction ceiling;
+    // plain logical dumps and MongoDB's directly streamed gzip archive need
+    // only their actual source file reserved here.
+    if options.archive_format.is_some() {
+        return maximum;
+    }
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(maximum)
 }
 
 async fn close_unclaimed_upload_job(
@@ -413,19 +407,56 @@ pub(super) async fn enqueue_job(
         created_at: now.clone(),
         updated_at: now,
     };
-    state
-        .import_export_jobs
-        .insert(job.clone())
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    if let Err(insert_error) = state.import_export_jobs.insert(job.clone()).await {
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            match state.import_export_jobs.get(&job.job_id).await {
+                Ok(Some(stored)) if stored == job => {
+                    state
+                        .import_export_jobs
+                        .cache_durable_job(job.clone())
+                        .await;
+                    tracing::warn!(job_id = job.job_id, %insert_error, attempt, "recovered an acknowledged durable import/export enqueue");
+                    break;
+                }
+                Ok(Some(_)) => {
+                    tracing::error!(job_id = job.job_id, %insert_error, attempt, "import/export enqueue read-back differed from the intended durable job");
+                    return Err(ApiError::Runtime(
+                        "import/export job persistence was inconsistent".to_string(),
+                    ));
+                }
+                Ok(None) => return Err(ApiError::Runtime(insert_error.to_string())),
+                Err(read_error) if state.import_export_jobs.is_accepting() => {
+                    tracing::warn!(job_id = job.job_id, %insert_error, %read_error, attempt, "retrying uncertain import/export enqueue read-back");
+                    let exponent = attempt.saturating_sub(1).min(6);
+                    let delay_ms = 25_u64
+                        .saturating_mul(1_u64 << exponent)
+                        .min(MAX_ENQUEUE_READBACK_DELAY_MS);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(read_error) => {
+                    tracing::error!(job_id = job.job_id, %insert_error, %read_error, attempt, "daemon shutdown interrupted uncertain import/export enqueue classification; startup recovery will reconcile any durable row");
+                    return Err(ApiError::Runtime(insert_error.to_string()));
+                }
+            }
+        }
+    }
     Ok((job, admission))
 }
 
 pub(super) fn serialize_replay_descriptor(
     descriptor: &ReplayDescriptor,
 ) -> Result<String, ApiError> {
-    serde_json::to_string(descriptor)
-        .map_err(|error| ApiError::Runtime(format!("failed to encode job replay options: {error}")))
+    let encoded = serde_json::to_string(descriptor).map_err(|error| {
+        ApiError::Runtime(format!("failed to encode job replay options: {error}"))
+    })?;
+    if encoded.len() > MAX_REPLAY_OPTIONS_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "import/export selection exceeds the {MAX_REPLAY_OPTIONS_BYTES}-byte queued-job limit"
+        )));
+    }
+    Ok(encoded)
 }
 
 pub(crate) async fn replay_failed_job(
@@ -515,62 +546,49 @@ pub(crate) async fn replay_failed_job(
     }
 }
 
-pub(super) async fn run_export_job(
+pub(super) async fn run_export_job_locked(
     state: AppState,
     job_id: String,
-    instance_id: String,
+    metadata: InstanceMetadata,
     artifact_path: PathBuf,
     options: ExportOptions,
-    _admission: ImportExportJobPermit,
 ) {
-    let _operation = state.instance_locks.lock(&instance_id).await;
-    if !begin_import_export_job(&state, &job_id).await {
-        return;
+    let result =
+        match crate::api::instances::reconcile_instance_locked(&state, &metadata.instance_id).await
+        {
+            Ok(_) => {
+                export_instance_artifact_reserved(
+                    &state,
+                    &metadata,
+                    artifact_path.clone(),
+                    &options,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+    if !update_job_result(&state, &job_id, result, Some(artifact_path)).await {
+        tracing::error!(%job_id, "export completed but its terminal status remained uncertain during shutdown; startup recovery will reconcile it");
     }
-    let result = match crate::api::instances::reconcile_instance_locked(&state, &instance_id).await
-    {
-        Ok(_) => {
-            export_instance_artifact(&state, &instance_id, artifact_path.clone(), &options).await
-        }
-        Err(error) => Err(error),
-    };
-    let _ = update_job_result(&state, &job_id, result, Some(artifact_path)).await;
 }
 
-pub(super) async fn run_import_job(
+pub(super) async fn run_import_job_locked(
     state: AppState,
     job_id: String,
     instance_id: String,
     options: ImportOptions,
-    _admission: ImportExportJobPermit,
-    _staging_permit: Option<super::uploads::ImportStagingPermit>,
 ) {
-    let _operation = state.instance_locks.lock(&instance_id).await;
     let upload_id = match &options.source {
         ImportSourceOptions::Upload { upload_id, .. } => Some(upload_id.clone()),
         _ => None,
     };
-    if !begin_import_export_job(&state, &job_id).await {
-        if let Some(upload_id) = upload_id.as_deref() {
-            super::uploads::finish_upload_import_job(
-                &state,
-                &instance_id,
-                upload_id,
-                &job_id,
-                false,
-                Some("daemon shutdown began before the import started"),
-            )
-            .await;
-        }
-        return;
-    }
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
         ImportSourceOptions::Upload { .. } => None,
         ImportSourceOptions::Remote(_) => None,
         ImportSourceOptions::RemoteRequest(_) => {
             tracing::error!(%job_id, "validated import job retained an unresolved remote source");
-            let _ = update_job_result(
+            let persisted = update_job_result(
                 &state,
                 &job_id,
                 Err(ApiError::Runtime(
@@ -579,6 +597,12 @@ pub(super) async fn run_import_job(
                 None,
             )
             .await;
+            if !persisted
+                && let Err(quarantine_error) =
+                    quarantine_after_uncertain_import(&state, &instance_id).await
+            {
+                tracing::error!(%job_id, %instance_id, %quarantine_error, "failed to quarantine a target after unresolved import status became uncertain");
+            }
             return;
         }
     };
@@ -593,41 +617,28 @@ pub(super) async fn run_import_job(
         .err()
         .map(|error| PublicDiagnostic::from_api_error("import operation", error).message);
     let terminal_status_persisted = update_job_result(&state, &job_id, result, artifact_path).await;
-    if let Some(upload_id) = upload_id.as_deref() {
-        if !terminal_status_persisted {
-            tracing::error!(
-                %job_id,
-                instance_id,
+    if !terminal_status_persisted {
+        tracing::error!(
+            %job_id,
+            instance_id,
+            "import outcome is uncertain because the terminal job status is not durable"
+        );
+        if let Some(upload_id) = upload_id.as_deref() {
+            block_uncertain_upload(
+                &state,
+                &instance_id,
                 upload_id,
-                "retaining claimed import upload because the job's terminal status is not durable"
-            );
-            let reason = "import outcome could not be recorded durably; the upload is blocked and the target was quarantined";
-            match state
-                .import_uploads
-                .repository()
-                .reconcile_interrupted_importing(
-                    &instance_id,
-                    upload_id,
-                    &job_id,
-                    crate::storage::import_uploads::InterruptedImportDisposition::Failed,
-                    reason,
-                    &crate::jobs::import_export::now_rfc3339(),
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::error!(%job_id, instance_id, upload_id, "uncertain terminal job persistence did not match the claimed upload state")
-                }
-                Err(error) => {
-                    tracing::error!(%job_id, instance_id, upload_id, %error, "failed to block an upload with uncertain terminal job persistence")
-                }
-            }
-            if let Err(error) = quarantine_after_uncertain_import(&state, &instance_id).await {
-                tracing::error!(%job_id, instance_id, upload_id, %error, "failed to fully quarantine an import with uncertain terminal job persistence");
-            }
-            return;
+                &job_id,
+                "import outcome could not be recorded durably; the upload is blocked and the target was quarantined",
+            )
+            .await;
         }
+        if let Err(error) = quarantine_after_uncertain_import(&state, &instance_id).await {
+            tracing::error!(%job_id, instance_id, %error, "failed to fully quarantine an import with uncertain terminal job persistence");
+        }
+        return;
+    }
+    if let Some(upload_id) = upload_id.as_deref() {
         super::uploads::finish_upload_import_job(
             &state,
             &instance_id,
@@ -640,35 +651,312 @@ pub(super) async fn run_import_job(
     }
 }
 
-pub(super) async fn begin_import_export_job(state: &AppState, job_id: &str) -> bool {
-    if !state.import_export_jobs.is_accepting() {
-        let diagnostic = PublicDiagnostic::public(
-            "shutdown",
-            "daemon shutdown began before the queued job started",
-        );
-        if let Err(error) = state
-            .import_export_jobs
-            .update_status(
+async fn acquire_upload_staging(
+    state: &AppState,
+    instance_id: &str,
+    options: &ImportOptions,
+) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+    if let Some(staging) = options.upload_staging.as_ref() {
+        return match staging {
+            UploadStagingBudget::Logical { budget, .. } => {
+                let root = logical_staging_root(state).await?;
+                state
+                    .import_uploads
+                    .acquire_staging(&root, budget.reservation_bytes)
+                    .await
+                    .map(Some)
+            }
+            UploadStagingBudget::Physical {
+                extracted_bytes, ..
+            } => {
+                let paths = InstancePaths::new(&state.config.paths, instance_id)
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                let data_parent = paths.data.parent().ok_or_else(|| {
+                    ApiError::Runtime("physical import data directory has no parent".to_string())
+                })?;
+                state
+                    .import_uploads
+                    .acquire_staging_on_existing_root(data_parent, *extracted_bytes)
+                    .await
+                    .map(Some)
+            }
+        };
+    }
+
+    let metadata = state
+        .instances
+        .get(instance_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+    if !protocol_uses_logical_dumps(metadata.protocol) {
+        return match &options.source {
+            ImportSourceOptions::Remote(_) => {
+                let root = PathBuf::from(state.config.paths.tmp_root());
+                state
+                    .import_uploads
+                    .acquire_staging(
+                        &root,
+                        state.config.security.remote_import.max_staged_bytes.max(1),
+                    )
+                    .await
+                    .map(Some)
+            }
+            ImportSourceOptions::Artifact(_) => {
+                let paths = InstancePaths::new(&state.config.paths, instance_id)
+                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                let data_parent = paths.data.parent().ok_or_else(|| {
+                    ApiError::Runtime("physical import data directory has no parent".to_string())
+                })?;
+                let extracted = metadata
+                    .limits
+                    .disk_mib
+                    .saturating_mul(1024 * 1024)
+                    .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+                state
+                    .import_uploads
+                    .acquire_staging_on_existing_root(data_parent, extracted)
+                    .await
+                    .map(Some)
+            }
+            ImportSourceOptions::Upload { .. } => Err(ApiError::Runtime(
+                "physical upload import is missing its validated staging budget".to_string(),
+            )),
+            ImportSourceOptions::RemoteRequest(_) => Err(ApiError::Runtime(
+                "remote import source was not validated".to_string(),
+            )),
+        };
+    }
+    let requested = match &options.source {
+        ImportSourceOptions::Artifact(path) => {
+            let prepared = if import_source_is_compressed(metadata.protocol, options) {
+                MAX_UNARCHIVED_BYTES
+            } else {
+                tokio::fs::metadata(path)
+                    .await
+                    .ok()
+                    .filter(|value| value.is_file())
+                    .map(|value| value.len().min(MAX_UNARCHIVED_BYTES))
+                    .unwrap_or(MAX_UNARCHIVED_BYTES)
+            };
+            let rollback = if options.mode == ImportMode::Wipe {
+                estimated_logical_rollback_bytes(&metadata)
+            } else {
+                0
+            };
+            prepared.checked_add(rollback).ok_or_else(|| {
+                ApiError::Conflict("logical import staging reservation overflowed".to_string())
+            })?
+        }
+        ImportSourceOptions::Remote(_) => remote_import_staging_reservation_bytes(
+            metadata.protocol,
+            state.config.security.remote_import.max_staged_bytes,
+        )?,
+        ImportSourceOptions::Upload { .. } => {
+            return Err(ApiError::Runtime(
+                "upload import is missing its validated staging budget".to_string(),
+            ));
+        }
+        ImportSourceOptions::RemoteRequest(_) => {
+            return Err(ApiError::Runtime(
+                "remote import source was not validated".to_string(),
+            ));
+        }
+    };
+    let root = logical_staging_root(state).await?;
+    state
+        .import_uploads
+        .acquire_staging(&root, requested.max(1))
+        .await
+        .map(Some)
+}
+
+pub(super) fn remote_import_staging_reservation_bytes(
+    protocol: Protocol,
+    max_staged_bytes: u64,
+) -> Result<u64, ApiError> {
+    let copies = if matches!(
+        protocol,
+        Protocol::Mariadb | Protocol::Mysql | Protocol::Clickhouse
+    ) {
+        2
+    } else {
+        1
+    };
+    max_staged_bytes.max(1).checked_mul(copies).ok_or_else(|| {
+        ApiError::Conflict("remote import staging reservation overflowed".to_string())
+    })
+}
+
+pub(super) fn import_source_is_compressed(protocol: Protocol, options: &ImportOptions) -> bool {
+    protocol_uses_native_compression(protocol)
+        || options.archive_format.is_some()
+        || match &options.source {
+            ImportSourceOptions::Artifact(path) | ImportSourceOptions::Upload { path, .. } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    let name = name.to_ascii_lowercase();
+                    name.ends_with(".gz") || name.ends_with(".bz2") || name.ends_with(".zip")
+                }),
+            ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => false,
+        }
+}
+
+async fn estimate_export_execution_cost(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    options: &ExportOptions,
+) -> JobResourceCost {
+    let allocated_bytes = metadata
+        .limits
+        .disk_mib
+        .saturating_mul(1024 * 1024)
+        .min(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    let input_size_bytes = match InstancePaths::new(&state.config.paths, &metadata.instance_id) {
+        Ok(paths) => state
+            .resource_cache
+            .disk_usage(&state.config, &metadata.instance_id, paths.data)
+            .await
+            .map(|usage| usage.used_bytes)
+            .unwrap_or(allocated_bytes),
+        Err(_) => allocated_bytes,
+    }
+    .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    JobResourceCost::estimate(JobEstimateInput {
+        protocol: metadata.protocol,
+        input_size_bytes,
+        rollback_size_bytes: 0,
+        wipe: false,
+        compressed: protocol_uses_native_compression(metadata.protocol)
+            || options.archive_format != ExportArchiveFormat::Plain,
+        export: true,
+    })
+}
+
+async fn estimate_import_execution_cost(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    options: &ImportOptions,
+) -> JobResourceCost {
+    let upload_limit = state.config.artifacts.import_upload_max_bytes;
+    let remote_limit = state.config.security.remote_import.max_staged_bytes;
+    let source_bytes = match &options.source {
+        ImportSourceOptions::Artifact(path) | ImportSourceOptions::Upload { path, .. } => {
+            tokio::fs::metadata(path)
+                .await
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .unwrap_or(upload_limit)
+        }
+        ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => remote_limit,
+    };
+    let compressed = import_source_is_compressed(metadata.protocol, options);
+    let prepared_ceiling =
+        import_prepared_ceiling_bytes(options, upload_limit, remote_limit, compressed);
+    // A compressed dump has no trustworthy expansion ratio until bounded
+    // extraction completes. Charge the configured prepared-data ceiling so a
+    // tiny gzip bomb cannot evade resource scheduling.
+    let estimated_expanded_bytes = conservative_import_input_bytes(
+        metadata.protocol,
+        source_bytes,
+        prepared_ceiling,
+        metadata.limits.disk_mib,
+        compressed,
+    );
+    let rollback_size_bytes =
+        if options.mode == ImportMode::Wipe && protocol_uses_logical_dumps(metadata.protocol) {
+            estimated_logical_rollback_bytes(metadata)
+        } else {
+            0
+        };
+    JobResourceCost::estimate(JobEstimateInput {
+        protocol: metadata.protocol,
+        input_size_bytes: estimated_expanded_bytes.max(1),
+        rollback_size_bytes,
+        wipe: options.mode == ImportMode::Wipe,
+        compressed,
+        export: false,
+    })
+}
+
+pub(super) fn import_prepared_ceiling_bytes(
+    options: &ImportOptions,
+    upload_limit: u64,
+    remote_limit: u64,
+    compressed: bool,
+) -> u64 {
+    match &options.source {
+        ImportSourceOptions::Artifact(_) => MAX_UNARCHIVED_BYTES,
+        ImportSourceOptions::Upload { .. } => {
+            let validated = match options.upload_staging.as_ref() {
+                Some(UploadStagingBudget::Logical { budget, .. }) => budget.prepared_bytes,
+                Some(UploadStagingBudget::Physical { .. }) | None => upload_limit,
+            };
+            if compressed {
+                validated.max(upload_limit.min(MAX_UNARCHIVED_BYTES))
+            } else {
+                validated
+            }
+        }
+        ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => remote_limit,
+    }
+    .max(1)
+}
+
+fn estimated_logical_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
+    metadata
+        .limits
+        .disk_mib
+        .saturating_mul(1024 * 1024)
+        .clamp(1, MAX_UNARCHIVED_BYTES)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum JobBeginOutcome {
+    Running,
+    Closed,
+    Uncertain,
+}
+
+pub(super) async fn begin_import_export_job(state: &AppState, job_id: &str) -> JobBeginOutcome {
+    let mut attempt = 0_u32;
+    loop {
+        if !state.import_export_jobs.is_accepting() {
+            let diagnostic = PublicDiagnostic::public(
+                "shutdown",
+                "daemon shutdown began before the queued job started",
+            );
+            return if persist_terminal_job_status(
+                state,
                 job_id,
                 ImportExportStatus::Failed,
                 None,
                 Some(diagnostic.to_storage_string()),
             )
             .await
-        {
-            tracing::error!(%job_id, %error, "failed to persist shutdown cancellation for queued import/export job");
+            {
+                JobBeginOutcome::Closed
+            } else {
+                JobBeginOutcome::Uncertain
+            };
         }
-        return false;
+        match state
+            .import_export_jobs
+            .update_status(job_id, ImportExportStatus::Running, None, None)
+            .await
+        {
+            Ok(()) => return JobBeginOutcome::Running,
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(%job_id, %error, attempt, "retrying durable running status before import/export execution");
+                let delay_ms = 50_u64
+                    .saturating_mul(1_u64 << attempt.saturating_sub(1).min(5))
+                    .min(1_000);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
     }
-    if let Err(error) = state
-        .import_export_jobs
-        .update_status(job_id, ImportExportStatus::Running, None, None)
-        .await
-    {
-        tracing::error!(%job_id, %error, "refusing to run import/export job because its running status could not be persisted");
-        return false;
-    }
-    true
 }
 
 pub(super) async fn update_job_result(
@@ -711,24 +999,31 @@ async fn persist_terminal_job_status(
     artifact_path: Option<String>,
     error: Option<String>,
 ) -> bool {
-    const ATTEMPTS: u32 = 3;
-    for attempt in 1..=ATTEMPTS {
+    const SHUTDOWN_ATTEMPTS: u32 = 3;
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
         match state
             .import_export_jobs
             .update_status(job_id, status, artifact_path.clone(), error.clone())
             .await
         {
             Ok(()) => return true,
-            Err(storage_error) if attempt < ATTEMPTS => {
+            Err(storage_error)
+                if state.import_export_jobs.is_accepting() || attempt < SHUTDOWN_ATTEMPTS =>
+            {
                 tracing::warn!(%job_id, %storage_error, attempt, "retrying terminal import/export job persistence");
-                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                let delay_ms = 100_u64
+                    .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+                    .min(1_000);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
             Err(storage_error) => {
                 tracing::error!(%job_id, %storage_error, attempt, "import/export operation completed but its terminal status could not be persisted");
+                return false;
             }
         }
     }
-    false
 }
 
 pub(super) async fn export_instance_artifact(
@@ -742,12 +1037,74 @@ pub(super) async fn export_instance_artifact(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    validate_logical_operation_eligible(&metadata)?;
+    let _reservations =
+        acquire_export_output_capacity(state, &metadata, &artifact_path, options).await?;
+    export_instance_artifact_reserved(state, &metadata, artifact_path, options).await
+}
+
+pub(super) struct ExportOutputReservations {
+    _artifact: super::uploads::DiskCapacityReservation,
+    _staging: Option<super::uploads::DiskCapacityReservation>,
+}
+
+pub(super) async fn acquire_export_output_capacity(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    artifact_path: &FsPath,
+    options: &ExportOptions,
+) -> Result<ExportOutputReservations, ApiError> {
+    validate_logical_operation_eligible(metadata)?;
+    let artifact_root = artifact_path
+        .parent()
+        .ok_or_else(|| ApiError::Runtime("export artifact has no parent directory".to_string()))?;
+    let physical = matches!(
+        metadata.protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    );
+    let output_capacity = if physical {
+        metadata
+            .limits
+            .disk_mib
+            .saturating_mul(1024 * 1024)
+            .saturating_add(64 * 1024 * 1024)
+            .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
+    } else {
+        export_artifact_capacity_bytes(MAX_UNARCHIVED_BYTES, options.archive_format).ok_or_else(
+            || ApiError::Runtime("export artifact capacity calculation overflowed".to_string()),
+        )?
+    };
+    let _artifact_capacity = state
+        .import_uploads
+        .reserve_output_capacity(artifact_root, output_capacity)
+        .await?;
+    let staging = if physical {
+        None
+    } else {
+        let staging_root = logical_staging_root(state).await?;
+        Some(
+            state
+                .import_uploads
+                .reserve_output_capacity(&staging_root, MAX_UNARCHIVED_BYTES)
+                .await?,
+        )
+    };
+    Ok(ExportOutputReservations {
+        _artifact: _artifact_capacity,
+        _staging: staging,
+    })
+}
+
+pub(super) async fn export_instance_artifact_reserved(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    artifact_path: PathBuf,
+    options: &ExportOptions,
+) -> Result<(), ApiError> {
     match metadata.protocol {
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             export_physical_archive(
                 state,
-                instance_id,
+                &metadata.instance_id,
                 metadata.protocol,
                 artifact_path,
                 &options.selection,
@@ -757,7 +1114,7 @@ pub(super) async fn export_instance_artifact(
         protocol => {
             export_logical_dump(
                 state,
-                &metadata,
+                metadata,
                 protocol,
                 artifact_path,
                 options,

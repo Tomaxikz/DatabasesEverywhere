@@ -169,8 +169,9 @@ pub async fn update_instance_image(
             )
         })?;
     if request.major_upgrade {
-        return update_instance_image_by_major_migration(
-            &state,
+        return run_major_upgrade_supervisor(
+            state.clone(),
+            _operation,
             metadata,
             current_image,
             image,
@@ -179,7 +180,6 @@ pub async fn update_instance_image(
         .await
         .map(ApiResponse::ok);
     }
-
     let image_change = classify_image_update(metadata.protocol, &current_image, &image)?;
     if image_change == ImageVersionChange::Major {
         return Err(major_upgrade_required_error(

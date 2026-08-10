@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.11.0
+  version: 0.12.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -196,7 +196,7 @@ components:
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.11.0}
+        api_version: {type: string, example: 0.12.0}
         api_readiness:
           type: string
           const: ready
@@ -252,6 +252,65 @@ components:
       required: [status]
       properties:
         status: {type: string, const: ok}
+    ImportExportJobResourceCost:
+      type: object
+      additionalProperties: false
+      required: [input_size_bytes, memory_mib, io_mib, cpu_units]
+      properties:
+        input_size_bytes: {type: integer, minimum: 1}
+        memory_mib: {type: integer, minimum: 1}
+        io_mib: {type: integer, minimum: 1}
+        cpu_units: {type: integer, minimum: 1}
+    ImportExportSchedulerCapacity:
+      type: object
+      additionalProperties: false
+      required: [mode, max_active_jobs, memory_budget_mib, io_budget_mib, cpu_units]
+      properties:
+        mode: {type: string, enum: [dynamic, manual]}
+        max_active_jobs: {type: integer, minimum: 1}
+        memory_budget_mib: {type: integer, minimum: 1}
+        io_budget_mib: {type: integer, minimum: 1}
+        cpu_units: {type: integer, minimum: 1}
+    ImportExportSchedulerSnapshot:
+      type: object
+      additionalProperties: false
+      required: [capacity, active_jobs, waiting_jobs, active_memory_mib, active_io_mib, active_cpu_units, accepting]
+      properties:
+        capacity:
+          $ref: "#/components/schemas/ImportExportSchedulerCapacity"
+        active_jobs: {type: integer, minimum: 0}
+        waiting_jobs: {type: integer, minimum: 0}
+        active_memory_mib: {type: integer, minimum: 0}
+        active_io_mib: {type: integer, minimum: 0}
+        active_cpu_units: {type: integer, minimum: 0}
+        accepting: {type: boolean}
+    ImportExportSchedulerRecommendation:
+      type: object
+      additionalProperties: false
+      required: [scheduler, estimate, recommended_active_jobs, admitted_jobs, max_queued_jobs, max_queued_jobs_per_instance]
+      properties:
+        scheduler:
+          $ref: "#/components/schemas/ImportExportSchedulerSnapshot"
+        estimate:
+          $ref: "#/components/schemas/ImportExportJobResourceCost"
+        recommended_active_jobs:
+          type: integer
+          minimum: 0
+          description: >-
+            Mode-independent resource-model concurrency for jobs with the
+            requested characteristics, bounded by dynamic_max_active_jobs.
+            Zero is a valid safety result when the live memory budget cannot
+            fit one modelled job; clients must not clamp it to one. CPU and
+            I/O are concurrency weights, so a memory-safe job that exceeds
+            either whole weight budget is recommended as one isolated job. In manual mode, compare it with
+            scheduler.capacity.max_active_jobs, which is the actual fixed
+            ceiling.
+        admitted_jobs:
+          type: integer
+          minimum: 0
+          description: Current node-wide durable jobs and synchronous data operations holding queue admission, including work still waiting for an instance lock.
+        max_queued_jobs: {type: integer, minimum: 1}
+        max_queued_jobs_per_instance: {type: integer, minimum: 1}
     GatewayReadiness:
       type: object
       additionalProperties: false
@@ -368,6 +427,10 @@ components:
         archive_format:
           type: [string, "null"]
           enum: [plain, gzip, bzip2, null]
+          description: >-
+            Optional outer wrapper. MongoDB plain output is already a native
+            gzip archive, so gzip is normalized to plain instead of creating a
+            double-gzip artifact. Redis, Valkey, and Qdrant accept only plain.
         selection:
           $ref: "#/components/schemas/ImportExportSelection"
     ArtifactImportSource:
@@ -394,9 +457,10 @@ components:
         instance's import endpoint. The daemon uses the persisted, inspected
         archive format; clients cannot override it. A successful import
         consumes and deletes the upload. A failed import releases it for retry
-        until it is cancelled or expires. MongoDB uploads additionally require
-        source_database so the archive namespace can be selected and remapped
-        without restoring other databases.
+        until it is cancelled or expires. MongoDB uploads use source_database
+        so one archive namespace can be selected and remapped without restoring
+        other databases; DBEV may infer it from an inspected, complete,
+        single-candidate catalog.
       properties:
         type:
           type: string
@@ -410,9 +474,13 @@ components:
           minLength: 1
           maxLength: 63
           description: >-
-            Original database namespace in a MongoDB archive. Required for
-            MongoDB upload imports and rejected for every other protocol. DBEV
-            restores only this namespace and remaps it to the target database.
+            Original database namespace in a MongoDB archive. Rejected for
+            every other protocol. It may be omitted only when the persisted
+            inspection catalog is complete and has exactly one candidate;
+            multiple or inconclusive candidates require an explicit value.
+            DBEV restores only this namespace and remaps it to the target. The
+            value must occupy 1-63 UTF-8 bytes and cannot contain NUL,
+            slash, backslash, dot, space, double quote, or dollar sign.
           example: legacy_tenant
     RemoteImportSource:
       type: object
@@ -453,8 +521,9 @@ components:
         password:
           type: [string, "null"]
           format: password
+          maxLength: 4096
           writeOnly: true
-          description: Source credentials are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis and Valkey keep it in process memory. SQL passwords cannot contain NUL, CR, or LF.
+          description: Source credentials are limited to 4096 UTF-8 bytes and are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis and Valkey keep it in process memory. SQL passwords cannot contain NUL, CR, or LF.
         authentication_database:
           type: [string, "null"]
           minLength: 1
@@ -469,8 +538,9 @@ components:
         api_key:
           type: [string, "null"]
           format: password
+          maxLength: 4096
           writeOnly: true
-          description: Optional Qdrant API key kept in process memory and not stored in a credential file, durable job record, or job metadata. It must be a syntactically valid HTTP header value and permit cluster-topology, collection, and alias reads plus snapshot creation, download, and cleanup.
+          description: Optional Qdrant API key limited to 4096 UTF-8 bytes, kept in process memory, and not stored in a credential file, durable job record, or job metadata. It must be a syntactically valid HTTP header value and permit cluster-topology, collection, and alias reads plus snapshot creation, download, and cleanup.
     ImportExportSelection:
       type: object
       additionalProperties: false
@@ -481,19 +551,27 @@ components:
           default: full
         include:
           type: array
+          maxItems: 512
           description: Required and non-empty when mode is selective. MongoDB credential imports accept multiple collection names; MongoDB exports accept exactly one.
           items:
             type: string
+            maxLength: 257
         exclude:
           type: array
+          maxItems: 512
           items:
             type: string
+            maxLength: 257
         fields:
           type: object
+          maxProperties: 512
+          description: The complete replayable job options document is limited to 65536 encoded bytes.
           additionalProperties:
             type: array
+            maxItems: 512
             items:
               type: string
+              maxLength: 128
     ImportUpload:
       type: object
       additionalProperties: false
@@ -562,10 +640,11 @@ components:
           description: The only authoritative switch for enabling selective-import controls.
         catalog_complete:
           type: boolean
-          description: False when the bounded inspector could not enumerate every selectable object.
+          description: False when the bounded inspector could not enumerate every relevant catalog item.
         namespaces:
           type: array
           maxItems: 512
+          description: For MongoDB uploads, sorted source database candidates discovered from the bounded native archive prelude; otherwise protocol-specific namespace hints or an empty list. Treat this list as authoritative only when catalog_complete is true; an incomplete list may contain partial hints.
           items:
             type: string
         objects:
@@ -1076,6 +1155,45 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SystemResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/system/import-export-scheduler/recommendation:
+    get:
+      summary: Inspect live import/export scheduling capacity and estimate representative concurrency.
+      description: The recommendation is a conservative resource model, not a measured throughput guarantee. A result of zero means the live memory budget cannot safely fit one modelled job and must not be coerced to one. CPU and I/O are concurrency weights; a memory-safe job that exceeds either whole weight budget may run only as one isolated job. A compressed logical import is charged at the configured prepared-data ceiling because its expansion ratio is not trusted before bounded extraction; compressed Redis, Valkey, and Qdrant physical imports are charged at the target disk allocation, capped by the physical archive limit. MongoDB, Redis, Valkey, and Qdrant are always modelled as natively compressed. action=export with mode=wipe is invalid.
+      x-required-scope: system:read
+      parameters:
+        - in: query
+          name: protocol
+          description: Defaults to postgres when omitted.
+          schema: {$ref: "#/components/schemas/Protocol"}
+        - in: query
+          name: action
+          schema: {type: string, enum: [import, export], default: import}
+        - in: query
+          name: size_bytes
+          description: Plain or prepared input size. Defaults to the configured maximum upload size.
+          schema: {type: integer, minimum: 1, maximum: 68719476736}
+        - in: query
+          name: target_disk_mib
+          description: Defaults to size_bytes rounded up to MiB.
+          schema: {type: integer, minimum: 1}
+        - in: query
+          name: mode
+          schema: {type: string, enum: [merge, wipe], default: merge}
+        - in: query
+          name: compressed
+          description: Compression hint. Native-compression protocols are treated as compressed even when false.
+          schema: {type: boolean, default: false}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Live scheduler snapshot and model-based recommendation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportSchedulerRecommendation"
         "401":
           $ref: "#/components/responses/Unauthorized"
   /api/system/config:

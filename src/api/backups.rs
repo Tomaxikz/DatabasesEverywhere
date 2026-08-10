@@ -22,12 +22,12 @@ use crate::{
         BackupBundle, BackupStorage, BackupStoreError, MaterializedBackup, StoredBackup,
         build_manifest,
         catalog::{BackupCatalog, BackupCatalogColumn},
-        new_backup_id,
+        ensure_private_directory, new_backup_id,
     },
     instances::metadata::{InstanceMetadata, InstanceStatus},
     jobs::import_export::{
-        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError,
-        create_data_archive_with_policy,
+        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError, JobEstimateInput,
+        JobResourceCost, SchedulerAcquireError, create_data_archive_with_policy_bounded,
     },
     shared::{ids::validate_instance_id, protocol::Protocol},
 };
@@ -308,6 +308,55 @@ async fn restore_instance_backup_admitted(
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     crate::api::import_export::verify_physical_data_replacement(&state, &metadata, &paths)?;
     let storage = backup_storage(&state)?;
+    let stored = storage
+        .find(&instance_id, &backup_id)
+        .await
+        .map_err(store_error)?;
+    let restore_size_bytes = stored.size_bytes.max(
+        metadata
+            .limits
+            .disk_mib
+            .saturating_mul(1024 * 1024)
+            .min(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES),
+    );
+    let _execution = state
+        .import_export_jobs
+        .acquire_execution(JobResourceCost::estimate(JobEstimateInput {
+            protocol: metadata.protocol,
+            input_size_bytes: restore_size_bytes.max(1),
+            rollback_size_bytes: 0,
+            wipe: true,
+            compressed: true,
+            export: false,
+        }))
+        .await
+        .map_err(scheduler_execution_error)?;
+    let data_parent = paths.data.parent().ok_or_else(|| {
+        ApiError::Runtime("backup restore data directory has no parent".to_string())
+    })?;
+    let extracted_capacity = metadata
+        .limits
+        .disk_mib
+        .saturating_mul(1024 * 1024)
+        .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    let _extracted_capacity = state
+        .import_uploads
+        .reserve_output_capacity(data_parent, extracted_capacity)
+        .await?;
+    let temporary_capacity = if storage.kind() == crate::config::BackupStorageDriver::Local {
+        None
+    } else {
+        let temporary_root = PathBuf::from(state.config.paths.tmp_root());
+        ensure_private_directory(&temporary_root, "backup materialization directory")
+            .await
+            .map_err(store_error)?;
+        Some(
+            state
+                .import_uploads
+                .reserve_output_capacity(&temporary_root, stored.size_bytes.max(1))
+                .await?,
+        )
+    };
     let materialized = storage
         .materialize(
             &instance_id,
@@ -316,6 +365,7 @@ async fn restore_instance_backup_admitted(
         )
         .await
         .map_err(store_error)?;
+    let _temporary_capacity = temporary_capacity;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running
         && let Err(error) = crate::api::instances::lifecycle_instance_locked(
@@ -328,12 +378,13 @@ async fn restore_instance_backup_admitted(
         materialized.cleanup().await;
         return Err(error);
     }
-    let finished = crate::api::import_export::restore_data_from_archive(
+    let finished = crate::api::import_export::restore_data_from_archive_bounded(
         &state,
         &instance_id,
         paths,
         &materialized.path,
         was_running,
+        extracted_capacity,
     )
     .await;
     materialized.cleanup().await;
@@ -373,6 +424,18 @@ async fn backup_instance_admitted(
     ensure_operation_can_start(&state)?;
     let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
     validate_backup_eligible(&metadata)?;
+    let _execution = state
+        .import_export_jobs
+        .acquire_execution(JobResourceCost::estimate(JobEstimateInput {
+            protocol: metadata.protocol,
+            input_size_bytes: metadata.limits.disk_mib.saturating_mul(1024 * 1024).max(1),
+            rollback_size_bytes: 0,
+            wipe: false,
+            compressed: true,
+            export: true,
+        }))
+        .await
+        .map_err(scheduler_execution_error)?;
     let storage = backup_storage(&state)?;
     let backup_id = new_backup_id();
     let catalog = if state.config.backups.browsing.enabled {
@@ -396,6 +459,23 @@ async fn backup_instance_admitted(
     let bundle = BackupBundle::create(&backups_root, &instance_id, &backup_id)
         .await
         .map_err(store_error)?;
+    let output_capacity = metadata
+        .limits
+        .disk_mib
+        .saturating_mul(1024 * 1024)
+        .saturating_add(64 * 1024 * 1024)
+        .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    let _output_capacity = match state
+        .import_uploads
+        .reserve_output_capacity(&backups_root, output_capacity)
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            bundle.cleanup().await;
+            return Err(error);
+        }
+    };
     if let Some(catalog) = catalog.as_deref()
         && let Err(error) = bundle.write_catalog(catalog).await
     {
@@ -403,7 +483,7 @@ async fn backup_instance_admitted(
         return Err(store_error(error));
     }
 
-    let result = create_physical_archive(&state, &metadata, &bundle.archive).await;
+    let result = create_physical_archive(&state, &metadata, &bundle.archive, output_capacity).await;
     if let Err(error) = result {
         bundle.cleanup().await;
         return Err(error);
@@ -456,6 +536,7 @@ async fn create_physical_archive(
     state: &AppState,
     metadata: &InstanceMetadata,
     archive: &FsPath,
+    max_output_bytes: u64,
 ) -> Result<(), ApiError> {
     let instance_id = &metadata.instance_id;
     let was_running = metadata.status == InstanceStatus::Running;
@@ -474,9 +555,14 @@ async fn create_physical_archive(
     } else {
         DataArchiveSourcePolicy::Strict
     };
-    let result = create_data_archive_with_policy(paths.data, archive.to_path_buf(), archive_policy)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()));
+    let result = create_data_archive_with_policy_bounded(
+        paths.data,
+        archive.to_path_buf(),
+        archive_policy,
+        max_output_bytes,
+    )
+    .await
+    .map_err(|error| ApiError::Runtime(error.to_string()));
     if let Err(error) = &result {
         tracing::error!(
             event = "audit backup_archive_failed",
@@ -709,7 +795,7 @@ fn admit_backup_operation(
 ) -> Result<ImportExportJobPermit, ApiError> {
     state
         .import_export_jobs
-        .try_admit(instance_id)
+        .try_admit_exclusive(instance_id)
         .map_err(|error| match error {
             JobAdmissionError::GlobalCapacity => ApiError::RateLimited,
             JobAdmissionError::InstanceCapacity => ApiError::Conflict(format!(
@@ -719,6 +805,18 @@ fn admit_backup_operation(
                 ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
             }
         })
+}
+
+fn scheduler_execution_error(error: SchedulerAcquireError) -> ApiError {
+    match error {
+        SchedulerAcquireError::Closed => {
+            ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
+        }
+        SchedulerAcquireError::InsufficientCapacity => ApiError::Conflict(
+            "the estimated backup operation exceeds a fixed dynamic import/export scheduler budget; increase the configured budget or reduce the instance allocation"
+                .to_string(),
+        ),
+    }
 }
 
 fn ensure_operation_can_start(state: &AppState) -> Result<(), ApiError> {

@@ -28,6 +28,33 @@ fn gzip(contents: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
+    let mut bytes = vec![0x6d, 0xe2, 0x99, 0x81];
+    bytes.extend(
+        bson::to_vec(&bson::doc! {
+            "concurrent_collections": 4_i32,
+            "version": "0.1",
+            "server_version": "8.0.0",
+            "tool_version": "100.12.2",
+        })
+        .unwrap(),
+    );
+    for (database, collection) in metadata {
+        bytes.extend(
+            bson::to_vec(&bson::doc! {
+                "db": database,
+                "collection": collection,
+                "metadata": "{}",
+                "size": 0_i32,
+                "type": "collection",
+            })
+            .unwrap(),
+        );
+    }
+    bytes.extend(u32::MAX.to_le_bytes());
+    bytes
+}
+
 #[test]
 fn tar_gzip_uses_the_documented_json_value() {
     assert_eq!(
@@ -354,6 +381,30 @@ async fn archive_depth_and_expansion_limits_fail_before_extraction() {
     assert!(error.to_string().contains("expansion"));
 }
 
+#[tokio::test]
+async fn bounded_failure_retains_the_confirmed_wrapper_format() {
+    let directory = TempDir::new().unwrap();
+    let mut oversized = Vec::new();
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_mode(0o600);
+    header.set_path("dump.sql").unwrap();
+    header.set_size(MAX_INSPECTED_BYTES + 1);
+    header.set_cksum();
+    oversized.extend_from_slice(header.as_bytes());
+    oversized.extend_from_slice(&[0_u8; 1024]);
+    let path = write_temp_file(&directory, "bounded.tar", &oversized);
+
+    let failure = inspect_uploaded_dump_with_format(&path, Protocol::Postgres, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, ApiError::ServiceUnavailable(_)));
+    assert_eq!(
+        failure.detected_archive_format,
+        Some(DumpArchiveFormat::Tar)
+    );
+}
+
 #[test]
 fn bounded_reader_enforces_decompressed_limit_even_when_metadata_lies() {
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -399,20 +450,24 @@ fn prefix_reads_are_not_confused_by_short_underlying_reads() {
 #[tokio::test]
 async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() {
     let directory = TempDir::new().unwrap();
-    let gzip_bytes = gzip(b"opaque native archive metadata");
+    let gzip_bytes = gzip(&mongodb_archive(&[
+        ("tenant", "users"),
+        ("tenant", "orders"),
+    ]));
     let mongo = write_temp_file(&directory, "mongo.archive.gz", &gzip_bytes);
     let mongo_result = inspect_uploaded_dump(&mongo, Protocol::Mongodb, None)
         .await
         .unwrap();
     assert_eq!(mongo_result.selection_kind, DumpSelectionKind::Collections);
     assert!(!mongo_result.selective_supported);
-    assert!(!mongo_result.catalog_complete);
+    assert!(mongo_result.catalog_complete);
+    assert_eq!(mongo_result.namespaces, ["tenant"]);
     assert!(
         mongo_result
             .selective_unavailable_reason
             .as_deref()
             .unwrap()
-            .contains("full import only")
+            .contains("complete selected source database")
     );
 
     let physical_archive = tar(&[("data/dump.rdb", b"opaque")]);
@@ -486,8 +541,14 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
         &directory,
         "two.tar",
         &tar(&[
-            ("one.archive.gz", gzip(b"one").as_slice()),
-            ("two.mongodb.archive.gz", gzip(b"two").as_slice()),
+            (
+                "one.archive.gz",
+                gzip(&mongodb_archive(&[("one", "users")])).as_slice(),
+            ),
+            (
+                "two.mongodb.archive.gz",
+                gzip(&mongodb_archive(&[("two", "users")])).as_slice(),
+            ),
         ]),
     );
     assert!(
@@ -498,7 +559,7 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
             .contains("multiple")
     );
 
-    let valid_gzip = gzip(b"opaque native archive");
+    let valid_gzip = gzip(&mongodb_archive(&[("legacy", "users")]));
     let valid = write_temp_file(
         &directory,
         "valid.tar",
@@ -508,4 +569,148 @@ async fn mongodb_wrappers_require_one_valid_native_gzip_archive() {
         .await
         .unwrap();
     assert_eq!(result.detected_archive_format, DumpArchiveFormat::Tar);
+    assert_eq!(result.namespaces, ["legacy"]);
+}
+
+#[tokio::test]
+async fn mongodb_discovery_represents_one_multiple_and_no_source_databases() {
+    let directory = TempDir::new().unwrap();
+    let cases = [
+        (
+            "one.archive.gz",
+            vec![("tenant", "users"), ("tenant", "orders")],
+            vec!["tenant"],
+        ),
+        (
+            "multiple.archive.gz",
+            vec![
+                ("beta", "events"),
+                ("alpha", "users"),
+                ("admin", "system.users"),
+                ("config", "settings"),
+                ("local", "oplog.rs"),
+            ],
+            vec!["alpha", "beta"],
+        ),
+        (
+            "none.archive.gz",
+            vec![("admin", "system.users"), ("local", "oplog.rs")],
+            vec![],
+        ),
+    ];
+    for (name, metadata, expected) in cases {
+        let path = write_temp_file(
+            &directory,
+            name,
+            &gzip(&mongodb_archive(metadata.as_slice())),
+        );
+        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, None)
+            .await
+            .unwrap();
+        assert_eq!(result.namespaces, expected);
+        assert!(result.catalog_complete);
+        assert!(!result.selective_supported);
+        assert!(result.objects.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn mongodb_rejects_gzip_that_is_not_a_native_archive() {
+    let directory = TempDir::new().unwrap();
+    let path = write_temp_file(
+        &directory,
+        "fake.archive.gz",
+        &gzip(b"not a mongodump archive"),
+    );
+    let error = inspect_uploaded_dump(&path, Protocol::Mongodb, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("native mongodump archive"));
+}
+
+#[tokio::test]
+async fn mongodb_validates_every_gzip_member_and_rejects_trailing_data() {
+    let directory = TempDir::new().unwrap();
+    let archive = mongodb_archive(&[("tenant", "users")]);
+
+    let split = archive.len() / 2;
+    let mut multistream = gzip(&archive[..split]);
+    multistream.extend(gzip(&archive[split..]));
+    let valid = write_temp_file(&directory, "multi.archive.gz", &multistream);
+    let result = inspect_uploaded_dump(&valid, Protocol::Mongodb, None)
+        .await
+        .unwrap();
+    assert_eq!(result.namespaces, ["tenant"]);
+
+    let mut trailing = gzip(&archive);
+    trailing.extend(b"not another gzip member");
+    let invalid = write_temp_file(&directory, "trailing.archive.gz", &trailing);
+    assert!(
+        inspect_uploaded_dump(&invalid, Protocol::Mongodb, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("malformed native gzip archive")
+    );
+
+    let mut truncated = gzip(&archive);
+    truncated.truncate(truncated.len() - 4);
+    let invalid = write_temp_file(&directory, "truncated.archive.gz", &truncated);
+    assert!(
+        inspect_uploaded_dump(&invalid, Protocol::Mongodb, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("malformed")
+    );
+}
+
+#[tokio::test]
+async fn mongodb_tar_gzip_wrapper_validates_its_complete_outer_stream() {
+    let directory = TempDir::new().unwrap();
+    let inner = gzip(&mongodb_archive(&[("tenant", "users")]));
+    let mut outer = gzip(&tar(&[("dump.mongodb.archive.gz", &inner)]));
+    outer.extend(b"trailing outer data");
+    let path = write_temp_file(&directory, "dump.tar.gz", &outer);
+    assert!(
+        inspect_uploaded_dump(&path, Protocol::Mongodb, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn mongodb_zip_tar_gzip_and_bzip2_wrappers_preserve_discovery() {
+    let directory = TempDir::new().unwrap();
+    let native_gzip = gzip(&mongodb_archive(&[("legacy", "users")]));
+    let tar_bytes = tar(&[("nested/dump.mongodb.archive.gz", &native_gzip)]);
+    let inputs = [
+        (
+            "dump.tar.gz",
+            gzip(&tar_bytes),
+            Some("tar.gz"),
+            DumpArchiveFormat::TarGzip,
+        ),
+        (
+            "dump.zip",
+            zip(&[("nested/dump.mongodb.archive.gz", &native_gzip)]),
+            Some("zip"),
+            DumpArchiveFormat::Zip,
+        ),
+        (
+            "dump.archive.gz.bz2",
+            bzip2(&native_gzip),
+            Some("bzip2"),
+            DumpArchiveFormat::Bzip2,
+        ),
+    ];
+    for (name, bytes, requested, expected_format) in inputs {
+        let path = write_temp_file(&directory, name, &bytes);
+        let result = inspect_uploaded_dump(&path, Protocol::Mongodb, requested)
+            .await
+            .unwrap();
+        assert_eq!(result.namespaces, ["legacy"]);
+        assert_eq!(result.detected_archive_format, expected_format);
+        assert!(result.catalog_complete);
+    }
 }

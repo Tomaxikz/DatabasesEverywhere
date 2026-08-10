@@ -107,10 +107,26 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         tracing::warn!(failed_jobs, "marked unfinished import/export jobs failed");
     }
     let job_repository_for_prune = job_repository.clone();
-    let import_export_jobs = ImportExportJobs::with_repository(job_repository);
-    let import_uploads = crate::api::import_export::ImportUploadService::new(
+    let import_export_jobs =
+        ImportExportJobs::with_repository_and_config(job_repository, &config.artifacts);
+    let scheduler_capacity = import_export_jobs.scheduler_snapshot().capacity;
+    tracing::info!(
+        mode = ?scheduler_capacity.mode,
+        max_active_jobs = scheduler_capacity.max_active_jobs,
+        memory_budget_mib = scheduler_capacity.memory_budget_mib,
+        io_budget_mib = scheduler_capacity.io_budget_mib,
+        cpu_units = scheduler_capacity.cpu_units,
+        max_queued_jobs = config.artifacts.import_export_scheduler.max_queued_jobs,
+        max_queued_jobs_per_instance = config
+            .artifacts
+            .import_export_scheduler
+            .max_queued_jobs_per_instance,
+        "import/export scheduler initialized"
+    );
+    let import_uploads = crate::api::import_export::ImportUploadService::new_with_staging_limit(
         ImportUploadRepository::new(pool.clone()),
         config.artifacts.import_upload_max_concurrent,
+        scheduler_capacity.max_active_jobs,
     );
     let manager = InstanceManager::new(store.clone(), repository);
     manager

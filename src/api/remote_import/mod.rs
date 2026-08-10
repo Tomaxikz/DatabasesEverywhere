@@ -4,8 +4,9 @@ pub mod redis_resp;
 pub mod security;
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex as StdMutex},
 };
 
 use http::HeaderValue;
@@ -106,6 +107,8 @@ pub(crate) async fn validate_remote_source(
             "remote database imports are disabled by node policy".to_string(),
         ));
     }
+    validate_secret_size("source.password", request.password.as_ref())?;
+    validate_secret_size("source.api_key", request.api_key.as_ref())?;
 
     let database = normalize_optional("source.database", request.database, 256)?;
     let username = normalize_optional("source.username", request.username, 256)?;
@@ -229,6 +232,15 @@ pub(crate) async fn validate_remote_source(
         database_index: request.database_index.unwrap_or_default(),
         api_key: request.api_key,
     })
+}
+
+fn validate_secret_size(field: &str, value: Option<&SecretString>) -> Result<(), ApiError> {
+    if value.is_some_and(|value| value.expose_secret().len() > MAX_REMOTE_SECRET_BYTES) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} exceeds the {MAX_REMOTE_SECRET_BYTES}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 fn require_present(field: &str, value: Option<&str>) -> Result<(), ApiError> {
@@ -370,6 +382,7 @@ const REMOTE_CREDENTIAL_FILES: &[&str] = &[
     "mongodump.yml",
     "clickhouse-client.xml",
 ];
+const MAX_REMOTE_SECRET_BYTES: usize = 4096;
 const MAX_STALE_REMOTE_IMPORT_ENTRIES: usize = 4096;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -899,6 +912,61 @@ struct RemoteImportLimiter {
     notify: Notify,
 }
 
+#[derive(Debug, Default)]
+struct RemoteJobAdmission {
+    state: Arc<StdMutex<RemoteJobAdmissionState>>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteJobAdmissionState {
+    active: usize,
+    instances: HashSet<String>,
+}
+
+impl RemoteJobAdmission {
+    fn try_acquire(&self, instance_id: &str, maximum: usize) -> Option<RemoteJobAdmissionPermit> {
+        let maximum = maximum.max(1);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active >= maximum || state.instances.contains(instance_id) {
+            return None;
+        }
+        state.active += 1;
+        state.instances.insert(instance_id.to_string());
+        Some(RemoteJobAdmissionPermit {
+            state: Arc::clone(&self.state),
+            instance_id: instance_id.to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteJobAdmissionPermit {
+    state: Arc<StdMutex<RemoteJobAdmissionState>>,
+    instance_id: String,
+}
+
+impl Drop for RemoteJobAdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = state.instances.remove(&self.instance_id);
+        debug_assert!(removed, "remote job admission instance was missing");
+        state.active = state.active.saturating_sub(usize::from(removed));
+    }
+}
+
+pub(crate) fn try_admit_remote_job(
+    instance_id: &str,
+    maximum: usize,
+) -> Option<RemoteJobAdmissionPermit> {
+    REMOTE_JOB_ADMISSION.try_acquire(instance_id, maximum)
+}
+
 impl RemoteImportLimiter {
     async fn acquire(&'static self, max: usize) -> RemoteImportPermit {
         let max = max.max(1);
@@ -939,10 +1007,41 @@ static REMOTE_IMPORT_LIMITER: LazyLock<RemoteImportLimiter> =
         active: Mutex::new(0),
         notify: Notify::new(),
     });
+static REMOTE_JOB_ADMISSION: LazyLock<RemoteJobAdmission> =
+    LazyLock::new(RemoteJobAdmission::default);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_secrets_have_a_small_utf8_byte_limit() {
+        let exact = SecretString::from("x".repeat(MAX_REMOTE_SECRET_BYTES));
+        let oversized = SecretString::from("é".repeat(MAX_REMOTE_SECRET_BYTES / 2 + 1));
+        assert!(validate_secret_size("source.password", Some(&exact)).is_ok());
+        assert!(validate_secret_size("source.api_key", Some(&oversized)).is_err());
+        assert!(validate_secret_size("source.password", None).is_ok());
+    }
+
+    #[test]
+    fn remote_job_admission_is_nonblocking_bounded_and_releases() {
+        let admission = RemoteJobAdmission::default();
+        let first = admission.try_acquire("instance-a", 4).unwrap();
+        assert!(admission.try_acquire("instance-a", 4).is_none());
+        let second = admission.try_acquire("instance-b", 4).unwrap();
+        let third = admission.try_acquire("instance-c", 4).unwrap();
+        let fourth = admission.try_acquire("instance-d", 4).unwrap();
+        assert!(admission.try_acquire("instance-e", 4).is_none());
+        drop(first);
+        let replacement = admission.try_acquire("instance-e", 4).unwrap();
+        drop((second, third, fourth, replacement));
+        let state = admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.active, 0);
+        assert!(state.instances.is_empty());
+    }
 
     #[test]
     fn mongodb_authentication_database_requires_complete_credentials() {

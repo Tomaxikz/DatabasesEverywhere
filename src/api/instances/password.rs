@@ -101,7 +101,7 @@ pub async fn reset_instance_password(
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     let permit = state
         .import_export_jobs
-        .try_admit(&instance_id)
+        .try_admit_exclusive(&instance_id)
         .map_err(|error| match error {
             crate::jobs::import_export::JobAdmissionError::GlobalCapacity => {
                 ApiError::ServiceUnavailable(
@@ -165,6 +165,30 @@ async fn reset_instance_password_inner(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
+    let _execution = state
+        .import_export_jobs
+        .acquire_execution(crate::jobs::import_export::JobResourceCost::estimate(
+            crate::jobs::import_export::JobEstimateInput {
+                protocol: metadata.protocol,
+                input_size_bytes: 1,
+                rollback_size_bytes: 0,
+                wipe: false,
+                compressed: false,
+                export: false,
+            },
+        ))
+        .await
+        .map_err(|error| match error {
+            crate::jobs::import_export::SchedulerAcquireError::Closed => {
+                ApiError::ServiceUnavailable("daemon shutdown has started".to_string())
+            }
+            crate::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
+                ApiError::Conflict(
+                    "password maintenance exceeds a fixed dynamic import/export scheduler budget"
+                        .to_string(),
+                )
+            }
+        })?;
     validate_password(metadata.protocol, &new_password)?;
     require_resettable_instance(&state, &metadata).await?;
     ensure_qdrant_route_is_available(&state, &metadata, &new_password).await?;

@@ -350,6 +350,17 @@ artifacts:
   import_upload_ttl_hours: 24
   import_upload_timeout_seconds: 3600
   import_upload_idle_timeout_seconds: 30
+  import_export_scheduler:
+    dynamic_limiter_enabled: true
+    max_queued_jobs: 1024
+    max_queued_jobs_per_instance: 32
+    manual_max_active_jobs: 16
+    dynamic_max_active_jobs: 256
+    dynamic_memory_budget_mib: 0
+    dynamic_io_budget_mib: 0
+    dynamic_cpu_units: 0
+    starvation_timeout_seconds: 30
+    max_bypass: 8
 ```
 
 The node reserves the declared `Content-Length` before accepting the body and
@@ -357,6 +368,45 @@ also checks free disk space. The total timeout bounds the complete transfer;
 the idle timeout rejects a stalled request without imposing the ordinary API
 body limit on dump uploads. Expired uploads are removed by the background
 sweeper.
+
+Import/export execution uses a separate weighted scheduler. In dynamic mode,
+DBEV estimates each job from its protocol, immutable input size, compression,
+wipe/rollback work, and target disk allocation. Memory is a hard safety budget;
+CPU and I/O are concurrency weights. A memory-safe job whose CPU or I/O weight
+exceeds the whole budget may run only by itself, reserving the full weight so a
+second job cannot overlap it. Small plain dumps can therefore run at higher
+concurrency, while compressed, physical, or wipe imports are charged
+conservatively. Jobs waiting in the durable queue do
+not hold active-execution or staging-disk reservations, and mutations of the
+same instance remain serialized.
+
+Set a dynamic budget to `0` to derive it automatically. Memory uses a
+conservative share of the effective host-or-cgroup available memory, CPU uses
+the effective host-or-cgroup quota as its concurrency weight, and I/O covers
+the configured upload capacity plus one maximum physical restore. Auto-detected CPU and memory headroom are refreshed
+while the daemon runs; explicit nonzero budgets remain fixed. If the live
+memory budget cannot safely fit one modelled job, the
+recommendation endpoint returns `recommended_active_jobs: 0`; clients must not
+clamp that safety result to one. A job that exceeds an explicit dynamic memory
+budget is rejected immediately. CPU/I/O-only oversize runs exclusively. A job waiting for auto-detected memory
+headroom is rejected if it still cannot fit after
+`starvation_timeout_seconds`. The same timeout and `max_bypass` bound how long smaller fitting jobs
+may pass an older job that can otherwise run.
+
+To use a fixed active-job ceiling instead, set
+`dynamic_limiter_enabled: false` and configure `manual_max_active_jobs`.
+Manual mode still retains per-instance serialization, queue bounds, upload
+validation, extraction limits, and free-space reservations; it disables only
+weighted active-work admission. A configuration change takes effect after a
+daemon restart.
+
+Scheduler validation ranges are: `max_queued_jobs` 64-8,192;
+`max_queued_jobs_per_instance` 1-256 and no greater than the global queue;
+manual/dynamic active ceilings 1-1,024 and no greater than the global queue;
+memory budget `0` or 128-16,777,216 MiB; I/O budget `0` or
+256-67,108,864 MiB; CPU units 0-65,536; starvation timeout 1-3,600 seconds;
+and bypass count 0-1,024. Replayable queued options are capped at 64 KiB, so a
+large durable queue cannot retain unbounded selection payloads in memory.
 
 Automatic backups:
 
@@ -505,8 +555,10 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.11.0` adds instance-scoped temporary dump uploads, lazy
-bounded catalog inspection, upload lifecycle endpoints, and the `upload` import
+version. Contract `0.12.0` adds MongoDB upload source-database discovery and a
+live import/export scheduler recommendation endpoint. Contract `0.11.0` adds
+instance-scoped temporary dump uploads, lazy bounded catalog inspection,
+upload lifecycle endpoints, and the `upload` import
 source. Contract `0.8.0` adds Valkey as a first-class protocol with an isolated
 RESP gateway, lifecycle, imports, exports, backups, and capability reporting.
 Contract `0.7.0` adds pluggable local/S3/Kopia backup storage, storage
@@ -870,11 +922,18 @@ is globally concurrency-limited. A `429` means retry later; a bounded timeout or
 catalog resource ceiling returns `503` while leaving the upload ready for a
 normal full import.
 
+For MongoDB native archives, inspection also reads the bounded, published
+archive prelude and returns source database candidates in `catalog.namespaces`.
+It does not execute the archive or connect it to a database. When the catalog is
+complete and non-empty, the panel should auto-fill a single candidate, offer an
+explicit choice for multiple candidates, and reject a manually entered name
+that is not listed. If discovery is empty or incomplete, keep the validated manual
+`source_database` field available instead of guessing.
+
 Queue the ready upload by ID. The archive wrapper is persisted by DBEV and
-cannot be overridden by the client. MongoDB uploads also require the original
-archive database name as `source_database`; DBEV selects only that namespace
-and remaps it to the target database. The field is rejected for other
-protocols:
+cannot be overridden by the client. MongoDB uploads use the original archive
+database name as `source_database`; DBEV selects only that namespace and remaps
+it to the target database. The field is rejected for other protocols:
 
 ```json
 {
@@ -900,8 +959,11 @@ MongoDB example:
 ```
 
 `source_database` is 1–63 UTF-8 bytes and follows MongoDB database-name
-restrictions. Omitting it for MongoDB returns `409` before DBEV queues a job or
-claims the upload.
+restrictions. If an inspected, complete catalog contains exactly one source
+database, DBEV safely infers it when this field is omitted. Multiple candidates
+require an explicit choice. An empty, incomplete, or unavailable catalog
+requires a manual value. A provided value that contradicts a complete,
+non-empty catalog returns `409` before DBEV queues a job or claims the upload.
 
 The upload stays available while the panel modal is open. Closing or cancelling
 the modal should call `DELETE`; merely navigating away does not count as a
@@ -938,6 +1000,23 @@ Exports and imports are async. You queue a job, then watch it via polling or the
 Queueing, safe retry, and recovery-restore endpoints return `202 Accepted` with a
 `Location` header pointing at the instance-scoped job status endpoint.
 
+`GET /api/system/import-export-scheduler/recommendation` (scope
+`system:read`) returns live active/waiting counts, configured resource budgets,
+the modelled cost of a representative job, and a recommended active
+concurrency. Query parameters are `protocol`, `action`, `size_bytes`,
+`target_disk_mib`, `mode`, and `compressed`. `protocol` defaults to `postgres`,
+`target_disk_mib` defaults to `size_bytes` rounded up to MiB, and
+`action=export&mode=wipe` is rejected. MongoDB, Redis, Valkey, and Qdrant use
+native compression and are modelled as compressed even when `compressed=false`.
+Treat the result as a conservative planning model, not a measured throughput
+guarantee. `recommended_active_jobs` may validly be `0` when current memory
+capacity cannot safely fit one modelled job; display that as
+blocked/unsafe and do not coerce it to `1`. Compressed logical imports
+are charged at the configured prepared-data ceiling because their expansion
+ratio is untrusted before bounded extraction. Redis, Valkey, and Qdrant
+physical imports are instead charged at the target disk allocation, bounded by
+the physical archive limit.
+
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
 | POST | `/api/instances/{id}/export` | import-export:write | Queue an export |
@@ -945,7 +1024,9 @@ Queueing, safe retry, and recovery-restore endpoints return `202 Accepted` with 
 | GET | `/api/instances/{id}/import-export/jobs` | import-export:read | List that instance's jobs (`?status=&limit=`) |
 | GET | `/api/instances/{id}/import-export/jobs/{job_id}` | import-export:read | One job, after ownership verification |
 
-Export body (all optional — empty body means a full plain dump):
+Export body (all optional): clients sending `Content-Type: application/json`
+must serialize at least `{}`; a truly bodyless request is accepted only without
+a JSON content type. Either form requests a full plain dump:
 
 ```json
 {
@@ -954,8 +1035,10 @@ Export body (all optional — empty body means a full plain dump):
 }
 ```
 
-`archive_format` is `plain`, `gzip`, or `bzip2`. Omit it for Redis, Valkey, and Qdrant,
-whose exports are already physical archives.
+`archive_format` is `plain`, `gzip`, or `bzip2`. Omit it for Redis, Valkey, and
+Qdrant, whose exports are already physical archives. MongoDB's `plain` choice
+already produces its native `.mongodb.archive.gz`; an explicit `gzip` choice is
+normalized to `plain` rather than wrapping the native gzip stream a second time.
 
 Export/import formats:
 
@@ -964,7 +1047,7 @@ Export/import formats:
 | PostgreSQL | `.postgres.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | MariaDB | `.mariadb.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | MySQL | `.mysql.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
-| MongoDB | `.mongodb.archive.gz` archive dump | Native gzip archive, or bzip2/tar/tar.gz/zip wrapper containing exactly one valid `.archive.gz` dump; upload imports require the original `source_database` for safe namespace remapping |
+| MongoDB | `.mongodb.archive.gz` archive dump | Native gzip archive, or bzip2/tar/tar.gz/zip wrapper containing exactly one valid `.archive.gz` dump; upload imports use an auto-discovered or explicit original `source_database` for safe namespace remapping |
 | ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
 | Valkey | `.valkey.tar.gz` physical archive | Full physical archive only |
@@ -1031,8 +1114,12 @@ and dollar sign; an authentication database may instead be exactly
 `username` and `password`. A ClickHouse source database name must be at most
 128 bytes and contain only ASCII letters, digits, underscores, or dashes. SQL
 passwords also cannot contain NUL, CR, or LF. MySQL and MariaDB source database
-names are limited to 64 characters. A Qdrant `api_key` must be a valid HTTP
-header value; invalid values are rejected without echoing the secret.
+names are limited to 64 characters. Remote passwords and Qdrant API keys are
+limited to 4,096 UTF-8 bytes so queued work cannot retain unbounded secrets. A
+Qdrant `api_key` must also be a valid HTTP header value; invalid values are
+rejected without echoing the secret. At most one credential-bearing remote job
+is admitted per instance, and the node-wide admission/execution ceiling is
+`security.remote_import.max_concurrent_jobs`.
 
 MySQL and MariaDB logical imports structurally rebase qualified references from
 the source database to the managed target database without changing quoted
@@ -1375,7 +1462,13 @@ Physical restores keep the previous data in a private sibling workspace until th
 
 If creation cleanup was interrupted, a normal retry fails closed rather than reusing orphaned files with new credentials. After preserving any required data, retry the create request with `"purge_stale_resources": true` to explicitly and irreversibly remove that instance ID's orphaned container and paths before creation.
 
-Import/export admission is bounded to 64 jobs node-wide and two running-or-queued jobs per instance. The in-memory status cache retains at most 2,048 completed jobs, and SQLite retains the latest 10,000 completed records; queued/running records are never pruned.
+Import/export admission is bounded by
+`artifacts.import_export_scheduler.max_queued_jobs` node-wide (1,024 by
+default) and
+`max_queued_jobs_per_instance` per instance. Active execution is separately
+bounded by the weighted dynamic scheduler or `manual_max_active_jobs`. The
+in-memory status cache retains at most 2,048 completed jobs, and SQLite retains
+the latest 10,000 completed records; queued/running records are never pruned.
 
 ## Benchmarking a running node
 
@@ -1449,6 +1542,20 @@ a disposable performance instance with representative data. After a successful
 re-import the benchmark deletes only the export artifact it created. Add
 `--bench-keep-artifact` to retain it. Failed imports retain it for diagnosis.
 
+Add `--bench-recommend-manual-active-jobs` to that destructive, single-instance
+run to request two report-only estimates from the daemon's live scheduler: a
+worst-case compressed wipe at the configured upload maximum and the freshly
+exported representative artifact. The report labels the method
+`model_based_single_job_v1`, shows the separate memory/I/O/CPU ceilings, and
+never writes configuration. It verifies that the benchmark config UUID and
+token ID match the target daemon before making a recommendation. This is a
+conservative single-job model, not an empirical concurrent saturation test;
+dynamic mode remains preferable for mixed dump sizes. A reported recommendation
+of `0` is preserved as a blocked-headroom signal and is not a valid value for
+`manual_max_active_jobs`; do not apply it as a configuration change. A zero
+raw CPU or I/O ratio may still produce a recommendation of one because those
+weights permit exactly one isolated, memory-safe operation.
+
 When instances are selected, the benchmark samples their containers directly
 through the configured Docker or Podman socket. Multiple containers are
 sampled round-robin, one per interval, to keep the stats observer from
@@ -1473,6 +1580,7 @@ Useful controls:
 | `--bench-concurrency` | `DBEV_BENCH_CONCURRENCY` | `32` |
 | `--bench-websockets` | `DBEV_BENCH_WEBSOCKETS` | `10` |
 | `--bench-import-export` | `DBEV_BENCH_IMPORT_EXPORT` | Disabled |
+| `--bench-recommend-manual-active-jobs` | `DBEV_BENCH_RECOMMEND_MANUAL_ACTIVE_JOBS` | Disabled; requires `--bench-instance` and `--bench-import-export` |
 | `--bench-keep-artifact` | `DBEV_BENCH_KEEP_ARTIFACT` | Disabled |
 | `--bench-timeout-seconds` | `DBEV_BENCH_TIMEOUT_SECONDS` | `900` |
 | `--bench-sample-interval-ms` | `DBEV_BENCH_SAMPLE_INTERVAL_MS` | `250` |

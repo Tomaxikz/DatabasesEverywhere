@@ -59,7 +59,13 @@ fn bounded_physical_extraction_accepts_exact_limit() {
     let target = dir.path().join("target");
     write_archive(&archive_path, "data/file.txt", b"12345678");
 
-    extract_data_archive_bounded_blocking(&archive_path, &target, "data", 8).unwrap();
+    extract_data_archive_bounded_blocking(
+        &archive_path,
+        &target,
+        "data",
+        DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES + 8,
+    )
+    .unwrap();
 
     assert_eq!(
         std::fs::read(target.join("data/file.txt")).unwrap(),
@@ -74,10 +80,15 @@ fn bounded_physical_extraction_rejects_before_oversized_file_is_written() {
     let target = dir.path().join("target");
     write_archive(&archive_path, "data/file.txt", b"12345678");
 
+    let limit = DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES + 7;
     let error =
-        extract_data_archive_bounded_blocking(&archive_path, &target, "data", 7).unwrap_err();
+        extract_data_archive_bounded_blocking(&archive_path, &target, "data", limit).unwrap_err();
 
-    assert!(error.to_string().contains("expands beyond 7 bytes"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("expands beyond {limit} bytes"))
+    );
     assert!(!target.join("data/file.txt").exists());
 }
 
@@ -284,7 +295,13 @@ fn physical_backup_reader_enforces_deadline_inside_file_copy() {
 
 #[test]
 fn import_export_admission_bounds_global_and_per_instance_waiters() {
-    let jobs = ImportExportJobs::default();
+    const MAX_ADMITTED_JOBS: usize = 64;
+    let mut artifacts = crate::config::ArtifactConfig::default();
+    artifacts.import_export_scheduler.max_queued_jobs = MAX_ADMITTED_JOBS;
+    artifacts
+        .import_export_scheduler
+        .max_queued_jobs_per_instance = 2;
+    let jobs = ImportExportJobs::new(None, &artifacts);
     let first = jobs.try_admit("inst-one").unwrap();
     let second = jobs.try_admit("inst-one").unwrap();
     assert_eq!(
@@ -305,6 +322,34 @@ fn import_export_admission_bounds_global_and_per_instance_waiters() {
     assert!(jobs.try_admit("inst-one").is_ok());
     drop(second);
     drop(other_permits);
+}
+
+#[test]
+fn exclusive_maintenance_admission_never_queues_behind_instance_jobs() {
+    let mut artifacts = crate::config::ArtifactConfig::default();
+    artifacts
+        .import_export_scheduler
+        .max_queued_jobs_per_instance = 64;
+    let jobs = ImportExportJobs::new(None, &artifacts);
+
+    let queued_import = jobs.try_admit("inst-one").unwrap();
+    assert_eq!(
+        jobs.try_admit_exclusive("inst-one").unwrap_err(),
+        JobAdmissionError::InstanceCapacity
+    );
+    drop(queued_import);
+
+    let maintenance = jobs.try_admit_exclusive("inst-one").unwrap();
+    assert_eq!(
+        jobs.try_admit_exclusive("inst-one").unwrap_err(),
+        JobAdmissionError::InstanceCapacity
+    );
+    assert_eq!(
+        jobs.try_admit("inst-one").unwrap_err(),
+        JobAdmissionError::InstanceCapacity
+    );
+    drop(maintenance);
+    assert!(jobs.try_admit("inst-one").is_ok());
 }
 
 #[tokio::test]

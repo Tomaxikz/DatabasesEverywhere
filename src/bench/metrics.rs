@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use hdrhistogram::Histogram;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkOptionsReport {
@@ -18,6 +18,7 @@ pub struct BenchmarkOptionsReport {
     pub timeout_seconds: u64,
     pub sample_interval_ms: u64,
     pub import_export_enabled: bool,
+    pub recommend_manual_active_jobs: bool,
     pub keep_artifact: bool,
 }
 
@@ -285,6 +286,54 @@ pub struct JobBenchmarkReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ManualActiveJobsRecommendationReport {
+    pub method: String,
+    pub status: String,
+    pub unavailable_reason: Option<String>,
+    pub identity_verified: bool,
+    pub configured_node_uuid: String,
+    pub server_node_uuid: Option<String>,
+    pub scheduler_capacity: Option<SchedulerCapacityReport>,
+    pub max_queued_jobs: Option<usize>,
+    pub max_queued_jobs_per_instance: Option<usize>,
+    pub configured_max_upload_worst_case: Option<ManualActiveJobsWorkloadReport>,
+    pub representative_exported_dump: Option<ManualActiveJobsWorkloadReport>,
+    pub representative_unavailable_reason: Option<String>,
+    pub caveats: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SchedulerCapacityReport {
+    pub mode: String,
+    pub max_active_jobs: usize,
+    pub memory_budget_mib: u64,
+    pub io_budget_mib: u64,
+    pub cpu_units: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SchedulerJobCostReport {
+    pub input_size_bytes: u64,
+    pub memory_mib: u64,
+    pub io_mib: u64,
+    pub cpu_units: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ManualActiveJobsWorkloadReport {
+    pub workload: String,
+    pub protocol: String,
+    pub mode: String,
+    pub compressed: bool,
+    pub estimate: SchedulerJobCostReport,
+    pub memory_ceiling_jobs: usize,
+    pub io_ceiling_jobs: usize,
+    pub cpu_ceiling_jobs: usize,
+    pub configured_active_ceiling_jobs: usize,
+    pub recommended_manual_max_active_jobs: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ResourceSample {
     pub elapsed_ms: u64,
     pub phase: String,
@@ -415,6 +464,7 @@ pub struct BenchmarkReport {
     pub http_phases: Vec<HttpPhaseReport>,
     pub websocket: Option<WebSocketBenchmarkReport>,
     pub jobs: Vec<JobBenchmarkReport>,
+    pub manual_active_jobs_recommendation: Option<ManualActiveJobsRecommendationReport>,
     pub resources: Option<ResourceSummary>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,

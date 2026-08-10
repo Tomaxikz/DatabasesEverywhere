@@ -165,8 +165,7 @@ pub(super) async fn extract_zip_archive(
                     .ok_or_else(|| format!("zip entry {} has unsafe path", file.name()))?
                     .to_path_buf();
                 validate_relative_archive_path(&enclosed)?;
-                total = total
-                    .checked_add(file.size())
+                total = logical_archive_accounted_bytes(total, file.size())
                     .ok_or("archive uncompressed size overflow")?;
                 if total > max_unarchived_bytes {
                     return Err(
@@ -215,8 +214,7 @@ pub(super) fn unpack_tar_safely<R: Read>(
         let path = entry.path()?.to_path_buf();
         validate_relative_archive_path(&path)?;
         let size = entry.header().size()?;
-        total = total
-            .checked_add(size)
+        total = logical_archive_accounted_bytes(total, size)
             .ok_or("archive uncompressed size overflow")?;
         if total > max_unarchived_bytes {
             return Err(format!("archive expands beyond {max_unarchived_bytes} bytes").into());
@@ -233,6 +231,12 @@ pub(super) fn unpack_tar_safely<R: Read>(
         copy_limited_until(&mut entry, &mut output, size, deadline)?;
     }
     Ok(())
+}
+
+pub(super) fn logical_archive_accounted_bytes(current: u64, entry_size: u64) -> Option<u64> {
+    current
+        .checked_add(entry_size)?
+        .checked_add(ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES)
 }
 
 pub(super) fn validate_relative_archive_path(

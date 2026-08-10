@@ -42,6 +42,7 @@ pub(super) fn upload_logical_staging_budget(
     state: &AppState,
     metadata: &InstanceMetadata,
     mode: ImportMode,
+    prepared_bytes: u64,
 ) -> Result<Option<UploadLogicalStagingBudget>, ApiError> {
     if matches!(
         metadata.protocol,
@@ -49,10 +50,9 @@ pub(super) fn upload_logical_staging_budget(
     ) {
         return Ok(None);
     }
-    let prepared_bytes = state
-        .config
-        .artifacts
-        .import_upload_max_bytes
+    let prepared_bytes = prepared_bytes
+        .max(1)
+        .min(state.config.artifacts.import_upload_max_bytes)
         .min(MAX_UNARCHIVED_BYTES);
     let instance_disk_bytes = metadata
         .limits
@@ -60,7 +60,7 @@ pub(super) fn upload_logical_staging_budget(
         .checked_mul(1024 * 1024)
         .ok_or_else(|| ApiError::Runtime("instance disk limit overflowed".to_string()))?;
     let rollback_bytes = if mode == ImportMode::Wipe {
-        prepared_bytes.min(instance_disk_bytes)
+        MAX_UNARCHIVED_BYTES.min(instance_disk_bytes)
     } else {
         0
     };
@@ -333,12 +333,19 @@ pub(super) async fn import_instance_artifact(
     let protocol = metadata.protocol;
     match protocol {
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
+            let max_extracted_bytes = physical_staging_bytes_for(
+                protocol,
+                metadata.limits.disk_mib,
+            )?
+            .ok_or_else(|| {
+                ApiError::Runtime("physical import extraction budget was unavailable".to_string())
+            })?;
             import_physical_archive(
                 state,
                 instance_id,
                 protocol,
                 artifact_path,
-                crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+                max_extracted_bytes,
             )
             .await
         }

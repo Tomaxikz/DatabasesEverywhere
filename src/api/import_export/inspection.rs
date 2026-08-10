@@ -13,8 +13,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{api::api_response::ApiError, shared::protocol::Protocol};
 
+mod mongodb;
 mod sql;
 
+use mongodb::{MongoArchiveCatalog, inspect_native_gzip};
 use sql::inspect_sql_reader;
 
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -116,84 +118,119 @@ pub(crate) struct DumpInspection {
 }
 
 /// Inspects an immutable uploaded dump without executing it or exposing its contents.
+#[cfg(test)]
 pub(crate) async fn inspect_uploaded_dump(
     path: &Path,
     protocol: Protocol,
     archive_format: Option<&str>,
 ) -> Result<DumpInspection, ApiError> {
+    inspect_uploaded_dump_with_format(path, protocol, archive_format)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+pub(crate) struct DumpInspectionFailure {
+    pub(crate) error: ApiError,
+    pub(crate) detected_archive_format: Option<DumpArchiveFormat>,
+}
+
+pub(crate) async fn inspect_uploaded_dump_with_format(
+    path: &Path,
+    protocol: Protocol,
+    archive_format: Option<&str>,
+) -> Result<DumpInspection, DumpInspectionFailure> {
     let path = path.to_path_buf();
     let requested_format = archive_format.map(str::to_owned);
-    tokio::task::spawn_blocking(move || {
+    let attempt = tokio::task::spawn_blocking(move || {
         inspect_uploaded_dump_blocking(&path, protocol, requested_format.as_deref())
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("dump inspection worker failed: {error}")))?
-    .map_err(InspectionError::into_api_error)
+    .map_err(|error| DumpInspectionFailure {
+        error: ApiError::Runtime(format!("dump inspection worker failed: {error}")),
+        detected_archive_format: None,
+    })?;
+    attempt.result.map_err(|error| DumpInspectionFailure {
+        error: error.into_api_error(),
+        detected_archive_format: attempt.detected_archive_format,
+    })
+}
+
+struct BlockingInspectionAttempt {
+    result: Result<DumpInspection, InspectionError>,
+    detected_archive_format: Option<DumpArchiveFormat>,
 }
 
 fn inspect_uploaded_dump_blocking(
     path: &Path,
     protocol: Protocol,
     requested_format: Option<&str>,
-) -> Result<DumpInspection, InspectionError> {
-    let deadline = Instant::now() + INSPECTION_TIMEOUT;
-    let mut source = open_regular_no_follow(path)?;
-    let source_size = source.metadata()?.len();
-    if source_size > MAX_SOURCE_BYTES {
-        return Err(InspectionError::Limit(
-            "uploaded dump exceeds the size limit",
-        ));
-    }
-
-    let sha256 = sha256_reader(&mut source, deadline)?;
-    source.seek(SeekFrom::Start(0))?;
-    let detected = detect_archive_format(&mut source, deadline)?;
-    source.seek(SeekFrom::Start(0))?;
-    let format = match requested_format {
-        Some(value) => {
-            let requested = DumpArchiveFormat::parse(value)?;
-            if requested != detected {
-                return Err(InspectionError::Invalid(
-                    "archive format does not match the uploaded file",
-                ));
-            }
-            requested
+) -> BlockingInspectionAttempt {
+    let mut detected_archive_format = None;
+    let result = (|| {
+        let deadline = Instant::now() + INSPECTION_TIMEOUT;
+        let mut source = open_regular_no_follow(path)?;
+        let source_size = source.metadata()?.len();
+        if source_size > MAX_SOURCE_BYTES {
+            return Err(InspectionError::Limit(
+                "uploaded dump exceeds the size limit",
+            ));
         }
-        None => detected,
-    };
 
-    if matches!(
-        protocol,
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-    ) {
-        validate_physical_wrapper(&mut source, format, deadline)?;
-        return Ok(full_only_inspection(protocol, sha256, source_size, format));
-    }
+        let sha256 = sha256_reader(&mut source, deadline)?;
+        source.seek(SeekFrom::Start(0))?;
+        let detected = detect_archive_format(&mut source, deadline)?;
+        detected_archive_format = Some(detected);
+        source.seek(SeekFrom::Start(0))?;
+        let format = match requested_format {
+            Some(value) => {
+                let requested = DumpArchiveFormat::parse(value)?;
+                if requested != detected {
+                    return Err(InspectionError::Invalid(
+                        "archive format does not match the uploaded file",
+                    ));
+                }
+                requested
+            }
+            None => detected,
+        };
 
-    if protocol == Protocol::Mongodb {
-        validate_mongodb_wrapper(&mut source, format, deadline)?;
-        return Ok(DumpInspection {
+        if matches!(
             protocol,
-            sha256,
-            source_size_bytes: source_size,
-            detected_archive_format: format,
-            selection_kind: DumpSelectionKind::Collections,
-            selective_supported: false,
-            catalog_complete: false,
-            namespaces: Vec::new(),
-            objects: Vec::new(),
-            unselectable_object_count: 0,
-            selective_unavailable_reason: Some(
-                "MongoDB native archives do not expose a stable bounded collection index; upload inspection supports full import only"
-                    .to_string(),
-            ),
-        });
-    }
+            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+        ) {
+            validate_physical_wrapper(&mut source, format, deadline)?;
+            return Ok(full_only_inspection(protocol, sha256, source_size, format));
+        }
 
-    let mut catalog = CatalogBuilder::new(protocol);
-    inspect_sql_source(&mut source, format, protocol, deadline, &mut catalog)?;
-    catalog.validate_dialect()?;
-    Ok(catalog.finish(sha256, source_size, format))
+        if protocol == Protocol::Mongodb {
+            let catalog = inspect_mongodb_wrapper(&mut source, format, deadline)?;
+            return Ok(DumpInspection {
+                protocol,
+                sha256,
+                source_size_bytes: source_size,
+                detected_archive_format: format,
+                selection_kind: DumpSelectionKind::Collections,
+                selective_supported: false,
+                catalog_complete: catalog.complete,
+                namespaces: catalog.databases,
+                objects: Vec::new(),
+                unselectable_object_count: 0,
+                selective_unavailable_reason: Some(
+                    "MongoDB upload inspection detects source databases, but collection-level selective import is not safely supported yet; import the complete selected source database"
+                        .to_string(),
+                ),
+            });
+        }
+
+        let mut catalog = CatalogBuilder::new(protocol);
+        inspect_sql_source(&mut source, format, protocol, deadline, &mut catalog)?;
+        catalog.validate_dialect()?;
+        Ok(catalog.finish(sha256, source_size, format))
+    })();
+    BlockingInspectionAttempt {
+        result,
+        detected_archive_format,
+    }
 }
 
 fn full_only_inspection(
@@ -631,83 +668,70 @@ fn validate_physical_wrapper(
     deadline: Instant,
 ) -> Result<(), InspectionError> {
     match format {
-        DumpArchiveFormat::TarGzip => validate_tar_container(source, true, deadline, false),
+        DumpArchiveFormat::TarGzip => validate_tar_container(source, true, deadline),
         _ => Err(InspectionError::Invalid(
             "physical database uploads must be gzip-compressed tar archives",
         )),
     }
 }
 
-fn validate_mongodb_wrapper(
+fn inspect_mongodb_wrapper(
     source: &mut File,
     format: DumpArchiveFormat,
     deadline: Instant,
-) -> Result<(), InspectionError> {
+) -> Result<MongoArchiveCatalog, InspectionError> {
     match format {
-        DumpArchiveFormat::Gzip => validate_gzip_stream(source, deadline),
-        DumpArchiveFormat::Tar => validate_tar_container(source, false, deadline, true),
-        DumpArchiveFormat::TarGzip => validate_tar_container(source, true, deadline, true),
-        DumpArchiveFormat::Zip => validate_zip_container(source, deadline, true),
-        DumpArchiveFormat::Bzip2 => validate_bzip2_wrapped_mongodb(source, deadline),
+        DumpArchiveFormat::Gzip => {
+            source.seek(SeekFrom::Start(0))?;
+            inspect_native_gzip(source, deadline)
+        }
+        DumpArchiveFormat::Tar => inspect_mongodb_tar_container(source, false, deadline),
+        DumpArchiveFormat::TarGzip => inspect_mongodb_tar_container(source, true, deadline),
+        DumpArchiveFormat::Zip => inspect_mongodb_zip_container(source, deadline),
+        DumpArchiveFormat::Bzip2 => inspect_bzip2_wrapped_mongodb(source, deadline),
         DumpArchiveFormat::Plain => Err(InspectionError::Invalid(
             "MongoDB uploads must be native gzip archives or wrappers containing exactly one .archive.gz file",
         )),
     }
 }
 
-fn validate_gzip_stream(source: &mut File, deadline: Instant) -> Result<(), InspectionError> {
-    source.seek(SeekFrom::Start(0))?;
-    let decoder = flate2::read::GzDecoder::new(source);
-    let mut bounded = BoundedReader::new(decoder, MAX_INSPECTED_BYTES, deadline);
-    io::copy(&mut bounded, &mut io::sink())
-        .map_err(|_| InspectionError::Invalid("uploaded gzip stream is malformed"))?;
-    Ok(())
-}
-
-fn validate_bzip2_wrapped_mongodb(
+fn inspect_bzip2_wrapped_mongodb(
     source: &mut File,
     deadline: Instant,
-) -> Result<(), InspectionError> {
+) -> Result<MongoArchiveCatalog, InspectionError> {
     source.seek(SeekFrom::Start(0))?;
-    let bzip2 = bzip2::read::BzDecoder::new(source);
-    let decoder = flate2::read::GzDecoder::new(bzip2);
-    let mut bounded = BoundedReader::new(decoder, MAX_INSPECTED_BYTES, deadline);
-    io::copy(&mut bounded, &mut io::sink()).map_err(|_| {
-        InspectionError::Invalid(
+    let bzip2 = bzip2::read::MultiBzDecoder::new(source);
+    let bounded = BoundedReader::new(bzip2, MAX_INSPECTED_BYTES, deadline);
+    inspect_native_gzip(bounded, deadline).map_err(|error| match error {
+        InspectionError::Limit(_) => error,
+        _ => InspectionError::Invalid(
             "MongoDB bzip2 wrapper does not contain a valid native gzip archive",
-        )
-    })?;
-    Ok(())
+        ),
+    })
 }
 
-fn validate_tar_container(
+fn inspect_mongodb_tar_container(
     source: &mut File,
     gzipped: bool,
     deadline: Instant,
-    require_mongodb_archive: bool,
-) -> Result<(), InspectionError> {
+) -> Result<MongoArchiveCatalog, InspectionError> {
     source.seek(SeekFrom::Start(0))?;
     if gzipped {
-        validate_tar_entries(
-            flate2::read::GzDecoder::new(source),
-            deadline,
-            require_mongodb_archive,
-        )
+        inspect_mongodb_tar_entries(flate2::read::MultiGzDecoder::new(source), deadline)
     } else {
-        validate_tar_entries(source, deadline, require_mongodb_archive)
+        inspect_mongodb_tar_entries(source, deadline)
     }
 }
 
-fn validate_tar_entries<R: Read>(
+fn inspect_mongodb_tar_entries<R: Read>(
     reader: R,
     deadline: Instant,
-    require_mongodb_archive: bool,
-) -> Result<(), InspectionError> {
+) -> Result<MongoArchiveCatalog, InspectionError> {
     let bounded = BoundedReader::new(reader, MAX_INSPECTED_BYTES, deadline);
     let mut archive = tar::Archive::new(bounded);
     let mut count = 0_usize;
     let mut total = 0_u64;
-    let mut mongodb_candidates = 0_usize;
+    let mut catalog = None;
     let entries = archive
         .entries()
         .map_err(|_| InspectionError::Invalid("uploaded tar archive is malformed"))?;
@@ -729,11 +753,7 @@ fn validate_tar_entries<R: Read>(
             .path()
             .map_err(|_| InspectionError::Invalid("archive contains an invalid entry path"))?;
         validate_archive_path(&path)?;
-        let mongodb_candidate =
-            require_mongodb_archive && kind.is_file() && is_mongodb_archive_candidate(&path)?;
-        if mongodb_candidate {
-            mongodb_candidates = mongodb_candidates.saturating_add(1);
-        }
+        let candidate = kind.is_file() && is_mongodb_archive_candidate(&path)?;
         total = total
             .checked_add(
                 entry
@@ -749,19 +769,27 @@ fn validate_tar_entries<R: Read>(
                 "archive expansion exceeds the size limit",
             ));
         }
-        if mongodb_candidate {
-            validate_mongodb_gzip_reader(&mut entry, deadline)?;
+        if candidate {
+            if catalog.is_some() {
+                return Err(InspectionError::Invalid(
+                    "MongoDB wrapper contains multiple .archive.gz dumps",
+                ));
+            }
+            catalog = Some(inspect_native_gzip(&mut entry, deadline)?);
         }
     }
-    ensure_single_mongodb_candidate(require_mongodb_archive, mongodb_candidates)?;
-    Ok(())
+    let mut remainder = archive.into_inner();
+    io::copy(&mut remainder, &mut io::sink())
+        .map_err(|error| map_mongodb_read_error(error, "MongoDB tar wrapper is malformed"))?;
+    catalog.ok_or(InspectionError::Invalid(
+        "MongoDB wrapper does not contain a .archive.gz dump",
+    ))
 }
 
-fn validate_zip_container(
+fn inspect_mongodb_zip_container(
     source: &mut File,
     deadline: Instant,
-    require_mongodb_archive: bool,
-) -> Result<(), InspectionError> {
+) -> Result<MongoArchiveCatalog, InspectionError> {
     source.seek(SeekFrom::Start(0))?;
     let mut archive = zip::ZipArchive::new(source.try_clone()?)
         .map_err(|_| InspectionError::Invalid("uploaded zip archive is malformed"))?;
@@ -769,7 +797,7 @@ fn validate_zip_container(
         return Err(InspectionError::Limit("archive contains too many entries"));
     }
     let mut total = 0_u64;
-    let mut mongodb_candidates = 0_usize;
+    let mut catalog = None;
     for index in 0..archive.len() {
         ensure_deadline(deadline)?;
         let mut entry = archive
@@ -780,11 +808,7 @@ fn validate_zip_container(
         ))?;
         validate_archive_path(&path)?;
         validate_zip_entry_type(&entry)?;
-        let mongodb_candidate =
-            require_mongodb_archive && !entry.is_dir() && is_mongodb_archive_candidate(&path)?;
-        if mongodb_candidate {
-            mongodb_candidates = mongodb_candidates.saturating_add(1);
-        }
+        let candidate = !entry.is_dir() && is_mongodb_archive_candidate(&path)?;
         total = total
             .checked_add(entry.size())
             .ok_or(InspectionError::Limit(
@@ -795,8 +819,13 @@ fn validate_zip_container(
                 "archive expansion exceeds the size limit",
             ));
         }
-        if mongodb_candidate {
-            validate_mongodb_gzip_reader(&mut entry, deadline)?;
+        if candidate {
+            if catalog.is_some() {
+                return Err(InspectionError::Invalid(
+                    "MongoDB wrapper contains multiple .archive.gz dumps",
+                ));
+            }
+            catalog = Some(inspect_native_gzip(&mut entry, deadline)?);
         } else if !entry.is_dir() {
             let size = entry.size();
             let mut bounded = BoundedReader::new(&mut entry, size, deadline);
@@ -805,19 +834,66 @@ fn validate_zip_container(
             })?;
         }
     }
-    ensure_single_mongodb_candidate(require_mongodb_archive, mongodb_candidates)?;
-    Ok(())
+    catalog.ok_or(InspectionError::Invalid(
+        "MongoDB wrapper does not contain a .archive.gz dump",
+    ))
 }
 
-fn validate_mongodb_gzip_reader<R: Read>(
-    reader: R,
+fn validate_tar_container(
+    source: &mut File,
+    gzipped: bool,
     deadline: Instant,
 ) -> Result<(), InspectionError> {
-    let decoder = flate2::read::GzDecoder::new(reader);
-    let mut bounded = BoundedReader::new(decoder, MAX_INSPECTED_BYTES, deadline);
-    io::copy(&mut bounded, &mut io::sink()).map_err(|_| {
-        InspectionError::Invalid("MongoDB wrapper contains a malformed .archive.gz dump")
-    })?;
+    source.seek(SeekFrom::Start(0))?;
+    if gzipped {
+        validate_tar_entries(flate2::read::GzDecoder::new(source), deadline)
+    } else {
+        validate_tar_entries(source, deadline)
+    }
+}
+
+fn validate_tar_entries<R: Read>(reader: R, deadline: Instant) -> Result<(), InspectionError> {
+    let bounded = BoundedReader::new(reader, MAX_INSPECTED_BYTES, deadline);
+    let mut archive = tar::Archive::new(bounded);
+    let mut count = 0_usize;
+    let mut total = 0_u64;
+    let entries = archive
+        .entries()
+        .map_err(|_| InspectionError::Invalid("uploaded tar archive is malformed"))?;
+    for entry in entries {
+        ensure_deadline(deadline)?;
+        count += 1;
+        if count > MAX_ARCHIVE_ENTRIES {
+            return Err(InspectionError::Limit("archive contains too many entries"));
+        }
+        let entry =
+            entry.map_err(|_| InspectionError::Invalid("uploaded tar archive is malformed"))?;
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            return Err(InspectionError::Invalid(
+                "archive contains a link, device, or unsupported special entry",
+            ));
+        }
+        let path = entry
+            .path()
+            .map_err(|_| InspectionError::Invalid("archive contains an invalid entry path"))?;
+        validate_archive_path(&path)?;
+        total = total
+            .checked_add(
+                entry
+                    .header()
+                    .size()
+                    .map_err(|_| InspectionError::Invalid("uploaded tar archive is malformed"))?,
+            )
+            .ok_or(InspectionError::Limit(
+                "archive expansion exceeds the size limit",
+            ))?;
+        if total > MAX_INSPECTED_BYTES {
+            return Err(InspectionError::Limit(
+                "archive expansion exceeds the size limit",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -832,24 +908,6 @@ fn is_mongodb_archive_candidate(path: &Path) -> Result<bool, InspectionError> {
     Ok(name.ends_with(".mongodb.archive.gz") || name.ends_with(".archive.gz"))
 }
 
-fn ensure_single_mongodb_candidate(
-    required: bool,
-    candidates: usize,
-) -> Result<(), InspectionError> {
-    if !required {
-        return Ok(());
-    }
-    match candidates {
-        1 => Ok(()),
-        0 => Err(InspectionError::Invalid(
-            "MongoDB wrapper does not contain a .archive.gz dump",
-        )),
-        _ => Err(InspectionError::Invalid(
-            "MongoDB wrapper contains multiple .archive.gz dumps",
-        )),
-    }
-}
-
 fn ensure_deadline(deadline: Instant) -> Result<(), InspectionError> {
     if Instant::now() >= deadline {
         Err(InspectionError::Limit(
@@ -858,6 +916,20 @@ fn ensure_deadline(deadline: Instant) -> Result<(), InspectionError> {
     } else {
         Ok(())
     }
+}
+
+fn map_mongodb_read_error(error: io::Error, malformed_message: &'static str) -> InspectionError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        return InspectionError::Limit("dump inspection exceeded its time limit");
+    }
+    if error.kind() == io::ErrorKind::InvalidData
+        && error
+            .to_string()
+            .contains("decompressed dump exceeds inspection limit")
+    {
+        return InspectionError::Limit("MongoDB archive expansion exceeds the size limit");
+    }
+    InspectionError::Invalid(malformed_message)
 }
 
 struct BoundedReader<R> {

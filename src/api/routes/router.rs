@@ -266,6 +266,10 @@ async fn track_mutating_request(
 fn system_routes() -> Router<AppState> {
     Router::new()
         .route("/api/system", get(system::system))
+        .route(
+            "/api/system/import-export-scheduler/recommendation",
+            get(system::import_export_scheduler_recommendation),
+        )
         .route("/api/system/config", patch(config_admin::patch_config))
         .route("/api/heartbeat", get(system::heartbeat))
         .route("/metrics", get(metrics::metrics))

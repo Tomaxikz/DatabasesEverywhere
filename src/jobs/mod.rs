@@ -29,12 +29,20 @@ pub mod import_export {
         ImportExportJobRepository, ImportExportJobStorageError,
     };
 
+    #[path = "scheduler.rs"]
+    mod scheduler;
+    pub use scheduler::{
+        ExecutionPermit, ImportExportScheduler, JobEstimateInput, JobResourceCost,
+        SchedulerAcquireError, SchedulerCapacity, SchedulerMode, SchedulerSnapshot,
+        conservative_import_input_bytes, protocol_uses_logical_dumps,
+        protocol_uses_native_compression,
+    };
+
     pub const MAX_DATA_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
     const MAX_DATA_ARCHIVE_ENTRIES: usize = 100_000;
+    const DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES: u64 = 16 * 1024;
     const MAX_DATA_ARCHIVE_DEPTH: usize = 64;
     const DATA_ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-    const MAX_ADMITTED_JOBS: usize = 64;
-    const MAX_ADMITTED_JOBS_PER_INSTANCE: usize = 2;
     const MAX_CACHED_JOBS: usize = 2_048;
     const MAX_PERSISTED_COMPLETED_JOBS: u32 = 10_000;
 
@@ -53,7 +61,7 @@ pub mod import_export {
         deadline: DATA_ARCHIVE_OPERATION_TIMEOUT,
     };
 
-    #[derive(Debug, Clone, Serialize)]
+    #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
     pub struct ImportExportJob {
         pub job_id: String,
         pub instance_id: String,
@@ -127,7 +135,9 @@ pub mod import_export {
         repository: Option<ImportExportJobRepository>,
         events: broadcast::Sender<ImportExportJob>,
         admission: Arc<Semaphore>,
-        admitted_by_instance: Arc<Mutex<HashMap<String, usize>>>,
+        max_admitted_jobs_per_instance: usize,
+        admitted_by_instance: Arc<Mutex<HashMap<String, InstanceAdmission>>>,
+        execution_scheduler: ImportExportScheduler,
         accepting: Arc<AtomicBool>,
         active_jobs: Arc<AtomicUsize>,
         drain_notify: Arc<Notify>,
@@ -143,37 +153,55 @@ pub mod import_export {
     #[derive(Debug)]
     pub struct ImportExportJobPermit {
         _global: OwnedSemaphorePermit,
-        admitted_by_instance: Arc<Mutex<HashMap<String, usize>>>,
+        admitted_by_instance: Arc<Mutex<HashMap<String, InstanceAdmission>>>,
         instance_id: String,
         active_jobs: Arc<AtomicUsize>,
         drain_notify: Arc<Notify>,
     }
 
+    #[derive(Debug, Default)]
+    struct InstanceAdmission {
+        count: usize,
+        exclusive: bool,
+    }
+
     impl Default for ImportExportJobs {
         fn default() -> Self {
-            let (events, _) = broadcast::channel(256);
-            Self {
-                inner: Arc::new(RwLock::new(HashMap::new())),
-                repository: None,
-                events,
-                admission: Arc::new(Semaphore::new(MAX_ADMITTED_JOBS)),
-                admitted_by_instance: Arc::default(),
-                accepting: Arc::new(AtomicBool::new(true)),
-                active_jobs: Arc::default(),
-                drain_notify: Arc::default(),
-            }
+            Self::new(None, &crate::config::ArtifactConfig::default())
         }
     }
 
     impl ImportExportJobs {
         pub fn with_repository(repository: ImportExportJobRepository) -> Self {
+            Self::new(Some(repository), &crate::config::ArtifactConfig::default())
+        }
+
+        pub fn with_repository_and_config(
+            repository: ImportExportJobRepository,
+            artifacts: &crate::config::ArtifactConfig,
+        ) -> Self {
+            Self::new(Some(repository), artifacts)
+        }
+
+        fn new(
+            repository: Option<ImportExportJobRepository>,
+            artifacts: &crate::config::ArtifactConfig,
+        ) -> Self {
             let (events, _) = broadcast::channel(256);
+            let scheduler_config = &artifacts.import_export_scheduler;
+            let capacity = SchedulerCapacity::detect(
+                scheduler_config,
+                artifacts.import_upload_max_bytes,
+                artifacts.import_upload_max_total_bytes,
+            );
             Self {
                 inner: Arc::new(RwLock::new(HashMap::new())),
-                repository: Some(repository),
+                repository,
                 events,
-                admission: Arc::new(Semaphore::new(MAX_ADMITTED_JOBS)),
+                admission: Arc::new(Semaphore::new(scheduler_config.max_queued_jobs)),
+                max_admitted_jobs_per_instance: scheduler_config.max_queued_jobs_per_instance,
                 admitted_by_instance: Arc::default(),
+                execution_scheduler: ImportExportScheduler::new(capacity, scheduler_config),
                 accepting: Arc::new(AtomicBool::new(true)),
                 active_jobs: Arc::default(),
                 drain_notify: Arc::default(),
@@ -183,6 +211,24 @@ pub mod import_export {
         pub fn try_admit(
             &self,
             instance_id: &str,
+        ) -> Result<ImportExportJobPermit, JobAdmissionError> {
+            self.try_admit_kind(instance_id, false)
+        }
+
+        /// Admit a synchronous maintenance operation only when the instance
+        /// has no queued data operation. While held, ordinary jobs are also
+        /// rejected so secrets and backup requests cannot pile up behind it.
+        pub fn try_admit_exclusive(
+            &self,
+            instance_id: &str,
+        ) -> Result<ImportExportJobPermit, JobAdmissionError> {
+            self.try_admit_kind(instance_id, true)
+        }
+
+        fn try_admit_kind(
+            &self,
+            instance_id: &str,
+            exclusive: bool,
         ) -> Result<ImportExportJobPermit, JobAdmissionError> {
             if !self.accepting.load(Ordering::Acquire) {
                 return Err(JobAdmissionError::ShuttingDown);
@@ -197,11 +243,15 @@ pub mod import_export {
             if !self.accepting.load(Ordering::Acquire) {
                 return Err(JobAdmissionError::ShuttingDown);
             }
-            let count = admitted.entry(instance_id.to_string()).or_default();
-            if *count >= MAX_ADMITTED_JOBS_PER_INSTANCE {
+            let instance = admitted.entry(instance_id.to_string()).or_default();
+            if instance.exclusive
+                || (exclusive && instance.count > 0)
+                || instance.count >= self.max_admitted_jobs_per_instance
+            {
                 return Err(JobAdmissionError::InstanceCapacity);
             }
-            *count += 1;
+            instance.count += 1;
+            instance.exclusive = exclusive;
             self.active_jobs.fetch_add(1, Ordering::AcqRel);
             drop(admitted);
             Ok(ImportExportJobPermit {
@@ -225,6 +275,18 @@ pub mod import_export {
             let _admitted = lock_unpoisoned(&self.admitted_by_instance);
             self.accepting.store(false, Ordering::Release);
             self.admission.close();
+            self.execution_scheduler.close();
+        }
+
+        pub async fn acquire_execution(
+            &self,
+            cost: JobResourceCost,
+        ) -> Result<ExecutionPermit, SchedulerAcquireError> {
+            self.execution_scheduler.acquire(cost).await
+        }
+
+        pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+            self.execution_scheduler.snapshot()
         }
 
         pub async fn wait_for_drain(&self, deadline: Duration) -> bool {
@@ -251,12 +313,16 @@ pub mod import_export {
             if let Some(repository) = &self.repository {
                 repository.insert(&job).await?;
             }
+            self.cache_durable_job(job).await;
+            Ok(())
+        }
+
+        pub async fn cache_durable_job(&self, job: ImportExportJob) {
             let mut cache = self.inner.write().await;
             cache.insert(job.job_id.clone(), job.clone());
             prune_job_cache(&mut cache);
             drop(cache);
             self.publish(job);
-            Ok(())
         }
 
         pub async fn get(
@@ -380,9 +446,9 @@ pub mod import_export {
     impl Drop for ImportExportJobPermit {
         fn drop(&mut self) {
             let mut admitted = lock_unpoisoned(&self.admitted_by_instance);
-            if let Some(count) = admitted.get_mut(&self.instance_id) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+            if let Some(instance) = admitted.get_mut(&self.instance_id) {
+                instance.count = instance.count.saturating_sub(1);
+                if instance.count == 0 {
                     admitted.remove(&self.instance_id);
                 }
             }
@@ -439,8 +505,22 @@ pub mod import_export {
         artifact_path: PathBuf,
         policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
+        create_data_archive_with_policy_bounded(data_dir, artifact_path, policy, u64::MAX).await
+    }
+
+    pub async fn create_data_archive_with_policy_bounded(
+        data_dir: PathBuf,
+        artifact_path: PathBuf,
+        policy: DataArchiveSourcePolicy,
+        max_output_bytes: u64,
+    ) -> Result<(), ImportExportError> {
         tokio::task::spawn_blocking(move || {
-            create_data_archive_blocking(&data_dir, &artifact_path, policy)
+            create_data_archive_bounded_blocking(
+                &data_dir,
+                &artifact_path,
+                policy,
+                max_output_bytes,
+            )
         })
         .await
         .map_err(|error| ImportExportError::Join(error.to_string()))?
@@ -451,16 +531,13 @@ pub mod import_export {
         artifact_path: PathBuf,
         max_output_bytes: u64,
     ) -> Result<(), ImportExportError> {
-        tokio::task::spawn_blocking(move || {
-            create_data_archive_bounded_blocking(
-                &data_dir,
-                &artifact_path,
-                DataArchiveSourcePolicy::Strict,
-                max_output_bytes,
-            )
-        })
+        create_data_archive_with_policy_bounded(
+            data_dir,
+            artifact_path,
+            DataArchiveSourcePolicy::Strict,
+            max_output_bytes,
+        )
         .await
-        .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
     pub async fn extract_data_archive(
@@ -506,6 +583,7 @@ pub mod import_export {
         .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
+    #[cfg(test)]
     fn create_data_archive_blocking(
         data_dir: &Path,
         artifact_path: &Path,
@@ -648,9 +726,7 @@ pub mod import_export {
                 })?;
                 validate_archive_symlink(&path, &link_name, expected_root)?;
             }
-            bytes = bytes.checked_add(entry.header().size()?).ok_or_else(|| {
-                ImportExportError::InvalidArchive("archive size overflow".to_string())
-            })?;
+            bytes = account_extracted_entry(bytes, entry.header().size()?)?;
             validate_archive_limits(started, entries, bytes, DATA_ARCHIVE_LIMITS)?;
         }
         Ok(())
@@ -775,9 +851,7 @@ pub mod import_export {
             let entry_type = entry.header().entry_type();
             validate_entry_type(entry_type)?;
             let entry_size = entry.header().size()?;
-            bytes = bytes.checked_add(entry_size).ok_or_else(|| {
-                ImportExportError::InvalidArchive("archive size overflow".to_string())
-            })?;
+            bytes = account_extracted_entry(bytes, entry_size)?;
             validate_archive_limits(started, entries, bytes, limits)?;
             let target = data_parent.join(&path);
             if !target.starts_with(data_parent) {
@@ -831,6 +905,13 @@ pub mod import_export {
             create_symlink(&link_name, &target)?;
         }
         Ok(())
+    }
+
+    fn account_extracted_entry(current: u64, entry_size: u64) -> Result<u64, ImportExportError> {
+        current
+            .checked_add(entry_size)
+            .and_then(|bytes| bytes.checked_add(DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES))
+            .ok_or_else(|| ImportExportError::InvalidArchive("archive size overflow".to_string()))
     }
 
     #[cfg(unix)]

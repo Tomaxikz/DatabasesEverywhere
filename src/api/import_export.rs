@@ -11,8 +11,9 @@ use crate::{
         instances::{LifecycleAction, lifecycle_instance_locked},
         public_diagnostic::PublicDiagnostic,
         remote_import::{
-            ImportMode, RemoteImportRequest, RemoteImportSource, acquire_logical_dump,
-            import_qdrant, import_redis, import_valkey, validate_remote_source,
+            ImportMode, RemoteImportRequest, RemoteImportSource, RemoteJobAdmissionPermit,
+            acquire_logical_dump, import_qdrant, import_redis, import_valkey, try_admit_remote_job,
+            validate_remote_source,
         },
         routes::AppState,
         security_policy::ApiRequestContext,
@@ -24,15 +25,18 @@ use crate::{
     },
     jobs::import_export::{
         ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
-        JobAdmissionError, create_data_archive, extract_data_archive_bounded,
+        JobAdmissionError, JobEstimateInput, JobResourceCost, SchedulerAcquireError,
+        conservative_import_input_bytes, extract_data_archive_bounded, protocol_uses_logical_dumps,
+        protocol_uses_native_compression,
     },
     shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
 };
 use axum::extract::State;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub(crate) const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES: u64 = 16 * 1024;
 const MAX_ARCHIVE_DEPTH: usize = 32;
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SELECTION_ITEMS: usize = 512;
@@ -222,6 +226,17 @@ impl ExportArchiveFormat {
     }
 }
 
+fn normalized_export_archive_format(
+    protocol: Protocol,
+    archive_format: ExportArchiveFormat,
+) -> ExportArchiveFormat {
+    if protocol == Protocol::Mongodb && archive_format == ExportArchiveFormat::Gzip {
+        ExportArchiveFormat::Plain
+    } else {
+        archive_format
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ImportSourceOptions {
     Artifact(PathBuf),
@@ -382,11 +397,11 @@ pub(crate) use jobs::{
 };
 pub(crate) use logical::quarantine_after_uncertain_import;
 pub(crate) use physical::{
-    finish_physical_operation, restore_data_from_archive, rollback_data_from_archive,
+    finish_physical_operation, restore_data_from_archive_bounded, rollback_data_from_archive,
     verify_physical_data_replacement,
 };
 pub(crate) use upload_recovery::{reconcile_import_uploads_once, run_import_upload_sweeper};
-pub(crate) use uploads::ImportUploadService;
+pub(crate) use uploads::{DiskCapacityReservation, ImportUploadService};
 pub(crate) use uploads::{
     delete_import_upload, get_import_upload, import_entry, inspect_import_upload,
     list_import_uploads,

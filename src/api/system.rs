@@ -1,16 +1,16 @@
 use axum::extract::State;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::api::{
-    api_response::{ApiResponse, ApiResult},
+    api_response::{ApiError, ApiQuery, ApiResponse, ApiResult},
     routes::AppState,
     security_policy::ApiRequestContext,
 };
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.11.0";
+pub const API_VERSION: &str = "0.12.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {
@@ -109,6 +109,130 @@ pub struct HeartbeatResponse {
 pub async fn heartbeat(auth: ApiRequestContext) -> ApiResult<HeartbeatResponse> {
     auth.require_scope(scopes::SYSTEM_READ)?;
     Ok(ApiResponse::ok(HeartbeatResponse { status: "ok" }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImportExportSchedulerEstimateQuery {
+    pub protocol: Option<String>,
+    pub action: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub target_disk_mib: Option<u64>,
+    pub mode: Option<String>,
+    pub compressed: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportExportSchedulerRecommendationResponse {
+    pub scheduler: crate::jobs::import_export::SchedulerSnapshot,
+    pub estimate: crate::jobs::import_export::JobResourceCost,
+    pub recommended_active_jobs: usize,
+    pub admitted_jobs: usize,
+    pub max_queued_jobs: usize,
+    pub max_queued_jobs_per_instance: usize,
+}
+
+pub async fn import_export_scheduler_recommendation(
+    State(state): State<AppState>,
+    auth: ApiRequestContext,
+    ApiQuery(query): ApiQuery<ImportExportSchedulerEstimateQuery>,
+) -> ApiResult<ImportExportSchedulerRecommendationResponse> {
+    auth.require_scope(scopes::SYSTEM_READ)?;
+    let protocol = query
+        .protocol
+        .as_deref()
+        .unwrap_or("postgres")
+        .parse::<crate::shared::protocol::Protocol>()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let export = match query.action.as_deref().unwrap_or("import") {
+        "import" => false,
+        "export" => true,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "action must be import or export".to_string(),
+            ));
+        }
+    };
+    let wipe = match query.mode.as_deref().unwrap_or("merge") {
+        "merge" => false,
+        "wipe" if !export => true,
+        "wipe" => {
+            return Err(ApiError::BadRequest(
+                "mode=wipe is valid only for imports".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "mode must be merge or wipe".to_string(),
+            ));
+        }
+    };
+    let size_bytes = query
+        .size_bytes
+        .unwrap_or(state.config.artifacts.import_upload_max_bytes);
+    if size_bytes == 0 || size_bytes > crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "size_bytes must be between 1 and {}",
+            crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES
+        )));
+    }
+    let compressed = query.compressed.unwrap_or(false)
+        || crate::jobs::import_export::protocol_uses_native_compression(protocol);
+    let target_disk_mib = query
+        .target_disk_mib
+        .unwrap_or_else(|| size_bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024));
+    if target_disk_mib == 0 {
+        return Err(ApiError::BadRequest(
+            "target_disk_mib must be greater than zero".to_string(),
+        ));
+    }
+    let estimated_input_size_bytes = if export {
+        size_bytes
+    } else {
+        crate::jobs::import_export::conservative_import_input_bytes(
+            protocol,
+            size_bytes,
+            state
+                .config
+                .artifacts
+                .import_upload_max_bytes
+                .min(crate::api::import_export::MAX_UNARCHIVED_BYTES),
+            target_disk_mib,
+            compressed,
+        )
+    };
+    let rollback_size_bytes =
+        if wipe && crate::jobs::import_export::protocol_uses_logical_dumps(protocol) {
+            target_disk_mib
+                .saturating_mul(1024 * 1024)
+                .clamp(1, crate::api::import_export::MAX_UNARCHIVED_BYTES)
+        } else {
+            0
+        };
+    let estimate = crate::jobs::import_export::JobResourceCost::estimate(
+        crate::jobs::import_export::JobEstimateInput {
+            protocol,
+            input_size_bytes: estimated_input_size_bytes,
+            rollback_size_bytes,
+            wipe,
+            compressed,
+            export,
+        },
+    );
+    let scheduler = state.import_export_jobs.scheduler_snapshot();
+    let config = &state.config.artifacts.import_export_scheduler;
+    Ok(ApiResponse::ok(
+        ImportExportSchedulerRecommendationResponse {
+            recommended_active_jobs: scheduler
+                .capacity
+                .model_recommended_active_jobs(estimate, config.dynamic_max_active_jobs),
+            admitted_jobs: state.import_export_jobs.active_count(),
+            scheduler,
+            estimate,
+            max_queued_jobs: config.max_queued_jobs,
+            max_queued_jobs_per_instance: config.max_queued_jobs_per_instance,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -253,5 +377,34 @@ mod tests {
         assert!(config.allocation.prevent_cpu_overallocation);
         assert!(config.allocation.prevent_memory_overallocation);
         assert!(config.allocation.prevent_disk_overallocation);
+    }
+
+    #[test]
+    fn scheduler_recommendation_distinguishes_admission_from_execution_waiters() {
+        let jobs = crate::jobs::import_export::ImportExportJobs::default();
+        let _admitted = jobs.try_admit("inst-waiting-on-lock").unwrap();
+        let scheduler = jobs.scheduler_snapshot();
+        let estimate = crate::jobs::import_export::JobResourceCost::estimate(
+            crate::jobs::import_export::JobEstimateInput {
+                protocol: crate::shared::protocol::Protocol::Postgres,
+                input_size_bytes: 1024,
+                rollback_size_bytes: 0,
+                wipe: false,
+                compressed: false,
+                export: false,
+            },
+        );
+        let response = ImportExportSchedulerRecommendationResponse {
+            scheduler,
+            estimate,
+            recommended_active_jobs: 1,
+            admitted_jobs: jobs.active_count(),
+            max_queued_jobs: 1024,
+            max_queued_jobs_per_instance: 32,
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["admitted_jobs"].as_u64(), Some(1));
+        assert_eq!(json["scheduler"]["active_jobs"].as_u64(), Some(0));
+        assert_eq!(json["scheduler"]["waiting_jobs"].as_u64(), Some(0));
     }
 }

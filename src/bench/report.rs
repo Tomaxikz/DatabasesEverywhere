@@ -373,6 +373,55 @@ fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -
         }
     }
 
+    if let Some(recommendation) = &report.manual_active_jobs_recommendation {
+        terminal_section(
+            &mut output,
+            &colors,
+            "MANUAL ACTIVE-JOB RECOMMENDATION",
+            &thin_rule,
+        );
+        let _ = writeln!(output, "  {:<24} {}", "Method", recommendation.method);
+        let _ = writeln!(output, "  {:<24} {}", "Status", recommendation.status);
+        if let Some(reason) = &recommendation.unavailable_reason {
+            let _ = writeln!(output, "  {:<24} {reason}", "Unavailable");
+        }
+        if let Some(capacity) = &recommendation.scheduler_capacity {
+            let _ = writeln!(
+                output,
+                "  {:<24} {} (active ceiling {}, memory {} MiB, I/O {} MiB, CPU units {})",
+                "Scheduler model",
+                capacity.mode,
+                capacity.max_active_jobs,
+                capacity.memory_budget_mib,
+                capacity.io_budget_mib,
+                capacity.cpu_units
+            );
+        }
+        if recommendation.configured_max_upload_worst_case.is_some()
+            || recommendation.representative_exported_dump.is_some()
+        {
+            let _ = writeln!(
+                output,
+                "\n  {:<34} {:>12} {:>9} {:>9} {:>9} {:>11}",
+                "WORKLOAD", "INPUT", "MEM MAX", "I/O MAX", "CPU MAX", "RECOMMEND"
+            );
+            let _ = writeln!(output, "  {}", ".".repeat(92));
+            if let Some(workload) = &recommendation.configured_max_upload_worst_case {
+                terminal_recommendation_row(&mut output, workload);
+            }
+            if let Some(workload) = &recommendation.representative_exported_dump {
+                terminal_recommendation_row(&mut output, workload);
+            }
+        }
+        if let Some(reason) = &recommendation.representative_unavailable_reason {
+            let _ = writeln!(output, "\n  Representative estimate unavailable: {reason}");
+        }
+        let _ = writeln!(
+            output,
+            "\n  Model only: no concurrent saturation test was performed and configuration was not changed."
+        );
+    }
+
     if !report.warnings.is_empty() || !report.errors.is_empty() {
         terminal_section(&mut output, &colors, "DIAGNOSTICS", &thin_rule);
         for error in &report.errors {
@@ -473,6 +522,22 @@ fn terminal_resource_row(output: &mut String, scope: &str, cpu: Option<f64>, mem
         truncate(scope, 24),
         format_percent(cpu),
         memory.map(human_bytes).unwrap_or_else(|| "n/a".to_string())
+    );
+}
+
+fn terminal_recommendation_row(
+    output: &mut String,
+    workload: &crate::bench::metrics::ManualActiveJobsWorkloadReport,
+) {
+    let _ = writeln!(
+        output,
+        "  {:<34} {:>12} {:>9} {:>9} {:>9} {:>11}",
+        truncate(&workload.workload, 34),
+        human_bytes(workload.estimate.input_size_bytes),
+        grouped_usize(workload.memory_ceiling_jobs),
+        grouped_usize(workload.io_ceiling_jobs),
+        grouped_usize(workload.cpu_ceiling_jobs),
+        grouped_usize(workload.recommended_manual_max_active_jobs)
     );
 }
 
@@ -724,6 +789,76 @@ fn markdown_report(report: &BenchmarkReport) -> String {
         }
     }
 
+    if let Some(recommendation) = &report.manual_active_jobs_recommendation {
+        let _ = writeln!(output, "\n## Manual active-job recommendation\n");
+        let _ = writeln!(output, "- Method: `{}`", recommendation.method);
+        let _ = writeln!(output, "- Status: `{}`", recommendation.status);
+        let _ = writeln!(
+            output,
+            "- Daemon identity verified: `{}` (configured `{}`, server `{}`)",
+            recommendation.identity_verified,
+            recommendation.configured_node_uuid,
+            recommendation
+                .server_node_uuid
+                .as_deref()
+                .unwrap_or("unknown")
+        );
+        if let Some(reason) = &recommendation.unavailable_reason {
+            let _ = writeln!(output, "- Unavailable reason: {reason}");
+        }
+        if let Some(capacity) = &recommendation.scheduler_capacity {
+            let _ = writeln!(
+                output,
+                "- Scheduler capacity used by the model: mode `{}`, active ceiling `{}`, memory `{}` MiB, I/O `{}` MiB, CPU units `{}`.",
+                capacity.mode,
+                capacity.max_active_jobs,
+                capacity.memory_budget_mib,
+                capacity.io_budget_mib,
+                capacity.cpu_units
+            );
+        }
+        if let (Some(global), Some(per_instance)) = (
+            recommendation.max_queued_jobs,
+            recommendation.max_queued_jobs_per_instance,
+        ) {
+            let _ = writeln!(
+                output,
+                "- Queue admission limits: `{global}` node-wide, `{per_instance}` per instance."
+            );
+        }
+        if recommendation.configured_max_upload_worst_case.is_some()
+            || recommendation.representative_exported_dump.is_some()
+        {
+            let _ = writeln!(
+                output,
+                "\n| Workload | Protocol | Mode | Compressed | Input | Estimated RAM MiB | Estimated I/O MiB | CPU units | RAM ceiling | I/O ceiling | CPU ceiling | Active ceiling | Recommended `manual_max_active_jobs` |"
+            );
+            let _ = writeln!(
+                output,
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            );
+            if let Some(workload) = &recommendation.configured_max_upload_worst_case {
+                write_recommendation_row(&mut output, workload);
+            }
+            if let Some(workload) = &recommendation.representative_exported_dump {
+                write_recommendation_row(&mut output, workload);
+            }
+        }
+        if let Some(reason) = &recommendation.representative_unavailable_reason {
+            let _ = writeln!(output, "\n- Representative estimate unavailable: {reason}");
+        }
+        if !recommendation.caveats.is_empty() {
+            let _ = writeln!(output, "\n### Recommendation caveats\n");
+            for caveat in &recommendation.caveats {
+                let _ = writeln!(output, "- {caveat}");
+            }
+        }
+        let _ = writeln!(
+            output,
+            "\nThe benchmark did not modify daemon configuration."
+        );
+    }
+
     if let Some(resources) = &report.resources {
         let _ = writeln!(output, "\n## Peak resources\n");
         let _ = writeln!(
@@ -784,6 +919,29 @@ fn markdown_report(report: &BenchmarkReport) -> String {
         }
     }
     output
+}
+
+fn write_recommendation_row(
+    output: &mut String,
+    workload: &crate::bench::metrics::ManualActiveJobsWorkloadReport,
+) {
+    let _ = writeln!(
+        output,
+        "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | **{}** |",
+        workload.workload,
+        workload.protocol,
+        workload.mode,
+        workload.compressed,
+        human_bytes(workload.estimate.input_size_bytes),
+        workload.estimate.memory_mib,
+        workload.estimate.io_mib,
+        workload.estimate.cpu_units,
+        workload.memory_ceiling_jobs,
+        workload.io_ceiling_jobs,
+        workload.cpu_ceiling_jobs,
+        workload.configured_active_ceiling_jobs,
+        workload.recommended_manual_max_active_jobs
+    );
 }
 
 fn write_http_row(output: &mut String, phase: &HttpPhaseReport) {
@@ -972,6 +1130,38 @@ mod tests {
         );
         assert_eq!(truncate("a-very-long-instance-name", 12), "a-very-lo...");
         assert!(truncate("a-very-long-instance-name", 12).is_ascii());
+    }
+
+    #[test]
+    fn manual_active_job_recommendation_rows_expose_model_inputs_and_result() {
+        let workload = crate::bench::metrics::ManualActiveJobsWorkloadReport {
+            workload: "configured maximum upload".to_string(),
+            protocol: "mongodb".to_string(),
+            mode: "wipe".to_string(),
+            compressed: true,
+            estimate: crate::bench::metrics::SchedulerJobCostReport {
+                input_size_bytes: 4 * 1024 * 1024 * 1024,
+                memory_mib: 1024,
+                io_mib: 4096,
+                cpu_units: 2,
+            },
+            memory_ceiling_jobs: 8,
+            io_ceiling_jobs: 4,
+            cpu_ceiling_jobs: 6,
+            configured_active_ceiling_jobs: 12,
+            recommended_manual_max_active_jobs: 4,
+        };
+
+        let mut terminal = String::new();
+        terminal_recommendation_row(&mut terminal, &workload);
+        assert!(terminal.contains("configured maximum upload"));
+        assert!(terminal.contains("4.00 GiB"));
+        assert!(terminal.trim_end().ends_with('4'));
+
+        let mut markdown = String::new();
+        write_recommendation_row(&mut markdown, &workload);
+        assert!(markdown.contains("| `configured maximum upload` | mongodb | wipe | true |"));
+        assert!(markdown.contains("| 1024 | 4096 | 2 | 8 | 4 | 6 | 12 | **4** |"));
     }
 
     #[tokio::test]

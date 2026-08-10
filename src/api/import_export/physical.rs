@@ -22,9 +22,19 @@ pub(super) async fn export_physical_archive(
 
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let result = create_data_archive(paths.data, artifact_path)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()));
+    let max_output_bytes = metadata
+        .limits
+        .disk_mib
+        .saturating_mul(1024 * 1024)
+        .saturating_add(64 * 1024 * 1024)
+        .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    let result = crate::jobs::import_export::create_data_archive_bounded(
+        paths.data,
+        artifact_path,
+        max_output_bytes,
+    )
+    .await
+    .map_err(|error| ApiError::Runtime(error.to_string()));
     finish_physical_operation(state, instance_id, was_running, result).await
 }
 
@@ -153,24 +163,6 @@ impl PendingDataReplacement {
         cleanup_dir(&self.workspace).await;
         Ok(())
     }
-}
-
-pub(crate) async fn restore_data_from_archive(
-    state: &AppState,
-    instance_id: &str,
-    paths: InstancePaths,
-    artifact_path: &FsPath,
-    should_be_running: bool,
-) -> Result<(), ApiError> {
-    restore_data_from_archive_bounded(
-        state,
-        instance_id,
-        paths,
-        artifact_path,
-        should_be_running,
-        crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
-    )
-    .await
 }
 
 pub(crate) async fn restore_data_from_archive_bounded(

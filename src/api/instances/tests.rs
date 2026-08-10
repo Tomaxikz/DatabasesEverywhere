@@ -1,5 +1,29 @@
 use super::*;
 
+#[tokio::test]
+async fn dropping_major_upgrade_waiter_does_not_cancel_owned_operation() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let owned = spawn_owned_major_upgrade_task(async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let _ = finished_tx.send(());
+    });
+    let waiter = tokio::spawn(async move {
+        let _ = owned.await;
+    });
+    started_rx.await.unwrap();
+    waiter.abort();
+    let _ = waiter.await;
+    release_tx.send(()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+        .await
+        .expect("owned major-upgrade operation should outlive its request waiter")
+        .unwrap();
+}
+
 fn sample_lifecycle_metadata() -> InstanceMetadata {
     InstanceMetadata {
         schema_version: crate::instances::metadata::SCHEMA_VERSION,

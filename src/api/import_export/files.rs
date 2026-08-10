@@ -44,11 +44,30 @@ pub(super) async fn archive_or_copy_export(
     to: &FsPath,
     format: ExportArchiveFormat,
 ) -> Result<(), ApiError> {
+    let source_bytes = tokio::fs::symlink_metadata(from)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to inspect export staging: {error}")))?
+        .len();
+    let output_bound = export_artifact_capacity_bytes(source_bytes, format).ok_or_else(|| {
+        ApiError::Runtime("compressed export capacity calculation overflowed".to_string())
+    })?;
     match format {
         ExportArchiveFormat::Plain => move_or_copy_file(from, to).await,
-        ExportArchiveFormat::Gzip => compress_gzip(from, to).await,
-        ExportArchiveFormat::Bzip2 => compress_bzip2(from, to).await,
+        ExportArchiveFormat::Gzip => compress_gzip(from, to, output_bound).await,
+        ExportArchiveFormat::Bzip2 => compress_bzip2(from, to, output_bound).await,
     }
+}
+
+pub(super) fn export_artifact_capacity_bytes(
+    source_bytes: u64,
+    format: ExportArchiveFormat,
+) -> Option<u64> {
+    if format == ExportArchiveFormat::Plain {
+        return Some(source_bytes.max(1));
+    }
+    source_bytes
+        .checked_add(source_bytes.div_ceil(50))
+        .and_then(|bytes| bytes.checked_add(1024 * 1024))
 }
 
 pub(super) async fn move_or_copy_file(from: &FsPath, to: &FsPath) -> Result<(), ApiError> {
@@ -68,7 +87,11 @@ pub(super) async fn move_or_copy_file(from: &FsPath, to: &FsPath) -> Result<(), 
     }
 }
 
-pub(super) async fn compress_gzip(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+pub(super) async fn compress_gzip(
+    source: &FsPath,
+    target: &FsPath,
+    max_output_bytes: u64,
+) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
@@ -80,6 +103,7 @@ pub(super) async fn compress_gzip(source: &FsPath, target: &FsPath) -> Result<()
             }
             let mut input = std::fs::File::open(source)?;
             write_new_private_file(&target, |output| {
+                let output = BoundedExportWriter::new(output, max_output_bytes);
                 let mut encoder =
                     flate2::write::GzEncoder::new(output, flate2::Compression::new(3));
                 copy_limited_until(&mut input, &mut encoder, u64::MAX, deadline)?;
@@ -91,7 +115,11 @@ pub(super) async fn compress_gzip(source: &FsPath, target: &FsPath) -> Result<()
     .await
 }
 
-pub(super) async fn compress_bzip2(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+pub(super) async fn compress_bzip2(
+    source: &FsPath,
+    target: &FsPath,
+    max_output_bytes: u64,
+) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
@@ -103,6 +131,7 @@ pub(super) async fn compress_bzip2(source: &FsPath, target: &FsPath) -> Result<(
             }
             let mut input = std::fs::File::open(source)?;
             write_new_private_file(&target, |output| {
+                let output = BoundedExportWriter::new(output, max_output_bytes);
                 let mut encoder =
                     bzip2::write::BzEncoder::new(output, bzip2::Compression::default());
                 copy_limited_until(&mut input, &mut encoder, u64::MAX, deadline)?;
@@ -112,6 +141,39 @@ pub(super) async fn compress_bzip2(source: &FsPath, target: &FsPath) -> Result<(
         },
     )
     .await
+}
+
+struct BoundedExportWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W> BoundedExportWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<W: Write> Write for BoundedExportWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if u64::try_from(buffer.len()).unwrap_or(u64::MAX) > self.remaining {
+            return Err(std::io::Error::other(
+                "compressed export exceeded its reserved output capacity",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.remaining = self
+            .remaining
+            .saturating_sub(u64::try_from(written).unwrap_or(u64::MAX));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 pub(super) async fn run_archive_file_operation(

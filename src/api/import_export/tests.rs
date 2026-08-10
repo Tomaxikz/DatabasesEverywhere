@@ -72,6 +72,42 @@ fn archive_copy_stops_at_expired_deadline() {
 }
 
 #[test]
+fn logical_archive_accounting_includes_empty_entry_filesystem_overhead() {
+    let accounted = (0..MAX_ARCHIVE_ENTRIES)
+        .try_fold(0_u64, |total, _| logical_archive_accounted_bytes(total, 0));
+
+    assert_eq!(
+        accounted,
+        Some(ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES * MAX_ARCHIVE_ENTRIES as u64)
+    );
+}
+
+#[test]
+fn compressed_export_capacity_covers_worst_case_expansion() {
+    let bound =
+        export_artifact_capacity_bytes(MAX_UNARCHIVED_BYTES, ExportArchiveFormat::Bzip2).unwrap();
+
+    assert!(bound > MAX_UNARCHIVED_BYTES + 64 * 1024 * 1024);
+    assert_eq!(
+        bound,
+        MAX_UNARCHIVED_BYTES + MAX_UNARCHIVED_BYTES.div_ceil(50) + 1024 * 1024
+    );
+}
+
+#[tokio::test]
+async fn compressed_export_cannot_write_past_its_reserved_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.sql");
+    let target = directory.path().join("target.sql.gz");
+    tokio::fs::write(&source, vec![0x5a; 4096]).await.unwrap();
+
+    let error = compress_gzip(&source, &target, 1).await.unwrap_err();
+
+    assert!(matches!(error, ApiError::Runtime(_)));
+    assert!(!target.exists());
+}
+
+#[test]
 fn physical_operation_preserves_primary_error_over_restart_error() {
     let result = preserve_primary_error(
         Err(ApiError::BadRequest("restore failed".to_string())),
@@ -226,9 +262,155 @@ async fn remote_import_staging_budget_is_aggregate() {
 }
 
 #[test]
+fn remote_sql_rewrite_reserves_both_the_source_and_atomic_replacement() {
+    const MIB: u64 = 1024 * 1024;
+    for protocol in [Protocol::Mariadb, Protocol::Mysql, Protocol::Clickhouse] {
+        assert_eq!(
+            jobs::remote_import_staging_reservation_bytes(protocol, 8 * MIB).unwrap(),
+            16 * MIB
+        );
+    }
+    for protocol in [Protocol::Postgres, Protocol::Mongodb, Protocol::Redis] {
+        assert_eq!(
+            jobs::remote_import_staging_reservation_bytes(protocol, 8 * MIB).unwrap(),
+            8 * MIB
+        );
+    }
+    assert!(jobs::remote_import_staging_reservation_bytes(Protocol::Mysql, u64::MAX).is_err());
+}
+
+#[test]
 fn qdrant_uses_physical_archive_extension() {
     assert_eq!(dump_extension(Protocol::Qdrant), "qdrant.tar.gz");
     assert!(dump_candidate_suffixes(Protocol::Qdrant).contains(&".qdrant.tar.gz"));
+}
+
+#[test]
+fn mongodb_gzip_export_is_normalized_to_its_native_gzip_archive() {
+    assert_eq!(
+        normalized_export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Gzip),
+        ExportArchiveFormat::Plain
+    );
+    assert_eq!(
+        normalized_export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Bzip2),
+        ExportArchiveFormat::Bzip2
+    );
+    assert_eq!(
+        normalized_export_archive_format(Protocol::Postgres, ExportArchiveFormat::Gzip),
+        ExportArchiveFormat::Gzip
+    );
+}
+
+#[test]
+fn stored_native_uploads_use_conservative_compressed_scheduler_costs() {
+    let options = ImportOptions {
+        source: ImportSourceOptions::Upload {
+            upload_id: "upload-id".to_string(),
+            path: PathBuf::from("upload-id.upload"),
+        },
+        ..ImportOptions::default()
+    };
+    for protocol in [
+        Protocol::Mongodb,
+        Protocol::Redis,
+        Protocol::Valkey,
+        Protocol::Qdrant,
+    ] {
+        assert!(jobs::import_source_is_compressed(protocol, &options));
+    }
+    assert!(!jobs::import_source_is_compressed(
+        Protocol::Postgres,
+        &options
+    ));
+
+    let prepared_ceiling = 8 * 1024 * 1024 * 1024;
+    assert_eq!(
+        conservative_import_input_bytes(Protocol::Mongodb, 1, prepared_ceiling, 4096, true),
+        prepared_ceiling
+    );
+    for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
+        assert_eq!(
+            conservative_import_input_bytes(protocol, 1, prepared_ceiling, 4096, true),
+            4 * 1024 * 1024 * 1024
+        );
+    }
+}
+
+#[test]
+fn prepared_scheduler_ceilings_follow_each_source_specific_limit() {
+    const MIB: u64 = 1024 * 1024;
+    let upload_limit = 64 * MIB;
+    let remote_limit = 3 * 1024 * MIB;
+    let artifact = ImportOptions {
+        source: ImportSourceOptions::Artifact(PathBuf::from("dump.sql.gz")),
+        ..ImportOptions::default()
+    };
+    assert_eq!(
+        jobs::import_prepared_ceiling_bytes(&artifact, upload_limit, remote_limit, true),
+        MAX_UNARCHIVED_BYTES
+    );
+
+    let upload = ImportOptions {
+        source: ImportSourceOptions::Upload {
+            upload_id: "upload-id".to_string(),
+            path: PathBuf::from("upload-id.upload"),
+        },
+        upload_staging: Some(UploadStagingBudget::Logical {
+            budget: UploadLogicalStagingBudget {
+                prepared_bytes: 32 * MIB,
+                rollback_bytes: 0,
+                reservation_bytes: 32 * MIB,
+            },
+            target_created_at: "created".to_string(),
+            disk_mib: 1024,
+        }),
+        ..ImportOptions::default()
+    };
+    assert_eq!(
+        jobs::import_prepared_ceiling_bytes(&upload, upload_limit, remote_limit, true),
+        upload_limit
+    );
+
+    let remote = ImportOptions {
+        source: ImportSourceOptions::RemoteRequest(RemoteImportRequest {
+            host: "source.example".to_string(),
+            port: None,
+            tls: true,
+            database: None,
+            username: None,
+            password: None,
+            authentication_database: None,
+            database_index: None,
+            api_key: None,
+        }),
+        ..ImportOptions::default()
+    };
+    assert_eq!(
+        jobs::import_prepared_ceiling_bytes(&remote, upload_limit, remote_limit, true),
+        remote_limit
+    );
+}
+
+#[test]
+fn queued_replay_payloads_have_a_bounded_node_wide_memory_envelope() {
+    let scheduler = crate::config::ImportExportSchedulerConfig::default();
+    assert_eq!(scheduler.max_queued_jobs, 1024);
+    assert_eq!(
+        scheduler
+            .max_queued_jobs
+            .checked_mul(jobs::MAX_REPLAY_OPTIONS_BYTES),
+        Some(64 * 1024 * 1024)
+    );
+
+    let oversized = ReplayDescriptor::Export {
+        selection: ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: vec!["x".repeat(jobs::MAX_REPLAY_OPTIONS_BYTES)],
+            ..ImportExportSelection::default()
+        },
+        archive_format: ExportArchiveFormat::Plain,
+    };
+    assert!(jobs::serialize_replay_descriptor(&oversized).is_err());
 }
 
 #[test]
@@ -650,7 +832,7 @@ fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() {
 }
 
 #[test]
-fn mongodb_upload_requires_a_safe_source_database_before_job_admission() {
+fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database() {
     let missing = ImportOptions {
         source: ImportSourceOptions::Upload {
             upload_id: "upload-1".to_string(),
@@ -658,9 +840,7 @@ fn mongodb_upload_requires_a_safe_source_database_before_job_admission() {
         },
         ..ImportOptions::default()
     };
-    let error = validate_upload_source_database(Protocol::Mongodb, &missing).unwrap_err();
-    assert!(matches!(error, ApiError::Conflict(_)));
-    assert!(error.to_string().contains("source.source_database"));
+    validate_upload_source_database(Protocol::Mongodb, &missing).unwrap();
 
     let invalid = ImportOptions {
         source_database: Some("unsafe.name".to_string()),

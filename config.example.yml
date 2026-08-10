@@ -119,7 +119,25 @@ artifacts:
   # Total-transfer and per-body-idle deadlines; neither changes ordinary API limits.
   import_upload_timeout_seconds: 3600
   import_upload_idle_timeout_seconds: 30
-
+  import_export_scheduler:
+    # Dynamic mode admits a large durable queue but starts work only when its
+    # estimated CPU, streaming-memory, and I/O budgets fit. A zero model
+    # recommendation means live memory cannot safely fit one job and must not
+    # be forced to one. CPU/I/O-only oversize runs alone. Set false to use
+    # manual_max_active_jobs as a fixed execution ceiling.
+    dynamic_limiter_enabled: true
+    max_queued_jobs: 1024
+    max_queued_jobs_per_instance: 32
+    manual_max_active_jobs: 16
+    dynamic_max_active_jobs: 256
+    # Zero refreshes effective host/cgroup memory and CPU headroom while the
+    # daemon runs; I/O capacity is derived from upload limits.
+    dynamic_memory_budget_mib: 0
+    dynamic_io_budget_mib: 0
+    dynamic_cpu_units: 0
+    # Also bounds how long a job may wait for auto-detected headroom to recover.
+    starvation_timeout_seconds: 30
+    max_bypass: 8
 backups:
   enabled: false
   interval_minutes: 1440

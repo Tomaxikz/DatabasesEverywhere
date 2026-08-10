@@ -114,10 +114,7 @@ pub(super) fn validate_upload_source_database(
                 false,
             )
         }
-        (Protocol::Mongodb, None) => Err(ApiError::Conflict(
-            "mongodb upload imports require source.source_database so DBEV can safely select and remap the archive namespace"
-                .to_string(),
-        )),
+        (Protocol::Mongodb, None) => Ok(()),
         (_, Some(_)) => Err(ApiError::BadRequest(
             "source.source_database is supported only for mongodb upload imports".to_string(),
         )),

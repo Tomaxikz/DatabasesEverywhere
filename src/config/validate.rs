@@ -9,6 +9,8 @@ use super::{
 };
 use crate::shared::images::is_pinned_image_reference;
 
+mod import_export_scheduler;
+
 const MAX_REMOTE_IMPORT_JOBS: usize = 64;
 const MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: u64 = 5 * 60;
 const MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
@@ -102,6 +104,8 @@ pub enum ConfigValidationError {
     InvalidArtifactRetention,
     #[error("artifacts.{field} is outside the supported range")]
     InvalidImportUploadConfig { field: &'static str },
+    #[error("artifacts.import_export_scheduler.{field} is outside the supported range")]
+    InvalidImportExportSchedulerConfig { field: &'static str },
     #[error("backups.interval_minutes must be greater than zero")]
     InvalidBackupInterval,
     #[error("backups.retention_keep_latest_per_instance must be greater than zero")]
@@ -198,6 +202,7 @@ fn validate_import_uploads(
     if artifacts.import_upload_idle_timeout_seconds > artifacts.import_upload_timeout_seconds {
         return Err(invalid("import_upload_idle_timeout_seconds"));
     }
+    import_export_scheduler::validate(artifacts)?;
     Ok(())
 }
 

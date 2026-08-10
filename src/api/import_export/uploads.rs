@@ -1,10 +1,8 @@
 use std::{
+    collections::HashMap,
     future::Future,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -38,7 +36,9 @@ use super::{
     files::{
         artifact_has_allowed_extension, create_private_directory, create_private_file_blocking,
     },
-    inspection::{DumpArchiveFormat, DumpInspection, inspect_uploaded_dump},
+    inspection::{
+        DumpArchiveFormat, DumpInspection, DumpInspectionFailure, inspect_uploaded_dump_with_format,
+    },
     jobs::queue_import_instance,
     *,
 };
@@ -46,13 +46,21 @@ use super::{
 const FILENAME_HEADER: &str = "x-dbev-filename";
 const SHA256_HEADER: &str = "x-dbev-sha256";
 const MAX_ORIGINAL_FILENAME_BYTES: usize = 180;
-const UPLOAD_DISK_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+const DISK_SAFETY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LISTED_UPLOADS: u32 = 100;
 const MAX_CONCURRENT_INSPECTIONS: usize = 2;
 const MAX_CONCURRENT_IMPORT_STAGING: usize = 2;
 
+mod mongodb;
 #[cfg(test)]
 mod tests;
+mod worker;
+
+pub(super) use mongodb::resolve_upload_source_database_catalog;
+use worker::{
+    UploadWorkerGuards, UploadWorkerOptions, UploadWorkerRecovery, recover_interrupted_upload,
+    spawn_owned_upload_worker,
+};
 
 #[derive(Debug, Clone)]
 pub struct ImportUploadService {
@@ -60,12 +68,24 @@ pub struct ImportUploadService {
     admission: Arc<Semaphore>,
     inspection_admission: Arc<Semaphore>,
     disk_reservation_gate: Arc<Mutex<()>>,
-    reserved_disk_bytes: Arc<AtomicU64>,
+    reserved_disk_bytes_by_filesystem: Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
     staging_admission: Arc<Semaphore>,
 }
 
 impl ImportUploadService {
     pub fn new(repository: ImportUploadRepository, max_concurrent: usize) -> Self {
+        Self::new_with_staging_limit(
+            repository,
+            max_concurrent,
+            max_concurrent.min(MAX_CONCURRENT_IMPORT_STAGING),
+        )
+    }
+
+    pub fn new_with_staging_limit(
+        repository: ImportUploadRepository,
+        max_concurrent: usize,
+        max_concurrent_staging: usize,
+    ) -> Self {
         let max_concurrent = max_concurrent.max(1);
         Self {
             repository,
@@ -74,10 +94,8 @@ impl ImportUploadService {
                 max_concurrent.min(MAX_CONCURRENT_INSPECTIONS),
             )),
             disk_reservation_gate: Arc::new(Mutex::new(())),
-            reserved_disk_bytes: Arc::new(AtomicU64::new(0)),
-            staging_admission: Arc::new(Semaphore::new(
-                max_concurrent.min(MAX_CONCURRENT_IMPORT_STAGING),
-            )),
+            reserved_disk_bytes_by_filesystem: Arc::new(StdMutex::new(HashMap::new())),
+            staging_admission: Arc::new(Semaphore::new(max_concurrent_staging.max(1))),
         }
     }
 
@@ -114,9 +132,9 @@ impl ImportUploadService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::RateLimited)?;
-        let reservation = reserve_disk_capacity(
+        let reservation = reserve_shared_disk_capacity(
             &self.disk_reservation_gate,
-            &self.reserved_disk_bytes,
+            &self.reserved_disk_bytes_by_filesystem,
             root,
             requested,
         )
@@ -126,11 +144,33 @@ impl ImportUploadService {
             _reservation: reservation,
         })
     }
+
+    pub(crate) async fn reserve_output_capacity(
+        &self,
+        root: &std::path::Path,
+        requested: u64,
+    ) -> Result<DiskCapacityReservation, ApiError> {
+        let metadata = tokio::fs::symlink_metadata(root).await.map_err(|error| {
+            ApiError::Runtime(format!("failed to inspect output filesystem: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ApiError::Runtime(
+                "output filesystem root must be a real directory".to_string(),
+            ));
+        }
+        reserve_shared_disk_capacity(
+            &self.disk_reservation_gate,
+            &self.reserved_disk_bytes_by_filesystem,
+            root,
+            requested,
+        )
+        .await
+    }
 }
 
 pub(super) struct ImportStagingPermit {
     _admission: tokio::sync::OwnedSemaphorePermit,
-    _reservation: UploadDiskReservation,
+    _reservation: DiskCapacityReservation,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,7 +369,7 @@ async fn inspect_and_finalize_upload(
 ) -> Result<ImportUpload, ApiError> {
     let upload_id = upload.upload_id.clone();
     let path = upload_file_path(state, &upload)?;
-    let inspection = inspect_uploaded_dump(
+    let inspection = inspect_uploaded_dump_with_format(
         &path,
         upload.protocol,
         upload.archive_format.map(ImportUploadArchiveFormat::as_str),
@@ -352,10 +392,8 @@ async fn inspect_and_finalize_upload(
             let catalog_json = serde_json::to_string(&catalog).map_err(|error| {
                 ApiError::Runtime(format!("failed to encode upload catalog: {error}"))
             })?;
-            let confirmed_archive_format = catalog
-                .detected_archive_format
-                .import_archive_format(upload.protocol)
-                .map(|_| storage_archive_format(catalog.detected_archive_format));
+            let confirmed_archive_format =
+                confirmed_storage_archive_format(upload.protocol, catalog.detected_archive_format);
             if !state
                 .import_uploads
                 .repository()
@@ -375,7 +413,10 @@ async fn inspect_and_finalize_upload(
                 ));
             }
         }
-        Err(error @ ApiError::BadRequest(_)) => {
+        Err(DumpInspectionFailure {
+            error: error @ ApiError::BadRequest(_),
+            ..
+        }) => {
             let message = PublicDiagnostic::from_api_error("dump inspection", &error).message;
             let _ = state
                 .import_uploads
@@ -385,15 +426,20 @@ async fn inspect_and_finalize_upload(
                 .map_err(upload_storage_error)?;
             return Err(error);
         }
-        Err(error) => {
+        Err(DumpInspectionFailure {
+            error,
+            detected_archive_format,
+        }) => {
             let message = PublicDiagnostic::from_api_error("dump inspection", &error).message;
+            let confirmed_archive_format = detected_archive_format
+                .and_then(|format| confirmed_storage_archive_format(upload.protocol, format));
             let restored = state
                 .import_uploads
                 .repository()
                 .restore_ready_after_processing(
                     instance_id,
                     &upload_id,
-                    None,
+                    confirmed_archive_format,
                     None,
                     Some(&message),
                     &now_rfc3339(),
@@ -488,13 +534,13 @@ async fn upload_dump(
             "the uploaded filename has no supported database dump extension".to_string(),
         ));
     }
-    let _permit = state
+    let admission = state
         .import_uploads
         .admission
         .clone()
         .try_acquire_owned()
         .map_err(|_| ApiError::RateLimited)?;
-    let _instance_operation = state.instance_locks.lock(instance_id).await;
+    let instance_operation = state.instance_locks.lock(instance_id).await;
     let metadata = state
         .instances
         .get(instance_id)
@@ -504,7 +550,7 @@ async fn upload_dump(
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let root = paths.imports.join(".uploads");
     create_private_directory(&root, "managed import upload directory").await?;
-    let _disk_reservation = reserve_upload_disk_space(state, &root, declared_size).await?;
+    let disk_reservation = reserve_upload_disk_space(state, &root, declared_size).await?;
 
     let upload_id = format!("upl_{}", uuid::Uuid::new_v4().simple());
     let stored_filename = format!("{upload_id}.upload");
@@ -546,83 +592,46 @@ async fn upload_dump(
     };
     let partial_path = root.join(format!(".{stored_filename}.partial"));
     let final_path = root.join(&stored_filename);
-    let receive = receive_upload_body(
-        request.into_body(),
-        &partial_path,
-        declared_size,
-        expected_sha256.as_deref(),
-        Duration::from_secs(config.import_upload_idle_timeout_seconds),
+    let recovery = UploadWorkerRecovery::new(
+        state.import_uploads.repository().clone(),
+        upload,
+        partial_path,
+        final_path,
     );
-    let digest = match tokio::time::timeout(
-        Duration::from_secs(config.import_upload_timeout_seconds),
-        receive,
-    )
-    .await
-    {
-        Ok(Ok(digest)) => digest,
-        Ok(Err(error)) => {
-            cleanup_failed_upload(state, &upload, &partial_path).await;
-            return Err(error);
-        }
-        Err(_) => {
-            cleanup_failed_upload(state, &upload, &partial_path).await;
-            return Err(ApiError::RequestRejected {
-                status: StatusCode::REQUEST_TIMEOUT,
-                message: "upload exceeded its total time limit".to_string(),
-            });
+    let guards = Arc::new(UploadWorkerGuards::new(
+        admission,
+        instance_operation,
+        disk_reservation,
+    ));
+    let worker = spawn_owned_upload_worker(
+        recovery.clone(),
+        guards.clone(),
+        request.into_body(),
+        UploadWorkerOptions {
+            declared_size,
+            expected_sha256,
+            idle_timeout: Duration::from_secs(config.import_upload_idle_timeout_seconds),
+            total_timeout: Duration::from_secs(config.import_upload_timeout_seconds),
+        },
+    );
+    let committed = match worker.await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup_error) = recover_interrupted_upload(&recovery).await {
+                tracing::error!(
+                    upload_id,
+                    %cleanup_error,
+                    "failed upload join recovery will be retried during boot recovery"
+                );
+            }
+            drop(guards);
+            return Err(ApiError::Runtime(format!(
+                "upload worker stopped before completion: {error}"
+            )));
         }
     };
-    if let Err(error) = tokio::fs::rename(&partial_path, &final_path).await {
-        cleanup_failed_upload(state, &upload, &partial_path).await;
-        return Err(ApiError::Runtime(format!(
-            "failed to publish completed upload: {error}"
-        )));
-    }
-    let durable_path = final_path.clone();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        crate::shared::files::sync_private_regular_file_durable(&durable_path)
-    })
-    .await
-    .map_err(|error| std::io::Error::other(error.to_string()))
-    .and_then(|result| result)
-    {
-        cleanup_completed_upload(state, &upload).await;
-        return Err(ApiError::Runtime(format!(
-            "failed to make completed upload durable: {error}"
-        )));
-    }
-    if !state
-        .import_uploads
-        .repository()
-        .mark_uploaded(
-            instance_id,
-            &upload_id,
-            declared_size,
-            &digest,
-            &now_rfc3339(),
-        )
-        .await
-        .map_err(upload_storage_error)?
-        || !state
-            .import_uploads
-            .repository()
-            .mark_ready(instance_id, &upload_id, None, &now_rfc3339())
-            .await
-            .map_err(upload_storage_error)?
-    {
-        cleanup_completed_upload(state, &upload).await;
-        return Err(ApiError::Runtime(
-            "completed upload could not be committed safely".to_string(),
-        ));
-    }
-    tracing::info!(
-        event = "audit import_upload_completed",
-        instance_id,
-        upload_id,
-        size_bytes = declared_size,
-        protocol = metadata.protocol.as_str()
-    );
-    let committed = load_upload(state, instance_id, &upload_id).await?;
+    drop(guards);
+    let committed = committed?;
     Ok(ApiResponse::with_status(
         StatusCode::CREATED,
         public_upload(committed)?,
@@ -638,6 +647,15 @@ fn storage_archive_format(format: DumpArchiveFormat) -> ImportUploadArchiveForma
         DumpArchiveFormat::TarGzip => ImportUploadArchiveFormat::TarGzip,
         DumpArchiveFormat::Zip => ImportUploadArchiveFormat::Zip,
     }
+}
+
+fn confirmed_storage_archive_format(
+    protocol: Protocol,
+    format: DumpArchiveFormat,
+) -> Option<ImportUploadArchiveFormat> {
+    format
+        .import_archive_format(protocol)
+        .map(|_| storage_archive_format(format))
 }
 
 fn upload_archive_format(filename: &str, protocol: Protocol) -> Option<ImportUploadArchiveFormat> {
@@ -923,16 +941,23 @@ pub(super) async fn harden_upload_source(
             "temporary import upload size changed after reception".to_string(),
         ));
     }
-    let archive_format = match (target_protocol, upload.archive_format) {
-        (Protocol::Redis | Protocol::Valkey | Protocol::Qdrant, _)
-        | (Protocol::Mongodb, Some(ImportUploadArchiveFormat::Gzip))
-        | (_, Some(ImportUploadArchiveFormat::Plain) | None) => None,
-        (_, Some(format)) => Some(format.as_str().to_string()),
-    };
+    let archive_format = hardened_upload_archive_format(target_protocol, upload.archive_format);
     Ok((
         ImportSourceOptions::Upload { upload_id, path },
         archive_format,
     ))
+}
+
+fn hardened_upload_archive_format(
+    target_protocol: Protocol,
+    archive_format: Option<ImportUploadArchiveFormat>,
+) -> Option<String> {
+    match (target_protocol, archive_format) {
+        (Protocol::Redis | Protocol::Valkey | Protocol::Qdrant, _)
+        | (Protocol::Mongodb, Some(ImportUploadArchiveFormat::Gzip))
+        | (_, Some(ImportUploadArchiveFormat::Plain) | None) => None,
+        (_, Some(format)) => Some(format.as_str().to_string()),
+    }
 }
 
 pub(super) async fn validate_upload_selection_capability(
@@ -1108,97 +1133,34 @@ pub(super) async fn finish_upload_import_job(
     }
 }
 
-async fn cleanup_failed_upload(
-    state: &AppState,
-    upload: &ImportUpload,
-    partial_path: &std::path::Path,
-) {
-    if let Err(error) = remove_partial_upload_file(partial_path).await {
-        tracing::error!(upload_id = upload.upload_id, %error, "failed to durably remove rejected partial upload; recovery row retained");
-        return;
-    }
-    if let Err(error) = state
-        .import_uploads
-        .repository()
-        .abort_uploading(&upload.instance_id, &upload.upload_id)
-        .await
-    {
-        tracing::error!(upload_id = upload.upload_id, %error, "failed to remove rejected upload row");
-    }
-}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FilesystemIdentity(String);
 
-async fn remove_partial_upload_file(partial_path: &std::path::Path) -> Result<(), ApiError> {
-    let partial_path = partial_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        crate::shared::files::remove_private_file_durable(&partial_path)
-    })
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to join partial upload cleanup: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to delete partial upload: {error}")))
-}
-
-async fn cleanup_completed_upload(state: &AppState, upload: &ImportUpload) {
-    let current = match load_upload(state, &upload.instance_id, &upload.upload_id).await {
-        Ok(current) => current,
-        Err(error) => {
-            tracing::error!(upload_id = upload.upload_id, %error, "failed to load rejected completed upload for cleanup");
-            return;
-        }
-    };
-    if current.state == ImportUploadState::Uploading {
-        if let Err(error) = remove_upload_file(state, &current).await {
-            tracing::error!(upload_id = upload.upload_id, %error, "failed to remove rejected uploading file");
-            return;
-        }
-        if let Err(error) = state
-            .import_uploads
-            .repository()
-            .abort_uploading(&upload.instance_id, &upload.upload_id)
-            .await
-        {
-            tracing::error!(upload_id = upload.upload_id, %error, "failed to remove rejected uploading row");
-        }
-        return;
-    }
-    let claimed = state
-        .import_uploads
-        .repository()
-        .claim_for_deletion(&upload.instance_id, &upload.upload_id, &now_rfc3339())
-        .await;
-    if !matches!(claimed, Ok(true)) {
-        tracing::error!(
-            upload_id = upload.upload_id,
-            "failed to claim rejected completed upload for cleanup"
-        );
-        return;
-    }
-    if let Err(error) = remove_upload_file(state, &current).await {
-        tracing::error!(upload_id = upload.upload_id, %error, "failed to remove rejected completed upload");
-        return;
-    }
-    if let Err(error) = state
-        .import_uploads
-        .repository()
-        .finalize_delete(&upload.instance_id, &upload.upload_id)
-        .await
-    {
-        tracing::error!(upload_id = upload.upload_id, %error, "failed to finalize rejected completed upload cleanup");
-    }
-}
-
-struct UploadDiskReservation {
+pub(crate) struct DiskCapacityReservation {
+    filesystem: FilesystemIdentity,
     bytes: u64,
-    total: Arc<AtomicU64>,
+    totals: Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
 }
 
-impl Drop for UploadDiskReservation {
+impl Drop for DiskCapacityReservation {
     fn drop(&mut self) {
-        let released = self
-            .total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(self.bytes)
-            });
-        debug_assert!(released.is_ok(), "upload disk reservation underflow");
+        let mut totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(total) = totals.get_mut(&self.filesystem) else {
+            debug_assert!(false, "output capacity reservation identity was missing");
+            return;
+        };
+        let Some(remaining) = total.checked_sub(self.bytes) else {
+            debug_assert!(false, "output capacity reservation underflow");
+            return;
+        };
+        if remaining == 0 {
+            totals.remove(&self.filesystem);
+        } else {
+            *total = remaining;
+        }
     }
 }
 
@@ -1206,58 +1168,117 @@ async fn reserve_upload_disk_space(
     state: &AppState,
     root: &std::path::Path,
     requested: u64,
-) -> Result<UploadDiskReservation, ApiError> {
-    reserve_disk_capacity(
+) -> Result<DiskCapacityReservation, ApiError> {
+    reserve_shared_disk_capacity(
         &state.import_uploads.disk_reservation_gate,
-        &state.import_uploads.reserved_disk_bytes,
+        &state.import_uploads.reserved_disk_bytes_by_filesystem,
         root,
         requested,
     )
     .await
 }
 
-async fn reserve_disk_capacity(
+async fn reserve_shared_disk_capacity(
     gate: &Mutex<()>,
-    total: &Arc<AtomicU64>,
+    totals: &Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
     root: &std::path::Path,
     requested: u64,
-) -> Result<UploadDiskReservation, ApiError> {
+) -> Result<DiskCapacityReservation, ApiError> {
     let _reservation_gate = gate.lock().await;
-    let already_reserved = total.load(Ordering::Acquire);
-    ensure_upload_disk_space(root, requested, already_reserved).await?;
-    total.fetch_add(requested, Ordering::AcqRel);
-    Ok(UploadDiskReservation {
+    let metadata = std::fs::metadata(root).map_err(|error| {
+        ApiError::Runtime(format!("failed to identify output filesystem: {error}"))
+    })?;
+    let filesystem = filesystem_identity(root, &metadata)?;
+    let already_reserved = totals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&filesystem)
+        .copied()
+        .unwrap_or(0);
+    ensure_disk_space(root, requested, already_reserved).await?;
+    let mut totals_guard = totals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = totals_guard.entry(filesystem.clone()).or_default();
+    *total = total
+        .checked_add(requested)
+        .ok_or_else(|| ApiError::Conflict("output capacity reservation overflowed".to_string()))?;
+    drop(totals_guard);
+    Ok(DiskCapacityReservation {
+        filesystem,
         bytes: requested,
-        total: total.clone(),
+        totals: totals.clone(),
     })
 }
 
-async fn ensure_upload_disk_space(
+#[cfg(unix)]
+fn filesystem_identity(
+    _root: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> Result<FilesystemIdentity, ApiError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(FilesystemIdentity(format!(
+        "unix-device:{}",
+        metadata.dev()
+    )))
+}
+
+#[cfg(windows)]
+fn filesystem_identity(
+    root: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<FilesystemIdentity, ApiError> {
+    use std::path::Component;
+    let prefix = root
+        .components()
+        .find_map(|component| match component {
+            Component::Prefix(prefix) => Some(prefix.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .ok_or_else(|| ApiError::Runtime("output path has no Windows volume prefix".to_string()))?;
+    Ok(FilesystemIdentity(format!("windows-volume:{prefix}")))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_identity(
+    root: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<FilesystemIdentity, ApiError> {
+    let canonical = std::fs::canonicalize(root).map_err(|error| {
+        ApiError::Runtime(format!("failed to resolve output filesystem: {error}"))
+    })?;
+    Ok(FilesystemIdentity(format!(
+        "filesystem-root:{}",
+        canonical.display()
+    )))
+}
+
+async fn ensure_disk_space(
     root: &std::path::Path,
     requested: u64,
     already_reserved: u64,
 ) -> Result<(), ApiError> {
     let sample = crate::api::resources::read_host_disk(
         root.to_str()
-            .ok_or_else(|| ApiError::Runtime("upload path is not valid UTF-8".to_string()))?,
+            .ok_or_else(|| ApiError::Runtime("storage path is not valid UTF-8".to_string()))?,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to inspect upload capacity: {error}")))?;
-    let required = required_upload_capacity(requested, already_reserved)?;
+    .map_err(|error| ApiError::Runtime(format!("failed to inspect storage capacity: {error}")))?;
+    let required = required_disk_capacity(requested, already_reserved)?;
     if sample.available_bytes < required {
         return Err(ApiError::Conflict(format!(
-            "upload needs {required} bytes including safety reserve, but only {} bytes are available",
+            "operation needs {required} bytes of output capacity including the safety reserve, but only {} bytes are available",
             sample.available_bytes
         )));
     }
     Ok(())
 }
 
-fn required_upload_capacity(requested: u64, already_reserved: u64) -> Result<u64, ApiError> {
+fn required_disk_capacity(requested: u64, already_reserved: u64) -> Result<u64, ApiError> {
     requested
         .checked_add(already_reserved)
-        .and_then(|bytes| bytes.checked_add(UPLOAD_DISK_RESERVE_BYTES))
-        .ok_or_else(|| ApiError::Conflict("upload disk reservation overflowed".to_string()))
+        .and_then(|bytes| bytes.checked_add(DISK_SAFETY_RESERVE_BYTES))
+        .ok_or_else(|| ApiError::Conflict("output capacity reservation overflowed".to_string()))
 }
 
 fn expiration_timestamp(ttl_hours: u64) -> Result<String, ApiError> {
@@ -1307,12 +1328,12 @@ mod upload_tests {
         std::fs::write(&victim, b"keep").unwrap();
         symlink(&victim, &partial).unwrap();
 
-        remove_partial_upload_file(&partial).await.unwrap();
+        worker::remove_worker_file(&partial).await.unwrap();
         assert!(!partial.exists());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
-        remove_partial_upload_file(&partial).await.unwrap();
+        worker::remove_worker_file(&partial).await.unwrap();
 
         let missing_parent = directory.path().join("missing").join("partial");
-        assert!(remove_partial_upload_file(&missing_parent).await.is_err());
+        assert!(worker::remove_worker_file(&missing_parent).await.is_err());
     }
 }

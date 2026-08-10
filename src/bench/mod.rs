@@ -1,5 +1,6 @@
 mod http;
 mod metrics;
+mod recommendation;
 mod report;
 mod resources;
 
@@ -27,11 +28,12 @@ use self::{
         BenchmarkOptionsReport, BenchmarkReport, EnvironmentReport, HttpPhaseReport, RequestSample,
         ResourceSample, TargetInstanceReport,
     },
+    recommendation::build_manual_active_jobs_recommendation,
     report::{print_terminal_report, reserve_report_directory, write_reports},
     resources::{InstanceSampleTarget, ResourceSampler},
 };
 
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 4;
 const DEFAULT_WARMUP_REQUESTS: usize = 10;
 const DEFAULT_LATENCY_SAMPLES: usize = 50;
 const DEFAULT_CONCURRENT_REQUESTS: usize = 400;
@@ -145,6 +147,15 @@ pub struct BenchArgs {
     )]
     pub bench_import_export: bool,
 
+    /// Report model-based manual active-job recommendations without changing configuration.
+    #[arg(
+        long,
+        env = "DBEV_BENCH_RECOMMEND_MANUAL_ACTIVE_JOBS",
+        action = ArgAction::SetTrue,
+        requires_all = ["bench", "bench_instance", "bench_import_export"]
+    )]
+    pub bench_recommend_manual_active_jobs: bool,
+
     /// Retain the fresh export artifact after a successful benchmark import.
     #[arg(
         long,
@@ -237,6 +248,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         timeout_seconds: args.bench_timeout_seconds,
         sample_interval_ms: args.bench_sample_interval_ms,
         import_export_enabled: args.bench_import_export,
+        recommend_manual_active_jobs: args.bench_recommend_manual_active_jobs,
         keep_artifact: args.bench_keep_artifact,
     };
     let mut report = BenchmarkReport {
@@ -268,6 +280,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         http_phases: Vec::new(),
         websocket: None,
         jobs: Vec::new(),
+        manual_active_jobs_recommendation: None,
         resources: None,
         warnings: Vec::new(),
         errors: Vec::new(),
@@ -322,6 +335,12 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                 .as_str()
                 .ok_or_else(|| anyhow!("instance response did not contain status"))?
                 .to_string();
+            let disk_mib = instance["limits"]["disk_mib"].as_u64();
+            if args.bench_recommend_manual_active_jobs && disk_mib.is_none() {
+                return Err(anyhow!(
+                    "manual active-job recommendation requires limits.disk_mib in the instance response"
+                ));
+            }
             if args.bench_import_export && status != "running" {
                 return Err(anyhow!(
                     "destructive import/export benchmark requires a running instance; {instance_id} is {status}"
@@ -331,6 +350,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                 instance_id: instance_id.to_string(),
                 protocol,
                 initial_status: status,
+                disk_mib,
             });
         } else if args.bench_max_instances > 0 {
             let value = client
@@ -344,6 +364,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                     instance_id: instance.instance_id,
                     protocol: instance.protocol,
                     initial_status: instance.status,
+                    disk_mib: None,
                 })
                 .collect::<Vec<_>>();
             if running.is_empty() {
@@ -477,6 +498,30 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                     args.bench_keep_artifact,
                 )
                 .await;
+            if args.bench_recommend_manual_active_jobs {
+                let target = selected_instances.first().ok_or_else(|| {
+                    anyhow!("manual active-job recommendation requires a selected instance")
+                })?;
+                let recommendation = build_manual_active_jobs_recommendation(
+                    &client,
+                    &config,
+                    &system,
+                    target.protocol,
+                    target.disk_mib,
+                    &import_export.jobs,
+                )
+                .await;
+                if recommendation.status != "available" {
+                    report.warnings.push(format!(
+                        "manual active-job recommendation unavailable: {}",
+                        recommendation
+                            .unavailable_reason
+                            .as_deref()
+                            .unwrap_or("no diagnostic")
+                    ));
+                }
+                report.manual_active_jobs_recommendation = Some(recommendation);
+            }
             for job in &import_export.jobs {
                 if job.status != "succeeded" {
                     report.errors.push(format!(
@@ -651,6 +696,7 @@ struct SelectedBenchmarkInstance {
     instance_id: String,
     protocol: Protocol,
     initial_status: String,
+    disk_mib: Option<u64>,
 }
 
 impl SelectedBenchmarkInstance {
@@ -762,6 +808,13 @@ fn validate_args(args: &BenchArgs) -> anyhow::Result<()> {
             "--bench-import-export requires an exact --bench-instance target"
         ));
     }
+    if args.bench_recommend_manual_active_jobs
+        && (!args.bench_import_export || args.bench_instance.is_none())
+    {
+        return Err(anyhow!(
+            "--bench-recommend-manual-active-jobs requires --bench-import-export and an exact --bench-instance target"
+        ));
+    }
     Ok(())
 }
 
@@ -838,7 +891,8 @@ fn warn_about_rate_limit(args: &BenchArgs, config: &Config, warnings: &mut Vec<S
         .saturating_add(args.bench_latency_samples)
         .saturating_add(args.bench_requests)
         .saturating_add(args.bench_websockets)
-        .saturating_add(3);
+        .saturating_add(3)
+        .saturating_add(usize::from(args.bench_recommend_manual_active_jobs) * 2);
     let limit = config.security.api_rate_limit_per_minute as usize;
     if planned_node_token_requests > limit {
         warnings.push(format!(
@@ -908,6 +962,24 @@ mod tests {
         ])
         .unwrap();
         assert!(enabled.bench.bench_import_export);
+    }
+
+    #[test]
+    fn manual_active_job_recommendation_requires_destructive_instance_benchmark() {
+        assert!(
+            BenchCli::try_parse_from(["dbev", "--bench", "--bench-recommend-manual-active-jobs",])
+                .is_err()
+        );
+        let parsed = BenchCli::try_parse_from([
+            "dbev",
+            "--bench",
+            "--bench-instance",
+            "perf-mongodb",
+            "--bench-import-export",
+            "--bench-recommend-manual-active-jobs",
+        ])
+        .unwrap();
+        assert!(parsed.bench.bench_recommend_manual_active_jobs);
     }
 
     #[test]
@@ -1016,6 +1088,7 @@ paths:
             bench_concurrency: DEFAULT_CONCURRENCY,
             bench_websockets: DEFAULT_WEBSOCKET_CONNECTIONS,
             bench_import_export: false,
+            bench_recommend_manual_active_jobs: false,
             bench_keep_artifact: false,
             bench_insecure_tls: false,
             bench_timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
