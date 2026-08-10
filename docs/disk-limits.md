@@ -17,6 +17,10 @@ disk:
   fuse_quota_rescan_interval_seconds: 150
   soft_scanner:
     scan_interval_seconds: 15
+    use_inotify: true
+    full_scan_interval_seconds: 90
+    inotify_debounce_milliseconds: 500
+    max_dirty_paths_per_instance: 512
     max_concurrent_scans: 2
     max_entries_per_scan: 1000000
     scan_timeout_seconds: 30
@@ -25,6 +29,30 @@ disk:
     recovery_percent: 85
     shutdown_grace_seconds: 30
 ```
+
+The soft scanner uses the same hybrid model as Wings: one recursive inotify
+watcher coalesces changed paths, bounded partial scans replace only affected
+subtrees in the cached usage tree, and periodic full scans reconcile anything
+notifications cannot observe. DBEV additionally treats queue overflow, watcher
+errors, cache/root replacement, and dirty-path saturation as mandatory full
+reconciliation. A watcher failure never disables enforcement; that instance
+falls back to periodic full scans. Qdrant always receives a full scan at
+`scan_interval_seconds` because mmap-backed writes may not emit inotify events.
+
+The configured target interval for authoritative full scans is the greater of
+`full_scan_interval_seconds` and `scan_interval_seconds`, and both are bounded
+to one hour. Completion can be later when the active scanner fleet generates
+more work than `max_concurrent_scans` can process. Size concurrency for the
+number and size of instances, and monitor scanner completion latency; this is
+one reason soft enforcement is intentionally not described as a hard quota.
+This preserves older configurations that used a longer base interval.
+`max_dirty_paths_per_instance` bounds memory during event storms; exceeding it
+deliberately collapses the hints into one full scan. Incremental usage trees are
+additionally capped at 4,096 directories per instance and 32,768 directories
+process-wide. A target that exceeds either cache cap drops its tree and safely
+uses the original bounded-memory streaming full scan. Inotify is an
+accelerator, not a quota boundary: only native project quotas or FuseQuota
+provide hard write-time enforcement.
 
 `disk.mode` accepts:
 

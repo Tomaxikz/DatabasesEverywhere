@@ -922,6 +922,24 @@ mod disk_config_tests {
         assert!(!yaml.contains("host_filesystem_quota"));
         assert!(yaml.contains("project_id_base:"));
     }
+
+    #[test]
+    fn legacy_soft_scanner_config_receives_safe_hybrid_defaults() {
+        let scanner: SoftDiskScannerConfig = serde_yaml::from_str(
+            r#"
+scan_interval_seconds: 20
+max_concurrent_scans: 3
+"#,
+        )
+        .unwrap();
+
+        assert!(scanner.use_inotify);
+        assert_eq!(scanner.full_scan_interval_seconds, 90);
+        assert_eq!(scanner.inotify_debounce_milliseconds, 500);
+        assert_eq!(scanner.max_dirty_paths_per_instance, 512);
+        assert_eq!(scanner.scan_interval_seconds, 20);
+        assert_eq!(scanner.max_concurrent_scans, 3);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -944,8 +962,23 @@ pub enum DiskLimitSelection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SoftDiskScannerConfig {
-    /// Maximum delay between complete directory scans.
+    /// Base scheduler interval. It is also the authoritative full-scan
+    /// interval for protocols such as Qdrant whose mmap writes may not emit
+    /// filesystem notifications.
     pub scan_interval_seconds: u64,
+    /// Use one process-wide recursive inotify watcher to prioritize changed
+    /// instances and perform bounded incremental subtree reconciliation.
+    /// Periodic full scans remain authoritative when this is disabled or the
+    /// host watcher is unavailable.
+    pub use_inotify: bool,
+    /// Maximum time between authoritative full scans while incremental
+    /// inotify-driven scans are healthy.
+    pub full_scan_interval_seconds: u64,
+    /// Coalesce event bursts for this long before scanning dirty subtrees.
+    pub inotify_debounce_milliseconds: u64,
+    /// Maximum independent dirty subtrees retained for one instance. Hitting
+    /// the bound discards the hints and forces a full reconciliation.
+    pub max_dirty_paths_per_instance: usize,
     /// Concurrent directory walks across all instances.
     pub max_concurrent_scans: usize,
     /// Per-instance entry bound for a single walk.
@@ -969,6 +1002,10 @@ impl Default for SoftDiskScannerConfig {
     fn default() -> Self {
         Self {
             scan_interval_seconds: 15,
+            use_inotify: true,
+            full_scan_interval_seconds: 90,
+            inotify_debounce_milliseconds: 500,
+            max_dirty_paths_per_instance: 512,
             max_concurrent_scans: 2,
             max_entries_per_scan: 1_000_000,
             scan_timeout_seconds: 30,

@@ -1,20 +1,41 @@
 use std::{
     collections::HashMap,
     future::Future,
-    path::{Path, PathBuf},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use tokio::sync::{Mutex, Semaphore};
+
+use sha2::Digest;
 
 use crate::{
     config::{DiskLimitMode, SoftDiskScannerConfig},
     shared::protocol::Protocol,
 };
 
-use super::usage::{DirectoryUsage, ScanLimits, scan_directory_blocking};
+use super::usage::{DirectoryUsage, ScanLimits, scan_directory_blocking_identified};
+
+// Bound tenant-controlled incremental state; larger trees stream full scans.
+const DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET: usize = 4_096;
+const DEFAULT_MAX_CACHED_DIRECTORIES_GLOBAL: usize = 32_768;
+
+pub(crate) mod planner;
+pub(crate) mod usage_tree;
+pub(crate) mod watcher;
+
+#[path = "soft/growth.rs"]
+mod growth;
+
+#[cfg(test)]
+#[path = "soft/hybrid_tests.rs"]
+mod hybrid_tests;
 
 pub(crate) type RuntimeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 pub(crate) type StopRuntimeFuture<'a> =
@@ -27,9 +48,25 @@ pub struct SoftDiskTarget {
     pub protocol: Protocol,
     pub data_path: PathBuf,
     pub limit_bytes: u64,
-    /// Durable normalized metadata bit. It survives daemon restarts so usage
-    /// between recovery and stop thresholds cannot bypass hysteresis.
+    /// Durable restart hysteresis owned by the disk limiter.
     pub durable_blocked: bool,
+}
+
+impl SoftDiskTarget {
+    /// Process-local fingerprint of the instance generation and disk policy.
+    pub(crate) fn scanner_fingerprint(&self) -> String {
+        let mut digest = sha2::Sha256::new();
+        for component in [
+            self.created_at.as_bytes(),
+            self.protocol.as_str().as_bytes(),
+            self.data_path.as_os_str().as_bytes(),
+            &self.limit_bytes.to_le_bytes(),
+        ] {
+            digest.update(component.len().to_le_bytes());
+            digest.update(component);
+        }
+        format!("{:x}", digest.finalize())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,9 +121,7 @@ impl SoftDiskBlockReason {
 }
 
 pub trait SoftDiskRuntime: Send + Sync {
-    /// Persist an intentional stopped state before touching the runtime. This
-    /// keeps event reconciliation and daemon restarts from reviving a tenant
-    /// whose data is still above the safe threshold.
+    /// Persist stopped intent before touching the runtime.
     fn mark_disk_blocked<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
@@ -101,17 +136,12 @@ pub trait SoftDiskRuntime: Send + Sync {
 
     fn force_kill<'a>(&'a self, target: &'a SoftDiskTarget) -> RuntimeFuture<'a>;
 
-    /// Clear only the limiter-owned durable restart block after a fresh scan
-    /// crosses below recovery hysteresis. Operator-requested stopped state is
-    /// intentionally separate and is never inferred or changed here.
+    /// Clear only the limiter-owned block after crossing recovery hysteresis.
     fn clear_disk_blocked<'a>(&'a self, _target: &'a SoftDiskTarget) -> RuntimeFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 
-    /// Atomically persist the stop intent and enforce it. Production runtimes
-    /// override this method to hold their per-instance lifecycle lock across
-    /// both operations; the default keeps lightweight deterministic mocks
-    /// useful without coupling this module to API state.
+    /// Persist and enforce stop intent; production wraps this in a lifecycle lock.
     fn enforce_disk_stop<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
@@ -144,6 +174,31 @@ pub enum ScanOutcome {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum HybridScanRequest {
+    /// Authoritative O(depth) scan that does not retain incremental state.
+    StreamingFull,
+    Full,
+    Partial {
+        relative_directories: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PerformedScanKind {
+    Full,
+    Partial,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HybridScanExecution {
+    pub(crate) outcome: ScanOutcome,
+    pub(crate) performed: PerformedScanKind,
+    /// False when fail-closed enforcement used an older trustworthy sample.
+    pub(crate) measurement_succeeded: bool,
+    pub(crate) root_identity: Option<usage_tree::RootIdentity>,
+}
+
 impl ScanOutcome {
     pub fn snapshot(&self) -> &SoftDiskSnapshot {
         match self {
@@ -162,7 +217,16 @@ pub struct SoftDiskLimiter {
     states: Arc<Mutex<HashMap<String, TrackerState>>>,
     scan_failures: Arc<Mutex<HashMap<String, TargetScanFailures>>>,
     capacity_outage_failures: Arc<Mutex<u8>>,
+    usage_trees: Arc<Mutex<HashMap<String, UsageTreeState>>>,
+    cached_directories: Arc<AtomicUsize>,
+    usage_cache_limits: UsageCacheLimits,
     permits: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageCacheLimits {
+    per_target_directories: usize,
+    global_directories: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +235,137 @@ struct TargetFingerprint {
     protocol: Protocol,
     data_path: PathBuf,
     limit_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct UsageTreeState {
+    target: TargetFingerprint,
+    slot: Arc<UsageTreeSlot>,
+}
+
+#[derive(Debug)]
+struct UsageTreeSlot {
+    state: std::sync::Mutex<UsageTreeSlotState>,
+    cached_directories: Arc<AtomicUsize>,
+    global_directory_limit: usize,
+}
+
+#[derive(Debug, Default)]
+struct UsageTreeSlotState {
+    cache: Option<usage_tree::UsageTreeCache>,
+    cached_directory_count: usize,
+    streaming_only: bool,
+}
+
+impl UsageTreeSlot {
+    fn new(cached_directories: Arc<AtomicUsize>, global_directory_limit: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(UsageTreeSlotState::default()),
+            cached_directories,
+            global_directory_limit,
+        }
+    }
+
+    fn install_cache(
+        &self,
+        state: &mut UsageTreeSlotState,
+        cache: usage_tree::UsageTreeCache,
+    ) -> bool {
+        if state.streaming_only {
+            return false;
+        }
+        let old_count = state.cached_directory_count;
+        let new_count = cache.directory_count();
+        if new_count > old_count
+            && !reserve_cached_directories(
+                &self.cached_directories,
+                new_count - old_count,
+                self.global_directory_limit,
+            )
+        {
+            self.switch_to_streaming(state);
+            return false;
+        }
+        if old_count > new_count {
+            release_cached_directories(&self.cached_directories, old_count - new_count);
+        }
+        state.cached_directory_count = new_count;
+        state.cache = Some(cache);
+        true
+    }
+
+    /// Reserve the reconciled cache size before publishing it.
+    fn account_reconciled_cache(&self, state: &mut UsageTreeSlotState) -> bool {
+        let Some(new_count) = state
+            .cache
+            .as_ref()
+            .map(usage_tree::UsageTreeCache::directory_count)
+        else {
+            return false;
+        };
+        let old_count = state.cached_directory_count;
+        if new_count > old_count
+            && !reserve_cached_directories(
+                &self.cached_directories,
+                new_count - old_count,
+                self.global_directory_limit,
+            )
+        {
+            self.switch_to_streaming(state);
+            return false;
+        }
+        if old_count > new_count {
+            release_cached_directories(&self.cached_directories, old_count - new_count);
+        }
+        state.cached_directory_count = new_count;
+        true
+    }
+
+    fn switch_to_streaming(&self, state: &mut UsageTreeSlotState) {
+        release_cached_directories(&self.cached_directories, state.cached_directory_count);
+        state.cached_directory_count = 0;
+        state.cache = None;
+        state.streaming_only = true;
+    }
+}
+
+impl Drop for UsageTreeSlot {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        release_cached_directories(&self.cached_directories, state.cached_directory_count);
+        state.cached_directory_count = 0;
+    }
+}
+
+fn reserve_cached_directories(counter: &AtomicUsize, additional: usize, limit: usize) -> bool {
+    if additional == 0 {
+        return true;
+    }
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let Some(updated) = current.checked_add(additional) else {
+            return false;
+        };
+        if updated > limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(current, updated, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_cached_directories(counter: &AtomicUsize, released: usize) {
+    if released == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(released))
+    });
 }
 
 impl From<&SoftDiskTarget> for TargetFingerprint {
@@ -199,12 +394,28 @@ struct TargetScanFailures {
 
 impl SoftDiskLimiter {
     pub fn new(config: SoftDiskScannerConfig) -> Self {
+        Self::with_usage_cache_limits(
+            config,
+            UsageCacheLimits {
+                per_target_directories: DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET,
+                global_directories: DEFAULT_MAX_CACHED_DIRECTORIES_GLOBAL,
+            },
+        )
+    }
+
+    fn with_usage_cache_limits(
+        config: SoftDiskScannerConfig,
+        usage_cache_limits: UsageCacheLimits,
+    ) -> Self {
         let permits = config.max_concurrent_scans.max(1);
         Self {
             config,
             states: Arc::default(),
             scan_failures: Arc::default(),
             capacity_outage_failures: Arc::default(),
+            usage_trees: Arc::default(),
+            cached_directories: Arc::default(),
+            usage_cache_limits,
             permits: Arc::new(Semaphore::new(permits)),
         }
     }
@@ -230,9 +441,7 @@ impl SoftDiskLimiter {
             || (global_mode == DiskLimitMode::FuseQuota && protocol == Protocol::Qdrant)
     }
 
-    /// Return a measurement only when it belongs to this exact instance
-    /// generation and disk policy. Instance ids can be reused after deletion,
-    /// and limits/paths can change while an old scan result is still cached.
+    /// Return only samples matching the current target fingerprint.
     pub async fn snapshot(&self, target: &SoftDiskTarget) -> Option<SoftDiskSnapshot> {
         let fingerprint = TargetFingerprint::from(target);
         self.states
@@ -246,6 +455,7 @@ impl SoftDiskLimiter {
     pub async fn remove(&self, instance_id: &str) {
         self.states.lock().await.remove(instance_id);
         self.scan_failures.lock().await.remove(instance_id);
+        self.evict_usage_cache(instance_id).await;
     }
 
     pub async fn scan_and_enforce<R: SoftDiskRuntime>(
@@ -253,19 +463,58 @@ impl SoftDiskLimiter {
         runtime: &R,
         target: &SoftDiskTarget,
     ) -> Result<ScanOutcome, String> {
-        let usage = match self.scan(&target.data_path).await {
-            Ok(usage) => {
+        Ok(self
+            .scan_hybrid_and_enforce(runtime, target, HybridScanRequest::StreamingFull)
+            .await?
+            .outcome)
+    }
+
+    pub(crate) async fn scan_hybrid_and_enforce<R: SoftDiskRuntime>(
+        &self,
+        runtime: &R,
+        target: &SoftDiskTarget,
+        request: HybridScanRequest,
+    ) -> Result<HybridScanExecution, String> {
+        let (usage, performed, root_identity) = match self.scan_hybrid(target, request).await {
+            Ok(measurement) => {
                 self.scan_failures.lock().await.remove(&target.instance_id);
                 *self.capacity_outage_failures.lock().await = 0;
-                usage
+                measurement
             }
             Err(ScanFailure::Capacity(error)) => {
-                return self.enforce_capacity_outage(runtime, target, error).await;
+                let outcome = self.enforce_capacity_outage(runtime, target, error).await?;
+                return Ok(HybridScanExecution {
+                    outcome,
+                    performed: PerformedScanKind::Full,
+                    measurement_succeeded: false,
+                    root_identity: None,
+                });
             }
             Err(ScanFailure::Measurement(error)) => {
-                return self.enforce_unmeasurable(runtime, target, error).await;
+                let outcome = self.enforce_unmeasurable(runtime, target, error).await?;
+                return Ok(HybridScanExecution {
+                    outcome,
+                    performed: PerformedScanKind::Full,
+                    measurement_succeeded: false,
+                    root_identity: None,
+                });
             }
         };
+        let outcome = self.enforce_measured_usage(runtime, target, usage).await?;
+        Ok(HybridScanExecution {
+            outcome,
+            performed,
+            measurement_succeeded: true,
+            root_identity: Some(root_identity),
+        })
+    }
+
+    async fn enforce_measured_usage<R: SoftDiskRuntime>(
+        &self,
+        runtime: &R,
+        target: &SoftDiskTarget,
+        usage: DirectoryUsage,
+    ) -> Result<ScanOutcome, String> {
         let decision = self.record_sample(target, usage).await;
         let snapshot = decision.snapshot;
 
@@ -294,18 +543,17 @@ impl SoftDiskLimiter {
         })
     }
 
-    /// Always perform a fresh scan before admitting a soft-limited start. The
-    /// durable desired state preserves the stop across daemon restarts while
-    /// this unconditional preflight reconstructs the reason without relying
-    /// on an in-memory flag that disappeared during that restart.
+    /// Perform a fresh scan before admitting a soft-limited start.
     pub async fn ensure_start_allowed(
         &self,
         target: &SoftDiskTarget,
     ) -> Result<SoftDiskSnapshot, String> {
-        let usage = self
-            .scan(&target.data_path)
-            .await
-            .map_err(ScanFailure::into_message)?;
+        let measurement = self
+            .scan_hybrid(target, HybridScanRequest::StreamingFull)
+            .await;
+        // A rejected start will not enter the monitor to evict this tree later.
+        self.evict_usage_cache(&target.instance_id).await;
+        let (usage, _, _) = measurement.map_err(ScanFailure::into_message)?;
         *self.capacity_outage_failures.lock().await = 0;
         self.scan_failures.lock().await.remove(&target.instance_id);
         let decision = self.record_sample(target, usage).await;
@@ -320,7 +568,11 @@ impl SoftDiskLimiter {
         Ok(decision.snapshot)
     }
 
-    async fn scan(&self, path: &Path) -> Result<DirectoryUsage, ScanFailure> {
+    async fn scan_hybrid(
+        &self,
+        target: &SoftDiskTarget,
+        request: HybridScanRequest,
+    ) -> Result<(DirectoryUsage, PerformedScanKind, usage_tree::RootIdentity), ScanFailure> {
         let scan_timeout = Duration::from_secs(self.config.scan_timeout_seconds.max(1));
         let permit = tokio::time::timeout(scan_timeout, self.permits.clone().acquire_owned())
             .await
@@ -331,26 +583,95 @@ impl SoftDiskLimiter {
                 ))
             })?
             .map_err(|_| ScanFailure::Capacity("soft disk scan limiter closed".to_string()))?;
-        let scan_path = path.to_path_buf();
+        let scan_path = target.data_path.clone();
+        let generation = target.scanner_fingerprint();
+        // Qdrant mmap writes are not reliably observable through inotify.
+        let cache_allowed = self.config.use_inotify
+            && target.protocol != Protocol::Qdrant
+            && !matches!(&request, HybridScanRequest::StreamingFull);
+        let cache = if cache_allowed {
+            Some(self.usage_tree_slot(target).await)
+        } else {
+            self.evict_usage_cache(&target.instance_id).await;
+            None
+        };
         let limits = ScanLimits {
             timeout: scan_timeout,
             max_entries: self.config.max_entries_per_scan.max(1),
             max_depth: 128,
         };
-        // The permit moves into the blocking worker. If a filesystem syscall
-        // wedges past the async deadline, this request returns fail-closed but
-        // the stuck worker keeps its permit, bounding leaked workers to the
-        // configured concurrency instead of spawning replacements forever.
+        let per_target_cache_limit = self
+            .usage_cache_limits
+            .per_target_directories
+            .min(limits.max_entries.saturating_add(1));
+        // A wedged worker keeps its permit, bounding leaked blocking workers.
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            scan_directory_blocking(&scan_path, limits)
+            let Some(cache) = cache else {
+                return scan_directory_blocking_identified(&scan_path, limits)
+                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
+            };
+            let mut state = cache
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.streaming_only {
+                return scan_directory_blocking_identified(&scan_path, limits)
+                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
+            }
+            match request {
+                HybridScanRequest::StreamingFull => {
+                    scan_directory_blocking_identified(&scan_path, limits)
+                        .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
+                }
+                HybridScanRequest::Full => scan_full_with_bounded_cache(
+                    &cache,
+                    &mut state,
+                    &scan_path,
+                    generation,
+                    limits,
+                    per_target_cache_limit,
+                ),
+                HybridScanRequest::Partial {
+                    relative_directories,
+                } => {
+                    let reconcile = state.cache.as_mut().map(|existing| {
+                        existing.reconcile(&scan_path, &generation, &relative_directories, limits)
+                    });
+                    match reconcile {
+                        Some(Ok(usage)) => {
+                            let identity = state
+                                .cache
+                                .as_ref()
+                                .expect("successful reconciliation retains its cache")
+                                .root_identity();
+                            cache.account_reconciled_cache(&mut state);
+                            Ok((usage, PerformedScanKind::Partial, identity))
+                        }
+                        Some(Err(error)) if !error.requires_full_scan() => match error {
+                            usage_tree::ReconcileError::Io(error) => Err(error),
+                            usage_tree::ReconcileError::FullScanRequired(_) => {
+                                unreachable!("full reconciliation was handled above")
+                            }
+                        },
+                        Some(Err(_)) | None => scan_full_with_bounded_cache(
+                            &cache,
+                            &mut state,
+                            &scan_path,
+                            generation,
+                            limits,
+                            per_target_cache_limit,
+                        ),
+                    }
+                }
+            }
         });
         tokio::time::timeout(scan_timeout.saturating_add(Duration::from_secs(1)), worker)
             .await
             .map_err(|_| {
                 ScanFailure::Measurement(format!(
                     "soft disk scan of {} exceeded its outer {} second deadline",
-                    path.display(),
+                    target.data_path.display(),
                     scan_timeout
                         .saturating_add(Duration::from_secs(1))
                         .as_secs()
@@ -359,12 +680,43 @@ impl SoftDiskLimiter {
             .map_err(|error| {
                 ScanFailure::Measurement(format!(
                     "soft disk scan worker failed for {}: {error}",
-                    path.display()
+                    target.data_path.display()
                 ))
             })?
             .map_err(|error| {
-                ScanFailure::Measurement(format!("failed to scan {}: {error}", path.display()))
+                ScanFailure::Measurement(format!(
+                    "failed to scan {}: {error}",
+                    target.data_path.display()
+                ))
             })
+    }
+
+    async fn usage_tree_slot(&self, target: &SoftDiskTarget) -> Arc<UsageTreeSlot> {
+        let fingerprint = TargetFingerprint::from(target);
+        let mut states = self.usage_trees.lock().await;
+        let state = states
+            .entry(target.instance_id.clone())
+            .or_insert_with(|| UsageTreeState {
+                target: fingerprint.clone(),
+                slot: Arc::new(UsageTreeSlot::new(
+                    Arc::clone(&self.cached_directories),
+                    self.usage_cache_limits.global_directories,
+                )),
+            });
+        if state.target != fingerprint {
+            *state = UsageTreeState {
+                target: fingerprint,
+                slot: Arc::new(UsageTreeSlot::new(
+                    Arc::clone(&self.cached_directories),
+                    self.usage_cache_limits.global_directories,
+                )),
+            };
+        }
+        Arc::clone(&state.slot)
+    }
+
+    pub(crate) async fn evict_usage_cache(&self, instance_id: &str) {
+        self.usage_trees.lock().await.remove(instance_id);
     }
 
     async fn record_sample(
@@ -378,15 +730,24 @@ impl SoftDiskLimiter {
         let previous = states
             .get(&target.instance_id)
             .filter(|state| state.target == fingerprint);
-        let growth_bytes_per_second = growth_rate(previous, usage.physical_bytes, now);
+        let growth_bytes_per_second = growth::growth_rate(
+            previous,
+            usage.physical_bytes,
+            now,
+            Duration::from_secs(self.config.scan_interval_seconds.max(1)),
+        );
         let peak_growth_bytes_per_second = previous.map_or(growth_bytes_per_second, |state| {
             state
                 .snapshot
                 .peak_growth_bytes_per_second
                 .max(growth_bytes_per_second)
         });
-        let (stop_threshold_bytes, recovery_threshold_bytes) =
-            thresholds(&self.config, target.limit_bytes, growth_bytes_per_second);
+        let (stop_threshold_bytes, recovery_threshold_bytes) = thresholds(
+            &self.config,
+            target.protocol,
+            target.limit_bytes,
+            growth_bytes_per_second,
+        );
         let was_blocked =
             target.durable_blocked || previous.is_some_and(|state| state.snapshot.blocked);
         let recovered = was_blocked && usage.physical_bytes < recovery_threshold_bytes;
@@ -404,7 +765,9 @@ impl SoftDiskLimiter {
         let warning_now = !blocked
             && (usage.physical_bytes >= target.limit_bytes.saturating_mul(75) / 100
                 || predicted_seconds_to_limit.is_some_and(|seconds| {
-                    seconds <= self.config.scan_interval_seconds.saturating_mul(2)
+                    seconds
+                        <= authoritative_scan_interval_seconds(&self.config, target.protocol)
+                            .saturating_mul(2)
                 }));
         let previously_warned = previous.is_some_and(|state| state.warned);
         let warning = warning_now && !previously_warned;
@@ -530,8 +893,12 @@ impl SoftDiskLimiter {
             previous.map_or(0.0, |state| state.snapshot.growth_bytes_per_second);
         let peak_growth_bytes_per_second =
             previous.map_or(0.0, |state| state.snapshot.peak_growth_bytes_per_second);
-        let (stop_threshold_bytes, recovery_threshold_bytes) =
-            thresholds(&self.config, target.limit_bytes, growth_bytes_per_second);
+        let (stop_threshold_bytes, recovery_threshold_bytes) = thresholds(
+            &self.config,
+            target.protocol,
+            target.limit_bytes,
+            growth_bytes_per_second,
+        );
         let snapshot = SoftDiskSnapshot {
             usage,
             limit_bytes: target.limit_bytes,
@@ -559,6 +926,38 @@ impl SoftDiskLimiter {
     }
 }
 
+fn scan_full_with_bounded_cache(
+    slot: &UsageTreeSlot,
+    state: &mut UsageTreeSlotState,
+    scan_path: &std::path::Path,
+    generation: String,
+    limits: ScanLimits,
+    per_target_cache_limit: usize,
+) -> Result<(DirectoryUsage, PerformedScanKind, usage_tree::RootIdentity), std::io::Error> {
+    match usage_tree::UsageTreeCache::scan_full_bounded(
+        scan_path,
+        generation,
+        limits,
+        per_target_cache_limit,
+    )? {
+        usage_tree::BoundedFullScan::Cached(replacement) => {
+            let identity = replacement.root_identity();
+            if slot.install_cache(state, replacement) {
+                let usage = state
+                    .cache
+                    .as_ref()
+                    .map_or_else(DirectoryUsage::default, usage_tree::UsageTreeCache::usage);
+                return Ok((usage, PerformedScanKind::Full, identity));
+            }
+        }
+        usage_tree::BoundedFullScan::DirectoryLimitExceeded => {
+            slot.switch_to_streaming(state);
+        }
+    }
+    scan_directory_blocking_identified(scan_path, limits)
+        .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
+}
+
 enum ScanFailure {
     Capacity(String),
     Measurement(String),
@@ -582,26 +981,9 @@ struct SampleDecision {
     recovered: bool,
 }
 
-fn growth_rate(previous: Option<&TrackerState>, bytes: u64, now: Instant) -> f64 {
-    let Some(previous) = previous else {
-        return 0.0;
-    };
-    let elapsed = now
-        .saturating_duration_since(previous.snapshot.sampled_at)
-        .as_secs_f64();
-    if elapsed <= f64::EPSILON {
-        return previous.snapshot.growth_bytes_per_second;
-    }
-    let instantaneous =
-        bytes.saturating_sub(previous.snapshot.usage.physical_bytes) as f64 / elapsed;
-    // Bias toward the faster observation so a short burst cannot be hidden by
-    // a long idle history; decay still prevents a stale spike lasting forever.
-    (previous.snapshot.growth_bytes_per_second * 0.6 + instantaneous * 0.4)
-        .max(instantaneous * 0.75)
-}
-
 fn safety_reserve_bytes(
     config: &SoftDiskScannerConfig,
+    protocol: Protocol,
     limit_bytes: u64,
     growth_bytes_per_second: f64,
 ) -> u64 {
@@ -610,8 +992,8 @@ fn safety_reserve_bytes(
         .safety_reserve_mib
         .saturating_mul(1024 * 1024)
         .min(maximum);
-    let exposure_seconds = config
-        .scan_interval_seconds
+    let exposure_seconds = authoritative_scan_interval_seconds(config, protocol)
+        .saturating_add(config.scan_timeout_seconds)
         .saturating_add(config.shutdown_grace_seconds)
         .saturating_add(1);
     let predicted =
@@ -621,10 +1003,11 @@ fn safety_reserve_bytes(
 
 fn thresholds(
     config: &SoftDiskScannerConfig,
+    protocol: Protocol,
     limit_bytes: u64,
     growth_bytes_per_second: f64,
 ) -> (u64, u64) {
-    let reserve = safety_reserve_bytes(config, limit_bytes, growth_bytes_per_second);
+    let reserve = safety_reserve_bytes(config, protocol, limit_bytes, growth_bytes_per_second);
     let stop_threshold_bytes = limit_bytes.saturating_sub(reserve);
     let configured_recovery =
         limit_bytes.saturating_mul(u64::from(config.recovery_percent.min(99))) / 100;
@@ -632,6 +1015,16 @@ fn thresholds(
     let recovery_threshold_bytes =
         configured_recovery.min(stop_threshold_bytes.saturating_sub(hysteresis_margin));
     (stop_threshold_bytes, recovery_threshold_bytes)
+}
+
+fn authoritative_scan_interval_seconds(config: &SoftDiskScannerConfig, protocol: Protocol) -> u64 {
+    if config.use_inotify && protocol != Protocol::Qdrant {
+        config
+            .full_scan_interval_seconds
+            .max(config.scan_interval_seconds)
+    } else {
+        config.scan_interval_seconds
+    }
 }
 
 fn predict_seconds_to_limit(current: u64, limit: u64, growth: f64) -> Option<u64> {
@@ -755,6 +1148,10 @@ mod tests {
     fn test_config() -> SoftDiskScannerConfig {
         SoftDiskScannerConfig {
             scan_interval_seconds: 1,
+            use_inotify: false,
+            full_scan_interval_seconds: 4,
+            inotify_debounce_milliseconds: 1,
+            max_dirty_paths_per_instance: 32,
             max_concurrent_scans: 1,
             max_entries_per_scan: 100,
             scan_timeout_seconds: 2,
@@ -782,8 +1179,7 @@ mod tests {
             durable_blocked: false,
         };
 
-        // Keep the deterministic unit test fast while exercising the same
-        // timeout/kill path used with the production 30-second configuration.
+        // Exercise the production timeout/kill path with a short test deadline.
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
             limiter.scan_and_enforce(&runtime, &target),
@@ -914,9 +1310,7 @@ mod tests {
             limit_bytes: 2_000,
             ..old_target.clone()
         };
-        // 1,700 is above the new 80% recovery threshold (1,600) but below
-        // its stop threshold (2,000). Inheriting the old block would stop the
-        // recreated instance even though its own target is healthy.
+        // 1,700 is between this target's recovery and stop thresholds.
         let current = limiter
             .record_sample(
                 &new_target,
@@ -1045,5 +1439,25 @@ mod tests {
             DiskLimitMode::FuseQuota,
             Protocol::Postgres
         ));
+    }
+
+    #[test]
+    fn reserve_covers_the_authoritative_full_scan_window_and_qdrant_base_window() {
+        let mut config = test_config();
+        config.scan_interval_seconds = 10;
+        config.use_inotify = true;
+        config.full_scan_interval_seconds = 100;
+        config.scan_timeout_seconds = 20;
+        config.shutdown_grace_seconds = 30;
+        let limit = 10 * 1024 * 1024;
+
+        assert_eq!(
+            safety_reserve_bytes(&config, Protocol::Postgres, limit, 1_000.0),
+            151_000
+        );
+        assert_eq!(
+            safety_reserve_bytes(&config, Protocol::Qdrant, limit, 1_000.0),
+            61_000
+        );
     }
 }

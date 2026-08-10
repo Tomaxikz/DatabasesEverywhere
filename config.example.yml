@@ -181,6 +181,13 @@ disk:
   fuse_quota_rescan_interval_seconds: 150
   soft_scanner:
     scan_interval_seconds: 15
+    # Use inotify to rescan only changed subtrees between authoritative full
+    # scans. Event loss, overflow, watch failure, or cache uncertainty always
+    # falls back to a full scan.
+    use_inotify: true
+    full_scan_interval_seconds: 90
+    inotify_debounce_milliseconds: 500
+    max_dirty_paths_per_instance: 512
     max_concurrent_scans: 2
     max_entries_per_scan: 1000000
     scan_timeout_seconds: 30

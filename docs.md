@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.4.6 # replace with the reviewed release
+DBEV_VERSION=v0.5.0 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -219,6 +219,10 @@ disk:
   project_id_base: 200000
   soft_scanner:
     scan_interval_seconds: 15
+    use_inotify: true
+    full_scan_interval_seconds: 90
+    inotify_debounce_milliseconds: 500
+    max_dirty_paths_per_instance: 512
     max_concurrent_scans: 2
     max_entries_per_scan: 1000000
     scan_timeout_seconds: 30
@@ -234,6 +238,19 @@ disk:
 reports `disk_enforced: false`, `disk_enforcement_method: "soft_scanner"`, and
 `enforcement_strength: "soft"` so callers can distinguish predictive
 stop/kill enforcement from a hard write-time quota.
+
+The scanner uses a Wings-style hybrid: one recursive inotify watcher
+coalesces changed paths and drives bounded subtree rescans, while periodic
+full scans remain authoritative. Queue overflow, watcher errors, root changes,
+or too many independent dirty paths force a full reconciliation. If inotify
+is disabled or unavailable, DBE safely falls back to periodic full scans.
+Incremental usage trees retain at most 4,096 directories per instance and
+32,768 across the daemon; larger trees automatically use bounded-memory
+streaming full scans. Qdrant always receives a full scan at the base interval
+because mmap writes may not generate filesystem events. These intervals are
+scheduling targets: completion can be later when fleet scan demand exceeds
+`max_concurrent_scans`, so size concurrency for the number and size of managed
+instances and treat scanner enforcement as soft rather than quota-equivalent.
 
 Changing between a raw-data mode and FuseQuota cannot mutate an existing
 container's bind mount. DBE detects that mismatch, stops the affected instance
@@ -305,7 +322,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.4.6@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.0@sha256:REPLACE_ME'
 docker compose up -d
 ```
 

@@ -1,22 +1,26 @@
 use std::{
     io::{Error, ErrorKind},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use rustix::{
-    fs::{AtFlags, Dir, FileType, Mode, OFlags, open, openat, statat},
+    fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, statat},
     io::Errno,
 };
 
+/// Stable identity of an opened directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DirectoryIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectoryUsage {
-    /// Sum of apparent file lengths. Sparse and preallocated files can make
-    /// this differ materially from host space consumption.
+    /// Sum of apparent file lengths.
     pub logical_bytes: u64,
-    /// Filesystem blocks allocated to files and directories (`st_blocks *
-    /// 512`), matching host-capacity pressure more closely than apparent size.
+    /// Allocated filesystem blocks (`st_blocks * 512`).
     pub physical_bytes: u64,
     pub entries: u64,
 }
@@ -45,30 +49,62 @@ pub async fn scan_directory(path: PathBuf, limits: ScanLimits) -> Result<Directo
 }
 
 pub fn scan_directory_blocking(path: &Path, limits: ScanLimits) -> Result<DirectoryUsage, Error> {
+    scan_directory_blocking_identified(path, limits).map(|(usage, _)| usage)
+}
+
+pub(crate) fn scan_directory_blocking_identified(
+    path: &Path,
+    limits: ScanLimits,
+) -> Result<(DirectoryUsage, DirectoryIdentity), Error> {
     let started = Instant::now();
-    let root_metadata = std::fs::symlink_metadata(path)?;
-    if !root_metadata.file_type().is_dir() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "disk scan root is not a directory",
-        ));
-    }
     let root = open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(Error::from)?;
+    let root_stat = fstat(&root).map_err(Error::from)?;
+    let identity = identity_from_stat(&root_stat)?;
     let mut scanner = DirectoryScanner {
         started,
         limits,
         usage: DirectoryUsage {
-            physical_bytes: root_metadata.blocks().saturating_mul(512),
+            physical_bytes: allocated_bytes(root_stat.st_blocks)?,
             ..DirectoryUsage::default()
         },
     };
     scanner.scan_open_directory(&root, 0)?;
-    Ok(scanner.usage)
+    // Reject scans whose pathname changed during traversal.
+    if directory_identity(path)? != identity {
+        return Err(Error::other(
+            "disk scan root was replaced while it was being scanned",
+        ));
+    }
+    Ok((scanner.usage, identity))
+}
+
+pub(crate) fn directory_identity(path: &Path) -> Result<DirectoryIdentity, Error> {
+    let directory = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(Error::from)?;
+    identity_from_stat(&fstat(&directory).map_err(Error::from)?)
+}
+
+fn identity_from_stat(stat: &rustix::fs::Stat) -> Result<DirectoryIdentity, Error> {
+    Ok(DirectoryIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+fn allocated_bytes(blocks: i64) -> Result<u64, Error> {
+    u64::try_from(blocks)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "directory reported negative blocks"))?
+        .checked_mul(512)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "allocated disk usage overflow"))
 }
 
 struct DirectoryScanner {
@@ -78,9 +114,7 @@ struct DirectoryScanner {
 }
 
 impl DirectoryScanner {
-    /// Depth-first traversal holds only the current directory and its
-    /// ancestors open. A tenant-created wide tree therefore consumes O(depth)
-    /// descriptors instead of one descriptor per queued directory.
+    /// Depth-first traversal keeps descriptor use at O(depth).
     fn scan_open_directory(
         &mut self,
         directory: &rustix::fd::OwnedFd,
@@ -111,10 +145,7 @@ impl DirectoryScanner {
 
             let stat = match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
-                // Database WAL/SST/temp files are renamed and unlinked during
-                // ordinary operation. A vanished/stale entry no longer holds
-                // linked space in this tree and must not count as a scanner
-                // failure that could stop a healthy, busy database.
+                // Ignore ordinary database rename/unlink races.
                 Err(error) if transient_entry_error(error) => continue,
                 Err(error) => return Err(Error::from(error)),
             };
@@ -205,6 +236,29 @@ mod tests {
         assert_eq!(usage.logical_bytes, 18);
         assert!(usage.physical_bytes >= 18);
         assert_eq!(usage.entries, 4);
+    }
+
+    #[test]
+    fn identified_scan_binds_measurement_to_the_opened_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let replacement = temporary.path().join("replacement");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(root.join("old"), b"old").unwrap();
+        fs::write(replacement.join("new"), b"replacement").unwrap();
+
+        let (_, old_identity) =
+            scan_directory_blocking_identified(&root, ScanLimits::default()).unwrap();
+        assert_eq!(old_identity, directory_identity(&root).unwrap());
+
+        fs::rename(&root, temporary.path().join("retired")).unwrap();
+        fs::rename(&replacement, &root).unwrap();
+        let (usage, new_identity) =
+            scan_directory_blocking_identified(&root, ScanLimits::default()).unwrap();
+        assert_ne!(old_identity, new_identity);
+        assert_eq!(new_identity, directory_identity(&root).unwrap());
+        assert_eq!(usage.logical_bytes, b"replacement".len() as u64);
     }
 
     #[test]

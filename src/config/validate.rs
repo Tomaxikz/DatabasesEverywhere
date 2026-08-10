@@ -510,6 +510,16 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
             scanner.scan_interval_seconds,
             3_600,
         ),
+        (
+            "full_scan_interval_seconds",
+            scanner.full_scan_interval_seconds,
+            3_600,
+        ),
+        (
+            "inotify_debounce_milliseconds",
+            scanner.inotify_debounce_milliseconds,
+            60_000,
+        ),
         ("scan_timeout_seconds", scanner.scan_timeout_seconds, 3_600),
         (
             "shutdown_grace_seconds",
@@ -520,6 +530,11 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
         if value == 0 || value > maximum {
             return Err(ConfigValidationError::InvalidSoftDiskScanner { field });
         }
+    }
+    if scanner.max_dirty_paths_per_instance == 0 || scanner.max_dirty_paths_per_instance > 65_536 {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "max_dirty_paths_per_instance",
+        });
     }
     if scanner.max_concurrent_scans == 0 || scanner.max_concurrent_scans > 64 {
         return Err(ConfigValidationError::InvalidSoftDiskScanner {
@@ -1233,6 +1248,39 @@ mod tests {
         let error = validate_config(&config).unwrap_err();
 
         assert!(matches!(error, ConfigValidationError::InvalidProjectIdBase));
+    }
+
+    #[test]
+    fn validates_hybrid_soft_scanner_bounds() {
+        let mut config = valid_config();
+        config.disk.soft_scanner.scan_interval_seconds = 30;
+        config.disk.soft_scanner.full_scan_interval_seconds = 30;
+        config.disk.soft_scanner.inotify_debounce_milliseconds = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::InvalidSoftDiskScanner {
+                field: "inotify_debounce_milliseconds"
+            })
+        ));
+
+        config.disk.soft_scanner.inotify_debounce_milliseconds = 500;
+        config.disk.soft_scanner.max_dirty_paths_per_instance = 0;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::InvalidSoftDiskScanner {
+                field: "max_dirty_paths_per_instance"
+            })
+        ));
+
+        config.disk.soft_scanner.max_dirty_paths_per_instance = 512;
+        validate_config(&config).unwrap();
+
+        // Older configurations could set a longer base interval before the
+        // hybrid full-scan field existed. Runtime normalization uses the
+        // greater interval instead of rejecting that valid configuration.
+        config.disk.soft_scanner.scan_interval_seconds = 3_600;
+        config.disk.soft_scanner.full_scan_interval_seconds = 90;
+        validate_config(&config).unwrap();
     }
 
     #[test]
