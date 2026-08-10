@@ -8,9 +8,10 @@ pub(super) async fn prepare_logical_import_artifact(
     host_temp: &FsPath,
     staging_root: &FsPath,
     options: &ImportOptions,
+    max_unarchived_bytes: u64,
 ) -> Result<(), ApiError> {
     let Some(requested_format) = options.archive_format.as_deref() else {
-        ensure_import_file_size(artifact_path).await?;
+        ensure_source_within_limit(artifact_path, max_unarchived_bytes).await?;
         copy_file(artifact_path, host_temp).await?;
         return Ok(());
     };
@@ -18,21 +19,26 @@ pub(super) async fn prepare_logical_import_artifact(
     let format = ImportArchiveFormat::parse(requested_format)?;
     match format {
         ImportArchiveFormat::Plain => {
-            ensure_import_file_size(artifact_path).await?;
+            ensure_source_within_limit(artifact_path, max_unarchived_bytes).await?;
             copy_file(artifact_path, host_temp).await
         }
-        ImportArchiveFormat::Gzip => decompress_gzip(artifact_path, host_temp).await,
-        ImportArchiveFormat::Bzip2 => decompress_bzip2(artifact_path, host_temp).await,
+        ImportArchiveFormat::Gzip => {
+            decompress_gzip(artifact_path, host_temp, max_unarchived_bytes).await
+        }
+        ImportArchiveFormat::Bzip2 => {
+            decompress_bzip2(artifact_path, host_temp, max_unarchived_bytes).await
+        }
         ImportArchiveFormat::Tar | ImportArchiveFormat::TarGzip => {
             let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
             let result = match extract_tar_archive(
                 artifact_path,
                 &staging,
                 format == ImportArchiveFormat::TarGzip,
+                max_unarchived_bytes,
             )
             .await
             {
-                Ok(()) => copy_selected_dump(protocol, &staging, host_temp).await,
+                Ok(()) => install_selected_dump(protocol, &staging, host_temp).await,
                 Err(error) => Err(error),
             };
             cleanup_dir(&staging).await;
@@ -40,17 +46,32 @@ pub(super) async fn prepare_logical_import_artifact(
         }
         ImportArchiveFormat::Zip => {
             let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
-            let result = match extract_zip_archive(artifact_path, &staging).await {
-                Ok(()) => copy_selected_dump(protocol, &staging, host_temp).await,
-                Err(error) => Err(error),
-            };
+            let result =
+                match extract_zip_archive(artifact_path, &staging, max_unarchived_bytes).await {
+                    Ok(()) => install_selected_dump(protocol, &staging, host_temp).await,
+                    Err(error) => Err(error),
+                };
             cleanup_dir(&staging).await;
             result
         }
     }
 }
 
-pub(super) async fn decompress_gzip(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+async fn ensure_source_within_limit(path: &FsPath, limit: u64) -> Result<(), ApiError> {
+    let size = ensure_import_file_size(path).await?;
+    if size > limit {
+        return Err(ApiError::BadRequest(format!(
+            "import artifact is too large after preparation: {size} bytes exceeds {limit} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn decompress_gzip(
+    source: &FsPath,
+    target: &FsPath,
+    max_unarchived_bytes: u64,
+) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
@@ -60,7 +81,7 @@ pub(super) async fn decompress_gzip(source: &FsPath, target: &FsPath) -> Result<
             let input = std::fs::File::open(source)?;
             let mut decoder = flate2::read::GzDecoder::new(input);
             write_new_private_file(&target, |mut output| {
-                copy_limited_until(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES, deadline)?;
+                copy_limited_until(&mut decoder, &mut output, max_unarchived_bytes, deadline)?;
                 output.flush()
             })
         },
@@ -68,7 +89,11 @@ pub(super) async fn decompress_gzip(source: &FsPath, target: &FsPath) -> Result<
     .await
 }
 
-pub(super) async fn decompress_bzip2(source: &FsPath, target: &FsPath) -> Result<(), ApiError> {
+pub(super) async fn decompress_bzip2(
+    source: &FsPath,
+    target: &FsPath,
+    max_unarchived_bytes: u64,
+) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
     run_archive_file_operation(
@@ -78,7 +103,7 @@ pub(super) async fn decompress_bzip2(source: &FsPath, target: &FsPath) -> Result
             let input = std::fs::File::open(source)?;
             let mut decoder = bzip2::read::BzDecoder::new(input);
             write_new_private_file(&target, |mut output| {
-                copy_limited_until(&mut decoder, &mut output, MAX_UNARCHIVED_BYTES, deadline)?;
+                copy_limited_until(&mut decoder, &mut output, max_unarchived_bytes, deadline)?;
                 output.flush()
             })
         },
@@ -90,6 +115,7 @@ pub(super) async fn extract_tar_archive(
     source: &FsPath,
     target_dir: &FsPath,
     gzipped: bool,
+    max_unarchived_bytes: u64,
 ) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target_dir = target_dir.to_path_buf();
@@ -101,10 +127,10 @@ pub(super) async fn extract_tar_archive(
             if gzipped {
                 let decoder = flate2::read::GzDecoder::new(input);
                 let mut archive = tar::Archive::new(decoder);
-                unpack_tar_safely(&mut archive, &target_dir, deadline)?;
+                unpack_tar_safely(&mut archive, &target_dir, deadline, max_unarchived_bytes)?;
             } else {
                 let mut archive = tar::Archive::new(input);
-                unpack_tar_safely(&mut archive, &target_dir, deadline)?;
+                unpack_tar_safely(&mut archive, &target_dir, deadline, max_unarchived_bytes)?;
             }
             Ok(())
         },
@@ -117,6 +143,7 @@ pub(super) async fn extract_tar_archive(
 pub(super) async fn extract_zip_archive(
     source: &FsPath,
     target_dir: &FsPath,
+    max_unarchived_bytes: u64,
 ) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target_dir = target_dir.to_path_buf();
@@ -141,9 +168,9 @@ pub(super) async fn extract_zip_archive(
                 total = total
                     .checked_add(file.size())
                     .ok_or("archive uncompressed size overflow")?;
-                if total > MAX_UNARCHIVED_BYTES {
+                if total > max_unarchived_bytes {
                     return Err(
-                        format!("archive expands beyond {MAX_UNARCHIVED_BYTES} bytes").into(),
+                        format!("archive expands beyond {max_unarchived_bytes} bytes").into(),
                     );
                 }
                 let size = file.size();
@@ -170,6 +197,7 @@ pub(super) fn unpack_tar_safely<R: Read>(
     archive: &mut tar::Archive<R>,
     target_dir: &FsPath,
     deadline: Instant,
+    max_unarchived_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut total = 0_u64;
     let mut entries = 0_usize;
@@ -190,8 +218,8 @@ pub(super) fn unpack_tar_safely<R: Read>(
         total = total
             .checked_add(size)
             .ok_or("archive uncompressed size overflow")?;
-        if total > MAX_UNARCHIVED_BYTES {
-            return Err(format!("archive expands beyond {MAX_UNARCHIVED_BYTES} bytes").into());
+        if total > max_unarchived_bytes {
+            return Err(format!("archive expands beyond {max_unarchived_bytes} bytes").into());
         }
         let target = target_dir.join(&path);
         if kind.is_dir() {
@@ -270,7 +298,7 @@ pub(super) fn copy_limited_until<R: Read, W: Write>(
     }
 }
 
-pub(super) async fn copy_selected_dump(
+pub(super) async fn install_selected_dump(
     protocol: Protocol,
     staging_dir: &FsPath,
     host_temp: &FsPath,
@@ -283,7 +311,7 @@ pub(super) async fn copy_selected_dump(
                 ApiError::Runtime(format!("failed to inspect archive contents: {error}"))
             })?
             .map_err(ApiError::BadRequest)?;
-    copy_file(&candidate, host_temp).await
+    move_or_copy_file(&candidate, host_temp).await
 }
 
 pub(super) fn find_dump_candidate(protocol: Protocol, root: &FsPath) -> Result<PathBuf, String> {

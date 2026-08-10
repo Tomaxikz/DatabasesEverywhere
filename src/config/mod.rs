@@ -457,6 +457,13 @@ impl Default for PidsLimitConfig {
 pub struct ArtifactConfig {
     pub retention_keep_latest: usize,
     pub retention_max_age_days: u64,
+    pub import_upload_max_bytes: u64,
+    pub import_upload_max_total_bytes: u64,
+    pub import_upload_max_per_instance: usize,
+    pub import_upload_max_concurrent: usize,
+    pub import_upload_ttl_hours: u64,
+    pub import_upload_timeout_seconds: u64,
+    pub import_upload_idle_timeout_seconds: u64,
 }
 
 impl Default for ArtifactConfig {
@@ -464,6 +471,13 @@ impl Default for ArtifactConfig {
         Self {
             retention_keep_latest: 20,
             retention_max_age_days: 30,
+            import_upload_max_bytes: 8 * 1024 * 1024 * 1024,
+            import_upload_max_total_bytes: 32 * 1024 * 1024 * 1024,
+            import_upload_max_per_instance: 4,
+            import_upload_max_concurrent: 2,
+            import_upload_ttl_hours: 24,
+            import_upload_timeout_seconds: 3600,
+            import_upload_idle_timeout_seconds: 30,
         }
     }
 }

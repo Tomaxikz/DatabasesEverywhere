@@ -33,6 +33,7 @@ pub(super) async fn import_physical_archive(
     instance_id: &str,
     protocol: Protocol,
     artifact_path: &FsPath,
+    max_extracted_bytes: u64,
 ) -> Result<(), ApiError> {
     match protocol {
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {}
@@ -55,7 +56,15 @@ pub(super) async fn import_physical_archive(
     if was_running {
         let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
-    restore_data_from_archive(state, instance_id, paths, artifact_path, was_running).await
+    restore_data_from_archive_bounded(
+        state,
+        instance_id,
+        paths,
+        artifact_path,
+        was_running,
+        max_extracted_bytes,
+    )
+    .await
 }
 
 pub(crate) fn verify_physical_data_replacement(
@@ -153,6 +162,25 @@ pub(crate) async fn restore_data_from_archive(
     artifact_path: &FsPath,
     should_be_running: bool,
 ) -> Result<(), ApiError> {
+    restore_data_from_archive_bounded(
+        state,
+        instance_id,
+        paths,
+        artifact_path,
+        should_be_running,
+        crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn restore_data_from_archive_bounded(
+    state: &AppState,
+    instance_id: &str,
+    paths: InstancePaths,
+    artifact_path: &FsPath,
+    should_be_running: bool,
+    max_extracted_bytes: u64,
+) -> Result<(), ApiError> {
     restore_data_from_archive_with_policy(
         state,
         instance_id,
@@ -160,6 +188,7 @@ pub(crate) async fn restore_data_from_archive(
         artifact_path,
         should_be_running,
         true,
+        max_extracted_bytes,
     )
     .await
 }
@@ -170,8 +199,16 @@ pub(crate) async fn rollback_data_from_archive(
     paths: InstancePaths,
     artifact_path: &FsPath,
 ) -> Result<(), ApiError> {
-    restore_data_from_archive_with_policy(state, instance_id, paths, artifact_path, true, false)
-        .await
+    restore_data_from_archive_with_policy(
+        state,
+        instance_id,
+        paths,
+        artifact_path,
+        true,
+        false,
+        crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+    )
+    .await
 }
 
 async fn restore_data_from_archive_with_policy(
@@ -181,6 +218,7 @@ async fn restore_data_from_archive_with_policy(
     artifact_path: &FsPath,
     should_be_running: bool,
     recover_current_after_preparation_failure: bool,
+    max_extracted_bytes: u64,
 ) -> Result<(), ApiError> {
     let metadata = state
         .instances
@@ -209,34 +247,37 @@ async fn restore_data_from_archive_with_policy(
             "the original runtime",
         ));
     }
-    let replacement = match prepare_data_replacement(paths.clone(), artifact_path).await {
-        Ok(replacement) => replacement,
-        Err(failure) if failure.original_restored && recover_current_after_preparation_failure => {
-            if detached_fuse {
-                let recovery = recover_detached_physical_runtime(
+    let replacement =
+        match prepare_data_replacement(paths.clone(), artifact_path, max_extracted_bytes).await {
+            Ok(replacement) => replacement,
+            Err(failure)
+                if failure.original_restored && recover_current_after_preparation_failure =>
+            {
+                if detached_fuse {
+                    let recovery = recover_detached_physical_runtime(
+                        state,
+                        &metadata,
+                        &paths,
+                        should_be_running,
+                        &disk_limiter,
+                    )
+                    .await;
+                    return Err(physical_recovery_error(
+                        failure.error,
+                        recovery,
+                        "the original runtime",
+                    ));
+                }
+                return finish_physical_operation(
                     state,
-                    &metadata,
-                    &paths,
+                    instance_id,
                     should_be_running,
-                    &disk_limiter,
+                    Err(failure.error),
                 )
                 .await;
-                return Err(physical_recovery_error(
-                    failure.error,
-                    recovery,
-                    "the original runtime",
-                ));
             }
-            return finish_physical_operation(
-                state,
-                instance_id,
-                should_be_running,
-                Err(failure.error),
-            )
-            .await;
-        }
-        Err(failure) => return Err(failure.error),
-    };
+            Err(failure) => return Err(failure.error),
+        };
 
     let validation = async {
         reapply_instance_data_owner(state, &paths).await?;
@@ -314,6 +355,7 @@ fn physical_recovery_error(
 async fn prepare_data_replacement(
     paths: InstancePaths,
     artifact_path: &FsPath,
+    max_extracted_bytes: u64,
 ) -> Result<PendingDataReplacement, DataReplacementPreparationError> {
     let import_id = uuid::Uuid::new_v4();
     let expected_root = paths
@@ -352,10 +394,11 @@ async fn prepare_data_replacement(
         cleanup_dir(&workspace).await;
         return Err(DataReplacementPreparationError::safe(error));
     }
-    if let Err(error) = extract_data_archive(
+    if let Err(error) = extract_data_archive_bounded(
         artifact_path.to_path_buf(),
         staging_dir.clone(),
         expected_root,
+        max_extracted_bytes,
     )
     .await
     {

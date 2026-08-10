@@ -58,6 +58,7 @@ use crate::{
     },
     storage::{
         import_export_jobs::ImportExportJobRepository,
+        import_uploads::ImportUploadRepository,
         repositories::{InstanceRepository, ProtectedSecretField},
         sqlite,
     },
@@ -66,6 +67,7 @@ use crate::{
 mod boot_recovery;
 mod container_events;
 mod daemon;
+mod import_temp_cleanup;
 mod maintenance;
 mod runtime_paths;
 mod server;
@@ -76,6 +78,7 @@ mod startup;
 use boot_recovery::*;
 use container_events::*;
 use daemon::*;
+use import_temp_cleanup::*;
 use maintenance::*;
 use runtime_paths::*;
 use server::*;
@@ -277,6 +280,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AdmittedApiStream<S> {
 #[derive(Debug, Parser)]
 #[command(name = "dbev")]
 #[command(about = "Container-backed database hosting daemon")]
+#[command(version)]
 pub struct Cli {
     #[arg(short, long, default_value = defaults::CONFIG_PATH)]
     config: PathBuf,

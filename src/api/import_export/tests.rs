@@ -90,6 +90,52 @@ fn physical_operation_returns_restart_error_after_primary_success() {
 }
 
 #[test]
+fn physical_upload_expansion_is_capped_by_the_instance_disk_limit() {
+    let one_gib = 1024_u64 * 1024 * 1024;
+    for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
+        assert_eq!(
+            physical_staging_bytes_for(protocol, 1024).unwrap(),
+            Some(one_gib)
+        );
+        assert_eq!(
+            physical_staging_bytes_for(protocol, u64::MAX / (1024 * 1024)).unwrap(),
+            Some(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
+        );
+    }
+    assert_eq!(
+        physical_staging_bytes_for(Protocol::Postgres, 1024).unwrap(),
+        None
+    );
+    assert!(physical_staging_bytes_for(Protocol::Redis, 0).is_err());
+    assert!(physical_staging_bytes_for(Protocol::Redis, u64::MAX).is_err());
+}
+
+#[test]
+fn upload_staging_is_bound_to_target_generation_and_disk_limit() {
+    let staging = UploadStagingBudget::Physical {
+        extracted_bytes: 1024,
+        target_created_at: "2026-01-01T00:00:00Z".to_string(),
+        disk_mib: 512,
+    };
+
+    assert!(upload_staging_matches_target(
+        &staging,
+        "2026-01-01T00:00:00Z",
+        512
+    ));
+    assert!(!upload_staging_matches_target(
+        &staging,
+        "2026-01-02T00:00:00Z",
+        512
+    ));
+    assert!(!upload_staging_matches_target(
+        &staging,
+        "2026-01-01T00:00:00Z",
+        1024
+    ));
+}
+
+#[test]
 fn allows_only_supported_import_artifact_extensions() {
     assert!(artifact_has_allowed_extension(FsPath::new(
         "instance-1.postgres.sql"
@@ -240,7 +286,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         mysql_root_password: Some("internal-root-password".to_string()),
         mongodb_root_password: None,
         postgres_admin_password: None,
-        tenant_password: None,
+        tenant_password: Some("internal-tenant-password".to_string()),
         limits: InstanceLimits::default(),
         image: None,
         database_version: None,
@@ -262,8 +308,11 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         true,
     )
     .unwrap();
-    let import = import_script(&metadata, "/tmp/import.mysql.sql", None, false).unwrap();
-    let rollback_import = import_script(&metadata, "/tmp/rollback.mysql.sql", None, true).unwrap();
+    let selection = ImportExportSelection::default();
+    let import =
+        import_script(&metadata, "/tmp/import.mysql.sql", None, &selection, false).unwrap();
+    let rollback_import =
+        import_script(&metadata, "/tmp/rollback.mysql.sql", None, &selection, true).unwrap();
     let wipe = wipe_logical_script(&metadata, false).unwrap();
     let rollback_wipe = wipe_logical_script(&metadata, true).unwrap();
 
@@ -276,21 +325,40 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(export.contains("--hex-blob"));
     assert!(export.contains("MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\""));
     assert!(import.contains("mysql \\"));
+    assert!(import.contains("--binary-mode"));
     assert!(import.contains("--socket=/var/run/mysqld/mysqld.sock"));
-    assert!(import.contains("MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\""));
-    assert!(import.contains("-u root"));
+    assert!(import.contains("MYSQL_PWD=\"$DBE_IMPORT_PASSWORD\""));
+    assert!(import.contains("-u \"$DBE_IMPORT_USER\""));
+    assert!(!import.contains("MYSQL_ROOT_PASSWORD"));
+    assert!(!import.contains("-u root"));
     assert!(wipe.contains("--socket=/var/run/mysqld/mysqld.sock"));
-    assert!(wipe.contains("-u root"));
+    assert!(wipe.contains("MYSQL_PWD=\"$DBE_IMPORT_PASSWORD\""));
+    assert!(wipe.contains("-u \"$DBE_IMPORT_USER\""));
+    assert!(!wipe.contains("MYSQL_ROOT_PASSWORD"));
+    assert!(!wipe.contains("-u root"));
     assert!(wipe.contains("SELECT @@character_set_database, @@collation_database"));
     assert!(wipe.contains("CHARACTER SET $1 COLLATE $2"));
     assert!(rollback_wipe.contains("DROP DATABASE IF EXISTS"));
     assert!(!rollback_wipe.contains("CREATE DATABASE"));
     assert!(!rollback_import.contains("\"$MYSQL_DATABASE\""));
     assert!(rollback_import.contains("-u root"));
+    assert!(rollback_import.contains("--binary-mode"));
+    assert!(rollback_import.contains("MYSQL_ROOT_PASSWORD"));
     assert!(!export.contains("--databases"));
     assert!(rollback_export.contains("--databases"));
     assert!(!export.contains("internal-root-password"));
     assert!(!import.contains("internal-root-password"));
+    assert!(!import.contains("internal-tenant-password"));
+    assert!(
+        mysql_tenant_import_credentials(&metadata, false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        mysql_tenant_import_credentials(&metadata, true)
+            .unwrap()
+            .is_none()
+    );
 
     let mut postgres = metadata.clone();
     postgres.protocol = Protocol::Postgres;
@@ -301,13 +369,36 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         false,
     )
     .unwrap();
-    let postgres_import =
-        import_script(&postgres, "/tmp/import.postgres.sql", None, false).unwrap();
+    let postgres_import = import_script(
+        &postgres,
+        "/tmp/import.postgres.sql",
+        None,
+        &selection,
+        false,
+    )
+    .unwrap();
     let postgres_wipe = wipe_logical_script(&postgres, false).unwrap();
     for script in [&postgres_export, &postgres_import, &postgres_wipe] {
         assert!(script.contains("-h /var/run/postgresql"));
         assert!(!script.contains("-h 127.0.0.1"));
     }
+    assert!(postgres_import.contains("\\restrict dbev"));
+    assert!(postgres_import.contains("--no-psqlrc"));
+    assert!(postgres_import.contains("-f -"));
+    assert!(postgres_import.contains("cat /tmp/import.postgres.sql"));
+    assert!(!postgres_import.contains("\\unrestrict"));
+    let restrict_key = postgres_import
+        .split_once("\\restrict ")
+        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .map(|(key, _)| key)
+        .unwrap();
+    assert_eq!(restrict_key.len(), 36);
+    assert!(restrict_key.starts_with("dbev"));
+    assert!(
+        restrict_key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    );
 
     let mut mariadb = metadata.clone();
     mariadb.protocol = Protocol::Mariadb;
@@ -325,9 +416,16 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
         true,
     )
     .unwrap();
-    let mariadb_import = import_script(&mariadb, "/tmp/import.mariadb.sql", None, false).unwrap();
-    let mariadb_rollback_import =
-        import_script(&mariadb, "/tmp/rollback.mariadb.sql", None, true).unwrap();
+    let mariadb_import =
+        import_script(&mariadb, "/tmp/import.mariadb.sql", None, &selection, false).unwrap();
+    let mariadb_rollback_import = import_script(
+        &mariadb,
+        "/tmp/rollback.mariadb.sql",
+        None,
+        &selection,
+        true,
+    )
+    .unwrap();
     let mariadb_wipe = wipe_logical_script(&mariadb, false).unwrap();
     let mariadb_rollback_wipe = wipe_logical_script(&mariadb, true).unwrap();
     for script in [&mariadb_export, &mariadb_import, &mariadb_wipe] {
@@ -339,6 +437,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(mariadb_import.contains("-u \"$MARIADB_USER\""));
     assert!(mariadb_export.contains("DBE_MARIADB_PASSWORD"));
     assert!(mariadb_import.contains("DBE_MARIADB_PASSWORD"));
+    assert!(mariadb_import.contains("--binary-mode"));
     assert!(mariadb_wipe.contains("DBE_MARIADB_ROOT_PASSWORD"));
     assert!(mariadb_wipe.contains("-u root"));
     assert!(mariadb_wipe.contains("SELECT @@character_set_database, @@collation_database"));
@@ -347,8 +446,30 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(!mariadb_rollback_wipe.contains("CREATE DATABASE"));
     assert!(!mariadb_rollback_import.contains("\"$MARIADB_DATABASE\""));
     assert!(mariadb_rollback_import.contains("-u root"));
+    assert!(mariadb_rollback_import.contains("--binary-mode"));
     assert!(!mariadb_export.contains("--databases"));
     assert!(mariadb_rollback_export.contains("--databases"));
+
+    let mut mongodb = metadata;
+    mongodb.protocol = Protocol::Mongodb;
+    mongodb.mongodb_root_password = Some("internal-mongodb-password".to_string());
+    let mongodb_selection = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders".to_string(), "customers".to_string()],
+        ..ImportExportSelection::default()
+    };
+    let mongodb_import = import_script(
+        &mongodb,
+        "/tmp/import.mongodb.archive",
+        None,
+        &mongodb_selection,
+        false,
+    )
+    .unwrap();
+    assert!(mongodb_import.contains("mongorestore"));
+    assert!(mongodb_import.contains("--nsInclude \"$DBE_MONGO_DATABASE\".'orders'"));
+    assert!(mongodb_import.contains("--nsInclude \"$DBE_MONGO_DATABASE\".'customers'"));
+    assert!(!mongodb_import.contains("internal-mongodb-password"));
 }
 
 #[tokio::test]
@@ -501,6 +622,63 @@ fn remote_import_source_is_typed_and_does_not_accept_a_protocol_override() {
 }
 
 #[test]
+fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() {
+    let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
+        "source": {
+            "type": "upload",
+            "upload_id": "upload-1",
+            "source_database": "legacy_tenant"
+        },
+        "mode": "wipe"
+    }))
+    .unwrap();
+    let options = ImportOptions::from(&request);
+
+    assert_eq!(options.source_database.as_deref(), Some("legacy_tenant"));
+    validate_upload_source_database(Protocol::Mongodb, &options).unwrap();
+    let replay = serde_json::to_string(&ReplayDescriptor::UploadImport {
+        upload_id: "upload-1".to_string(),
+        source_database: options.source_database.clone(),
+        mode: options.mode,
+        selection: options.selection.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replay).unwrap()["source_database"],
+        "legacy_tenant"
+    );
+}
+
+#[test]
+fn mongodb_upload_requires_a_safe_source_database_before_job_admission() {
+    let missing = ImportOptions {
+        source: ImportSourceOptions::Upload {
+            upload_id: "upload-1".to_string(),
+            path: PathBuf::new(),
+        },
+        ..ImportOptions::default()
+    };
+    let error = validate_upload_source_database(Protocol::Mongodb, &missing).unwrap_err();
+    assert!(matches!(error, ApiError::Conflict(_)));
+    assert!(error.to_string().contains("source.source_database"));
+
+    let invalid = ImportOptions {
+        source_database: Some("unsafe.name".to_string()),
+        ..missing.clone()
+    };
+    let error = validate_upload_source_database(Protocol::Mongodb, &invalid).unwrap_err();
+    assert!(matches!(error, ApiError::BadRequest(_)));
+    assert!(error.to_string().contains("1-63 UTF-8 bytes"));
+
+    let wrong_protocol = ImportOptions {
+        source_database: Some("legacy_tenant".to_string()),
+        ..missing
+    };
+    let error = validate_upload_source_database(Protocol::Postgres, &wrong_protocol).unwrap_err();
+    assert!(error.to_string().contains("only for mongodb"));
+}
+
+#[test]
 fn import_archive_settings_are_rejected_at_the_top_level() {
     let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
         "source": {
@@ -607,6 +785,144 @@ fn mongodb_dump_selection_uses_supported_collection_flags() {
 }
 
 #[test]
+fn only_mongodb_logical_artifacts_accept_selective_imports() {
+    let selection = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders".to_string()],
+        ..ImportExportSelection::default()
+    };
+
+    validate_logical_artifact_selection(Protocol::Mongodb, &selection).unwrap();
+    for protocol in [
+        Protocol::Postgres,
+        Protocol::Mariadb,
+        Protocol::Mysql,
+        Protocol::Clickhouse,
+        Protocol::Redis,
+        Protocol::Valkey,
+        Protocol::Qdrant,
+    ] {
+        let error = validate_logical_artifact_selection(protocol, &selection).unwrap_err();
+        assert!(error.to_string().contains("selection.mode=full"));
+    }
+}
+
+#[test]
+fn local_mongodb_rollback_import_keeps_selection_but_prefiltered_remote_does_not() {
+    let options = ImportOptions {
+        selection: ImportExportSelection {
+            mode: SelectionMode::Selective,
+            include: vec!["orders".to_string(), "customers".to_string()],
+            ..ImportExportSelection::default()
+        },
+        ..ImportOptions::default()
+    };
+
+    let local = logical_apply_options(&options, false);
+    assert_eq!(local.selection.mode, SelectionMode::Selective);
+    assert_eq!(
+        local.selection.include,
+        ["orders".to_string(), "customers".to_string()]
+    );
+
+    let remote = logical_apply_options(&options, true);
+    assert_eq!(remote.selection.mode, SelectionMode::Full);
+    assert!(remote.selection.include.is_empty());
+}
+
+#[test]
+fn mongodb_local_restore_filters_multiple_collections_in_target_database() {
+    let selection = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders".to_string(), "customers_2026".to_string()],
+        exclude: vec!["audit-log".to_string()],
+        ..ImportExportSelection::default()
+    };
+
+    let args = mongodb_restore_namespace_args(&selection, None).unwrap();
+
+    assert_eq!(
+        args,
+        concat!(
+            "--nsInclude \"$DBE_MONGO_DATABASE\".'orders' \\\n",
+            "  --nsInclude \"$DBE_MONGO_DATABASE\".'customers_2026' \\\n",
+            "  --nsExclude \"$DBE_MONGO_DATABASE\".'audit-log'"
+        )
+    );
+    assert!(!args.contains("--nsFrom"));
+    assert!(!args.contains("--nsTo"));
+}
+
+#[test]
+fn mongodb_remote_restore_preserves_namespace_remapping_with_selection() {
+    let selection = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders".to_string(), "customers".to_string()],
+        exclude: vec!["audit".to_string()],
+        ..ImportExportSelection::default()
+    };
+
+    let args = mongodb_restore_namespace_args(&selection, Some("tenant*archive")).unwrap();
+
+    assert_eq!(
+        args,
+        concat!(
+            "--nsInclude 'tenant\\*archive.orders' \\\n",
+            "  --nsInclude 'tenant\\*archive.customers' \\\n",
+            "  --nsExclude 'tenant\\*archive.audit' \\\n",
+            "  --nsFrom 'tenant\\*archive.*' \\\n",
+            "  --nsTo \"$DBE_MONGO_DATABASE.*\""
+        )
+    );
+}
+
+#[test]
+fn mongodb_restore_selection_rejects_overlap_and_shell_injection() {
+    let overlap = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders".to_string()],
+        exclude: vec!["orders".to_string()],
+        ..ImportExportSelection::default()
+    };
+    let overlap_error = mongodb_restore_namespace_args(&overlap, None).unwrap_err();
+    assert!(
+        overlap_error
+            .to_string()
+            .contains("both include and exclude")
+    );
+
+    let injection = ImportExportSelection {
+        mode: SelectionMode::Selective,
+        include: vec!["orders'; touch /tmp/pwn; #".to_string()],
+        ..ImportExportSelection::default()
+    };
+    let injection_error = mongodb_restore_namespace_args(&injection, Some("source")).unwrap_err();
+    assert!(
+        injection_error
+            .to_string()
+            .contains("invalid mongodb collection")
+    );
+}
+
+#[test]
+fn mongodb_full_restore_namespace_arguments_remain_compatible() {
+    let selection = ImportExportSelection::default();
+
+    assert_eq!(
+        mongodb_restore_namespace_args(&selection, None).unwrap(),
+        "--nsInclude \"$DBE_MONGO_DATABASE.*\""
+    );
+    assert_eq!(
+        mongodb_restore_namespace_args(&selection, Some("analytics")).unwrap(),
+        concat!(
+            "--nsInclude 'analytics.*' \\\n",
+            "  --nsFrom 'analytics.*' \\\n",
+            "  --nsTo \"$DBE_MONGO_DATABASE.*\""
+        )
+    );
+}
+
+#[test]
 fn mongodb_remote_import_accepts_multiple_collections_but_export_stays_single_collection() {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
@@ -676,14 +992,15 @@ async fn test_state_with_config(config: Config) -> AppState {
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();
     let store = InstanceStore::default();
-    let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
-    test_state_with_store(store, manager, config)
+    let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
+    test_state_with_store(store, manager, config, pool)
 }
 
 fn test_state_with_store(
     store: InstanceStore,
     manager: InstanceManager,
     config: Config,
+    pool: sqlx::SqlitePool,
 ) -> AppState {
     AppState::new(crate::api::routes::AppStateData {
         config: Arc::new(config),
@@ -694,6 +1011,10 @@ fn test_state_with_store(
         manager,
         docker: DockerRuntime::offline_for_tests(&Default::default(), false),
         import_export_jobs: ImportExportJobs::default(),
+        import_uploads: crate::api::import_export::ImportUploadService::new(
+            crate::storage::import_uploads::ImportUploadRepository::new(pool),
+            2,
+        ),
         api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
         install_progress: crate::api::progress::InstallProgressStore::default(),
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),

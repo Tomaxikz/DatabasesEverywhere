@@ -2,6 +2,111 @@
 
 use super::{archive::*, files::*, physical::*, protocol::*, *};
 
+const LOGICAL_STREAM_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Copy, Default)]
+struct LogicalStagingLimits {
+    remote_staged_limit: Option<u64>,
+    max_prepared_bytes: Option<u64>,
+    max_rollback_bytes: Option<u64>,
+    max_combined_bytes: Option<u64>,
+}
+
+impl LogicalStagingLimits {
+    fn remote(max_bytes: u64) -> Self {
+        Self {
+            remote_staged_limit: Some(max_bytes),
+            max_combined_bytes: Some(max_bytes),
+            ..Self::default()
+        }
+    }
+
+    fn upload(budget: UploadLogicalStagingBudget) -> Self {
+        Self {
+            max_prepared_bytes: Some(budget.prepared_bytes),
+            max_rollback_bytes: Some(budget.rollback_bytes),
+            max_combined_bytes: Some(budget.reservation_bytes),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UploadLogicalStagingBudget {
+    pub(super) prepared_bytes: u64,
+    pub(super) rollback_bytes: u64,
+    pub(super) reservation_bytes: u64,
+}
+
+pub(super) fn upload_logical_staging_budget(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    mode: ImportMode,
+) -> Result<Option<UploadLogicalStagingBudget>, ApiError> {
+    if matches!(
+        metadata.protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
+        return Ok(None);
+    }
+    let prepared_bytes = state
+        .config
+        .artifacts
+        .import_upload_max_bytes
+        .min(MAX_UNARCHIVED_BYTES);
+    let instance_disk_bytes = metadata
+        .limits
+        .disk_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| ApiError::Runtime("instance disk limit overflowed".to_string()))?;
+    let rollback_bytes = if mode == ImportMode::Wipe {
+        prepared_bytes.min(instance_disk_bytes)
+    } else {
+        0
+    };
+    if mode == ImportMode::Wipe && rollback_bytes == 0 {
+        return Err(ApiError::Conflict(
+            "logical upload import requires a nonzero rollback staging budget".to_string(),
+        ));
+    }
+    let reservation_bytes = prepared_bytes
+        .checked_add(rollback_bytes)
+        .ok_or_else(|| ApiError::Runtime("logical import staging budget overflowed".to_string()))?;
+    Ok(Some(UploadLogicalStagingBudget {
+        prepared_bytes,
+        rollback_bytes,
+        reservation_bytes,
+    }))
+}
+
+pub(super) fn upload_physical_staging_bytes(
+    metadata: &InstanceMetadata,
+) -> Result<Option<u64>, ApiError> {
+    physical_staging_bytes_for(metadata.protocol, metadata.limits.disk_mib)
+}
+
+pub(super) fn physical_staging_bytes_for(
+    protocol: Protocol,
+    disk_mib: u64,
+) -> Result<Option<u64>, ApiError> {
+    if !matches!(
+        protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
+        return Ok(None);
+    }
+    let instance_disk_bytes = disk_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| ApiError::Runtime("instance disk limit overflowed".to_string()))?;
+    let bytes = instance_disk_bytes.min(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    if bytes == 0 {
+        return Err(ApiError::Conflict(
+            "physical upload import requires a nonzero extraction budget".to_string(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
 pub(super) async fn import_instance_source(
     state: &AppState,
     instance_id: &str,
@@ -13,6 +118,7 @@ pub(super) async fn import_instance_source(
         .await
         .ok_or(ApiError::NotFound)?;
     validate_logical_operation_eligible(&metadata)?;
+    let upload_staging = validated_upload_staging(&metadata, options)?;
     match &options.source {
         ImportSourceOptions::Artifact(path)
             if options.mode == ImportMode::Wipe
@@ -21,11 +127,89 @@ pub(super) async fn import_instance_source(
                     Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
                 ) =>
         {
-            import_logical_with_rollback(state, &metadata, path, options, None, None).await
+            import_logical_with_rollback(
+                state,
+                &metadata,
+                path,
+                options,
+                None,
+                LogicalStagingLimits::default(),
+            )
+            .await
         }
         ImportSourceOptions::Artifact(path) => {
             import_instance_artifact(state, instance_id, &metadata, path, options, None).await
         }
+        ImportSourceOptions::Upload { path, .. }
+            if options.mode == ImportMode::Wipe
+                && !matches!(
+                    metadata.protocol,
+                    Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+                ) =>
+        {
+            let staging = match upload_staging {
+                Some(UploadStagingBudget::Logical { budget, .. }) => *budget,
+                _ => {
+                    return Err(ApiError::Runtime(
+                        "logical upload staging was unavailable".to_string(),
+                    ));
+                }
+            };
+            import_logical_with_rollback(
+                state,
+                &metadata,
+                path,
+                options,
+                options.source_database.as_deref(),
+                LogicalStagingLimits::upload(staging),
+            )
+            .await
+        }
+        ImportSourceOptions::Upload { path, .. } => match metadata.protocol {
+            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
+                let max_extracted_bytes = match upload_staging {
+                    Some(UploadStagingBudget::Physical {
+                        extracted_bytes, ..
+                    }) => *extracted_bytes,
+                    _ => {
+                        return Err(ApiError::Runtime(
+                            "physical upload staging was unavailable".to_string(),
+                        ));
+                    }
+                };
+                import_physical_archive(
+                    state,
+                    instance_id,
+                    metadata.protocol,
+                    path,
+                    max_extracted_bytes,
+                )
+                .await
+            }
+            protocol => {
+                let staging = match upload_staging {
+                    Some(UploadStagingBudget::Logical { budget, .. }) => *budget,
+                    _ => {
+                        return Err(ApiError::Runtime(
+                            "logical upload staging was unavailable".to_string(),
+                        ));
+                    }
+                };
+                import_logical_dump(
+                    state,
+                    &metadata,
+                    protocol,
+                    path,
+                    options,
+                    LogicalImportControls {
+                        source_database: options.source_database.as_deref(),
+                        max_prepared_bytes: Some(staging.prepared_bytes),
+                        ..LogicalImportControls::default()
+                    },
+                )
+                .await
+            }
+        },
         ImportSourceOptions::Remote(source) => {
             if metadata.status != InstanceStatus::Running {
                 return Err(ApiError::BadRequest(format!(
@@ -61,7 +245,9 @@ pub(super) async fn import_instance_source(
                         &artifact_paths,
                         options,
                         staged.source_database.as_deref(),
-                        Some(state.config.security.remote_import.max_staged_bytes),
+                        LogicalStagingLimits::remote(
+                            state.config.security.remote_import.max_staged_bytes,
+                        ),
                     )
                     .await;
                     staged.cleanup().await;
@@ -73,6 +259,50 @@ pub(super) async fn import_instance_source(
             "remote import source was not validated".to_string(),
         )),
     }
+}
+
+fn validated_upload_staging<'a>(
+    metadata: &InstanceMetadata,
+    options: &'a ImportOptions,
+) -> Result<Option<&'a UploadStagingBudget>, ApiError> {
+    if !matches!(&options.source, ImportSourceOptions::Upload { .. }) {
+        if options.upload_staging.is_some() {
+            return Err(ApiError::Runtime(
+                "non-upload import unexpectedly retained upload staging".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    let staging = options.upload_staging.as_ref().ok_or_else(|| {
+        ApiError::Runtime("upload import did not retain its staging reservation".to_string())
+    })?;
+    if !upload_staging_matches_target(staging, &metadata.created_at, metadata.limits.disk_mib) {
+        return Err(ApiError::Conflict(
+            "the target instance or disk limit changed after import admission; submit the upload import again"
+                .to_string(),
+        ));
+    }
+    Ok(Some(staging))
+}
+
+pub(super) fn upload_staging_matches_target(
+    staging: &UploadStagingBudget,
+    current_created_at: &str,
+    current_disk_mib: u64,
+) -> bool {
+    let (target_created_at, disk_mib) = match staging {
+        UploadStagingBudget::Logical {
+            target_created_at,
+            disk_mib,
+            ..
+        }
+        | UploadStagingBudget::Physical {
+            target_created_at,
+            disk_mib,
+            ..
+        } => (target_created_at, *disk_mib),
+    };
+    target_created_at == current_created_at && disk_mib == current_disk_mib
 }
 
 pub(super) fn validate_logical_operation_eligible(
@@ -103,7 +333,14 @@ pub(super) async fn import_instance_artifact(
     let protocol = metadata.protocol;
     match protocol {
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
-            import_physical_archive(state, instance_id, protocol, artifact_path).await
+            import_physical_archive(
+                state,
+                instance_id,
+                protocol,
+                artifact_path,
+                crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+            )
+            .await
         }
         protocol => {
             import_logical_dump(
@@ -122,13 +359,13 @@ pub(super) async fn import_instance_artifact(
     }
 }
 
-pub(super) async fn import_logical_with_rollback(
+async fn import_logical_with_rollback(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_path: &FsPath,
     options: &ImportOptions,
     source_database: Option<&str>,
-    staging_limit: Option<u64>,
+    staging: LogicalStagingLimits,
 ) -> Result<(), ApiError> {
     import_logical_artifacts_with_rollback(
         state,
@@ -136,25 +373,36 @@ pub(super) async fn import_logical_with_rollback(
         &[artifact_path],
         options,
         source_database,
-        staging_limit,
+        staging,
     )
     .await
 }
 
-pub(super) async fn import_logical_artifacts_with_rollback(
+pub(super) fn logical_apply_options(
+    options: &ImportOptions,
+    remote_dump_was_prefiltered: bool,
+) -> ImportOptions {
+    let mut apply_options = options.clone();
+    if remote_dump_was_prefiltered {
+        apply_options.selection = ImportExportSelection::default();
+    }
+    apply_options
+}
+
+async fn import_logical_artifacts_with_rollback(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_paths: &[&FsPath],
     options: &ImportOptions,
     source_database: Option<&str>,
-    staging_limit: Option<u64>,
+    staging: LogicalStagingLimits,
 ) -> Result<(), ApiError> {
     if artifact_paths.is_empty() {
         return Err(ApiError::Runtime(
             "logical import did not contain any artifacts".to_string(),
         ));
     }
-    let remote_exec_timeout = staging_limit.map(|_| {
+    let remote_exec_timeout = staging.remote_staged_limit.map(|_| {
         Duration::from_secs(
             state
                 .config
@@ -163,16 +411,13 @@ pub(super) async fn import_logical_artifacts_with_rollback(
                 .operation_timeout_seconds,
         )
     });
-    // Remote selective acquisition has already reduced the dump. Applying that
-    // native dump is therefore a full artifact import; forwarding the original
-    // selection would reject it or filter it a second time.
-    let mut apply_options = options.clone();
-    apply_options.selection = ImportExportSelection::default();
+    let apply_options = logical_apply_options(options, staging.remote_staged_limit.is_some());
     let controls = LogicalImportControls {
         source_database,
-        reuse_staged_artifact: staging_limit.is_some(),
+        reuse_staged_artifact: staging.remote_staged_limit.is_some(),
         exec_timeout: remote_exec_timeout,
-        remove_uploaded_source_limit: staging_limit,
+        remove_uploaded_source_limit: staging.remote_staged_limit,
+        max_prepared_bytes: staging.max_prepared_bytes,
         ..LogicalImportControls::default()
     };
     let mut prepared = Vec::with_capacity(artifact_paths.len());
@@ -194,11 +439,23 @@ pub(super) async fn import_logical_artifacts_with_rollback(
             }
         }
     }
-    let retained_source_bytes = match staging_limit {
+    let prepared_source_bytes = prepared.iter().try_fold(0_u64, |total, artifact| {
+        total
+            .checked_add(artifact.prepared_source_bytes)
+            .ok_or_else(|| ApiError::BadRequest("prepared import size overflowed".to_string()))
+    });
+    let prepared_source_bytes = match prepared_source_bytes {
+        Ok(total) => total,
+        Err(error) => {
+            cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+            return Err(error);
+        }
+    };
+    let retained_source_bytes = match staging.remote_staged_limit {
         Some(limit) => {
             let mut total = 0_u64;
             for artifact in &prepared {
-                let Some(source_bytes) = artifact.removed_host_source_bytes else {
+                let Some(source_bytes) = artifact.staged_source_bytes else {
                     cleanup_prepared_logical_imports(state, metadata, &prepared).await;
                     return Err(ApiError::Runtime(
                         "remote import source staging accounting was unavailable".to_string(),
@@ -216,9 +473,25 @@ pub(super) async fn import_logical_artifacts_with_rollback(
             }
             total
         }
-        None => 0,
+        None => prepared_source_bytes,
     };
-    let rollback_limit = staging_limit.map(|limit| limit - retained_source_bytes);
+    let remaining_combined_bytes = match staging.max_combined_bytes {
+        Some(limit) => match limit.checked_sub(retained_source_bytes) {
+            Some(remaining) if remaining > 0 => Some(remaining),
+            _ => {
+                cleanup_prepared_logical_imports(state, metadata, &prepared).await;
+                return Err(ApiError::BadRequest(format!(
+                    "prepared import data leaves no room in the configured {limit}-byte staging budget for rollback"
+                )));
+            }
+        },
+        None => None,
+    };
+    let rollback_limit = match (staging.max_rollback_bytes, remaining_combined_bytes) {
+        (Some(rollback), Some(remaining)) => Some(rollback.min(remaining)),
+        (Some(rollback), None) => Some(rollback),
+        (None, remaining) => remaining,
+    };
 
     let rollback_root = match logical_staging_root(state).await {
         Ok(root) => root,
@@ -252,7 +525,7 @@ pub(super) async fn import_logical_artifacts_with_rollback(
         cleanup_path(&rollback_path).await;
         return Err(error);
     }
-    if let Some(limit) = staging_limit
+    if let Some(limit) = staging.max_combined_bytes
         && let Err(error) = ensure_remote_import_staging_budget_with_retained_bytes(
             &[&rollback_path],
             retained_source_bytes,
@@ -640,68 +913,40 @@ pub(super) async fn export_logical_dump(
     let temp_name = format!(".dbe-export-{}.{}", uuid::Uuid::new_v4(), extension);
     let staging_root = logical_staging_root(state).await?;
     let host_temp = staging_root.join(&temp_name);
-    let container_temp = format!("/tmp/{temp_name}");
     cleanup_path(&host_temp).await;
 
-    let mut script = export_script(
+    let script = export_script(
         metadata,
-        &container_temp,
+        "/dev/stdout",
         &options.selection,
         controls.include_database_definition,
     )?;
-    if let Some(max_bytes) = controls.max_output_bytes {
-        // POSIX shells differ on whether `ulimit -f` blocks are 512 or 1024 bytes.
-        // Dividing by 1024 is conservative on both and bounds the container-side
-        // dump before Docker transfer begins.
-        let blocks = max_bytes / 1024;
-        if blocks == 0 {
-            return Err(ApiError::BadRequest(
-                "remote import staging limit leaves no room for a rollback dump".to_string(),
-            ));
-        }
-        script = format!("set -eu\nulimit -f {blocks}\n{script}");
+    let max_output_bytes = controls
+        .max_output_bytes
+        .unwrap_or(MAX_UNARCHIVED_BYTES)
+        .min(MAX_UNARCHIVED_BYTES);
+    if max_output_bytes == 0 {
+        return Err(ApiError::BadRequest(
+            "logical export output limit must be nonzero".to_string(),
+        ));
     }
     let result = async {
-        let output = match controls.exec_timeout {
-            Some(timeout) => {
-                state
-                    .docker
-                    .exec_shell_with_timeout(protocol, instance_id, &script, timeout)
-                    .await
-            }
-            None => {
-                state
-                    .docker
-                    .exec_shell(protocol, instance_id, &script)
-                    .await
-            }
-        };
-        output.map_err(|error| ApiError::Runtime(error.to_string()))?;
-        match controls.max_output_bytes {
-            Some(max_bytes) => {
-                state
-                    .docker
-                    .download_file_bounded(
-                        protocol,
-                        instance_id,
-                        &container_temp,
-                        &host_temp,
-                        max_bytes,
-                    )
-                    .await
-            }
-            None => {
-                state
-                    .docker
-                    .download_file(protocol, instance_id, &container_temp, &host_temp)
-                    .await
-            }
-        }
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        state
+            .docker
+            .exec_shell_to_file_with_secret_env(
+                protocol,
+                instance_id,
+                &script,
+                &[],
+                &host_temp,
+                max_output_bytes,
+                controls.exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT),
+            )
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
         archive_or_copy_export(&host_temp, &artifact_path, options.archive_format).await
     }
     .await;
-    cleanup_container_temp(state, protocol, instance_id, &container_temp).await;
     cleanup_path(&host_temp).await;
     result
 }
@@ -713,6 +958,7 @@ pub(super) struct LogicalImportControls<'a> {
     database_definition_in_dump: bool,
     exec_timeout: Option<Duration>,
     remove_uploaded_source_limit: Option<u64>,
+    max_prepared_bytes: Option<u64>,
 }
 
 pub(super) async fn import_logical_dump(
@@ -734,11 +980,11 @@ pub(super) struct PreparedLogicalImport {
     protocol: Protocol,
     host_temp: PathBuf,
     owns_host_temp: bool,
-    container_temp: String,
     script: String,
     exec_timeout: Option<Duration>,
     database_definition_in_dump: bool,
-    removed_host_source_bytes: Option<u64>,
+    prepared_source_bytes: u64,
+    staged_source_bytes: Option<u64>,
 }
 
 pub(super) async fn prepare_logical_import(
@@ -749,7 +995,7 @@ pub(super) async fn prepare_logical_import(
     options: &ImportOptions,
     controls: LogicalImportControls<'_>,
 ) -> Result<PreparedLogicalImport, ApiError> {
-    ensure_full_selection(protocol, &options.selection)?;
+    validate_logical_artifact_selection(protocol, &options.selection)?;
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-import-{}.{}", uuid::Uuid::new_v4(), extension);
     let staging_root = logical_staging_root(state).await?;
@@ -758,9 +1004,12 @@ pub(super) async fn prepare_logical_import(
     } else {
         staging_root.join(&temp_name)
     };
-    let container_temp = format!("/tmp/{temp_name}");
-    let staged_source_bytes = if controls.reuse_staged_artifact {
-        Some(ensure_import_file_size(&host_temp).await?)
+    let max_prepared_bytes = controls
+        .max_prepared_bytes
+        .unwrap_or(MAX_UNARCHIVED_BYTES)
+        .min(MAX_UNARCHIVED_BYTES);
+    let prepared_source_bytes = if controls.reuse_staged_artifact {
+        ensure_import_file_size(&host_temp).await?
     } else {
         cleanup_path(&host_temp).await;
         if let Err(error) = prepare_logical_import_artifact(
@@ -769,27 +1018,36 @@ pub(super) async fn prepare_logical_import(
             &host_temp,
             &staging_root,
             options,
+            max_prepared_bytes,
         )
         .await
         {
             cleanup_path(&host_temp).await;
             return Err(error);
         }
-        None
+        ensure_import_file_size(&host_temp).await?
     };
-    if let (Some(source_bytes), Some(limit)) =
-        (staged_source_bytes, controls.remove_uploaded_source_limit)
-        && source_bytes > limit
+    if prepared_source_bytes > max_prepared_bytes {
+        if !controls.reuse_staged_artifact {
+            cleanup_path(&host_temp).await;
+        }
+        return Err(ApiError::BadRequest(format!(
+            "prepared import source is {prepared_source_bytes} bytes; configured limit is {max_prepared_bytes} bytes"
+        )));
+    }
+    if let Some(limit) = controls.remove_uploaded_source_limit
+        && prepared_source_bytes > limit
     {
         return Err(ApiError::BadRequest(format!(
-            "remote import source is {source_bytes} bytes; configured staging limit is {limit} bytes"
+            "remote import source is {prepared_source_bytes} bytes; configured staging limit is {limit} bytes"
         )));
     }
 
     let script = match import_script(
         metadata,
-        &container_temp,
+        "/dev/stdin",
         controls.source_database,
+        &options.selection,
         controls.database_definition_in_dump,
     ) {
         Ok(script) => script,
@@ -800,40 +1058,13 @@ pub(super) async fn prepare_logical_import(
             return Err(error);
         }
     };
-    if let Err(error) = state
-        .docker
-        .upload_file(protocol, &metadata.instance_id, &host_temp, &container_temp)
-        .await
-    {
-        cleanup_container_temp(state, protocol, &metadata.instance_id, &container_temp).await;
+    let staged_source_bytes = if controls.remove_uploaded_source_limit.is_some() {
         if !controls.reuse_staged_artifact {
-            cleanup_path(&host_temp).await;
+            return Err(ApiError::Runtime(
+                "remote import source accounting requires a staged source artifact".to_string(),
+            ));
         }
-        return Err(ApiError::Runtime(error.to_string()));
-    }
-    let removed_host_source_bytes = if controls.remove_uploaded_source_limit.is_some() {
-        let source_bytes = staged_source_bytes.ok_or_else(|| {
-            ApiError::Runtime(
-                "remote import source removal requires a staged source artifact".to_string(),
-            )
-        })?;
-        let source_path = host_temp.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            crate::shared::files::remove_private_file_durable(&source_path)
-        })
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to join remote source cleanup: {error}"))
-        })?
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to remove uploaded remote source from host staging: {error}"
-            ))
-        }) {
-            cleanup_container_temp(state, protocol, &metadata.instance_id, &container_temp).await;
-            return Err(error);
-        }
-        Some(source_bytes)
+        Some(prepared_source_bytes)
     } else {
         None
     };
@@ -841,11 +1072,11 @@ pub(super) async fn prepare_logical_import(
         protocol,
         host_temp,
         owns_host_temp: !controls.reuse_staged_artifact,
-        container_temp,
         script,
         exec_timeout: controls.exec_timeout,
         database_definition_in_dump: controls.database_definition_in_dump,
-        removed_host_source_bytes,
+        prepared_source_bytes,
+        staged_source_bytes,
     })
 }
 
@@ -886,53 +1117,46 @@ pub(super) async fn apply_prepared_logical_imports(
         )
         .await?;
     }
+    let credentials = mysql_tenant_import_credentials(metadata, first.database_definition_in_dump)?;
     let import_started = Instant::now();
     for artifact in prepared {
-        let result = match artifact.exec_timeout {
-            Some(timeout) => {
-                let remaining = timeout
-                    .checked_sub(import_started.elapsed())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or_else(|| {
-                        ApiError::Runtime(format!(
-                            "{} import timed out while applying multiple artifacts",
-                            metadata.protocol.as_str()
-                        ))
-                    })?;
-                state
-                    .docker
-                    .exec_shell_with_timeout(
-                        artifact.protocol,
-                        instance_id,
-                        &artifact.script,
-                        remaining,
-                    )
-                    .await
-            }
-            None => {
-                state
-                    .docker
-                    .exec_shell(artifact.protocol, instance_id, &artifact.script)
-                    .await
-            }
+        let timeout = match artifact.exec_timeout {
+            Some(total) => total
+                .checked_sub(import_started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    ApiError::Runtime(format!(
+                        "{} import timed out while applying multiple artifacts",
+                        metadata.protocol.as_str()
+                    ))
+                })?,
+            None => LOGICAL_STREAM_EXEC_TIMEOUT,
         };
-        result.map_err(|error| ApiError::Runtime(error.to_string()))?;
+        let environment = credentials
+            .as_ref()
+            .map(MysqlTenantImportCredentials::environment);
+        state
+            .docker
+            .exec_shell_with_file_stdin_and_secret_env(
+                artifact.protocol,
+                instance_id,
+                &artifact.script,
+                environment.as_ref().map_or(&[], |value| value.as_slice()),
+                &artifact.host_temp,
+                artifact.prepared_source_bytes,
+                timeout,
+            )
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
     }
     Ok(())
 }
 
 pub(super) async fn cleanup_prepared_logical_import(
-    state: &AppState,
-    metadata: &InstanceMetadata,
+    _state: &AppState,
+    _metadata: &InstanceMetadata,
     prepared: &PreparedLogicalImport,
 ) {
-    cleanup_container_temp(
-        state,
-        prepared.protocol,
-        &metadata.instance_id,
-        &prepared.container_temp,
-    )
-    .await;
     if prepared.owns_host_temp {
         cleanup_path(&prepared.host_temp).await;
     }

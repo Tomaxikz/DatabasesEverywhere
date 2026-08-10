@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.10.0
+  version: 0.11.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -196,7 +196,7 @@ components:
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.10.0}
+        api_version: {type: string, example: 0.11.0}
         api_readiness:
           type: string
           const: ready
@@ -342,21 +342,23 @@ components:
           oneOf:
             - $ref: "#/components/schemas/ArtifactImportSource"
             - $ref: "#/components/schemas/RemoteImportSource"
+            - $ref: "#/components/schemas/UploadImportSource"
           discriminator:
             propertyName: type
             mapping:
               artifact: "#/components/schemas/ArtifactImportSource"
               remote: "#/components/schemas/RemoteImportSource"
+              upload: "#/components/schemas/UploadImportSource"
         mode:
           type: string
           enum: [merge, wipe]
           default: merge
           description: >-
-            For credential imports, merge replaces source-named
+            For nonphysical imports, merge replaces source-named
             objects/keys/collections while preserving target-only data; wipe
             clears the target database first. Redis, Valkey, and Qdrant artifact imports
-            always replace the complete physical database, so mode does not
-            change their behavior.
+            and uploads always replace the complete physical database, so mode
+            does not change their behavior.
         selection:
           $ref: "#/components/schemas/ImportExportSelection"
     ExportRequest:
@@ -383,6 +385,35 @@ components:
           type: [string, "null"]
           enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
           description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Valkey/Qdrant physical archives.
+    UploadImportSource:
+      type: object
+      additionalProperties: false
+      required: [type, upload_id]
+      description: >-
+        A temporary dump received through the octet-stream form of this
+        instance's import endpoint. The daemon uses the persisted, inspected
+        archive format; clients cannot override it. A successful import
+        consumes and deletes the upload. A failed import releases it for retry
+        until it is cancelled or expires. MongoDB uploads additionally require
+        source_database so the archive namespace can be selected and remapped
+        without restoring other databases.
+      properties:
+        type:
+          type: string
+          const: upload
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+          description: Opaque ID returned by a successful temporary dump upload.
+        source_database:
+          type: string
+          minLength: 1
+          maxLength: 63
+          description: >-
+            Original database namespace in a MongoDB archive. Required for
+            MongoDB upload imports and rejected for every other protocol. DBEV
+            restores only this namespace and remaps it to the target database.
+          example: legacy_tenant
     RemoteImportSource:
       type: object
       additionalProperties: false
@@ -463,6 +494,116 @@ components:
             type: array
             items:
               type: string
+    ImportUpload:
+      type: object
+      additionalProperties: false
+      required: [upload_id, instance_id, original_filename, protocol, archive_format, state, size_bytes, sha256, created_at, updated_at, expires_at]
+      properties:
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+        instance_id:
+          type: string
+        original_filename:
+          type: string
+          maxLength: 180
+          description: Display-only flat filename supplied in X-DBEV-Filename; never a host path.
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        archive_format:
+          type: [string, "null"]
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
+          description: Persisted wrapper selection. Catalog inspection verifies and may refine this value.
+        state:
+          type: string
+          enum: [uploading, uploaded, processing, ready, failed, importing, consumed, deleting]
+        size_bytes:
+          type: integer
+          minimum: 1
+        sha256:
+          type: [string, "null"]
+          pattern: '^[0-9a-f]{64}$'
+          description: Daemon-computed digest; null only while reception has not committed.
+        catalog:
+          $ref: "#/components/schemas/DumpInspection"
+        error:
+          type: string
+          description: Safe diagnostic for the most recent upload or inspection failure.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    DumpInspection:
+      type: object
+      additionalProperties: false
+      required: [protocol, sha256, source_size_bytes, detected_archive_format, selection_kind, selective_supported, catalog_complete, namespaces, objects, unselectable_object_count]
+      properties:
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        source_size_bytes:
+          type: integer
+          minimum: 1
+        detected_archive_format:
+          type: string
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip]
+        selection_kind:
+          type: string
+          enum: [tables, collections, full_only]
+        selective_supported:
+          type: boolean
+          description: The only authoritative switch for enabling selective-import controls.
+        catalog_complete:
+          type: boolean
+          description: False when the bounded inspector could not enumerate every selectable object.
+        namespaces:
+          type: array
+          maxItems: 512
+          items:
+            type: string
+        objects:
+          type: array
+          maxItems: 512
+          items:
+            $ref: "#/components/schemas/DumpSelectableObject"
+        unselectable_object_count:
+          type: integer
+          minimum: 0
+        selective_unavailable_reason:
+          type: string
+          description: Human-readable reason selective import is unavailable.
+    DumpSelectableObject:
+      type: object
+      additionalProperties: false
+      required: [kind, name, selection_key]
+      properties:
+        kind:
+          type: string
+          enum: [table, collection]
+        name:
+          type: string
+        namespace:
+          type: string
+        selection_key:
+          type: string
+          description: Exact opaque value to send in selection.include or selection.exclude if selective_supported is true.
+    ImportUploadDeleteResponse:
+      type: object
+      additionalProperties: false
+      required: [upload_id, deleted]
+      properties:
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+        deleted:
+          type: boolean
     ImportExportJob:
       type: object
       required: [job_id, instance_id, action, status, artifact_id, artifact_size_bytes, error, created_at, updated_at]
@@ -1323,7 +1464,12 @@ paths:
                 $ref: "#/components/schemas/ImportExportJob"
   /api/instances/{instance_id}/import:
     post:
-      summary: Import a protocol-native artifact or a remote database into one instance.
+      summary: Upload a temporary dump or queue an import into one instance.
+      description: >-
+        application/octet-stream stores, hashes, and returns a temporary upload
+        without starting an import. application/json queues an import from an
+        artifact, typed remote source, or ready temporary upload. Temporary
+        uploads are separate from generated artifacts.
       x-required-scope: import-export:write
       parameters:
         - name: instance_id
@@ -1331,15 +1477,53 @@ paths:
           required: true
           schema:
             type: string
+        - name: Content-Length
+          in: header
+          required: false
+          description: Required for application/octet-stream and must exactly equal the bytes sent.
+          schema:
+            type: integer
+            minimum: 1
+        - name: X-DBEV-Filename
+          in: header
+          required: false
+          description: >-
+            Required for application/octet-stream. Percent-encoded UTF-8 flat
+            filename, at most 180 decoded bytes, with a supported native dump
+            extension. Paths and traversal components are rejected.
+          schema:
+            type: string
+        - name: X-DBEV-SHA256
+          in: header
+          required: false
+          description: Optional expected digest for application/octet-stream; exactly 64 lowercase hexadecimal characters.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/ImportRequest"
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: >-
+                Raw, unencoded dump bytes. Content-Encoding must be absent or
+                identity. The configured default limit is 8 GiB; the daemon
+                also enforces per-instance count, node-wide byte, concurrency,
+                free-space, total-duration, and idle-duration limits.
       responses:
         default:
           $ref: "#/components/responses/ApiError"
+        "201":
+          description: Temporary upload committed, hashed, and ready for inspection or full import; no import job was started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
         "202":
           description: Queued import job.
           headers:
@@ -1350,6 +1534,111 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/import/uploads:
+    get:
+      summary: List active temporary import uploads for one instance.
+      description: Returns at most 100 instance-owned records. Temporary uploads never appear in the artifact inventory.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary upload list.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items:
+                  $ref: "#/components/schemas/ImportUpload"
+  /api/instances/{instance_id}/import/uploads/{upload_id}:
+    get:
+      summary: Get one temporary import upload belonging to an instance.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary upload state and optional cached inspection catalog.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
+    delete:
+      summary: Cancel and durably delete one temporary import upload.
+      description: Importing uploads return a conflict. Deletion never removes a DBEV-generated artifact or operator-staged import file.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Upload deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUploadDeleteResponse"
+  /api/instances/{instance_id}/import/uploads/{upload_id}/catalog:
+    post:
+      summary: Inspect a ready temporary dump and cache its bounded catalog.
+      description: >-
+        Validates the archive wrapper and extracts a bounded metadata-only
+        catalog without executing dump content. Inspection is lazy and
+        idempotent once cached. The selective_supported response field is the
+        authoritative capability; v0.5.1 uploads are full-import only. A
+        concurrency rejection or bounded inspection limit leaves the upload
+        ready, so a full import remains available.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Upload with cached dump inspection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
   /api/instances/{instance_id}/import-export/jobs:
     get:
       summary: List import/export jobs for one instance.

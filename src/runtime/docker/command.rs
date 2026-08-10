@@ -330,6 +330,47 @@ impl DockerRuntime {
             timeout_seconds = timeout.as_secs(),
             "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
         );
+        self.restart_after_exec_interruption(
+            protocol,
+            instance_id,
+            container,
+            operation,
+            readiness_timeout,
+        )
+        .await
+    }
+
+    pub(super) async fn recover_interrupted_exec(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container: &str,
+        operation: &str,
+        readiness_timeout: Duration,
+    ) -> Result<(), DockerError> {
+        tracing::warn!(
+            %container,
+            %operation,
+            "docker exec was interrupted before exit could be confirmed; restarting the managed container"
+        );
+        self.restart_after_exec_interruption(
+            protocol,
+            instance_id,
+            container,
+            operation,
+            readiness_timeout,
+        )
+        .await
+    }
+
+    async fn restart_after_exec_interruption(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container: &str,
+        operation: &str,
+        readiness_timeout: Duration,
+    ) -> Result<(), DockerError> {
         match tokio::time::timeout(
             DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
             self.docker.kill_container(
@@ -386,7 +427,7 @@ impl DockerRuntime {
         tracing::info!(
             %container,
             %operation,
-            "managed container recovered after docker exec timeout"
+            "managed container recovered after interrupted docker exec"
         );
         Ok(())
     }

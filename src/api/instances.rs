@@ -533,6 +533,12 @@ pub async fn delete_instance(
         .delete_for_instance(&metadata.instance_id)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to purge instance jobs: {error}")))?;
+    state
+        .import_uploads
+        .repository()
+        .delete_for_instance(&metadata.instance_id)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to purge import uploads: {error}")))?;
     let deleted = state
         .manager
         .delete(&metadata.instance_id)

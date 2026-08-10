@@ -8,6 +8,7 @@ mod podman_api;
 mod remote_import;
 mod security;
 mod spec;
+mod stream_exec;
 mod transfer;
 
 use transfer::*;
@@ -18,6 +19,7 @@ pub use events::{ManagedContainerAction, ManagedContainerEvent};
 pub use remote_import::RemoteImportHelperSpec;
 pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
+pub use stream_exec::ExecStreamResult;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1196,6 +1198,39 @@ pub enum DockerError {
         exit_code: i64,
         failure_output: String,
     },
+    #[error("invalid streaming exec command")]
+    InvalidExecCommand,
+    #[error("invalid streaming exec environment")]
+    InvalidExecEnvironment,
+    #[error("invalid streaming exec {direction} file {path}")]
+    InvalidExecStreamFile {
+        direction: &'static str,
+        path: String,
+    },
+    #[error("streaming exec {direction} failed for {path}: {source}")]
+    ExecStreamIo {
+        direction: &'static str,
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("streaming exec input {path} is {size} bytes; maximum is {max_bytes} bytes")]
+    ExecStreamInputTooLarge {
+        path: String,
+        size: u64,
+        max_bytes: u64,
+    },
+    #[error("streaming exec output {path} exceeded the {max_bytes}-byte limit")]
+    ExecStreamOutputTooLarge { path: String, max_bytes: u64 },
+    #[error("streaming exec failed in {container} with exit code {exit_code}")]
+    ExecStreamFailed { container: String, exit_code: i64 },
+    #[error("streaming exec unexpectedly started detached in {container}")]
+    ExecStreamDetached { container: String },
+    #[error("streaming exec ended without an exit status")]
+    ExecExitStatusUnavailable,
+    #[error("streaming exec was cancelled in {container}; the container was restarted")]
+    ExecStreamCancelled { container: String },
+    #[error("streaming exec task failed: {0}")]
+    ExecStreamTask(String),
     #[error("docker exec timeout must be greater than zero")]
     InvalidExecTimeout,
     #[error(

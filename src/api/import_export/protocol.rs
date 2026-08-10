@@ -1,6 +1,49 @@
 //! Protocol-specific selection validation and native dump/restore scripts.
 
 use super::{files::*, *};
+use secrecy::SecretString;
+
+const MYSQL_IMPORT_USER_ENV: &str = "DBE_IMPORT_USER";
+const MYSQL_IMPORT_PASSWORD_ENV: &str = "DBE_IMPORT_PASSWORD";
+
+pub(super) struct MysqlTenantImportCredentials {
+    username: SecretString,
+    password: SecretString,
+}
+
+impl MysqlTenantImportCredentials {
+    pub(super) fn environment(&self) -> [(&'static str, &SecretString); 2] {
+        [
+            (MYSQL_IMPORT_USER_ENV, &self.username),
+            (MYSQL_IMPORT_PASSWORD_ENV, &self.password),
+        ]
+    }
+}
+
+pub(super) fn mysql_tenant_import_credentials(
+    metadata: &InstanceMetadata,
+    database_definition_in_dump: bool,
+) -> Result<Option<MysqlTenantImportCredentials>, ApiError> {
+    if metadata.protocol != Protocol::Mysql || database_definition_in_dump {
+        return Ok(None);
+    }
+    if metadata.database.username.is_empty() {
+        return Err(ApiError::BadRequest(
+            "mysql tenant username is missing; repair or recreate this instance before importing"
+                .to_string(),
+        ));
+    }
+    let password = metadata.tenant_password.as_deref().ok_or_else(|| {
+        ApiError::BadRequest(
+            "mysql tenant password is missing; reset the instance password before importing"
+                .to_string(),
+        )
+    })?;
+    Ok(Some(MysqlTenantImportCredentials {
+        username: SecretString::from(metadata.database.username.clone()),
+        password: SecretString::from(password.to_string()),
+    }))
+}
 
 pub(super) async fn validate_import_source(
     _state: &AppState,
@@ -14,17 +57,30 @@ pub(super) async fn validate_import_source(
                     "artifact import requires source.artifact_id".to_string(),
                 ));
             }
+            validate_logical_artifact_selection(target_protocol, &options.selection)?;
             if matches!(
                 target_protocol,
                 Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-            ) {
-                ensure_full_selection(target_protocol, &options.selection)?;
-                if options.archive_format.is_some() {
-                    return Err(ApiError::BadRequest(format!(
-                        "{} artifact imports consume their physical archive directly; omit archive_format",
-                        target_protocol.as_str()
-                    )));
-                }
+            ) && options.archive_format.is_some()
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "{} artifact imports consume their physical archive directly; omit archive_format",
+                    target_protocol.as_str()
+                )));
+            }
+        }
+        ImportSourceOptions::Upload { upload_id, .. } => {
+            if upload_id.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "upload import requires source.upload_id".to_string(),
+                ));
+            }
+            validate_logical_artifact_selection(target_protocol, &options.selection)?;
+            if options.archive_format.is_some() {
+                return Err(ApiError::BadRequest(
+                    "upload imports detect their format from the uploaded file; omit archive_format"
+                        .to_string(),
+                ));
             }
         }
         ImportSourceOptions::RemoteRequest(_) | ImportSourceOptions::Remote(_) => {
@@ -38,6 +94,37 @@ pub(super) async fn validate_import_source(
     Ok(())
 }
 
+pub(super) fn validate_upload_source_database(
+    target_protocol: Protocol,
+    options: &ImportOptions,
+) -> Result<(), ApiError> {
+    if !matches!(&options.source, ImportSourceOptions::Upload { .. }) {
+        if options.source_database.is_some() {
+            return Err(ApiError::BadRequest(
+                "source.source_database is supported only for temporary uploads".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    match (target_protocol, options.source_database.as_deref()) {
+        (Protocol::Mongodb, Some(source_database)) => {
+            crate::api::remote_import::validate_mongodb_database_name(
+                "source.source_database",
+                source_database,
+                false,
+            )
+        }
+        (Protocol::Mongodb, None) => Err(ApiError::Conflict(
+            "mongodb upload imports require source.source_database so DBEV can safely select and remap the archive namespace"
+                .to_string(),
+        )),
+        (_, Some(_)) => Err(ApiError::BadRequest(
+            "source.source_database is supported only for mongodb upload imports".to_string(),
+        )),
+        (_, None) => Ok(()),
+    }
+}
+
 pub(super) async fn harden_import_options(
     state: &AppState,
     instance_id: &str,
@@ -45,9 +132,22 @@ pub(super) async fn harden_import_options(
     mut options: ImportOptions,
 ) -> Result<ImportOptions, ApiError> {
     validate_import_source(state, target_protocol, &options).await?;
-    options.source = match options.source {
+    validate_upload_source_database(target_protocol, &options)?;
+    let source = std::mem::take(&mut options.source);
+    options.source = match source {
         ImportSourceOptions::Artifact(path) => {
             ImportSourceOptions::Artifact(validate_artifact_path(state, instance_id, &path).await?)
+        }
+        ImportSourceOptions::Upload { upload_id, .. } => {
+            let (source, archive_format) = super::uploads::harden_upload_source(
+                state,
+                instance_id,
+                target_protocol,
+                upload_id,
+            )
+            .await?;
+            options.archive_format = archive_format;
+            source
         }
         ImportSourceOptions::RemoteRequest(request) => ImportSourceOptions::Remote(
             validate_remote_source(state, target_protocol, request).await?,
@@ -357,6 +457,17 @@ pub(super) fn clickhouse_table_source(
     ))
 }
 
+pub(super) fn validate_logical_artifact_selection(
+    protocol: Protocol,
+    selection: &ImportExportSelection,
+) -> Result<(), ApiError> {
+    if protocol == Protocol::Mongodb {
+        validate_selection(protocol, selection, SelectionUse::Import)
+    } else {
+        ensure_full_selection(protocol, selection)
+    }
+}
+
 pub(super) fn clickhouse_column_expr_function(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
@@ -610,10 +721,11 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             .to_string()
         }
         Protocol::Mysql => {
-            ensure_mysql_root_password(metadata)?;
+            mysql_tenant_import_credentials(metadata, false)?;
             r#"set -eu
-settings=$(MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
-  --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root \
+settings=$(MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
+  --protocol=socket --socket=/var/run/mysqld/mysqld.sock \
+  -u "$DBE_IMPORT_USER" \
   --batch --skip-column-names "$MYSQL_DATABASE" \
   -e 'SELECT @@character_set_database, @@collation_database')
 set -- $settings
@@ -629,8 +741,9 @@ case "$2" in ''|*[!A-Za-z0-9_]*)
   echo 'target database returned an invalid collation name' >&2
   exit 43
 ;; esac
-MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
-  --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root \
+MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
+  --protocol=socket --socket=/var/run/mysqld/mysqld.sock \
+  -u "$DBE_IMPORT_USER" \
   -e "DROP DATABASE IF EXISTS \`$MYSQL_DATABASE\`; CREATE DATABASE \`$MYSQL_DATABASE\` CHARACTER SET $1 COLLATE $2;"
 "#
             .to_string()
@@ -686,14 +799,40 @@ pub(super) async fn wipe_logical_target(
     database_definition_in_dump: bool,
 ) -> Result<(), ApiError> {
     let script = wipe_logical_script(metadata, database_definition_in_dump)?;
-    let result = match exec_timeout {
-        Some(timeout) => {
+    let credentials = mysql_tenant_import_credentials(metadata, database_definition_in_dump)?;
+    let result = match (exec_timeout, credentials.as_ref()) {
+        (Some(timeout), Some(credentials)) => {
+            let environment = credentials.environment();
+            state
+                .docker
+                .exec_shell_with_secret_env_timeout(
+                    metadata.protocol,
+                    &metadata.instance_id,
+                    &script,
+                    &environment,
+                    timeout,
+                )
+                .await
+        }
+        (None, Some(credentials)) => {
+            let environment = credentials.environment();
+            state
+                .docker
+                .exec_shell_with_secret_env(
+                    metadata.protocol,
+                    &metadata.instance_id,
+                    &script,
+                    &environment,
+                )
+                .await
+        }
+        (Some(timeout), None) => {
             state
                 .docker
                 .exec_shell_with_timeout(metadata.protocol, &metadata.instance_id, &script, timeout)
                 .await
         }
-        None => {
+        (None, None) => {
             state
                 .docker
                 .exec_shell(metadata.protocol, &metadata.instance_id, &script)
@@ -722,27 +861,102 @@ pub(super) fn mongodb_namespace_pattern(database: &str) -> String {
     pattern
 }
 
+fn mongodb_collection_namespace_pattern(database: &str, collection: &str) -> String {
+    let mut pattern = mongodb_namespace_pattern(database);
+    pattern.pop();
+    pattern.push_str(collection);
+    pattern
+}
+
+pub(super) fn mongodb_restore_namespace_args(
+    selection: &ImportExportSelection,
+    source_database: Option<&str>,
+) -> Result<String, ApiError> {
+    validate_selection(Protocol::Mongodb, selection, SelectionUse::Import)?;
+
+    let mut filters = Vec::new();
+    match source_database {
+        Some(source_database) => {
+            if selection.mode == SelectionMode::Full {
+                filters.push(format!(
+                    "--nsInclude {}",
+                    sh_quote(&mongodb_namespace_pattern(source_database))
+                ));
+            } else {
+                for collection in &selection.include {
+                    filters.push(format!(
+                        "--nsInclude {}",
+                        sh_quote(&mongodb_collection_namespace_pattern(
+                            source_database,
+                            collection
+                        ))
+                    ));
+                }
+                for collection in &selection.exclude {
+                    filters.push(format!(
+                        "--nsExclude {}",
+                        sh_quote(&mongodb_collection_namespace_pattern(
+                            source_database,
+                            collection
+                        ))
+                    ));
+                }
+            }
+            let source_pattern = mongodb_namespace_pattern(source_database);
+            filters.push(format!("--nsFrom {}", sh_quote(&source_pattern)));
+            filters.push("--nsTo \"$DBE_MONGO_DATABASE.*\"".to_string());
+        }
+        None if selection.mode == SelectionMode::Full => {
+            filters.push("--nsInclude \"$DBE_MONGO_DATABASE.*\"".to_string());
+        }
+        None => {
+            // Local archives have no trusted source database to remap. Collection filters
+            // therefore apply only to namespaces already matching the target database.
+            for collection in &selection.include {
+                filters.push(format!(
+                    "--nsInclude \"$DBE_MONGO_DATABASE\".{}",
+                    sh_quote(collection)
+                ));
+            }
+            for collection in &selection.exclude {
+                filters.push(format!(
+                    "--nsExclude \"$DBE_MONGO_DATABASE\".{}",
+                    sh_quote(collection)
+                ));
+            }
+        }
+    }
+    Ok(filters.join(" \\\n  "))
+}
+
 pub(super) fn import_script(
     metadata: &InstanceMetadata,
     input_path: &str,
     source_database: Option<&str>,
+    selection: &ImportExportSelection,
     database_definition_in_dump: bool,
 ) -> Result<String, ApiError> {
     let protocol = metadata.protocol;
     let script = match protocol {
-        Protocol::Postgres => format!(
-            r#"set -eu
+        Protocol::Postgres => {
+            let restrict_key = format!("dbev{}", uuid::Uuid::new_v4().simple());
+            format!(
+                r#"set -eu
+{{ printf '%s\n' '\restrict {restrict_key}'; cat {input_path}; }} | \
 PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
+  --no-psqlrc \
   -h /var/run/postgresql \
   -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
   -d "$POSTGRES_DB" \
   -v ON_ERROR_STOP=1 \
-  -f {input_path}
+  -f -
 "#
-        ),
+            )
+        }
         Protocol::Mariadb if database_definition_in_dump => format!(
             r#"set -eu
 mariadb \
+  --binary-mode \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u root \
@@ -753,6 +967,7 @@ mariadb \
         Protocol::Mariadb => format!(
             r#"set -eu
 mariadb \
+  --binary-mode \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u "$MARIADB_USER" \
@@ -766,6 +981,7 @@ mariadb \
             format!(
                 r#"set -eu
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
+  --binary-mode \
   --protocol=socket \
   --socket=/var/run/mysqld/mysqld.sock \
   -u root \
@@ -774,13 +990,14 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             )
         }
         Protocol::Mysql => {
-            ensure_mysql_root_password(metadata)?;
+            mysql_tenant_import_credentials(metadata, false)?;
             format!(
                 r#"set -eu
-MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
+MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
+  --binary-mode \
   --protocol=socket \
   --socket=/var/run/mysqld/mysqld.sock \
-  -u root \
+  -u "$DBE_IMPORT_USER" \
   "$MYSQL_DATABASE" \
   < {input_path}
 "#
@@ -788,17 +1005,7 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
         }
         Protocol::Mongodb => {
             ensure_mongodb_root_password(metadata)?;
-            let namespaces = match source_database {
-                Some(source_database) => {
-                    let source_pattern = mongodb_namespace_pattern(source_database);
-                    format!(
-                        "--nsInclude {} \\\n  --nsFrom {} \\\n  --nsTo \"$DBE_MONGO_DATABASE.*\"",
-                        sh_quote(&source_pattern),
-                        sh_quote(&source_pattern),
-                    )
-                }
-                None => "--nsInclude \"$DBE_MONGO_DATABASE.*\"".to_string(),
-            };
+            let namespaces = mongodb_restore_namespace_args(selection, source_database)?;
             format!(
                 r#"set -eu
 mongorestore \

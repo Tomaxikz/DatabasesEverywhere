@@ -124,16 +124,6 @@ pub(crate) async fn queue_export_instance_with_options(
     Ok(accepted_job_response(job).await)
 }
 
-pub async fn import_instance(
-    State(state): State<AppState>,
-    auth: ApiRequestContext,
-    ApiPath(instance_id): ApiPath<String>,
-    ApiJson(request): ApiJson<ImportRequest>,
-) -> ApiResult<ImportExportJobResponse> {
-    auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
-    queue_import_instance(&state, &instance_id, ImportOptions::from(&request)).await
-}
-
 pub(crate) async fn queue_import_instance(
     state: &AppState,
     instance_id: &str,
@@ -144,11 +134,66 @@ pub(crate) async fn queue_import_instance(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let options =
+    let mut options =
         harden_import_options(state, &metadata.instance_id, metadata.protocol, options).await?;
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Import)?;
+    super::uploads::validate_upload_selection_capability(
+        state,
+        &metadata.instance_id,
+        &options.source,
+        &options.selection,
+    )
+    .await?;
+    let (staging_permit, upload_staging) =
+        if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
+            match upload_logical_staging_budget(state, &metadata, options.mode)? {
+                Some(budget) => {
+                    let root = logical_staging_root(state).await?;
+                    let permit = state
+                        .import_uploads
+                        .acquire_staging(&root, budget.reservation_bytes)
+                        .await?;
+                    (
+                        Some(permit),
+                        Some(UploadStagingBudget::Logical {
+                            budget,
+                            target_created_at: metadata.created_at.clone(),
+                            disk_mib: metadata.limits.disk_mib,
+                        }),
+                    )
+                }
+                None => match upload_physical_staging_bytes(&metadata)? {
+                    Some(bytes) => {
+                        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+                            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+                        let data_parent = paths.data.parent().ok_or_else(|| {
+                            ApiError::Runtime(
+                                "physical import data directory has no parent".to_string(),
+                            )
+                        })?;
+                        let permit = state
+                            .import_uploads
+                            .acquire_staging_on_existing_root(data_parent, bytes)
+                            .await?;
+                        (
+                            Some(permit),
+                            Some(UploadStagingBudget::Physical {
+                                extracted_bytes: bytes,
+                                target_created_at: metadata.created_at.clone(),
+                                disk_mib: metadata.limits.disk_mib,
+                            }),
+                        )
+                    }
+                    None => (None, None),
+                },
+            }
+        } else {
+            (None, None)
+        };
+    options.upload_staging = upload_staging;
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
+        ImportSourceOptions::Upload { .. } => None,
         ImportSourceOptions::Remote(_) => None,
         ImportSourceOptions::RemoteRequest(_) => {
             return Err(ApiError::Runtime(
@@ -164,6 +209,14 @@ pub(crate) async fn queue_import_instance(
                 archive_format: options.archive_format.clone(),
             },
         )?),
+        ImportSourceOptions::Upload { upload_id, .. } => Some(serialize_replay_descriptor(
+            &ReplayDescriptor::UploadImport {
+                upload_id: upload_id.clone(),
+                source_database: options.source_database.clone(),
+                mode: options.mode,
+                selection: options.selection.clone(),
+            },
+        )?),
         ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => None,
     };
     let (job, admission) = enqueue_job(
@@ -177,16 +230,92 @@ pub(crate) async fn queue_import_instance(
     )
     .await?;
 
+    if let ImportSourceOptions::Upload { upload_id, .. } = &options.source {
+        let claimed = match state
+            .import_uploads
+            .repository()
+            .claim_ready_for_job(
+                &metadata.instance_id,
+                upload_id,
+                &job.job_id,
+                &crate::jobs::import_export::now_rfc3339(),
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                close_unclaimed_upload_job(
+                    state,
+                    &job.job_id,
+                    "upload_storage",
+                    "the temporary import upload claim could not be persisted",
+                )
+                .await;
+                if let Err(release_error) = state
+                    .import_uploads
+                    .repository()
+                    .release_claim_after_failed_job(
+                        &metadata.instance_id,
+                        upload_id,
+                        &job.job_id,
+                        "upload claim acknowledgement was uncertain; submit the import again",
+                        &crate::jobs::import_export::now_rfc3339(),
+                    )
+                    .await
+                {
+                    tracing::error!(job_id = job.job_id, %release_error, "failed to reconcile an uncertain upload claim");
+                }
+                return Err(ApiError::Runtime(format!(
+                    "failed to claim import upload: {error}"
+                )));
+            }
+        };
+        if !claimed {
+            close_unclaimed_upload_job(
+                state,
+                &job.job_id,
+                "upload_conflict",
+                "the temporary import upload is no longer ready",
+            )
+            .await;
+            return Err(ApiError::Conflict(
+                "the temporary import upload changed before the job could claim it".to_string(),
+            ));
+        }
+    }
+
     tokio::spawn(run_import_job(
         state.clone(),
         job.job_id.clone(),
         metadata.instance_id,
         options,
         admission,
+        staging_permit,
     ));
 
     audit_import_export(&job, "queued");
     Ok(accepted_job_response(job).await)
+}
+
+async fn close_unclaimed_upload_job(
+    state: &AppState,
+    job_id: &str,
+    code: &'static str,
+    message: &'static str,
+) {
+    let diagnostic = PublicDiagnostic::public(code, message);
+    if let Err(error) = state
+        .import_export_jobs
+        .update_status(
+            job_id,
+            ImportExportStatus::Failed,
+            None,
+            Some(diagnostic.to_storage_string()),
+        )
+        .await
+    {
+        tracing::error!(job_id, %error, "failed to close an unclaimed upload import job");
+    }
 }
 
 pub async fn get_import_export_job(
@@ -353,6 +482,32 @@ pub(crate) async fn replay_failed_job(
             )
             .await
         }
+        (
+            ImportExportAction::Import,
+            ReplayDescriptor::UploadImport {
+                upload_id,
+                source_database,
+                mode,
+                selection,
+            },
+        ) => {
+            queue_import_instance(
+                state,
+                &job.instance_id,
+                ImportOptions {
+                    archive_format: None,
+                    source: ImportSourceOptions::Upload {
+                        upload_id,
+                        path: PathBuf::new(),
+                    },
+                    source_database,
+                    mode,
+                    selection,
+                    upload_staging: None,
+                },
+            )
+            .await
+        }
         _ => Err(ApiError::BadRequest(
             "job replay metadata does not match the original action; submit a new request"
                 .to_string(),
@@ -379,7 +534,7 @@ pub(super) async fn run_export_job(
         }
         Err(error) => Err(error),
     };
-    update_job_result(&state, &job_id, result, Some(artifact_path)).await;
+    let _ = update_job_result(&state, &job_id, result, Some(artifact_path)).await;
 }
 
 pub(super) async fn run_import_job(
@@ -388,17 +543,34 @@ pub(super) async fn run_import_job(
     instance_id: String,
     options: ImportOptions,
     _admission: ImportExportJobPermit,
+    _staging_permit: Option<super::uploads::ImportStagingPermit>,
 ) {
     let _operation = state.instance_locks.lock(&instance_id).await;
+    let upload_id = match &options.source {
+        ImportSourceOptions::Upload { upload_id, .. } => Some(upload_id.clone()),
+        _ => None,
+    };
     if !begin_import_export_job(&state, &job_id).await {
+        if let Some(upload_id) = upload_id.as_deref() {
+            super::uploads::finish_upload_import_job(
+                &state,
+                &instance_id,
+                upload_id,
+                &job_id,
+                false,
+                Some("daemon shutdown began before the import started"),
+            )
+            .await;
+        }
         return;
     }
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
+        ImportSourceOptions::Upload { .. } => None,
         ImportSourceOptions::Remote(_) => None,
         ImportSourceOptions::RemoteRequest(_) => {
             tracing::error!(%job_id, "validated import job retained an unresolved remote source");
-            update_job_result(
+            let _ = update_job_result(
                 &state,
                 &job_id,
                 Err(ApiError::Runtime(
@@ -415,7 +587,57 @@ pub(super) async fn run_import_job(
         Ok(_) => import_instance_source(&state, &instance_id, &options).await,
         Err(error) => Err(error),
     };
-    update_job_result(&state, &job_id, result, artifact_path).await;
+    let succeeded = result.is_ok();
+    let failure = result
+        .as_ref()
+        .err()
+        .map(|error| PublicDiagnostic::from_api_error("import operation", error).message);
+    let terminal_status_persisted = update_job_result(&state, &job_id, result, artifact_path).await;
+    if let Some(upload_id) = upload_id.as_deref() {
+        if !terminal_status_persisted {
+            tracing::error!(
+                %job_id,
+                instance_id,
+                upload_id,
+                "retaining claimed import upload because the job's terminal status is not durable"
+            );
+            let reason = "import outcome could not be recorded durably; the upload is blocked and the target was quarantined";
+            match state
+                .import_uploads
+                .repository()
+                .reconcile_interrupted_importing(
+                    &instance_id,
+                    upload_id,
+                    &job_id,
+                    crate::storage::import_uploads::InterruptedImportDisposition::Failed,
+                    reason,
+                    &crate::jobs::import_export::now_rfc3339(),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::error!(%job_id, instance_id, upload_id, "uncertain terminal job persistence did not match the claimed upload state")
+                }
+                Err(error) => {
+                    tracing::error!(%job_id, instance_id, upload_id, %error, "failed to block an upload with uncertain terminal job persistence")
+                }
+            }
+            if let Err(error) = quarantine_after_uncertain_import(&state, &instance_id).await {
+                tracing::error!(%job_id, instance_id, upload_id, %error, "failed to fully quarantine an import with uncertain terminal job persistence");
+            }
+            return;
+        }
+        super::uploads::finish_upload_import_job(
+            &state,
+            &instance_id,
+            upload_id,
+            &job_id,
+            succeeded,
+            failure.as_deref(),
+        )
+        .await;
+    }
 }
 
 pub(super) async fn begin_import_export_job(state: &AppState, job_id: &str) -> bool {
@@ -454,40 +676,59 @@ pub(super) async fn update_job_result(
     job_id: &str,
     result: Result<(), ApiError>,
     artifact_path: Option<PathBuf>,
-) {
+) -> bool {
     match result {
         Ok(()) => {
             tracing::info!(%job_id, "audit import_export_job_succeeded");
-            if let Err(error) = state
-                .import_export_jobs
-                .update_status(
-                    job_id,
-                    ImportExportStatus::Succeeded,
-                    artifact_path.map(|path| path.display().to_string()),
-                    None,
-                )
-                .await
-            {
-                tracing::error!(%job_id, %error, "import/export operation succeeded but its terminal status could not be persisted");
-            }
+            persist_terminal_job_status(
+                state,
+                job_id,
+                ImportExportStatus::Succeeded,
+                artifact_path.map(|path| path.display().to_string()),
+                None,
+            )
+            .await
         }
         Err(error) => {
             tracing::warn!(%job_id, %error, "audit import_export_job_failed");
             let diagnostic = PublicDiagnostic::from_api_error("import/export operation", &error);
-            if let Err(storage_error) = state
-                .import_export_jobs
-                .update_status(
-                    job_id,
-                    ImportExportStatus::Failed,
-                    artifact_path.map(|path| path.display().to_string()),
-                    Some(diagnostic.to_storage_string()),
-                )
-                .await
-            {
-                tracing::error!(%job_id, %storage_error, "import/export operation failed and its terminal status could not be persisted");
+            persist_terminal_job_status(
+                state,
+                job_id,
+                ImportExportStatus::Failed,
+                artifact_path.map(|path| path.display().to_string()),
+                Some(diagnostic.to_storage_string()),
+            )
+            .await
+        }
+    }
+}
+
+async fn persist_terminal_job_status(
+    state: &AppState,
+    job_id: &str,
+    status: ImportExportStatus,
+    artifact_path: Option<String>,
+    error: Option<String>,
+) -> bool {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        match state
+            .import_export_jobs
+            .update_status(job_id, status, artifact_path.clone(), error.clone())
+            .await
+        {
+            Ok(()) => return true,
+            Err(storage_error) if attempt < ATTEMPTS => {
+                tracing::warn!(%job_id, %storage_error, attempt, "retrying terminal import/export job persistence");
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+            }
+            Err(storage_error) => {
+                tracing::error!(%job_id, %storage_error, attempt, "import/export operation completed but its terminal status could not be persisted");
             }
         }
     }
+    false
 }
 
 pub(super) async fn export_instance_artifact(

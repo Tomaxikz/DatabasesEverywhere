@@ -8,27 +8,6 @@ pub(super) async fn logical_staging_root(state: &AppState) -> Result<PathBuf, Ap
     Ok(root)
 }
 
-pub(super) async fn cleanup_container_temp(
-    state: &AppState,
-    protocol: Protocol,
-    instance_id: &str,
-    path: &str,
-) {
-    let script = format!("rm -f -- {}", sh_quote(path));
-    if let Err(error) = state
-        .docker
-        .exec_shell(protocol, instance_id, &script)
-        .await
-    {
-        tracing::warn!(
-            instance_id,
-            %protocol,
-            %error,
-            "failed to remove container import/export temporary file"
-        );
-    }
-}
-
 pub(super) fn dump_extension(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Postgres => "postgres.sql",

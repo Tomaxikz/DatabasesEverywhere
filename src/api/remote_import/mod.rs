@@ -258,7 +258,7 @@ fn normalize_optional(
     Ok(Some(value))
 }
 
-fn validate_mongodb_database_name(
+pub(crate) fn validate_mongodb_database_name(
     field: &str,
     value: &str,
     allow_external: bool,

@@ -10,7 +10,7 @@ use crate::api::{
 use crate::auth::scopes;
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.10.0";
+pub const API_VERSION: &str = "0.11.0";
 
 #[derive(Debug, Serialize)]
 pub struct SystemResponse {

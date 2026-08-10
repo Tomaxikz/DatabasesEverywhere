@@ -106,14 +106,12 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     if failed_jobs > 0 {
         tracing::warn!(failed_jobs, "marked unfinished import/export jobs failed");
     }
-    let pruned_jobs = job_repository
-        .prune_completed(10_000)
-        .await
-        .context("failed to prune completed import/export jobs during startup")?;
-    if pruned_jobs > 0 {
-        tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
-    }
+    let job_repository_for_prune = job_repository.clone();
     let import_export_jobs = ImportExportJobs::with_repository(job_repository);
+    let import_uploads = crate::api::import_export::ImportUploadService::new(
+        ImportUploadRepository::new(pool.clone()),
+        config.artifacts.import_upload_max_concurrent,
+    );
     let manager = InstanceManager::new(store.clone(), repository);
     manager
         .load_from_storage()
@@ -151,6 +149,18 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "quarantined instances with retained import recovery manifests"
         );
     }
+    let import_temp_cleanup =
+        cleanup_orphaned_import_export_staging(Path::new(&config.paths.tmp_root()))
+            .await
+            .context("failed to clean orphaned logical import staging")?;
+    tracing::info!(
+        scanned_entries = import_temp_cleanup.scanned_entries,
+        removed_files = import_temp_cleanup.removed_files,
+        removed_directories = import_temp_cleanup.removed_directories,
+        protected_rollbacks = import_temp_cleanup.protected_rollbacks,
+        skipped_entries = import_temp_cleanup.skipped_entries,
+        "orphaned logical import staging cleanup complete"
+    );
 
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?
@@ -263,6 +273,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         manager,
         docker,
         import_export_jobs,
+        import_uploads,
         instance_locks,
         api_rate_limiter: crate::api::security::ApiRateLimiter::new(
             config.security.api_rate_limit_per_minute,
@@ -278,7 +289,30 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
     });
+    let upload_recovery = crate::api::import_export::reconcile_import_uploads_once(&state)
+        .await
+        .context("failed to reconcile temporary import uploads")?;
+    if upload_recovery.examined > 0 || upload_recovery.failures > 0 {
+        tracing::info!(
+            examined = upload_recovery.examined,
+            restored_ready = upload_recovery.restored_ready,
+            blocked = upload_recovery.blocked,
+            deleted = upload_recovery.deleted,
+            failures = upload_recovery.failures,
+            "temporary import upload recovery completed"
+        );
+    }
+    let pruned_jobs = job_repository_for_prune
+        .prune_completed(10_000)
+        .await
+        .context("failed to prune completed import/export jobs during startup")?;
+    if pruned_jobs > 0 {
+        tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
+    }
     crate::api::resources::start_resource_sampler(state.clone());
+    let import_upload_sweeper = tokio::spawn(crate::api::import_export::run_import_upload_sweeper(
+        state.clone(),
+    ));
     let soft_disk_limits = tokio::spawn(monitor_soft_disk_limits(state.clone()));
     tracing::info!(
         "critical startup complete; API will accept requests while managed instances start in the background"
@@ -316,6 +350,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let _ = managed_container_events.await;
     soft_disk_limits.abort();
     let _ = soft_disk_limits.await;
+    import_upload_sweeper.abort();
+    let _ = import_upload_sweeper.await;
     managed_runtime_boot.abort();
     let _ = managed_runtime_boot.await;
     let (jobs_drained, creations_drained, mutations_drained, websocket_drained, gateway_drain) = tokio::join!(

@@ -4,6 +4,8 @@ use std::{
     process::Command,
 };
 
+use clap::CommandFactory;
+
 use super::*;
 use crate::{
     instances::metadata::{
@@ -13,6 +15,14 @@ use crate::{
     jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
     shared::{backend::BackendEndpoint, limits::InstanceLimits},
 };
+
+#[test]
+fn cli_exposes_the_package_version() {
+    assert_eq!(
+        Cli::command().get_version(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
 
 #[test]
 fn api_connection_admission_is_per_ip_and_releases_capacity() {

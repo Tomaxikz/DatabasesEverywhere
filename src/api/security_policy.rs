@@ -195,7 +195,13 @@ pub fn cors_layer(policy: HostPolicy) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            http::HeaderName::from_static("x-dbev-filename"),
+            http::HeaderName::from_static("x-dbev-sha256"),
+        ])
 }
 
 fn validate_allowed_request_hosts(

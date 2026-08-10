@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.0 # replace with the reviewed release
+DBEV_VERSION=v0.5.1 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -322,7 +322,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.0@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.1@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -335,6 +335,28 @@ manager on a dedicated host or VM; if FuseQuota is not used, remove
 Before starting that profile, ensure the host `/etc/fuse.conf` contains an
 uncommented `user_allow_other`; Compose mounts the file read-only so the daemon
 cannot modify host configuration from inside the container.
+
+Temporary import-upload limits are configured separately from generated
+artifact retention:
+
+```yaml
+artifacts:
+  retention_keep_latest: 20
+  retention_max_age_days: 30
+  import_upload_max_bytes: 8589934592        # one upload; 8 GiB
+  import_upload_max_total_bytes: 34359738368 # all active uploads; 32 GiB
+  import_upload_max_per_instance: 4
+  import_upload_max_concurrent: 2
+  import_upload_ttl_hours: 24
+  import_upload_timeout_seconds: 3600
+  import_upload_idle_timeout_seconds: 30
+```
+
+The node reserves the declared `Content-Length` before accepting the body and
+also checks free disk space. The total timeout bounds the complete transfer;
+the idle timeout rejects a stalled request without imposing the ordinary API
+body limit on dump uploads. Expired uploads are removed by the background
+sweeper.
 
 Automatic backups:
 
@@ -470,7 +492,10 @@ database errors are never returned to clients.
 | 401 | Missing/wrong token, disallowed host/origin, or token in query string |
 | 403 | Token is valid but lacks the required scope |
 | 404 | Instance, job, or file doesn't exist |
+| 408 | Request body or upload exceeded its configured deadline |
 | 409 | Conflict (usually from the container runtime) |
+| 413 | Request or import upload is too large |
+| 415 | Request media type is unsupported |
 | 429 | Rate limited |
 | 501 | Endpoint not implemented yet |
 | 500 | Something broke on the daemon side |
@@ -480,7 +505,9 @@ database errors are never returned to clients.
 `GET /api/system` returns both the daemon binary `version` and the independently
 advertised `api_version`. A panel must verify `api_version` before enabling node
 actions. Binary patch/minor releases can change without changing this contract
-version. Contract `0.8.0` adds Valkey as a first-class protocol with an isolated
+version. Contract `0.11.0` adds instance-scoped temporary dump uploads, lazy
+bounded catalog inspection, upload lifecycle endpoints, and the `upload` import
+source. Contract `0.8.0` adds Valkey as a first-class protocol with an isolated
 RESP gateway, lifecycle, imports, exports, backups, and capability reporting.
 Contract `0.7.0` adds pluggable local/S3/Kopia backup storage, storage
 status fields, and bounded backup-catalog browsing. Contract `0.6.0` adds typed credential-based remote imports with
@@ -769,8 +796,125 @@ change between sampling and creation.
 Three related but different things — don't mix them up:
 
 - **Exports** are portable database-native dumps (`pg_dump` style). They are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs.
-- **Imports** load one of that instance's trusted local artifacts or acquire a native dump/snapshot directly from a typed remote source. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, helper images, commands, or connection URLs.
+- **Imports** load one of that instance's trusted local artifacts, a temporary dump uploaded through the API, or a native dump/snapshot acquired directly from a typed remote source. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, helper images, commands, or connection URLs.
 - **Backups** are physical archives of the whole instance volume. The local driver stores them under `paths.backups/<instance_id>/`; S3 and Kopia store them in the configured remote repository. They're for disaster recovery on the same daemon, not portability.
+
+### Temporary dump uploads
+
+DBEV v0.5.1 can receive a user-provided dump without placing it in the artifact
+inventory or starting an import immediately. The same import URL selects its
+behavior by media type: `application/octet-stream` uploads raw bytes and
+returns `201 Created`; `application/json` queues an import and returns
+`202 Accepted`.
+
+| Method | Path | Scope | What it does |
+| --- | --- | --- | --- |
+| POST | `/api/instances/{id}/import` | import-export:write | Upload raw dump bytes (`application/octet-stream`) or queue an import (`application/json`) |
+| GET | `/api/instances/{id}/import/uploads` | import-export:read | List active temporary uploads for the instance |
+| GET | `/api/instances/{id}/import/uploads/{upload_id}` | import-export:read | Read one upload's state and cached catalog |
+| POST | `/api/instances/{id}/import/uploads/{upload_id}/catalog` | import-export:write | Validate and inspect the dump without executing it |
+| DELETE | `/api/instances/{id}/import/uploads/{upload_id}` | import-export:write | Cancel and durably delete an upload that is not being imported |
+
+The upload request must use raw, unencoded bytes and these headers:
+
+- `Content-Type: application/octet-stream`
+- `Content-Length`: required and exactly equal to the bytes sent
+- `X-DBEV-Filename`: required, percent-encoded UTF-8 flat filename (maximum
+  180 decoded bytes) with a supported dump extension
+- `X-DBEV-SHA256`: optional expected SHA-256 as 64 lowercase hexadecimal
+  characters
+
+`Content-Encoding` must be absent or `identity`. Compression belongs in the
+dump format itself. For an ASCII filename, a server-side upload looks like:
+
+```bash
+DUMP=/srv/panel-uploads/customer.postgres.sql
+SIZE=$(wc -c < "$DUMP" | tr -d ' ')
+SHA256=$(sha256sum -- "$DUMP" | cut -d ' ' -f 1)
+curl --fail-with-body --request POST \
+  --header "Authorization: Bearer $DBEV_TOKEN" \
+  --header 'Content-Type: application/octet-stream' \
+  --header "Content-Length: $SIZE" \
+  --header 'X-DBEV-Filename: customer.postgres.sql' \
+  --header "X-DBEV-SHA256: $SHA256" \
+  --data-binary "@$DUMP" \
+  "$DBEV_ORIGIN/api/instances/$INSTANCE_ID/import"
+```
+
+The response includes the daemon-computed hash and expiry:
+
+```json
+{
+  "upload_id": "upl_0123456789abcdef0123456789abcdef",
+  "instance_id": "cust-42-db",
+  "original_filename": "customer.postgres.sql",
+  "protocol": "postgres",
+  "archive_format": "plain",
+  "state": "ready",
+  "size_bytes": 7340032,
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "created_at": "2026-08-10T12:00:00Z",
+  "updated_at": "2026-08-10T12:00:01Z",
+  "expires_at": "2026-08-11T12:00:00Z"
+}
+```
+
+Catalog inspection is optional for a full import. It verifies the wrapper and
+extracts bounded object metadata without booting the dump, executing SQL, or
+returning row contents. Its `selective_supported` field is authoritative: show
+selective controls only when it is true, and submit the exact `selection_key`
+values returned in `catalog.objects`. In v0.5.1, SQL dumps can expose an object
+catalog for preview, but all uploaded formats are deliberately full-import
+only; the response explains why in `selective_unavailable_reason`. Inspection
+is globally concurrency-limited. A `429` means retry later; a bounded timeout or
+catalog resource ceiling returns `503` while leaving the upload ready for a
+normal full import.
+
+Queue the ready upload by ID. The archive wrapper is persisted by DBEV and
+cannot be overridden by the client. MongoDB uploads also require the original
+archive database name as `source_database`; DBEV selects only that namespace
+and remaps it to the target database. The field is rejected for other
+protocols:
+
+```json
+{
+  "source": {
+    "type": "upload",
+    "upload_id": "upl_0123456789abcdef0123456789abcdef"
+  },
+  "mode": "merge"
+}
+```
+
+MongoDB example:
+
+```json
+{
+  "source": {
+    "type": "upload",
+    "upload_id": "upl_0123456789abcdef0123456789abcdef",
+    "source_database": "legacy_tenant"
+  },
+  "mode": "wipe"
+}
+```
+
+`source_database` is 1–63 UTF-8 bytes and follows MongoDB database-name
+restrictions. Omitting it for MongoDB returns `409` before DBEV queues a job or
+claims the upload.
+
+The upload stays available while the panel modal is open. Closing or cancelling
+the modal should call `DELETE`; merely navigating away does not count as a
+successful import. A successful import consumes and deletes the upload and its
+job has `artifact_id: null`. A failed import releases the upload for an explicit
+retry or cancellation. Unused uploads expire after 24 hours by default and are
+also reconciled after daemon restarts.
+
+DBEV stores these files privately under
+`paths.imports/<instance_id>/.uploads/` with managed names and restrictive
+permissions. That directory is an implementation detail: it is never returned
+as a host path, operator-staged files outside `.uploads` are not swept, and
+temporary uploads never become downloadable artifacts.
 
 ### Import/export jobs
 
@@ -820,7 +964,7 @@ Export/import formats:
 | PostgreSQL | `.postgres.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | MariaDB | `.mariadb.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | MySQL | `.mysql.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
-| MongoDB | `.mongodb.archive.gz` archive dump | MongoDB archive dump or gzip/tar/zip-wrapped archive |
+| MongoDB | `.mongodb.archive.gz` archive dump | Native gzip archive, or bzip2/tar/tar.gz/zip wrapper containing exactly one valid `.archive.gz` dump; upload imports require the original `source_database` for safe namespace remapping |
 | ClickHouse | `.clickhouse.sql` logical dump | Plain dump or gzip/bzip2/tar/zip-wrapped dump |
 | Redis | `.redis.tar.gz` physical archive | Full physical archive only |
 | Valkey | `.valkey.tar.gz` physical archive | Full physical archive only |
@@ -860,11 +1004,11 @@ Import directly from credentials (the target instance determines the protocol):
 }
 ```
 
-For credential imports, `merge` replaces source-named
+For nonphysical imports, `merge` replaces source-named
 objects/keys/collections and preserves target-only data; `wipe` clears the
-target first. Redis, Valkey, and Qdrant artifact imports are different: those archives
-always replace the complete physical database, so `mode` does not change their
-behavior. PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse use their native
+target first. Redis, Valkey, and Qdrant artifact or upload imports are different:
+those archives always replace the complete physical database, so `mode` does
+not change their behavior. PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse use their native
 dump tools in a one-shot helper. Redis and Valkey use binary-safe
 SCAN/DUMP/PTTL/RESTORE, and Qdrant uses collection snapshots.
 
@@ -1069,6 +1213,8 @@ POST /api/instances/{id}/backups/{backup_id}/download      (scope: backups:read)
 | POST | `/api/instances/{id}/artifacts/retention` | artifacts:write | Apply retention to that instance only |
 
 Artifact list items have the same path-free `{id, instance_id, size_bytes, modified_at, sha256}` shape as backups. New exports are stored under `paths.exports/<instance_id>/`.
+User-provided temporary dumps are not artifacts, are never returned here, and
+are governed by their upload TTL instead of artifact retention.
 
 ### Recovery
 

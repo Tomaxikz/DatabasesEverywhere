@@ -100,6 +100,8 @@ pub enum ConfigValidationError {
     InvalidSoftDiskScanner { field: &'static str },
     #[error("artifacts.retention_keep_latest must be greater than zero")]
     InvalidArtifactRetention,
+    #[error("artifacts.{field} is outside the supported range")]
+    InvalidImportUploadConfig { field: &'static str },
     #[error("backups.interval_minutes must be greater than zero")]
     InvalidBackupInterval,
     #[error("backups.retention_keep_latest_per_instance must be greater than zero")]
@@ -144,6 +146,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     if config.artifacts.retention_keep_latest == 0 {
         return Err(ConfigValidationError::InvalidArtifactRetention);
     }
+    validate_import_uploads(&config.artifacts)?;
     if config.backups.interval_minutes == 0 {
         return Err(ConfigValidationError::InvalidBackupInterval);
     }
@@ -160,6 +163,41 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_images(&config.images)?;
     validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
 
+    Ok(())
+}
+
+fn validate_import_uploads(
+    artifacts: &crate::config::ArtifactConfig,
+) -> Result<(), ConfigValidationError> {
+    let invalid = |field| ConfigValidationError::InvalidImportUploadConfig { field };
+    if artifacts.import_upload_max_bytes == 0
+        || artifacts.import_upload_max_bytes > 8 * 1024 * 1024 * 1024
+    {
+        return Err(invalid("import_upload_max_bytes"));
+    }
+    if artifacts.import_upload_max_total_bytes < artifacts.import_upload_max_bytes
+        || artifacts.import_upload_max_total_bytes > i64::MAX as u64
+    {
+        return Err(invalid("import_upload_max_total_bytes"));
+    }
+    if !(1..=64).contains(&artifacts.import_upload_max_per_instance) {
+        return Err(invalid("import_upload_max_per_instance"));
+    }
+    if !(1..=32).contains(&artifacts.import_upload_max_concurrent) {
+        return Err(invalid("import_upload_max_concurrent"));
+    }
+    if !(1..=168).contains(&artifacts.import_upload_ttl_hours) {
+        return Err(invalid("import_upload_ttl_hours"));
+    }
+    if !(60..=86_400).contains(&artifacts.import_upload_timeout_seconds) {
+        return Err(invalid("import_upload_timeout_seconds"));
+    }
+    if !(5..=300).contains(&artifacts.import_upload_idle_timeout_seconds) {
+        return Err(invalid("import_upload_idle_timeout_seconds"));
+    }
+    if artifacts.import_upload_idle_timeout_seconds > artifacts.import_upload_timeout_seconds {
+        return Err(invalid("import_upload_idle_timeout_seconds"));
+    }
     Ok(())
 }
 
@@ -1403,6 +1441,34 @@ mod tests {
         let error = validate_config(&config).unwrap_err();
 
         assert!(matches!(error, ConfigValidationError::InvalidRemoteUrl));
+    }
+
+    #[test]
+    fn accepts_default_import_upload_limits() {
+        validate_config(&valid_config()).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_import_upload_limits() {
+        let mut config = valid_config();
+        config.artifacts.import_upload_max_total_bytes =
+            config.artifacts.import_upload_max_bytes - 1;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::InvalidImportUploadConfig {
+                field: "import_upload_max_total_bytes"
+            })
+        ));
+
+        let mut config = valid_config();
+        config.artifacts.import_upload_idle_timeout_seconds =
+            config.artifacts.import_upload_timeout_seconds + 1;
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::InvalidImportUploadConfig {
+                field: "import_upload_idle_timeout_seconds"
+            })
+        ));
     }
 
     fn valid_config() -> Config {

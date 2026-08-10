@@ -107,6 +107,18 @@ security:
 artifacts:
   retention_keep_latest: 20
   retention_max_age_days: 30
+  # Temporary user-provided dumps are separate from DBEV-generated artifacts.
+  # Declared Content-Length is reserved before the stream is accepted.
+  import_upload_max_bytes: 8589934592
+  import_upload_max_total_bytes: 34359738368
+  import_upload_max_per_instance: 4
+  # Additional simultaneous uploads fail fast so request bodies are not read.
+  import_upload_max_concurrent: 2
+  # Ready or failed uploads are swept unless imported or cancelled sooner.
+  import_upload_ttl_hours: 24
+  # Total-transfer and per-body-idle deadlines; neither changes ordinary API limits.
+  import_upload_timeout_seconds: 3600
+  import_upload_idle_timeout_seconds: 30
 
 backups:
   enabled: false

@@ -7,9 +7,7 @@ use std::{
 
 use crate::{
     api::{
-        api_response::{
-            ApiError, ApiJson, ApiOptionalJson, ApiPath, ApiQuery, ApiResponse, ApiResult,
-        },
+        api_response::{ApiError, ApiOptionalJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         instances::{LifecycleAction, lifecycle_instance_locked},
         public_diagnostic::PublicDiagnostic,
         remote_import::{
@@ -26,7 +24,7 @@ use crate::{
     },
     jobs::import_export::{
         ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
-        JobAdmissionError, create_data_archive, extract_data_archive,
+        JobAdmissionError, create_data_archive, extract_data_archive_bounded,
     },
     shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
 };
@@ -87,6 +85,11 @@ pub enum ImportSource {
         #[serde(default)]
         archive_format: Option<String>,
     },
+    Upload {
+        upload_id: String,
+        #[serde(default)]
+        source_database: Option<String>,
+    },
     Remote(RemoteImportRequest),
 }
 
@@ -134,8 +137,24 @@ where
 pub(crate) struct ImportOptions {
     archive_format: Option<String>,
     source: ImportSourceOptions,
+    source_database: Option<String>,
     mode: ImportMode,
     selection: ImportExportSelection,
+    upload_staging: Option<UploadStagingBudget>,
+}
+
+#[derive(Debug, Clone)]
+enum UploadStagingBudget {
+    Logical {
+        budget: logical::UploadLogicalStagingBudget,
+        target_created_at: String,
+        disk_mib: u64,
+    },
+    Physical {
+        extracted_bytes: u64,
+        target_created_at: String,
+        disk_mib: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,6 +183,13 @@ enum ReplayDescriptor {
         mode: ImportMode,
         selection: ImportExportSelection,
         archive_format: Option<String>,
+    },
+    UploadImport {
+        upload_id: String,
+        #[serde(default)]
+        source_database: Option<String>,
+        mode: ImportMode,
+        selection: ImportExportSelection,
     },
 }
 
@@ -199,6 +225,7 @@ impl ExportArchiveFormat {
 #[derive(Debug, Clone)]
 pub(crate) enum ImportSourceOptions {
     Artifact(PathBuf),
+    Upload { upload_id: String, path: PathBuf },
     RemoteRequest(RemoteImportRequest),
     Remote(RemoteImportSource),
 }
@@ -222,8 +249,10 @@ impl ImportOptions {
         Self {
             archive_format: recovery_archive_format(&path, protocol),
             source: ImportSourceOptions::Artifact(path),
+            source_database: None,
             mode: ImportMode::Wipe,
             selection: ImportExportSelection::default(),
+            upload_staging: None,
         }
     }
 
@@ -236,8 +265,10 @@ impl ImportOptions {
         Self {
             archive_format,
             source: ImportSourceOptions::Artifact(path.into()),
+            source_database: None,
             mode,
             selection,
+            upload_staging: None,
         }
     }
 }
@@ -283,14 +314,32 @@ impl From<&ImportRequest> for ImportOptions {
             } => Self {
                 archive_format: archive_format.clone(),
                 source: ImportSourceOptions::Artifact(PathBuf::from(artifact_id)),
+                source_database: None,
                 mode: request.mode,
                 selection,
+                upload_staging: None,
+            },
+            ImportSource::Upload {
+                upload_id,
+                source_database,
+            } => Self {
+                archive_format: None,
+                source: ImportSourceOptions::Upload {
+                    upload_id: upload_id.clone(),
+                    path: PathBuf::new(),
+                },
+                source_database: source_database.clone(),
+                mode: request.mode,
+                selection,
+                upload_staging: None,
             },
             ImportSource::Remote(remote) => Self {
                 archive_format: None,
                 source: ImportSourceOptions::RemoteRequest(remote.clone()),
+                source_database: None,
                 mode: request.mode,
                 selection,
+                upload_staging: None,
             },
         }
     }
@@ -318,23 +367,29 @@ pub struct ImportExportJobResponse {
 
 mod archive;
 mod files;
+pub(crate) mod inspection;
 mod jobs;
 mod logical;
 mod physical;
 mod protocol;
+mod upload_recovery;
+mod uploads;
 
-pub use jobs::{export_instance, get_import_export_job, import_instance, list_import_export_jobs};
+pub use jobs::{export_instance, get_import_export_job, list_import_export_jobs};
 pub(crate) use jobs::{
     export_instance_to_default_artifact, import_default_artifact_into_metadata,
     public_job_response, queue_import_instance, replay_failed_job,
 };
-// Preserve the existing crate-internal facade even though no current sibling calls it.
-#[allow(unused_imports)]
-pub(crate) use jobs::queue_export_instance_with_options;
 pub(crate) use logical::quarantine_after_uncertain_import;
 pub(crate) use physical::{
     finish_physical_operation, restore_data_from_archive, rollback_data_from_archive,
     verify_physical_data_replacement,
+};
+pub(crate) use upload_recovery::{reconcile_import_uploads_once, run_import_upload_sweeper};
+pub(crate) use uploads::ImportUploadService;
+pub(crate) use uploads::{
+    delete_import_upload, get_import_upload, import_entry, inspect_import_upload,
+    list_import_uploads,
 };
 
 #[cfg(test)]

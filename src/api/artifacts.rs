@@ -1126,7 +1126,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap().keep();
         let pool = sqlite::connect(&dir).await.unwrap();
         let store = InstanceStore::default();
-        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool));
+        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
         AppState::new(crate::api::routes::AppStateData {
             config: Arc::new(Config {
                 uuid: "node".to_string(),
@@ -1148,6 +1148,10 @@ mod tests {
             instance_locks: crate::instances::locks::InstanceLocks::default(),
             docker: DockerRuntime::offline_for_tests(&Default::default(), false),
             import_export_jobs: ImportExportJobs::default(),
+            import_uploads: crate::api::import_export::ImportUploadService::new(
+                crate::storage::import_uploads::ImportUploadRepository::new(pool),
+                2,
+            ),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: ArtifactDownloadTickets::default(),

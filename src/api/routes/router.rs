@@ -10,6 +10,7 @@ use std::{
 
 use axum::{
     Router,
+    body::Body,
     extract::{DefaultBodyLimit, Request, State},
     http::Method,
     middleware::{self, Next},
@@ -17,7 +18,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use tokio::sync::{Notify, watch};
-use tower_http::timeout::RequestBodyTimeoutLayer;
+use tower_http::timeout::TimeoutBody;
 
 use crate::{
     api::{
@@ -50,6 +51,7 @@ pub struct AppStateData {
     pub instance_locks: crate::instances::locks::InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
+    pub import_uploads: crate::api::import_export::ImportUploadService,
     pub api_rate_limiter: crate::api::security::ApiRateLimiter,
     pub install_progress: crate::api::progress::InstallProgressStore,
     pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
@@ -188,7 +190,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             state.config.security.api_body_limit_bytes,
         ))
-        .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(60)))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            apply_request_body_timeout,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_mutating_request,
@@ -207,6 +212,35 @@ pub fn build_router(state: AppState) -> Router {
             crate::api::security::rate_limit,
         ))
         .with_state(state)
+}
+
+async fn apply_request_body_timeout(
+    State(_state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_import_upload = request.method() == Method::POST
+        && request.uri().path().ends_with("/import")
+        && request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(';').next().is_some_and(|value| {
+                    value
+                        .trim()
+                        .eq_ignore_ascii_case("application/octet-stream")
+                })
+            });
+    if is_import_upload {
+        // The streaming upload handler applies both its configured idle and
+        // total deadlines and maps either one to a stable 408 response.
+        return next.run(request).await;
+    }
+    let timeout = Duration::from_secs(60);
+    let (parts, body) = request.into_parts();
+    let body = Body::new(TimeoutBody::new(timeout, body));
+    next.run(Request::from_parts(parts, body)).await
 }
 
 async fn track_mutating_request(
@@ -302,7 +336,19 @@ fn import_export_routes() -> Router<AppState> {
         )
         .route(
             "/api/instances/{instance_id}/import",
-            post(import_export::import_instance),
+            post(import_export::import_entry),
+        )
+        .route(
+            "/api/instances/{instance_id}/import/uploads",
+            get(import_export::list_import_uploads),
+        )
+        .route(
+            "/api/instances/{instance_id}/import/uploads/{upload_id}",
+            get(import_export::get_import_upload).delete(import_export::delete_import_upload),
+        )
+        .route(
+            "/api/instances/{instance_id}/import/uploads/{upload_id}/catalog",
+            post(import_export::inspect_import_upload),
         )
         .route(
             "/api/instances/{instance_id}/import-export/jobs",
@@ -532,6 +578,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_upload_stream_bypasses_json_limit_and_deletes_durably() {
+        use sha2::{Digest, Sha256};
+
+        let (state, _directory) = upload_test_state().await;
+        let content = vec![b'x'; 64];
+        let digest = format!("{:x}", Sha256::digest(&content));
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/instances/inst_upload/import")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header(header::CONTENT_LENGTH, content.len())
+                    .header("x-dbev-filename", "dump.postgres.sql")
+                    .header("x-dbev-sha256", digest)
+                    .body(Body::from(content))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let upload_id = json_body(response).await["upload_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let upload = state
+            .import_uploads
+            .repository()
+            .get("inst_upload", &upload_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            upload.state,
+            crate::storage::import_uploads::ImportUploadState::Ready
+        );
+        let upload_path =
+            crate::instances::paths::InstancePaths::new(&state.config.paths, "inst_upload")
+                .unwrap()
+                .imports
+                .join(".uploads")
+                .join(&upload.stored_filename);
+        assert_eq!(tokio::fs::metadata(upload_path).await.unwrap().len(), 64);
+
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/instances/inst_upload/import/uploads/{upload_id}"
+                    ))
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .import_uploads
+                .repository()
+                .get("inst_upload", &upload_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_json_requests_still_obey_the_small_body_limit() {
+        let (state, _directory) = upload_test_state().await;
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/images/pull")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"protocol":"postgres","padding":"xxxxxxxxxxxxxxxx"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn shutdown_closes_mutation_admission_and_drains_existing_work() {
         let shutdown = DaemonShutdown::default();
         let mutation = shutdown.try_admit_mutation().unwrap();
@@ -560,7 +702,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(directory.path()).await.unwrap();
         let instances = InstanceStore::default();
-        let manager = InstanceManager::new(instances.clone(), InstanceRepository::new(pool));
+        let manager =
+            InstanceManager::new(instances.clone(), InstanceRepository::new(pool.clone()));
         let config = Arc::new(Config {
             remote: "https://panel.example.com".to_string(),
             token_id: "test-token".to_string(),
@@ -578,6 +721,10 @@ mod tests {
             instance_locks: crate::instances::locks::InstanceLocks::default(),
             docker: DockerRuntime::offline_for_tests(&Default::default(), false),
             import_export_jobs: ImportExportJobs::default(),
+            import_uploads: crate::api::import_export::ImportUploadService::new(
+                crate::storage::import_uploads::ImportUploadRepository::new(pool),
+                2,
+            ),
             api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
             install_progress: crate::api::progress::InstallProgressStore::default(),
             artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
@@ -588,5 +735,108 @@ mod tests {
             gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
             daemon_shutdown: DaemonShutdown::default(),
         })
+    }
+
+    async fn upload_test_state() -> (AppState, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(directory.path()).await.unwrap();
+        let instances = InstanceStore::default();
+        let manager =
+            InstanceManager::new(instances.clone(), InstanceRepository::new(pool.clone()));
+        manager
+            .upsert(upload_test_metadata("inst_upload"))
+            .await
+            .unwrap();
+        let root = directory.path();
+        let mut config = Config {
+            remote: "https://panel.example.com".to_string(),
+            token_id: "test-token".to_string(),
+            token: "secret".to_string(),
+            jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
+            paths: crate::config::PathConfig {
+                data: root.join("data").display().to_string(),
+                sockets: root.join("sockets").display().to_string(),
+                locks: root.join("locks").display().to_string(),
+                logs: root.join("logs").display().to_string(),
+                artifacts: root.join("artifacts").display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.security.api_body_limit_bytes = 16;
+        let config = Arc::new(config);
+        let state = AppState::new(AppStateData {
+            config: config.clone(),
+            config_path: root.join("config.yml"),
+            config_patches: crate::api::config_admin::ConfigPatchCoordinator::default(),
+            api_token: ApiToken::from_config(&config),
+            instances,
+            manager,
+            instance_locks: crate::instances::locks::InstanceLocks::default(),
+            docker: DockerRuntime::offline_for_tests(&Default::default(), false),
+            import_export_jobs: ImportExportJobs::default(),
+            import_uploads: crate::api::import_export::ImportUploadService::new(
+                crate::storage::import_uploads::ImportUploadRepository::new(pool),
+                2,
+            ),
+            api_rate_limiter: crate::api::security::ApiRateLimiter::default(),
+            install_progress: crate::api::progress::InstallProgressStore::default(),
+            artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
+            resource_cache: crate::api::resources::ResourceCache::default(),
+            soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
+            monitoring_cache: crate::api::websocket::MonitoringSnapshotCache::default(),
+            instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+            gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
+            daemon_shutdown: DaemonShutdown::default(),
+        });
+        (state, directory)
+    }
+
+    fn upload_test_metadata(instance_id: &str) -> crate::instances::metadata::InstanceMetadata {
+        use crate::{
+            instances::metadata::{
+                DatabaseIdentity, DesiredInstanceState, InstanceStatus, PublicEndpoint,
+                RuntimeKind, RuntimeMetadata,
+            },
+            shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
+        };
+
+        crate::instances::metadata::InstanceMetadata {
+            schema_version: 1,
+            instance_id: instance_id.to_string(),
+            protocol: Protocol::Postgres,
+            status: InstanceStatus::Running,
+            desired_state: DesiredInstanceState::Running,
+            disk_limit_blocked: false,
+            public: PublicEndpoint {
+                host: "db.example.com".to_string(),
+                port: 5432,
+            },
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: format!("dbe-postgres-{instance_id}"),
+                network_mode: "none".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: "db".to_string(),
+                username: "user".to_string(),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
+            mongodb_root_password: None,
+            postgres_admin_password: None,
+            tenant_password: None,
+            limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
     }
 }
