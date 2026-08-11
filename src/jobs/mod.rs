@@ -373,6 +373,24 @@ pub mod import_export {
             Ok(counts)
         }
 
+        /// Returns every active export destination tracked by this daemon.
+        ///
+        /// Active jobs are never evicted by `prune_job_cache`, so this avoids
+        /// the public list endpoint's pagination limit when protecting
+        /// one-use outputs from the expiry sweeper.
+        pub async fn active_export_artifact_paths(&self) -> Vec<String> {
+            self.inner
+                .read()
+                .await
+                .values()
+                .filter(|job| {
+                    job.action == ImportExportAction::Export
+                        && job.status == ImportExportStatus::Running
+                })
+                .filter_map(|job| job.artifact_path.clone())
+                .collect()
+        }
+
         pub async fn delete_for_instance(
             &self,
             instance_id: &str,

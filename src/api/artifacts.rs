@@ -29,6 +29,12 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+mod one_use;
+pub(crate) use one_use::{
+    ensure_client_export_slot, instance_one_use_export_root, reconcile_one_use_exports_once,
+    run_one_use_export_sweeper,
+};
+
 use crate::api::{
     api_response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
     routes::AppState,
@@ -206,6 +212,12 @@ struct DownloadStream {
     cleanup: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct DownloadableArtifact {
+    path: PathBuf,
+    one_use: bool,
+}
+
 impl Stream for DownloadStream {
     type Item = Result<Bytes, std::io::Error>;
 
@@ -220,13 +232,11 @@ impl Drop for DownloadStream {
         let Some(path) = self.cleanup.take() else {
             return;
         };
-        if let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
+        if let Err(error) = one_use::remove_download_spool_blocking(&path) {
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "failed to remove materialized backup download"
+                "failed to remove temporary download spool"
             );
         }
     }
@@ -289,7 +299,9 @@ pub async fn delete_artifact(
 ) -> ApiResult<DeleteArtifactResponse> {
     auth.require_scope(scopes::ARTIFACTS_WRITE)?;
     ensure_instance_exists(&state, &instance_id).await?;
-    let path = verified_artifact_path_for_instance(&state, &artifact_id, &instance_id).await?;
+    let path = downloadable_artifact_path_for_instance(&state, &artifact_id, &instance_id)
+        .await?
+        .path;
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {
             remove_checksum_sidecar(&path).await;
@@ -453,15 +465,18 @@ async fn create_download_url(
             "expires_in_seconds must be between 1 and {MAX_DOWNLOAD_TTL_SECONDS}"
         )));
     }
-    let single_use = request.single_use.unwrap_or(true);
-    match kind {
+    let one_use = match kind {
         DownloadKind::Artifact => {
-            verified_artifact_path_for_instance(state, name, instance_id).await?;
+            downloadable_artifact_path_for_instance(state, name, instance_id)
+                .await?
+                .one_use
         }
         DownloadKind::Backup => {
             crate::api::backups::ensure_backup_exists(state, instance_id, name).await?;
+            false
         }
-    }
+    };
+    let single_use = request.single_use.unwrap_or(true) || one_use;
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let exp = now + ttl_seconds;
@@ -530,11 +545,16 @@ async fn download(
         return Err(ApiError::Unauthorized);
     }
     let (path, cleanup) = match kind {
-        DownloadKind::Artifact => (
-            verified_artifact_path_for_instance(state, &claims.artifact, &claims.instance_id)
-                .await?,
-            None,
-        ),
+        DownloadKind::Artifact => {
+            let artifact = downloadable_artifact_path_for_instance(
+                state,
+                &claims.artifact,
+                &claims.instance_id,
+            )
+            .await?;
+            let cleanup = artifact.one_use.then(|| artifact.path.clone());
+            (artifact.path, cleanup)
+        }
         DownloadKind::Backup => {
             let backup = crate::api::backups::materialize_backup_for_download(
                 state,
@@ -701,6 +721,39 @@ pub(crate) async fn verified_artifact_path_for_instance(
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     validate_artifact_name(name)?;
     let root = instance_export_root(state, instance_id);
+    verified_artifact_path_in_root(&root, name).await
+}
+
+async fn downloadable_artifact_path_for_instance(
+    state: &AppState,
+    name: &str,
+    instance_id: &str,
+) -> Result<DownloadableArtifact, ApiError> {
+    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_artifact_name(name)?;
+    let retained =
+        verified_artifact_path_in_root(&instance_export_root(state, instance_id), name).await;
+    let one_use =
+        verified_artifact_path_in_root(&instance_one_use_export_root(state, instance_id), name)
+            .await;
+    match (retained, one_use) {
+        (Ok(_), Ok(_)) => Err(ApiError::Conflict(
+            "artifact identifier exists in both retained and one-use storage".to_string(),
+        )),
+        (Ok(path), Err(ApiError::NotFound)) => Ok(DownloadableArtifact {
+            path,
+            one_use: false,
+        }),
+        (Err(ApiError::NotFound), Ok(path)) => Ok(DownloadableArtifact {
+            path,
+            one_use: true,
+        }),
+        (Err(ApiError::NotFound), Err(ApiError::NotFound)) => Err(ApiError::NotFound),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+async fn verified_artifact_path_in_root(root: &FsPath, name: &str) -> Result<PathBuf, ApiError> {
     let root_metadata =
         tokio::fs::symlink_metadata(&root)
             .await
@@ -1106,6 +1159,111 @@ mod tests {
         assert!(matches!(error, ApiError::NotFound));
     }
 
+    #[tokio::test]
+    async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() {
+        let state = test_state_with_policy(true, 20).await;
+        let artifact_name = "one-use.mongodb.archive.gz";
+        let artifact = instance_one_use_export_root(&state, "inst_abc").join(artifact_name);
+        tokio::fs::create_dir_all(artifact.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&artifact, b"dump").await.unwrap();
+        state.instances.upsert(sample_metadata("inst_abc")).await;
+
+        assert!(
+            read_instance_artifacts(&state, "inst_abc")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let ticket = create_download_url(
+            &state,
+            artifact_name,
+            "inst_abc",
+            CreateDownloadRequest {
+                expires_in_seconds: Some(60),
+                single_use: Some(false),
+            },
+            DownloadKind::Artifact,
+        )
+        .await
+        .unwrap()
+        .into_body();
+        assert!(ticket.single_use);
+        let token = ticket.url.split_once("token=").unwrap().1;
+        let response = download(
+            &state,
+            token,
+            "inst_abc",
+            artifact_name,
+            DownloadKind::Artifact,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(artifact.exists());
+        drop(response);
+        assert!(!artifact.exists());
+    }
+
+    #[tokio::test]
+    async fn per_instance_artifact_limit_counts_retained_and_one_use_outputs() {
+        let state = test_state_with_policy(false, 2).await;
+        for path in [
+            instance_export_root(&state, "inst_abc").join("retained.sql"),
+            instance_one_use_export_root(&state, "inst_abc").join("pending.sql"),
+        ] {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, b"dump").await.unwrap();
+        }
+
+        let error = ensure_client_export_slot(&state, "inst_abc")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() {
+        let state = test_state_with_policy(true, 20).await;
+        let root = instance_one_use_export_root(&state, "inst_abc");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let stale = root.join("stale.sql");
+        let active = root.join("active.sql");
+        for path in [&stale, &active] {
+            std::fs::write(path, b"dump").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+        state
+            .import_export_jobs
+            .insert(crate::jobs::import_export::ImportExportJob {
+                job_id: "active-export".to_string(),
+                instance_id: "inst_abc".to_string(),
+                action: crate::jobs::import_export::ImportExportAction::Export,
+                status: crate::jobs::import_export::ImportExportStatus::Running,
+                artifact_path: Some(active.display().to_string()),
+                replay_options: None,
+                error: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(reconcile_one_use_exports_once(&state).await.unwrap(), 1);
+        assert!(!stale.exists());
+        assert!(active.exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn verified_artifact_path_rejects_symlinks() {
@@ -1123,6 +1281,13 @@ mod tests {
     }
 
     async fn test_state() -> AppState {
+        test_state_with_policy(false, 20).await
+    }
+
+    async fn test_state_with_policy(
+        stream_exports_only: bool,
+        max_artifacts_per_instance: usize,
+    ) -> AppState {
         let dir = tempfile::tempdir().unwrap().keep();
         let pool = sqlite::connect(&dir).await.unwrap();
         let store = InstanceStore::default();
@@ -1134,8 +1299,15 @@ mod tests {
                 token: "secret".to_string(),
                 jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
                 remote: "https://panel.example.com".to_string(),
+                artifacts: crate::config::ArtifactConfig {
+                    stream_exports_only,
+                    max_artifacts_per_instance,
+                    ..Default::default()
+                },
                 paths: PathConfig {
+                    data: dir.display().to_string(),
                     artifacts: dir.join("artifacts").display().to_string(),
+                    tmp: dir.join("tmp").display().to_string(),
                     ..Default::default()
                 },
                 ..Default::default()

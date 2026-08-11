@@ -94,6 +94,43 @@ fn compressed_export_capacity_covers_worst_case_expansion() {
     );
 }
 
+#[test]
+fn logical_export_capacity_tracks_managed_database_usage() {
+    const MIB: u64 = 1024 * 1024;
+    assert_eq!(
+        jobs::estimated_logical_export_capacity_bytes(Protocol::Mongodb, 0),
+        64 * MIB
+    );
+    assert_eq!(
+        jobs::estimated_logical_export_capacity_bytes(Protocol::Mongodb, 10 * MIB),
+        84 * MIB
+    );
+    assert_eq!(
+        jobs::estimated_logical_export_capacity_bytes(Protocol::Postgres, 10 * MIB),
+        104 * MIB
+    );
+    assert_eq!(
+        jobs::estimated_logical_export_capacity_bytes(Protocol::Mysql, 3 * 1024 * MIB),
+        MAX_UNARCHIVED_BYTES
+    );
+}
+
+#[test]
+fn plain_export_on_one_filesystem_does_not_reserve_the_dump_twice() {
+    assert!(!jobs::logical_export_needs_separate_staging_reservation(
+        ExportArchiveFormat::Plain,
+        true,
+    ));
+    assert!(jobs::logical_export_needs_separate_staging_reservation(
+        ExportArchiveFormat::Plain,
+        false,
+    ));
+    assert!(jobs::logical_export_needs_separate_staging_reservation(
+        ExportArchiveFormat::Gzip,
+        true,
+    ));
+}
+
 #[tokio::test]
 async fn compressed_export_cannot_write_past_its_reserved_bound() {
     let directory = tempfile::tempdir().unwrap();

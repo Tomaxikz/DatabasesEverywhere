@@ -1281,6 +1281,7 @@ pub(crate) async fn purge_instance_paths(
         paths.imports,
         paths.backups,
         paths.runtime_config,
+        crate::api::artifacts::instance_one_use_export_root(state, instance_id),
     ];
     let retained_volumes = retained_instance_volume_paths(&purge_paths[0])
         .await

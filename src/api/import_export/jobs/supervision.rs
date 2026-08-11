@@ -58,12 +58,14 @@ pub(super) fn spawn_export_job_supervisor(
         let failure_job_id = job_id.clone();
         let failure_instance_id = instance_id.clone();
         let failure_artifact_path = artifact_path.clone();
+        let logical_output_capacity = reservations.logical_output_capacity;
         let worker = tokio::spawn(run_export_job_locked(
             state,
             job_id,
             metadata,
             artifact_path,
             options,
+            logical_output_capacity,
         ));
         if let Err(error) = worker.await {
             handle_export_worker_failure(

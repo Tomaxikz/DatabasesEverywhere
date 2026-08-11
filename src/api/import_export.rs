@@ -165,6 +165,33 @@ enum UploadStagingBudget {
 pub(crate) struct ExportOptions {
     selection: ImportExportSelection,
     archive_format: ExportArchiveFormat,
+    delivery: ExportDelivery,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ExportDelivery {
+    #[default]
+    InternalRetained,
+    ClientRetained,
+    ClientOneUse,
+}
+
+impl ExportDelivery {
+    fn for_client(state: &AppState) -> Self {
+        if state.config.artifacts.stream_exports_only {
+            Self::ClientOneUse
+        } else {
+            Self::ClientRetained
+        }
+    }
+
+    fn is_client(self) -> bool {
+        !matches!(self, Self::InternalRetained)
+    }
+
+    fn is_one_use(self) -> bool {
+        matches!(self, Self::ClientOneUse)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

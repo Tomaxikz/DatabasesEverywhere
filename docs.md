@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.2 # replace with the reviewed release
+DBEV_VERSION=v0.5.3 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -322,7 +322,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.2@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.3@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -343,6 +343,8 @@ artifact retention:
 artifacts:
   retention_keep_latest: 20
   retention_max_age_days: 30
+  stream_exports_only: false
+  max_artifacts_per_instance: 20
   import_upload_max_bytes: 8589934592        # one upload; 8 GiB
   import_upload_max_total_bytes: 34359738368 # all active uploads; 32 GiB
   import_upload_max_per_instance: 4
@@ -362,6 +364,17 @@ artifacts:
     starvation_timeout_seconds: 30
     max_bypass: 8
 ```
+
+`stream_exports_only: false` keeps the existing retained-artifact behavior.
+When true, client-requested exports use a private one-use spool, remain absent
+from the artifact inventory, force a single-use download ticket, and are
+durably removed when the HTTP download finishes or disconnects. Abandoned
+spools expire after one hour and are swept at startup and every minute. Internal
+upgrade/recovery exports remain retained because they are required for safe
+rollback. `max_artifacts_per_instance` (1-10,000) is a hard combined cap over
+retained artifacts and pending one-use exports; another export returns a
+conflict until the client downloads or deletes one. Both fields default safely
+when absent from an older configuration and take effect after daemon restart.
 
 The node reserves the declared `Content-Length` before accepting the body and
 also checks free disk space. The total timeout bounds the complete transfer;
@@ -872,9 +885,19 @@ change between sampling and creation.
 
 Three related but different things — don't mix them up:
 
-- **Exports** are portable database-native dumps (`pg_dump` style). They are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs.
+- **Exports** are portable database-native dumps (`pg_dump` style). By default they are kept under `paths.exports/<instance_id>/` and exposed to clients only through opaque artifact IDs. Stream-only mode instead exposes the completed job through the same download flow without retaining it in that inventory.
 - **Imports** load one of that instance's trusted local artifacts, a temporary dump uploaded through the API, or a native dump/snapshot acquired directly from a typed remote source. An operator can stage a file under `paths.imports/<instance_id>/` and reference its filename as the artifact ID. API clients never submit host filesystem paths, helper images, commands, or connection URLs.
 - **Backups** are physical archives of the whole instance volume. The local driver stores them under `paths.backups/<instance_id>/`; S3 and Kopia store them in the configured remote repository. They're for disaster recovery on the same daemon, not portability.
+
+Before a logical export starts, DBEV measures the managed instance data
+directory only; container image layers are not part of this measurement. It
+adds a bounded protocol-specific allowance for logical-dump expansion, caps the
+stream at 8 GiB, and checks that allowance against the current free bytes and
+other active reservations on the actual staging and artifact filesystems. A
+plain export whose staging and artifact directories share a filesystem is
+reserved once because installation is an atomic rename. Compressed exports keep
+separate bounded reservations for the source dump and compressed artifact while
+both files coexist.
 
 ### Temporary dump uploads
 

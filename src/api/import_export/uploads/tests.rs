@@ -65,6 +65,24 @@ async fn output_reservations_share_capacity_without_consuming_staging_slots() {
     drop(staging);
 }
 
+#[tokio::test]
+async fn output_roots_on_the_same_device_are_identified_as_one_filesystem() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_lazy("sqlite::memory:")
+        .unwrap();
+    let service = ImportUploadService::new(ImportUploadRepository::new(pool), 1);
+    let directory = tempfile::tempdir().unwrap();
+    let staging = directory.path().join("staging");
+    tokio::fs::create_dir(&staging).await.unwrap();
+
+    assert!(
+        service
+            .output_roots_share_filesystem(directory.path(), &staging)
+            .await
+            .unwrap()
+    );
+}
+
 #[test]
 fn filesystem_reservation_totals_aggregate_only_matching_identities() {
     let first = FilesystemIdentity("device-a".to_string());

@@ -457,6 +457,12 @@ impl Default for PidsLimitConfig {
 pub struct ArtifactConfig {
     pub retention_keep_latest: usize,
     pub retention_max_age_days: u64,
+    /// When true, generated client exports are delivered from a private
+    /// one-use spool and removed after download instead of entering the
+    /// retained artifact inventory.
+    pub stream_exports_only: bool,
+    /// Maximum retained artifacts, or pending one-use exports, per instance.
+    pub max_artifacts_per_instance: usize,
     pub import_upload_max_bytes: u64,
     pub import_upload_max_total_bytes: u64,
     pub import_upload_max_per_instance: usize,
@@ -472,6 +478,8 @@ impl Default for ArtifactConfig {
         Self {
             retention_keep_latest: 20,
             retention_max_age_days: 30,
+            stream_exports_only: false,
+            max_artifacts_per_instance: 20,
             import_upload_max_bytes: 8 * 1024 * 1024 * 1024,
             import_upload_max_total_bytes: 32 * 1024 * 1024 * 1024,
             import_upload_max_per_instance: 4,

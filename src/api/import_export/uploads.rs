@@ -166,6 +166,16 @@ impl ImportUploadService {
         )
         .await
     }
+
+    pub(crate) async fn output_roots_share_filesystem(
+        &self,
+        first: &std::path::Path,
+        second: &std::path::Path,
+    ) -> Result<bool, ApiError> {
+        let first = validated_output_filesystem_identity(first).await?;
+        let second = validated_output_filesystem_identity(second).await?;
+        Ok(first == second)
+    }
 }
 
 pub(super) struct ImportStagingPermit {
@@ -1221,6 +1231,20 @@ fn filesystem_identity(
         "unix-device:{}",
         metadata.dev()
     )))
+}
+
+async fn validated_output_filesystem_identity(
+    root: &std::path::Path,
+) -> Result<FilesystemIdentity, ApiError> {
+    let metadata = tokio::fs::symlink_metadata(root).await.map_err(|error| {
+        ApiError::Runtime(format!("failed to inspect output filesystem: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ApiError::Runtime(
+            "output filesystem root must be a real directory".to_string(),
+        ));
+    }
+    filesystem_identity(root, &metadata)
 }
 
 #[cfg(windows)]

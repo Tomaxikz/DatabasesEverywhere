@@ -312,6 +312,15 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
     });
+    let expired_one_use_exports = crate::api::artifacts::reconcile_one_use_exports_once(&state)
+        .await
+        .context("failed to reconcile one-use export spools")?;
+    if expired_one_use_exports > 0 {
+        tracing::info!(
+            removed = expired_one_use_exports,
+            "expired one-use exports removed during startup"
+        );
+    }
     let upload_recovery = crate::api::import_export::reconcile_import_uploads_once(&state)
         .await
         .context("failed to reconcile temporary import uploads")?;
@@ -333,6 +342,9 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
     }
     crate::api::resources::start_resource_sampler(state.clone());
+    let one_use_export_sweeper = tokio::spawn(crate::api::artifacts::run_one_use_export_sweeper(
+        state.clone(),
+    ));
     let import_upload_sweeper = tokio::spawn(crate::api::import_export::run_import_upload_sweeper(
         state.clone(),
     ));
@@ -373,6 +385,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let _ = managed_container_events.await;
     soft_disk_limits.abort();
     let _ = soft_disk_limits.await;
+    one_use_export_sweeper.abort();
+    let _ = one_use_export_sweeper.await;
     import_upload_sweeper.abort();
     let _ = import_upload_sweeper.await;
     managed_runtime_boot.abort();

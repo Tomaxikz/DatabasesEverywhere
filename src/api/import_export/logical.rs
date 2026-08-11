@@ -899,6 +899,15 @@ pub(super) struct LogicalExportControls {
     include_database_definition: bool,
 }
 
+impl LogicalExportControls {
+    pub(super) fn with_max_output_bytes(max_output_bytes: u64) -> Self {
+        Self {
+            max_output_bytes: Some(max_output_bytes),
+            ..Self::default()
+        }
+    }
+}
+
 pub(super) async fn export_logical_dump(
     state: &AppState,
     metadata: &InstanceMetadata,

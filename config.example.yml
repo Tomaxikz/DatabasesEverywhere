@@ -107,6 +107,11 @@ security:
 artifacts:
   retention_keep_latest: 20
   retention_max_age_days: 30
+  # False retains generated exports in the artifact inventory. True keeps only
+  # a private one-use spool until download, disconnect, or expiry.
+  stream_exports_only: false
+  # Hard per-database cap for retained artifacts or pending one-use exports.
+  max_artifacts_per_instance: 20
   # Temporary user-provided dumps are separate from DBEV-generated artifacts.
   # Declared Content-Length is reserved before the stream is accepted.
   import_upload_max_bytes: 8589934592

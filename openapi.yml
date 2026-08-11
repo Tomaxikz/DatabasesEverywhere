@@ -699,6 +699,7 @@ components:
           enum: [queued, running, succeeded, failed]
         artifact_id:
           type: [string, "null"]
+          description: Retained artifact ID, or a one-use download ID when stream-only export policy is enabled.
         artifact_size_bytes:
           type: [integer, "null"]
         error:
@@ -1554,6 +1555,11 @@ paths:
   /api/instances/{instance_id}/export:
     post:
       summary: Export one instance to a protocol-native dump artifact.
+      description: >-
+        Queues an export using the node artifact policy. Retained mode stores the
+        result in the instance artifact inventory. Stream-only mode exposes the
+        same job artifact_id through a forced single-use download and deletes
+        its private spool when streaming finishes, disconnects, or expires.
       x-required-scope: import-export:write
       parameters:
         - name: instance_id
@@ -2023,7 +2029,8 @@ paths:
                 $ref: "#/components/schemas/RestoreBackupResponse"
   /api/instances/{instance_id}/artifacts:
     get:
-      summary: List export artifacts belonging to one instance.
+      summary: List retained export artifacts belonging to one instance.
+      description: One-use stream-only export spools never appear in this inventory.
       x-required-scope: artifacts:read
       parameters:
         - name: instance_id
@@ -2044,7 +2051,7 @@ paths:
                   $ref: "#/components/schemas/StoredArtifact"
   /api/instances/{instance_id}/artifacts/{artifact_id}:
     delete:
-      summary: Delete one export artifact belonging to an instance.
+      summary: Delete one retained artifact or pending one-use export belonging to an instance.
       x-required-scope: artifacts:write
       parameters:
         - name: instance_id
@@ -2080,7 +2087,10 @@ paths:
           type: string
     get:
       summary: Download an artifact using its temporary URL.
-      description: The stream is admitted under node-wide and transport-peer concurrency caps. A 429 response does not consume a single-use ticket.
+      description: >-
+        The stream is admitted under node-wide and transport-peer concurrency
+        caps. A 429 response does not consume a single-use ticket. A stream-only
+        export is deleted when this response finishes or disconnects.
       security: []
       parameters:
         - name: token

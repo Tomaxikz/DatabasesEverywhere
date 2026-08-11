@@ -9,6 +9,7 @@ use super::{
 };
 use crate::shared::images::is_pinned_image_reference;
 
+mod artifact_policy;
 mod import_export_scheduler;
 
 const MAX_REMOTE_IMPORT_JOBS: usize = 64;
@@ -174,6 +175,7 @@ fn validate_import_uploads(
     artifacts: &crate::config::ArtifactConfig,
 ) -> Result<(), ConfigValidationError> {
     let invalid = |field| ConfigValidationError::InvalidImportUploadConfig { field };
+    artifact_policy::validate(artifacts)?;
     if artifacts.import_upload_max_bytes == 0
         || artifacts.import_upload_max_bytes > 8 * 1024 * 1024 * 1024
     {
