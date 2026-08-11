@@ -938,13 +938,17 @@ async fn handle_mongodb_client(
         for _ in 0..MAX_MONGODB_HELLO_MESSAGES {
             let message =
                 mongodb::read_message_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
-            if mongodb::is_hello(&message) {
-                mongodb::write_response(&mut client, &message, mongodb::hello_response()).await?;
-                continue;
-            }
-
-            let route = match mongodb::parse_sasl_start_route(&message) {
-                Ok(route) => route,
+            let routes = match if mongodb::is_hello(&message) {
+                mongodb::parse_hello_routes(&message)
+            } else {
+                mongodb::parse_sasl_start_route(&message).map(|route| vec![route])
+            } {
+                Ok(routes) if routes.is_empty() => {
+                    mongodb::write_response(&mut client, &message, mongodb::hello_response())
+                        .await?;
+                    continue;
+                }
+                Ok(routes) => routes,
                 Err(error) => {
                     mongodb::write_response(
                         &mut client,
@@ -956,10 +960,33 @@ async fn handle_mongodb_client(
                 }
             };
 
-            let Some(target) = resolver
-                .resolve_mongodb(&route.username, &route.database)
-                .await
-            else {
+            // Some drivers build mechanism negotiation from their default `admin` source while
+            // speculative SCRAM carries the explicit authSource. Trust neither field alone: only
+            // a unique registered DBEV route may select the backend.
+            let mut target = None;
+            for route in routes {
+                let Some(candidate) = resolver
+                    .resolve_mongodb(&route.username, &route.database)
+                    .await
+                else {
+                    continue;
+                };
+                match &target {
+                    None => target = Some(candidate),
+                    Some(existing) if existing.instance_id == candidate.instance_id => {}
+                    Some(_) => {
+                        let error = mongodb::MongodbProxyError::ConflictingHelloRoutes;
+                        mongodb::write_response(
+                            &mut client,
+                            &message,
+                            mongodb::command_error(&error.to_string(), 18),
+                        )
+                        .await?;
+                        return Err(error.into());
+                    }
+                }
+            }
+            let Some(target) = target else {
                 mongodb::write_response(
                     &mut client,
                     &message,

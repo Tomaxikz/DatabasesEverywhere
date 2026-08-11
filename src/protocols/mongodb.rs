@@ -36,6 +36,10 @@ pub enum MongodbProxyError {
     MissingDatabase,
     #[error("mongodb saslStart did not include a username")]
     MissingUsername,
+    #[error("mongodb hello authentication route is malformed")]
+    InvalidHelloRoute,
+    #[error("mongodb hello included conflicting authentication routes")]
+    ConflictingHelloRoutes,
     #[error("mongodb bson decode failed: {0}")]
     BsonDecode(#[from] bson::de::Error),
     #[error("mongodb bson encode failed: {0}")]
@@ -168,18 +172,39 @@ pub fn parse_sasl_start_route(message: &MongoMessage) -> Result<MongodbRoute, Mo
         return Err(MongodbProxyError::MalformedMessage);
     }
 
-    let database = body
-        .get_str("$db")
-        .map_err(|_| MongodbProxyError::MissingDatabase)?
-        .to_string();
-    let payload = body
-        .get_binary_generic("payload")
-        .map_err(|_| MongodbProxyError::MissingUsername)?;
-    let first_message =
-        std::str::from_utf8(payload).map_err(|_| MongodbProxyError::MalformedMessage)?;
-    let username = scram_username(first_message).ok_or(MongodbProxyError::MissingUsername)?;
+    parse_scram_route(body, "$db")
+}
 
-    Ok(MongodbRoute { username, database })
+pub fn parse_hello_routes(message: &MongoMessage) -> Result<Vec<MongodbRoute>, MongodbProxyError> {
+    if !is_hello(message) {
+        return Err(MongodbProxyError::MalformedMessage);
+    }
+    let body = message
+        .body
+        .as_ref()
+        .ok_or(MongodbProxyError::MalformedMessage)?;
+
+    let negotiated = match body.get("saslSupportedMechs") {
+        None => None,
+        Some(Bson::String(route)) => Some(parse_negotiated_route(route)?),
+        Some(_) => return Err(MongodbProxyError::InvalidHelloRoute),
+    };
+    let speculative = match body.get("speculativeAuthenticate") {
+        None => None,
+        Some(Bson::Document(speculative)) => parse_speculative_route(speculative)?,
+        Some(_) => return Err(MongodbProxyError::InvalidHelloRoute),
+    };
+
+    let mut routes = Vec::with_capacity(2);
+    if let Some(route) = negotiated {
+        routes.push(route);
+    }
+    if let Some(route) = speculative
+        && !routes.contains(&route)
+    {
+        routes.push(route);
+    }
+    Ok(routes)
 }
 
 pub fn hello_response() -> Document {
@@ -189,10 +214,15 @@ pub fn hello_response() -> Document {
         "isWritablePrimary": true,
         "ismaster": true,
         "secondary": false,
+        "maxBsonObjectSize": 16_777_216_i32,
+        "maxMessageSizeBytes": 48_000_000_i32,
+        "maxWriteBatchSize": 100_000_i32,
+        "localTime": bson::DateTime::now(),
         "maxWireVersion": 21_i32,
         "minWireVersion": 0_i32,
         "logicalSessionTimeoutMinutes": 30_i32,
         "connectionId": 1_i32,
+        "readOnly": false,
         "compression": bson::Array::new(),
     }
 }
@@ -256,6 +286,77 @@ fn parse_op_query_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
     }
     let mut cursor = Cursor::new(&payload[offset..]);
     Ok(Document::from_reader(&mut cursor)?)
+}
+
+fn parse_negotiated_route(value: &str) -> Result<MongodbRoute, MongodbProxyError> {
+    let (database, username) = value
+        .split_once('.')
+        .ok_or(MongodbProxyError::InvalidHelloRoute)?;
+    let route = MongodbRoute {
+        username: username.to_string(),
+        database: database.to_string(),
+    };
+    validate_managed_route(&route)?;
+    Ok(route)
+}
+
+fn parse_speculative_route(
+    speculative: &Document,
+) -> Result<Option<MongodbRoute>, MongodbProxyError> {
+    if !matches!(
+        speculative.get("saslStart"),
+        Some(Bson::Int32(1) | Bson::Int64(1))
+    ) {
+        return Ok(None);
+    }
+    if !matches!(
+        speculative.get_str("mechanism"),
+        Ok("SCRAM-SHA-1" | "SCRAM-SHA-256")
+    ) {
+        return Ok(None);
+    }
+
+    let route =
+        parse_scram_route(speculative, "db").map_err(|_| MongodbProxyError::InvalidHelloRoute)?;
+    validate_managed_route(&route)?;
+    Ok(Some(route))
+}
+
+fn parse_scram_route(
+    body: &Document,
+    database_field: &str,
+) -> Result<MongodbRoute, MongodbProxyError> {
+    let database = body
+        .get_str(database_field)
+        .map_err(|_| MongodbProxyError::MissingDatabase)?
+        .to_string();
+    let payload = body
+        .get_binary_generic("payload")
+        .map_err(|_| MongodbProxyError::MissingUsername)?;
+    let first_message =
+        std::str::from_utf8(payload).map_err(|_| MongodbProxyError::MalformedMessage)?;
+    let username = scram_username(first_message).ok_or(MongodbProxyError::MissingUsername)?;
+
+    Ok(MongodbRoute { username, database })
+}
+
+fn validate_managed_route(route: &MongodbRoute) -> Result<(), MongodbProxyError> {
+    if valid_managed_identifier(&route.username) && valid_managed_identifier(&route.database) {
+        Ok(())
+    } else {
+        Err(MongodbProxyError::InvalidHelloRoute)
+    }
+}
+
+fn valid_managed_identifier(value: &str) -> bool {
+    if value.is_empty() || value.len() > 63 {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn scram_username(first_message: &str) -> Option<String> {
@@ -326,6 +427,148 @@ mod tests {
             };
 
             assert!(is_hello(&message));
+        }
+    }
+
+    #[test]
+    fn routes_credential_bearing_hello_from_mechanism_negotiation() {
+        let message = MongoMessage {
+            request_id: 1,
+            op_code: OP_MSG,
+            body: Some(doc! {
+                "hello": 1_i32,
+                "saslSupportedMechs": "mongo_1.app_mongo_1",
+                "$db": "admin",
+            }),
+            raw: Vec::new(),
+        };
+
+        assert_eq!(
+            parse_hello_routes(&message).unwrap(),
+            vec![MongodbRoute {
+                username: "app_mongo_1".to_string(),
+                database: "mongo_1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn routes_speculative_scram_hello() {
+        let message = MongoMessage {
+            request_id: 1,
+            op_code: OP_MSG,
+            body: Some(doc! {
+                "hello": 1_i32,
+                "speculativeAuthenticate": {
+                    "saslStart": 1_i32,
+                    "mechanism": "SCRAM-SHA-256",
+                    "payload": Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes: b"n,,n=app_mongo_1,r=nonce".to_vec(),
+                    }),
+                    "db": "mongo_1",
+                },
+                "$db": "admin",
+            }),
+            raw: Vec::new(),
+        };
+
+        assert_eq!(
+            parse_hello_routes(&message).unwrap(),
+            vec![MongodbRoute {
+                username: "app_mongo_1".to_string(),
+                database: "mongo_1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn preserves_driver_auth_source_mismatch_for_registered_route_resolution() {
+        let message = MongoMessage {
+            request_id: 1,
+            op_code: OP_MSG,
+            body: Some(doc! {
+                "hello": 1_i32,
+                "saslSupportedMechs": "admin.app_mongo_1",
+                "speculativeAuthenticate": {
+                    "saslStart": 1_i32,
+                    "mechanism": "SCRAM-SHA-256",
+                    "payload": Bson::Binary(Binary {
+                        subtype: BinarySubtype::Generic,
+                        bytes: b"n,,n=app_mongo_1,r=nonce".to_vec(),
+                    }),
+                    "db": "mongo_1",
+                },
+                "$db": "admin",
+            }),
+            raw: Vec::new(),
+        };
+
+        assert_eq!(
+            parse_hello_routes(&message).unwrap(),
+            vec![
+                MongodbRoute {
+                    username: "app_mongo_1".to_string(),
+                    database: "admin".to_string(),
+                },
+                MongodbRoute {
+                    username: "app_mongo_1".to_string(),
+                    database: "mongo_1".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_free_hello_uses_fallback_and_fallback_is_complete() {
+        let message = MongoMessage {
+            request_id: 1,
+            op_code: OP_MSG,
+            body: Some(doc! { "hello": 1_i32, "$db": "admin" }),
+            raw: Vec::new(),
+        };
+
+        assert!(parse_hello_routes(&message).unwrap().is_empty());
+        let response = hello_response();
+        for field in [
+            "isWritablePrimary",
+            "maxBsonObjectSize",
+            "maxMessageSizeBytes",
+            "maxWriteBatchSize",
+            "localTime",
+            "maxWireVersion",
+            "minWireVersion",
+            "logicalSessionTimeoutMinutes",
+            "connectionId",
+        ] {
+            assert!(response.contains_key(field), "missing hello field {field}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_hello_route_without_echoing_it() {
+        for route in [
+            "missing_separator",
+            ".missing_database",
+            "missing_username.",
+            "mongo_1.bad.username",
+            "mongo_1.1starts_with_digit",
+        ] {
+            let message = MongoMessage {
+                request_id: 1,
+                op_code: OP_MSG,
+                body: Some(doc! {
+                    "hello": 1_i32,
+                    "saslSupportedMechs": route,
+                    "$db": "admin",
+                }),
+                raw: Vec::new(),
+            };
+
+            assert!(matches!(
+                parse_hello_routes(&message),
+                Err(MongodbProxyError::InvalidHelloRoute)
+            ));
         }
     }
 

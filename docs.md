@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.1 # replace with the reviewed release
+DBEV_VERSION=v0.5.2 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -322,7 +322,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.1@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.2@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -789,6 +789,16 @@ gateway-to-Unix-socket boundary because managed containers use
 `network_mode=none`; RX is traffic delivered to the database and TX is traffic
 returned by it. The counters start at zero on daemon boot. For continuous
 monitoring use the WebSocket instead of polling this.
+
+The MongoDB gateway keeps credential-free monitoring sockets on a bounded
+standalone `hello` response until a tenant route is known. General-use clients
+normally include `saslSupportedMechs` and optional SCRAM
+`speculativeAuthenticate` data in their first `hello`; DBE resolves both signals
+against the registered tenant routes and requires them to identify at most one
+managed instance. It then forwards that original handshake unchanged to the real
+`mongod`. This preserves server-reported wire limits, authentication-mechanism
+negotiation, and speculative-authentication responses instead of emulating them
+in the gateway.
 
 Soft-scanner reports additionally expose nullable `scanner_logical_bytes`,
 `scanner_physical_bytes`, current and peak `scanner_growth_bytes_per_second`,
