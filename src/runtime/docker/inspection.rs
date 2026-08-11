@@ -252,6 +252,91 @@ impl DockerRuntime {
         Ok((username, SecretString::from(password)))
     }
 
+    pub(crate) async fn postgres_legacy_tenant_credentials(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(String, SecretString)>, DockerError> {
+        self.legacy_tenant_credentials(
+            Protocol::Postgres,
+            instance_id,
+            &[("DBE_POSTGRES_USER", "DBE_POSTGRES_PASSWORD")],
+        )
+        .await
+    }
+
+    pub(crate) async fn mysql_legacy_tenant_credentials(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(String, SecretString)>, DockerError> {
+        self.legacy_tenant_credentials(
+            Protocol::Mysql,
+            instance_id,
+            &[
+                ("DBE_MYSQL_USER", "DBE_MYSQL_PASSWORD"),
+                ("MYSQL_USER", "MYSQL_PASSWORD"),
+            ],
+        )
+        .await
+    }
+
+    async fn legacy_tenant_credentials(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        key_pairs: &[(&str, &str)],
+    ) -> Result<Option<(String, SecretString)>, DockerError> {
+        let name = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&name, None).await?;
+        let environment = response
+            .config
+            .and_then(|config| config.env)
+            .unwrap_or_default();
+        let mut credential = None;
+        for (username_key, password_key) in key_pairs {
+            let username = optional_unique_environment_value(&environment, username_key).map_err(
+                |reason| DockerError::InvalidLegacyCredentialEnvironment {
+                    instance_id: instance_id.to_string(),
+                    protocol: protocol.as_str().to_string(),
+                    reason,
+                },
+            )?;
+            let password = optional_unique_environment_value(&environment, password_key).map_err(
+                |reason| DockerError::InvalidLegacyCredentialEnvironment {
+                    instance_id: instance_id.to_string(),
+                    protocol: protocol.as_str().to_string(),
+                    reason,
+                },
+            )?;
+            match (username, password) {
+                (None, None) => {}
+                (Some(username), Some(password))
+                    if !username.trim().is_empty() && !password.is_empty() =>
+                {
+                    if credential.is_some() {
+                        return Err(DockerError::InvalidLegacyCredentialEnvironment {
+                            instance_id: instance_id.to_string(),
+                            protocol: protocol.as_str().to_string(),
+                            reason: "multiple tenant credential pairs are present".to_string(),
+                        });
+                    }
+                    credential = Some((username, SecretString::from(password)));
+                }
+                _ => {
+                    return Err(DockerError::InvalidLegacyCredentialEnvironment {
+                        instance_id: instance_id.to_string(),
+                        protocol: protocol.as_str().to_string(),
+                        reason: format!(
+                            "{username_key} and {password_key} must both be present and non-empty"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(credential)
+    }
+
     pub async fn container_image(
         &self,
         protocol: Protocol,
@@ -549,6 +634,21 @@ fn environment_value(environment: &[String], key: &str) -> Option<String> {
         let (entry_key, value) = entry.split_once('=')?;
         (entry_key == key).then(|| value.to_string())
     })
+}
+
+fn optional_unique_environment_value(
+    environment: &[String],
+    key: &str,
+) -> Result<Option<String>, String> {
+    let prefix = format!("{key}=");
+    let mut values = environment
+        .iter()
+        .filter_map(|entry| entry.strip_prefix(&prefix));
+    let value = values.next().map(str::to_string);
+    if values.next().is_some() {
+        return Err(format!("duplicate {key} entries are present"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

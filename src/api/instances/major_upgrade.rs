@@ -1,5 +1,6 @@
 use super::*;
 use futures::FutureExt;
+use secrecy::SecretString;
 
 pub(super) async fn run_major_upgrade_supervisor(
     state: AppState,
@@ -1221,13 +1222,16 @@ pub(super) async fn validate_replacement_instance(
         &metadata.database.username,
         &metadata.database.name,
     )?;
-    let script = format!(
-        "set -eu\nexport DBE_UPGRADE_PASSWORD={}\n{command}",
-        crate::shared::shell::sh_quote(password)
-    );
+    let password = SecretString::from(password.to_string());
+    let script = format!("set -eu\n{command}");
     state
         .docker
-        .exec_shell(metadata.protocol, &metadata.instance_id, &script)
+        .exec_shell_with_secret_env(
+            metadata.protocol,
+            &metadata.instance_id,
+            &script,
+            &[("DBE_UPGRADE_PASSWORD", &password)],
+        )
         .await
         .map_err(|error| fail_image_update_runtime(state, &metadata.instance_id, error))?;
     Ok(())
@@ -1239,15 +1243,28 @@ pub(super) fn replacement_validation_command(
     database: &str,
 ) -> Result<String, ApiError> {
     let command = match protocol {
-        Protocol::Postgres => "PGPASSWORD=\"${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}\" psql -h /var/run/postgresql -U \"${DBE_POSTGRES_USER:-$POSTGRES_USER}\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null".to_string(),
+        Protocol::Postgres => format!(
+            "PGPASSWORD=\"$DBE_UPGRADE_PASSWORD\" psql -X -h /var/run/postgresql -U {} -d {} -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null",
+            crate::shared::shell::sh_quote(username),
+            crate::shared::shell::sh_quote(database),
+        ),
         Protocol::Mariadb => "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'select 1' >/dev/null".to_string(),
         Protocol::Mysql => format!(
             "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
             crate::shared::shell::sh_quote(username),
             crate::shared::shell::sh_quote(database),
         ),
-        Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
-        Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$CLICKHOUSE_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
+        Protocol::Mongodb => format!(
+            "mongosh --quiet --host 127.0.0.1 --username {} --password \"$DBE_UPGRADE_PASSWORD\" --authenticationDatabase {} {} --eval 'db.runCommand({{ ping: 1 }}).ok' >/dev/null",
+            crate::shared::shell::sh_quote(username),
+            crate::shared::shell::sh_quote(database),
+            crate::shared::shell::sh_quote(database),
+        ),
+        Protocol::Clickhouse => format!(
+            "clickhouse-client --host 127.0.0.1 --user {} --password \"$DBE_UPGRADE_PASSWORD\" --database {} --query 'SELECT 1' >/dev/null",
+            crate::shared::shell::sh_quote(username),
+            crate::shared::shell::sh_quote(database),
+        ),
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(
                 "{} major upgrade migration is not supported",

@@ -274,6 +274,76 @@ async fn verify_mysql_tenant_auth(
     Ok(())
 }
 
+async fn verify_mysql_tenant_auth_for_adoption(
+    state: &AppState,
+    instance_id: &str,
+    username: &str,
+    password: &SecretString,
+) -> Result<bool, ApiError> {
+    let username = SecretString::from(username.to_string());
+    let invalid_password =
+        SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()));
+    let command = "set -eu\nMYSQL_PWD=\"$DBE_MYSQL_TENANT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u\"$DBE_MYSQL_TENANT_USER\" \"$MYSQL_DATABASE\" -N -B -e 'SELECT 1' >/dev/null\n";
+    let environment = mysql_tenant_probe_environment(&username, password);
+    if state
+        .docker
+        .exec_readiness_probe_with_secret_env_timeout(
+            Protocol::Mysql,
+            instance_id,
+            command,
+            &environment,
+            MYSQL_AUTH_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let invalid_environment = mysql_tenant_probe_environment(&username, &invalid_password);
+    match state
+        .docker
+        .exec_readiness_probe_with_secret_env_timeout(
+            Protocol::Mysql,
+            instance_id,
+            command,
+            &invalid_environment,
+            MYSQL_AUTH_ATTEMPT_TIMEOUT,
+        )
+        .await
+    {
+        Err(error) if is_definite_mysql_auth_rejection(&error) => {}
+        Ok(_) => {
+            return Err(ApiError::Conflict(
+                "MySQL tenant authentication accepted a deliberately invalid password; refusing to adopt an unverifiable legacy credential"
+                    .to_string(),
+            ));
+        }
+        Err(error) => return Err(fail_runtime(state, instance_id, error)),
+    }
+    let environment = mysql_tenant_probe_environment(&username, password);
+    Ok(state
+        .docker
+        .exec_readiness_probe_with_secret_env_timeout(
+            Protocol::Mysql,
+            instance_id,
+            command,
+            &environment,
+            MYSQL_AUTH_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .is_ok())
+}
+
+fn mysql_tenant_probe_environment<'a>(
+    username: &'a SecretString,
+    password: &'a SecretString,
+) -> [(&'static str, &'a SecretString); 2] {
+    [
+        ("DBE_MYSQL_TENANT_USER", username),
+        ("DBE_MYSQL_TENANT_PASSWORD", password),
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MysqlAuthHardeningFailure {
     pub instance_id: String,
@@ -316,90 +386,163 @@ async fn harden_mysql_account_on_boot(
     }
     summary.checked = 1;
     let mut metadata = metadata;
-    let (root_password, migrate_root_password) = match metadata.mysql_root_password.as_deref() {
-        Some(password) => (SecretString::from(password.to_string()), false),
-        None => match state
-            .docker
-            .container_environment_value(
-                Protocol::Mysql,
-                &metadata.instance_id,
-                "MYSQL_ROOT_PASSWORD",
-            )
-            .await
+    let container_root_password = state
+        .docker
+        .container_environment_value(
+            Protocol::Mysql,
+            &metadata.instance_id,
+            "MYSQL_ROOT_PASSWORD",
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|password| !password.expose_secret().is_empty());
+    let persisted_root_password = metadata
+        .mysql_root_password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+        .map(|password| SecretString::from(password.to_string()));
+    let mut migrate_root_password = false;
+    let root_password = if let Some(persisted) = persisted_root_password {
+        if verify_mysql_root_auth_with_timeout(
+            state,
+            &metadata.instance_id,
+            &persisted,
+            MYSQL_AUTH_READINESS_TIMEOUT,
+        )
+        .await
+        .is_ok()
         {
-            Ok(Some(password)) if !password.expose_secret().is_empty() => (password, true),
-            Ok(_) => {
-                record_mysql_auth_failure(
+            persisted
+        } else if let Some(container) = container_root_password {
+            if container.expose_secret() != persisted.expose_secret()
+                && verify_mysql_root_auth_with_timeout(
                     state,
-                    &metadata,
-                    "the encrypted MySQL maintenance credential is missing and the managed container does not expose a recoverable root credential; reset or recreate this legacy instance".to_string(),
-                    &mut summary,
+                    &metadata.instance_id,
+                    &container,
+                    MYSQL_AUTH_READINESS_TIMEOUT,
                 )
-                .await;
-                return summary;
-            }
-            Err(_) => {
+                .await
+                .is_ok()
+            {
+                migrate_root_password = true;
+                container
+            } else {
                 record_mysql_auth_failure(
                     state,
                     &metadata,
-                    "the encrypted MySQL maintenance credential is missing and the managed container could not be inspected safely"
+                    "neither the encrypted nor legacy MySQL maintenance credential matches the live database"
                         .to_string(),
                     &mut summary,
                 )
                 .await;
                 return summary;
             }
-        },
-    };
-    if verify_mysql_root_auth_with_timeout(
-        state,
-        &metadata.instance_id,
-        &root_password,
-        MYSQL_AUTH_READINESS_TIMEOUT,
-    )
-    .await
-    .is_err()
-    {
-        record_mysql_auth_failure(
-            state,
-            &metadata,
-            "the MySQL maintenance credential could not be verified safely; reset or recreate this legacy instance"
-                .to_string(),
-            &mut summary,
-        )
-        .await;
-        return summary;
-    }
-    if migrate_root_password {
-        metadata.mysql_root_password = Some(root_password.expose_secret().to_string());
-        if let Err(error) = state.manager.upsert(metadata.clone()).await {
+        } else {
             record_mysql_auth_failure(
                 state,
                 &metadata,
-                format!(
-                    "the existing MySQL maintenance credential was verified, but its encrypted migration could not be persisted: {error}"
-                ),
+                "the encrypted MySQL maintenance credential was rejected and no legacy container credential is available"
+                    .to_string(),
                 &mut summary,
             )
             .await;
             return summary;
         }
-        summary.root_credentials_migrated = 1;
-        tracing::info!(
-            event = "audit mysql_root_credential_migrated",
-            instance_id = %metadata.instance_id,
-            "verified and encrypted the existing MySQL maintenance credential"
-        );
-    }
-    let Some(password) = metadata.tenant_password.clone() else {
+    } else if let Some(container) = container_root_password {
+        if verify_mysql_root_auth_with_timeout(
+            state,
+            &metadata.instance_id,
+            &container,
+            MYSQL_AUTH_READINESS_TIMEOUT,
+        )
+        .await
+        .is_ok()
+        {
+            migrate_root_password = true;
+            container
+        } else {
+            record_mysql_auth_failure(
+                state,
+                &metadata,
+                "the legacy MySQL maintenance credential could not be verified safely; reset or recreate this instance"
+                    .to_string(),
+                &mut summary,
+            )
+            .await;
+            return summary;
+        }
+    } else {
         record_mysql_auth_failure(
             state,
             &metadata,
-            "the encrypted MySQL tenant credential is missing; reset this legacy instance before opening its gateway".to_string(),
+            "the encrypted MySQL maintenance credential is missing and the managed container does not expose a recoverable root credential; reset or recreate this legacy instance"
+                .to_string(),
             &mut summary,
         )
         .await;
         return summary;
+    };
+    let mut migrate_tenant_password = false;
+    let password = match metadata.tenant_password.as_deref() {
+        Some(password) if !password.is_empty() => password.to_string(),
+        _ => {
+            let candidate = match state
+                .docker
+                .mysql_legacy_tenant_credentials(&metadata.instance_id)
+                .await
+            {
+                Ok(Some((username, password))) if username == metadata.database.username => {
+                    password
+                }
+                Ok(Some(_)) => {
+                    record_mysql_auth_failure(
+                        state,
+                        &metadata,
+                        "the legacy MySQL tenant username does not match protected instance metadata; refusing to adopt it"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+                Ok(None) | Err(_) => {
+                    record_mysql_auth_failure(
+                        state,
+                        &metadata,
+                        "the encrypted MySQL tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+            };
+            match verify_mysql_tenant_auth_for_adoption(
+                state,
+                &metadata.instance_id,
+                &metadata.database.username,
+                &candidate,
+            )
+            .await
+            {
+                Ok(true) => {
+                    migrate_tenant_password = true;
+                    candidate.expose_secret().to_string()
+                }
+                _ => {
+                    record_mysql_auth_failure(
+                        state,
+                        &metadata,
+                        "the legacy MySQL tenant credential could not be verified against the live database; reset this legacy instance before opening its gateway"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+            }
+        }
     };
     if apply_mysql_tenant_auth(
         state,
@@ -422,21 +565,44 @@ async fn harden_mysql_account_on_boot(
         return summary;
     }
     let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(&password);
-    if metadata.mysql_native_password_sha1_stage2.as_deref() != Some(verifier.as_str()) {
+    let verifier_changed =
+        metadata.mysql_native_password_sha1_stage2.as_deref() != Some(verifier.as_str());
+    if verifier_changed {
         metadata.mysql_native_password_sha1_stage2 = Some(verifier);
-        if let Err(error) = state.manager.upsert(metadata.clone()).await {
+    }
+    metadata.mysql_root_password = Some(root_password.expose_secret().to_string());
+    metadata.tenant_password = Some(password);
+    if migrate_root_password || migrate_tenant_password || verifier_changed {
+        let persistence = if migrate_root_password || migrate_tenant_password {
+            state
+                .manager
+                .upsert_recovered_protected_secrets(metadata.clone())
+                .await
+        } else {
+            state.manager.upsert(metadata.clone()).await
+        };
+        if let Err(error) = persistence {
             record_mysql_auth_failure(
                 state,
                 &metadata,
                 format!(
-                    "MySQL tenant authentication was verified, but its gateway verifier could not be persisted: {error}"
+                    "verified MySQL credentials or gateway verifier could not be encrypted and persisted: {error}"
                 ),
                 &mut summary,
             )
             .await;
             return summary;
         }
-        summary.verifiers_repaired = 1;
+        summary.root_credentials_migrated = usize::from(migrate_root_password);
+        summary.verifiers_repaired = usize::from(verifier_changed);
+        tracing::info!(
+            event = "audit mysql_credentials_migrated",
+            instance_id = %metadata.instance_id,
+            maintenance = migrate_root_password,
+            tenant = migrate_tenant_password,
+            verifier = verifier_changed,
+            "verified and encrypted current MySQL credentials"
+        );
     }
     summary
 }

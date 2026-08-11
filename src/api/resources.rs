@@ -948,6 +948,43 @@ impl ResourceCache {
         }
     }
 
+    /// Measure managed database bytes for a capacity-sensitive operation.
+    ///
+    /// Dashboard samples may be up to `DISK_REFRESH_INTERVAL` old, which is
+    /// desirable for polling but can substantially overstate a database that
+    /// was just truncated or restored. Export admission must not reserve from
+    /// that stale value, so this path always asks the active quota runtime or
+    /// performs a bounded fresh directory scan before returning.
+    pub(crate) async fn fresh_disk_usage(
+        &self,
+        config: &Config,
+        instance_id: &str,
+        path: PathBuf,
+    ) -> Result<CachedDiskUsage, String> {
+        let refresh_lock = {
+            let mut inner = self.inner.lock().await;
+            inner
+                .disk_refresh_locks
+                .entry(instance_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _refresh = refresh_lock.lock().await;
+        if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
+            return Ok(sample);
+        }
+        let used_bytes = self
+            .scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string())?;
+        let sample = CachedDiskUsage {
+            used_bytes,
+            sampled_at: Instant::now(),
+        };
+        self.store_disk_usage(instance_id.to_string(), sample).await;
+        Ok(sample)
+    }
+
     async fn quota_disk_usage(
         &self,
         config: &Config,

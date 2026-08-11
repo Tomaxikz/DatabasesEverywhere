@@ -160,6 +160,90 @@ pub(crate) async fn verify_internal_admin_password(
     Ok(())
 }
 
+async fn verify_tenant_password_against_scram(
+    docker: &DockerRuntime,
+    instance_id: &str,
+    tenant_username: &str,
+    tenant_password: &SecretString,
+    admin_password: &SecretString,
+) -> Result<bool, DockerError> {
+    let verifier_query = shell_quote(&super::provision::tenant_password_verifier_sql(
+        tenant_username,
+    ));
+    let output = docker
+        .exec_shell_with_secret_env_timeout(
+            Protocol::Postgres,
+            instance_id,
+            &format!(
+                "set -eu\nPGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc {verifier_query}\n"
+            ),
+            &[("DBE_POSTGRES_ADMIN_PASSWORD", admin_password)],
+            HARDENING_TIMEOUT,
+        )
+        .await?;
+    let verifier = output.stdout.trim().to_string();
+    let password = tenant_password.expose_secret().to_string();
+    tokio::task::spawn_blocking(move || verify_scram_sha256_password(&password, &verifier))
+        .await
+        .map_err(|error| DockerError::PostgresAuthHardeningFailed {
+            instance_id: instance_id.to_string(),
+            reason: format!("the PostgreSQL tenant SCRAM verification task failed: {error}"),
+        })
+}
+
+/// Rotate the DBEV-only administrator to a known protected candidate only when
+/// legacy local authentication demonstrably accepts a deliberately invalid
+/// password. This is a controlled migration out of `trust`; it never changes
+/// a tenant credential and cannot bypass an already enforced password policy.
+async fn repair_internal_admin_password_under_bypassed_auth(
+    docker: &DockerRuntime,
+    instance_id: &str,
+    replacement: &SecretString,
+) -> Result<bool, DockerError> {
+    let invalid_password =
+        SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()));
+    let reset = shell_quote(&super::provision::reset_tenant_password_sql(
+        super::docker::INTERNAL_ADMIN_USERNAME,
+    ));
+    let script = format!(
+        r#"set -eu
+test "$(cat /proc/1/comm)" = postgres
+if ! PGPASSWORD="$DBE_INVALID_PASSWORD" psql -X -h /var/run/postgresql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc 'SELECT 1' >/dev/null 2>&1; then
+  printf 'password_enforced\n'
+  exit 0
+fi
+{{ printf '%s\n' '\getenv tenant_password DBE_RECOVERY_ADMIN_PASSWORD'; printf '%s\n' {reset}; }} | \
+  PGPASSWORD="$DBE_INVALID_PASSWORD" psql -X -h /var/run/postgresql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 >/dev/null
+printf 'rotated\n'
+"#
+    );
+    let output = docker
+        .exec_shell_with_secret_env_timeout(
+            Protocol::Postgres,
+            instance_id,
+            &script,
+            &[
+                ("DBE_INVALID_PASSWORD", &invalid_password),
+                ("DBE_RECOVERY_ADMIN_PASSWORD", replacement),
+            ],
+            HARDENING_TIMEOUT,
+        )
+        .await?;
+    match output.stdout.lines().last() {
+        Some("rotated") => {
+            verify_internal_admin_password(docker, instance_id, replacement).await?;
+            Ok(true)
+        }
+        Some("password_enforced") => Ok(false),
+        _ => Err(DockerError::PostgresAuthHardeningFailed {
+            instance_id: instance_id.to_string(),
+            reason:
+                "the controlled administrator credential recovery returned an unexpected result"
+                    .to_string(),
+        }),
+    }
+}
+
 fn verify_scram_sha256_password(password: &str, verifier: &str) -> bool {
     const MAX_VERIFIER_BYTES: usize = 4_096;
     const MAX_ITERATIONS: u32 = 100_000;
@@ -299,46 +383,80 @@ async fn harden_postgres_instance_on_boot(
         record_running_auth_failure(manager, &metadata, error.to_string(), &mut summary).await;
         return summary;
     }
-    let (admin_password, migrate_admin_password) = match metadata.postgres_admin_password.as_deref()
-    {
-        Some(persisted) => {
-            if persisted != bootstrap_password.expose_secret() {
-                let error = DockerError::PostgresAuthHardeningFailed {
-                    instance_id: metadata.instance_id.clone(),
-                    reason: "the encrypted internal administrator credential does not match the managed container; refusing to guess or overwrite it".to_string(),
-                };
-                if metadata.status != InstanceStatus::Running {
-                    summary.deferred = 1;
-                    tracing::warn!(
-                        event = "audit postgres_admin_credential_mismatch_deferred",
-                        instance_id = %metadata.instance_id,
-                        %error,
-                        "non-running PostgreSQL instance has inconsistent administrator metadata and remains unavailable"
-                    );
-                    return summary;
-                }
-                record_running_auth_failure(manager, &metadata, error.to_string(), &mut summary)
-                    .await;
-                return summary;
-            }
-            (SecretString::from(persisted.to_string()), false)
-        }
-        None => {
-            if metadata.status != InstanceStatus::Running {
-                summary.deferred = 1;
-                tracing::warn!(
-                    event = "audit postgres_admin_credential_migration_deferred",
-                    instance_id = %metadata.instance_id,
-                    "the existing administrator credential was found but cannot be adopted until the running database verifies it"
-                );
-                return summary;
-            }
-            (bootstrap_password, true)
-        }
-    };
     if metadata.status != InstanceStatus::Running {
         return summary;
     }
+    let persisted_admin = metadata
+        .postgres_admin_password
+        .as_deref()
+        .map(|password| SecretString::from(password.to_string()));
+    let mut migrate_admin_password = false;
+    let admin_password = if let Some(persisted) = persisted_admin {
+        if verify_internal_admin_password(docker, &metadata.instance_id, &persisted)
+            .await
+            .is_ok()
+        {
+            persisted
+        } else if persisted.expose_secret() != bootstrap_password.expose_secret()
+            && verify_internal_admin_password(docker, &metadata.instance_id, &bootstrap_password)
+                .await
+                .is_ok()
+        {
+            migrate_admin_password = true;
+            bootstrap_password
+        } else {
+            match repair_internal_admin_password_under_bypassed_auth(
+                docker,
+                &metadata.instance_id,
+                &persisted,
+            )
+            .await
+            {
+                Ok(true) => persisted,
+                _ => {
+                    record_running_auth_failure(
+                        manager,
+                        &metadata,
+                        "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+            }
+        }
+    } else if verify_internal_admin_password(docker, &metadata.instance_id, &bootstrap_password)
+        .await
+        .is_ok()
+    {
+        migrate_admin_password = true;
+        bootstrap_password
+    } else {
+        match repair_internal_admin_password_under_bypassed_auth(
+            docker,
+            &metadata.instance_id,
+            &bootstrap_password,
+        )
+        .await
+        {
+            Ok(true) => {
+                migrate_admin_password = true;
+                bootstrap_password
+            }
+            _ => {
+                record_running_auth_failure(
+                    manager,
+                    &metadata,
+                    "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
+                        .to_string(),
+                    &mut summary,
+                )
+                .await;
+                return summary;
+            }
+        }
+    };
     if verify_internal_admin_password(docker, &metadata.instance_id, &admin_password)
         .await
         .is_err()
@@ -356,41 +474,74 @@ async fn harden_postgres_instance_on_boot(
     let mut metadata = metadata;
     if migrate_admin_password {
         metadata.postgres_admin_password = Some(admin_password.expose_secret().to_string());
-        if let Err(error) = manager.upsert(metadata.clone()).await {
-            record_running_auth_failure(
-                manager,
-                &metadata,
-                format!(
-                    "the existing administrator credential was verified, but its encrypted migration could not be persisted: {error}"
-                ),
-                &mut summary,
-            )
-            .await;
-            return summary;
-        }
-        summary.administrator_credentials_migrated = 1;
-        tracing::info!(
-            event = "audit postgres_admin_credential_migrated",
-            instance_id = %metadata.instance_id,
-            "verified and encrypted the existing PostgreSQL internal administrator credential"
-        );
     }
-    let Some(tenant_password) = metadata.tenant_password.as_deref() else {
-        record_running_auth_failure(
-            manager,
-            &metadata,
-            "the encrypted tenant credential is missing; reset this legacy instance before opening its gateway".to_string(),
-            &mut summary,
-        )
-        .await;
-        return summary;
+    let mut migrate_tenant_password = false;
+    let tenant_password = match metadata.tenant_password.as_deref() {
+        Some(password) if !password.is_empty() => SecretString::from(password.to_string()),
+        _ => {
+            let candidate = match docker
+                .postgres_legacy_tenant_credentials(&metadata.instance_id)
+                .await
+            {
+                Ok(Some((username, password))) if username == metadata.database.username => {
+                    password
+                }
+                Ok(Some(_)) => {
+                    record_running_auth_failure(
+                        manager,
+                        &metadata,
+                        "the legacy PostgreSQL tenant username does not match protected instance metadata; refusing to adopt it"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+                Ok(None) | Err(_) => {
+                    record_running_auth_failure(
+                        manager,
+                        &metadata,
+                        "the encrypted tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+            };
+            match verify_tenant_password_against_scram(
+                docker,
+                &metadata.instance_id,
+                &metadata.database.username,
+                &candidate,
+                &admin_password,
+            )
+            .await
+            {
+                Ok(true) => {
+                    migrate_tenant_password = true;
+                    candidate
+                }
+                _ => {
+                    record_running_auth_failure(
+                        manager,
+                        &metadata,
+                        "the legacy PostgreSQL tenant credential does not match the live database SCRAM verifier; reset this legacy instance before opening its gateway"
+                            .to_string(),
+                        &mut summary,
+                    )
+                    .await;
+                    return summary;
+                }
+            }
+        }
     };
     summary.checked = 1;
     let hardening = harden_instance_auth(
         docker,
         &metadata.instance_id,
         &metadata.database.username,
-        &SecretString::from(tenant_password.to_string()),
+        &tenant_password,
         &admin_password,
     )
     .await;
@@ -410,6 +561,35 @@ async fn harden_postgres_instance_on_boot(
     };
     if changed {
         summary.hardened = 1;
+    }
+    if migrate_admin_password || migrate_tenant_password {
+        metadata.postgres_admin_password = Some(admin_password.expose_secret().to_string());
+        metadata.tenant_password = Some(tenant_password.expose_secret().to_string());
+        if let Err(error) = manager
+            .upsert_recovered_protected_secrets(metadata.clone())
+            .await
+        {
+            record_running_auth_failure(
+                manager,
+                &metadata,
+                format!(
+                    "verified legacy PostgreSQL credentials could not be encrypted and persisted: {error}"
+                ),
+                &mut summary,
+            )
+            .await;
+            return summary;
+        }
+        if migrate_admin_password {
+            summary.administrator_credentials_migrated = 1;
+        }
+        tracing::info!(
+            event = "audit postgres_credentials_migrated",
+            instance_id = %metadata.instance_id,
+            administrator = migrate_admin_password,
+            tenant = migrate_tenant_password,
+            "verified and encrypted current PostgreSQL credentials"
+        );
     }
     summary
 }

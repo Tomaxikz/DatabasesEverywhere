@@ -22,11 +22,15 @@ use tokio::{
 };
 
 use super::{DockerError, DockerRuntime};
-use crate::shared::protocol::Protocol;
+use crate::shared::{
+    logs::summarize_failure_logs, protocol::Protocol, redaction::redact_connection_url,
+};
 
 const EXEC_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const EXEC_STREAM_DECODER_CAPACITY: usize = 64 * 1024;
 const EXEC_STREAM_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const EXEC_STREAM_STDERR_TAIL_BYTES: usize = 32 * 1024;
+const EXEC_STREAM_FAILURE_DIAGNOSTIC_CHARS: usize = 8 * 1024;
 const STREAM_OPERATION: &str = "streaming exec [command and environment redacted]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +183,13 @@ impl DockerRuntime {
             return Err(DockerError::InvalidExecTimeout);
         }
         validate_exec_command(&command)?;
+        let mut secret_values = environment
+            .iter()
+            .map(|(_, value)| value.expose_secret().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        secret_values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+        secret_values.dedup();
         let environment = encode_secret_environment(environment)?;
         let container = self
             .required_managed_container_id(protocol, instance_id)
@@ -195,6 +206,7 @@ impl DockerRuntime {
                     &container,
                     command,
                     environment,
+                    secret_values,
                     direction,
                     timeout,
                     cancel_receiver,
@@ -217,6 +229,7 @@ impl DockerRuntime {
         container: &str,
         command: Vec<String>,
         environment: Vec<String>,
+        secret_values: Vec<String>,
         direction: ExecStreamDirection,
         timeout: Duration,
         cancel_receiver: oneshot::Receiver<()>,
@@ -226,6 +239,7 @@ impl DockerRuntime {
             container,
             command,
             environment,
+            secret_values,
             direction,
             Arc::clone(&active),
         );
@@ -263,6 +277,7 @@ impl DockerRuntime {
         container: &str,
         command: Vec<String>,
         environment: Vec<String>,
+        secret_values: Vec<String>,
         direction: ExecStreamDirection,
         active: Arc<AtomicBool>,
     ) -> Result<ExecStreamResult, DockerError> {
@@ -307,14 +322,14 @@ impl DockerRuntime {
             });
         };
 
-        let transferred_bytes = match direction {
+        let (transferred_bytes, failure_output) = match direction {
             ExecStreamDirection::Input { path, max_bytes } => {
                 let (file, expected_bytes) = input_file
                     .take()
                     .expect("input direction always opens an input descriptor");
                 let transfer = pump_private_input(file, input, expected_bytes, max_bytes);
-                let drain = discard_exec_output(output);
-                let (transferred, ()) = tokio::try_join!(
+                let drain = drain_exec_stderr(output, &secret_values);
+                let (transferred, failure_output) = tokio::try_join!(
                     async {
                         transfer.await.map_err(|source| DockerError::ExecStreamIo {
                             direction: "input",
@@ -324,15 +339,17 @@ impl DockerRuntime {
                     },
                     async { drain.await.map_err(DockerError::from) }
                 )?;
-                transferred
+                (transferred, failure_output)
             }
             ExecStreamDirection::Output { path, max_bytes } => {
                 drop(input);
                 let output_file = output_file
                     .as_mut()
                     .expect("output direction always opens an output descriptor");
-                match drain_exec_output(output, output_file.file_mut(), max_bytes).await {
-                    Ok(bytes) => bytes,
+                match drain_exec_output(output, output_file.file_mut(), max_bytes, &secret_values)
+                    .await
+                {
+                    Ok(result) => (result.transferred_bytes, result.failure_output),
                     Err(OutputDrainError::Api(error)) => return Err(error.into()),
                     Err(OutputDrainError::Io(source)) => {
                         return Err(DockerError::ExecStreamIo {
@@ -356,6 +373,7 @@ impl DockerRuntime {
             return Err(DockerError::ExecStreamFailed {
                 container: container.to_string(),
                 exit_code,
+                failure_output,
             });
         }
         if let Some(output_file) = output_file {
@@ -471,14 +489,20 @@ where
     Ok(transferred)
 }
 
-async fn discard_exec_output<S>(mut output: S) -> Result<(), BollardError>
+async fn drain_exec_stderr<S>(
+    mut output: S,
+    secret_values: &[String],
+) -> Result<String, BollardError>
 where
     S: Stream<Item = Result<LogOutput, BollardError>> + Unpin,
 {
+    let mut stderr = StderrTail::default();
     while let Some(chunk) = output.next().await {
-        let _ = chunk?;
+        if let LogOutput::StdErr { message } = chunk? {
+            stderr.push(&message);
+        }
     }
-    Ok(())
+    Ok(stderr.finish(secret_values))
 }
 
 #[derive(Debug)]
@@ -488,21 +512,79 @@ enum OutputDrainError {
     Limit,
 }
 
+#[derive(Debug)]
+struct OutputDrainResult {
+    transferred_bytes: u64,
+    failure_output: String,
+}
+
+#[derive(Default)]
+struct StderrTail {
+    bytes: Vec<u8>,
+    truncated_prefix: bool,
+}
+
+impl StderrTail {
+    fn push(&mut self, message: &[u8]) {
+        if message.len() >= EXEC_STREAM_STDERR_TAIL_BYTES {
+            self.bytes.clear();
+            self.bytes.extend_from_slice(
+                &message[message.len().saturating_sub(EXEC_STREAM_STDERR_TAIL_BYTES)..],
+            );
+            self.truncated_prefix = true;
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(message.len())
+            .saturating_sub(EXEC_STREAM_STDERR_TAIL_BYTES);
+        if overflow > 0 {
+            self.bytes.drain(..overflow.min(self.bytes.len()));
+            self.truncated_prefix = true;
+        }
+        self.bytes.extend_from_slice(message);
+    }
+
+    fn finish(mut self, secret_values: &[String]) -> String {
+        if self.truncated_prefix {
+            if let Some(newline) = self.bytes.iter().position(|byte| *byte == b'\n') {
+                self.bytes.drain(..=newline);
+            } else {
+                self.bytes.clear();
+            }
+        }
+        let decoded = String::from_utf8_lossy(&self.bytes);
+        let mut redacted = decoded.into_owned();
+        for secret in secret_values {
+            redacted = redacted.replace(secret, "[redacted]");
+        }
+        let redacted = redact_connection_url(&redacted);
+        summarize_failure_logs(&redacted, EXEC_STREAM_FAILURE_DIAGNOSTIC_CHARS)
+    }
+}
+
 async fn drain_exec_output<S, W>(
     mut output: S,
     writer: &mut W,
     max_bytes: u64,
-) -> Result<u64, OutputDrainError>
+    secret_values: &[String],
+) -> Result<OutputDrainResult, OutputDrainError>
 where
     S: Stream<Item = Result<LogOutput, BollardError>> + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut transferred = 0_u64;
+    let mut stderr = StderrTail::default();
     while let Some(chunk) = output.next().await {
         let chunk = chunk.map_err(OutputDrainError::Api)?;
         let message = match chunk {
             LogOutput::StdOut { message } | LogOutput::Console { message } => message,
-            LogOutput::StdErr { .. } | LogOutput::StdIn { .. } => continue,
+            LogOutput::StdErr { message } => {
+                stderr.push(&message);
+                continue;
+            }
+            LogOutput::StdIn { .. } => continue,
         };
         transferred = transferred
             .checked_add(message.len() as u64)
@@ -516,7 +598,10 @@ where
             .map_err(OutputDrainError::Io)?;
     }
     writer.flush().await.map_err(OutputDrainError::Io)?;
-    Ok(transferred)
+    Ok(OutputDrainResult {
+        transferred_bytes: transferred,
+        failure_output: stderr.finish(secret_values),
+    })
 }
 
 #[cfg(unix)]
@@ -831,15 +916,44 @@ mod tests {
         ]);
         let (mut writer, mut reader) = tokio::io::duplex(64);
         let drain = tokio::spawn(async move {
-            let bytes = drain_exec_output(output, &mut writer, 9).await.unwrap();
+            let result = drain_exec_output(output, &mut writer, 9, &[])
+                .await
+                .unwrap();
             writer.shutdown().await.unwrap();
-            bytes
+            result
         });
         let mut contents = Vec::new();
         reader.read_to_end(&mut contents).await.unwrap();
 
-        assert_eq!(drain.await.unwrap(), 9);
+        let result = drain.await.unwrap();
+        assert_eq!(result.transferred_bytes, 9);
+        assert_eq!(result.failure_output, "not part of dump");
         assert_eq!(contents, b"dump-tail");
+    }
+
+    #[tokio::test]
+    async fn stderr_diagnostics_are_bounded_and_redacted() {
+        let secret = "PASSWORD=do-not-log postgres://user:secret@localhost/db\n";
+        let output = futures::stream::iter(vec![Ok(LogOutput::StdErr {
+            message: Bytes::from(secret.repeat(1_000)),
+        })]);
+
+        let diagnostic = drain_exec_stderr(output, &["raw-secret-value".to_string()])
+            .await
+            .unwrap();
+
+        assert!(diagnostic.len() <= EXEC_STREAM_FAILURE_DIAGNOSTIC_CHARS + 3);
+        assert!(diagnostic.contains("PASSWORD=[redacted]"));
+        assert!(!diagnostic.contains("do-not-log"));
+        assert!(!diagnostic.contains("user:secret"));
+
+        let output = futures::stream::iter(vec![Ok(LogOutput::StdErr {
+            message: Bytes::from_static(b"client echoed raw-secret-value"),
+        })]);
+        let diagnostic = drain_exec_stderr(output, &["raw-secret-value".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(diagnostic, "client echoed [redacted]");
     }
 
     #[tokio::test]
@@ -847,7 +961,7 @@ mod tests {
         let output = futures::stream::iter(vec![Ok(LogOutput::StdOut {
             message: Bytes::from_static(b"oversized"),
         })]);
-        let error = drain_exec_output(output, &mut tokio::io::sink(), 4)
+        let error = drain_exec_output(output, &mut tokio::io::sink(), 4, &[])
             .await
             .unwrap_err();
         assert!(matches!(error, OutputDrainError::Limit));
@@ -910,7 +1024,7 @@ mod tests {
         ]);
         let mut file = PrivateOutputFile::create(&output_path).unwrap();
 
-        let error = drain_exec_output(output, file.file_mut(), 4)
+        let error = drain_exec_output(output, file.file_mut(), 4, &[])
             .await
             .unwrap_err();
         assert!(matches!(error, OutputDrainError::Limit));

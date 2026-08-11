@@ -187,7 +187,7 @@ pub(crate) async fn queue_import_instance(
     .await?;
     let upload_staging = if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
         let prepared_bytes = upload_prepared_reservation_bytes(state, &options).await;
-        match upload_logical_staging_budget(state, &metadata, options.mode, prepared_bytes)? {
+        match upload_logical_staging_budget(state, &metadata, options.mode, prepared_bytes).await? {
             Some(budget) => Some(UploadStagingBudget::Logical {
                 budget,
                 target_created_at: metadata.created_at.clone(),
@@ -748,7 +748,7 @@ async fn acquire_upload_staging(
                     .unwrap_or(MAX_UNARCHIVED_BYTES)
             };
             let rollback = if options.mode == ImportMode::Wipe {
-                estimated_logical_rollback_bytes(&metadata)
+                measured_logical_export_capacity_bytes(state, &metadata).await?
             } else {
                 0
             };
@@ -1086,7 +1086,7 @@ pub(super) fn logical_export_needs_separate_staging_reservation(
     archive_format != ExportArchiveFormat::Plain || !roots_share_filesystem
 }
 
-async fn measured_logical_export_capacity_bytes(
+pub(super) async fn measured_logical_export_capacity_bytes(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<u64, ApiError> {
@@ -1094,7 +1094,7 @@ async fn measured_logical_export_capacity_bytes(
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let database_used_bytes = state
         .resource_cache
-        .disk_usage(&state.config, &metadata.instance_id, paths.data)
+        .fresh_disk_usage(&state.config, &metadata.instance_id, paths.data)
         .await
         .map_err(|error| {
             ApiError::ServiceUnavailable(format!(
@@ -1229,7 +1229,13 @@ pub(super) async fn export_artifact_path(
 }
 
 pub(crate) async fn public_job_response(job: ImportExportJob) -> ImportExportJobResponse {
-    let artifact_size_bytes = match job.artifact_path.as_deref() {
+    let exposes_export_artifact =
+        job.action == ImportExportAction::Export && job.status == ImportExportStatus::Succeeded;
+    let artifact_size_bytes = match job
+        .artifact_path
+        .as_deref()
+        .filter(|_| exposes_export_artifact)
+    {
         Some(path) => tokio::fs::metadata(path)
             .await
             .ok()
@@ -1239,6 +1245,7 @@ pub(crate) async fn public_job_response(job: ImportExportJob) -> ImportExportJob
     let artifact_id = job
         .artifact_path
         .as_deref()
+        .filter(|_| exposes_export_artifact)
         .and_then(|path| FsPath::new(path).file_name())
         .and_then(|name| name.to_str())
         .map(str::to_string);

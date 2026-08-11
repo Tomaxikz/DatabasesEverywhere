@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::BackupBrowsingConfig, instances::metadata::InstanceMetadata,
-    runtime::docker::DockerRuntime, shared::protocol::Protocol,
+    config::BackupBrowsingConfig, instances::credentials::logical_export_environment,
+    instances::metadata::InstanceMetadata, runtime::docker::DockerRuntime,
+    shared::protocol::Protocol,
 };
 
 pub const BACKUP_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -282,11 +283,14 @@ async fn execute(
     metadata: &InstanceMetadata,
     script: &str,
 ) -> Result<String, String> {
+    let credentials = logical_export_environment(metadata).map_err(|error| error.to_string())?;
+    let environment = credentials.references();
     docker
-        .exec_shell_with_timeout(
+        .exec_shell_with_secret_env_timeout(
             metadata.protocol,
             &metadata.instance_id,
             script,
+            &environment,
             CATALOG_QUERY_TIMEOUT,
         )
         .await
@@ -297,10 +301,10 @@ async fn execute(
 fn postgres_schema_script(max_objects: usize) -> String {
     format!(
         r#"set -eu
-PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
+PGPASSWORD="$DBE_POSTGRES_PASSWORD" psql \
   -X -qAt -F '|' -v ON_ERROR_STOP=1 \
   -h /var/run/postgresql \
-  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
+  -U "$DBE_POSTGRES_USER" \
   -d "$POSTGRES_DB" <<'DBEV_SQL'
 WITH objects AS (
   SELECT c.oid, n.nspname, c.relname, c.relkind,
@@ -334,7 +338,7 @@ fn mysql_schema_script(mysql: bool, max_objects: usize) -> String {
     let command = if mysql {
         "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root --database=\"$MYSQL_DATABASE\""
     } else {
-        "MYSQL_PWD=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" --database=\"$MARIADB_DATABASE\""
+        "MYSQL_PWD=\"$DBE_MARIADB_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" --database=\"$MARIADB_DATABASE\""
     };
     format!(
         r#"set -eu
@@ -404,7 +408,7 @@ fn preview_script(
                 "SELECT left(row_to_json(dbev_row)::text, {max_row_bytes}) FROM (SELECT * FROM {qualified} LIMIT {rows}) AS dbev_row"
             );
             Some(format!(
-                "set -eu\nPGPASSWORD=\"${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}\" psql -X -qAt -v ON_ERROR_STOP=1 -h /var/run/postgresql -U \"${{DBE_POSTGRES_USER:-$POSTGRES_USER}}\" -d \"$POSTGRES_DB\" -c {}\n",
+                "set -eu\nPGPASSWORD=\"$DBE_POSTGRES_PASSWORD\" psql -X -qAt -v ON_ERROR_STOP=1 -h /var/run/postgresql -U \"$DBE_POSTGRES_USER\" -d \"$POSTGRES_DB\" -c {}\n",
                 shell_quote(&query)
             ))
         }
@@ -425,7 +429,7 @@ fn preview_script(
             let command = if protocol == Protocol::Mysql {
                 "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root \"$MYSQL_DATABASE\""
             } else {
-                "MYSQL_PWD=\"${DBE_MARIADB_PASSWORD:-${MARIADB_PASSWORD:-}}\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\""
+                "MYSQL_PWD=\"$DBE_MARIADB_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\""
             };
             Some(format!(
                 "set -eu\n{command} --batch --raw --skip-column-names -e {}\n",

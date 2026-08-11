@@ -1,49 +1,7 @@
 //! Protocol-specific selection validation and native dump/restore scripts.
 
 use super::{files::*, *};
-use secrecy::SecretString;
-
-const MYSQL_IMPORT_USER_ENV: &str = "DBE_IMPORT_USER";
-const MYSQL_IMPORT_PASSWORD_ENV: &str = "DBE_IMPORT_PASSWORD";
-
-pub(super) struct MysqlTenantImportCredentials {
-    username: SecretString,
-    password: SecretString,
-}
-
-impl MysqlTenantImportCredentials {
-    pub(super) fn environment(&self) -> [(&'static str, &SecretString); 2] {
-        [
-            (MYSQL_IMPORT_USER_ENV, &self.username),
-            (MYSQL_IMPORT_PASSWORD_ENV, &self.password),
-        ]
-    }
-}
-
-pub(super) fn mysql_tenant_import_credentials(
-    metadata: &InstanceMetadata,
-    database_definition_in_dump: bool,
-) -> Result<Option<MysqlTenantImportCredentials>, ApiError> {
-    if metadata.protocol != Protocol::Mysql || database_definition_in_dump {
-        return Ok(None);
-    }
-    if metadata.database.username.is_empty() {
-        return Err(ApiError::BadRequest(
-            "mysql tenant username is missing; repair or recreate this instance before importing"
-                .to_string(),
-        ));
-    }
-    let password = metadata.tenant_password.as_deref().ok_or_else(|| {
-        ApiError::BadRequest(
-            "mysql tenant password is missing; reset the instance password before importing"
-                .to_string(),
-        )
-    })?;
-    Ok(Some(MysqlTenantImportCredentials {
-        username: SecretString::from(metadata.database.username.clone()),
-        password: SecretString::from(password.to_string()),
-    }))
-}
+use crate::instances::credentials::logical_import_environment;
 
 pub(super) async fn validate_import_source(
     _state: &AppState,
@@ -519,9 +477,9 @@ pub(super) fn export_script(
             let filters = postgres_dump_selection_args(selection)?;
             format!(
                 r#"set -eu
-PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" pg_dump \
+PGPASSWORD="$DBE_POSTGRES_PASSWORD" pg_dump \
   -h /var/run/postgresql \
-  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
+  -U "$DBE_POSTGRES_USER" \
   -d "$POSTGRES_DB" \
   --clean --if-exists --no-owner --no-privileges{filters} \
   > {output_path}
@@ -541,7 +499,7 @@ mariadb-dump \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u "$MARIADB_USER" \
-  -p"${{DBE_MARIADB_PASSWORD:-${{MARIADB_PASSWORD:-}}}}" \
+  -p"$DBE_MARIADB_PASSWORD" \
   --single-transaction --quick --routines --events --triggers \
   --hex-blob --add-drop-table{database_definition}{filters} \
   > {output_path}
@@ -657,9 +615,9 @@ pub(super) fn wipe_logical_script(
 ) -> Result<String, ApiError> {
     let script = match metadata.protocol {
         Protocol::Postgres => r#"set -eu
-PGPASSWORD="${DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}" psql \
+PGPASSWORD="$DBE_POSTGRES_PASSWORD" psql \
   -h /var/run/postgresql \
-  -U "${DBE_POSTGRES_USER:-$POSTGRES_USER}" \
+  -U "$DBE_POSTGRES_USER" \
   -d "$POSTGRES_DB" \
   -v ON_ERROR_STOP=1 <<'DBEV_SQL'
 DO $dbev$
@@ -681,13 +639,13 @@ DBEV_SQL
         .to_string(),
         Protocol::Mariadb if database_definition_in_dump => r#"set -eu
 mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
+  -u root -p"$DBE_MARIADB_ROOT_PASSWORD" \
   -e "DROP DATABASE IF EXISTS \`$MARIADB_DATABASE\`;"
 "#
         .to_string(),
         Protocol::Mariadb => r#"set -eu
 settings=$(mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
+  -u root -p"$DBE_MARIADB_ROOT_PASSWORD" \
   --batch --skip-column-names "$MARIADB_DATABASE" \
   -e 'SELECT @@character_set_database, @@collation_database')
 set -- $settings
@@ -704,7 +662,7 @@ case "$2" in ''|*[!A-Za-z0-9_]*)
   exit 43
 ;; esac
 mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
-  -u root -p"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}" \
+  -u root -p"$DBE_MARIADB_ROOT_PASSWORD" \
   -e "DROP DATABASE IF EXISTS \`$MARIADB_DATABASE\`; CREATE DATABASE \`$MARIADB_DATABASE\` CHARACTER SET $1 COLLATE $2;"
 "#
         .to_string(),
@@ -718,7 +676,8 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             .to_string()
         }
         Protocol::Mysql => {
-            mysql_tenant_import_credentials(metadata, false)?;
+            logical_import_environment(metadata, false)
+                .map_err(|error| ApiError::Conflict(error.to_string()))?;
             r#"set -eu
 settings=$(MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
   --protocol=socket --socket=/var/run/mysqld/mysqld.sock \
@@ -796,10 +755,11 @@ pub(super) async fn wipe_logical_target(
     database_definition_in_dump: bool,
 ) -> Result<(), ApiError> {
     let script = wipe_logical_script(metadata, database_definition_in_dump)?;
-    let credentials = mysql_tenant_import_credentials(metadata, database_definition_in_dump)?;
-    let result = match (exec_timeout, credentials.as_ref()) {
-        (Some(timeout), Some(credentials)) => {
-            let environment = credentials.environment();
+    let credentials = logical_import_environment(metadata, database_definition_in_dump)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let environment = credentials.references();
+    let result = match exec_timeout {
+        Some(timeout) => {
             state
                 .docker
                 .exec_shell_with_secret_env_timeout(
@@ -811,8 +771,7 @@ pub(super) async fn wipe_logical_target(
                 )
                 .await
         }
-        (None, Some(credentials)) => {
-            let environment = credentials.environment();
+        None => {
             state
                 .docker
                 .exec_shell_with_secret_env(
@@ -821,18 +780,6 @@ pub(super) async fn wipe_logical_target(
                     &script,
                     &environment,
                 )
-                .await
-        }
-        (Some(timeout), None) => {
-            state
-                .docker
-                .exec_shell_with_timeout(metadata.protocol, &metadata.instance_id, &script, timeout)
-                .await
-        }
-        (None, None) => {
-            state
-                .docker
-                .exec_shell(metadata.protocol, &metadata.instance_id, &script)
                 .await
         }
     };
@@ -926,6 +873,7 @@ pub(super) fn mongodb_restore_namespace_args(
     Ok(filters.join(" \\\n  "))
 }
 
+#[cfg(test)]
 pub(super) fn import_script(
     metadata: &InstanceMetadata,
     input_path: &str,
@@ -933,17 +881,50 @@ pub(super) fn import_script(
     selection: &ImportExportSelection,
     database_definition_in_dump: bool,
 ) -> Result<String, ApiError> {
+    import_script_with_postgres_wrapper(
+        metadata,
+        input_path,
+        source_database,
+        selection,
+        database_definition_in_dump,
+        None,
+    )
+}
+
+pub(super) fn import_script_with_postgres_wrapper(
+    metadata: &InstanceMetadata,
+    input_path: &str,
+    source_database: Option<&str>,
+    selection: &ImportExportSelection,
+    database_definition_in_dump: bool,
+    postgres_wrapper_lines: Option<(u64, u64)>,
+) -> Result<String, ApiError> {
     let protocol = metadata.protocol;
     let script = match protocol {
         Protocol::Postgres => {
             let restrict_key = format!("dbev{}", uuid::Uuid::new_v4().simple());
+            let input = match postgres_wrapper_lines {
+                Some((restrict_line, unrestrict_line))
+                    if restrict_line > 0 && unrestrict_line > restrict_line =>
+                {
+                    format!(
+                        "command -v sed >/dev/null\nsed -e '{restrict_line}d' -e '{unrestrict_line}d' {input_path}"
+                    )
+                }
+                Some(_) => {
+                    return Err(ApiError::Runtime(
+                        "PostgreSQL dump wrapper line numbers are invalid".to_string(),
+                    ));
+                }
+                None => format!("cat {input_path}"),
+            };
             format!(
                 r#"set -eu
-{{ printf '%s\n' '\restrict {restrict_key}'; cat {input_path}; }} | \
-PGPASSWORD="${{DBE_POSTGRES_PASSWORD:-$POSTGRES_PASSWORD}}" psql \
+{{ printf '%s\n' '\restrict {restrict_key}'; {input}; }} | \
+PGPASSWORD="$DBE_POSTGRES_PASSWORD" psql \
   --no-psqlrc \
   -h /var/run/postgresql \
-  -U "${{DBE_POSTGRES_USER:-$POSTGRES_USER}}" \
+  -U "$DBE_POSTGRES_USER" \
   -d "$POSTGRES_DB" \
   -v ON_ERROR_STOP=1 \
   -f -
@@ -957,7 +938,7 @@ mariadb \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u root \
-  -p"${{DBE_MARIADB_ROOT_PASSWORD:-${{MARIADB_ROOT_PASSWORD:-}}}}" \
+  -p"$DBE_MARIADB_ROOT_PASSWORD" \
   < {input_path}
 "#
         ),
@@ -968,7 +949,7 @@ mariadb \
   --protocol=socket \
   --socket=/run/mysqld/mysqld.sock \
   -u "$MARIADB_USER" \
-  -p"${{DBE_MARIADB_PASSWORD:-${{MARIADB_PASSWORD:-}}}}" \
+  -p"$DBE_MARIADB_PASSWORD" \
   "$MARIADB_DATABASE" \
   < {input_path}
 "#
@@ -987,7 +968,8 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             )
         }
         Protocol::Mysql => {
-            mysql_tenant_import_credentials(metadata, false)?;
+            logical_import_environment(metadata, false)
+                .map_err(|error| ApiError::Conflict(error.to_string()))?;
             format!(
                 r#"set -eu
 MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \

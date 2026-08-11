@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.3 # replace with the reviewed release
+DBEV_VERSION=v0.5.5 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -172,7 +172,13 @@ and never return tenant passwords through metadata or API responses. Runtime
 secrets required by an image remain confined to its isolated container
 configuration; DBE encrypts tenant and maintenance credentials plus routing
 verifiers in the private metadata store and never serializes them in API
-responses. Enable the database gateway's native TLS whenever the
+responses. Those protected metadata values are the authority after a password
+rotation: DBE injects the current decrypted credential into each short-lived
+managed client instead of trusting immutable container environment variables.
+During an upgrade, DBE adopts an old container credential only when its field
+pair is unambiguous and the live database cryptographically or actively proves
+that it is correct; a missing plaintext that cannot be proved still requires one
+explicit password reset. Enable the database gateway's native TLS whenever the
 listener crosses an untrusted network.
 
 Keep CPU, memory, and disk reservations inside the node's safe capacity:
@@ -322,7 +328,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.3@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.5@sha256:REPLACE_ME'
 docker compose up -d
 ```
 

@@ -59,6 +59,26 @@ async fn public_job_response_redacts_legacy_internal_failure_text() {
     assert!(!response.contains("/var/lib/private"));
 }
 
+#[tokio::test]
+async fn failed_export_does_not_advertise_a_nonexistent_artifact() {
+    let job = ImportExportJob {
+        job_id: "job-failed-export".to_string(),
+        instance_id: "instance-1".to_string(),
+        action: ImportExportAction::Export,
+        status: ImportExportStatus::Failed,
+        artifact_path: Some("/private/pending.postgres.sql".to_string()),
+        replay_options: None,
+        error: Some("streaming exec failed".to_string()),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+
+    let response = public_job_response(job).await;
+
+    assert!(response.artifact_id.is_none());
+    assert!(response.artifact_size_bytes.is_none());
+}
+
 #[test]
 fn archive_copy_stops_at_expired_deadline() {
     let mut input = Cursor::new(b"contents".as_slice());
@@ -108,6 +128,10 @@ fn logical_export_capacity_tracks_managed_database_usage() {
     assert_eq!(
         jobs::estimated_logical_export_capacity_bytes(Protocol::Postgres, 10 * MIB),
         104 * MIB
+    );
+    assert_eq!(
+        jobs::estimated_logical_export_capacity_bytes(Protocol::Postgres, 7 * MIB),
+        92 * MIB
     );
     assert_eq!(
         jobs::estimated_logical_export_capacity_bytes(Protocol::Mysql, 3 * 1024 * MIB),
@@ -568,17 +592,6 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(!export.contains("internal-root-password"));
     assert!(!import.contains("internal-root-password"));
     assert!(!import.contains("internal-tenant-password"));
-    assert!(
-        mysql_tenant_import_credentials(&metadata, false)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        mysql_tenant_import_credentials(&metadata, true)
-            .unwrap()
-            .is_none()
-    );
-
     let mut postgres = metadata.clone();
     postgres.protocol = Protocol::Postgres;
     let postgres_export = export_script(
@@ -599,6 +612,9 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     let postgres_wipe = wipe_logical_script(&postgres, false).unwrap();
     for script in [&postgres_export, &postgres_import, &postgres_wipe] {
         assert!(script.contains("-h /var/run/postgresql"));
+        assert!(script.contains("DBE_POSTGRES_PASSWORD"));
+        assert!(script.contains("DBE_POSTGRES_USER"));
+        assert!(!script.contains("$POSTGRES_PASSWORD"));
         assert!(!script.contains("-h 127.0.0.1"));
     }
     assert!(postgres_import.contains("\\restrict dbev"));
@@ -618,6 +634,18 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
     );
+    let wrapped_postgres_import = import_script_with_postgres_wrapper(
+        &postgres,
+        "/dev/stdin",
+        None,
+        &selection,
+        false,
+        Some((5, 900)),
+    )
+    .unwrap();
+    assert!(wrapped_postgres_import.contains("sed -e '5d' -e '900d' /dev/stdin"));
+    assert!(wrapped_postgres_import.contains("\\restrict dbev"));
+    assert!(!wrapped_postgres_import.contains("\\unrestrict"));
 
     let mut mariadb = metadata.clone();
     mariadb.protocol = Protocol::Mariadb;

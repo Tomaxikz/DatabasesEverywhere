@@ -1,3 +1,4 @@
+pub(crate) mod credentials;
 pub mod locks;
 pub mod manager;
 pub mod metadata;

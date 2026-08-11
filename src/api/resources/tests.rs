@@ -109,6 +109,37 @@ async fn host_disk_sample_uses_the_target_filesystem() {
     assert!(sample.available_bytes <= sample.total_bytes);
 }
 
+#[tokio::test]
+async fn capacity_measurement_ignores_a_stale_dashboard_disk_sample() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data.bin");
+    tokio::fs::write(&data, vec![0_u8; 7 * 1024 * 1024])
+        .await
+        .unwrap();
+    let cache = ResourceCache::default();
+    cache
+        .store_disk_usage(
+            "inst_fresh_capacity".to_string(),
+            CachedDiskUsage {
+                used_bytes: 8 * 1024 * 1024 * 1024,
+                sampled_at: Instant::now(),
+            },
+        )
+        .await;
+
+    let measured = cache
+        .fresh_disk_usage(
+            &Config::default(),
+            "inst_fresh_capacity",
+            directory.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+    assert!(measured.used_bytes >= 7 * 1024 * 1024);
+    assert!(measured.used_bytes < 8 * 1024 * 1024);
+}
+
 #[test]
 fn allocations_include_running_and_stopped_instances() {
     let running = metadata_with_limits(

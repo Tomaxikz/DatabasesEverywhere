@@ -1096,6 +1096,14 @@ pub enum DockerError {
         protocol: String,
     },
     #[error(
+        "managed {protocol} container for instance {instance_id} has an invalid legacy credential environment: {reason}"
+    )]
+    InvalidLegacyCredentialEnvironment {
+        instance_id: String,
+        protocol: String,
+        reason: String,
+    },
+    #[error(
         "managed container {instance_id} data bind mismatch at {destination}: expected {expected_source}, actual {actual_source}; recreate or migrate the container before using the selected disk-limit mode"
     )]
     DiskBindSourceMismatch {
@@ -1221,8 +1229,14 @@ pub enum DockerError {
     },
     #[error("streaming exec output {path} exceeded the {max_bytes}-byte limit")]
     ExecStreamOutputTooLarge { path: String, max_bytes: u64 },
-    #[error("streaming exec failed in {container} with exit code {exit_code}")]
-    ExecStreamFailed { container: String, exit_code: i64 },
+    #[error(
+        "streaming exec failed in {container} with exit code {exit_code}; stderr: {failure_output}"
+    )]
+    ExecStreamFailed {
+        container: String,
+        exit_code: i64,
+        failure_output: String,
+    },
     #[error("streaming exec unexpectedly started detached in {container}")]
     ExecStreamDetached { container: String },
     #[error("streaming exec ended without an exit status")]
