@@ -53,6 +53,19 @@ impl InstanceManager {
         Ok(())
     }
 
+    /// Commits live-verified replacement credentials and clears any protected
+    /// secret recovery marker in the same durable transaction.
+    pub(crate) async fn upsert_recovered_protected_secrets(
+        &self,
+        metadata: InstanceMetadata,
+    ) -> Result<(), RepositoryError> {
+        self.repository
+            .upsert_recovered_protected_secrets(&metadata)
+            .await?;
+        self.store.upsert(metadata).await;
+        Ok(())
+    }
+
     /// Read the durable metadata directly instead of consulting the in-memory
     /// route store. Mutation recovery uses this after an SQLite commit returns
     /// an error: the transaction may have committed even though its

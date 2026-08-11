@@ -1,5 +1,6 @@
 pub const AUTHORIZATION_HEADER: &str = "authorization";
 pub const RUST_LOG_ENV: &str = "RUST_LOG";
+pub(crate) const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
 
 pub mod defaults {
     pub const CONFIG_PATH: &str = "/etc/databases-everywhere/config.yml";

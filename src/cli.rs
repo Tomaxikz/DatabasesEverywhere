@@ -39,8 +39,11 @@ use crate::{
         routes::{AppState, AppStateData, build_router},
     },
     auth::api_token::ApiToken,
-    config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
-    constants::{self, defaults},
+    config::{
+        Config, DaemonEngine, DiskLimitMode,
+        load::{load_config, load_config_with_report},
+    },
+    constants::{self, MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
     disk::DiskLimiter,
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
@@ -99,7 +102,6 @@ const API_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const API_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_API_CONNECTIONS: usize = 2_048;
 const MAX_ACTIVE_API_CONNECTIONS_PER_PEER: usize = 256;
-const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
 const CONTAINER_EVENT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const CONTAINER_EVENT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 

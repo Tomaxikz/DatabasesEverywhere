@@ -393,6 +393,13 @@ headroom is rejected if it still cannot fit after
 `starvation_timeout_seconds`. The same timeout and `max_bypass` bound how long smaller fitting jobs
 may pass an older job that can otherwise run.
 
+Upgrades from a config written before the scheduler was introduced remain
+backward compatible: a missing scheduler block, or missing fields inside it,
+uses the documented defaults in memory. DBEV reports those defaulted field
+names at startup but does not rewrite the YAML, node identity, panel tokens,
+remote URL, or TLS paths. Copy the block above into the managed configuration
+when you want the defaults to be explicit.
+
 To use a fixed active-job ceiling instead, set
 `dynamic_limiter_enabled: false` and configure `manual_max_active_jobs`.
 Manual mode still retains per-instance serialization, queue bounds, upload
@@ -697,6 +704,14 @@ immutable bootstrap superuser. DBE refuses to open gateways when it detects that
 legacy layout because PostgreSQL cannot safely demote that role. Export the data
 through the management API, recreate the instance with explicit stale-resource
 purging, and import the dump to migrate it to the restricted tenant layout.
+
+For recoverable legacy instances that have the restricted internal administrator
+but still use `trust` or `peer` for local socket access, password reset verifies
+the protected administrator password directly against PostgreSQL's SCRAM verifier.
+It then rotates the tenant password, replaces the legacy local rules with
+`scram-sha-256`, and confirms that an incorrect password is rejected before the
+gateway route is restored. A password-bypassing socket connection is never treated
+as proof that a maintenance credential is valid.
 
 ### Updating limits
 

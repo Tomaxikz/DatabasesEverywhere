@@ -23,8 +23,12 @@ use resources::{
     cgroup_v2_cpu_sample_complete, control_value_unchanged, minimum_present,
     parse_cgroup_memory_available_mib, parse_cgroup_v1_cpu_units, parse_cgroup_v2_cpu_units,
     parse_host_available_memory_mib, read_cgroup_memory, read_cgroup_v2_cpu_units,
-    safe_cgroup_relative_path,
+    safe_cgroup_relative_path, test_resource_sample_from_cgroups,
 };
+
+#[cfg(test)]
+#[path = "scheduler/resource_tests.rs"]
+mod resource_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1293,6 +1297,7 @@ mod tests {
         let parent = root.join("pod");
         let leaf = parent.join("service");
         std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
         std::fs::write(root.join("memory.max"), "max\n").unwrap();
         std::fs::write(root.join("cpu.max"), "max 100000\n").unwrap();
         std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
@@ -1336,6 +1341,100 @@ mod tests {
             "memory.max",
             "memory.current",
             false,
+        ));
+    }
+
+    #[test]
+    fn unlimited_systemd_cgroup_uses_host_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let slice = root.join("system.slice");
+        let service = slice.join("databases-everywhere.service");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
+
+        for base in [root, slice.as_path(), service.as_path()] {
+            std::fs::write(base.join("memory.max"), "max\n").unwrap();
+            std::fs::write(base.join("cpu.max"), "max 100000\n").unwrap();
+        }
+        std::fs::write(service.join("memory.current"), (937 * MIB).to_string()).unwrap();
+
+        assert!(cgroup_memory_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
+            "memory.max",
+            "memory.current",
+            false,
+        ));
+        assert_eq!(
+            read_cgroup_memory(
+                &[root],
+                Some("/system.slice/databases-everywhere.service"),
+                "memory.max",
+                "memory.current",
+                false,
+            ),
+            None
+        );
+        assert!(cgroup_v2_cpu_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
+        ));
+        assert_eq!(
+            read_cgroup_v2_cpu_units(&[root], Some("/system.slice/databases-everywhere.service"),),
+            None
+        );
+        assert_eq!(minimum_present(Some(11_451), None), Some(11_451));
+
+        let provider = MutableResourceProvider {
+            memory_mib: std::sync::atomic::AtomicU64::new(11_451),
+            cpu_units: std::sync::atomic::AtomicUsize::new(8),
+            valid: std::sync::atomic::AtomicBool::new(true),
+        };
+        let capacity = SchedulerCapacity::detect_with_provider(
+            &ImportExportSchedulerConfig::default(),
+            8 * 1024 * MIB,
+            32 * 1024 * MIB,
+            &provider,
+        );
+        assert_eq!(capacity.memory_budget_mib, 6_870);
+        assert_eq!(capacity.cpu_units, 8);
+    }
+
+    #[test]
+    fn verified_unavailable_v2_controller_is_unlimited_but_malformed_limits_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let service = root.join("system.slice/databases-everywhere.service");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "io\n").unwrap();
+
+        assert!(cgroup_memory_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
+            "memory.max",
+            "memory.current",
+            false,
+        ));
+        assert!(cgroup_v2_cpu_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
+        ));
+
+        std::fs::write(service.join("memory.max"), "not-a-limit\n").unwrap();
+        std::fs::write(service.join("memory.current"), "0\n").unwrap();
+        std::fs::write(service.join("cpu.max"), "max not-a-period\n").unwrap();
+
+        assert!(!cgroup_memory_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
+            "memory.max",
+            "memory.current",
+            false,
+        ));
+        assert!(!cgroup_v2_cpu_sample_complete(
+            &[root],
+            Some("/system.slice/databases-everywhere.service"),
         ));
     }
 }

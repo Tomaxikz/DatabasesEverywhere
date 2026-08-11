@@ -10,7 +10,7 @@ use axum::extract::State;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 use super::{docker_error, instance_image_update_spec};
 use crate::{
@@ -41,6 +41,11 @@ const MAX_ACL_FILE_BYTES: u64 = 64 * 1024;
 const ROTATION_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const PASSWORD_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
+mod legacy;
+mod supervision;
+use legacy::*;
+use supervision::*;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResetInstancePasswordRequest {
@@ -56,7 +61,11 @@ pub struct ResetInstancePasswordResponse {
 #[derive(Default)]
 struct PreviousCredential {
     environment: Option<SecretString>,
+    maintenance: Option<SecretString>,
+    maintenance_username: Option<String>,
     native_password_verifier: Option<String>,
+    mysql_auth_plugin: Option<String>,
+    mysql_auth_string_b64: Option<SecretString>,
     acl: Option<Vec<u8>>,
 }
 
@@ -123,28 +132,30 @@ pub async fn reset_instance_password(
     let worker_instance_id = instance_id.clone();
     tokio::spawn(async move {
         let recovery_state = state.clone();
-        let result = match tokio::spawn(reset_instance_password_inner(state, instance_id, request))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let mut quarantine_summary =
-                    "the instance metadata was unavailable for quarantine".to_string();
-                if let Some(metadata) = recovery_state.instances.get(&worker_instance_id).await {
-                    let quarantine = quarantine_instance(&recovery_state, &metadata).await;
-                    quarantine_summary = password_quarantine_summary(&quarantine);
-                }
+        let worker_state = state.clone();
+        let recovery_instance_id = worker_instance_id.clone();
+        let result = run_password_worker_with_panic_recovery(
+            &state.instance_locks,
+            &worker_instance_id,
+            reset_instance_password_inner(worker_state, instance_id, request),
+            move |error| async move {
+                let quarantine_summary = recover_password_worker_panic(
+                    &recovery_state,
+                    &recovery_instance_id,
+                )
+                .await;
                 tracing::error!(
                     event = "audit instance_password_reset_worker_failed",
-                    instance_id = %worker_instance_id,
+                    instance_id = %recovery_instance_id,
                     %error,
                     "password reset worker failed unexpectedly"
                 );
                 Err(ApiError::Runtime(format!(
                     "password reset worker failed unexpectedly; {quarantine_summary}; repair or recover it before retrying"
                 )))
-            }
-        };
+            },
+        )
+        .await;
         drop(permit);
         let _ = result_sender.send(result);
     });
@@ -159,7 +170,6 @@ async fn reset_instance_password_inner(
     request: ResetInstancePasswordRequest,
 ) -> ApiResult<ResetInstancePasswordResponse> {
     let new_password = SecretString::from(request.password);
-    let _operation = state.instance_locks.lock(&instance_id).await;
     let mut metadata = state
         .instances
         .get(&instance_id)
@@ -305,10 +315,14 @@ async fn reset_instance_password_inner(
         .await;
     }
 
-    apply_new_route_auth(&mut metadata, &new_password);
+    apply_new_route_auth(&mut metadata, &new_password, &previous);
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
-    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+    if let Err(error) = state
+        .manager
+        .upsert_recovered_protected_secrets(metadata.clone())
+        .await
+    {
         let commit_error = error.to_string();
         match resolve_password_metadata_commit(&state, &previous_metadata, &metadata).await {
             PasswordMetadataCommitResolution::Committed => {
@@ -482,10 +496,14 @@ async fn reset_password_in_place(
         }
     }
 
-    apply_new_route_auth(&mut metadata, new_password);
+    apply_new_route_auth(&mut metadata, new_password, previous);
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
-    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+    if let Err(error) = state
+        .manager
+        .upsert_recovered_protected_secrets(metadata.clone())
+        .await
+    {
         let commit_error = error.to_string();
         match resolve_password_metadata_commit(state, &previous_metadata, &metadata).await {
             PasswordMetadataCommitResolution::Committed => {
@@ -556,9 +574,11 @@ async fn require_resettable_instance(
             "password reset requires the instance desired state to be running".to_string(),
         ));
     }
-    if metadata.status != InstanceStatus::Running {
+    let recoverable_failed_instance = metadata.status == InstanceStatus::Failed
+        && metadata.desired_state == crate::instances::metadata::DesiredInstanceState::Running;
+    if metadata.status != InstanceStatus::Running && !recoverable_failed_instance {
         return Err(ApiError::Conflict(format!(
-            "password reset requires a running instance; current status is {}",
+            "password reset requires a running instance or a failed running instance awaiting credential recovery; current status is {}",
             metadata.status.as_str()
         )));
     }
@@ -573,19 +593,21 @@ async fn require_resettable_instance(
                 .to_string(),
         ));
     }
-    state
-        .docker
-        .wait_until_ready(
-            metadata.protocol,
-            &metadata.instance_id,
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|error| {
-            ApiError::Conflict(format!(
-                "the current database credential is not ready for rotation: {error}"
-            ))
-        })?;
+    if !recoverable_failed_instance {
+        state
+            .docker
+            .wait_until_ready(
+                metadata.protocol,
+                &metadata.instance_id,
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|error| {
+                ApiError::Conflict(format!(
+                    "the current database credential is not ready for rotation: {error}"
+                ))
+            })?;
+    }
     Ok(())
 }
 
@@ -621,6 +643,7 @@ async fn capture_previous_credential(
             .map(|password| SecretString::from(password.clone())),
         ..PreviousCredential::default()
     };
+    capture_maintenance_credential(state, metadata, &mut previous).await?;
     let environment_keys = credential_environment_keys(metadata.protocol);
     if previous.environment.is_none() && !environment_keys.is_empty() {
         for key in environment_keys {
@@ -635,7 +658,7 @@ async fn capture_previous_credential(
                 break;
             }
         }
-        if previous.environment.is_none() {
+        if previous.environment.is_none() && metadata.protocol != Protocol::Postgres {
             return Err(ApiError::Conflict(format!(
                 "the current {} credential is unavailable from the managed container; the instance cannot be safely rolled back",
                 metadata.protocol
@@ -643,17 +666,24 @@ async fn capture_previous_credential(
         }
     }
     previous.native_password_verifier = match metadata.protocol {
+        Protocol::Postgres => {
+            Some(capture_postgres_password_verifier(state, metadata, &previous).await?)
+        }
         Protocol::Mariadb => metadata.mariadb_native_password_sha1_stage2.clone(),
         Protocol::Mysql => metadata.mysql_native_password_sha1_stage2.clone(),
         _ => None,
     };
-    if matches!(metadata.protocol, Protocol::Mariadb | Protocol::Mysql)
-        && previous.native_password_verifier.is_none()
-    {
+    if metadata.protocol == Protocol::Mariadb && previous.native_password_verifier.is_none() {
         return Err(ApiError::Conflict(format!(
             "the stored {} password verifier is missing; the instance cannot be safely rolled back",
             metadata.protocol
         )));
+    }
+    if metadata.protocol == Protocol::Mysql {
+        let (plugin, authentication_string_b64) =
+            capture_mysql_tenant_auth(state, metadata, &previous).await?;
+        previous.mysql_auth_plugin = Some(plugin);
+        previous.mysql_auth_string_b64 = Some(authentication_string_b64);
     }
     if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
         let path = credential_data_path.join("users.acl");
@@ -749,11 +779,12 @@ async fn perform_in_place_password_reset(
         rotate_database_password_to_container_environment(
             context.state,
             context.metadata,
-            new_verifier,
+            context.previous,
             Some(context.new_password),
+            new_verifier,
+            Some(credential_changed.as_ref()),
         )
         .await?;
-        credential_changed.store(true, Ordering::Release);
     }
     validate_rotated_credential(context.state, context.metadata, context.new_password).await
 }
@@ -839,13 +870,30 @@ async fn rollback_in_place_password_reset(
         return Ok(());
     }
 
+    // The mutation flag is set immediately before a live database command is
+    // dispatched. If it is still clear, preparation or administrator
+    // verification failed and the tenant credential was never touched.
+    if !credential_changed {
+        return Ok(());
+    }
+
+    // PostgreSQL and MySQL can restore the exact captured verifier rather than
+    // deriving a new salted verifier from plaintext. This also handles legacy
+    // instances whose tenant plaintext was never persisted.
+    let rollback_password = match context.metadata.protocol {
+        Protocol::Postgres | Protocol::Mysql => None,
+        _ => context.previous.environment.as_ref(),
+    };
     rotate_database_password_to_container_environment(
         context.state,
         context.metadata,
+        context.previous,
+        rollback_password,
         context.previous.native_password_verifier.as_deref(),
-        context.previous.environment.as_ref(),
+        None,
     )
-    .await
+    .await?;
+    verify_rolled_back_credential(context).await
 }
 
 async fn activate_resp_acl(
@@ -929,12 +977,17 @@ async fn perform_password_reset(
 async fn rotate_database_password_to_container_environment(
     state: &AppState,
     metadata: &InstanceMetadata,
-    native_password_verifier: Option<&str>,
+    previous: &PreviousCredential,
     target_password: Option<&SecretString>,
+    native_password_verifier: Option<&str>,
+    credential_change_possible: Option<&AtomicBool>,
 ) -> Result<(), ApiError> {
-    wait_for_rotation_admin(state, metadata).await?;
+    wait_for_rotation_admin(state, metadata, previous).await?;
     let script = match metadata.protocol {
-        Protocol::Postgres => postgres_rotation_script(&metadata.database.username),
+        Protocol::Postgres if target_password.is_some() => {
+            postgres_rotation_script(&metadata.database.username, &metadata.database.name)
+        }
+        Protocol::Postgres => postgres_verifier_restore_script(metadata),
         Protocol::Mariadb => mysql_family_rotation_script(
             metadata.protocol,
             &metadata.database.name,
@@ -943,8 +996,26 @@ async fn rotate_database_password_to_container_environment(
                 ApiError::Runtime("mariadb replacement verifier is missing".to_string())
             })?,
         )?,
-        Protocol::Mysql => mysql_rotation_script(&metadata.database.username)?,
-        Protocol::Mongodb => mongodb_rotation_script(metadata)?,
+        Protocol::Mysql if target_password.is_some() => {
+            mysql_rotation_script(&metadata.database.username)?
+        }
+        Protocol::Mysql => mysql_auth_restore_script(
+            &metadata.database.username,
+            previous.mysql_auth_plugin.as_deref().ok_or_else(|| {
+                ApiError::Runtime(
+                    "the previous MySQL authentication plugin was not captured".to_string(),
+                )
+            })?,
+        )?,
+        Protocol::Mongodb => {
+            if target_password.is_none() {
+                return Err(ApiError::Runtime(
+                    "the previous MongoDB tenant credential is unavailable for rollback"
+                        .to_string(),
+                ));
+            }
+            mongodb_rotation_script(metadata)?
+        }
         Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
             return Err(ApiError::Runtime(format!(
                 "{} credentials are managed through recreated startup configuration, not live SQL",
@@ -963,26 +1034,37 @@ async fn rotate_database_password_to_container_environment(
         None
     };
     let postgres_admin_password = if metadata.protocol == Protocol::Postgres {
-        Some(SecretString::from(
-            metadata.postgres_admin_password.clone().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before rotating its password"
-                        .to_string(),
-                )
-            })?,
-        ))
+        previous.maintenance.as_ref()
     } else {
         None
     };
-    let mut environment = Vec::with_capacity(3);
+    let maintenance_password = previous.maintenance.as_ref();
+    let mut environment = Vec::with_capacity(5);
     if let Some(password) = target_password {
         environment.push(("DBE_ROTATED_PASSWORD", password));
     }
     if let Some(password_b64) = mysql_password_b64.as_ref() {
         environment.push(("DBE_ROTATED_PASSWORD_B64", password_b64));
     }
-    if let Some(admin_password) = postgres_admin_password.as_ref() {
+    if let Some(admin_password) = postgres_admin_password {
         environment.push(("DBE_POSTGRES_ADMIN_PASSWORD", admin_password));
+    }
+    if let Some(password) = maintenance_password {
+        environment.push(("DBE_ROTATION_ADMIN_PASSWORD", password));
+    }
+    let previous_verifier = native_password_verifier.map(SecretString::from);
+    if target_password.is_none()
+        && let Some(verifier) = previous_verifier.as_ref()
+    {
+        environment.push(("DBE_PREVIOUS_PASSWORD_VERIFIER", verifier));
+    }
+    if target_password.is_none()
+        && let Some(authentication_string) = previous.mysql_auth_string_b64.as_ref()
+    {
+        environment.push(("DBE_PREVIOUS_MYSQL_AUTH_B64", authentication_string));
+    }
+    if let Some(changed) = credential_change_possible {
+        changed.store(true, Ordering::Release);
     }
     state
         .docker
@@ -997,131 +1079,37 @@ async fn rotate_database_password_to_container_environment(
         .map_err(|error| {
             ApiError::Runtime(format!("database password rotation failed: {error}"))
         })?;
+    if requires_postgres_auth_hardening(metadata.protocol, target_password)
+        && let Some(password) = target_password
+    {
+        let admin_password = previous.maintenance.as_ref().ok_or_else(|| {
+            ApiError::Runtime(
+                "the PostgreSQL maintenance credential disappeared during password rotation"
+                    .to_string(),
+            )
+        })?;
+        databases::postgres::hardening::harden_instance_auth(
+            &state.docker,
+            &metadata.instance_id,
+            &metadata.database.username,
+            password,
+            admin_password,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "PostgreSQL password rotation succeeded, but local authentication hardening failed: {error}"
+            ))
+        })?;
+    }
     Ok(())
 }
 
-async fn wait_for_rotation_admin(
-    state: &AppState,
-    metadata: &InstanceMetadata,
-) -> Result<(), ApiError> {
-    let postgres_admin_password = if metadata.protocol == Protocol::Postgres {
-        Some(SecretString::from(
-            metadata.postgres_admin_password.clone().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before rotating its password"
-                        .to_string(),
-                )
-            })?,
-        ))
-    } else {
-        None
-    };
-    let command = match metadata.protocol {
-        Protocol::Postgres => {
-            "test \"$(cat /proc/1/comm)\" = postgres && PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc 'SELECT 1' >/dev/null"
-                .to_string()
-        }
-        Protocol::Mariadb => "root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null".to_string(),
-        Protocol::Mysql => "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null".to_string(),
-        Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval 'db.adminCommand({ ping: 1 }).ok' >/dev/null".to_string(),
-        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
-            return Err(ApiError::Runtime(format!(
-                "{} does not support live password rotation",
-                metadata.protocol
-            )));
-        }
-    };
-    let deadline = Instant::now() + ROTATION_READINESS_TIMEOUT;
-    let mut last_error = String::new();
-    let environment = postgres_admin_password
-        .as_ref()
-        .map(|password| vec![("DBE_POSTGRES_ADMIN_PASSWORD", password)])
-        .unwrap_or_default();
-    while Instant::now() < deadline {
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            state.docker.exec_readiness_probe_with_secret_env(
-                metadata.protocol,
-                &metadata.instance_id,
-                &command,
-                &environment,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(error)) => {
-                last_error = error.to_string();
-                sleep(Duration::from_secs(1)).await;
-            }
-            Err(_) => {
-                last_error = "administrator readiness attempt exceeded 5 seconds".to_string();
-            }
-        }
-    }
-    Err(ApiError::Runtime(format!(
-        "database administrator connection did not become ready for password rotation: {last_error}"
-    )))
-}
-
-fn postgres_rotation_script(username: &str) -> String {
-    let sql = databases::postgres::provision::reset_tenant_password_sql(username);
-    format!(
-        "set -eu\n{{ printf '%s\\n' '\\getenv tenant_password DBE_ROTATED_PASSWORD'; printf '%s\\n' {}; }} | PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1\n",
-        sh_quote(&sql)
-    )
-}
-
-fn mysql_family_rotation_script(
+fn requires_postgres_auth_hardening(
     protocol: Protocol,
-    database: &str,
-    username: &str,
-    verifier: &str,
-) -> Result<String, ApiError> {
-    let sql = match protocol {
-        Protocol::Mariadb => {
-            databases::mariadb::provision::tenant_user_sql(database, username, verifier)
-                .map_err(|error| ApiError::Runtime(error.to_string()))?
-        }
-        _ => {
-            return Err(ApiError::Runtime(
-                "invalid mysql-family password rotation protocol".to_string(),
-            ));
-        }
-    };
-    let command = if protocol == Protocol::Mariadb {
-        "MYSQL_PWD=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root"
-    } else {
-        "MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root"
-    };
-    Ok(format!(
-        "set -eu\nprintf %s {} | {command}\n",
-        sh_quote(&sql)
-    ))
-}
-
-fn mysql_rotation_script(username: &str) -> Result<String, ApiError> {
-    let sql = databases::mysql::provision::reset_tenant_password_sql(username);
-    let (before_password, after_password) =
-        databases::mysql::provision::password_sql_fragments(&sql)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    Ok(format!(
-        "set -eu\n{{ printf %s {}; printf %s \"$DBE_ROTATED_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
-        sh_quote(before_password),
-        sh_quote(after_password),
-    ))
-}
-
-fn mongodb_rotation_script(metadata: &InstanceMetadata) -> Result<String, ApiError> {
-    let javascript = databases::mongodb::provision::update_user_password_from_env_script(
-        &metadata.database.name,
-        &metadata.database.username,
-    )
-    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    Ok(format!(
-        "set -eu\nmongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin admin --eval {}\n",
-        sh_quote(&javascript)
-    ))
+    target_password: Option<&SecretString>,
+) -> bool {
+    protocol == Protocol::Postgres && target_password.is_some()
 }
 
 async fn validate_rotated_credential(
@@ -1143,14 +1131,27 @@ async fn validate_rotated_credential(
             "valkey-cli -s /run/dbev/valkey.sock --user {} -a \"$DBE_ROTATED_PASSWORD\" --no-auth-warning ping >/dev/null",
             sh_quote(&metadata.database.username),
         ),
-        Protocol::Mariadb => "MYSQL_PWD=\"$DBE_ROTATED_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'SELECT 1' >/dev/null".to_string(),
+        Protocol::Mariadb => format!(
+            "MYSQL_PWD=\"$DBE_ROTATED_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u {} {} -N -B -e 'SELECT 1' >/dev/null",
+            sh_quote(&metadata.database.username),
+            sh_quote(&metadata.database.name),
+        ),
         Protocol::Mysql => format!(
             "MYSQL_PWD=\"$DBE_ROTATED_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'SELECT 1' >/dev/null",
             sh_quote(&metadata.database.username),
             sh_quote(&metadata.database.name),
         ),
-        Protocol::Mongodb => "mongosh --quiet --host 127.0.0.1 --username \"$DBE_MONGO_USER\" --password \"$DBE_ROTATED_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\" \"$DBE_MONGO_DATABASE\" --eval 'db.runCommand({ ping: 1 }).ok' >/dev/null".to_string(),
-        Protocol::Clickhouse => "clickhouse-client --host 127.0.0.1 --user \"$CLICKHOUSE_USER\" --password \"$DBE_ROTATED_PASSWORD\" --database \"$CLICKHOUSE_DB\" --query 'SELECT 1' >/dev/null".to_string(),
+        Protocol::Mongodb => format!(
+            "mongosh --quiet --host 127.0.0.1 --username {} --password \"$DBE_ROTATED_PASSWORD\" --authenticationDatabase {} {} --eval 'db.runCommand({{ ping: 1 }}).ok' >/dev/null",
+            sh_quote(&metadata.database.username),
+            sh_quote(&metadata.database.name),
+            sh_quote(&metadata.database.name),
+        ),
+        Protocol::Clickhouse => format!(
+            "clickhouse-client --host 127.0.0.1 --user {} --password \"$DBE_ROTATED_PASSWORD\" --database {} --query 'SELECT 1' >/dev/null",
+            sh_quote(&metadata.database.username),
+            sh_quote(&metadata.database.name),
+        ),
         // Qdrant reads the new API key from its immutable container
         // configuration. Its startup readiness probe confirms the authenticated
         // gRPC listener is accepting connections before metadata is committed.
@@ -1313,16 +1314,28 @@ async fn delete_managed_container(
     }
 }
 
-fn apply_new_route_auth(metadata: &mut InstanceMetadata, password: &SecretString) {
+fn apply_new_route_auth(
+    metadata: &mut InstanceMetadata,
+    password: &SecretString,
+    previous: &PreviousCredential,
+) {
     metadata.tenant_password = Some(password.expose_secret().to_string());
     match metadata.protocol {
         Protocol::Mariadb => {
+            metadata.mariadb_root_password = previous
+                .maintenance
+                .as_ref()
+                .map(|value| value.expose_secret().to_string());
             metadata.mariadb_native_password_sha1_stage2 =
                 Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
                     password.expose_secret(),
                 ));
         }
         Protocol::Mysql => {
+            metadata.mysql_root_password = previous
+                .maintenance
+                .as_ref()
+                .map(|value| value.expose_secret().to_string());
             metadata.mysql_native_password_sha1_stage2 =
                 Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
                     password.expose_secret(),
@@ -1333,11 +1346,19 @@ fn apply_new_route_auth(metadata: &mut InstanceMetadata, password: &SecretString
                 password.expose_secret(),
             ));
         }
-        Protocol::Postgres
-        | Protocol::Redis
-        | Protocol::Valkey
-        | Protocol::Mongodb
-        | Protocol::Clickhouse => {}
+        Protocol::Postgres => {
+            metadata.postgres_admin_password = previous
+                .maintenance
+                .as_ref()
+                .map(|value| value.expose_secret().to_string());
+        }
+        Protocol::Mongodb => {
+            metadata.mongodb_root_password = previous
+                .maintenance
+                .as_ref()
+                .map(|value| value.expose_secret().to_string());
+        }
+        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse => {}
     }
 }
 

@@ -1,6 +1,5 @@
 use std::{future::Future, time::Duration};
 
-use base64::Engine;
 use secrecy::SecretString;
 use tokio::time::sleep;
 
@@ -28,6 +27,14 @@ use crate::{
         backend::BackendEndpoint, logs::summarize_failure_logs, protocol::Protocol, redaction,
         shell::sh_quote, time::now_rfc3339,
     },
+};
+
+mod mysql_hardening;
+
+#[cfg(test)]
+use mysql_hardening::mysql_auth_failed_metadata;
+pub(crate) use mysql_hardening::{
+    harden_mysql_accounts_on_boot, harden_mysql_tenant_auth, verify_mysql_root_auth,
 };
 
 pub async fn create_instance_from_request(
@@ -844,99 +851,17 @@ pub(crate) async fn provision_mysql_tenant_user(
     password: &str,
     root_password: &str,
 ) -> Result<(), ApiError> {
-    wait_for_mysql_localhost(state, instance_id).await?;
+    let root_password_secret = SecretString::from(root_password.to_string());
+    mysql_hardening::verify_mysql_root_auth_with_timeout(
+        state,
+        instance_id,
+        &root_password_secret,
+        Duration::from_secs(120),
+    )
+    .await?;
     let sql = databases::mysql::provision::tenant_user_sql(database, username);
-    execute_mysql_protected_sql(state, instance_id, &sql, password, root_password).await
-}
-
-pub(crate) async fn harden_mysql_tenant_auth(
-    state: &AppState,
-    instance_id: &str,
-    username: &str,
-    password: &str,
-    root_password: &str,
-) -> Result<(), ApiError> {
-    wait_for_mysql_localhost(state, instance_id).await?;
-    let sql = databases::mysql::provision::reset_tenant_password_sql(username);
-    execute_mysql_protected_sql(state, instance_id, &sql, password, root_password).await
-}
-
-async fn execute_mysql_protected_sql(
-    state: &AppState,
-    instance_id: &str,
-    sql: &str,
-    password: &str,
-    root_password: &str,
-) -> Result<(), ApiError> {
-    let (before_password, after_password) =
-        databases::mysql::provision::password_sql_fragments(sql)
-            .map_err(|error| fail_runtime(state, instance_id, error))?;
-    let script = format!(
-        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$DBE_MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot\n",
-        sh_quote(before_password),
-        sh_quote(after_password),
-    );
-    let password_b64 =
-        SecretString::from(base64::engine::general_purpose::STANDARD.encode(password.as_bytes()));
-    let root_password = SecretString::from(root_password.to_string());
-    state
-        .docker
-        .exec_shell_with_secret_env(
-            Protocol::Mysql,
-            instance_id,
-            &script,
-            &[
-                ("DBE_PASSWORD_B64", &password_b64),
-                ("DBE_MYSQL_ROOT_PASSWORD", &root_password),
-            ],
-        )
+    mysql_hardening::execute_mysql_protected_sql(state, instance_id, &sql, password, root_password)
         .await
-        .map_err(|error| fail_runtime(state, instance_id, error))?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MysqlAuthHardeningSummary {
-    pub checked: usize,
-}
-
-pub(crate) async fn harden_mysql_accounts_on_boot(
-    state: &AppState,
-) -> Result<MysqlAuthHardeningSummary, ApiError> {
-    let instances = state.manager.store().list().await;
-    let mut checked = 0;
-    for snapshot in instances {
-        if snapshot.protocol != Protocol::Mysql {
-            continue;
-        }
-        let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
-        let Some(metadata) = state.manager.store().get(&snapshot.instance_id).await else {
-            continue;
-        };
-        if metadata.protocol != Protocol::Mysql || metadata.status != InstanceStatus::Running {
-            continue;
-        }
-        let password = metadata.tenant_password.as_deref().ok_or_else(|| {
-            ApiError::Conflict(
-                "the encrypted MySQL tenant credential is missing; reset or recreate this legacy instance before opening its gateway".to_string(),
-            )
-        })?;
-        let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
-            ApiError::Conflict(
-                "the encrypted MySQL maintenance credential is missing; recreate this legacy instance before opening its gateway".to_string(),
-            )
-        })?;
-        harden_mysql_tenant_auth(
-            state,
-            &metadata.instance_id,
-            &metadata.database.username,
-            password,
-            root_password,
-        )
-        .await?;
-        checked += 1;
-    }
-    Ok(MysqlAuthHardeningSummary { checked })
 }
 
 pub(crate) async fn provision_postgres_tenant_role(
@@ -988,22 +913,6 @@ async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Resu
         Protocol::Mariadb,
         instance_id,
         "test \"$(cat /proc/1/comm)\" = mariadbd || exit 1; root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null",
-        Duration::from_secs(120),
-    )
-    .await
-}
-
-async fn wait_for_mysql_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    state.install_progress.stage(
-        instance_id,
-        "readiness",
-        "waiting for MySQL local socket to become available",
-    );
-    wait_for_container_shell_command(
-        state,
-        Protocol::Mysql,
-        instance_id,
-        "test \"$(cat /proc/1/comm)\" = mysqld && MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root -N -B -e 'SELECT 1' >/dev/null",
         Duration::from_secs(120),
     )
     .await

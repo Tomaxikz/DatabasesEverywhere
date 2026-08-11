@@ -23,6 +23,20 @@ pub fn reset_tenant_password_sql(username: &str) -> String {
     )
 }
 
+pub fn tenant_password_verifier_sql(username: &str) -> String {
+    format!(
+        "SELECT COALESCE(rolpassword, '') FROM pg_authid WHERE rolname = {};",
+        quote_literal(username),
+    )
+}
+
+pub fn restore_tenant_password_verifier_sql(username: &str) -> String {
+    format!(
+        "ALTER ROLE {} PASSWORD :'tenant_password_verifier';",
+        quote_ident(username),
+    )
+}
+
 pub fn tenant_role_state_sql(username: &str) -> String {
     format!(
         "SELECT oid::text || ':' || (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls)::int::text FROM pg_roles WHERE rolname = {};",
@@ -77,6 +91,18 @@ mod tests {
 
         assert!(sql.starts_with("SET password_encryption = 'scram-sha-256';"));
         assert!(sql.ends_with("ALTER ROLE \"app_user\" PASSWORD :'tenant_password';"));
+    }
+
+    #[test]
+    fn password_verifier_capture_and_restore_quote_the_role() {
+        let capture = tenant_password_verifier_sql("user'name");
+        let restore = restore_tenant_password_verifier_sql("user\"name");
+
+        assert!(capture.contains("rolname = 'user''name'"));
+        assert_eq!(
+            restore,
+            "ALTER ROLE \"user\"\"name\" PASSWORD :'tenant_password_verifier';"
+        );
     }
 
     #[test]

@@ -1,12 +1,19 @@
 use super::*;
 
 pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
-    let mut config = load_config(&config_path)?;
+    let (mut config, config_load_report) = load_config_with_report(&config_path)?;
     let runtime_directories = ensure_runtime_directories(&config)
         .await
         .context("failed to create runtime directories")?;
     let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
     init_configured_logging(&config)?;
+    if config_load_report.used_import_export_scheduler_defaults() {
+        tracing::warn!(
+            config = %config_path.display(),
+            fields = ?config_load_report.defaulted_import_export_scheduler_fields,
+            "missing import/export scheduler settings were filled with backward-compatible in-memory defaults; the config file was not rewritten; copy artifacts.import_export_scheduler from config.example.yml to make the defaults explicit"
+        );
+    }
     warn_if_memory_overcommit_disabled();
     detect_and_log_disk_mode(&mut config)?;
     let config = Arc::new(config);

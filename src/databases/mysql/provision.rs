@@ -1,9 +1,12 @@
 pub const PASSWORD_B64_PLACEHOLDER: &str = "__DBEV_PASSWORD_B64__";
+pub const AUTH_STRING_B64_PLACEHOLDER: &str = "__DBEV_AUTH_STRING_B64__";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MysqlProvisionError {
     #[error("MySQL password SQL template is missing its protected placeholder")]
     MissingPasswordPlaceholder,
+    #[error("MySQL authentication plugin name is invalid")]
+    InvalidAuthenticationPlugin,
 }
 
 pub fn tenant_user_sql(database: &str, username: &str) -> String {
@@ -59,8 +62,52 @@ SET @dbev_alter = NULL;
     )
 }
 
+pub fn tenant_auth_state_sql(username: &str) -> String {
+    format!(
+        "SELECT CONCAT(plugin, CHAR(9), REPLACE(TO_BASE64(authentication_string), '\\n', '')) FROM mysql.user WHERE User = {} AND Host = '%';",
+        quote_sql_string(username),
+    )
+}
+
+pub fn restore_tenant_auth_sql(
+    username: &str,
+    plugin: &str,
+) -> Result<String, MysqlProvisionError> {
+    if plugin.is_empty()
+        || plugin.len() > 64
+        || !plugin
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(MysqlProvisionError::InvalidAuthenticationPlugin);
+    }
+    let account = format!("{}@'%'", quote_identifier(username));
+    let alter = quote_sql_string(&format!(
+        "ALTER USER {account} IDENTIFIED WITH {} AS ",
+        quote_identifier(plugin),
+    ));
+    Ok(format!(
+        r#"
+SET SESSION sql_log_bin = 0;
+SET SESSION sql_log_off = 1;
+SET @dbev_auth_string = CONVERT(FROM_BASE64('{AUTH_STRING_B64_PLACEHOLDER}') USING ascii);
+SET @dbev_alter = CONCAT({alter}, QUOTE(@dbev_auth_string));
+PREPARE dbev_statement FROM @dbev_alter;
+EXECUTE dbev_statement;
+DEALLOCATE PREPARE dbev_statement;
+SET @dbev_auth_string = NULL;
+SET @dbev_alter = NULL;
+"#
+    ))
+}
+
 pub fn password_sql_fragments(sql: &str) -> Result<(&str, &str), MysqlProvisionError> {
     sql.split_once(PASSWORD_B64_PLACEHOLDER)
+        .ok_or(MysqlProvisionError::MissingPasswordPlaceholder)
+}
+
+pub fn auth_string_sql_fragments(sql: &str) -> Result<(&str, &str), MysqlProvisionError> {
+    sql.split_once(AUTH_STRING_B64_PLACEHOLDER)
         .ok_or(MysqlProvisionError::MissingPasswordPlaceholder)
 }
 
@@ -116,5 +163,23 @@ mod tests {
         assert!(!before.contains(PASSWORD_B64_PLACEHOLDER));
         assert!(!after.contains(PASSWORD_B64_PLACEHOLDER));
         assert_eq!(sql.matches(PASSWORD_B64_PLACEHOLDER).count(), 1);
+    }
+
+    #[test]
+    fn captures_and_restores_existing_authentication_state_without_plaintext() {
+        let capture = tenant_auth_state_sql("user'name");
+        let restore = restore_tenant_auth_sql("user`name", "caching_sha2_password").unwrap();
+
+        assert!(capture.contains("User = 'user''name'"));
+        assert!(capture.contains("TO_BASE64(authentication_string)"));
+        assert!(restore.contains("ALTER USER `user``name`@''%''"));
+        assert!(restore.contains("`caching_sha2_password` AS"));
+        assert!(restore.contains(AUTH_STRING_B64_PLACEHOLDER));
+        assert!(!restore.contains("CREATE USER"));
+    }
+
+    #[test]
+    fn rejects_untrusted_authentication_plugin_names() {
+        assert!(restore_tenant_auth_sql("app", "plugin; DROP USER root").is_err());
     }
 }

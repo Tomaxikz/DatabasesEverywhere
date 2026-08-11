@@ -178,6 +178,46 @@ async fn redis_and_valkey_use_separate_route_namespaces() {
     reject_duplicate_instance(&state, &request).await.unwrap();
 }
 
+#[tokio::test]
+async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes() {
+    let store = InstanceStore::default();
+    let legacy = sample_metadata(
+        "inst_legacy_mysql",
+        Protocol::Mysql,
+        "legacy_db",
+        "legacy_user",
+    );
+    let healthy = sample_metadata(
+        "inst_healthy_mysql",
+        Protocol::Mysql,
+        "healthy_db",
+        "healthy_user",
+    );
+    store.upsert(legacy.clone()).await;
+    store.upsert(healthy).await;
+
+    let failed = mysql_auth_failed_metadata(&legacy);
+    store.upsert(failed.clone()).await;
+
+    assert_eq!(failed.status, InstanceStatus::Failed);
+    assert_eq!(
+        failed.desired_state,
+        crate::instances::metadata::DesiredInstanceState::Running
+    );
+    assert!(
+        store
+            .resolve_mysql("legacy_user", "legacy_db")
+            .await
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_mysql("healthy_user", "healthy_db")
+            .await
+            .is_some()
+    );
+}
+
 #[test]
 fn allocation_guard_rejects_a_projected_limit_over_the_node_pool() {
     let error = enforce_resource_allocation(

@@ -59,6 +59,53 @@ async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_d
 }
 
 #[tokio::test]
+async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(dir.path()).await.unwrap();
+    let plain = InstanceRepository::new(pool.clone());
+    let mut affected = metadata("inst_affected", "affected_user");
+    affected.tenant_password = Some("dbev1:ambiguous".to_string());
+    plain.upsert(&affected).await.unwrap();
+    let encrypted = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let loaded = encrypted.load_for_daemon().await.unwrap();
+    let mut recovered = loaded.metadata.into_iter().next().unwrap();
+    recovered.status = InstanceStatus::Running;
+    recovered.desired_state = DesiredInstanceState::Running;
+    recovered.tenant_password = Some("verified-replacement".to_string());
+
+    let error = encrypted
+        .upsert_recovered_protected_secrets(&recovered)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RepositoryError::IncompleteProtectedSecretRecovery { .. }
+    ));
+    assert!(recovery_required(&pool, "inst_affected").await);
+    assert_eq!(
+        raw_field(&pool, "inst_affected", "tenant_password").await,
+        "dbev1:ambiguous"
+    );
+
+    recovered.postgres_admin_password = Some("verified-admin".to_string());
+    encrypted
+        .upsert_recovered_protected_secrets(&recovered)
+        .await
+        .unwrap();
+
+    assert!(!recovery_required(&pool, "inst_affected").await);
+    assert!(is_encrypted(
+        &raw_field(&pool, "inst_affected", "tenant_password").await
+    ));
+    let loaded = encrypted.get("inst_affected").await.unwrap().unwrap();
+    assert_eq!(
+        loaded.tenant_password.as_deref(),
+        Some("verified-replacement")
+    );
+    assert_eq!(loaded.status, InstanceStatus::Running);
+}
+
+#[tokio::test]
 async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();

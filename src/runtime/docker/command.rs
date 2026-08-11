@@ -105,13 +105,17 @@ impl DockerRuntime {
         .await
     }
 
-    pub(crate) async fn exec_readiness_probe_with_secret_env(
+    pub(crate) async fn exec_readiness_probe_with_secret_env_timeout(
         &self,
         protocol: Protocol,
         instance_id: &str,
         script: &str,
         environment: &[(&str, &SecretString)],
+        timeout: Duration,
     ) -> Result<CommandOutput, DockerError> {
+        if timeout.is_zero() {
+            return Err(DockerError::InvalidExecTimeout);
+        }
         let environment = environment
             .iter()
             .map(|(key, value)| format!("{key}={}", value.expose_secret()))
@@ -123,8 +127,8 @@ impl DockerRuntime {
             Some(environment),
             ExecPolicy {
                 log_failure: false,
-                timeout: DOCKER_EXEC_TIMEOUT,
-                recovery_readiness_timeout: DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT,
+                timeout,
+                recovery_readiness_timeout: DOCKER_EXEC_SHORT_RECOVERY_READINESS_TIMEOUT,
             },
         )
         .await

@@ -40,54 +40,47 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
-    let postgres_role_hardening = match crate::databases::postgres::hardening::harden_on_boot(
+    let postgres_role_hardening = crate::databases::postgres::hardening::harden_on_boot(
         &state.manager,
         &state.docker,
         &state.instance_locks,
     )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "PostgreSQL authentication hardening failed; API remains available and database gateways remain closed"
-            );
-            state
-                .gateway_supervisor
-                .fail_and_stop("postgres role hardening failed");
-            return;
-        }
-    };
+    .await;
+    for failure in &postgres_role_hardening.failures {
+        tracing::debug!(
+            instance_id = %failure.instance_id,
+            reason = %failure.reason,
+            "PostgreSQL boot-hardening failure included in the per-instance summary"
+        );
+    }
     tracing::info!(
         checked = postgres_role_hardening.checked,
         hardened = postgres_role_hardening.hardened,
-        "PostgreSQL role and local authentication hardening complete"
+        administrator_credentials_migrated =
+            postgres_role_hardening.administrator_credentials_migrated,
+        deferred = postgres_role_hardening.deferred,
+        failed = postgres_role_hardening.failures.len(),
+        "PostgreSQL role and local authentication hardening complete; failed instances were isolated individually"
     );
     if !state.import_export_jobs.is_accepting() {
         return;
     }
 
-    let mysql_auth_hardening = match crate::api::instance_create::harden_mysql_accounts_on_boot(
-        &state,
-    )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "MySQL authentication migration failed; API remains available and database gateways remain closed"
-            );
-            state
-                .gateway_supervisor
-                .fail_and_stop("mysql authentication migration failed");
-            return;
-        }
-    };
+    let mysql_auth_hardening =
+        crate::api::instance_create::harden_mysql_accounts_on_boot(&state).await;
+    for failure in &mysql_auth_hardening.failures {
+        tracing::debug!(
+            instance_id = %failure.instance_id,
+            reason = %failure.reason,
+            "MySQL boot-hardening failure included in the per-instance summary"
+        );
+    }
     tracing::info!(
         checked = mysql_auth_hardening.checked,
-        "MySQL caching_sha2_password migration complete"
+        root_credentials_migrated = mysql_auth_hardening.root_credentials_migrated,
+        verifiers_repaired = mysql_auth_hardening.verifiers_repaired,
+        failed = mysql_auth_hardening.failures.len(),
+        "MySQL caching_sha2_password migration complete; failed instances were isolated individually"
     );
     if !state.import_export_jobs.is_accepting() {
         return;

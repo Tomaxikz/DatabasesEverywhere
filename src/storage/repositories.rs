@@ -3,8 +3,8 @@ use std::path::Path;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
-    instances::metadata::{DesiredInstanceState, InstanceMetadata, SCHEMA_VERSION},
-    shared::backend::BackendEndpoint,
+    instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, SCHEMA_VERSION},
+    shared::{backend::BackendEndpoint, protocol::Protocol},
     storage::secrets::{SecretStore, SecretStoreError},
 };
 
@@ -113,7 +113,30 @@ impl InstanceRepository {
     }
 
     pub async fn upsert(&self, metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
+        self.upsert_with_protected_secret_replacement(metadata, false)
+            .await
+    }
+
+    /// Atomically replaces protected route authentication and clears an
+    /// existing recovery marker. Callers must verify the replacement against
+    /// the live database before using this path.
+    pub(crate) async fn upsert_recovered_protected_secrets(
+        &self,
+        metadata: &InstanceMetadata,
+    ) -> Result<(), RepositoryError> {
+        self.upsert_with_protected_secret_replacement(metadata, true)
+            .await
+    }
+
+    async fn upsert_with_protected_secret_replacement(
+        &self,
+        metadata: &InstanceMetadata,
+        clear_protected_secret_recovery: bool,
+    ) -> Result<(), RepositoryError> {
         validate_metadata_schema(metadata)?;
+        if clear_protected_secret_recovery {
+            validate_complete_protected_secret_recovery(metadata)?;
+        }
         let backend = BackendColumns::from(&metadata.backend);
         let runtime_kind = metadata.runtime.kind.as_str();
         let limits_json = serde_json::to_string(&metadata.limits)?;
@@ -154,13 +177,17 @@ impl InstanceRepository {
             metadata.tenant_password.as_deref(),
         )?;
         let mut transaction = self.pool.begin().await?;
-        let preserve_route_auth = sqlx::query_scalar::<_, bool>(
-            "SELECT protected_secret_recovery_required FROM instance_metadata WHERE instance_id = ?1",
-        )
-        .bind(&metadata.instance_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .unwrap_or(false);
+        let preserve_route_auth = if clear_protected_secret_recovery {
+            false
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT protected_secret_recovery_required FROM instance_metadata WHERE instance_id = ?1",
+            )
+            .bind(&metadata.instance_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .unwrap_or(false)
+        };
 
         sqlx::query(
             r#"
@@ -285,6 +312,15 @@ impl InstanceRepository {
                 .bind(&metadata.instance_id)
                 .execute(&mut *transaction)
                 .await?;
+        }
+
+        if clear_protected_secret_recovery {
+            sqlx::query(
+                "UPDATE instance_metadata SET protected_secret_recovery_required = 0 WHERE instance_id = ?1",
+            )
+            .bind(&metadata.instance_id)
+            .execute(&mut *transaction)
+            .await?;
         }
 
         transaction.commit().await?;
@@ -478,6 +514,73 @@ fn validate_metadata_schema(metadata: &InstanceMetadata) -> Result<(), Repositor
     }
 }
 
+fn validate_complete_protected_secret_recovery(
+    metadata: &InstanceMetadata,
+) -> Result<(), RepositoryError> {
+    let mut missing = Vec::new();
+    if metadata.status != InstanceStatus::Running {
+        missing.push("running_status");
+    }
+    if metadata.desired_state != DesiredInstanceState::Running {
+        missing.push("running_desired_state");
+    }
+    if protected_secret_missing(metadata.tenant_password.as_deref()) {
+        missing.push("tenant_password");
+    }
+    match metadata.protocol {
+        Protocol::Postgres => {
+            if protected_secret_missing(metadata.postgres_admin_password.as_deref()) {
+                missing.push("postgres_admin_password");
+            }
+        }
+        Protocol::Mariadb => {
+            if protected_secret_missing(metadata.mariadb_root_password.as_deref()) {
+                missing.push("mariadb_root_password");
+            }
+            if !valid_hex_secret(metadata.mariadb_native_password_sha1_stage2.as_deref(), 40) {
+                missing.push("mariadb_native_password_sha1_stage2");
+            }
+        }
+        Protocol::Mysql => {
+            if protected_secret_missing(metadata.mysql_root_password.as_deref()) {
+                missing.push("mysql_root_password");
+            }
+            if !valid_hex_secret(metadata.mysql_native_password_sha1_stage2.as_deref(), 40) {
+                missing.push("mysql_native_password_sha1_stage2");
+            }
+        }
+        Protocol::Mongodb => {
+            if protected_secret_missing(metadata.mongodb_root_password.as_deref()) {
+                missing.push("mongodb_root_password");
+            }
+        }
+        Protocol::Qdrant => {
+            if !valid_hex_secret(metadata.route_key_sha256.as_deref(), 64) {
+                missing.push("route_key_sha256");
+            }
+        }
+        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse => {}
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(RepositoryError::IncompleteProtectedSecretRecovery {
+            instance_id: metadata.instance_id.clone(),
+            missing: missing.join(","),
+        })
+    }
+}
+
+fn protected_secret_missing(value: Option<&str>) -> bool {
+    value.is_none_or(str::is_empty)
+}
+
+fn valid_hex_secret(value: Option<&str>, expected_len: usize) -> bool {
+    value.is_some_and(|value| {
+        value.len() == expected_len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
     #[error("sqlite query failed: {0}")]
@@ -507,6 +610,13 @@ pub enum RepositoryError {
         "the supplied plaintext does not exactly match the ambiguous stored value for instance {instance_id} field {field}"
     )]
     ProtectedSecretPlaintextMismatch { instance_id: String, field: String },
+    #[error(
+        "instance {instance_id} protected-secret recovery is incomplete; missing verified fields: {missing}"
+    )]
+    IncompleteProtectedSecretRecovery {
+        instance_id: String,
+        missing: String,
+    },
     #[error("metadata schema version {actual} is not supported")]
     UnsupportedSchema { actual: u32 },
     #[error("instance {instance_id} has unsupported desired state {value:?}")]
