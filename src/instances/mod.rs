@@ -1,3 +1,4 @@
+pub(crate) mod auth_hardening;
 pub(crate) mod credentials;
 pub mod locks;
 pub mod manager;

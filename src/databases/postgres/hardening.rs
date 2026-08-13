@@ -31,6 +31,7 @@ pub struct PostgresHardeningSummary {
     pub checked: usize,
     pub hardened: usize,
     pub administrator_credentials_migrated: usize,
+    pub attestations_reused: usize,
     pub deferred: usize,
     pub failures: Vec<PostgresHardeningFailure>,
 }
@@ -338,6 +339,24 @@ async fn harden_postgres_instance_on_boot(
     if metadata.protocol != Protocol::Postgres || metadata.status == InstanceStatus::Quarantined {
         return summary;
     }
+    if metadata.status == InstanceStatus::Running {
+        match crate::instances::auth_hardening::attestation_is_current(manager, docker, &metadata)
+            .await
+        {
+            Ok(true) => {
+                summary.attestations_reused = 1;
+                return summary;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                event = "audit auth_hardening_attestation_check_failed",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "could not validate the cached hardening attestation; running full PostgreSQL hardening"
+            ),
+        }
+    }
     let bootstrap_credentials = docker
         .postgres_bootstrap_credentials(&metadata.instance_id)
         .await;
@@ -591,6 +610,17 @@ async fn harden_postgres_instance_on_boot(
             "verified and encrypted current PostgreSQL credentials"
         );
     }
+    if let Err(error) =
+        crate::instances::auth_hardening::record_attestation(manager, docker, &metadata).await
+    {
+        tracing::warn!(
+            event = "audit auth_hardening_attestation_write_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
+        );
+    }
     summary
 }
 
@@ -602,6 +632,7 @@ fn aggregate_postgres_hardening_summaries(
         summary.checked += outcome.checked;
         summary.hardened += outcome.hardened;
         summary.administrator_credentials_migrated += outcome.administrator_credentials_migrated;
+        summary.attestations_reused += outcome.attestations_reused;
         summary.deferred += outcome.deferred;
         summary.failures.append(&mut outcome.failures);
     }
@@ -853,6 +884,7 @@ mod tests {
                 checked: 1,
                 hardened: 1,
                 administrator_credentials_migrated: 0,
+                attestations_reused: 1,
                 deferred: 0,
                 failures: vec![PostgresHardeningFailure {
                     instance_id: "postgres-z".to_string(),
@@ -863,6 +895,7 @@ mod tests {
                 checked: 2,
                 hardened: 0,
                 administrator_credentials_migrated: 1,
+                attestations_reused: 2,
                 deferred: 1,
                 failures: vec![PostgresHardeningFailure {
                     instance_id: "postgres-a".to_string(),
@@ -874,6 +907,7 @@ mod tests {
         assert_eq!(summary.checked, 3);
         assert_eq!(summary.hardened, 1);
         assert_eq!(summary.administrator_credentials_migrated, 1);
+        assert_eq!(summary.attestations_reused, 3);
         assert_eq!(summary.deferred, 1);
         assert_eq!(summary.failures.len(), 2);
         assert_eq!(summary.failures[0].instance_id, "postgres-a");

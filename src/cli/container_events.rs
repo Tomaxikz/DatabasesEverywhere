@@ -338,12 +338,12 @@ async fn harden_activated_instance_auth(
             let admin_password = metadata.postgres_admin_password.as_deref().ok_or_else(|| {
                 "the encrypted PostgreSQL administrator credential is missing".to_string()
             })?;
-            crate::databases::postgres::hardening::harden_instance_auth(
-                &state.docker,
+            crate::api::instance_create::harden_postgres_instance_auth(
+                state,
                 &metadata.instance_id,
                 &metadata.database.username,
-                &secrecy::SecretString::from(password.to_string()),
-                &secrecy::SecretString::from(admin_password.to_string()),
+                password,
+                admin_password,
             )
             .await
             .map(|_| ())

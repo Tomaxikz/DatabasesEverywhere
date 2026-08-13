@@ -8,6 +8,7 @@ use crate::{
     storage::secrets::{SecretStore, SecretStoreError},
 };
 
+mod auth_hardening;
 mod protected_secrets;
 
 pub use protected_secrets::{
@@ -600,6 +601,15 @@ pub enum RepositoryError {
     },
     #[error("encrypted metadata storage is required for protected-secret repair")]
     EncryptedRepositoryRequired,
+    #[error("encrypted metadata storage is required for authentication hardening attestations")]
+    AuthHardeningAttestationRequiresEncryption,
+    #[error(
+        "instance {instance_id} cannot be bound to an authentication hardening attestation because protected field {field} is missing"
+    )]
+    AuthHardeningCredentialMissing {
+        instance_id: String,
+        field: &'static str,
+    },
     #[error("instance {0} does not exist")]
     InstanceNotFound(String),
     #[error("instance {instance_id} has no stored value for protected field {field}")]
@@ -1087,6 +1097,146 @@ mod tests {
         .unwrap();
         assert!(is_encrypted(&raw));
         assert!(!raw.contains("legacy-plain-root"));
+    }
+
+    #[tokio::test]
+    async fn hardening_attestation_is_bound_to_container_generation_and_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.tenant_password = Some("tenant-secret".to_string());
+        metadata.postgres_admin_password = Some("admin-secret".to_string());
+        repository.upsert(&metadata).await.unwrap();
+
+        repository
+            .record_auth_hardening_attestation(
+                &metadata,
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "2026-08-13T12:00:00Z",
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "2026-08-13T12:00:00Z",
+                    1,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "2026-08-13T12:00:00Z",
+                    1,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "2026-08-13T12:01:00Z",
+                    1,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "2026-08-13T12:00:00Z",
+                    2,
+                )
+                .await
+                .unwrap()
+        );
+        metadata.tenant_password = Some("rotated-tenant-secret".to_string());
+        assert!(
+            !repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                    "2026-08-13T12:00:00Z",
+                    1,
+                )
+                .await
+                .unwrap()
+        );
+        metadata.tenant_password = Some("tenant-secret".to_string());
+        sqlx::query(
+            "UPDATE instance_auth_hardening_attestations SET container_id = ?1, container_started_at = ?2, hardening_revision = 2 WHERE instance_id = ?3",
+        )
+        .bind("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        .bind("2026-08-13T12:01:00Z")
+        .bind("inst_abc")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !repository
+                .auth_hardening_attestation_is_current(
+                    &metadata,
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "2026-08-13T12:01:00Z",
+                    2,
+                )
+                .await
+                .unwrap()
+        );
+
+        let binding: String = sqlx::query_scalar(
+            "SELECT credential_binding FROM instance_auth_hardening_attestations WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(binding.starts_with("dbevh1:"));
+        assert!(!binding.contains("tenant-secret"));
+        assert!(!binding.contains("admin-secret"));
+    }
+
+    #[tokio::test]
+    async fn hardening_attestation_cascades_when_instance_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+        let mut metadata = sample_metadata();
+        metadata.tenant_password = Some("tenant-secret".to_string());
+        metadata.postgres_admin_password = Some("admin-secret".to_string());
+        repository.upsert(&metadata).await.unwrap();
+        repository
+            .record_auth_hardening_attestation(
+                &metadata,
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "2026-08-13T12:00:00Z",
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(repository.delete("inst_abc").await.unwrap());
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM instance_auth_hardening_attestations WHERE instance_id = ?1",
+        )
+        .bind("inst_abc")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     fn assert_invalid_protected_secret(

@@ -1,4 +1,5 @@
 use super::{metadata::InstanceMetadata, state::InstanceStore};
+use crate::runtime::docker::ManagedContainerIdentity;
 use crate::storage::repositories::{InstanceRepository, RepositoryError};
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,38 @@ impl InstanceManager {
         instance_id: &str,
     ) -> Result<Option<InstanceMetadata>, RepositoryError> {
         self.repository.get(instance_id).await
+    }
+
+    pub(crate) async fn auth_hardening_attestation_is_current(
+        &self,
+        metadata: &InstanceMetadata,
+        identity: &ManagedContainerIdentity,
+        hardening_revision: u32,
+    ) -> Result<bool, RepositoryError> {
+        self.repository
+            .auth_hardening_attestation_is_current(
+                metadata,
+                &identity.id,
+                &identity.started_at,
+                hardening_revision,
+            )
+            .await
+    }
+
+    pub(crate) async fn record_auth_hardening_attestation(
+        &self,
+        metadata: &InstanceMetadata,
+        identity: &ManagedContainerIdentity,
+        hardening_revision: u32,
+    ) -> Result<(), RepositoryError> {
+        self.repository
+            .record_auth_hardening_attestation(
+                metadata,
+                &identity.id,
+                &identity.started_at,
+                hardening_revision,
+            )
+            .await
     }
 
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {

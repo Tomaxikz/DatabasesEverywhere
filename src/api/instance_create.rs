@@ -891,7 +891,32 @@ pub(crate) async fn harden_postgres_instance_auth(
     tenant_password: &str,
     admin_password: &str,
 ) -> Result<bool, ApiError> {
-    databases::postgres::hardening::harden_instance_auth(
+    let metadata = state.instances.get(instance_id).await.filter(|metadata| {
+        metadata.protocol == Protocol::Postgres
+            && metadata.database.username == tenant_username
+            && metadata.tenant_password.as_deref() == Some(tenant_password)
+            && metadata.postgres_admin_password.as_deref() == Some(admin_password)
+    });
+    if let Some(metadata) = metadata.as_ref() {
+        match crate::instances::auth_hardening::attestation_is_current(
+            &state.manager,
+            &state.docker,
+            metadata,
+        )
+        .await
+        {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                event = "audit auth_hardening_attestation_check_failed",
+                instance_id,
+                protocol = %Protocol::Postgres,
+                %error,
+                "could not validate the cached hardening attestation; running full PostgreSQL hardening"
+            ),
+        }
+    }
+    let changed = databases::postgres::hardening::harden_instance_auth(
         &state.docker,
         instance_id,
         tenant_username,
@@ -899,7 +924,24 @@ pub(crate) async fn harden_postgres_instance_auth(
         &SecretString::from(admin_password.to_string()),
     )
     .await
-    .map_err(|error| fail_runtime(state, instance_id, error))
+    .map_err(|error| fail_runtime(state, instance_id, error))?;
+    if let Some(metadata) = metadata.as_ref()
+        && let Err(error) = crate::instances::auth_hardening::record_attestation(
+            &state.manager,
+            &state.docker,
+            metadata,
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "audit auth_hardening_attestation_write_failed",
+            instance_id,
+            protocol = %Protocol::Postgres,
+            %error,
+            "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
+        );
+    }
+    Ok(changed)
 }
 
 async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {

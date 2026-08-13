@@ -60,6 +60,31 @@ pub(crate) async fn harden_mysql_tenant_auth(
     password: &str,
     root_password: &str,
 ) -> Result<(), ApiError> {
+    let metadata = state.instances.get(instance_id).await.filter(|metadata| {
+        metadata.protocol == Protocol::Mysql
+            && metadata.database.username == username
+            && metadata.tenant_password.as_deref() == Some(password)
+            && metadata.mysql_root_password.as_deref() == Some(root_password)
+    });
+    if let Some(metadata) = metadata.as_ref() {
+        match crate::instances::auth_hardening::attestation_is_current(
+            &state.manager,
+            &state.docker,
+            metadata,
+        )
+        .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                event = "audit auth_hardening_attestation_check_failed",
+                instance_id,
+                protocol = %Protocol::Mysql,
+                %error,
+                "could not validate the cached hardening attestation; running full MySQL hardening"
+            ),
+        }
+    }
     let root_password = SecretString::from(root_password.to_string());
     verify_mysql_root_auth_with_timeout(
         state,
@@ -75,7 +100,24 @@ pub(crate) async fn harden_mysql_tenant_auth(
         password,
         root_password.expose_secret(),
     )
-    .await
+    .await?;
+    if let Some(metadata) = metadata.as_ref()
+        && let Err(error) = crate::instances::auth_hardening::record_attestation(
+            &state.manager,
+            &state.docker,
+            metadata,
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "audit auth_hardening_attestation_write_failed",
+            instance_id,
+            protocol = %Protocol::Mysql,
+            %error,
+            "MySQL hardening succeeded, but its optimization attestation could not be persisted"
+        );
+    }
+    Ok(())
 }
 
 async fn apply_mysql_tenant_auth(
@@ -355,6 +397,7 @@ pub(crate) struct MysqlAuthHardeningSummary {
     pub checked: usize,
     pub root_credentials_migrated: usize,
     pub verifiers_repaired: usize,
+    pub attestations_reused: usize,
     pub failures: Vec<MysqlAuthHardeningFailure>,
 }
 
@@ -383,6 +426,26 @@ async fn harden_mysql_account_on_boot(
     };
     if metadata.protocol != Protocol::Mysql || metadata.status != InstanceStatus::Running {
         return summary;
+    }
+    match crate::instances::auth_hardening::attestation_is_current(
+        &state.manager,
+        &state.docker,
+        &metadata,
+    )
+    .await
+    {
+        Ok(true) => {
+            summary.attestations_reused = 1;
+            return summary;
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            event = "audit auth_hardening_attestation_check_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "could not validate the cached hardening attestation; running full MySQL hardening"
+        ),
     }
     summary.checked = 1;
     let mut metadata = metadata;
@@ -604,6 +667,21 @@ async fn harden_mysql_account_on_boot(
             "verified and encrypted current MySQL credentials"
         );
     }
+    if let Err(error) = crate::instances::auth_hardening::record_attestation(
+        &state.manager,
+        &state.docker,
+        &metadata,
+    )
+    .await
+    {
+        tracing::warn!(
+            event = "audit auth_hardening_attestation_write_failed",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            %error,
+            "MySQL hardening succeeded, but its optimization attestation could not be persisted"
+        );
+    }
     summary
 }
 
@@ -615,6 +693,7 @@ fn aggregate_mysql_auth_hardening_summaries(
         summary.checked += outcome.checked;
         summary.root_credentials_migrated += outcome.root_credentials_migrated;
         summary.verifiers_repaired += outcome.verifiers_repaired;
+        summary.attestations_reused += outcome.attestations_reused;
         summary.failures.append(&mut outcome.failures);
     }
     summary.failures.sort_by(|left, right| {
@@ -710,6 +789,7 @@ mod tests {
                 checked: 1,
                 root_credentials_migrated: 0,
                 verifiers_repaired: 1,
+                attestations_reused: 1,
                 failures: vec![MysqlAuthHardeningFailure {
                     instance_id: "mysql-z".to_string(),
                     reason: "z failure".to_string(),
@@ -719,6 +799,7 @@ mod tests {
                 checked: 2,
                 root_credentials_migrated: 1,
                 verifiers_repaired: 0,
+                attestations_reused: 2,
                 failures: vec![MysqlAuthHardeningFailure {
                     instance_id: "mysql-a".to_string(),
                     reason: "a failure".to_string(),
@@ -729,6 +810,7 @@ mod tests {
         assert_eq!(summary.checked, 3);
         assert_eq!(summary.root_credentials_migrated, 1);
         assert_eq!(summary.verifiers_repaired, 1);
+        assert_eq!(summary.attestations_reused, 3);
         assert_eq!(summary.failures.len(), 2);
         assert_eq!(summary.failures[0].instance_id, "mysql-a");
         assert_eq!(summary.failures[1].instance_id, "mysql-z");

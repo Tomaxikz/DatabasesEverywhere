@@ -73,6 +73,14 @@ pub struct DockerInstanceInspection {
     pub image: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedContainerIdentity {
+    pub id: String,
+    /// Docker's immutable start generation for this container. A stop/start
+    /// keeps the container ID but changes this value.
+    pub started_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerContainerStatus {
     Running,
@@ -1114,6 +1122,8 @@ pub enum DockerError {
     },
     #[error("managed container {container} did not report an immutable container id")]
     ManagedContainerIdUnavailable { container: String },
+    #[error("managed container {container} did not report its current start generation")]
+    ManagedContainerStartedAtUnavailable { container: String },
     #[error("DBE node ownership identity is unavailable for this container operation")]
     RuntimeNodeIdUnavailable,
     #[error("file transfer failed for {path}: {source}")]

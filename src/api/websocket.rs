@@ -903,6 +903,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn monitoring_serializes_cpu_as_percentage_points_without_rescaling() {
+        let instance = MonitoringInstance {
+            instance_id: "inst_cpu".to_string(),
+            protocol: "postgres".to_string(),
+            status: "running".to_string(),
+            runtime: "docker",
+            cpu_cores: 1.0,
+            cpu_limit_cores: 1.0,
+            cpu_usage_percent: Some(11.0),
+            memory_mib: 512,
+            memory_usage_bytes: Some(128),
+            memory_limit_bytes: Some(512),
+            disk_mib: 1_024,
+            disk_limit_bytes: 1_024,
+            disk_used_bytes: Some(64),
+            disk_enforced: true,
+            network_rx_bytes: Some(0),
+            network_tx_bytes: Some(0),
+            resources: None,
+            resource_error: None,
+        };
+
+        let json = serde_json::to_value(instance).unwrap();
+        assert_eq!(json["cpu_usage_percent"], serde_json::json!(11.0));
+    }
+
+    #[test]
     fn scoped_claims_filter_foreign_jobs_when_query_is_omitted() {
         let claims = claims_for_instances(vec!["inst_allowed"]);
         let foreign_job = sample_job("job-foreign", "inst_foreign");

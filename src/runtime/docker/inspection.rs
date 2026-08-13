@@ -17,7 +17,7 @@ use crate::{
     constants::docker::PROJECT_LABEL,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
-        container_config::startup_readiness_script,
+        ManagedContainerIdentity, container_config::startup_readiness_script,
     },
     shared::protocol::Protocol,
 };
@@ -77,6 +77,51 @@ impl DockerRuntime {
                 container: container.clone(),
             })?;
         Ok(Some(id))
+    }
+
+    /// Returns a hardening-safe runtime identity. Container IDs survive a
+    /// stop/start, so the start timestamp is included to distinguish a fresh
+    /// database process from a daemon-only restart.
+    pub(crate) async fn verified_managed_container_identity(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<ManagedContainerIdentity>, DockerError> {
+        let container = self.container_name(protocol, instance_id)?;
+        let response = match self.docker.inspect_container(&container, None).await {
+            Ok(response) => response,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let labels = response
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        super::verify_managed_instance_labels(
+            &labels,
+            &container,
+            protocol,
+            instance_id,
+            self.node_id.as_deref(),
+        )?;
+        let id = response
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| DockerError::ManagedContainerIdUnavailable {
+                container: container.clone(),
+            })?;
+        let started_at = response
+            .state
+            .and_then(|state| state.started_at)
+            .filter(|started_at| !started_at.trim().is_empty())
+            .ok_or_else(|| DockerError::ManagedContainerStartedAtUnavailable {
+                container: container.clone(),
+            })?;
+        Ok(Some(ManagedContainerIdentity { id, started_at }))
     }
 
     pub(super) async fn required_managed_container_id(
@@ -597,7 +642,10 @@ impl DockerRuntime {
             Some(
                 StatsOptionsBuilder::default()
                     .stream(false)
-                    .one_shot(true)
+                    // Docker's CLI waits for a second sample before calculating
+                    // CPU usage. Do the same here so `precpu_stats` covers a real
+                    // sampling interval instead of returning an unprimed snapshot.
+                    .one_shot(false)
                     .build(),
             ),
         );

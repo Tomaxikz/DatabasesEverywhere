@@ -7,6 +7,7 @@ use std::{
 
 use aws_lc_rs::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    hmac,
     rand::{SecureRandom, SystemRandom},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -14,11 +15,13 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const PREFIX: &str = "dbev1";
+const FINGERPRINT_PREFIX: &str = "dbevh1";
 const KEY_FILE_NAME: &str = "metadata.key";
 
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     key: Arc<LessSafeKey>,
+    fingerprint_key: Arc<hmac::Key>,
 }
 
 impl SecretStore {
@@ -37,8 +40,14 @@ impl SecretStore {
         };
         let unbound = UnboundKey::new(&aead::AES_256_GCM, &key_bytes)
             .map_err(|_| SecretStoreError::Crypto("failed to initialize metadata key".into()))?;
+        let derivation_key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
+        let fingerprint_key = hmac::sign(
+            &derivation_key,
+            b"databases-everywhere metadata fingerprint key v1",
+        );
         Ok(Self {
             key: Arc::new(LessSafeKey::new(unbound)),
+            fingerprint_key: Arc::new(hmac::Key::new(hmac::HMAC_SHA256, fingerprint_key.as_ref())),
         })
     }
 
@@ -95,6 +104,27 @@ impl SecretStore {
             .map_err(|_| SecretStoreError::InvalidCiphertext)?;
         String::from_utf8(plaintext.to_vec()).map_err(|_| SecretStoreError::InvalidCiphertext)
     }
+
+    /// Produces a key-bound, length-delimited fingerprint without persisting
+    /// plaintext or a password-guessable unkeyed digest.
+    pub(crate) fn fingerprint(&self, domain: &str, instance_id: &str, values: &[&str]) -> String {
+        let mut message = Vec::new();
+        append_fingerprint_field(&mut message, domain.as_bytes());
+        append_fingerprint_field(&mut message, instance_id.as_bytes());
+        for value in values {
+            append_fingerprint_field(&mut message, value.as_bytes());
+        }
+        let tag = hmac::sign(&self.fingerprint_key, &message);
+        format!(
+            "{FINGERPRINT_PREFIX}:{}",
+            URL_SAFE_NO_PAD.encode(tag.as_ref())
+        )
+    }
+}
+
+fn append_fingerprint_field(message: &mut Vec<u8>, value: &[u8]) {
+    message.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    message.extend_from_slice(value);
 }
 
 pub fn is_encrypted(value: &str) -> bool {
@@ -287,5 +317,25 @@ mod tests {
                 .unwrap(),
             plaintext
         );
+    }
+
+    #[test]
+    fn fingerprints_are_keyed_bound_and_length_delimited() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = SecretStore::open_or_create(first_dir.path()).unwrap();
+        let first_reopened = SecretStore::open_or_create(first_dir.path()).unwrap();
+        let second = SecretStore::open_or_create(second_dir.path()).unwrap();
+
+        let expected = first.fingerprint("auth", "inst_1", &["ab", "c"]);
+        assert_eq!(
+            expected,
+            first_reopened.fingerprint("auth", "inst_1", &["ab", "c"])
+        );
+        assert_ne!(expected, first.fingerprint("auth", "inst_1", &["a", "bc"]));
+        assert_ne!(expected, first.fingerprint("auth", "inst_2", &["ab", "c"]));
+        assert_ne!(expected, second.fingerprint("auth", "inst_1", &["ab", "c"]));
+        assert!(expected.starts_with("dbevh1:"));
+        assert!(!expected.contains("ab"));
     }
 }

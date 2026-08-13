@@ -58,6 +58,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         hardened = postgres_role_hardening.hardened,
         administrator_credentials_migrated =
             postgres_role_hardening.administrator_credentials_migrated,
+        attestations_reused = postgres_role_hardening.attestations_reused,
         deferred = postgres_role_hardening.deferred,
         failed = postgres_role_hardening.failures.len(),
         "PostgreSQL role and local authentication hardening complete; failed instances were isolated individually"
@@ -79,6 +80,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         checked = mysql_auth_hardening.checked,
         root_credentials_migrated = mysql_auth_hardening.root_credentials_migrated,
         verifiers_repaired = mysql_auth_hardening.verifiers_repaired,
+        attestations_reused = mysql_auth_hardening.attestations_reused,
         failed = mysql_auth_hardening.failures.len(),
         "MySQL caching_sha2_password migration complete; failed instances were isolated individually"
     );

@@ -38,6 +38,7 @@ use crate::{
 use futures::{StreamExt, TryStreamExt};
 
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
+const STATS_STALE_GRACE: Duration = Duration::from_secs(2);
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_DISK_SCAN_TIMEOUT: Duration = Duration::from_millis(750);
 const BACKGROUND_DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -813,23 +814,24 @@ impl ResourceCache {
             Err(_) => {
                 // Keep the last complete sample briefly during transient Docker
                 // errors instead of making every waiting client retry at once.
-                let mut inner = self.inner.lock().await;
-                let stale = inner.stats.get_mut(&cache_key)?;
-                stale.sampled_at = Instant::now();
-                return Some(stale.clone());
+                // Do not refresh its timestamp: repeated Docker failures must not
+                // make a pre-restart reading appear current forever.
+                return self.stats_after_refresh_error(&cache_key).await;
             }
         };
         let response_cpu_usage = cpu_percent_from_container_stats(&stats);
-        let cpu_usage_percent = match cpu_sample_from_container_stats(stats.cpu_stats.as_ref()) {
-            Some(current) => self
-                .record_cpu_sample(&cache_key, current)
-                .await
-                .or(response_cpu_usage),
-            None => response_cpu_usage,
-        };
+        let cross_response_cpu_usage =
+            match cpu_sample_from_container_stats(stats.cpu_stats.as_ref()) {
+                Some(current) => self.record_cpu_sample(&cache_key, current).await,
+                None => None,
+            };
         let cached = CachedRuntimeStats {
-            cpu_usage_percent,
-            memory_usage_bytes: stats.memory_stats.as_ref().and_then(|memory| memory.usage),
+            // A non-one-shot Docker response contains a primed cpu_stats /
+            // precpu_stats pair. Prefer that same interval used by `docker stats`;
+            // retain the cross-response calculation only as a compatibility
+            // fallback for runtimes that omit precpu_stats.
+            cpu_usage_percent: preferred_cpu_percent(response_cpu_usage, cross_response_cpu_usage),
+            memory_usage_bytes: docker_compatible_memory_usage(&stats),
             sampled_at: Instant::now(),
         };
         let mut inner = self.inner.lock().await;
@@ -862,6 +864,20 @@ impl ResourceCache {
             .get(instance_id)
             .filter(|sample| sample.sampled_at.elapsed() < STATS_REFRESH_INTERVAL)
             .cloned()
+    }
+
+    async fn stats_after_refresh_error(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
+        let mut inner = self.inner.lock().await;
+        let stale = inner
+            .stats
+            .get(instance_id)
+            .filter(|sample| sample.sampled_at.elapsed() < STATS_STALE_GRACE)
+            .cloned();
+        if stale.is_none() {
+            inner.stats.remove(instance_id);
+            inner.cpu_samples.remove(instance_id);
+        }
+        stale
     }
 
     async fn record_cpu_sample(&self, instance_id: &str, current: CpuStatsSample) -> Option<f64> {
@@ -1365,6 +1381,36 @@ fn cpu_percent_from_container_stats(stats: &ContainerStatsResponse) -> Option<f6
     cpu_percent_between(previous, current)
 }
 
+fn preferred_cpu_percent(
+    primed_response_percent: Option<f64>,
+    cross_response_percent: Option<f64>,
+) -> Option<f64> {
+    primed_response_percent.or(cross_response_percent)
+}
+
+fn docker_compatible_memory_usage(stats: &ContainerStatsResponse) -> Option<u64> {
+    let memory = stats.memory_stats.as_ref()?;
+    if stats.os_type.as_deref() == Some("windows") {
+        return memory.privateworkingset.or(memory.usage);
+    }
+
+    let usage = memory.usage?;
+    // Match `docker stats`: on Linux the CLI reports the working set rather
+    // than raw cgroup usage by subtracting inactive file cache. Docker uses
+    // total_inactive_file for cgroup v1 and inactive_file for cgroup v2.
+    let inactive_file = memory
+        .stats
+        .as_ref()
+        .and_then(|values| {
+            values
+                .get("total_inactive_file")
+                .or_else(|| values.get("inactive_file"))
+        })
+        .copied()
+        .unwrap_or(0);
+    Some(usage.saturating_sub(inactive_file.min(usage)))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CpuStatsSample {
     total_usage: u64,
@@ -1388,10 +1434,24 @@ pub(crate) fn cpu_percent_between(
 
 fn cpu_sample_from_container_stats(stats: Option<&ContainerCpuStats>) -> Option<CpuStatsSample> {
     let stats = stats?;
+    let online_cpus = stats
+        .online_cpus
+        .map(u64::from)
+        .filter(|count| *count > 0)
+        .or_else(|| {
+            stats
+                .cpu_usage
+                .as_ref()?
+                .percpu_usage
+                .as_ref()
+                .map(|usage| usage.len() as u64)
+                .filter(|count| *count > 0)
+        })
+        .unwrap_or(1);
     Some(CpuStatsSample {
         total_usage: stats.cpu_usage.as_ref()?.total_usage?,
         system_cpu_usage: stats.system_cpu_usage?,
-        online_cpus: u64::from(stats.online_cpus.unwrap_or(1)).max(1),
+        online_cpus,
     })
 }
 

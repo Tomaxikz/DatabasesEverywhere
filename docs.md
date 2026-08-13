@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.5 # replace with the reviewed release
+DBEV_VERSION=v0.5.9 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -328,7 +328,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.5@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.9@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -803,7 +803,12 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 ```
 
 CPU and memory fields are `null` when the container isn't running or container
-runtime stats aren't available yet. Network counters are measured at DBE's authenticated
+runtime stats aren't available yet. CPU usage is reported in percentage points:
+`11.0` means 11%, not `0.11`; panels must not divide or multiply it by 100. DBEV
+uses Docker's primed two-sample CPU interval, including the runtime-reported
+online CPU count, so the value follows `docker stats --no-stream` semantics.
+On Linux, memory usage is the Docker-compatible working set (raw cgroup usage
+minus inactive file cache), not raw cgroup usage. Network counters are measured at DBE's authenticated
 gateway-to-Unix-socket boundary because managed containers use
 `network_mode=none`; RX is traffic delivered to the database and TX is traffic
 returned by it. The counters start at zero on daemon boot. For continuous
@@ -1377,6 +1382,10 @@ Restore requires explicit intent — `confirm` and a `reason` (it's audit-logged
 
 WebSockets use short-lived JWTs instead of the node token, so you can hand them to a browser without exposing node credentials.
 
+For a complete panel/AI implementation handoff covering event reducers,
+reconnection, close codes, capacity, and daemon-restart state, see
+[`docs/panel-websocket-ai-handoff.md`](docs/panel-websocket-ai-handoff.md).
+
 ### Step 1: mint a token (panel side)
 
 ```json
@@ -1451,17 +1460,23 @@ Every message is a JSON object with a `type` field.
 }
 ```
 
+`cpu_usage_percent` is already expressed as percentage points (`11.0` is 11%).
+The WebSocket does not rescale it, and the panel must not rescale it either.
+Snapshots are emitted every 500 ms, while Docker CPU measurements use a primed
+sampling interval; adjacent snapshots may therefore repeat the same authoritative
+sample rather than fabricate a new short-window value.
+
 Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories. Concurrent fallback walks are coalesced per instance and capped node-wide. Monitoring clients share each completed all-instance sample, which is then filtered against each JWT before serialization.
 `install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. The existing `healthcheck` stage name is retained for API compatibility but represents the bounded startup-readiness check, not a permanent probe. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
 
-**`/ws/instances/{instance_id}/logs`** (scope `logs:read`, token must cover the instance) — a snapshot every 3 seconds:
+**`/ws/instances/{instance_id}/logs`** (scope `logs:read`, token must cover the instance) — a rolling snapshot whenever output arrives plus a 30-second heartbeat:
 
 ```json
 { "type": "logs", "instance_id": "cust-42-db", "sequence": 7,
   "stdout": "…", "stderr": "…", "error": null }
 ```
 
-Connection URLs in log output are redacted before they leave the daemon. If fetching logs fails, `stdout`/`stderr` are null and `error` says why.
+Connection URLs in log output are redacted before they leave the daemon. If fetching logs fails, `stdout`/`stderr` are null and `error` says why. The stdout/stderr fields are cumulative rolling buffers for the current connection, not deltas, and `sequence` resets whenever the socket reconnects.
 
 **`/ws/instances/{instance_id}/import-export?job_id=…`** (scope `import-export:read`, token must cover the instance) — `job_id` is optional. On connect you get that instance's current state, then push updates as its jobs change:
 
@@ -1501,6 +1516,20 @@ of database instance or gateway state. Clients should use each instance's status
 for instance readiness and `/api/system.gateways` for listener startup state.
 Database gateways open after background startup and legacy PostgreSQL role
 hardening complete.
+
+Successful PostgreSQL and MySQL authentication hardening is recorded only in
+DBEV's private SQLite metadata. The attestation is bound to the owned runtime's
+full container ID, Docker/Podman start generation, a keyed fingerprint of the
+current protected credentials and route identity, and DBEV's internal
+hardening revision. A daemon-only restart can therefore skip repeat database
+mutation and authentication probes for an unchanged running container. A real
+container restart, replacement or image upgrade, a password or route change,
+a missing/corrupt attestation, or a future hardening revision automatically
+forces the complete fail-closed hardening flow again. Attestations contain no
+plaintext passwords, are never returned by the API, and are deleted with their
+instance metadata. Failure to read or write this optimization never bypasses
+hardening: DBEV runs the full check and merely retries attestation persistence
+on a later successful pass.
 
 Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, `token`, `jwt_signing_key`, and the Fuse helper path/digest; those security boundaries must be changed deliberately in the host config. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, path, image, or runtime changes to take effect.
 
