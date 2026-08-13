@@ -17,7 +17,7 @@ use crate::{
     constants::docker::PROJECT_LABEL,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
-        ManagedContainerIdentity, container_config::startup_readiness_script,
+        ManagedContainerIdentity, ManagedStatsSampler, container_config::startup_readiness_script,
     },
     shared::protocol::Protocol,
 };
@@ -634,18 +634,38 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<ContainerStatsResponse, DockerError> {
-        let name = self
+        self.stats_sampler(protocol, instance_id)
+            .await?
+            .sample()
+            .await
+    }
+
+    pub(crate) async fn stats_sampler(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<ManagedStatsSampler, DockerError> {
+        let container_id = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
+        Ok(ManagedStatsSampler {
+            docker: self.docker.clone(),
+            container_id,
+        })
+    }
+}
+
+impl ManagedStatsSampler {
+    pub(crate) async fn sample(&self) -> Result<ContainerStatsResponse, DockerError> {
         let mut stream = self.docker.stats(
-            &name,
+            &self.container_id,
             Some(
                 StatsOptionsBuilder::default()
                     .stream(false)
-                    // Docker's CLI waits for a second sample before calculating
-                    // CPU usage. Do the same here so `precpu_stats` covers a real
-                    // sampling interval instead of returning an unprimed snapshot.
-                    .one_shot(false)
+                    // Match wings-rs: take a non-streaming counter snapshot.
+                    // Callers calculate CPU from consecutive samples and real
+                    // wall-clock time rather than Docker's system CPU counter.
+                    .one_shot(true)
                     .build(),
             ),
         );

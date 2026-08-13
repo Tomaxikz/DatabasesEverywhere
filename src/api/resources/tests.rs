@@ -24,61 +24,38 @@ fn parses_host_cpu_and_calculates_non_idle_percentage() {
 
 #[test]
 fn container_cpu_counter_resets_do_not_emit_bogus_usage() {
-    let previous = CpuStatsSample {
-        total_usage: 1_000,
-        system_cpu_usage: 10_000,
-        online_cpus: 4,
-    };
-    let reset = CpuStatsSample {
-        total_usage: 10,
-        system_cpu_usage: 100,
-        online_cpus: 4,
-    };
-
-    assert_eq!(cpu_percent_between(previous, reset), None);
-}
-
-#[test]
-fn container_cpu_matches_docker_percentage_points() {
-    let previous = CpuStatsSample {
-        total_usage: 1_000,
-        system_cpu_usage: 10_000,
-        online_cpus: 4,
-    };
-    let current = CpuStatsSample {
-        total_usage: 1_110,
-        system_cpu_usage: 14_000,
-        online_cpus: 4,
-    };
-
-    assert_eq!(cpu_percent_between(previous, current), Some(11.0));
-}
-
-#[test]
-fn primed_docker_cpu_sample_wins_over_cross_request_fallback() {
-    assert_eq!(preferred_cpu_percent(Some(11.0), Some(0.01)), Some(11.0));
-    assert_eq!(preferred_cpu_percent(None, Some(0.01)), Some(0.01));
-}
-
-#[test]
-fn container_cpu_uses_per_cpu_count_when_online_cpus_is_missing() {
-    let stats = ContainerCpuStats {
-        cpu_usage: Some(ContainerCpuUsage {
-            total_usage: Some(1_000),
-            percpu_usage: Some(vec![0; 8]),
-            ..ContainerCpuUsage::default()
-        }),
-        system_cpu_usage: Some(10_000),
-        online_cpus: None,
-        ..ContainerCpuStats::default()
-    };
-
     assert_eq!(
-        cpu_sample_from_container_stats(Some(&stats))
-            .unwrap()
-            .online_cpus,
-        8
+        cpu_percent_over_wall_time(1_000, 10, Duration::from_secs(1)),
+        0.0
     );
+}
+
+#[test]
+fn container_cpu_matches_wings_rs_wall_clock_percentage() {
+    assert_eq!(
+        cpu_percent_over_wall_time(1_000, 110_001_000, Duration::from_secs(1)),
+        11.0
+    );
+    assert_eq!(
+        cpu_percent_over_wall_time(1_000, 2_500_001_000, Duration::from_secs(1)),
+        250.0
+    );
+}
+
+#[test]
+fn container_cpu_reads_the_cgroup_total_counter() {
+    let stats = ContainerStatsResponse {
+        cpu_stats: Some(ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(123_456),
+                ..ContainerCpuUsage::default()
+            }),
+            ..ContainerCpuStats::default()
+        }),
+        ..ContainerStatsResponse::default()
+    };
+
+    assert_eq!(container_cpu_total(&stats), Some(123_456));
 }
 
 #[test]
@@ -99,9 +76,47 @@ fn memory_usage_matches_docker_cli_working_set_on_cgroup_v1_and_v2() {
 }
 
 #[tokio::test]
-async fn docker_refresh_errors_cannot_keep_old_runtime_stats_alive() {
+async fn polling_stats_workers_ignore_superseded_samples() {
     let cache = ResourceCache::default();
-    let fresh_sampled_at = Instant::now() - STATS_REFRESH_INTERVAL;
+    let first_worker = cache.begin_runtime_stats_worker("inst_stats").await;
+    let second_worker = cache.begin_runtime_stats_worker("inst_stats").await;
+    let stats = ContainerStatsResponse {
+        cpu_stats: Some(ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(1_110),
+                percpu_usage: Some(vec![0; 4]),
+                ..ContainerCpuUsage::default()
+            }),
+            system_cpu_usage: Some(14_000),
+            online_cpus: Some(4),
+            ..ContainerCpuStats::default()
+        }),
+        memory_stats: Some(ContainerMemoryStats {
+            usage: Some(512),
+            ..ContainerMemoryStats::default()
+        }),
+        ..ContainerStatsResponse::default()
+    };
+
+    assert!(
+        !cache
+            .store_runtime_stats("inst_stats", first_worker, Some(99.0), &stats)
+            .await
+    );
+    assert!(
+        cache
+            .store_runtime_stats("inst_stats", second_worker, Some(11.0), &stats)
+            .await
+    );
+    let sample = cache.runtime_stats("inst_stats").await.unwrap();
+    assert_eq!(sample.cpu_usage_percent, Some(11.0));
+    assert_eq!(sample.memory_usage_bytes, Some(512));
+}
+
+#[tokio::test]
+async fn stopped_or_stale_runtime_stats_are_not_reported() {
+    let cache = ResourceCache::default();
+    let worker = cache.begin_runtime_stats_worker("inst_stats").await;
     {
         let mut inner = cache.inner.lock().await;
         inner.stats.insert(
@@ -109,36 +124,20 @@ async fn docker_refresh_errors_cannot_keep_old_runtime_stats_alive() {
             CachedRuntimeStats {
                 cpu_usage_percent: Some(11.0),
                 memory_usage_bytes: Some(384),
-                sampled_at: fresh_sampled_at,
+                sampled_at: Instant::now() - RUNTIME_STATS_STALE_AFTER,
             },
         );
     }
 
-    let transient = cache.stats_after_refresh_error("inst_stats").await.unwrap();
-    assert_eq!(transient.sampled_at, fresh_sampled_at);
-
-    {
-        let mut inner = cache.inner.lock().await;
-        inner.stats.get_mut("inst_stats").unwrap().sampled_at = Instant::now() - STATS_STALE_GRACE;
-        inner.cpu_samples.insert(
-            "inst_stats".to_string(),
-            CpuStatsSample {
-                total_usage: 1,
-                system_cpu_usage: 2,
-                online_cpus: 1,
-            },
-        );
-    }
-
-    assert!(
-        cache
-            .stats_after_refresh_error("inst_stats")
-            .await
-            .is_none()
-    );
+    assert!(cache.runtime_stats("inst_stats").await.is_none());
     let inner = cache.inner.lock().await;
     assert!(!inner.stats.contains_key("inst_stats"));
-    assert!(!inner.cpu_samples.contains_key("inst_stats"));
+    assert_eq!(inner.runtime_stats_workers.get("inst_stats"), Some(&worker));
+    drop(inner);
+
+    cache.clear_runtime_stats("inst_stats").await;
+    let inner = cache.inner.lock().await;
+    assert!(!inner.runtime_stats_workers.contains_key("inst_stats"));
 }
 
 #[tokio::test]

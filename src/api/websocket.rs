@@ -83,8 +83,10 @@ async fn stream_monitoring(
     let _monitor = state.resource_cache.register_monitor();
     let authorization = InstanceAuthorization::from_claims(&claims);
     let mut shutdown = state.daemon_shutdown.subscribe();
-    let mut ticker = interval(Duration::from_millis(500));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut ticker = interval(Duration::from_secs(1));
+    // Monitoring snapshots are current state, not an event backlog. If a send
+    // is delayed, skip missed ticks instead of emitting catch-up bursts.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let expiration_deadline = jwt_expiration_deadline(claims.exp);
     let expiration = sleep_until(expiration_deadline);
     tokio::pin!(expiration);

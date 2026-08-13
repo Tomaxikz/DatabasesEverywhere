@@ -336,6 +336,7 @@ mod tests {
         assert_ne!(expected, first.fingerprint("auth", "inst_2", &["ab", "c"]));
         assert_ne!(expected, second.fingerprint("auth", "inst_1", &["ab", "c"]));
         assert!(expected.starts_with("dbevh1:"));
-        assert!(!expected.contains("ab"));
+        let encoded = expected.strip_prefix("dbevh1:").unwrap();
+        assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap().len(), 32);
     }
 }

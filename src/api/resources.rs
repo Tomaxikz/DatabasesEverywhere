@@ -11,11 +11,12 @@ use std::{
 };
 
 use axum::extract::State;
-use bollard::models::{ContainerCpuStats, ContainerStatsResponse};
+use bollard::models::ContainerStatsResponse;
 use serde::Serialize;
 use tokio::{
     sync::{Mutex, Semaphore},
-    time::Instant,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
 };
 
 use crate::{
@@ -31,14 +32,21 @@ use crate::{
         metadata::{InstanceMetadata, InstanceStatus},
         paths::InstancePaths,
     },
-    runtime::docker::DockerRuntime,
     shared::protocol::Protocol,
 };
 
 use futures::{StreamExt, TryStreamExt};
 
-const STATS_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
-const STATS_STALE_GRACE: Duration = Duration::from_secs(2);
+#[path = "resources/runtime_metrics.rs"]
+mod runtime_metrics;
+
+use runtime_metrics::{
+    container_cpu_total, cpu_percent_over_wall_time, docker_compatible_memory_usage,
+};
+
+const HOST_CPU_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
+const RUNTIME_STATS_STALE_AFTER: Duration = Duration::from_secs(3);
+const RUNTIME_STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_DISK_SCAN_TIMEOUT: Duration = Duration::from_millis(750);
 const BACKGROUND_DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,8 +75,8 @@ impl Default for ResourceCache {
 #[derive(Debug, Default)]
 struct ResourceCacheInner {
     stats: HashMap<String, CachedRuntimeStats>,
-    stats_refresh_locks: HashMap<String, Arc<Mutex<()>>>,
-    cpu_samples: HashMap<String, CpuStatsSample>,
+    runtime_stats_workers: HashMap<String, u64>,
+    next_runtime_stats_worker: u64,
     network: HashMap<String, NetworkCounter>,
     disk: HashMap<String, CachedDiskUsage>,
     disk_refreshing: HashMap<String, bool>,
@@ -361,7 +369,7 @@ pub(crate) async fn resource_report(
 ) -> Result<ResourceReport, ApiError> {
     let stats = state
         .resource_cache
-        .runtime_stats(&state.docker, metadata.protocol, &metadata.instance_id)
+        .runtime_stats(&metadata.instance_id)
         .await;
     let (network_rx_bytes, network_tx_bytes) = state
         .resource_cache
@@ -564,7 +572,7 @@ impl ResourceCache {
             let inner = self.inner.lock().await;
             if let Some(cached) = inner
                 .host_cpu_usage
-                .filter(|cached| cached.sampled_at.elapsed() < STATS_REFRESH_INTERVAL)
+                .filter(|cached| cached.sampled_at.elapsed() < HOST_CPU_REFRESH_INTERVAL)
             {
                 return Ok(cached);
             }
@@ -763,8 +771,7 @@ impl ResourceCache {
     pub async fn remove(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
         inner.stats.remove(instance_id);
-        inner.stats_refresh_locks.remove(instance_id);
-        inner.cpu_samples.remove(instance_id);
+        inner.runtime_stats_workers.remove(instance_id);
         inner.network.remove(instance_id);
         inner.disk.remove(instance_id);
         inner.disk_refreshing.remove(instance_id);
@@ -782,61 +789,17 @@ impl ResourceCache {
         self.active_monitors.load(Ordering::Relaxed) > 0
     }
 
-    async fn runtime_stats(
-        &self,
-        docker: &DockerRuntime,
-        protocol: Protocol,
-        instance_id: &str,
-    ) -> Option<CachedRuntimeStats> {
-        let cache_key = instance_id.to_string();
-        if let Some(cached) = self.fresh_stats(&cache_key).await {
-            return Some(cached);
-        }
-
-        // Multiple REST requests and monitoring sockets can ask for the same
-        // container simultaneously. Serialize only that instance's refresh,
-        // then recheck the cache so one Docker call feeds every consumer.
-        let refresh_lock = {
-            let mut inner = self.inner.lock().await;
-            inner
-                .stats_refresh_locks
-                .entry(cache_key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _refresh = refresh_lock.lock().await;
-        if let Some(cached) = self.fresh_stats(&cache_key).await {
-            return Some(cached);
-        }
-
-        let stats = match docker.stats(protocol, instance_id).await {
-            Ok(stats) => stats,
-            Err(_) => {
-                // Keep the last complete sample briefly during transient Docker
-                // errors instead of making every waiting client retry at once.
-                // Do not refresh its timestamp: repeated Docker failures must not
-                // make a pre-restart reading appear current forever.
-                return self.stats_after_refresh_error(&cache_key).await;
-            }
-        };
-        let response_cpu_usage = cpu_percent_from_container_stats(&stats);
-        let cross_response_cpu_usage =
-            match cpu_sample_from_container_stats(stats.cpu_stats.as_ref()) {
-                Some(current) => self.record_cpu_sample(&cache_key, current).await,
-                None => None,
-            };
-        let cached = CachedRuntimeStats {
-            // A non-one-shot Docker response contains a primed cpu_stats /
-            // precpu_stats pair. Prefer that same interval used by `docker stats`;
-            // retain the cross-response calculation only as a compatibility
-            // fallback for runtimes that omit precpu_stats.
-            cpu_usage_percent: preferred_cpu_percent(response_cpu_usage, cross_response_cpu_usage),
-            memory_usage_bytes: docker_compatible_memory_usage(&stats),
-            sampled_at: Instant::now(),
-        };
+    async fn runtime_stats(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
         let mut inner = self.inner.lock().await;
-        inner.stats.insert(cache_key, cached.clone());
-        Some(cached)
+        let cached = inner.stats.get(instance_id).cloned();
+        if cached
+            .as_ref()
+            .is_some_and(|sample| sample.sampled_at.elapsed() < RUNTIME_STATS_STALE_AFTER)
+        {
+            return cached;
+        }
+        inner.stats.remove(instance_id);
+        None
     }
 
     pub(crate) async fn network_counter(&self, instance_id: &str) -> NetworkCounter {
@@ -857,38 +820,47 @@ impl ResourceCache {
             .unwrap_or_default()
     }
 
-    async fn fresh_stats(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
-        let inner = self.inner.lock().await;
+    async fn begin_runtime_stats_worker(&self, instance_id: &str) -> u64 {
+        let mut inner = self.inner.lock().await;
+        inner.next_runtime_stats_worker = inner.next_runtime_stats_worker.wrapping_add(1).max(1);
+        let worker = inner.next_runtime_stats_worker;
         inner
-            .stats
-            .get(instance_id)
-            .filter(|sample| sample.sampled_at.elapsed() < STATS_REFRESH_INTERVAL)
-            .cloned()
+            .runtime_stats_workers
+            .insert(instance_id.to_string(), worker);
+        worker
     }
 
-    async fn stats_after_refresh_error(&self, instance_id: &str) -> Option<CachedRuntimeStats> {
+    async fn store_runtime_stats(
+        &self,
+        instance_id: &str,
+        worker: u64,
+        cpu_usage_percent: Option<f64>,
+        stats: &ContainerStatsResponse,
+    ) -> bool {
+        let sample = CachedRuntimeStats {
+            cpu_usage_percent,
+            memory_usage_bytes: docker_compatible_memory_usage(stats),
+            sampled_at: Instant::now(),
+        };
         let mut inner = self.inner.lock().await;
-        let stale = inner
-            .stats
-            .get(instance_id)
-            .filter(|sample| sample.sampled_at.elapsed() < STATS_STALE_GRACE)
-            .cloned();
-        if stale.is_none() {
-            inner.stats.remove(instance_id);
-            inner.cpu_samples.remove(instance_id);
+        if inner.runtime_stats_workers.get(instance_id) != Some(&worker) {
+            return false;
         }
-        stale
+        inner.stats.insert(instance_id.to_string(), sample);
+        true
     }
 
-    async fn record_cpu_sample(&self, instance_id: &str, current: CpuStatsSample) -> Option<f64> {
+    async fn finish_runtime_stats_worker(&self, instance_id: &str, worker: u64) {
         let mut inner = self.inner.lock().await;
-        let usage = inner
-            .cpu_samples
-            .get(instance_id)
-            .copied()
-            .and_then(|previous| cpu_percent_between(previous, current));
-        inner.cpu_samples.insert(instance_id.to_string(), current);
-        usage
+        if inner.runtime_stats_workers.get(instance_id) == Some(&worker) {
+            inner.runtime_stats_workers.remove(instance_id);
+        }
+    }
+
+    async fn clear_runtime_stats(&self, instance_id: &str) {
+        let mut inner = self.inner.lock().await;
+        inner.runtime_stats_workers.remove(instance_id);
+        inner.stats.remove(instance_id);
     }
 
     pub(crate) async fn disk_usage(
@@ -1221,15 +1193,187 @@ impl ResourceCache {
 }
 
 pub fn start_resource_sampler(state: AppState) {
+    start_runtime_stats_sampler(state.clone());
+    start_disk_usage_sampler(state);
+}
+
+struct RuntimeStatsTask {
+    worker: u64,
+    handle: JoinHandle<()>,
+}
+
+fn start_runtime_stats_sampler(state: AppState) {
     let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(DISK_REFRESH_INTERVAL);
+        let mut tasks = HashMap::<String, RuntimeStatsTask>::new();
+        let mut ticker = tokio::time::interval(RUNTIME_STATS_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tracing::info!(
+            sample_source = "docker_one_shot_wall_clock_delta",
+            sample_interval_ms = 1_000_u64,
+            websocket_publish_interval_ms = 1_000_u64,
+            "container resource monitoring started with Calagopus wings-rs sampling semantics"
+        );
         loop {
             tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        tracing::info!("resource sampler stopped");
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {
+                    reconcile_runtime_stats_tasks(&state, &mut tasks).await;
+                }
+            }
+        }
+        for (instance_id, task) in tasks {
+            state.resource_cache.clear_runtime_stats(&instance_id).await;
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+        tracing::info!("container resource monitoring stopped");
+    });
+}
+
+async fn reconcile_runtime_stats_tasks(
+    state: &AppState,
+    tasks: &mut HashMap<String, RuntimeStatsTask>,
+) {
+    let desired = state
+        .instances
+        .list()
+        .await
+        .into_iter()
+        .filter(|metadata| {
+            matches!(
+                metadata.status,
+                InstanceStatus::Booting | InstanceStatus::Running
+            )
+        })
+        .map(|metadata| (metadata.instance_id.clone(), metadata))
+        .collect::<HashMap<_, _>>();
+
+    let finished_or_stopped = tasks
+        .iter()
+        .filter_map(|(instance_id, task)| {
+            (task.handle.is_finished() || !desired.contains_key(instance_id))
+                .then_some(instance_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for instance_id in finished_or_stopped {
+        let Some(task) = tasks.remove(&instance_id) else {
+            continue;
+        };
+        if !desired.contains_key(&instance_id) {
+            state.resource_cache.clear_runtime_stats(&instance_id).await;
+            task.handle.abort();
+        } else {
+            state
+                .resource_cache
+                .finish_runtime_stats_worker(&instance_id, task.worker)
+                .await;
+        }
+        if let Err(error) = task.handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(
+                %instance_id,
+                %error,
+                "container resource stream task stopped unexpectedly; it will be restarted"
+            );
+        }
+    }
+
+    for (instance_id, metadata) in desired {
+        if tasks.contains_key(&instance_id) {
+            continue;
+        }
+        let worker = state
+            .resource_cache
+            .begin_runtime_stats_worker(&instance_id)
+            .await;
+        let cache = state.resource_cache.clone();
+        let docker = state.docker.clone();
+        let protocol = metadata.protocol;
+        let task_instance_id = instance_id.clone();
+        let handle = tokio::spawn(async move {
+            let sampler = match docker.stats_sampler(protocol, &task_instance_id).await {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    tracing::debug!(
+                        instance_id = %task_instance_id,
+                        %protocol,
+                        %error,
+                        "could not bind the container resource sampler; retrying"
+                    );
+                    cache
+                        .finish_runtime_stats_worker(&task_instance_id, worker)
+                        .await;
+                    return;
+                }
+            };
+            let mut previous_cpu = None::<(u64, Instant)>;
+            loop {
+                // wings-rs takes one one-shot counter snapshot per second. Run
+                // the sleep concurrently so a slow Docker request does not add
+                // an extra second to the sampling interval.
+                let (result, _) = tokio::join!(
+                    sampler.sample(),
+                    tokio::time::sleep(RUNTIME_STATS_POLL_INTERVAL)
+                );
+                let stats = match result {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        tracing::debug!(
+                            instance_id = %task_instance_id,
+                            %protocol,
+                            %error,
+                            "one-shot container resource sample failed; rebinding the sampler"
+                        );
+                        break;
+                    }
+                };
+                let sampled_at = Instant::now();
+                let current_cpu = container_cpu_total(&stats);
+                let cpu_usage_percent = current_cpu.map(|current_total| {
+                    previous_cpu
+                        .map(|(previous_total, previous_at)| {
+                            cpu_percent_over_wall_time(
+                                previous_total,
+                                current_total,
+                                sampled_at.duration_since(previous_at),
+                            )
+                        })
+                        .unwrap_or(0.0)
+                });
+                previous_cpu = current_cpu.map(|total| (total, sampled_at));
+                if !cache
+                    .store_runtime_stats(&task_instance_id, worker, cpu_usage_percent, &stats)
+                    .await
+                {
+                    break;
+                }
+            }
+            cache
+                .finish_runtime_stats_worker(&task_instance_id, worker)
+                .await;
+        });
+        tasks.insert(instance_id, RuntimeStatsTask { worker, handle });
+    }
+}
+
+fn start_disk_usage_sampler(state: AppState) {
+    let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(DISK_REFRESH_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        tracing::info!("resource disk sampler stopped");
                         break;
                     }
                 }
@@ -1336,124 +1480,12 @@ fn ensure_scan_budget(
 }
 
 #[cfg(test)]
-mod disk_scan_tests {
-    use std::{fs, os::unix::fs::symlink};
-
-    use super::*;
-
-    #[test]
-    fn disk_scan_counts_regular_files_without_following_symlinks() {
-        let temporary = tempfile::tempdir().unwrap();
-        let data = temporary.path().join("data");
-        let outside = temporary.path().join("outside");
-        fs::create_dir_all(data.join("nested")).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(data.join("root.bin"), [0_u8; 7]).unwrap();
-        fs::write(data.join("nested/child.bin"), [0_u8; 11]).unwrap();
-        fs::write(outside.join("secret.bin"), [0_u8; 101]).unwrap();
-        symlink(&outside, data.join("outside-link")).unwrap();
-
-        assert_eq!(
-            directory_size_blocking(&data, Duration::from_secs(1)).unwrap(),
-            18
-        );
-    }
-
-    #[test]
-    fn disk_scan_rejects_a_symlink_root() {
-        let temporary = tempfile::tempdir().unwrap();
-        let data = temporary.path().join("data");
-        let linked = temporary.path().join("linked");
-        fs::create_dir(&data).unwrap();
-        symlink(&data, &linked).unwrap();
-
-        assert!(directory_size_blocking(&linked, Duration::from_secs(1)).is_err());
-    }
-}
+#[path = "resources/disk_scan_tests.rs"]
+mod disk_scan_tests;
 
 #[cfg(test)]
 #[path = "resources/tests.rs"]
 mod node_summary_tests;
-
-fn cpu_percent_from_container_stats(stats: &ContainerStatsResponse) -> Option<f64> {
-    let current = cpu_sample_from_container_stats(stats.cpu_stats.as_ref())?;
-    let previous = cpu_sample_from_container_stats(stats.precpu_stats.as_ref())?;
-    cpu_percent_between(previous, current)
-}
-
-fn preferred_cpu_percent(
-    primed_response_percent: Option<f64>,
-    cross_response_percent: Option<f64>,
-) -> Option<f64> {
-    primed_response_percent.or(cross_response_percent)
-}
-
-fn docker_compatible_memory_usage(stats: &ContainerStatsResponse) -> Option<u64> {
-    let memory = stats.memory_stats.as_ref()?;
-    if stats.os_type.as_deref() == Some("windows") {
-        return memory.privateworkingset.or(memory.usage);
-    }
-
-    let usage = memory.usage?;
-    // Match `docker stats`: on Linux the CLI reports the working set rather
-    // than raw cgroup usage by subtracting inactive file cache. Docker uses
-    // total_inactive_file for cgroup v1 and inactive_file for cgroup v2.
-    let inactive_file = memory
-        .stats
-        .as_ref()
-        .and_then(|values| {
-            values
-                .get("total_inactive_file")
-                .or_else(|| values.get("inactive_file"))
-        })
-        .copied()
-        .unwrap_or(0);
-    Some(usage.saturating_sub(inactive_file.min(usage)))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CpuStatsSample {
-    total_usage: u64,
-    system_cpu_usage: u64,
-    online_cpus: u64,
-}
-
-pub(crate) fn cpu_percent_between(
-    previous: CpuStatsSample,
-    current: CpuStatsSample,
-) -> Option<f64> {
-    let cpu_delta = current.total_usage.checked_sub(previous.total_usage)?;
-    let system_delta = current
-        .system_cpu_usage
-        .checked_sub(previous.system_cpu_usage)?;
-    if system_delta == 0 {
-        return None;
-    }
-    Some((cpu_delta as f64 / system_delta as f64) * current.online_cpus as f64 * 100.0)
-}
-
-fn cpu_sample_from_container_stats(stats: Option<&ContainerCpuStats>) -> Option<CpuStatsSample> {
-    let stats = stats?;
-    let online_cpus = stats
-        .online_cpus
-        .map(u64::from)
-        .filter(|count| *count > 0)
-        .or_else(|| {
-            stats
-                .cpu_usage
-                .as_ref()?
-                .percpu_usage
-                .as_ref()
-                .map(|usage| usage.len() as u64)
-                .filter(|count| *count > 0)
-        })
-        .unwrap_or(1);
-    Some(CpuStatsSample {
-        total_usage: stats.cpu_usage.as_ref()?.total_usage?,
-        system_cpu_usage: stats.system_cpu_usage?,
-        online_cpus,
-    })
-}
 
 pub(crate) fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(1024 * 1024)

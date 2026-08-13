@@ -81,6 +81,15 @@ pub(crate) struct ManagedContainerIdentity {
     pub started_at: String,
 }
 
+/// A stats reader bound to one verified managed-container generation. It is
+/// recreated after an engine error so a container restart cannot leave the
+/// sampler polling a stale container ID.
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedStatsSampler {
+    docker: Docker,
+    container_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerContainerStatus {
     Running,

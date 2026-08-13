@@ -25,6 +25,20 @@ fn cli_exposes_the_package_version() {
 }
 
 #[test]
+fn startup_banner_identifies_the_release_and_security_model() {
+    let banner = startup_banner();
+
+    assert!(banner.contains(env!("CARGO_PKG_VERSION")));
+    assert!(banner.contains(crate::api::system::API_VERSION));
+    assert!(banner.contains("DATABASES EVERYWHERE"));
+    assert!(banner.contains("private sockets"));
+    assert!(banner.contains("PostgreSQL / MySQL / MariaDB / MongoDB"));
+    assert!(banner.contains("ClickHouse / Redis / Valkey / Qdrant"));
+    assert!(banner.is_ascii());
+    assert!(banner.lines().all(|line| line.len() <= 72));
+}
+
+#[test]
 fn api_connection_admission_is_per_ip_and_releases_capacity() {
     let limiter = Arc::new(ApiConnectionLimiter::new(3, 2));
     let first_ip: IpAddr = "192.0.2.10".parse().unwrap();

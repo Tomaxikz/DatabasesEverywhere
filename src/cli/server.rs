@@ -726,11 +726,22 @@ pub(super) fn init_configured_logging(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn startup_banner() -> &'static str {
-    r#" ____        _        _                         _____                           _
-|  _ \  __ _| |_ __ _| |__   __ _ ___  ___  ___| ____|_   _____ _ __ _   ___      _____ _ __ ___
-| | | |/ _` | __/ _` | '_ \ / _` / __|/ _ \/ __|  _| \ \ / / _ \ '__| | | \ \ /\ / / _ \ '__/ _ \
-| |_| | (_| | || (_| | |_) | (_| \__ \  __/\__ \ |___ \ V /  __/ |  | |_| |\ V  V /  __/ | |  __/
-|____/ \__,_|\__\__,_|_.__/ \__,_|___/\___||___/_____| \_/ \___|_|   \__, | \_/\_/ \___|_|  \___|
-                                                                      |___/"#
+pub(super) fn startup_banner() -> String {
+    format!(
+        r#"     ____    ____    ______  _    __
+    / __ \  / __ )  / ____/ | |  / /
+   / / / / / __  | / __/    | | / /
+  / /_/ / / /_/ / / /___    | |/ /
+ /_____/ /_____/ /_____/     |___/
+
+ DATABASES EVERYWHERE
+ Isolated database workloads, managed from one control plane.
+
+ RELEASE    {release:<18} API       {api}
+ ENGINES    Docker / Podman    NETWORK   private sockets
+ DATABASES  PostgreSQL / MySQL / MariaDB / MongoDB
+            ClickHouse / Redis / Valkey / Qdrant"#,
+        release = env!("CARGO_PKG_VERSION"),
+        api = crate::api::system::API_VERSION,
+    )
 }

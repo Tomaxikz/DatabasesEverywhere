@@ -13,7 +13,7 @@ release changes the contract.
 
 | Endpoint | Required WebSocket JWT scope | Instance rule | Delivery model |
 | --- | --- | --- | --- |
-| `/ws/monitoring` | `monitor:read` | JWT allow-list is applied to every snapshot | Full current snapshot every 500 ms |
+| `/ws/monitoring` | `monitor:read` | JWT allow-list is applied to every snapshot | Full current snapshot every second |
 | `/ws/instances/{instance_id}/logs?tail=100` | `logs:read` | JWT must allow the path instance | Docker log follow stream plus a rolling snapshot heartbeat |
 | `/ws/instances/{instance_id}/import-export?job_id={optional}` | `import-export:read` | JWT must allow the path instance | Durable initial snapshot, then live job updates |
 
@@ -149,7 +149,7 @@ tracking. Token reuse is not part of the API contract.
 
 Endpoint: `/ws/monitoring`, scope `monitor:read`.
 
-The server sends a complete authorized snapshot every 500 ms. It is not a
+The server sends a complete authorized snapshot every second. It is not a
 delta. Replace the panel's node-monitoring state from each message. Instances
 outside the JWT allow-list never appear.
 
@@ -206,10 +206,11 @@ Important behavior:
 - `cpu_usage_percent` is expressed in percentage points. Render `11.0` as
   `11.0%`; do not divide or multiply it by 100. DBEV forwards the same value in
   the top-level field and nested resource report.
-- CPU is based on Docker's primed two-sample interval and Linux memory is the
-  Docker-compatible working set. Because snapshots are sent every 500 ms but a
-  runtime sample spans a real interval, consecutive snapshots may legitimately
-  repeat a value.
+- DBEV follows Calagopus wings-rs: it obtains one non-streaming Docker counter
+  snapshot per running container per second and calculates CPU from container
+  CPU-time delta divided by real wall-clock delta. Linux memory is the
+  Docker-compatible working set. WebSocket snapshots are sent every second from
+  the latest cache; missed ticks are skipped rather than sent as catch-up bursts.
 - If resource collection fails, the instance remains in the snapshot with
   nullable live values, `resources: null`, and a safe `resource_error`. Do not
   treat one metric failure as deletion or as an instance stop.

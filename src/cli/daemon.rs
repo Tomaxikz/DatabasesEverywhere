@@ -29,6 +29,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         );
     }
     tracing::info!(
+        phase = "configuration",
         version = env!("CARGO_PKG_VERSION"),
         config = %config_path.display(),
         logs = %config.paths.logs,
@@ -39,7 +40,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         api_host = %config.api.host,
         api_port = config.api.port,
         api_ssl = config.api.ssl.enabled,
-        "DatabasesEverywhere daemon starting"
+        "startup phase 1/5: configuration loaded"
     );
     tracing::info!(
         path = %Path::new(&config.paths.locks).join(DAEMON_LOCK_FILE).display(),
@@ -52,7 +53,10 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     log_boot_configuration(&config, &config_path);
     ensure_fuse_quota_host_config(&config)
         .context("failed to prepare fuse quota host configuration")?;
-    tracing::info!("runtime preflight starting");
+    tracing::info!(
+        phase = "host_preflight",
+        "startup phase 2/5: validating host capabilities and storage"
+    );
     validate_runtime_support(&config).await?;
     tracing::info!(
         mode = %config.disk.mode.method(),
@@ -249,6 +253,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     remote_import_helper_reconciliation
         .context("failed to reconcile stale remote import helper containers")?;
     tracing::info!(
+        phase = "container_engine",
         engine = %docker.engine_name(),
         socket = %docker.socket_path(),
         rootless_podman = docker.uses_rootless_podman(),
@@ -256,7 +261,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         engine_api_version = docker.engine_api_version().unwrap_or("unknown"),
         cgroup_version = docker.cgroup_version().unwrap_or("unknown"),
         response = %docker_ping,
-        "container engine api reachable"
+        "startup phase 3/5: container engine ready"
     );
     tracing::info!(
         engine = %docker.engine_name(),
@@ -275,13 +280,14 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .await
         .context("failed to reconcile instance metadata")?;
     tracing::info!(
+        phase = "instance_reconciliation",
         checked = reconcile_summary.checked,
         booting = reconcile_summary.booting,
         running = reconcile_summary.running,
         stopped = reconcile_summary.stopped,
         failed = reconcile_summary.failed,
         quarantined = reconcile_summary.quarantined,
-        "instance metadata reconciled"
+        "startup phase 4/5: managed instance state reconciled"
     );
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress = InstallProgressStore::default();
@@ -350,7 +356,13 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     ));
     let soft_disk_limits = tokio::spawn(monitor_soft_disk_limits(state.clone()));
     tracing::info!(
-        "critical startup complete; API will accept requests while managed instances start in the background"
+        phase = "service_start",
+        "startup phase 5/5: background services launched"
+    );
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        api = %config.api.bind_addr(),
+        "DBEV is ready; the management API is accepting requests while managed databases finish recovery in the background"
     );
     let managed_container_events = tokio::spawn(monitor_managed_container_events(state.clone()));
     let managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));

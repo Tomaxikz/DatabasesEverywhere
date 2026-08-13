@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.5.9 # replace with the reviewed release
+DBEV_VERSION=v0.6.0 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -328,7 +328,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.5.9@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.6.0@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -592,7 +592,7 @@ status fields, and bounded backup-catalog browsing. Contract `0.6.0` adds typed 
 verified TLS, SSRF controls, per-protocol acquisition, merge/wipe modes, and
 rollback-first target handling. Contract `0.5.0` exposes the API rate-limit allowance and its
 credential-plus-peer-IP scope through `/api/system`. Contract `0.4.0` emits
-monitoring snapshots every 500 ms, sources
+monitoring snapshots every second, sources
 per-instance RX/TX from the authenticated gateway used by network-isolated
 containers, and removes the redundant raw `docker_stats` string from monitoring
 messages. Contract `0.3.0` added MySQL as a distinct protocol and exposed
@@ -805,8 +805,11 @@ Omit `image` to pull the node's configured default for that protocol. Handy for 
 CPU and memory fields are `null` when the container isn't running or container
 runtime stats aren't available yet. CPU usage is reported in percentage points:
 `11.0` means 11%, not `0.11`; panels must not divide or multiply it by 100. DBEV
-uses Docker's primed two-sample CPU interval, including the runtime-reported
-online CPU count, so the value follows `docker stats --no-stream` semantics.
+uses the Calagopus wings-rs sampling model: one non-streaming Docker counter
+snapshot per running container per second. CPU is the change in container CPU
+time divided by the real wall-clock time between snapshots, so one fully used
+core is 100% and multi-core workloads can exceed 100%. Sampling is independent
+from REST and WebSocket delivery, so client activity cannot change the readings.
 On Linux, memory usage is the Docker-compatible working set (raw cgroup usage
 minus inactive file cache), not raw cgroup usage. Network counters are measured at DBE's authenticated
 gateway-to-Unix-socket boundary because managed containers use
@@ -1415,7 +1418,7 @@ Server-side clients can use either the subprotocol trick or a plain `Authorizati
 
 Every message is a JSON object with a `type` field.
 
-**`/ws/monitoring`** (scope `monitor:read`) — a full snapshot every 500 ms:
+**`/ws/monitoring`** (scope `monitor:read`) — a full snapshot every second:
 
 ```json
 {
@@ -1462,9 +1465,10 @@ Every message is a JSON object with a `type` field.
 
 `cpu_usage_percent` is already expressed as percentage points (`11.0` is 11%).
 The WebSocket does not rescale it, and the panel must not rescale it either.
-Snapshots are emitted every 500 ms, while Docker CPU measurements use a primed
-sampling interval; adjacent snapshots may therefore repeat the same authoritative
-sample rather than fabricate a new short-window value.
+Snapshots are emitted every second from the latest independently sampled cache.
+Sampling never runs inside the WebSocket send loop. Adjacent snapshots may
+repeat the same one-shot Docker sample, and missed client ticks are skipped
+instead of being emitted later as catch-up bursts.
 
 Disk usage is sampled from quota accounting when available and cached per instance. Directory walking is only a fallback, and a background sampler keeps the cache warm so websocket ticks do not block on large database directories. Concurrent fallback walks are coalesced per instance and capped node-wide. Monitoring clients share each completed all-instance sample, which is then filtered against each JWT before serialization.
 `install_progress.action` is `create`, `image_update`, or `major_upgrade`. For image updates, listen for stages like `queued`, `prepare`, `pull_image`, `delete_container`, `create_container`, `start`, `healthcheck`, `backend`, `completed`, and `failed`. The existing `healthcheck` stage name is retained for API compatibility but represents the bounded startup-readiness check, not a permanent probe. Major upgrades also emit `export`, `snapshot`, `prepare_replacement`, `import`, and `validate`.
