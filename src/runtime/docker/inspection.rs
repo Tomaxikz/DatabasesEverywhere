@@ -3,7 +3,7 @@ use std::time::Duration;
 use bollard::{
     container::LogOutput,
     errors::Error as BollardError,
-    models::ContainerStatsResponse,
+    models::{ContainerInspectResponse, ContainerStatsResponse},
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
 use futures::{StreamExt, TryStreamExt};
@@ -49,6 +49,25 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
+        let Some(response) = self
+            .verified_managed_container_inspection(protocol, instance_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let container = self.container_name(protocol, instance_id)?;
+        let id = response
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| DockerError::ManagedContainerIdUnavailable { container })?;
+        Ok(Some(id))
+    }
+
+    pub(super) async fn verified_managed_container_inspection(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<ContainerInspectResponse>, DockerError> {
         let container = self.container_name(protocol, instance_id)?;
         let response = match self.docker.inspect_container(&container, None).await {
             Ok(response) => response,
@@ -70,13 +89,7 @@ impl DockerRuntime {
             instance_id,
             self.node_id.as_deref(),
         )?;
-        let id = response
-            .id
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| DockerError::ManagedContainerIdUnavailable {
-                container: container.clone(),
-            })?;
-        Ok(Some(id))
+        Ok(Some(response))
     }
 
     /// Returns a hardening-safe runtime identity. Container IDs survive a
@@ -87,27 +100,13 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<ManagedContainerIdentity>, DockerError> {
-        let container = self.container_name(protocol, instance_id)?;
-        let response = match self.docker.inspect_container(&container, None).await {
-            Ok(response) => response,
-            Err(BollardError::DockerResponseServerError {
-                status_code: 404, ..
-            }) => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let Some(response) = self
+            .verified_managed_container_inspection(protocol, instance_id)
+            .await?
+        else {
+            return Ok(None);
         };
-        let labels = response
-            .config
-            .as_ref()
-            .and_then(|config| config.labels.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        super::verify_managed_instance_labels(
-            &labels,
-            &container,
-            protocol,
-            instance_id,
-            self.node_id.as_deref(),
-        )?;
+        let container = self.container_name(protocol, instance_id)?;
         let id = response
             .id
             .filter(|id| !id.trim().is_empty())

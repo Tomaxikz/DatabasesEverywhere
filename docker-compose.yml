@@ -10,6 +10,9 @@ services:
     # addresses. Managed database containers themselves use network_mode=none
     # and are reached only through bind-mounted Unix sockets.
     network_mode: host
+    # Keep /proc/<engine-pid>/cgroup paths anchored in the host hierarchy so
+    # CPU burst writes can be resolved without accepting traversal.
+    cgroup: host
 
     # FuseQuota needs /dev/fuse and SYS_ADMIN, but not blanket privileged mode.
     # If automatic detection selects native quotas, remove the device,
@@ -45,6 +48,11 @@ services:
       - /etc/databases-everywhere:/etc/databases-everywhere:rw
       # The host file must already contain an uncommented `user_allow_other`.
       - /etc/fuse.conf:/etc/fuse.conf:ro
+      # CPU burst reconciliation needs the host process view to bind the
+      # engine-reported PID to its exact cgroup, plus write access to that
+      # cgroup's CPU controller. The Docker socket is already host-root-equivalent.
+      - /proc:/host/proc:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - type: bind
         source: /var/lib/dbev
         target: /var/lib/dbev

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::DiskLimitError;
+use crate::shared::cgroup::unescape_mountinfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountInfo {
@@ -87,14 +88,6 @@ fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
         }
     }
     best
-}
-
-fn unescape_mountinfo(value: &str) -> String {
-    value
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
 }
 
 #[cfg(test)]

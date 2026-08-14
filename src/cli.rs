@@ -54,7 +54,9 @@ use crate::{
         state::InstanceStore,
     },
     jobs::import_export::ImportExportJobs,
-    runtime::docker::{DockerContainerStatus, DockerRuntime, ManagedContainerEvent},
+    runtime::docker::{
+        CpuBurstPolicyStatus, DockerContainerStatus, DockerRuntime, ManagedContainerEvent,
+    },
     shared::{
         ids::validate_instance_id, images::has_sha256_digest, logs::truncate_log_tail,
         protocol::Protocol, time::now_rfc3339,

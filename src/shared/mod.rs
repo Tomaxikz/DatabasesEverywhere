@@ -1,4 +1,5 @@
 pub mod backend;
+pub(crate) mod cgroup;
 pub mod files;
 pub mod ids;
 pub mod images;

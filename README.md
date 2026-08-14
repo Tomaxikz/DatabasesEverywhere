@@ -45,7 +45,8 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Database containers have no network interface (`network_mode=none`) and never publish backend ports.
 - The daemon reaches each instance through a private Unix socket; ClickHouse and Qdrant use a hash-verified, statically linked, loopback-only socket bridge inside their isolated containers.
 - Legacy bridge-network/TCP instances are stopped and quarantined on upgrade; preserve required data, delete them explicitly, and recreate them before serving traffic again.
-- Per-instance CPU, memory, PID, and disk limits, so one noisy instance can't eat the whole box.
+- Per-instance CPU, memory, PID, and disk limits, with bounded unused-CPU burst
+  credit to reduce short quota stalls without changing sustained CPU allocation.
 - Automatic disk enforcement selects native quotas when available and otherwise
   uses FuseQuota; Qdrant uses predictive soft scanning instead of unsafe FUSE storage.
 - Explicit project-quota, FuseQuota, and soft-scanner modes for unusual hosts.

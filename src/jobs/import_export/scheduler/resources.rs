@@ -1,6 +1,10 @@
 use super::*;
 use std::path::{Path, PathBuf};
 
+pub(super) use crate::shared::cgroup::{
+    membership_path as cgroup_path, safe_relative_path as safe_cgroup_relative_path,
+};
+
 #[derive(Debug)]
 pub(super) struct HostResourceProvider;
 
@@ -533,22 +537,6 @@ fn parse_cpu_quota_units(quota: u64, period: u64) -> Option<usize> {
         .map(|units| units.max(1))
 }
 
-pub(super) fn cgroup_path(contents: &str, controller: Option<&str>) -> Option<String> {
-    contents.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
-        let _hierarchy = fields.next()?;
-        let controllers = fields.next()?;
-        let path = fields.next()?;
-        match controller {
-            None if controllers.is_empty() => Some(path.to_string()),
-            Some(controller) if controllers.split(',').any(|value| value == controller) => {
-                Some(path.to_string())
-            }
-            _ => None,
-        }
-    })
-}
-
 #[cfg(test)]
 pub(super) fn cgroup_candidate_bases(roots: &[&Path], relative: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(roots.len().saturating_mul(2));
@@ -563,20 +551,6 @@ pub(super) fn cgroup_candidate_bases(roots: &[&Path], relative: Option<&str>) ->
         }
     }
     candidates
-}
-
-pub(super) fn safe_cgroup_relative_path(value: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::new();
-    for component in value.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." || component.contains(['/', '\\']) {
-            return None;
-        }
-        path.push(component);
-    }
-    Some(path)
 }
 
 pub(super) fn minimum_present<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {

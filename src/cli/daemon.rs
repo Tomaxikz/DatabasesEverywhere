@@ -289,6 +289,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         quarantined = reconcile_summary.quarantined,
         "startup phase 4/5: managed instance state reconciled"
     );
+    reconcile_running_cpu_burst_limits(&manager, &docker).await;
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress = InstallProgressStore::default();
     let shutdown_creations = install_progress.clone();

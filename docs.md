@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.6.0 # replace with the reviewed release
+DBEV_VERSION=v0.6.1 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -328,7 +328,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.6.0@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.6.1@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -337,6 +337,15 @@ networking, and write access to the Docker socket, but no longer uses blanket
 privileged mode. Docker socket access is still host-root-equivalent. Deploy the
 manager on a dedicated host or VM; if FuseQuota is not used, remove
 `SYS_ADMIN`, `/dev/fuse`, and the AppArmor override too.
+
+The supplied Compose file also selects the host cgroup namespace, mounts host
+`/proc` read-only at `/host/proc`, and mounts host `/sys/fs/cgroup` at the same
+in-container path. DBE uses the former to
+bind an engine-reported container PID to its immutable container ID before
+writing only that container's CPU burst control in the latter. Native systemd
+installs already have this host view. Existing Compose deployments must adopt
+these two mounts to receive CPU burst behavior; without them, ordinary CPU
+quotas remain enforced and DBE logs that burst reconciliation is unavailable.
 
 Before starting that profile, ensure the host `/etc/fuse.conf` contains an
 uncommented `user_allow_other`; Compose mounts the file read-only so the daemon
@@ -707,6 +716,15 @@ Validation rules your panel should mirror so users get nice errors:
 - `database` and `username`: 1–63 chars, must start with an ASCII letter, then letters/digits/`_`/`-` only. Reserved names are rejected (`postgres`, `mysql`, `admin`, `root`, `default`, `dbe_admin`, `dbe_health`, and a few more).
 - `password` and `public_host` must be non-empty.
 - `cpu_cores` must be finite and between `0.01` and `1024`; `memory_mib` must be between `1` and `1048576` (1 TiB); and `disk_mib` must be greater than zero. MongoDB and ClickHouse additionally need at least 1024 `memory_mib` **and** 1024 `disk_mib` or they won't even boot.
+
+On Linux hosts that expose CFS burst controls, DBE automatically lets each
+CPU-limited managed container accumulate one quota window of unused CPU credit.
+This reduces short quota-bound stalls without changing the sustained CPU limit.
+The policy is fixed and has no API or configuration setting. DBE reapplies it
+after starts, restarts, resource updates, external activations, and daemon boot.
+Older kernels or restricted cgroup namespaces retain the ordinary CPU quota and
+produce an operator warning; container startup is never blocked solely because
+burst control is unavailable.
 
 PostgreSQL clusters use a randomly protected internal `dbe_admin` bootstrap role
 that is never registered as a gateway route. The requested username is created

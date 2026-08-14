@@ -1,5 +1,6 @@
 mod command;
 mod container_config;
+mod cpu_burst;
 mod disk_probe;
 mod engine;
 mod events;
@@ -14,6 +15,7 @@ mod transfer;
 use transfer::*;
 
 pub use command::CommandOutput;
+pub(crate) use cpu_burst::CpuBurstPolicyStatus;
 pub use engine::{DaemonEngineConnection, rootless_podman_uid_from_socket_path};
 pub use events::{ManagedContainerAction, ManagedContainerEvent};
 pub use remote_import::RemoteImportHelperSpec;
@@ -629,6 +631,7 @@ impl DockerRuntime {
         self.docker
             .start_container(&name, None::<StartContainerOptions>)
             .await?;
+        self.enforce_cpu_burst_policy(protocol, instance_id).await;
         Ok(CommandOutput::empty())
     }
 
@@ -677,6 +680,7 @@ impl DockerRuntime {
             .required_managed_container_id(protocol, instance_id)
             .await?;
         self.docker.restart_container(&name, None).await?;
+        self.enforce_cpu_burst_policy(protocol, instance_id).await;
         Ok(CommandOutput::empty())
     }
 
@@ -741,18 +745,33 @@ impl DockerRuntime {
         cpu_cores: f64,
         memory_mib: u64,
     ) -> Result<CommandOutput, DockerError> {
+        validate_runtime_limits(cpu_cores, memory_mib)?;
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        match self.engine {
-            DaemonEngine::Docker => {
-                let body = Self::update_limits_body(cpu_cores, memory_mib)?;
-                self.docker.update_container(&name, body).await?;
-            }
+        let docker_body = if self.engine == DaemonEngine::Docker {
+            Some(Self::update_limits_body(cpu_cores, memory_mib)?)
+        } else {
+            None
+        };
+        self.clear_cpu_burst_before_limit_update(protocol, instance_id)
+            .await;
+        let update_result: Result<(), DockerError> = match self.engine {
+            DaemonEngine::Docker => self
+                .docker
+                .update_container(
+                    &name,
+                    docker_body.expect("Docker limit body is prepared for Docker"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(Into::into),
             DaemonEngine::Podman => {
-                podman_api::update_limits(&self.socket_path, &name, cpu_cores, memory_mib).await?;
+                podman_api::update_limits(&self.socket_path, &name, cpu_cores, memory_mib).await
             }
-        }
+        };
+        self.enforce_cpu_burst_policy(protocol, instance_id).await;
+        update_result?;
         Ok(CommandOutput::empty())
     }
 
@@ -1086,6 +1105,8 @@ pub enum DockerError {
     ResourceLimit(#[from] ResourceLimitError),
     #[error("cpu limit {cpu_cores} cannot be represented in Docker nano-CPU units")]
     CpuLimitConversion { cpu_cores: f64 },
+    #[error("managed container {instance_id} CPU burst policy failed: {reason}")]
+    CpuBurstPolicy { instance_id: String, reason: String },
     #[error("memory limit {memory_mib} MiB cannot be represented in Docker bytes")]
     MemoryLimitConversion { memory_mib: u64 },
     #[error("failed to prepare bind mount source {path}: {source}")]

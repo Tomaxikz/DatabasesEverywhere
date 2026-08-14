@@ -791,6 +791,68 @@ pub(super) async fn start_known_instances_on_boot(
     Ok(())
 }
 
+pub(super) async fn reconcile_running_cpu_burst_limits(
+    manager: &InstanceManager,
+    docker: &DockerRuntime,
+) {
+    let instances = manager
+        .store()
+        .list()
+        .await
+        .into_iter()
+        .filter(|metadata| metadata.status == InstanceStatus::Running)
+        .collect::<Vec<_>>();
+    let checked = instances.len();
+    let outcomes = futures::stream::iter(instances)
+        .map(|metadata| async move {
+            let result = docker
+                .apply_cpu_burst_policy(metadata.protocol, &metadata.instance_id)
+                .await;
+            (metadata, result)
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut applied = 0_usize;
+    let mut already_configured = 0_usize;
+    let mut inactive = 0_usize;
+    let mut unsupported = 0_usize;
+    let mut failed = 0_usize;
+    for (metadata, result) in outcomes {
+        match result {
+            Ok(CpuBurstPolicyStatus::Applied) => applied += 1,
+            Ok(CpuBurstPolicyStatus::AlreadyConfigured) => already_configured += 1,
+            Ok(CpuBurstPolicyStatus::Inactive) => inactive += 1,
+            Ok(CpuBurstPolicyStatus::Unsupported) => unsupported += 1,
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    event = "cpu_burst_policy_reconciliation_failed",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    %error,
+                    "failed to reconcile CPU burst credit; the normal CPU quota remains active"
+                );
+            }
+        }
+    }
+    if unsupported > 0 {
+        tracing::warn!(
+            unsupported,
+            "host cgroups do not expose CFS burst control for some running instances; their normal CPU quotas remain active"
+        );
+    }
+    tracing::info!(
+        checked,
+        applied,
+        already_configured,
+        inactive,
+        unsupported,
+        failed,
+        "managed container CPU burst policy reconciliation complete"
+    );
+}
+
 pub(super) async fn start_known_instance_on_boot(
     config: &Config,
     manager: &InstanceManager,

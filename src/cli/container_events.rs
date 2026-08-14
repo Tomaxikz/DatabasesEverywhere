@@ -234,6 +234,10 @@ pub(super) async fn reconcile_managed_container_state(
         }
     };
     let activation_error = if activation_observed {
+        state
+            .docker
+            .enforce_cpu_burst_policy(metadata.protocol, &metadata.instance_id)
+            .await;
         match state
             .docker
             .wait_until_ready(
