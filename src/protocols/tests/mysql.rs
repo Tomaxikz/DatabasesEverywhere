@@ -11,7 +11,7 @@ const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
 async fn gateway_wire_versions_are_plain_vendor_compatible_ascii() {
     for (flavor, expected) in [
         (GatewayFlavor::Mysql, "8.0.11"),
-        (GatewayFlavor::Mariadb, "10.11.0-MariaDB"),
+        (GatewayFlavor::Mariadb, "5.5.5-10.11.0-MariaDB"),
     ] {
         let (mut writer, mut reader) = tokio::io::duplex(1024);
         let task = tokio::spawn(async move {

@@ -30,7 +30,13 @@ impl GatewayFlavor {
     fn server_version(self) -> &'static str {
         match self {
             Self::Mysql => "8.0.11",
-            Self::Mariadb => "10.11.0-MariaDB",
+            // MariaDB itself uses this compatibility prefix. Oracle's
+            // Connector/J selects startup system variables from the leading
+            // numeric triplet; advertising 10.x makes it request MySQL-only
+            // `transaction_isolation`, while 5.5.5 selects MariaDB's
+            // compatible `tx_isolation` path. MariaDB-aware clients still
+            // recognize the vendor and real baseline after the prefix.
+            Self::Mariadb => "5.5.5-10.11.0-MariaDB",
         }
     }
 }
