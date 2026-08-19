@@ -134,34 +134,10 @@ jobs:
 
   mysql_driver_matrix:
     name: Real MySQL/MariaDB clients and versions
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
     needs: global_lint
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.95.0
-
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: mysql-driver-matrix
-          cache-on-failure: false
-
-      - name: Install real client toolchains
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            mariadb-client maven openjdk-21-jdk-headless openssl
-
-      - name: Exercise MySQL and MariaDB version families through real clients
-        run: bash .github/ci/mysql-driver-matrix.sh
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mysql-driver-matrix.yml
 
   podman_smoke:
     name: Rootless Podman compatibility

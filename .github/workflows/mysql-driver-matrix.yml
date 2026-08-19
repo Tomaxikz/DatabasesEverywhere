@@ -1,0 +1,79 @@
+name: MySQL and MariaDB driver compatibility
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  driver-case:
+    name: ${{ matrix.image }} with Connector/J ${{ matrix.connector }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - protocol: mysql
+            image: mysql:8.4
+            connector: 8.4.0
+          - protocol: mysql
+            image: mysql:8.4
+            connector: 9.7.0
+          - protocol: mysql
+            image: mysql:9.7
+            connector: 9.2.0
+          - protocol: mysql
+            image: mysql:26.7
+            connector: 9.7.0
+          - protocol: mariadb
+            image: mariadb:10.11
+            connector: 8.4.0
+          - protocol: mariadb
+            image: mariadb:11.4
+            connector: 9.2.0
+          - protocol: mariadb
+            image: mariadb:11.8
+            connector: 9.7.0
+          - protocol: mariadb
+            image: mariadb:12.3
+            connector: 9.7.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: mysql-driver-matrix
+          cache-on-failure: false
+
+      - name: Install real client toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            mariadb-client maven openjdk-21-jdk-headless openssl
+
+      - name: Compile the compatibility test
+        run: cargo test --locked --lib --no-run
+
+      - name: Exercise one real database and driver combination
+        env:
+          DBE_MATRIX_PROTOCOL: ${{ matrix.protocol }}
+          DBE_MATRIX_IMAGE: ${{ matrix.image }}
+          DBE_MATRIX_CONNECTOR: ${{ matrix.connector }}
+          DBE_DRIVER_CASE_TIMEOUT: 12m
+        run: |
+          bash .github/ci/mysql-driver-matrix.sh \
+            "$DBE_MATRIX_PROTOCOL" \
+            "$DBE_MATRIX_IMAGE" \
+            "$DBE_MATRIX_CONNECTOR"
