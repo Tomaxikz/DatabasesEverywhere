@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use secrecy::SecretString;
 use tokio::sync::RwLock;
@@ -48,6 +51,28 @@ impl InstanceStore {
         state.remove(instance_id)
     }
 
+    /// Temporarily removes every gateway lookup for an instance while keeping
+    /// its metadata available to lifecycle and recovery code. The caller must
+    /// hold the per-instance operation lock and republish through `upsert`
+    /// only after the runtime is ready and its durable state is settled.
+    pub(crate) async fn fence_routes(&self, instance_id: &str) -> bool {
+        let mut state = self.inner.write().await;
+        if !state.instances.contains_key(instance_id) {
+            return false;
+        }
+        state.remove_routes_for(instance_id);
+        state.fenced_instances.insert(instance_id.to_string());
+        true
+    }
+
+    pub(crate) async fn routes_fenced(&self, instance_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .fenced_instances
+            .contains(instance_id)
+    }
+
     pub async fn list(&self) -> Vec<InstanceMetadata> {
         self.inner
             .read()
@@ -83,6 +108,14 @@ impl InstanceStore {
             })
     }
 
+    pub async fn resolve_redis_password(
+        &self,
+        password_sha256: &str,
+    ) -> Option<(String, RouteTarget)> {
+        let state = self.inner.read().await;
+        resolve_password_route(&state, &state.redis_password_routes, password_sha256)
+    }
+
     pub async fn resolve_valkey(&self, username: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
         let instance_id = state.valkey_routes.get(username)?;
@@ -93,6 +126,14 @@ impl InstanceStore {
                 instance_id: metadata.instance_id.clone(),
                 endpoint: metadata.backend.clone(),
             })
+    }
+
+    pub async fn resolve_valkey_password(
+        &self,
+        password_sha256: &str,
+    ) -> Option<(String, RouteTarget)> {
+        let state = self.inner.read().await;
+        resolve_password_route(&state, &state.valkey_password_routes, password_sha256)
     }
 
     pub async fn resolve_mariadb(
@@ -268,6 +309,7 @@ fn resolve_plain_database_route(
 #[derive(Debug, Default)]
 struct InstanceState {
     instances: HashMap<String, InstanceMetadata>,
+    fenced_instances: HashSet<String>,
     postgres_routes: HashMap<(String, String), String>,
     mariadb_routes: HashMap<(String, String), String>,
     mysql_routes: HashMap<(String, String), String>,
@@ -276,6 +318,8 @@ struct InstanceState {
     qdrant_routes: HashMap<String, String>,
     redis_routes: HashMap<String, String>,
     valkey_routes: HashMap<String, String>,
+    redis_password_routes: HashMap<String, HashSet<String>>,
+    valkey_password_routes: HashMap<String, HashSet<String>>,
 }
 
 impl InstanceState {
@@ -289,6 +333,7 @@ impl InstanceState {
 
     fn upsert(&mut self, metadata: InstanceMetadata) {
         self.remove_routes_for(&metadata.instance_id);
+        self.fenced_instances.remove(&metadata.instance_id);
         if metadata.status != InstanceStatus::Running
             || metadata.desired_state != DesiredInstanceState::Running
         {
@@ -311,12 +356,28 @@ impl InstanceState {
                     metadata.database.username.clone(),
                     metadata.instance_id.clone(),
                 );
+                if let Some(password) = metadata.tenant_password.as_deref() {
+                    self.redis_password_routes
+                        .entry(crate::protocols::redis::password_route_sha256(
+                            password.as_bytes(),
+                        ))
+                        .or_default()
+                        .insert(metadata.instance_id.clone());
+                }
             }
             Protocol::Valkey => {
                 self.valkey_routes.insert(
                     metadata.database.username.clone(),
                     metadata.instance_id.clone(),
                 );
+                if let Some(password) = metadata.tenant_password.as_deref() {
+                    self.valkey_password_routes
+                        .entry(crate::protocols::redis::password_route_sha256(
+                            password.as_bytes(),
+                        ))
+                        .or_default()
+                        .insert(metadata.instance_id.clone());
+                }
             }
             Protocol::Mariadb => {
                 self.mariadb_routes.insert(
@@ -382,17 +443,54 @@ impl InstanceState {
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
         self.valkey_routes
             .retain(|_, routed_instance_id| routed_instance_id != instance_id);
+        remove_password_route(&mut self.redis_password_routes, instance_id);
+        remove_password_route(&mut self.valkey_password_routes, instance_id);
     }
 
     fn remove(&mut self, instance_id: &str) -> Option<InstanceMetadata> {
         self.remove_routes_for(instance_id);
+        self.fenced_instances.remove(instance_id);
         self.instances.remove(instance_id)
     }
+}
+
+fn resolve_password_route(
+    state: &InstanceState,
+    routes: &HashMap<String, HashSet<String>>,
+    password_sha256: &str,
+) -> Option<(String, RouteTarget)> {
+    let instance_ids = routes.get(password_sha256)?;
+    if instance_ids.len() != 1 {
+        return None;
+    }
+    let instance_id = instance_ids.iter().next()?;
+    state.instances.get(instance_id).map(|metadata| {
+        (
+            metadata.database.username.clone(),
+            RouteTarget {
+                instance_id: metadata.instance_id.clone(),
+                endpoint: metadata.backend.clone(),
+            },
+        )
+    })
+}
+
+fn remove_password_route(routes: &mut HashMap<String, HashSet<String>>, instance_id: &str) {
+    routes.retain(|_, instance_ids| {
+        instance_ids.remove(instance_id);
+        !instance_ids.is_empty()
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        instances::metadata::{
+            DatabaseIdentity, PublicEndpoint, RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
+        },
+        shared::limits::InstanceLimits,
+    };
 
     #[test]
     fn database_route_prefers_exact_names_and_infers_only_unique_usernames() {
@@ -427,5 +525,99 @@ mod tests {
             resolve_database_route(&routes, "unknown", None),
             RouteKeyResolution::NotFound
         ));
+    }
+
+    #[tokio::test]
+    async fn password_only_resp_routing_is_unique_and_updates_after_rotation_or_removal() {
+        let store = InstanceStore::default();
+        let first = resp_metadata("inst_first", "first", "shared-secret");
+        let second = resp_metadata("inst_second", "second", "shared-secret");
+        store.upsert(first.clone()).await;
+        let hash = crate::protocols::redis::password_route_sha256(b"shared-secret");
+        assert_eq!(
+            store.resolve_redis_password(&hash).await.unwrap().0,
+            "first"
+        );
+
+        store.upsert(second).await;
+        assert!(store.resolve_redis_password(&hash).await.is_none());
+
+        store.remove("inst_second").await;
+        assert_eq!(
+            store.resolve_redis_password(&hash).await.unwrap().0,
+            "first"
+        );
+
+        let mut rotated = first;
+        rotated.tenant_password = Some("rotated-secret".to_string());
+        store.upsert(rotated).await;
+        assert!(store.resolve_redis_password(&hash).await.is_none());
+        let rotated_hash = crate::protocols::redis::password_route_sha256(b"rotated-secret");
+        assert_eq!(
+            store.resolve_redis_password(&rotated_hash).await.unwrap().0,
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_fence_keeps_metadata_but_blocks_connections_until_republished() {
+        let store = InstanceStore::default();
+        let metadata = resp_metadata("inst_fenced", "tenant", "secret");
+        let password_hash = crate::protocols::redis::password_route_sha256(b"secret");
+        store.upsert(metadata.clone()).await;
+        assert!(store.resolve_redis("tenant").await.is_some());
+        assert!(store.resolve_redis_password(&password_hash).await.is_some());
+
+        assert!(store.fence_routes("inst_fenced").await);
+        assert!(store.routes_fenced("inst_fenced").await);
+        assert!(store.get("inst_fenced").await.is_some());
+        assert!(store.resolve_redis("tenant").await.is_none());
+        assert!(store.resolve_redis_password(&password_hash).await.is_none());
+
+        store.upsert(metadata).await;
+        assert!(!store.routes_fenced("inst_fenced").await);
+        assert!(store.resolve_redis("tenant").await.is_some());
+        assert!(store.resolve_redis_password(&password_hash).await.is_some());
+        assert!(!store.fence_routes("missing").await);
+    }
+
+    fn resp_metadata(instance_id: &str, username: &str, password: &str) -> InstanceMetadata {
+        InstanceMetadata {
+            schema_version: SCHEMA_VERSION,
+            instance_id: instance_id.to_string(),
+            protocol: Protocol::Redis,
+            status: InstanceStatus::Running,
+            desired_state: DesiredInstanceState::Running,
+            disk_limit_blocked: false,
+            public: PublicEndpoint {
+                host: "db.example.test".to_string(),
+                port: 6379,
+            },
+            backend: BackendEndpoint::UnixSocket {
+                socket_path: format!("/run/dbev/{instance_id}.sock"),
+            },
+            runtime: RuntimeMetadata {
+                kind: RuntimeKind::Docker,
+                container_name: format!("dbe-redis-{instance_id}"),
+                network_mode: "none".to_string(),
+            },
+            database: DatabaseIdentity {
+                name: "0".to_string(),
+                username: username.to_string(),
+            },
+            route_key_sha256: None,
+            mariadb_native_password_sha1_stage2: None,
+            mariadb_root_password: None,
+            mysql_native_password_sha1_stage2: None,
+            mysql_root_password: None,
+            mongodb_root_password: None,
+            postgres_admin_password: None,
+            tenant_password: Some(password.to_string()),
+            limits: InstanceLimits::default(),
+            image: None,
+            database_version: None,
+            created_at: "2026-08-19T00:00:00Z".to_string(),
+            updated_at: "2026-08-19T00:00:00Z".to_string(),
+        }
     }
 }

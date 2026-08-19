@@ -1,6 +1,6 @@
 use super::{metadata::InstanceMetadata, state::InstanceStore};
 use crate::runtime::docker::ManagedContainerIdentity;
-use crate::storage::repositories::{InstanceRepository, RepositoryError};
+use crate::storage::repositories::{CompatibilityAttestation, InstanceRepository, RepositoryError};
 
 #[derive(Debug, Clone)]
 pub struct InstanceManager {
@@ -107,6 +107,31 @@ impl InstanceManager {
                 &identity.started_at,
                 hardening_revision,
             )
+            .await
+    }
+
+    pub(crate) async fn compatibility_attestation(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<CompatibilityAttestation>, RepositoryError> {
+        self.repository.compatibility_attestation(instance_id).await
+    }
+
+    pub(crate) async fn delete_compatibility_attestation(
+        &self,
+        instance_id: &str,
+    ) -> Result<(), RepositoryError> {
+        self.repository
+            .delete_compatibility_attestation(instance_id)
+            .await
+    }
+
+    pub(crate) async fn record_compatibility_attestation(
+        &self,
+        attestation: &CompatibilityAttestation,
+    ) -> Result<(), RepositoryError> {
+        self.repository
+            .record_compatibility_attestation(attestation)
             .await
     }
 

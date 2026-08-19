@@ -1,10 +1,10 @@
-mod major_upgrade;
+pub(crate) mod major_upgrade;
 mod normal_image_update;
 mod password;
 mod runtime_info;
 
 #[cfg(test)]
-use runtime_info::normalize_database_version;
+use crate::compatibility::normalize_database_version;
 pub use runtime_info::{
     CreateInstanceAcceptedResponse, DeleteInstanceQuery, DeleteResponse, ImageUpdateStrategy,
     InstanceRuntimeInfoCache, InstanceStatusResponse, LogsQuery, LogsResponse, PowerRequest,
@@ -24,7 +24,7 @@ pub use password::{
 
 use axum::extract::State;
 use bollard::errors::Error as BollardError;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -135,7 +135,7 @@ pub async fn update_instance_image(
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     let image = validate_image(&request.image)?.to_string();
     let _operation = state.instance_locks.lock(&instance_id).await;
-    let mut metadata = state
+    let metadata = state
         .instances
         .get(&instance_id)
         .await
@@ -152,7 +152,6 @@ pub async fn update_instance_image(
                 .to_string(),
         ));
     }
-    ensure_image_allowed(&state, metadata.protocol, &image)?;
     let current_image = state
         .docker
         .container_image(metadata.protocol, &metadata.instance_id)
@@ -168,18 +167,52 @@ pub async fn update_instance_image(
                 ),
             )
         })?;
-    if request.major_upgrade {
+    update_instance_image_locked(
+        state,
+        _operation,
+        metadata,
+        current_image,
+        image,
+        request.major_upgrade,
+        request.password,
+    )
+    .await
+    .map(ApiResponse::ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn update_instance_image_locked(
+    state: AppState,
+    operation: tokio::sync::OwnedMutexGuard<()>,
+    metadata: InstanceMetadata,
+    current_image: String,
+    image: String,
+    major_upgrade: bool,
+    password: Option<String>,
+) -> Result<UpdateInstanceImageResponse, ApiError> {
+    ensure_image_allowed(&state, metadata.protocol, &image)?;
+    if major_upgrade {
         return run_major_upgrade_supervisor(
             state.clone(),
-            _operation,
+            operation,
             metadata,
             current_image,
             image,
-            request.password,
+            password,
         )
-        .await
-        .map(ApiResponse::ok);
+        .await;
     }
+    run_normal_image_update_supervisor(state, operation, metadata, current_image, image, password)
+        .await
+}
+
+pub(super) async fn update_instance_image_normal(
+    state: AppState,
+    mut metadata: InstanceMetadata,
+    current_image: String,
+    image: String,
+    password: Option<String>,
+) -> Result<UpdateInstanceImageResponse, ApiError> {
     let image_change = classify_image_update(metadata.protocol, &current_image, &image)?;
     if image_change == ImageVersionChange::Major {
         return Err(major_upgrade_required_error(
@@ -239,10 +272,7 @@ pub async fn update_instance_image(
     // The encrypted credential is authoritative once present. The optional
     // request field remains a compatibility fallback for legacy metadata that
     // predates encrypted tenant credential storage.
-    let effective_password = metadata
-        .tenant_password
-        .clone()
-        .or_else(|| request.password.clone());
+    let effective_password = metadata.tenant_password.clone().or(password);
     let rollback_image = state
         .docker
         .container_immutable_image_id(metadata.protocol, &metadata.instance_id)
@@ -321,6 +351,7 @@ pub async fn update_instance_image(
             ));
         }
     }
+    state.instances.fence_routes(&metadata.instance_id).await;
     let replacement_result: Result<(), ApiError> = async {
         launch_container_from_spec(
             &state,
@@ -427,6 +458,30 @@ pub async fn update_instance_image(
         if effective_password.is_some() {
             metadata.tenant_password.clone_from(&effective_password);
         }
+        state.install_progress.stage(
+            &metadata.instance_id,
+            "compatibility",
+            "attesting replacement database engine",
+        );
+        let compatibility = crate::compatibility::probe_instance_compatibility(
+            &state.manager,
+            &state.docker,
+            &metadata,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "replacement image compatibility probe failed: {error}"
+            ))
+        })?;
+        if !compatibility.compatible {
+            return Err(ApiError::Conflict(
+                compatibility
+                    .diagnostic
+                    .unwrap_or_else(|| "replacement database version is unsupported".to_string()),
+            ));
+        }
         metadata.status = InstanceStatus::Running;
         metadata.limits.disk_enforced = disk_limiter.mode().enforced();
         metadata.updated_at = now_rfc3339();
@@ -463,7 +518,7 @@ pub async fn update_instance_image(
         .install_progress
         .complete(&metadata.instance_id, "image update completed");
 
-    Ok(ApiResponse::ok(UpdateInstanceImageResponse {
+    Ok(UpdateInstanceImageResponse {
         instance: metadata,
         image,
         recreated: true,
@@ -471,7 +526,7 @@ pub async fn update_instance_image(
         warnings: Vec::new(),
         export_artifact_id: None,
         old_volume_backup_retained: false,
-    }))
+    })
 }
 
 pub async fn delete_instance(
@@ -842,7 +897,7 @@ pub(crate) async fn lifecycle_instance(
     instance_id: &str,
     action: LifecycleAction,
 ) -> ApiResult<InstanceMetadata> {
-    let _operation = state.instance_locks.lock(instance_id).await;
+    let operation = state.instance_locks.lock(instance_id).await;
     let mut metadata = state
         .instances
         .get(instance_id)
@@ -924,14 +979,62 @@ pub(crate) async fn lifecycle_instance(
         metadata.updated_at = now_rfc3339();
         metadata_changed = true;
     }
-    if metadata_changed {
-        state.manager.upsert(metadata).await.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to persist requested lifecycle state before applying it: {error}"
-            ))
+    let mutation = state
+        .daemon_shutdown
+        .try_admit_background_mutation()
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "daemon shutdown has started; lifecycle operations are not accepted".to_string(),
+            )
         })?;
-    }
-    lifecycle_instance_locked(state, instance_id, action).await
+    let worker_state = state.clone();
+    let worker_instance_id = instance_id.to_string();
+    let recovery = metadata.clone();
+    let worker = spawn_owned_mutation_task(async move {
+        let _mutation = mutation;
+        let _operation = operation;
+        let lifecycle = async {
+            if metadata_changed {
+                worker_state
+                    .manager
+                    .upsert(metadata)
+                    .await
+                    .map_err(|error| {
+                        ApiError::Runtime(format!(
+                            "failed to persist requested lifecycle state before applying it: {error}"
+                        ))
+                    })?;
+            }
+            lifecycle_instance_locked(&worker_state, &worker_instance_id, action).await
+        };
+        match std::panic::AssertUnwindSafe(lifecycle).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => {
+                let durable = worker_state
+                    .manager
+                    .get_persisted(&worker_instance_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(recovery);
+                let quarantine = quarantine_after_image_update_uncertainty(
+                    &worker_state,
+                    &durable,
+                    "lifecycle worker panicked after runtime mutation may have begun",
+                )
+                .await;
+                Err(ApiError::Runtime(format!(
+                    "lifecycle worker stopped unexpectedly; {}",
+                    image_update_quarantine_summary(&quarantine)
+                )))
+            }
+        }
+    });
+    worker.await.map_err(|error| {
+        ApiError::Runtime(format!(
+            "lifecycle supervisor stopped unexpectedly: {error}; inspect and reconcile the instance before retrying"
+        ))
+    })?
 }
 
 fn ensure_limiter_matches_persisted_method(
@@ -983,6 +1086,9 @@ pub(crate) async fn lifecycle_instance_locked(
     };
 
     let mut startup_readiness_failed = false;
+    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
+        state.instances.fence_routes(&metadata.instance_id).await;
+    }
     let operation_result: Result<(), ApiError> = async {
         if should_call_docker {
             if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
@@ -1156,6 +1262,27 @@ pub(crate) async fn lifecycle_instance_locked(
                     startup_readiness_failed = true;
                     return Err(error);
                 }
+            }
+            let compatibility = crate::compatibility::probe_instance_compatibility(
+                &state.manager,
+                &state.docker,
+                &metadata,
+                false,
+            )
+            .await
+            .map_err(|error| {
+                startup_readiness_failed = true;
+                ApiError::Runtime(format!(
+                    "database compatibility attestation failed during activation: {error}"
+                ))
+            })?;
+            if !compatibility.compatible {
+                startup_readiness_failed = true;
+                return Err(ApiError::Conflict(
+                    compatibility
+                        .diagnostic
+                        .unwrap_or_else(|| "database engine version is unsupported".to_string()),
+                ));
             }
         }
         Ok(())
@@ -1342,137 +1469,6 @@ fn retained_volume_name_matches(name: &str, prefixes: &[String]) -> bool {
         name.strip_prefix(prefix)
             .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
     })
-}
-
-async fn instance_image_update_spec(
-    metadata: &InstanceMetadata,
-    paths: &InstancePaths,
-    container_data_path: std::path::PathBuf,
-    image: &str,
-    password: Option<SecretString>,
-    pids_limit: i64,
-) -> Result<DockerInstanceSpec, ApiError> {
-    let password = match metadata.protocol {
-        Protocol::Redis | Protocol::Valkey => {
-            password.unwrap_or_else(|| SecretString::from(String::new()))
-        }
-        _ => password.ok_or_else(|| {
-            ApiError::BadRequest(
-                "password is required when recreating non-RESP database containers".to_string(),
-            )
-        })?,
-    };
-
-    let mut spec = match metadata.protocol {
-        Protocol::Postgres => databases::postgres::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            &metadata.database.name,
-            &metadata.database.username,
-            password,
-            SecretString::from(metadata.postgres_admin_password.clone().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before recreation".to_string(),
-                )
-            })?),
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Redis => databases::redis::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Valkey => databases::valkey::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mariadb => databases::mariadb::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            &metadata.database.name,
-            &metadata.database.username,
-            password,
-            SecretString::from(metadata.mariadb_root_password.clone().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "mariadb internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                )
-            })?),
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mysql => databases::mysql::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            &metadata.database.name,
-            SecretString::from(metadata.mysql_root_password.clone().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                )
-            })?),
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mongodb => databases::mongodb::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            &metadata.database.name,
-            databases::mongodb::docker::MongodbAuth {
-                username: metadata.database.username.clone(),
-                password,
-                root_password: SecretString::from(
-                    metadata.mongodb_root_password.clone().ok_or_else(|| {
-                        ApiError::BadRequest(
-                            "mongodb internal root password is missing; old MongoDB instances must be recreated or restored from a manual admin dump before image replacement".to_string(),
-                        )
-                    })?,
-                ),
-            },
-            container_data_path.clone(),
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Clickhouse => {
-            let hosted_config_path =
-                databases::clickhouse::docker::write_hosted_config(&paths.runtime_config)
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-            databases::clickhouse::docker::instance_spec(
-                &metadata.instance_id,
-                image,
-                &metadata.database.name,
-                &metadata.database.username,
-                password,
-                container_data_path,
-                paths.logs.clone(),
-                hosted_config_path,
-                paths.sockets.clone(),
-                paths.socket_bridge_binary.clone(),
-            )
-        }
-        Protocol::Qdrant => databases::qdrant::docker::instance_spec(
-            &metadata.instance_id,
-            image,
-            password,
-            container_data_path,
-            paths.logs.clone(),
-            paths.sockets.clone(),
-            paths.socket_bridge_binary.clone(),
-        ),
-    };
-    spec.cpu_cores = metadata.limits.cpu_cores;
-    spec.memory_mib = metadata.limits.memory_mib;
-    spec.disk_mib = metadata.limits.disk_mib;
-    spec.pids_limit = Some(pids_limit);
-    Ok(spec)
 }
 
 pub(crate) fn docker_error(error: DockerError) -> ApiError {

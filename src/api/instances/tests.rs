@@ -24,6 +24,99 @@ async fn dropping_major_upgrade_waiter_does_not_cancel_owned_operation() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn dropping_lifecycle_waiter_does_not_cancel_owned_operation() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let owned = spawn_owned_mutation_task(async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        let _ = finished_tx.send(());
+    });
+    let waiter = tokio::spawn(async move {
+        let _ = owned.await;
+    });
+    started_rx.await.unwrap();
+    waiter.abort();
+    let _ = waiter.await;
+    release_tx.send(()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), finished_rx)
+        .await
+        .expect("owned lifecycle operation should outlive its request waiter")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_cache_invalidation_rejects_a_late_stale_publication() {
+    let cache = InstanceRuntimeInfoCache::default();
+    let stale_epoch = cache.epoch().await;
+    cache.remove("inst_cache_race").await;
+    let image = crate::instances::metadata::InstanceImageStatus {
+        current: Some("postgres:16".to_string()),
+        configured: "postgres:17".to_string(),
+        update_available: true,
+    };
+
+    assert!(
+        !cache
+            .store_if_epoch("inst_cache_race".to_string(), image.clone(), stale_epoch)
+            .await
+    );
+    assert!(
+        cache
+            .fresh("inst_cache_race", "postgres:17")
+            .await
+            .is_none()
+    );
+
+    let current_epoch = cache.epoch().await;
+    assert!(
+        cache
+            .store_if_epoch("inst_cache_race".to_string(), image, current_epoch)
+            .await
+    );
+    assert!(
+        cache
+            .fresh("inst_cache_race", "postgres:17")
+            .await
+            .is_some()
+    );
+}
+
+#[test]
+fn live_runtime_cannot_publish_a_durable_pre_ready_or_failed_state() {
+    let running_inspection = Ok(DockerInstanceInspection {
+        status: DockerContainerStatus::Running,
+        network_mode: Some("none".to_string()),
+        health: Some("healthy".to_string()),
+        image: Some("sha256:image".to_string()),
+    });
+    for status in [
+        InstanceStatus::Creating,
+        InstanceStatus::Booting,
+        InstanceStatus::Stopped,
+        InstanceStatus::Failed,
+        InstanceStatus::Quarantined,
+        InstanceStatus::Deleting,
+    ] {
+        let mut metadata = sample_lifecycle_metadata();
+        metadata.status = status;
+        assert_eq!(
+            runtime_info::classify_live_instance_status(&metadata, Some(&running_inspection)),
+            status
+        );
+    }
+
+    let mut stopping = sample_lifecycle_metadata();
+    stopping.desired_state = DesiredInstanceState::Stopped;
+    assert_eq!(
+        runtime_info::classify_live_instance_status(&stopping, Some(&running_inspection)),
+        InstanceStatus::Stopped
+    );
+}
+
 fn sample_lifecycle_metadata() -> InstanceMetadata {
     InstanceMetadata {
         schema_version: crate::instances::metadata::SCHEMA_VERSION,

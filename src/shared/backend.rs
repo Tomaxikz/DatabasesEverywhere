@@ -19,6 +19,7 @@ const MONGODB_SOCKET_FILENAME: &str = "mongodb-27017.sock";
 const CLICKHOUSE_NATIVE_SOCKET_FILENAME: &str = "clickhouse-native.sock";
 const CLICKHOUSE_HTTP_SOCKET_FILENAME: &str = "clickhouse-http.sock";
 const QDRANT_GRPC_SOCKET_FILENAME: &str = "qdrant-grpc.sock";
+const QDRANT_HTTP_SOCKET_FILENAME: &str = "qdrant-http.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -59,6 +60,16 @@ pub fn clickhouse_http_socket_path(native_socket_path: &Path) -> Option<PathBuf>
 
 pub fn container_clickhouse_http_socket_path() -> String {
     format!("{CONTAINER_SOCKET_DIRECTORY}/{CLICKHOUSE_HTTP_SOCKET_FILENAME}")
+}
+
+pub fn qdrant_http_socket_path(grpc_socket_path: &Path) -> Option<PathBuf> {
+    grpc_socket_path
+        .parent()
+        .map(|parent| parent.join(QDRANT_HTTP_SOCKET_FILENAME))
+}
+
+pub fn container_qdrant_http_socket_path() -> String {
+    format!("{CONTAINER_SOCKET_DIRECTORY}/{QDRANT_HTTP_SOCKET_FILENAME}")
 }
 
 fn socket_filename(protocol: Protocol) -> &'static str {
@@ -113,6 +124,14 @@ mod tests {
         assert_eq!(
             clickhouse_http_socket_path(Path::new("/run/private/clickhouse-native.sock")),
             Some(PathBuf::from("/run/private/clickhouse-http.sock"))
+        );
+    }
+
+    #[test]
+    fn qdrant_http_socket_is_a_sibling_of_grpc_socket() {
+        assert_eq!(
+            qdrant_http_socket_path(Path::new("/run/private/qdrant-grpc.sock")),
+            Some(PathBuf::from("/run/private/qdrant-http.sock"))
         );
     }
 }

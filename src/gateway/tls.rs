@@ -41,9 +41,13 @@ pub fn acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, GatewayT
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+    // One certificate can serve every configured database listener. ALPN is
+    // optional for the traditional handshakes, required by PostgreSQL direct
+    // TLS, and expected by gRPC/HTTP clients.
+    config.alpn_protocols = vec![b"postgresql".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

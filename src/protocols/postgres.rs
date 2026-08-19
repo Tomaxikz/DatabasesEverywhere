@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 pub const SSL_REQUEST_CODE: i32 = 80877103;
+pub const GSSENC_REQUEST_CODE: i32 = 80877104;
+pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupRoute {
@@ -18,6 +20,10 @@ pub enum PostgresParseError {
     MissingField { field: &'static str },
     #[error("startup packet contains invalid utf8")]
     InvalidUtf8,
+    #[error("direct PostgreSQL TLS requires ALPN protocol postgresql")]
+    DirectTlsAlpnRequired,
+    #[error("PostgreSQL startup request is unsupported")]
+    UnsupportedStartupRequest,
 }
 
 pub fn is_ssl_request(bytes: &[u8]) -> bool {
@@ -25,6 +31,27 @@ pub fn is_ssl_request(bytes: &[u8]) -> bool {
         return false;
     }
     i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) == SSL_REQUEST_CODE
+}
+
+pub fn is_gssenc_request(bytes: &[u8]) -> bool {
+    startup_request_code(bytes) == Some(GSSENC_REQUEST_CODE)
+}
+
+pub fn cancel_request_key(bytes: &[u8]) -> Option<(i32, i32)> {
+    if bytes.len() != 16 || startup_request_code(bytes) != Some(CANCEL_REQUEST_CODE) {
+        return None;
+    }
+    Some((
+        i32::from_be_bytes(bytes[8..12].try_into().ok()?),
+        i32::from_be_bytes(bytes[12..16].try_into().ok()?),
+    ))
+}
+
+fn startup_request_code(bytes: &[u8]) -> Option<i32> {
+    if bytes.len() < 8 || u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize != bytes.len() {
+        return None;
+    }
+    Some(i32::from_be_bytes(bytes[4..8].try_into().ok()?))
 }
 
 pub fn parse_startup_route(bytes: &[u8]) -> Result<StartupRoute, PostgresParseError> {

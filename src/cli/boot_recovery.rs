@@ -1,6 +1,9 @@
 use super::*;
 
 pub(super) async fn complete_managed_runtime_boot(state: AppState) {
+    let Some(_mutation) = state.daemon_shutdown.try_admit_background_mutation() else {
+        return;
+    };
     if let Err(error) = start_known_instances_on_boot(
         &state.config,
         &state.manager,
@@ -18,6 +21,19 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
             .fail_and_stop("managed instance startup failed");
         return;
     }
+    if !state.import_export_jobs.is_accepting() {
+        return;
+    }
+
+    let compatibility = crate::compatibility::reconcile_managed_compatibility_on_boot(&state).await;
+    tracing::info!(
+        checked = compatibility.checked,
+        attestations_reused = compatibility.attestations_reused,
+        probed = compatibility.probed,
+        images_upgraded = compatibility.images_upgraded,
+        failed = compatibility.failed,
+        "configured image reconciliation and database compatibility attestation complete; failed instances were isolated individually"
+    );
     if !state.import_export_jobs.is_accepting() {
         return;
     }

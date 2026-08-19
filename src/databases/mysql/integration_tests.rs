@@ -8,10 +8,8 @@ use std::{
 use base64::Engine;
 
 use super::provision::{reset_tenant_password_sql, tenant_user_sql};
+use crate::databases::mysql_wire_integration::{run_jdbc_smoke, start_gateway, test_tls_acceptor};
 use crate::{
-    gateway::{
-        listeners::run_mysql_listener, resolver::RouteResolver, security::GatewayConnectionLimiter,
-    },
     instances::{
         metadata::{
             DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
@@ -23,7 +21,7 @@ use crate::{
     shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
 };
 
-const IMAGE: &str = "mysql:8.4";
+const DEFAULT_IMAGE: &str = "mysql:8.4";
 const DATABASE: &str = "integration_db";
 const TENANT: &str = "integration_user";
 const TENANT_PASSWORD: &str = "integration-tenant-password";
@@ -31,12 +29,17 @@ const ROTATED_TENANT_PASSWORD: &str = "integration-rotated-password";
 const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker, mysql:8.4, and the mariadb CLI"]
-async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() {
+#[ignore = "requires Docker, a supported MySQL image, and the mariadb CLI"]
+async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
+    let image = std::env::var("DBE_MYSQL_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
     let name = format!("dbev-mysql-test-{}", uuid::Uuid::new_v4().simple());
     let socket_root = tempfile::tempdir().unwrap();
-    let container = TestContainer::start(&name, socket_root.path());
+    let container = TestContainer::start(&name, socket_root.path(), &image);
     wait_until_ready(&name);
+    let version = query_mysql(&name, ROOT_PASSWORD, "root", "mysql", "SELECT VERSION()");
+    crate::compatibility::compatibility_profile(Protocol::Mysql, &version).unwrap_or_else(
+        |error| panic!("{image} reported unsupported live version {version}: {error}"),
+    );
 
     let sql = materialize_password(tenant_user_sql(DATABASE, TENANT), TENANT_PASSWORD);
     let provision = exec_with_input(
@@ -215,25 +218,13 @@ async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() 
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         })
         .await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let gateway_supervisor = crate::gateway::supervisor::GatewaySupervisor::new();
-    assert!(gateway_supervisor.begin(1));
-    let connections = gateway_supervisor.connection_tracker();
-    let bind = address.to_string();
-    let gateway = tokio::spawn(async move {
-        run_mysql_listener(
-            listener,
-            &bind,
-            RouteResolver::new(store, crate::api::resources::ResourceCache::default()),
-            None,
-            GatewayConnectionLimiter::default(),
-            shutdown_rx,
-            connections,
-        )
-        .await
-    });
+    let (address, gateway) =
+        start_gateway(Protocol::Mysql, store.clone(), None, shutdown_rx.clone()).await;
+    let tls_directory = tempfile::tempdir().unwrap();
+    let tls = test_tls_acceptor(tls_directory.path());
+    let (tls_address, tls_gateway) =
+        start_gateway(Protocol::Mysql, store, Some(tls), shutdown_rx).await;
 
     let routed = Command::new("mariadb")
         .args([
@@ -256,6 +247,13 @@ async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() 
         .expect("query through MySQL gateway");
     assert_success(&routed, "gateway-routed tenant query");
     assert_eq!(String::from_utf8_lossy(&routed.stdout).trim(), "before");
+    run_jdbc_smoke(
+        address.port(),
+        tls_address.port(),
+        DATABASE,
+        TENANT,
+        TENANT_PASSWORD,
+    );
 
     let rejected = Command::new("mariadb")
         .args([
@@ -281,6 +279,7 @@ async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() 
 
     shutdown_tx.send(true).unwrap();
     gateway.await.unwrap().unwrap();
+    tls_gateway.await.unwrap().unwrap();
 
     drop(container);
 }
@@ -288,7 +287,7 @@ async fn mysql_84_provisions_caching_sha2_tenant_and_round_trips_logical_dump() 
 struct TestContainer(String);
 
 impl TestContainer {
-    fn start(name: &str, socket_root: &std::path::Path) -> Self {
+    fn start(name: &str, socket_root: &std::path::Path, image: &str) -> Self {
         let output = Command::new("docker")
             .args([
                 "run",
@@ -302,7 +301,7 @@ impl TestContainer {
                 &format!("MYSQL_ROOT_PASSWORD={ROOT_PASSWORD}"),
                 "--env",
                 &format!("MYSQL_DATABASE={DATABASE}"),
-                IMAGE,
+                image,
                 "--skip-networking=ON",
                 "--skip-name-resolve",
                 "--skip-mysqlx",

@@ -7,6 +7,7 @@ const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+const CLIENT_SSL: u32 = 0x0000_0800;
 const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
@@ -28,8 +29,8 @@ pub enum GatewayFlavor {
 impl GatewayFlavor {
     fn server_version(self) -> &'static str {
         match self {
-            Self::Mysql => "8.4.0-databases-everywhere",
-            Self::Mariadb => "12.3.2-MariaDB-databases-everywhere",
+            Self::Mysql => "8.0.11",
+            Self::Mariadb => "10.11.0-MariaDB",
         }
     }
 }
@@ -71,6 +72,10 @@ pub enum MariadbProxyError {
     InvalidBackendPassword,
     #[error("mysql password authentication failed")]
     AuthenticationFailed,
+    #[error("mysql client requested TLS but this listener has no TLS configuration")]
+    TlsUnavailable,
+    #[error("mysql listener requires CLIENT_SSL negotiation")]
+    TlsRequired,
     #[error("mysql backend requested unsupported auth plugin: {0}")]
     UnsupportedBackendAuth(String),
 }
@@ -91,11 +96,27 @@ pub async fn send_gateway_handshake<S>(
     stream: &mut S,
     gateway_seed: &[u8],
     flavor: GatewayFlavor,
+    tls_available: bool,
 ) -> Result<(), MariadbProxyError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_packet(stream, 0, &gateway_handshake_payload(gateway_seed, flavor)?).await
+    write_packet(
+        stream,
+        0,
+        &gateway_handshake_payload(gateway_seed, flavor, tls_available)?,
+    )
+    .await
+}
+
+/// A MySQL client upgrades after the server greeting by sending the fixed
+/// 32-byte SSLRequest packet. It is not a full HandshakeResponse and must not
+/// be parsed for a username or authentication token.
+pub fn is_ssl_request(payload: &[u8]) -> Result<bool, MariadbProxyError> {
+    if payload.len() != 32 {
+        return Ok(false);
+    }
+    Ok(read_u32_le(payload, 0)? & CLIENT_SSL != 0)
 }
 
 pub async fn read_packet<S>(stream: &mut S) -> Result<MysqlPacket, MariadbProxyError>
@@ -337,18 +358,6 @@ pub fn caching_sha2_plaintext_password(password: &str) -> Result<Vec<u8>, Mariad
     Ok(payload)
 }
 
-pub fn ok_packet() -> Vec<u8> {
-    vec![
-        0x00,
-        0x00,
-        0x00,
-        OK_STATUS_AUTOCOMMIT[0],
-        OK_STATUS_AUTOCOMMIT[1],
-        0x00,
-        0x00,
-    ]
-}
-
 pub fn error_packet(message: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(0xff);
@@ -473,18 +482,22 @@ pub fn new_gateway_auth_seed() -> [u8; 20] {
 fn gateway_handshake_payload(
     gateway_seed: &[u8],
     flavor: GatewayFlavor,
+    tls_available: bool,
 ) -> Result<Vec<u8>, MariadbProxyError> {
     if gateway_seed.len() < 20 {
         return Err(MariadbProxyError::MalformedPacket);
     }
     let seed_1 = &gateway_seed[..8];
     let seed_2 = &gateway_seed[8..20];
-    let capabilities = CLIENT_LONG_PASSWORD
+    let mut capabilities = CLIENT_LONG_PASSWORD
         | CLIENT_LONG_FLAG
         | CLIENT_PROTOCOL_41
         | CLIENT_SECURE_CONNECTION
         | CLIENT_PLUGIN_AUTH
         | CLIENT_CONNECT_WITH_DB;
+    if tls_available {
+        capabilities |= CLIENT_SSL;
+    }
 
     let mut payload = Vec::new();
     payload.push(10);
@@ -733,7 +746,7 @@ mod tests {
     fn gateway_handshake_exposes_flavor_version_and_auth_plugin() {
         let gateway_seed = new_gateway_auth_seed();
         for flavor in [GatewayFlavor::Mysql, GatewayFlavor::Mariadb] {
-            let payload = gateway_handshake_payload(&gateway_seed, flavor).unwrap();
+            let payload = gateway_handshake_payload(&gateway_seed, flavor, false).unwrap();
             let mut offset = 1;
             let server_version = read_null_string(&payload, &mut offset).unwrap();
             offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
@@ -761,12 +774,10 @@ mod tests {
     #[test]
     fn connector_j_ascii_seed_parsing_preserves_the_exact_challenge() {
         let gateway_seed = new_gateway_auth_seed();
-        let payload = gateway_handshake_payload(&gateway_seed, GatewayFlavor::Mysql).unwrap();
+        let payload =
+            gateway_handshake_payload(&gateway_seed, GatewayFlavor::Mysql, false).unwrap();
         let mut offset = 1;
-        assert_eq!(
-            read_null_string(&payload, &mut offset).unwrap(),
-            "8.4.0-databases-everywhere"
-        );
+        assert_eq!(read_null_string(&payload, &mut offset).unwrap(), "8.0.11");
         offset += 4;
         let seed_1_start = offset;
         offset += 8 + 1 + 2 + 1 + 2 + 2;

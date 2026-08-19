@@ -10,6 +10,7 @@ pub struct InstanceRuntimeInfoCache {
 
 #[derive(Debug, Default)]
 pub(super) struct InstanceRuntimeInfoCacheInner {
+    epoch: u64,
     runtime: HashMap<String, CachedInstanceRuntimeInfo>,
     inspections: HashMap<String, CachedInstanceInspection>,
     inspection_locks: HashMap<String, Arc<Mutex<()>>>,
@@ -18,7 +19,6 @@ pub(super) struct InstanceRuntimeInfoCacheInner {
 #[derive(Debug, Clone)]
 pub(super) struct CachedInstanceRuntimeInfo {
     image: InstanceImageStatus,
-    database_version: InstanceDatabaseVersion,
     sampled_at: Instant,
 }
 
@@ -34,35 +34,42 @@ pub(super) struct MajorUpgradePrecheck {
 }
 
 impl InstanceRuntimeInfoCache {
-    async fn fresh(
+    pub(super) async fn epoch(&self) -> u64 {
+        self.inner.lock().await.epoch
+    }
+
+    pub(super) async fn fresh(
         &self,
         instance_id: &str,
         configured_image: &str,
-    ) -> Option<(InstanceImageStatus, InstanceDatabaseVersion)> {
+    ) -> Option<InstanceImageStatus> {
         let inner = self.inner.lock().await;
         let cached = inner
             .runtime
             .get(instance_id)
             .filter(|cached| cached.sampled_at.elapsed() < INSTANCE_RUNTIME_INFO_TTL)
             .filter(|cached| cached.image.configured == configured_image)?;
-        Some((cached.image.clone(), cached.database_version.clone()))
+        Some(cached.image.clone())
     }
 
-    async fn store(
+    pub(super) async fn store_if_epoch(
         &self,
         instance_id: String,
         image: InstanceImageStatus,
-        database_version: InstanceDatabaseVersion,
-    ) {
+        expected_epoch: u64,
+    ) -> bool {
         let mut inner = self.inner.lock().await;
+        if inner.epoch != expected_epoch {
+            return false;
+        }
         inner.runtime.insert(
             instance_id,
             CachedInstanceRuntimeInfo {
                 image,
-                database_version,
                 sampled_at: Instant::now(),
             },
         );
+        true
     }
 
     async fn inspect_instance(
@@ -71,41 +78,67 @@ impl InstanceRuntimeInfoCache {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<DockerInstanceInspection, DockerError> {
-        let requested_at = Instant::now();
-        let refresh_lock = {
-            let mut inner = self.inner.lock().await;
-            inner
-                .inspection_locks
-                .entry(instance_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _refresh = refresh_lock.lock().await;
+        loop {
+            let requested_at = Instant::now();
+            let (refresh_lock, epoch) = {
+                let mut inner = self.inner.lock().await;
+                let epoch = inner.epoch;
+                let lock = inner
+                    .inspection_locks
+                    .entry(instance_id.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                (lock, epoch)
+            };
+            let refresh = refresh_lock.lock().await;
 
-        {
-            let inner = self.inner.lock().await;
-            if let Some(cached) = inner
-                .inspections
-                .get(instance_id)
-                .filter(|cached| cached.sampled_at >= requested_at)
             {
-                return Ok(cached.inspection.clone());
+                let inner = self.inner.lock().await;
+                if inner.epoch != epoch {
+                    drop(inner);
+                    drop(refresh);
+                    continue;
+                }
+                if let Some(cached) = inner
+                    .inspections
+                    .get(instance_id)
+                    .filter(|cached| cached.sampled_at >= requested_at)
+                {
+                    return Ok(cached.inspection.clone());
+                }
             }
-        }
 
-        let inspection = docker.inspect_instance(protocol, instance_id).await?;
-        self.inner.lock().await.inspections.insert(
-            instance_id.to_string(),
-            CachedInstanceInspection {
-                inspection: inspection.clone(),
-                sampled_at: Instant::now(),
-            },
-        );
-        Ok(inspection)
+            let inspection = match docker.inspect_instance(protocol, instance_id).await {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    let invalidated = self.inner.lock().await.epoch != epoch;
+                    drop(refresh);
+                    if invalidated {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut inner = self.inner.lock().await;
+            if inner.epoch != epoch {
+                drop(inner);
+                drop(refresh);
+                continue;
+            }
+            inner.inspections.insert(
+                instance_id.to_string(),
+                CachedInstanceInspection {
+                    inspection: inspection.clone(),
+                    sampled_at: Instant::now(),
+                },
+            );
+            return Ok(inspection);
+        }
     }
 
     pub async fn remove(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
+        inner.epoch = inner.epoch.wrapping_add(1);
         inner.runtime.remove(instance_id);
         inner.inspections.remove(instance_id);
         inner.inspection_locks.remove(instance_id);
@@ -315,23 +348,24 @@ pub(super) async fn enrich_instance_runtime_info(
     state: &AppState,
     mut metadata: InstanceMetadata,
 ) -> InstanceMetadata {
+    let cache_epoch = state.instance_runtime_cache.epoch().await;
     let inspection = live_instance_inspection(state, &metadata).await;
-    metadata.status = classify_live_instance_status(&metadata, inspection.as_ref());
+    metadata.status = if state.instances.routes_fenced(&metadata.instance_id).await {
+        InstanceStatus::Booting
+    } else {
+        classify_live_instance_status(&metadata, inspection.as_ref())
+    };
     let configured = state
         .config
         .images
         .configured_for_protocol(metadata.protocol);
-    if let Some((image, database_version)) = state
+    if let Some(image) = state
         .instance_runtime_cache
         .fresh(&metadata.instance_id, configured)
         .await
     {
         metadata.image = Some(image);
-        metadata.database_version = Some(if metadata.status == InstanceStatus::Running {
-            database_version
-        } else {
-            current_database_version(state, &metadata).await
-        });
+        metadata.database_version = Some(current_database_version(state, &metadata).await);
         return metadata;
     }
 
@@ -355,11 +389,7 @@ pub(super) async fn enrich_instance_runtime_info(
     let database_version = current_database_version(state, &metadata).await;
     state
         .instance_runtime_cache
-        .store(
-            metadata.instance_id.clone(),
-            image.clone(),
-            database_version.clone(),
-        )
+        .store_if_epoch(metadata.instance_id.clone(), image.clone(), cache_epoch)
         .await;
     metadata.image = Some(image);
     metadata.database_version = Some(database_version);
@@ -370,6 +400,9 @@ pub(super) async fn live_instance_status(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> InstanceStatus {
+    if state.instances.routes_fenced(&metadata.instance_id).await {
+        return InstanceStatus::Booting;
+    }
     let inspection = live_instance_inspection(state, metadata).await;
     classify_live_instance_status(metadata, inspection.as_ref())
 }
@@ -397,6 +430,17 @@ pub(super) fn classify_live_instance_status(
     metadata: &InstanceMetadata,
     inspection: Option<&Result<DockerInstanceInspection, DockerError>>,
 ) -> InstanceStatus {
+    // Durable non-running states are also gateway-publication barriers. A
+    // container process may already exist while creation, startup hardening,
+    // recovery, or an explicit stop is still in progress; reporting `running`
+    // before that state is committed tells clients the route is ready when it
+    // deliberately is not.
+    if metadata.status != InstanceStatus::Running {
+        return metadata.status;
+    }
+    if metadata.desired_state == DesiredInstanceState::Stopped {
+        return InstanceStatus::Stopped;
+    }
     match inspection {
         None => metadata.status,
         Some(Ok(inspection)) => reconcile::classify_container_status(inspection.status),
@@ -419,104 +463,30 @@ pub(super) async fn current_database_version(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> InstanceDatabaseVersion {
-    if metadata.status != InstanceStatus::Running {
-        return InstanceDatabaseVersion {
-            current: None,
-            error: Some(PublicDiagnostic::public(
-                "not_running",
-                format!(
-                    "instance is {}; version is only probed for running instances",
-                    metadata.status.as_str()
-                ),
-            )),
-        };
-    }
-
-    let script = database_version_script(metadata.protocol);
-    match state
-        .docker
-        .exec_shell(metadata.protocol, &metadata.instance_id, script)
+    match crate::compatibility::compatibility_attestation(&state.manager, &state.docker, metadata)
         .await
     {
-        Ok(output) => {
-            let current = normalize_database_version(metadata.protocol, &output.stdout);
-            let error = current.is_none().then(|| {
-                PublicDiagnostic::public(
-                    "version_unavailable",
-                    "database version command returned no parseable output",
-                )
-            });
-            InstanceDatabaseVersion { current, error }
-        }
+        Ok(Some(attestation)) => InstanceDatabaseVersion {
+            current: Some(attestation.version),
+            error: attestation
+                .diagnostic
+                .map(|message| PublicDiagnostic::public("unsupported_database_version", message)),
+        },
+        Ok(None) => InstanceDatabaseVersion {
+            current: None,
+            error: Some(PublicDiagnostic::public(
+                "version_not_attested",
+                "the database version has not been attested yet; it will be checked at daemon boot or after reconstruction, password reset, or image update",
+            )),
+        },
         Err(error) => InstanceDatabaseVersion {
             current: None,
-            error: Some(PublicDiagnostic::internal("database version probe", error)),
+            error: Some(PublicDiagnostic::internal(
+                "database compatibility attestation",
+                error,
+            )),
         },
     }
-}
-
-pub(super) fn database_version_script(protocol: Protocol) -> &'static str {
-    match protocol {
-        Protocol::Postgres => "postgres --version 2>/dev/null || psql --version",
-        Protocol::Mariadb => "mariadb --version 2>/dev/null || mysqld --version",
-        Protocol::Mysql => "mysqld --version 2>/dev/null || mysql --version",
-        Protocol::Redis => "redis-server --version",
-        Protocol::Valkey => "valkey-server --version",
-        Protocol::Mongodb => "mongod --version | awk '/db version/ {print $3; exit}'",
-        Protocol::Clickhouse => "clickhouse-server --version 2>/dev/null || clickhouse --version",
-        Protocol::Qdrant => {
-            "if command -v qdrant >/dev/null 2>&1; then qdrant --version; elif [ -x /qdrant/qdrant ]; then /qdrant/qdrant --version; else cat /qdrant/VERSION 2>/dev/null; fi"
-        }
-    }
-}
-
-pub(super) fn normalize_database_version(protocol: Protocol, stdout: &str) -> Option<String> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
-    let version = match protocol {
-        Protocol::Postgres => line
-            .strip_prefix("postgres (PostgreSQL) ")
-            .or_else(|| line.strip_prefix("psql (PostgreSQL) "))
-            .unwrap_or(line),
-        Protocol::Mariadb => line
-            .split("Distrib ")
-            .nth(1)
-            .and_then(|rest| rest.split([',', ' ']).next())
-            .unwrap_or(line),
-        Protocol::Mysql => line
-            .split("Ver ")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .or_else(|| {
-                line.split("Distrib ")
-                    .nth(1)
-                    .and_then(|rest| rest.split([',', ' ']).next())
-            })
-            .unwrap_or(line),
-        Protocol::Redis | Protocol::Valkey => line
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("v="))
-            .unwrap_or(line),
-        Protocol::Mongodb => line.strip_prefix('v').unwrap_or(line),
-        Protocol::Clickhouse => line
-            .strip_prefix("ClickHouse server version ")
-            .or_else(|| line.strip_prefix("ClickHouse local version "))
-            .or_else(|| line.strip_prefix("ClickHouse client version "))
-            .unwrap_or(line)
-            .split(" (")
-            .next()
-            .unwrap_or(line),
-        Protocol::Qdrant => line
-            .strip_prefix("qdrant ")
-            .or_else(|| line.strip_prefix("Qdrant "))
-            .unwrap_or(line),
-    }
-    .trim()
-    .trim_end_matches('.');
-
-    (!version.is_empty()).then(|| version.to_string())
 }
 
 pub(super) fn fail_image_update_api(

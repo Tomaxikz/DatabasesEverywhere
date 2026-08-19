@@ -1,6 +1,9 @@
 pub mod docker;
 pub mod provision;
 
+#[cfg(test)]
+mod integration_tests;
+
 pub mod config {
     #[derive(Debug, Clone)]
     pub struct MariadbInstanceConfig {

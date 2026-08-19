@@ -9,7 +9,8 @@ use crate::{
     },
     shared::{
         backend::{
-            CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH, container_backend_socket_path,
+            CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH,
+            container_backend_socket_path, container_qdrant_http_socket_path,
         },
         protocol::Protocol,
     },
@@ -52,10 +53,16 @@ pub fn instance_spec(
                 read_only: true,
             },
         ],
-        socket_bridges: vec![SocketBridge {
-            socket_path: container_backend_socket_path(Protocol::Qdrant),
-            target: loopback_target(6334),
-        }],
+        socket_bridges: vec![
+            SocketBridge {
+                socket_path: container_backend_socket_path(Protocol::Qdrant),
+                target: loopback_target(6334),
+            },
+            SocketBridge {
+                socket_path: container_qdrant_http_socket_path(),
+                target: loopback_target(6333),
+            },
+        ],
         env: vec![
             DockerEnv {
                 key: "QDRANT__TELEMETRY_DISABLED".to_string(),
@@ -117,8 +124,9 @@ mod tests {
         assert_eq!(spec.entrypoint, None);
         assert_eq!(spec.extra_mounts[0].target, CONTAINER_SOCKET_DIRECTORY);
         assert_eq!(spec.extra_mounts[1].target, SOCKET_BRIDGE_CONTAINER_PATH);
-        assert_eq!(spec.socket_bridges.len(), 1);
+        assert_eq!(spec.socket_bridges.len(), 2);
         assert_eq!(spec.socket_bridges[0].target, loopback_target(6334));
+        assert_eq!(spec.socket_bridges[1].target, loopback_target(6333));
         assert!(spec.env.iter().any(|env| {
             env.key == "QDRANT__TELEMETRY_DISABLED" && env.value.expose_secret() == "true"
         }));

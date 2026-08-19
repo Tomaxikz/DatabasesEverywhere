@@ -339,24 +339,41 @@ async fn harden_postgres_instance_on_boot(
     if metadata.protocol != Protocol::Postgres || metadata.status == InstanceStatus::Quarantined {
         return summary;
     }
-    if metadata.status == InstanceStatus::Running {
-        match crate::instances::auth_hardening::attestation_is_current(manager, docker, &metadata)
-            .await
+    let attestation = if metadata.status == InstanceStatus::Running {
+        match crate::instances::auth_hardening::begin_attestation(manager, docker, &metadata).await
         {
-            Ok(true) => {
+            Ok(check) if check.current => {
                 summary.attestations_reused = 1;
                 return summary;
             }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                event = "audit auth_hardening_attestation_check_failed",
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
-                %error,
-                "could not validate the cached hardening attestation; running full PostgreSQL hardening"
-            ),
+            Ok(check) => {
+                if let Some(error) = check.cache_warning.as_deref() {
+                    tracing::warn!(
+                        event = "audit auth_hardening_attestation_check_failed",
+                        instance_id = %metadata.instance_id,
+                        protocol = %metadata.protocol,
+                        %error,
+                        "could not validate the cached hardening attestation; running full PostgreSQL hardening"
+                    );
+                }
+                Some(check)
+            }
+            Err(error) => {
+                record_running_auth_failure(
+                    manager,
+                    &metadata,
+                    format!(
+                        "could not bind PostgreSQL hardening to one container generation: {error}"
+                    ),
+                    &mut summary,
+                )
+                .await;
+                return summary;
+            }
         }
-    }
+    } else {
+        None
+    };
     let bootstrap_credentials = docker
         .postgres_bootstrap_credentials(&metadata.instance_id)
         .await;
@@ -610,16 +627,33 @@ async fn harden_postgres_instance_on_boot(
             "verified and encrypted current PostgreSQL credentials"
         );
     }
-    if let Err(error) =
-        crate::instances::auth_hardening::record_attestation(manager, docker, &metadata).await
+    if let Some(attestation) = attestation.as_ref()
+        && let Err(error) = crate::instances::auth_hardening::complete_attestation(
+            manager,
+            docker,
+            &metadata,
+            attestation.generation(),
+        )
+        .await
     {
-        tracing::warn!(
-            event = "audit auth_hardening_attestation_write_failed",
-            instance_id = %metadata.instance_id,
-            protocol = %metadata.protocol,
-            %error,
-            "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
-        );
+        if error.is_storage() {
+            tracing::warn!(
+                event = "audit auth_hardening_attestation_write_failed",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
+            );
+        } else {
+            record_running_auth_failure(
+                manager,
+                &metadata,
+                format!("PostgreSQL container generation changed during hardening: {error}"),
+                &mut summary,
+            )
+            .await;
+            return summary;
+        }
     }
     summary
 }

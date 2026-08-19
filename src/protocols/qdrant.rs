@@ -4,7 +4,7 @@ use h2::{
     client::{SendRequest, SendRequest as H2SendRequest},
     server::SendResponse,
 };
-use http::{Request, Response};
+use http::{HeaderMap, Request, Response};
 use sha2::{Digest, Sha256};
 use std::{future::Future, future::poll_fn, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,6 +30,8 @@ pub enum QdrantProxyError {
     OutboundStreamClosed,
     #[error("qdrant grpc peer reset the rpc stream: {reason:?}")]
     StreamReset { reason: h2::Reason },
+    #[error("qdrant HTTP proxy failed: {0}")]
+    Http(String),
 }
 
 impl QdrantProxyError {
@@ -71,14 +73,20 @@ pub fn route_key_sha256(api_key: &str) -> String {
     format!("{digest:x}")
 }
 
-pub fn api_key_from_request(request: &Request<RecvStream>) -> Result<String, QdrantProxyError> {
-    request
-        .headers()
-        .get(API_KEY_HEADER)
-        .ok_or(QdrantProxyError::MissingApiKey)?
+pub fn api_key_from_headers(headers: &HeaderMap) -> Result<String, QdrantProxyError> {
+    let mut values = headers.get_all(API_KEY_HEADER).iter();
+    let value = values.next().ok_or(QdrantProxyError::MissingApiKey)?;
+    if values.next().is_some() {
+        return Err(QdrantProxyError::InvalidApiKey);
+    }
+    value
         .to_str()
         .map(str::to_string)
         .map_err(|_| QdrantProxyError::InvalidApiKey)
+}
+
+pub fn api_key_from_request<B>(request: &Request<B>) -> Result<String, QdrantProxyError> {
+    api_key_from_headers(request.headers())
 }
 
 pub async fn server_handshake<S>(

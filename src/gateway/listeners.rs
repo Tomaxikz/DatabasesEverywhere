@@ -12,12 +12,16 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
-    task::JoinSet,
     time::{Duration, timeout},
 };
+
+#[path = "listeners/qdrant.rs"]
+mod qdrant_listener;
+use qdrant_listener::handle_qdrant_client;
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 use super::{
+    postgres_sessions,
     resolver::RouteResolver,
     security::{
         GatewayConnectionLimiter, GatewayConnectionRejection, GatewayConnectionRejectionReason,
@@ -37,6 +41,8 @@ pub enum ListenerError {
     Io(#[from] std::io::Error),
     #[error("postgres routing failed: {0}")]
     Postgres(#[from] postgres::PostgresParseError),
+    #[error("postgres session routing failed: {0}")]
+    PostgresSession(String),
     #[error("RESP routing failed: {0}")]
     Resp(#[from] redis::RedisParseError),
     #[error("mariadb routing failed: {0}")]
@@ -53,6 +59,8 @@ pub enum ListenerError {
     AmbiguousDatabaseRoute { protocol: &'static str },
     #[error("clickhouse backend endpoint is invalid")]
     InvalidClickhouseBackend,
+    #[error("qdrant backend endpoint is invalid")]
+    InvalidQdrantBackend,
     #[error("tunnel failed: {0}")]
     Tunnel(#[from] tunnel::TunnelError),
     #[error("backend for managed instance {instance_id} failed: {source}")]
@@ -603,40 +611,77 @@ fn expected_client_failure(error: &ListenerError) -> bool {
 }
 
 async fn handle_postgres_client(
-    mut client: TcpStream,
+    client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, packet) = client_handshake("postgres", async move {
-        let packet = read_postgres_startup_packet(&mut client).await?;
+    enum Initial {
+        Cancelled,
+        Session {
+            client: GatewayStream,
+            target: crate::gateway::resolver::ResolvedRoute,
+            packet: Vec<u8>,
+        },
+    }
 
-        let (client, packet) = if postgres::is_ssl_request(&packet) {
-            if let Some(tls) = tls {
-                client.write_all(b"S").await?;
-                let mut client = GatewayStream::Tls(Box::new(tls.accept(client).await?));
-                let packet = read_postgres_startup_packet(&mut client).await?;
-                (client, packet)
-            } else {
-                client.write_all(b"N").await?;
-                let mut client = GatewayStream::Plain(client);
-                let packet = read_postgres_startup_packet(&mut client).await?;
-                (client, packet)
+    let initial = client_handshake("postgres", async move {
+        let direct_tls = tls.is_some() && postgres_direct_tls_requested(&client).await?;
+        let (mut client, mut packet, encrypted) = if direct_tls {
+            let tls = tls
+                .clone()
+                .ok_or(postgres::PostgresParseError::UnsupportedStartupRequest)?;
+            let tls_stream = tls.accept(client).await?;
+            if tls_stream.get_ref().1.alpn_protocol() != Some(b"postgresql") {
+                return Err(postgres::PostgresParseError::DirectTlsAlpnRequired.into());
             }
-        } else if tls.is_some() {
-            return Err(postgres::PostgresParseError::InvalidLength.into());
+            let mut client = GatewayStream::Tls(Box::new(tls_stream));
+            let packet = read_postgres_startup_packet(&mut client).await?;
+            (client, packet, true)
         } else {
-            (GatewayStream::Plain(client), packet)
+            let mut client = GatewayStream::Plain(client);
+            let packet = read_postgres_startup_packet(&mut client).await?;
+            (client, packet, false)
         };
 
+        // libpq may try GSS encryption before SSL. DBEV deliberately does not
+        // terminate GSS, so reply N and continue the same startup negotiation.
+        while postgres::is_gssenc_request(&packet) {
+            client.write_all(b"N").await?;
+            packet = read_postgres_startup_packet(&mut client).await?;
+        }
+
+        if postgres::is_ssl_request(&packet) {
+            if encrypted {
+                return Err(postgres::PostgresParseError::UnsupportedStartupRequest.into());
+            }
+            let GatewayStream::Plain(mut raw_client) = client else {
+                return Err(postgres::PostgresParseError::UnsupportedStartupRequest.into());
+            };
+            if let Some(tls) = tls {
+                raw_client.write_all(b"S").await?;
+                let mut upgraded = GatewayStream::Tls(Box::new(tls.accept(raw_client).await?));
+                packet = read_postgres_startup_packet(&mut upgraded).await?;
+                client = upgraded;
+            } else {
+                raw_client.write_all(b"N").await?;
+                client = GatewayStream::Plain(raw_client);
+                packet = read_postgres_startup_packet(&mut client).await?;
+            }
+        } else if tls.is_some() && !encrypted {
+            return Err(postgres::PostgresParseError::UnsupportedStartupRequest.into());
+        }
+
+        if let Some(key) = postgres::cancel_request_key(&packet) {
+            let _ = postgres_sessions::forward_cancel(key.into(), &packet)
+                .await
+                .map_err(|error| ListenerError::PostgresSession(error.to_string()))?;
+            return Ok(Initial::Cancelled);
+        }
+
         let route = postgres::parse_startup_route(&packet)?;
-        let mut resolution = resolver
+        let resolution = resolver
             .resolve_postgres(&route.user, route.database.as_deref())
             .await;
-        if matches!(resolution, DatabaseRouteResolution::NotFound)
-            && route.database.as_deref() == Some(route.user.as_str())
-        {
-            resolution = resolver.resolve_postgres(&route.user, None).await;
-        }
         let (database, target) = match resolution {
             DatabaseRouteResolution::Found { database, target } => (database, target),
             DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
@@ -657,18 +702,60 @@ async fn handle_postgres_client(
             endpoint = ?target.endpoint,
             "postgres route resolved"
         );
-        Ok((client, target, packet))
+        Ok(Initial::Session {
+            client,
+            target,
+            packet,
+        })
     })
     .await?;
 
-    let instance_id = target.instance_id;
-    tunnel::connect_replay_and_tunnel(client, target.endpoint, &packet, target.network)
+    let Initial::Session {
+        mut client,
+        target,
+        packet,
+    } = initial
+    else {
+        return Ok(());
+    };
+
+    let instance_id = target.instance_id.clone();
+    let backend = tunnel::connect_backend(&target.endpoint)
         .await
         .map_err(|source| ListenerError::Backend {
-            instance_id,
+            instance_id: instance_id.clone(),
             source,
         })?;
+    let mut backend = tunnel::MeteredBackend::new(backend, target.network.clone());
+    backend.write_all(&packet).await?;
+    let _cancel_registration = timeout(
+        CLIENT_HANDSHAKE_TIMEOUT,
+        postgres_sessions::proxy_startup_and_register(&mut client, &mut backend, &target),
+    )
+    .await
+    .map_err(|_| ListenerError::HandshakeTimeout {
+        protocol: "postgres",
+        timeout_secs: CLIENT_HANDSHAKE_TIMEOUT.as_secs(),
+    })?
+    .map_err(|error| ListenerError::PostgresSession(error.to_string()))?;
+    let tunnel_result = io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut backend,
+        TUNNEL_BUFFER_SIZE,
+        TUNNEL_BUFFER_SIZE,
+    )
+    .await;
+    tunnel_result.map_err(|source| ListenerError::Backend {
+        instance_id,
+        source: tunnel::TunnelError::Tunnel(source),
+    })?;
     Ok(())
+}
+
+async fn postgres_direct_tls_requested(client: &TcpStream) -> Result<bool, std::io::Error> {
+    let mut first = [0_u8; 1];
+    let read = client.peek(&mut first).await?;
+    Ok(read == 1 && first[0] == 0x16)
 }
 
 async fn read_postgres_startup_packet<S>(client: &mut S) -> Result<Vec<u8>, ListenerError>
@@ -694,16 +781,8 @@ async fn handle_redis_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, initial) = client_handshake("redis", async move {
-        let mut client = accept_direct_tls(client, tls).await?;
-        let (route, initial) = read_resp_initial_frame(&mut client).await?;
-        let target = resolver
-            .resolve_redis(&route.username)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
-        Ok((client, target, initial))
-    })
-    .await?;
+    let (client, target, initial) =
+        client_handshake("redis", prepare_resp_tunnel(client, resolver, tls, false)).await?;
 
     let instance_id = target.instance_id;
     tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network)
@@ -720,16 +799,8 @@ async fn handle_valkey_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, initial) = client_handshake("valkey", async move {
-        let mut client = accept_direct_tls(client, tls).await?;
-        let (route, initial) = read_resp_initial_frame(&mut client).await?;
-        let target = resolver
-            .resolve_valkey(&route.username)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
-        Ok((client, target, initial))
-    })
-    .await?;
+    let (client, target, initial) =
+        client_handshake("valkey", prepare_resp_tunnel(client, resolver, tls, true)).await?;
 
     let instance_id = target.instance_id;
     tunnel::connect_replay_and_tunnel(client, target.endpoint, &initial, target.network)
@@ -739,6 +810,51 @@ async fn handle_valkey_client(
             source,
         })?;
     Ok(())
+}
+
+async fn prepare_resp_tunnel(
+    client: TcpStream,
+    resolver: RouteResolver,
+    tls: Option<TlsAcceptor>,
+    valkey: bool,
+) -> Result<
+    (
+        GatewayStream,
+        crate::gateway::resolver::ResolvedRoute,
+        Vec<u8>,
+    ),
+    ListenerError,
+> {
+    let mut client = accept_direct_tls(client, tls).await?;
+    let (route, initial, consumed) = read_resp_initial_frame(&mut client).await?;
+    let explicit_target = if let Some(username) = route.username() {
+        if valkey {
+            resolver.resolve_valkey(username).await
+        } else {
+            resolver.resolve_redis(username).await
+        }
+    } else {
+        None
+    };
+    let (target, initial) = if let Some(target) = explicit_target {
+        (target, initial)
+    } else if route
+        .username()
+        .is_none_or(|username| username.eq_ignore_ascii_case("default"))
+    {
+        let password_sha256 = route.password_route_sha256();
+        let (username, target) = if valkey {
+            resolver.resolve_valkey_password(&password_sha256).await
+        } else {
+            resolver.resolve_redis_password(&password_sha256).await
+        }
+        .ok_or(ListenerError::RouteNotFound)?;
+        let rewritten = route.rewrite_with_resolved_username(&initial, consumed, &username)?;
+        (target, rewritten)
+    } else {
+        return Err(ListenerError::RouteNotFound);
+    };
+    Ok((client, target, initial))
 }
 
 async fn handle_mariadb_client(
@@ -804,21 +920,59 @@ async fn prepare_mysql_wire_tunnel(
     mysql: bool,
 ) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
     let protocol = if mysql { "mysql" } else { "mariadb" };
-    let mut client = accept_direct_tls(client, tls).await?;
+    // MySQL TLS is negotiated *after* the server greeting with CLIENT_SSL.
+    // Wrapping the TCP stream before the greeting works only for nonstandard
+    // direct-TLS clients and breaks Connector/J, MariaDB JDBC, and the CLIs.
+    let mut raw_client = client;
+    let tls_available = tls.is_some();
     let gateway_seed = mariadb::new_gateway_auth_seed();
     let flavor = if mysql {
         mariadb::GatewayFlavor::Mysql
     } else {
         mariadb::GatewayFlavor::Mariadb
     };
-    mariadb::send_gateway_handshake(&mut client, &gateway_seed, flavor).await?;
-    let client_response =
-        mariadb::read_packet_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
+    mariadb::send_gateway_handshake(&mut raw_client, &gateway_seed, flavor, tls_available).await?;
+    let first_response =
+        mariadb::read_packet_limited(&mut raw_client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
+    let (mut client, client_response) = if mariadb::is_ssl_request(&first_response.payload)? {
+        let Some(tls) = tls else {
+            let error = mariadb::MariadbProxyError::TlsUnavailable;
+            mariadb::write_packet(
+                &mut raw_client,
+                first_response.sequence.wrapping_add(1),
+                &mariadb::error_packet(&error.to_string()),
+            )
+            .await?;
+            return Err(error.into());
+        };
+        let mut client = GatewayStream::Tls(Box::new(tls.accept(raw_client).await?));
+        let response =
+            mariadb::read_packet_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
+        (client, response)
+    } else {
+        if tls_available {
+            let error = mariadb::MariadbProxyError::TlsRequired;
+            mariadb::write_packet(
+                &mut raw_client,
+                first_response.sequence.wrapping_add(1),
+                &mariadb::error_packet(&error.to_string()),
+            )
+            .await?;
+            return Err(error.into());
+        }
+        (GatewayStream::Plain(raw_client), first_response)
+    };
+    let client_reply_sequence = client_response.sequence.wrapping_add(1);
     let mut route = match mariadb::parse_client_handshake_response(&client_response.payload) {
         Ok(route) => route,
         Err(error) => {
             let error_message = error.to_string();
-            mariadb::write_packet(&mut client, 2, &mariadb::error_packet(&error_message)).await?;
+            mariadb::write_packet(
+                &mut client,
+                client_reply_sequence,
+                &mariadb::error_packet(&error_message),
+            )
+            .await?;
             return Err(error.into());
         }
     };
@@ -843,7 +997,7 @@ async fn prepare_mysql_wire_tunnel(
         DatabaseRouteResolution::NotFound => {
             mariadb::write_packet(
                 &mut client,
-                2,
+                client_reply_sequence,
                 &mariadb::error_packet("Access denied for requested database"),
             )
             .await?;
@@ -852,7 +1006,7 @@ async fn prepare_mysql_wire_tunnel(
         DatabaseRouteResolution::Ambiguous => {
             mariadb::write_packet(
                 &mut client,
-                2,
+                client_reply_sequence,
                 &mariadb::error_packet("Database must be included for routing"),
             )
             .await?;
@@ -862,7 +1016,12 @@ async fn prepare_mysql_wire_tunnel(
     route.database = database;
     let Some(native_password_sha1_stage2) = target.native_password_sha1_stage2.as_deref() else {
         let message = mariadb::MariadbProxyError::MissingNativePasswordVerifier.to_string();
-        mariadb::write_packet(&mut client, 2, &mariadb::error_packet(&message)).await?;
+        mariadb::write_packet(
+            &mut client,
+            client_reply_sequence,
+            &mariadb::error_packet(&message),
+        )
+        .await?;
         return Err(mariadb::MariadbProxyError::MissingNativePasswordVerifier.into());
     };
     tracing::debug!(
@@ -896,7 +1055,12 @@ async fn prepare_mysql_wire_tunnel(
         Ok(payload) => payload,
         Err(error) => {
             let message = error.to_string();
-            mariadb::write_packet(&mut client, 2, &mariadb::error_packet(&message)).await?;
+            mariadb::write_packet(
+                &mut client,
+                client_reply_sequence,
+                &mariadb::error_packet(&message),
+            )
+            .await?;
             return Err(error.into());
         }
     };
@@ -915,7 +1079,12 @@ async fn prepare_mysql_wire_tunnel(
             Ok(payload) => payload,
             Err(error) => {
                 let message = error.to_string();
-                mariadb::write_packet(&mut client, 2, &mariadb::error_packet(&message)).await?;
+                mariadb::write_packet(
+                    &mut client,
+                    client_reply_sequence,
+                    &mariadb::error_packet(&message),
+                )
+                .await?;
                 return Err(error.into());
             }
         };
@@ -956,7 +1125,12 @@ async fn prepare_mysql_wire_tunnel(
     }
 
     if mariadb::packet_is_error(&backend_response.payload) {
-        mariadb::write_packet(&mut client, 2, &backend_response.payload).await?;
+        mariadb::write_packet(
+            &mut client,
+            client_reply_sequence,
+            &backend_response.payload,
+        )
+        .await?;
         return Ok(None);
     }
     if !mariadb::packet_is_ok(&backend_response.payload) {
@@ -965,11 +1139,24 @@ async fn prepare_mysql_wire_tunnel(
         } else {
             "unsupported mariadb backend auth response"
         };
-        mariadb::write_packet(&mut client, 2, &mariadb::error_packet(message)).await?;
+        mariadb::write_packet(
+            &mut client,
+            client_reply_sequence,
+            &mariadb::error_packet(message),
+        )
+        .await?;
         return Err(mariadb::MariadbProxyError::MalformedPacket.into());
     }
 
-    mariadb::write_packet(&mut client, 2, &mariadb::ok_packet()).await?;
+    // Preserve the backend's negotiated status flags and warnings. Only the
+    // sequence number belongs to the public handshake; synthesizing a fresh
+    // OK packet here needlessly discarded real server state.
+    mariadb::write_packet(
+        &mut client,
+        client_reply_sequence,
+        &backend_response.payload,
+    )
+    .await?;
     Ok(Some((client, backend)))
 }
 
@@ -1076,15 +1263,12 @@ async fn handle_clickhouse_client(
         let mut client = accept_direct_tls(client, tls).await?;
         let initial = read_clickhouse_hello(&mut client).await?;
         let route = clickhouse::parse_native_initial_route(&initial)?;
-        let mut resolution = resolver
+        let resolution = resolver
             .resolve_clickhouse(
                 &route.username,
                 (!route.database.is_empty()).then_some(route.database.as_str()),
             )
             .await;
-        if matches!(resolution, DatabaseRouteResolution::NotFound) && route.database == "default" {
-            resolution = resolver.resolve_clickhouse(&route.username, None).await;
-        }
         let (database, target) = match resolution {
             DatabaseRouteResolution::Found { database, target } => (database, target),
             DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
@@ -1123,17 +1307,12 @@ async fn handle_clickhouse_http_client(
             let mut client = accept_direct_tls(client, tls).await?;
             let initial = read_http_headers(&mut client).await?;
             let route = clickhouse::parse_http_initial_route(&initial)?;
-            let mut resolution = resolver
+            let resolution = resolver
                 .resolve_clickhouse(
                     &route.username,
                     (!route.database.is_empty()).then_some(route.database.as_str()),
                 )
                 .await;
-            if matches!(resolution, DatabaseRouteResolution::NotFound)
-                && route.database == "default"
-            {
-                resolution = resolver.resolve_clickhouse(&route.username, None).await;
-            }
             let (database, target) = match resolution {
                 DatabaseRouteResolution::Found { database, target } => (database, target),
                 DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
@@ -1166,115 +1345,6 @@ async fn handle_clickhouse_http_client(
             source,
         })?;
     Ok(())
-}
-
-async fn handle_qdrant_client(
-    client: TcpStream,
-    resolver: RouteResolver,
-    tls: Option<TlsAcceptor>,
-) -> Result<(), ListenerError> {
-    let (mut server, backend, first_request, first_respond) =
-        client_handshake("qdrant", async move {
-            let client = accept_direct_tls(client, tls).await?;
-            let mut server = qdrant::server_handshake(client).await?;
-            let Some(first_request) = server.accept().await else {
-                return Err(qdrant::QdrantProxyError::MissingApiKey.into());
-            };
-            let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
-            let api_key = qdrant::api_key_from_request(&request)?;
-            let route_key_sha256 = qdrant::route_key_sha256(&api_key);
-            let target = resolver
-                .resolve_qdrant(&route_key_sha256)
-                .await
-                .ok_or(ListenerError::RouteNotFound)?;
-            let backend_stream =
-                tunnel::connect_backend(&target.endpoint)
-                    .await
-                    .map_err(|source| ListenerError::Backend {
-                        instance_id: target.instance_id,
-                        source,
-                    })?;
-            let backend_stream = tunnel::MeteredBackend::new(backend_stream, target.network);
-            let backend = qdrant::client_handshake(backend_stream).await?;
-            Ok((server, backend, request, respond))
-        })
-        .await?;
-
-    let mut requests = JoinSet::new();
-    spawn_qdrant_request(&mut requests, first_request, first_respond, &backend);
-
-    loop {
-        tokio::select! {
-            next_request = server.accept() => {
-                let Some(next_request) = next_request else {
-                    requests.abort_all();
-                    while requests.join_next().await.is_some() {}
-                    return Ok(());
-                };
-                let (request, respond) = match next_request {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let error = qdrant::QdrantProxyError::from(error);
-                        if error.is_stream_local() {
-                            tracing::debug!(
-                                event = "qdrant_rpc_stream_reset_before_dispatch",
-                                %error,
-                                "qdrant rpc stream reset without closing the multiplexed connection"
-                            );
-                            continue;
-                        }
-                        return Err(error.into());
-                    }
-                };
-                spawn_qdrant_request(&mut requests, request, respond, &backend);
-            }
-            completed = requests.join_next(), if !requests.is_empty() => {
-                let Some(completed) = completed else {
-                    continue;
-                };
-                let (stream_id, result) = completed
-                    .map_err(|error| IoError::other(format!(
-                        "qdrant proxy request task failed: {error}"
-                    )))?;
-                handle_qdrant_stream_result(Some(stream_id), result)?;
-            }
-        }
-    }
-}
-
-fn handle_qdrant_stream_result(
-    stream_id: Option<h2::StreamId>,
-    result: Result<(), qdrant::QdrantProxyError>,
-) -> Result<(), ListenerError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) if error.is_stream_local() => {
-            tracing::debug!(
-                event = "qdrant_rpc_stream_reset",
-                stream_id = ?stream_id,
-                %error,
-                "qdrant rpc stream ended without closing the multiplexed connection"
-            );
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn spawn_qdrant_request(
-    requests: &mut JoinSet<(h2::StreamId, Result<(), qdrant::QdrantProxyError>)>,
-    request: http::Request<h2::RecvStream>,
-    respond: h2::server::SendResponse<bytes::Bytes>,
-    backend: &h2::client::SendRequest<bytes::Bytes>,
-) {
-    let stream_id = request.body().stream_id();
-    let mut backend = backend.clone();
-    requests.spawn(async move {
-        (
-            stream_id,
-            qdrant::proxy_request(request, respond, &mut backend).await,
-        )
-    });
 }
 
 fn clickhouse_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, ListenerError> {
@@ -1317,7 +1387,7 @@ where
 
 async fn read_resp_initial_frame<S>(
     client: &mut S,
-) -> Result<(redis::RedisRoute, Vec<u8>), ListenerError>
+) -> Result<(redis::RedisRoute, Vec<u8>, usize), ListenerError>
 where
     S: AsyncRead + Unpin + ?Sized,
 {
@@ -1330,7 +1400,7 @@ where
         }
         buffer.extend_from_slice(&chunk[..read]);
         match redis::parse_initial_frame_route(&buffer) {
-            Ok(Some((route, _))) => return Ok((route, buffer)),
+            Ok(Some((route, consumed))) => return Ok((route, buffer, consumed)),
             Ok(None) => {}
             Err(error) => return Err(error.into()),
         }
@@ -1398,36 +1468,6 @@ mod tests {
         assert!(!expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::InvalidNativeHello
         )));
-    }
-
-    #[test]
-    fn qdrant_stream_local_failures_do_not_close_the_multiplexed_connection() {
-        assert!(
-            handle_qdrant_stream_result(
-                None,
-                Err(qdrant::QdrantProxyError::InactivityTimeout { timeout_secs: 60 }),
-            )
-            .is_ok()
-        );
-        assert!(
-            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::OutboundStreamClosed),)
-                .is_ok()
-        );
-        assert!(
-            handle_qdrant_stream_result(
-                None,
-                Err(qdrant::QdrantProxyError::StreamReset {
-                    reason: h2::Reason::CANCEL,
-                }),
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::MissingApiKey)),
-            Err(ListenerError::Qdrant(
-                qdrant::QdrantProxyError::MissingApiKey
-            ))
-        ));
     }
 
     #[tokio::test]

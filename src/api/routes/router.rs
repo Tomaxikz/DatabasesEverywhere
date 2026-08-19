@@ -94,7 +94,7 @@ pub struct DaemonShutdown {
 }
 
 #[derive(Debug)]
-struct MutationPermit {
+pub(crate) struct MutationPermit {
     active: Arc<AtomicUsize>,
     drain: Arc<Notify>,
 }
@@ -138,6 +138,14 @@ impl DaemonShutdown {
             active: Arc::clone(&self.active_mutations),
             drain: Arc::clone(&self.mutation_drain),
         })
+    }
+
+    /// Keeps detached daemon-owned mutation work inside the same shutdown
+    /// fence as the HTTP request that started it. This is intentionally
+    /// separate from request middleware because a disconnected client drops
+    /// the request permit while its owned worker must continue safely.
+    pub(crate) fn try_admit_background_mutation(&self) -> Option<MutationPermit> {
+        self.try_admit_mutation()
     }
 
     pub fn active_mutation_count(&self) -> usize {
@@ -681,13 +689,17 @@ mod tests {
     async fn shutdown_closes_mutation_admission_and_drains_existing_work() {
         let shutdown = DaemonShutdown::default();
         let mutation = shutdown.try_admit_mutation().unwrap();
-        assert_eq!(shutdown.active_mutation_count(), 1);
+        let background = shutdown.try_admit_background_mutation().unwrap();
+        assert_eq!(shutdown.active_mutation_count(), 2);
         shutdown.trigger();
         assert!(shutdown.try_admit_mutation().is_none());
+        assert!(shutdown.try_admit_background_mutation().is_none());
 
         tokio::spawn(async move {
             tokio::task::yield_now().await;
             drop(mutation);
+            tokio::task::yield_now().await;
+            drop(background);
         });
         assert!(
             shutdown

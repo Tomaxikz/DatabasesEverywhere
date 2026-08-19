@@ -40,7 +40,7 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .githooks/pre-push
+        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
@@ -131,6 +131,37 @@ jobs:
 
       - name: Check and test Linux workspace
         run: bash .github/ci/check.sh test
+
+  mysql_driver_matrix:
+    name: Real MySQL/MariaDB clients and versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: global_lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: mysql-driver-matrix
+          cache-on-failure: false
+
+      - name: Install real client toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            mariadb-client maven openjdk-21-jdk-headless openssl
+
+      - name: Exercise MySQL and MariaDB version families through real clients
+        run: bash .github/ci/mysql-driver-matrix.sh
 
   podman_smoke:
     name: Rootless Podman compatibility
@@ -245,6 +276,7 @@ jobs:
     needs:
       - security_audit
       - tests
+      - mysql_driver_matrix
       - podman_smoke
       - documentation
     strategy:
@@ -320,6 +352,7 @@ jobs:
       - global_lint
       - security_audit
       - tests
+      - mysql_driver_matrix
       - podman_smoke
       - documentation
       - codeql
@@ -330,6 +363,7 @@ jobs:
           GLOBAL_LINT_RESULT: ${{ needs.global_lint.result }}
           SECURITY_AUDIT_RESULT: ${{ needs.security_audit.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
+          MYSQL_DRIVER_MATRIX_RESULT: ${{ needs.mysql_driver_matrix.result }}
           PODMAN_SMOKE_RESULT: ${{ needs.podman_smoke.result }}
           DOCUMENTATION_RESULT: ${{ needs.documentation.result }}
           CODEQL_RESULT: ${{ needs.codeql.result }}
@@ -347,6 +381,7 @@ jobs:
             "global lint=$GLOBAL_LINT_RESULT" \
             "dependency security=$SECURITY_AUDIT_RESULT" \
             "Linux tests=$TESTS_RESULT" \
+            "real MySQL/MariaDB clients and versions=$MYSQL_DRIVER_MATRIX_RESULT" \
             "rootless Podman compatibility=$PODMAN_SMOKE_RESULT" \
             "Rust documentation=$DOCUMENTATION_RESULT" \
             "CodeQL=$CODEQL_RESULT" \

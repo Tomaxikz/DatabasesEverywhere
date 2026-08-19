@@ -1,4 +1,6 @@
 use super::*;
+use futures::FutureExt;
+use std::collections::HashSet;
 
 pub(super) async fn monitor_managed_container_events(state: AppState) {
     let mut shutdown = state.daemon_shutdown.subscribe();
@@ -25,11 +27,47 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
             );
         }
 
+        let mut reconciliations = tokio::task::JoinSet::new();
+        let mut active_instances = HashSet::new();
+        let mut pending_events = HashMap::new();
         let stream_error = loop {
+            if reconciliations.len() >= MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY {
+                if let Err(error) = complete_event_reconciliation(
+                    &state,
+                    &mut reconciliations,
+                    &mut active_instances,
+                    &mut pending_events,
+                )
+                .await
+                {
+                    break Some(error);
+                }
+                continue;
+            }
             let next = tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
+                        drain_event_reconciliations(
+                            &state,
+                            &mut reconciliations,
+                            &mut active_instances,
+                            &mut pending_events,
+                        ).await;
                         return;
+                    }
+                    continue;
+                }
+                completed = reconciliations.join_next(), if !reconciliations.is_empty() => {
+                    if let Some(result) = completed
+                        && let Err(error) = finish_event_reconciliation(
+                            &state,
+                            &mut reconciliations,
+                            &mut active_instances,
+                            &mut pending_events,
+                            result,
+                        )
+                    {
+                        break Some(error);
                     }
                     continue;
                 }
@@ -38,17 +76,25 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
             match next {
                 Some(Ok(event)) => {
                     reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
-                    if let Err(error) = reconcile_managed_container_event(&state, event).await {
-                        tracing::error!(
-                            %error,
-                            "failed to reconcile a managed container lifecycle event"
-                        );
-                    }
+                    schedule_event_reconciliation(
+                        &state,
+                        &mut reconciliations,
+                        &mut active_instances,
+                        &mut pending_events,
+                        event,
+                    );
                 }
                 Some(Err(error)) => break Some(error.to_string()),
                 None => break None,
             }
         };
+        drain_event_reconciliations(
+            &state,
+            &mut reconciliations,
+            &mut active_instances,
+            &mut pending_events,
+        )
+        .await;
 
         match stream_error {
             Some(error) => tracing::warn!(
@@ -75,6 +121,110 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
             .saturating_mul(2)
             .min(CONTAINER_EVENT_RECONNECT_MAX_DELAY);
     }
+}
+
+fn schedule_event_reconciliation(
+    state: &AppState,
+    reconciliations: &mut tokio::task::JoinSet<String>,
+    active_instances: &mut HashSet<String>,
+    pending_events: &mut HashMap<String, ManagedContainerEvent>,
+    event: ManagedContainerEvent,
+) {
+    let instance_id = event.instance_id.clone();
+    if !active_instances.insert(instance_id.clone()) {
+        // Every reconciliation inspects the current Docker state. Retaining
+        // only the newest queued event for one busy instance preserves the
+        // final transition without allowing an event storm to grow memory.
+        pending_events.insert(instance_id, event);
+        return;
+    }
+    spawn_event_reconciliation(state, reconciliations, event);
+}
+
+fn spawn_event_reconciliation(
+    state: &AppState,
+    reconciliations: &mut tokio::task::JoinSet<String>,
+    event: ManagedContainerEvent,
+) {
+    let event_state = state.clone();
+    let instance_id = event.instance_id.clone();
+    reconciliations.spawn(async move {
+        match std::panic::AssertUnwindSafe(reconcile_managed_container_event(&event_state, event))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(
+                %error,
+                "failed to reconcile a managed container lifecycle event"
+            ),
+            Err(_) => tracing::error!(
+                instance_id,
+                "managed container event reconciliation task panicked"
+            ),
+        }
+        instance_id
+    });
+}
+
+async fn complete_event_reconciliation(
+    state: &AppState,
+    reconciliations: &mut tokio::task::JoinSet<String>,
+    active_instances: &mut HashSet<String>,
+    pending_events: &mut HashMap<String, ManagedContainerEvent>,
+) -> Result<(), String> {
+    let Some(result) = reconciliations.join_next().await else {
+        return Ok(());
+    };
+    finish_event_reconciliation(
+        state,
+        reconciliations,
+        active_instances,
+        pending_events,
+        result,
+    )
+}
+
+fn finish_event_reconciliation(
+    state: &AppState,
+    reconciliations: &mut tokio::task::JoinSet<String>,
+    active_instances: &mut HashSet<String>,
+    pending_events: &mut HashMap<String, ManagedContainerEvent>,
+    result: Result<String, tokio::task::JoinError>,
+) -> Result<(), String> {
+    let instance_id = result.map_err(|error| {
+        tracing::error!(
+            %error,
+            "managed container event reconciliation task stopped unexpectedly"
+        );
+        error.to_string()
+    })?;
+    if let Some(event) = pending_events.remove(&instance_id) {
+        spawn_event_reconciliation(state, reconciliations, event);
+    } else {
+        active_instances.remove(&instance_id);
+    }
+    Ok(())
+}
+
+async fn drain_event_reconciliations(
+    state: &AppState,
+    reconciliations: &mut tokio::task::JoinSet<String>,
+    active_instances: &mut HashSet<String>,
+    pending_events: &mut HashMap<String, ManagedContainerEvent>,
+) {
+    while !reconciliations.is_empty() {
+        if complete_event_reconciliation(state, reconciliations, active_instances, pending_events)
+            .await
+            .is_err()
+        {
+            reconciliations.abort_all();
+            while reconciliations.join_next().await.is_some() {}
+            break;
+        }
+    }
+    active_instances.clear();
+    pending_events.clear();
 }
 
 pub(super) async fn reconcile_managed_container_event(
@@ -109,6 +259,9 @@ pub(super) async fn reconcile_managed_container_state(
     instance_id: &str,
     event: Option<ManagedContainerEvent>,
 ) -> anyhow::Result<()> {
+    let Some(_mutation) = state.daemon_shutdown.try_admit_background_mutation() else {
+        return Ok(());
+    };
     let _operation = state.instance_locks.lock(instance_id).await;
     let Some(metadata) = state.instances.get(instance_id).await else {
         return Ok(());
@@ -195,7 +348,7 @@ pub(super) async fn reconcile_managed_container_state(
     }
 
     if let Some(event) = event.as_ref()
-        && event.action.deactivates_container()
+        && event.container_id.is_some()
     {
         let current_container_id = state
             .docker
@@ -208,17 +361,17 @@ pub(super) async fn reconcile_managed_container_state(
                 action = event.action.as_str(),
                 event_container_id = event.container_id.as_deref().unwrap_or("unknown"),
                 current_container_id = current_container_id.as_deref().unwrap_or("unknown"),
-                "ignored a delayed teardown event emitted by a replaced managed container"
+                "ignored a delayed lifecycle event emitted by a replaced managed container"
             );
             return Ok(());
         }
     }
 
     let previous_status = metadata.status;
-    let activation_observed = if previous_status == InstanceStatus::Running {
-        false
-    } else if let Some(event) = event.as_ref() {
+    let activation_observed = if let Some(event) = event.as_ref() {
         event.action.activates_container()
+    } else if previous_status == InstanceStatus::Running {
+        false
     } else {
         match state
             .docker
@@ -233,7 +386,8 @@ pub(super) async fn reconcile_managed_container_state(
             Err(error) => return Err(error.into()),
         }
     };
-    let activation_error = if activation_observed {
+    let mut activation_error = if activation_observed {
+        state.instances.fence_routes(&metadata.instance_id).await;
         state
             .docker
             .enforce_cpu_burst_policy(metadata.protocol, &metadata.instance_id)
@@ -247,12 +401,29 @@ pub(super) async fn reconcile_managed_container_state(
             )
             .await
         {
-            Ok(_) => harden_activated_instance_auth(state, &metadata).await.err(),
+            Ok(_) => match harden_activated_instance_auth(state, &metadata).await {
+                Ok(()) => compatibility_after_activation(state, &metadata).await.err(),
+                Err(error) => Some(error),
+            },
             Err(error) => Some(error.to_string()),
         }
     } else {
         None
     };
+    if activation_error.is_none() && !activation_observed {
+        match state
+            .docker
+            .inspect_instance(metadata.protocol, &metadata.instance_id)
+            .await
+        {
+            Ok(inspection) if inspection.status == DockerContainerStatus::Running => {
+                activation_error = compatibility_after_activation(state, &metadata).await.err();
+            }
+            Ok(_) => {}
+            Err(error) if error.is_not_found() => {}
+            Err(error) => activation_error = Some(error.to_string()),
+        }
+    }
     if activation_error.is_some()
         && let Err(error) = state
             .docker
@@ -330,6 +501,27 @@ pub(super) async fn reconcile_managed_container_state(
     Ok(())
 }
 
+async fn compatibility_after_activation(
+    state: &AppState,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> Result<(), String> {
+    let outcome = crate::compatibility::probe_instance_compatibility(
+        &state.manager,
+        &state.docker,
+        metadata,
+        false,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if outcome.compatible {
+        Ok(())
+    } else {
+        Err(outcome
+            .diagnostic
+            .unwrap_or_else(|| "database engine version is unsupported".to_string()))
+    }
+}
+
 async fn harden_activated_instance_auth(
     state: &AppState,
     metadata: &crate::instances::metadata::InstanceMetadata,
@@ -379,12 +571,11 @@ fn event_targets_superseded_container(
     event: &ManagedContainerEvent,
     current_container_id: Option<&str>,
 ) -> bool {
-    event.action.deactivates_container()
-        && event
-            .container_id
-            .as_deref()
-            .zip(current_container_id)
-            .is_some_and(|(event_id, current_id)| !container_ids_match(event_id, current_id))
+    event
+        .container_id
+        .as_deref()
+        .zip(current_container_id)
+        .is_some_and(|(event_id, current_id)| !container_ids_match(event_id, current_id))
 }
 
 fn container_ids_match(left: &str, right: &str) -> bool {
@@ -457,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_identity_and_activation_events_keep_normal_reconciliation() {
+    fn missing_identity_is_not_suppressed_but_stale_activation_is() {
         let unidentified = event(Protocol::Qdrant, ManagedContainerAction::Destroyed, None);
         let activation = event(
             Protocol::Qdrant,
@@ -469,9 +660,13 @@ mod tests {
             &unidentified,
             Some("new-container-id")
         ));
-        assert!(!event_targets_superseded_container(
+        assert!(event_targets_superseded_container(
             &activation,
             Some("new-container-id")
+        ));
+        assert!(!event_targets_superseded_container(
+            &activation,
+            Some("old-container-id")
         ));
     }
 }

@@ -4,6 +4,8 @@
 /.venv/
 /.venv-*/
 /scripts/
-/tests/
+/tests/*
+!/tests/real_drivers/
+!/tests/real_drivers/**
 /dbev-benchmarks/
 /dist/

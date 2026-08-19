@@ -1,6 +1,6 @@
 [package]
 name = "databases-everywhere"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 
 [[bin]]
@@ -22,6 +22,8 @@ futures = "0.3"
 h2 = "0.4"
 hdrhistogram = "7.5"
 http = "1.1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
 notify = { version = "8.2.0", default-features = false }

@@ -366,8 +366,9 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         api = %config.api.bind_addr(),
         "DBEV is ready; the management API is accepting requests while managed databases finish recovery in the background"
     );
-    let managed_container_events = tokio::spawn(monitor_managed_container_events(state.clone()));
-    let managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
+    let mut managed_container_events =
+        tokio::spawn(monitor_managed_container_events(state.clone()));
+    let mut managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
     let gateway_supervisor = state.gateway_supervisor.clone();
     let daemon_shutdown = state.daemon_shutdown.clone();
     let server_result = serve_api(
@@ -395,17 +396,21 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         active_gateway_connections = gateway_supervisor.active_connections(),
         "API listener stopped; shutting down daemon-owned background tasks"
     );
-    managed_container_events.abort();
-    let _ = managed_container_events.await;
     soft_disk_limits.abort();
     let _ = soft_disk_limits.await;
     one_use_export_sweeper.abort();
     let _ = one_use_export_sweeper.await;
     import_upload_sweeper.abort();
     let _ = import_upload_sweeper.await;
-    managed_runtime_boot.abort();
-    let _ = managed_runtime_boot.await;
-    let (jobs_drained, creations_drained, mutations_drained, websocket_drained, gateway_drain) = tokio::join!(
+    let (
+        jobs_drained,
+        creations_drained,
+        mutations_drained,
+        websocket_drained,
+        gateway_drain,
+        container_events_drained,
+        runtime_boot_drained,
+    ) = tokio::join!(
         shutdown_jobs.wait_for_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
         shutdown_creations.wait_for_creation_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
         daemon_shutdown.wait_for_mutation_drain(API_MUTATION_DRAIN_TIMEOUT),
@@ -416,6 +421,16 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             GATEWAY_CONNECTION_DRAIN_TIMEOUT,
             GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT,
         ),
+        drain_daemon_task(
+            &mut managed_container_events,
+            ACTIVE_OPERATION_DRAIN_TIMEOUT,
+            "managed container event monitor",
+        ),
+        drain_daemon_task(
+            &mut managed_runtime_boot,
+            ACTIVE_OPERATION_DRAIN_TIMEOUT,
+            "managed runtime boot",
+        ),
     );
     tracing::info!(
         phase = "drain_complete",
@@ -423,6 +438,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         jobs_drained,
         creations_drained,
         mutations_drained,
+        container_events_drained,
+        runtime_boot_drained,
         websocket_drained,
         gateway_connections_at_start = gateway_drain.active_at_start,
         gateway_connections_remaining = gateway_drain.remaining,
@@ -447,7 +464,37 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             API_MUTATION_DRAIN_TIMEOUT.as_secs()
         );
     }
+    if !container_events_drained || !runtime_boot_drained {
+        anyhow::bail!(
+            "timed out after {} seconds waiting for daemon-owned lifecycle work to finish safely",
+            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
+        );
+    }
     tracing::info!("active import/export jobs drained");
     tracing::info!("active instance creations drained");
     server_result
+}
+
+async fn drain_daemon_task(
+    task: &mut tokio::task::JoinHandle<()>,
+    deadline: Duration,
+    name: &'static str,
+) -> bool {
+    match tokio::time::timeout(deadline, &mut *task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, task = name, "daemon-owned lifecycle task stopped unexpectedly");
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                task = name,
+                timeout_seconds = deadline.as_secs(),
+                "daemon-owned lifecycle task did not finish before the shutdown deadline"
+            );
+            task.abort();
+            let _ = task.await;
+            false
+        }
+    }
 }

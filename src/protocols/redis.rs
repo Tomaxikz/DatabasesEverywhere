@@ -1,6 +1,74 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+use sha2::{Digest, Sha256};
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RedisRoute {
-    pub username: String,
+    username: Option<String>,
+    password: Vec<u8>,
+}
+
+impl std::fmt::Debug for RedisRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedisRoute")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RedisRoute {
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    pub fn password_route_sha256(&self) -> String {
+        password_route_sha256(&self.password)
+    }
+
+    pub fn rewrite_with_resolved_username(
+        &self,
+        original: &[u8],
+        consumed: usize,
+        resolved_username: &str,
+    ) -> Result<Vec<u8>, RedisParseError> {
+        if self
+            .username
+            .as_deref()
+            .is_some_and(|username| !username.eq_ignore_ascii_case("default"))
+            || resolved_username.is_empty()
+            || resolved_username.as_bytes().contains(&b'\r')
+            || resolved_username.as_bytes().contains(&b'\n')
+            || consumed > original.len()
+        {
+            return Err(RedisParseError::Unsupported);
+        }
+        let (mut args, parsed) = parse_resp_array(&original[..consumed])?;
+        if parsed != consumed || args.is_empty() {
+            return Err(RedisParseError::Unsupported);
+        }
+        if args[0].eq_ignore_ascii_case(b"AUTH") {
+            match args.len() {
+                2 => args.insert(1, resolved_username.as_bytes().to_vec()),
+                3 => args[1] = resolved_username.as_bytes().to_vec(),
+                _ => return Err(RedisParseError::Unsupported),
+            }
+        } else if args[0].eq_ignore_ascii_case(b"HELLO") {
+            let auth = args
+                .iter()
+                .position(|argument| argument.eq_ignore_ascii_case(b"AUTH"))
+                .ok_or(RedisParseError::MissingUsername)?;
+            if auth + 2 >= args.len() {
+                return Err(RedisParseError::MissingUsername);
+            }
+            args[auth + 1] = resolved_username.as_bytes().to_vec();
+        } else {
+            return Err(RedisParseError::Unsupported);
+        }
+
+        let mut rewritten = serialize_resp_array(&args);
+        rewritten.extend_from_slice(&original[consumed..]);
+        Ok(rewritten)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,10 +129,12 @@ fn redis_string(bytes: &[u8]) -> Result<String, RedisParseError> {
 fn parse_auth(args: &[Vec<u8>]) -> Result<RedisRoute, RedisParseError> {
     match args.len() {
         2 => Ok(RedisRoute {
-            username: "default".to_string(),
+            username: None,
+            password: args[1].clone(),
         }),
         3 => Ok(RedisRoute {
-            username: redis_string(&args[1])?,
+            username: Some(redis_string(&args[1])?),
+            password: args[2].clone(),
         }),
         _ => Err(RedisParseError::Unsupported),
     }
@@ -78,12 +148,38 @@ fn parse_hello(args: &[Vec<u8>]) -> Result<RedisRoute, RedisParseError> {
                 return Err(RedisParseError::MissingUsername);
             }
             return Ok(RedisRoute {
-                username: redis_string(&args[index + 1])?,
+                username: Some(redis_string(&args[index + 1])?),
+                password: args[index + 2].clone(),
             });
         }
         index += 1;
     }
     Err(RedisParseError::MissingUsername)
+}
+
+pub fn password_route_sha256(password: &[u8]) -> String {
+    let digest = Sha256::digest(password);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn serialize_resp_array(args: &[Vec<u8>]) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.extend_from_slice(b"*");
+    output.extend_from_slice(args.len().to_string().as_bytes());
+    output.extend_from_slice(b"\r\n");
+    for argument in args {
+        output.extend_from_slice(b"$");
+        output.extend_from_slice(argument.len().to_string().as_bytes());
+        output.extend_from_slice(b"\r\n");
+        output.extend_from_slice(argument);
+        output.extend_from_slice(b"\r\n");
+    }
+    output
 }
 
 fn parse_resp_array(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, usize), RedisParseError> {
@@ -173,7 +269,7 @@ mod tests {
         let route =
             parse_initial_route(b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n").unwrap();
 
-        assert_eq!(route.username, "app");
+        assert_eq!(route.username(), Some("app"));
     }
 
     #[test]
@@ -183,14 +279,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(route.username, "app");
+        assert_eq!(route.username(), Some("app"));
     }
 
     #[test]
     fn resp_auth_without_username_uses_default() {
         let route = parse_initial_route(b"*2\r\n$4\r\nAUTH\r\n$4\r\npass\r\n").unwrap();
 
-        assert_eq!(route.username, "default");
+        assert_eq!(route.username(), None);
+        assert_eq!(
+            route.password_route_sha256(),
+            password_route_sha256(b"pass")
+        );
     }
 
     #[test]
@@ -211,7 +311,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(route.username, "app");
+        assert_eq!(route.username(), Some("app"));
         assert_eq!(
             consumed,
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n".len()
@@ -237,5 +337,26 @@ mod tests {
         let error = parse_initial_route(b"AUTH pass\r\n").unwrap_err();
 
         assert!(matches!(error, RedisParseError::Unsupported));
+    }
+
+    #[test]
+    fn rewrites_legacy_password_only_auth_to_the_resolved_acl_user() {
+        let original = b"*2\r\n$4\r\nAUTH\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n";
+        let (route, consumed) = parse_initial_frame_route(original).unwrap().unwrap();
+        let rewritten = route
+            .rewrite_with_resolved_username(original, consumed, "tenant_a")
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            b"*3\r\n$4\r\nAUTH\r\n$8\r\ntenant_a\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n"
+        );
+    }
+
+    #[test]
+    fn debug_never_exposes_the_resp_password() {
+        let route = parse_initial_route(b"*2\r\n$4\r\nAUTH\r\n$12\r\nsuper-secret\r\n").unwrap();
+        let debug = format!("{route:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
     }
 }

@@ -83,6 +83,12 @@ pub(crate) struct ManagedContainerIdentity {
     pub started_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedContainerCompatibilityIdentity {
+    pub id: String,
+    pub image_id: String,
+}
+
 /// A stats reader bound to one verified managed-container generation. It is
 /// recreated after an engine error so a container restart cannot leave the
 /// sampler polling a stale container ID.
@@ -1152,6 +1158,8 @@ pub enum DockerError {
     },
     #[error("managed container {container} did not report an immutable container id")]
     ManagedContainerIdUnavailable { container: String },
+    #[error("managed container {container} did not report an immutable image id")]
+    ManagedContainerImageIdUnavailable { container: String },
     #[error("managed container {container} did not report its current start generation")]
     ManagedContainerStartedAtUnavailable { container: String },
     #[error("DBE node ownership identity is unavailable for this container operation")]

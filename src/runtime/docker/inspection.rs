@@ -17,7 +17,8 @@ use crate::{
     constants::docker::PROJECT_LABEL,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
-        ManagedContainerIdentity, ManagedStatsSampler, container_config::startup_readiness_script,
+        ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
+        container_config::startup_readiness_script,
     },
     shared::protocol::Protocol,
 };
@@ -121,6 +122,33 @@ impl DockerRuntime {
                 container: container.clone(),
             })?;
         Ok(Some(ManagedContainerIdentity { id, started_at }))
+    }
+
+    /// Reads both immutable IDs from one verified inspection. Callers re-read
+    /// this after probing to reject an external replacement during the exec.
+    pub(crate) async fn verified_managed_compatibility_identity(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<Option<ManagedContainerCompatibilityIdentity>, DockerError> {
+        let Some(response) = self
+            .verified_managed_container_inspection(protocol, instance_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let container = self.container_name(protocol, instance_id)?;
+        let id = response
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| DockerError::ManagedContainerIdUnavailable {
+                container: container.clone(),
+            })?;
+        let image_id = response
+            .image
+            .filter(|image| !image.trim().is_empty())
+            .ok_or(DockerError::ManagedContainerImageIdUnavailable { container })?;
+        Ok(Some(ManagedContainerCompatibilityIdentity { id, image_id }))
     }
 
     pub(super) async fn required_managed_container_id(

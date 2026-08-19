@@ -1,4 +1,83 @@
 use super::*;
+use futures::FutureExt;
+
+pub(super) async fn run_normal_image_update_supervisor(
+    state: AppState,
+    operation: tokio::sync::OwnedMutexGuard<()>,
+    metadata: InstanceMetadata,
+    current_image: String,
+    image: String,
+    password: Option<String>,
+) -> Result<UpdateInstanceImageResponse, ApiError> {
+    let instance_id = metadata.instance_id.clone();
+    let mutation = state
+        .daemon_shutdown
+        .try_admit_background_mutation()
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "daemon shutdown has started; image updates are not accepted".to_string(),
+            )
+        })?;
+    let task = spawn_owned_mutation_task(async move {
+        let _mutation = mutation;
+        let _operation = operation;
+        let recovery = metadata.clone();
+        match std::panic::AssertUnwindSafe(update_instance_image_normal(
+            state.clone(),
+            metadata,
+            current_image,
+            image,
+            password,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let durable = state
+                    .manager
+                    .get_persisted(&recovery.instance_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(recovery);
+                let quarantine = quarantine_after_image_update_uncertainty(
+                    &state,
+                    &durable,
+                    "normal image-update worker panicked during a potentially destructive replacement",
+                )
+                .await;
+                Err(ApiError::Runtime(format!(
+                    "normal image-update worker stopped unexpectedly; {}",
+                    image_update_quarantine_summary(&quarantine)
+                )))
+            }
+        }
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(
+                %instance_id,
+                worker_cancelled = error.is_cancelled(),
+                worker_panicked = error.is_panic(),
+                "normal image-update supervisor stopped unexpectedly"
+            );
+            Err(ApiError::Runtime(
+                "normal image-update supervisor stopped unexpectedly; inspect and reconcile the instance before retrying"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+pub(super) fn spawn_owned_mutation_task<F, T>(future: F) -> tokio::task::JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(future)
+}
 
 pub(super) async fn rollback_normal_image_update_or_quarantine(
     state: &AppState,
@@ -86,6 +165,15 @@ async fn restore_normal_image_update(
         .map_err(|error| {
             ApiError::Runtime(format!(
                 "previous container was restored but its metadata could not be persisted: {error}"
+            ))
+        })?;
+    state
+        .manager
+        .delete_compatibility_attestation(&rollback_metadata.instance_id)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "previous container was restored but its stale compatibility attestation could not be invalidated: {error}"
             ))
         })?;
     invalidate_image_update_caches(state, &rollback_metadata.instance_id).await;
@@ -212,5 +300,160 @@ pub(super) fn image_update_quarantine_summary(result: &Result<(), ApiError>) -> 
         Err(error) => format!(
             "the instance was quarantined in memory, but complete shutdown or persistence failed: {error}"
         ),
+    }
+}
+
+pub(super) async fn instance_image_update_spec(
+    metadata: &InstanceMetadata,
+    paths: &InstancePaths,
+    container_data_path: std::path::PathBuf,
+    image: &str,
+    password: Option<SecretString>,
+    pids_limit: i64,
+) -> Result<DockerInstanceSpec, ApiError> {
+    let password = match metadata.protocol {
+        Protocol::Redis | Protocol::Valkey => {
+            password.unwrap_or_else(|| SecretString::from(String::new()))
+        }
+        _ => password.ok_or_else(|| {
+            ApiError::BadRequest(
+                "password is required when recreating non-RESP database containers".to_string(),
+            )
+        })?,
+    };
+
+    let mut spec = match metadata.protocol {
+        Protocol::Postgres => databases::postgres::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            SecretString::from(metadata.postgres_admin_password.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before recreation".to_string(),
+                )
+            })?),
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Redis => databases::redis::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Valkey => databases::valkey::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Mariadb => databases::mariadb::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            SecretString::from(metadata.mariadb_root_password.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "mariadb internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+                )
+            })?),
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Mysql => databases::mysql::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            &metadata.database.name,
+            SecretString::from(metadata.mysql_root_password.clone().ok_or_else(|| {
+                ApiError::BadRequest(
+                    "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+                )
+            })?),
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Mongodb => databases::mongodb::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            &metadata.database.name,
+            databases::mongodb::docker::MongodbAuth {
+                username: metadata.database.username.clone(),
+                password,
+                root_password: SecretString::from(
+                    metadata.mongodb_root_password.clone().ok_or_else(|| {
+                        ApiError::BadRequest(
+                            "mongodb internal root password is missing; old MongoDB instances must be recreated or restored from a manual admin dump before image replacement".to_string(),
+                        )
+                    })?,
+                ),
+            },
+            container_data_path.clone(),
+            paths.logs.clone(),
+            paths.sockets.clone(),
+        ),
+        Protocol::Clickhouse => {
+            let hosted_config_path =
+                databases::clickhouse::docker::write_hosted_config(&paths.runtime_config)
+                    .await
+                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            databases::clickhouse::docker::instance_spec(
+                &metadata.instance_id,
+                image,
+                &metadata.database.name,
+                &metadata.database.username,
+                password,
+                container_data_path,
+                paths.logs.clone(),
+                hosted_config_path,
+                paths.sockets.clone(),
+                paths.socket_bridge_binary.clone(),
+            )
+        }
+        Protocol::Qdrant => databases::qdrant::docker::instance_spec(
+            &metadata.instance_id,
+            image,
+            password,
+            container_data_path,
+            paths.logs.clone(),
+            paths.sockets.clone(),
+            paths.socket_bridge_binary.clone(),
+        ),
+    };
+    spec.cpu_cores = metadata.limits.cpu_cores;
+    spec.memory_mib = metadata.limits.memory_mib;
+    spec.disk_mib = metadata.limits.disk_mib;
+    spec.pids_limit = Some(pids_limit);
+    Ok(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_owned_mutation_task;
+
+    #[tokio::test]
+    async fn dropping_http_waiter_does_not_cancel_owned_image_update_worker() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let waiter = spawn_owned_mutation_task(async move {
+            let _ = started_tx.send(());
+            let _ = finish_rx.await;
+            let _ = done_tx.send(());
+        });
+        started_rx.await.unwrap();
+        drop(waiter);
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .expect("detached image update worker should finish")
+            .unwrap();
     }
 }

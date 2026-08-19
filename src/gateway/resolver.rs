@@ -37,8 +37,17 @@ impl RouteResolver {
         username: &str,
         database: Option<&str>,
     ) -> DatabaseRouteResolution<ResolvedRoute> {
-        self.resolve_database_target(self.store.resolve_postgres(username, database).await)
-            .await
+        let mut resolution = self.store.resolve_postgres(username, database).await;
+        if matches!(resolution, DatabaseRouteResolution::NotFound)
+            && should_retry_without_database(
+                crate::shared::protocol::Protocol::Postgres,
+                username,
+                database,
+            )
+        {
+            resolution = self.store.resolve_postgres(username, None).await;
+        }
+        self.resolve_database_target(resolution).await
     }
 
     pub(crate) async fn resolve_redis(&self, username: &str) -> Option<ResolvedRoute> {
@@ -49,12 +58,36 @@ impl RouteResolver {
         )
     }
 
+    pub(crate) async fn resolve_redis_password(
+        &self,
+        password_sha256: &str,
+    ) -> Option<(String, ResolvedRoute)> {
+        let (username, target) = self.store.resolve_redis_password(password_sha256).await?;
+        Some((
+            username,
+            self.resolve_target(target.instance_id, target.endpoint)
+                .await,
+        ))
+    }
+
     pub(crate) async fn resolve_valkey(&self, username: &str) -> Option<ResolvedRoute> {
         let target = self.store.resolve_valkey(username).await?;
         Some(
             self.resolve_target(target.instance_id, target.endpoint)
                 .await,
         )
+    }
+
+    pub(crate) async fn resolve_valkey_password(
+        &self,
+        password_sha256: &str,
+    ) -> Option<(String, ResolvedRoute)> {
+        let (username, target) = self.store.resolve_valkey_password(password_sha256).await?;
+        Some((
+            username,
+            self.resolve_target(target.instance_id, target.endpoint)
+                .await,
+        ))
     }
 
     pub(crate) async fn resolve_mariadb(
@@ -92,8 +125,17 @@ impl RouteResolver {
         username: &str,
         database: Option<&str>,
     ) -> DatabaseRouteResolution<ResolvedRoute> {
-        self.resolve_database_target(self.store.resolve_clickhouse(username, database).await)
-            .await
+        let mut resolution = self.store.resolve_clickhouse(username, database).await;
+        if matches!(resolution, DatabaseRouteResolution::NotFound)
+            && should_retry_without_database(
+                crate::shared::protocol::Protocol::Clickhouse,
+                username,
+                database,
+            )
+        {
+            resolution = self.store.resolve_clickhouse(username, None).await;
+        }
+        self.resolve_database_target(resolution).await
     }
 
     pub(crate) async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<ResolvedRoute> {
@@ -156,5 +198,50 @@ impl RouteResolver {
             tenant_password: target.tenant_password,
             network,
         }
+    }
+}
+
+/// Some drivers insert a protocol-defined catalog placeholder before the
+/// application selects its real catalog. Keep those aliases in one resolver
+/// policy so native, HTTP, pooled, and future listener paths cannot diverge.
+fn should_retry_without_database(
+    protocol: crate::shared::protocol::Protocol,
+    username: &str,
+    database: Option<&str>,
+) -> bool {
+    match protocol {
+        crate::shared::protocol::Protocol::Postgres => database == Some(username),
+        crate::shared::protocol::Protocol::Clickhouse => database == Some("default"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::protocol::Protocol;
+
+    #[test]
+    fn default_catalog_alias_policy_is_protocol_specific() {
+        assert!(should_retry_without_database(
+            Protocol::Postgres,
+            "tenant",
+            Some("tenant")
+        ));
+        assert!(should_retry_without_database(
+            Protocol::Clickhouse,
+            "tenant",
+            Some("default")
+        ));
+        assert!(!should_retry_without_database(
+            Protocol::Postgres,
+            "tenant",
+            Some("other")
+        ));
+        assert!(!should_retry_without_database(
+            Protocol::Mysql,
+            "tenant",
+            Some("tenant")
+        ));
     }
 }

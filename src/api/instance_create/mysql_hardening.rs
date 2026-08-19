@@ -66,25 +66,32 @@ pub(crate) async fn harden_mysql_tenant_auth(
             && metadata.tenant_password.as_deref() == Some(password)
             && metadata.mysql_root_password.as_deref() == Some(root_password)
     });
-    if let Some(metadata) = metadata.as_ref() {
-        match crate::instances::auth_hardening::attestation_is_current(
+    let attestation = if let Some(metadata) = metadata.as_ref() {
+        match crate::instances::auth_hardening::begin_attestation(
             &state.manager,
             &state.docker,
             metadata,
         )
         .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                event = "audit auth_hardening_attestation_check_failed",
-                instance_id,
-                protocol = %Protocol::Mysql,
-                %error,
-                "could not validate the cached hardening attestation; running full MySQL hardening"
-            ),
+            Ok(check) if check.current => return Ok(()),
+            Ok(check) => {
+                if let Some(error) = check.cache_warning.as_deref() {
+                    tracing::warn!(
+                        event = "audit auth_hardening_attestation_check_failed",
+                        instance_id,
+                        protocol = %Protocol::Mysql,
+                        %error,
+                        "could not validate the cached hardening attestation; running full MySQL hardening"
+                    );
+                }
+                Some(check)
+            }
+            Err(error) => return Err(fail_runtime(state, instance_id, error)),
         }
-    }
+    } else {
+        None
+    };
     let root_password = SecretString::from(root_password.to_string());
     verify_mysql_root_auth_with_timeout(
         state,
@@ -101,21 +108,26 @@ pub(crate) async fn harden_mysql_tenant_auth(
         root_password.expose_secret(),
     )
     .await?;
-    if let Some(metadata) = metadata.as_ref()
-        && let Err(error) = crate::instances::auth_hardening::record_attestation(
+    if let (Some(metadata), Some(attestation)) = (metadata.as_ref(), attestation.as_ref())
+        && let Err(error) = crate::instances::auth_hardening::complete_attestation(
             &state.manager,
             &state.docker,
             metadata,
+            attestation.generation(),
         )
         .await
     {
-        tracing::warn!(
-            event = "audit auth_hardening_attestation_write_failed",
-            instance_id,
-            protocol = %Protocol::Mysql,
-            %error,
-            "MySQL hardening succeeded, but its optimization attestation could not be persisted"
-        );
+        if error.is_storage() {
+            tracing::warn!(
+                event = "audit auth_hardening_attestation_write_failed",
+                instance_id,
+                protocol = %Protocol::Mysql,
+                %error,
+                "MySQL hardening succeeded, but its optimization attestation could not be persisted"
+            );
+        } else {
+            return Err(fail_runtime(state, instance_id, error));
+        }
     }
     Ok(())
 }
@@ -427,26 +439,40 @@ async fn harden_mysql_account_on_boot(
     if metadata.protocol != Protocol::Mysql || metadata.status != InstanceStatus::Running {
         return summary;
     }
-    match crate::instances::auth_hardening::attestation_is_current(
+    let attestation = match crate::instances::auth_hardening::begin_attestation(
         &state.manager,
         &state.docker,
         &metadata,
     )
     .await
     {
-        Ok(true) => {
+        Ok(check) if check.current => {
             summary.attestations_reused = 1;
             return summary;
         }
-        Ok(false) => {}
-        Err(error) => tracing::warn!(
-            event = "audit auth_hardening_attestation_check_failed",
-            instance_id = %metadata.instance_id,
-            protocol = %metadata.protocol,
-            %error,
-            "could not validate the cached hardening attestation; running full MySQL hardening"
-        ),
-    }
+        Ok(check) => {
+            if let Some(error) = check.cache_warning.as_deref() {
+                tracing::warn!(
+                    event = "audit auth_hardening_attestation_check_failed",
+                    instance_id = %metadata.instance_id,
+                    protocol = %metadata.protocol,
+                    %error,
+                    "could not validate the cached hardening attestation; running full MySQL hardening"
+                );
+            }
+            check
+        }
+        Err(error) => {
+            record_mysql_auth_failure(
+                state,
+                &metadata,
+                format!("could not bind MySQL hardening to one container generation: {error}"),
+                &mut summary,
+            )
+            .await;
+            return summary;
+        }
+    };
     summary.checked = 1;
     let mut metadata = metadata;
     let container_root_password = state
@@ -667,20 +693,32 @@ async fn harden_mysql_account_on_boot(
             "verified and encrypted current MySQL credentials"
         );
     }
-    if let Err(error) = crate::instances::auth_hardening::record_attestation(
+    if let Err(error) = crate::instances::auth_hardening::complete_attestation(
         &state.manager,
         &state.docker,
         &metadata,
+        attestation.generation(),
     )
     .await
     {
-        tracing::warn!(
-            event = "audit auth_hardening_attestation_write_failed",
-            instance_id = %metadata.instance_id,
-            protocol = %metadata.protocol,
-            %error,
-            "MySQL hardening succeeded, but its optimization attestation could not be persisted"
-        );
+        if error.is_storage() {
+            tracing::warn!(
+                event = "audit auth_hardening_attestation_write_failed",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                %error,
+                "MySQL hardening succeeded, but its optimization attestation could not be persisted"
+            );
+        } else {
+            record_mysql_auth_failure(
+                state,
+                &metadata,
+                format!("MySQL container generation changed during hardening: {error}"),
+                &mut summary,
+            )
+            .await;
+            return summary;
+        }
     }
     summary
 }

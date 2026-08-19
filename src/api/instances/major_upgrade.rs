@@ -2,6 +2,11 @@ use super::*;
 use futures::FutureExt;
 use secrecy::SecretString;
 
+mod source_quiesce;
+use source_quiesce::{
+    harden_major_upgrade_target, quiesce_major_upgrade_source, restore_major_upgrade_source_route,
+};
+
 pub(super) async fn run_major_upgrade_supervisor(
     state: AppState,
     operation: tokio::sync::OwnedMutexGuard<()>,
@@ -68,9 +73,12 @@ fn spawn_major_upgrade_supervisor(
             Ok(result) => result,
             Err(_) => {
                 let quarantine_metadata = state
-                    .instances
-                    .get(&recovery_instance_id)
+                    .manager
+                    .get_persisted(&recovery_instance_id)
                     .await
+                    .ok()
+                    .flatten()
+                    .or(state.instances.get(&recovery_instance_id).await)
                     .unwrap_or(recovery_metadata);
                 let quarantine = quarantine_after_image_update_uncertainty(
                     &state,
@@ -218,17 +226,44 @@ pub(super) async fn update_instance_image_by_major_migration(
     let precheck = precheck_major_upgrade(state, &metadata, &current_image, &image)
         .await
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    if let Err(error) = quiesce_major_upgrade_source(state, &metadata, &password).await {
+        let quarantine = quarantine_after_image_update_uncertainty(
+            state,
+            &previous_metadata,
+            "major-upgrade source could not be quiesced safely before export",
+        )
+        .await;
+        return Err(fail_image_update_runtime(
+            state,
+            &metadata.instance_id,
+            format!(
+                "failed to establish a write-free major-upgrade source ({error}); {}",
+                image_update_quarantine_summary(&quarantine)
+            ),
+        ));
+    }
     state.install_progress.stage(
         &metadata.instance_id,
         "export",
-        "exporting old database before major upgrade",
+        "exporting quiesced old database before major upgrade",
     );
-    let export_artifact = crate::api::import_export::export_instance_to_default_artifact(
+    let export_artifact = match crate::api::import_export::export_instance_to_default_artifact(
         state,
         &metadata.instance_id,
     )
     .await
-    .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return Err(restore_major_upgrade_source_route(
+                state,
+                &previous_metadata,
+                &password,
+                error,
+            )
+            .await);
+        }
+    };
     metadata.runtime.network_mode = "none".to_string();
 
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
@@ -240,15 +275,38 @@ pub(super) async fn update_instance_image_by_major_migration(
         paths: paths.clone(),
     };
 
-    let staged =
-        create_staged_replacement_and_import(state, &metadata, &image, &password, &export_artifact)
-            .await
-            .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
+    let staged = match create_staged_replacement_and_import(
+        state,
+        &metadata,
+        &image,
+        &password,
+        &export_artifact,
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err(error) => {
+            return Err(restore_major_upgrade_source_route(
+                state,
+                &previous_metadata,
+                &password,
+                error,
+            )
+            .await);
+        }
+    };
 
     state.install_progress.stage(
         &metadata.instance_id,
         "cutover",
         "validated replacement; stopping old container for final cutover",
+    );
+    tracing::info!(
+        event = "audit instance_route_fenced",
+        instance_id = %metadata.instance_id,
+        protocol = %metadata.protocol,
+        operation = "major_image_upgrade",
+        "gateway route removed for the destructive cutover and will return only after compatibility and durable commit"
     );
     let old_volume_backup = old_volume_backup_path(&paths.data)
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
@@ -316,6 +374,7 @@ pub(super) async fn update_instance_image_by_major_migration(
         metadata.backend =
             backend_endpoint_for_instance(state, metadata.protocol, &metadata.instance_id)?;
         metadata.runtime.network_mode = "none".to_string();
+        harden_major_upgrade_target(state, &metadata, &password).await?;
         if metadata.protocol == Protocol::Mariadb {
             metadata.mariadb_native_password_sha1_stage2 = Some(
                 crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
@@ -327,6 +386,28 @@ pub(super) async fn update_instance_image_by_major_migration(
             );
         }
         metadata.tenant_password = Some(password.clone());
+        state.install_progress.stage(
+            &metadata.instance_id,
+            "compatibility",
+            "attesting migrated database engine",
+        );
+        let compatibility = crate::compatibility::probe_instance_compatibility(
+            &state.manager,
+            &state.docker,
+            &metadata,
+            true,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "migrated database compatibility probe failed: {error}"
+            ))
+        })?;
+        if !compatibility.compatible {
+            return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
+                || "migrated database version is unsupported".to_string(),
+            )));
+        }
         metadata.status = InstanceStatus::Running;
         metadata.updated_at = now_rfc3339();
         Ok(())
@@ -627,6 +708,7 @@ async fn run_major_upgrade_rollback(
     old_volume_backup: &std::path::Path,
     location: MajorUpgradeRollbackLocation,
 ) -> Result<(), ApiError> {
+    let instance_id = rollback.metadata.instance_id.clone();
     tokio::time::timeout(
         IMAGE_UPDATE_ROLLBACK_TIMEOUT,
         rollback.restore(state, old_volume_backup, location),
@@ -637,7 +719,17 @@ async fn run_major_upgrade_rollback(
             "major-upgrade rollback exceeded its {} second deadline",
             IMAGE_UPDATE_ROLLBACK_TIMEOUT.as_secs()
         ))
-    })?
+    })??;
+    state
+        .manager
+        .delete_compatibility_attestation(&instance_id)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "major-upgrade rollback restored the old container but could not invalidate the replacement compatibility attestation: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 pub(super) async fn precheck_major_upgrade(
@@ -1327,12 +1419,12 @@ pub(super) fn old_volume_backup_path(data_path: &std::path::Path) -> Result<Path
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ImageVersionChange {
+pub(crate) enum ImageVersionChange {
     SameMajorOrUnknown,
     Major,
 }
 
-pub(super) fn classify_image_update(
+pub(crate) fn classify_image_update(
     protocol: Protocol,
     current_image: &str,
     requested_image: &str,
@@ -1388,7 +1480,7 @@ pub(super) fn major_upgrade_required_error(
     ))
 }
 
-pub(super) fn ensure_major_upgrade_supported(protocol: Protocol) -> Result<(), ApiError> {
+pub(crate) fn ensure_major_upgrade_supported(protocol: Protocol) -> Result<(), ApiError> {
     match protocol {
         Protocol::Postgres
         | Protocol::Mariadb

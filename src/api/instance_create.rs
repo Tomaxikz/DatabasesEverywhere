@@ -660,11 +660,14 @@ async fn create_instance_from_validated_request(
     };
 
     let now = now_rfc3339();
-    let metadata = InstanceMetadata {
+    let mut metadata = InstanceMetadata {
         schema_version: SCHEMA_VERSION,
         instance_id: request.instance_id,
         protocol: request.protocol,
-        status: InstanceStatus::Running,
+        // Persist as non-routable until the exact running image has passed
+        // the compatibility probe. This also gives the attestation a durable
+        // foreign-key parent without briefly publishing an unverified route.
+        status: InstanceStatus::Booting,
         desired_state: crate::instances::metadata::DesiredInstanceState::Running,
         disk_limit_blocked: false,
         public: PublicEndpoint {
@@ -713,6 +716,44 @@ async fn create_instance_from_validated_request(
             );
             ApiError::Runtime(format!(
                 "created container but failed to persist instance metadata: {error}"
+            ))
+        })?;
+    state.install_progress.stage(
+        &metadata.instance_id,
+        "compatibility",
+        "attesting database engine compatibility",
+    );
+    let compatibility = crate::compatibility::probe_instance_compatibility(
+        &state.manager,
+        &state.docker,
+        &metadata,
+        true,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::Runtime(format!(
+            "created database container but its compatibility probe failed: {error}"
+        ))
+    })?;
+    if !compatibility.compatible {
+        return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
+            || "database engine version is unsupported".to_string(),
+        )));
+    }
+    metadata.status = InstanceStatus::Running;
+    metadata.updated_at = now_rfc3339();
+    state
+        .manager
+        .upsert(metadata.clone())
+        .await
+        .map_err(|error| {
+            state.install_progress.fail_internal(
+                &metadata.instance_id,
+                "verified instance metadata publication",
+                &error,
+            );
+            ApiError::Runtime(format!(
+                "attested the created container but failed to publish its route: {error}"
             ))
         })?;
     // IDs are normally unique, but clear any in-memory scanner history before
@@ -897,25 +938,32 @@ pub(crate) async fn harden_postgres_instance_auth(
             && metadata.tenant_password.as_deref() == Some(tenant_password)
             && metadata.postgres_admin_password.as_deref() == Some(admin_password)
     });
-    if let Some(metadata) = metadata.as_ref() {
-        match crate::instances::auth_hardening::attestation_is_current(
+    let attestation = if let Some(metadata) = metadata.as_ref() {
+        match crate::instances::auth_hardening::begin_attestation(
             &state.manager,
             &state.docker,
             metadata,
         )
         .await
         {
-            Ok(true) => return Ok(false),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                event = "audit auth_hardening_attestation_check_failed",
-                instance_id,
-                protocol = %Protocol::Postgres,
-                %error,
-                "could not validate the cached hardening attestation; running full PostgreSQL hardening"
-            ),
+            Ok(check) if check.current => return Ok(false),
+            Ok(check) => {
+                if let Some(error) = check.cache_warning.as_deref() {
+                    tracing::warn!(
+                        event = "audit auth_hardening_attestation_check_failed",
+                        instance_id,
+                        protocol = %Protocol::Postgres,
+                        %error,
+                        "could not validate the cached hardening attestation; running full PostgreSQL hardening"
+                    );
+                }
+                Some(check)
+            }
+            Err(error) => return Err(fail_runtime(state, instance_id, error)),
         }
-    }
+    } else {
+        None
+    };
     let changed = databases::postgres::hardening::harden_instance_auth(
         &state.docker,
         instance_id,
@@ -925,21 +973,26 @@ pub(crate) async fn harden_postgres_instance_auth(
     )
     .await
     .map_err(|error| fail_runtime(state, instance_id, error))?;
-    if let Some(metadata) = metadata.as_ref()
-        && let Err(error) = crate::instances::auth_hardening::record_attestation(
+    if let (Some(metadata), Some(attestation)) = (metadata.as_ref(), attestation.as_ref())
+        && let Err(error) = crate::instances::auth_hardening::complete_attestation(
             &state.manager,
             &state.docker,
             metadata,
+            attestation.generation(),
         )
         .await
     {
-        tracing::warn!(
-            event = "audit auth_hardening_attestation_write_failed",
-            instance_id,
-            protocol = %Protocol::Postgres,
-            %error,
-            "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
-        );
+        if error.is_storage() {
+            tracing::warn!(
+                event = "audit auth_hardening_attestation_write_failed",
+                instance_id,
+                protocol = %Protocol::Postgres,
+                %error,
+                "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
+            );
+        } else {
+            return Err(fail_runtime(state, instance_id, error));
+        }
     }
     Ok(changed)
 }

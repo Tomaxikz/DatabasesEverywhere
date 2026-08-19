@@ -56,7 +56,7 @@ newer. Choose a versioned release and the artifact matching your host. Do not
 automate installation from the mutable `latest` URL.
 
 ```bash
-DBEV_VERSION=v0.6.1 # replace with the reviewed release
+DBEV_VERSION=v0.7.0 # replace with the reviewed release
 case "$(uname -m)" in
   x86_64) DBEV_ARCH=x86_64 ;;
   aarch64|arm64) DBEV_ARCH=arm64 ;;
@@ -117,7 +117,7 @@ api:
   trusted_origins: [] # extra exact browser callers, if any
 ```
 
-Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0`, set `api.fqdn` to the hostname from the panel's node API URL, and configure `api.ssl` for that hostname. `api.host` controls the local bind while `api.fqdn` declares the canonical public request hostname, so clients must still include `api.port` when it is not the scheme default.
+Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and private Unix sockets. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Qdrant's one configured public listener auto-detects HTTP/2 gRPC and HTTP/1.1 REST, then uses distinct private gRPC/REST sockets and checks the API key on every request or stream. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0`, set `api.fqdn` to the hostname from the panel's node API URL, and configure `api.ssl` for that hostname. `api.host` controls the local bind while `api.fqdn` declares the canonical public request hostname, so clients must still include `api.port` when it is not the scheme default.
 
 `token` and `jwt_signing_key` are independent credentials and must each contain
 at least 32 random bytes. Generate them with a cryptographically secure secret
@@ -339,7 +339,7 @@ backup path resolution.
 Compose also requires an explicit immutable image selection:
 
 ```bash
-export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.6.1@sha256:REPLACE_ME'
+export DBEV_IMAGE='ghcr.io/tomaxikz/databaseseverywhere:v0.7.0@sha256:REPLACE_ME'
 docker compose up -d
 ```
 
@@ -663,10 +663,14 @@ An instance = one database container. The `InstanceMetadata` object you get back
 }
 ```
 
-`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh this value from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. Creation work before a container exists remains `creating`; fail-closed and operation states remain `failed`, `quarantined`, or `deleting`. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `valkey`, `mongodb`, `clickhouse`, `qdrant`.
+`status` is one of `creating`, `booting`, `running`, `stopped`, `failed`, `quarantined`, `deleting`. Instance reads refresh durably running instances from the container runtime, and the daemon subscribes to managed-container lifecycle events so starts, stops, exits, pauses, restarts, destruction, and OOM failures update durable routing state without polling every database. A container process alone never promotes a pre-ready, failed, quarantined, deleting, desired-stopped, or temporarily route-fenced maintenance state to `running`. A bounded real database query confirms readiness only during create/start/restart; no scheduled query continues after startup. `protocol` is one of `postgres`, `mariadb`, `mysql`, `redis`, `valkey`, `mongodb`, `clickhouse`, `qdrant`.
 Power actions also persist an internal desired state without adding a field to the API response. Explicitly stopped or killed instances remain stopped across daemon and container-engine restarts; desired-running instances are reattached when already running and are started only when the runtime reports them stopped or failed. Quarantined instances are always desired-stopped and never enter gateway routing.
 `image.update_available` is computed from the running container image versus the configured default image for that protocol. If it is `true`, the panel should offer the image update action.
-`database_version.current` is probed from the running database container for `GET /api/instances` and `GET /api/instances/{id}`. If the instance is stopped or the version probe fails, `current` is `null` and `error` contains a short non-fatal reason.
+`database_version.current` comes from a durable compatibility attestation bound to the exact managed container ID, immutable image ID, and DBEV probe revision. Read endpoints never execute commands in database containers. DBEV probes once at creation and for legacy unattested containers, then only after reconstruction, image update/migration, or password reset. An ordinary daemon restart or stop/start reuses the attestation when the container and image are unchanged. A missing/failed proof leaves `current` null with a short diagnostic; an unsupported detected version is isolated before its gateway route is published.
+
+DBEV v0.7.0 tests and admits these engine families: PostgreSQL 14-18; MySQL 8.0.11+, 9.x, and 26.x; MariaDB 10.11/11.4/11.8/12.3; MongoDB 7-8; Redis 6.2/7.2/7.4/8.x; Valkey 7.2/8.x/9.x; ClickHouse 25-26; and Qdrant 1.17-1.18. The live probe is authoritative—the image tag is only an upgrade hint. The shared gateways advertise plain oldest-supported compatibility baselines (`8.0.11` for MySQL and `10.11.0-MariaDB` for MariaDB, without a DBEV suffix) because the target instance is unknown until the client sends its username; backend authentication and actual `SELECT VERSION()` traffic still go to the attested engine. Cluster, replication, Sentinel, `mongos`, load-balanced MongoDB, MySQL X Protocol, PostgreSQL replication/GSS encryption, ClickHouse compatibility listeners, and distributed Qdrant routing remain deliberately outside the single-instance gateway model.
+
+The normal Rust suite includes fragmented, malformed, and golden packet fixtures under `src/protocols/tests`. CI additionally runs the actual DBEV gateways against official MySQL 8.4/9.7/26.7 and MariaDB 10.11/11.4/11.8/12.3 containers using MariaDB CLI, Connector/J 8.4/9.2/9.7, MariaDB Connector/J, and HikariCP. It covers explicit and deferred catalog selection plus standard post-greeting `CLIENT_SSL`; release builds are gated on that matrix rather than trusting only DBEV-generated packets.
 
 | Method | Path | Scope | What it does |
 | --- | --- | --- | --- |
@@ -781,6 +785,8 @@ This pulls the image, deletes the old container, and recreates it on the same da
 
 The requested image must also be allowed in `images.allowed.<protocol>`. The configured default image at `images.<protocol>` is always implicitly allowed. Keep the allowlist short and admin-controlled; do not pass arbitrary user input here.
 
+At daemon boot, each desired-running instance is compared with its explicitly configured protocol image. A different pinned configured image is applied through the same rollback-aware update path as the API; a supported major change uses the existing export/import migration. DBEV never follows an arbitrary `latest` tag. Failures are isolated per instance so healthy listeners still start. Internal runtime-spec changes that require container reconstruction (for example, adding Qdrant's private REST socket) also run once through the same safe replacement path.
+
 Patch/minor updates stay in-place. Major version changes are blocked unless the panel sends an explicit migration request:
 
 ```json
@@ -792,7 +798,7 @@ PATCH /api/instances/{id}/image
 }
 ```
 
-For Postgres, MariaDB, MySQL, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration: export the old database, preserve the old volume, recreate the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, import the dump, validate the replacement, then keep the old volume path and export artifact for rollback. If any step fails, DBE tries to restore and restart the old container. Redis, Valkey, and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
+For Postgres, MariaDB, MySQL, MongoDB, and ClickHouse, `major_upgrade: true` runs a safer provider-style migration. DBEV first removes the gateway route and restarts the source once, which closes established client sessions before taking the logical dump; new writes therefore cannot race the snapshot and disappear at cutover. It then preserves the old volume, recreates the same instance id on a fresh target-version volume with the same database name, username, password, public endpoint, and limits, imports the dump, validates and hardens the replacement, and retains the old volume path plus export artifact for rollback. A failure before cutover republishes the old route only after the source is reverified; later failures restore the old container or quarantine uncertain state. Redis, Valkey, and Qdrant major upgrades are rejected for now because their current DBE backup path is physical/version-specific rather than a reliable cross-major logical migration.
 
 The response includes `strategy`:
 
@@ -1538,7 +1544,7 @@ containers then auto-start in a lock-protected, bounded-concurrent background
 phase, so a slow or broken container does not hold node heartbeat or management
 endpoints offline. A daemon restart does not stop database containers or unmount
 healthy FuseQuota filesystems. Shutdown closes mutation admission, gives active
-API mutations up to 60 seconds and durable jobs or creations up to three minutes
+API and daemon-owned mutations up to three minutes, and durable jobs or creations up to three minutes
 to finish, and then bounds API connection draining to 10 seconds. WebSockets
 receive close code 1012, while database gateway connections get a five-second
 natural drain followed by a two-second forced proxy close. A long-lived client

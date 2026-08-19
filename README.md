@@ -37,14 +37,16 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 | Valkey | Works | RESP |
 | MongoDB | Works | MongoDB wire protocol |
 | ClickHouse | Works | Native TCP and HTTP |
-| Qdrant | Works | gRPC |
+| Qdrant | Works | gRPC/HTTP2 and REST/HTTP1.1 |
 
 ## What it does
 
 - One public gateway listener per database protocol — no port-per-instance chaos.
 - Database containers have no network interface (`network_mode=none`) and never publish backend ports.
 - The daemon reaches each instance through a private Unix socket; ClickHouse and Qdrant use a hash-verified, statically linked, loopback-only socket bridge inside their isolated containers.
-- PostgreSQL, MySQL, MariaDB, and ClickHouse accept both database-qualified clients and JDBC/Hikari clients that choose their catalog after connecting; database-less routing is allowed only for a uniquely matching username.
+- PostgreSQL, MySQL, MariaDB, and ClickHouse accept both database-qualified clients and JDBC/Hikari clients that choose their catalog after connecting; database-less routing is allowed only for a uniquely matching username. PostgreSQL supports negotiated/direct TLS, GSS-encryption fallback, and exact-session cancellation. MySQL/MariaDB use the standard post-greeting `CLIENT_SSL` upgrade.
+- Redis and Valkey accept RESP2/RESP3 ACL authentication plus legacy password-only `AUTH`; password-only routes are resolved by an in-memory SHA-256 index and rewritten to the exact managed ACL user without logging the secret.
+- Engine compatibility is probed once per exact container/image generation and persisted. Reads never run container probes, while configured pinned-image changes are reconciled on boot through rollback-aware image migration.
 - Legacy bridge-network/TCP instances are stopped and quarantined on upgrade; preserve required data, delete them explicitly, and recreate them before serving traffic again.
 - Per-instance CPU, memory, PID, and disk limits, with bounded unused-CPU burst
   credit to reduce short quota stalls without changing sustained CPU allocation.

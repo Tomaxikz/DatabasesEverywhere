@@ -9,8 +9,10 @@ use crate::{
 };
 
 mod auth_hardening;
+mod compatibility;
 mod protected_secrets;
 
+pub(crate) use compatibility::CompatibilityAttestation;
 pub use protected_secrets::{
     DaemonInstanceLoad, ProtectedSecretField, ProtectedSecretIncident, ProtectedSecretRepair,
 };
@@ -610,6 +612,8 @@ pub enum RepositoryError {
         instance_id: String,
         field: &'static str,
     },
+    #[error("instance {instance_id} has an invalid compatibility attestation: {reason}")]
+    InvalidCompatibilityAttestation { instance_id: String, reason: String },
     #[error("instance {0} does not exist")]
     InstanceNotFound(String),
     #[error("instance {instance_id} has no stored value for protected field {field}")]

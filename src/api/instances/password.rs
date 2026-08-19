@@ -217,6 +217,7 @@ async fn reset_instance_password_inner(
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     let previous = capture_previous_credential(&state, &metadata, &credential_data_path).await?;
     if !requires_container_recreation(metadata.protocol, &previous) {
+        attest_password_reset_target(&state, &metadata).await?;
         return reset_password_in_place(
             &state,
             metadata,
@@ -288,6 +289,7 @@ async fn reset_instance_password_inner(
         "recreating instance to apply its startup-managed credential"
     );
     delete_managed_container(&state, metadata.protocol, &metadata.instance_id).await?;
+    state.instances.fence_routes(&metadata.instance_id).await;
     let result = perform_password_reset(
         &state,
         &metadata,
@@ -301,6 +303,21 @@ async fn reset_instance_password_inner(
     .await;
 
     if let Err(error) = result {
+        return rollback_or_fail(
+            &state,
+            &metadata,
+            RollbackContext {
+                paths: &paths,
+                credential_data_path: &credential_data_path,
+                old_spec: &old_spec,
+                previous: &previous,
+            },
+            error,
+        )
+        .await;
+    }
+
+    if let Err(error) = attest_password_reset_target(&state, &metadata).await {
         return rollback_or_fail(
             &state,
             &metadata,
@@ -471,6 +488,7 @@ async fn reset_password_in_place(
     let previous_metadata = metadata.clone();
     let new_verifier = native_password_verifier(metadata.protocol, new_password);
     let credential_changed = Arc::new(AtomicBool::new(false));
+    state.instances.fence_routes(&metadata.instance_id).await;
     {
         let context = InPlaceResetContext {
             state,
@@ -1369,6 +1387,31 @@ async fn invalidate_password_caches(state: &AppState, metadata: &InstanceMetadat
         .await;
     state.resource_cache.remove(&metadata.instance_id).await;
     state.monitoring_cache.invalidate().await;
+}
+
+async fn attest_password_reset_target(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let outcome = crate::compatibility::probe_instance_compatibility(
+        &state.manager,
+        &state.docker,
+        metadata,
+        true,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::Runtime(format!(
+            "database compatibility probe failed before password rotation: {error}"
+        ))
+    })?;
+    if outcome.compatible {
+        Ok(())
+    } else {
+        Err(ApiError::Conflict(outcome.diagnostic.unwrap_or_else(
+            || "database version is outside the supported compatibility matrix".to_string(),
+        )))
+    }
 }
 
 async fn quarantine_instance(

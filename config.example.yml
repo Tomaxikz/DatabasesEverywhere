@@ -278,6 +278,9 @@ images:
       - "mariadb:12.3.2"
     mysql:
       - "mysql:8.4"
+      # Supported upgrade targets; keep only images your operators reviewed.
+      - "mysql:9.7"
+      - "mysql:26.7"
     mongodb:
       - "mongo:8.3.4"
       - "mongo:7.0.37"

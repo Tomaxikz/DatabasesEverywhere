@@ -107,6 +107,7 @@ components:
         status:
           type: string
           enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+          description: Live runtime classification for durably running instances; pre-ready, failed, quarantined, deleting, desired-stopped, and temporarily route-fenced maintenance states are never promoted to running merely because a container process exists.
         public:
           type: object
           required: [host, port]
@@ -175,11 +176,14 @@ components:
               type: boolean
         database_version:
           type: object
+          description: Durable engine-version compatibility attestation for the exact managed container and immutable image. Instance read endpoints never execute a version command. The proof is refreshed on creation, reconstruction, image update/migration, or password reset and reused across ordinary daemon/container restarts.
           required: [current, error]
           properties:
             current:
               type: [string, "null"]
+              description: Normalized vendor engine version, or null when no current attestation exists.
             error:
+              description: Non-fatal missing-probe diagnostic or unsupported-version reason; null for a compatible attestation.
               oneOf:
                 - $ref: "#/components/schemas/PublicDiagnostic"
                 - type: "null"
@@ -1251,7 +1255,7 @@ paths:
                 type: string
   /api/instances:
     get:
-      summary: List database instances with their live classified container statuses.
+      summary: List database instances with route-safe live status classification.
       x-required-scope: instances:read
       responses:
         default:
@@ -1298,7 +1302,7 @@ paths:
         schema:
           type: string
     get:
-      summary: Get one instance with its live classified container status.
+      summary: Get one instance with route-safe live status classification.
       x-required-scope: instances:read
       responses:
         default:

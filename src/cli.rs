@@ -95,7 +95,7 @@ use startup::*;
 mod tests;
 
 const ACTIVE_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-const API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+const API_MUTATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const API_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
