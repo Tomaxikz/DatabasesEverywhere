@@ -1,0 +1,77 @@
+name: Linux release binaries
+
+on:
+  workflow_call:
+    inputs:
+      upload_artifacts:
+        description: Upload the completed binaries for later release jobs
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: dbev-${{ matrix.asset_arch }}-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - asset_arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - asset_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
+          - asset_arch: riscv64
+            rust_target: riscv64gc-unknown-linux-gnu
+            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-zigbuild@0.22.3
+          fallback: none
+
+      - name: Restore architecture build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-release-${{ matrix.asset_arch }}
+          cache-on-failure: false
+
+      - name: Build and verify binary
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"
+
+      - name: Upload binary
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dbev-${{ matrix.asset_arch }}-linux
+          path: target/release-artifacts/dbev-${{ matrix.asset_arch }}-linux
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

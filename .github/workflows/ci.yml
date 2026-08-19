@@ -25,15 +25,15 @@ jobs:
   global_lint:
     name: Global lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Lint GitHub Actions syntax
-        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8 # v2.1.2
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: 1.7.12
           cache: false
@@ -43,13 +43,13 @@ jobs:
         run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
 
       - name: Install workflow security linter
-        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: zizmor@1.28.0
           fallback: none
@@ -64,8 +64,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: dbev-debug
           cache-on-failure: false
 
       - name: Lint Rust workspace
@@ -74,11 +75,11 @@ jobs:
   security_audit:
     name: Dependency security
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     needs: global_lint
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -88,33 +89,22 @@ jobs:
           toolchain: 1.95.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2.85.3
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-audit@0.22.2
           fallback: none
 
       - name: Audit dependencies
-        run: |
-          rsa_tree="$(cargo tree --locked --edges normal -i rsa 2>/dev/null || true)"
-          if [ -n "$rsa_tree" ]; then
-            echo "RUSTSEC-2023-0071 is ignored only while rsa is absent from the built graph" >&2
-            printf '%s\n' "$rsa_tree" >&2
-            exit 1
-          fi
-          cargo audit --no-yanked -D warnings
-          (
-            cd tools/helper-packer
-            cargo audit --no-yanked -D warnings
-          )
+        run: bash .github/ci/check.sh audit
 
   tests:
     name: Linux tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     needs: global_lint
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -124,9 +114,9 @@ jobs:
           toolchain: 1.95.0
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: tests
+          shared-key: dbev-debug
           cache-on-failure: false
 
       - name: Check and test Linux workspace
@@ -142,11 +132,11 @@ jobs:
   podman_smoke:
     name: Rootless Podman compatibility
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     needs: global_lint
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -156,15 +146,19 @@ jobs:
           toolchain: 1.95.0
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: podman-smoke
+          shared-key: dbev-debug
           cache-on-failure: false
 
-      - name: Install Podman
+      - name: Prepare the hosted rootless Podman runtime
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends podman uidmap
+          for command in podman newuidmap newgidmap; do
+            command -v "$command" >/dev/null || {
+              echo "GitHub runner is missing required rootless runtime tool: $command" >&2
+              exit 1
+            }
+          done
           runtime_dir="/run/user/$(id -u)"
           sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
           account="$(id -un)"
@@ -181,11 +175,11 @@ jobs:
   documentation:
     name: Rust documentation
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
     needs: global_lint
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -195,9 +189,9 @@ jobs:
           toolchain: 1.95.0
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: documentation
+          shared-key: dbev-debug
           cache-on-failure: false
 
       - name: Build documentation
@@ -208,7 +202,7 @@ jobs:
   codeql:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     needs: global_lint
     permissions:
       actions: read
@@ -223,7 +217,7 @@ jobs:
           - actions
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -234,90 +228,23 @@ jobs:
           toolchain: 1.95.0
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
 
       - name: Analyze
-        uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           category: /language:${{ matrix.language }}
 
   release_build:
-    name: Release build (${{ matrix.asset_arch }})
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    needs:
-      - security_audit
-      - tests
-      - mysql_driver_matrix
-      - podman_smoke
-      - documentation
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - asset_arch: x86_64
-            rust_target: x86_64-unknown-linux-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-          - asset_arch: arm64
-            rust_target: aarch64-unknown-linux-gnu
-            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
-          - asset_arch: riscv64
-            rust_target: riscv64gc-unknown-linux-gnu
-            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.95.0
-          targets: ${{ matrix.rust_targets }}
-
-      - name: Install cross compiler
-        if: matrix.asset_arch != 'x86_64'
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
-        run: |
-          set -euo pipefail
-          case "$ASSET_ARCH" in
-            arm64)
-              packages=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu)
-              ;;
-            riscv64)
-              packages=(gcc-riscv64-linux-gnu g++-riscv64-linux-gnu)
-              ;;
-            *)
-              echo "unsupported cross-compiler architecture: $ASSET_ARCH" >&2
-              exit 1
-              ;;
-          esac
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends "${packages[@]}"
-
-      - name: Install Zig for the RISC-V static helper
-        if: matrix.asset_arch == 'riscv64'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.14.1
-
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: release-${{ matrix.asset_arch }}
-          cache-on-failure: false
-
-      - name: Build optimized binary
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"
+    name: Linux release binaries
+    needs: global_lint
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
 
   ci_gate:
     name: CI gate

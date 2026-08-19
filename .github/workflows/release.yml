@@ -46,6 +46,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: databases-everywhere-production-release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -53,11 +57,12 @@ jobs:
   release-gate:
     name: Validate release source
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
       - name: Checkout release source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -108,15 +113,13 @@ jobs:
   security-audit:
     name: Security audit
     runs-on: ubuntu-24.04
-    needs:
-      - release-gate
-      - release-quality
-      - release-driver-matrix
+    timeout-minutes: 10
+    needs: release-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -126,34 +129,24 @@ jobs:
           toolchain: 1.95.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
         with:
           tool: cargo-audit@0.22.2
+          fallback: none
 
       - name: Audit dependencies
-        run: |
-          rsa_tree="$(cargo tree --locked --edges normal -i rsa 2>/dev/null || true)"
-          if [ -n "$rsa_tree" ]; then
-            echo "RUSTSEC-2023-0071 is ignored only while rsa is absent from the built graph" >&2
-            printf '%s\n' "$rsa_tree" >&2
-            exit 1
-          fi
-          cargo audit --no-yanked -D warnings
-          (
-            cd tools/helper-packer
-            cargo audit --no-yanked -D warnings
-          )
+        run: bash .github/ci/check.sh audit
 
   release-quality:
     name: Release lint and tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 25
     needs: release-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -164,9 +157,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: release-quality
+          shared-key: dbev-debug
           cache-on-failure: false
 
       - name: Run locked release checks
@@ -180,87 +173,18 @@ jobs:
     uses: ./.github/workflows/mysql-driver-matrix.yml
 
   build:
-    name: Build dbev-${{ matrix.asset_arch }}-linux
-    # Keep the release glibc baseline compatible with Debian bookworm (the
-    # runtime image) and other supported glibc 2.35+ hosts.
-    runs-on: ubuntu-22.04
-    needs: security-audit
+    name: Linux release binaries
+    needs: release-gate
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - asset_arch: x86_64
-            rust_target: x86_64-unknown-linux-gnu
-            rust_targets: x86_64-unknown-linux-gnu
-          - asset_arch: arm64
-            rust_target: aarch64-unknown-linux-gnu
-            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
-          - asset_arch: riscv64
-            rust_target: riscv64gc-unknown-linux-gnu
-            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.95.0
-          targets: ${{ matrix.rust_targets }}
-
-      - name: Install cross compiler
-        if: matrix.asset_arch != 'x86_64'
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
-        run: |
-          set -euo pipefail
-          case "$ASSET_ARCH" in
-            arm64)
-              packages=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu)
-              ;;
-            riscv64)
-              packages=(gcc-riscv64-linux-gnu g++-riscv64-linux-gnu)
-              ;;
-            *)
-              echo "unsupported cross-compiler architecture: $ASSET_ARCH" >&2
-              exit 1
-              ;;
-          esac
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends "${packages[@]}"
-
-      - name: Install Zig for the RISC-V static helper
-        if: matrix.asset_arch == 'riscv64'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.14.1
-
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: release-${{ matrix.asset_arch }}-linux
-
-      - name: Build release binary
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dbev-${{ matrix.asset_arch }}-linux
-          path: target/release-artifacts/dbev-${{ matrix.asset_arch }}-linux
-          if-no-files-found: error
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      upload_artifacts: true
 
   github-release:
     name: Create GitHub release
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     environment:
       name: production-release
     permissions:
@@ -269,10 +193,13 @@ jobs:
       attestations: write
     needs:
       - build
+      - release-quality
+      - release-driver-matrix
+      - security-audit
     if: ${{ inputs.create_github_release }}
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -290,13 +217,13 @@ jobs:
           fi
 
       - name: Attest release binaries
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/dbev-*-linux
 
       - name: Create release
         id: create_release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ github.sha }}
@@ -319,6 +246,7 @@ jobs:
   docker-image:
     name: Build Docker image
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     environment:
       name: production-release
     permissions:
@@ -326,16 +254,19 @@ jobs:
       packages: write
     needs:
       - build
+      - release-quality
+      - release-driver-matrix
+      - security-audit
       - github-release
-    if: ${{ always() && needs.build.result == 'success' && (inputs.create_github_release == false || needs.github-release.result == 'success') && inputs.publish_docker && !inputs.draft }}
+    if: ${{ always() && needs.build.result == 'success' && needs.release-quality.result == 'success' && needs.release-driver-matrix.result == 'success' && needs.security-audit.result == 'success' && (inputs.create_github_release == false || needs.github-release.result == 'success') && inputs.publish_docker && !inputs.draft }}
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Download release binaries
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -388,17 +319,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile

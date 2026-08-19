@@ -57,6 +57,6 @@ fi
 cd "$repository_root"
 export DBE_PODMAN_SOCKET="$socket"
 export RUST_BACKTRACE=1
-timeout 15m cargo test --lib --locked \
+timeout 10m cargo test --lib --locked \
   runtime::docker::podman_live_tests::rootless_podman_compatibility_smoke -- \
   --ignored --exact --nocapture

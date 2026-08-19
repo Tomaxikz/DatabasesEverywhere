@@ -18,6 +18,7 @@ helper_linker=""
 helper_uses_zig=false
 fusequota_arch=""
 fusequota_sha256=""
+glibc_version="2.35"
 
 case "$rust_target:$asset_arch" in
   x86_64-unknown-linux-gnu:x86_64)
@@ -27,26 +28,12 @@ case "$rust_target:$asset_arch" in
     helper_linker="rust-lld"
     fusequota_arch="aarch64"
     fusequota_sha256="afd429f034458e0f3fe200cf74f91f82813a7395378174ba8985ce988492f740"
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
-    export CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
-    export CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
-    export AR_aarch64_unknown_linux_gnu="aarch64-linux-gnu-ar"
-    export RANLIB_aarch64_unknown_linux_gnu="aarch64-linux-gnu-ranlib"
-    export TARGET_CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
-    export TARGET_CXX_aarch64_unknown_linux_gnu="aarch64-linux-gnu-g++"
     ;;
   riscv64gc-unknown-linux-gnu:riscv64)
     helper_target="riscv64gc-unknown-linux-musl"
     helper_uses_zig=true
     fusequota_arch="riscv64"
     fusequota_sha256="ab3b6c84dc905abf8b358f93e5b3eb9d2d8b8d3d0a542971cfa27414c5c34109"
-    export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="riscv64-linux-gnu-gcc"
-    export CC_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-gcc"
-    export CXX_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-g++"
-    export AR_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-ar"
-    export RANLIB_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-ranlib"
-    export TARGET_CC_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-gcc"
-    export TARGET_CXX_riscv64gc_unknown_linux_gnu="riscv64-linux-gnu-g++"
     ;;
   *)
     echo "unsupported release target and asset architecture: $rust_target / $asset_arch" >&2
@@ -58,6 +45,15 @@ repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$repository_root"
 artifact_dir="${DBEV_RELEASE_OUTPUT_DIR:-$repository_root/target/release-artifacts}"
 mkdir -p "$artifact_dir"
+
+if ! command -v zig >/dev/null 2>&1; then
+  echo "Zig is required for pinned glibc-targeted release builds" >&2
+  exit 1
+fi
+if ! cargo zigbuild --help >/dev/null 2>&1; then
+  echo "cargo-zigbuild is required for release builds" >&2
+  exit 1
+fi
 
 if [ -n "$helper_target" ]; then
   helper_dir="$repository_root/target/release-helpers/$rust_target"
@@ -81,6 +77,7 @@ if [ -n "$helper_target" ]; then
   fi
 
   curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+    --connect-timeout 10 --max-time 120 \
     "https://github.com/calagopus/fusequota/releases/download/f939851/fusequota-${fusequota_arch}-linux" \
     --output "$fusequota_executable"
   printf '%s  %s\n' "$fusequota_sha256" "$fusequota_executable" |
@@ -109,9 +106,37 @@ fi
 export AWS_LC_SYS_CMAKE_BUILDER=0
 export CARGO_INCREMENTAL=0
 
-cargo build --release --locked --bin dbev --target "$rust_target"
+cargo zigbuild --release --locked --bin dbev \
+  --target "${rust_target}.${glibc_version}"
 install -m 0755 \
   "$repository_root/target/$rust_target/release/dbev" \
   "$artifact_dir/dbev-${asset_arch}-linux"
 
-file "$artifact_dir/dbev-${asset_arch}-linux"
+artifact="$artifact_dir/dbev-${asset_arch}-linux"
+file_output="$(file -b "$artifact")"
+case "$asset_arch" in
+  x86_64) expected_machine="x86-64" ;;
+  arm64) expected_machine="ARM aarch64" ;;
+  riscv64) expected_machine="UCB RISC-V" ;;
+esac
+if [[ "$file_output" != *"$expected_machine"* ]]; then
+  echo "release artifact has the wrong architecture: $file_output" >&2
+  exit 1
+fi
+
+max_glibc="$(
+  readelf --version-info "$artifact" |
+    grep -o 'GLIBC_[0-9][0-9.]*' |
+    sort -Vu |
+    tail -n 1 || true
+)"
+if [ -z "$max_glibc" ]; then
+  echo "release artifact did not declare a glibc symbol baseline" >&2
+  exit 1
+fi
+if [ "$(printf '%s\n' "GLIBC_$glibc_version" "$max_glibc" | sort -V | tail -n 1)" != "GLIBC_$glibc_version" ]; then
+  echo "release artifact requires $max_glibc, above supported GLIBC_$glibc_version" >&2
+  exit 1
+fi
+
+printf '%s\nMaximum glibc symbol: %s\n' "$file_output" "$max_glibc"

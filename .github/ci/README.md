@@ -16,26 +16,32 @@ chmod +x .githooks/pre-push
 git config core.hooksPath .githooks
 ```
 
-The hook runs formatting, strict Clippy, the explicit Linux-target check, and
-the complete test suite for both the daemon workspace and the separately
-locked static-helper packer. A failed check stops the push. Git's `--no-verify`
-option remains available for an intentional emergency bypass.
+The hook runs formatting, strict Clippy, and the complete test suite for both
+the daemon workspace and the separately locked static-helper packer. A failed
+check stops the push. Git's `--no-verify` option remains available for an
+intentional emergency bypass.
 
-GitHub Actions runs `Global lint` first. Only after it passes do dependency
-auditing, Linux tests, the real MySQL driver matrix, documentation checks,
-CodeQL, and the release build run. The driver matrix runs each official MySQL
+GitHub Actions uses `Global lint` as its fast fail gate. After it passes,
+dependency auditing, Linux tests, the real MySQL driver matrix, rootless Podman,
+documentation, CodeQL, and all three release-architecture builds run in
+parallel. The final `CI gate` requires every branch to succeed. The binary
+builds have one canonical reusable workflow and use Zig/cargo-zigbuild with a
+glibc 2.35 floor, so CI never downloads cross-compilers through Ubuntu mirrors.
+
+The driver matrix runs each official MySQL
 8.4/9.7/26.7 and MariaDB 10.11/11.4/11.8/12.3 image/connector combination in
 an isolated parallel job. It exercises MariaDB CLI, Connector/J 8.4/9.2/9.7,
 MariaDB Connector/J, HikariCP, database-qualified and deferred-catalog
 connections, and standard CLIENT_SSL. Each case is compiled before its own
 12-minute runtime deadline begins and has a 20-minute total job deadline, so a
 stuck external client cannot consume the former one-hour serial matrix timeout.
-Configure the `main` branch ruleset to require the single `CI gate` status;
-that gate fails when any required stage fails or is skipped.
+Configure the `main` branch ruleset to require the single `CI gate` status.
 
-The release workflow independently repeats the locked lint and test gate and
-audits both Cargo lockfiles before it builds publishable artifacts. A release
-therefore cannot rely on a separate CI run that is still pending or failed.
+The release workflow independently repeats locked lint/tests, dependency
+auditing, real-driver coverage, and binary builds after validating its version.
+Those independent jobs run in parallel, but neither GitHub releases nor Docker
+images can publish until every validation and build succeeds. Release runs are
+serialized so two production publications cannot overlap.
 
 To run one driver case on a Linux host with Docker, Maven, JDK 21, and OpenSSL
 installed:
