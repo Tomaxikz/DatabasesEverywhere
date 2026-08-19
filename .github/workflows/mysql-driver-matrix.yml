@@ -10,7 +10,7 @@ jobs:
   driver-case:
     name: ${{ matrix.image }} with Connector/J ${{ matrix.connector }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -57,11 +57,22 @@ jobs:
           key: mysql-driver-matrix
           cache-on-failure: false
 
-      - name: Install real client toolchains
+      - name: Select hosted Java 21 and verify client toolchains
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            mariadb-client maven openjdk-21-jdk-headless openssl
+          if [ -z "${JAVA_HOME_21_X64:-}" ] || \
+             [ ! -x "$JAVA_HOME_21_X64/bin/java" ] || \
+             [ ! -x "$JAVA_HOME_21_X64/bin/javac" ]; then
+            echo "GitHub runner is missing its advertised Java 21 toolchain" >&2
+            exit 1
+          fi
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          for command in docker mvn openssl; do
+            command -v "$command" >/dev/null || {
+              echo "GitHub runner is missing required tool: $command" >&2
+              exit 1
+            }
+          done
 
       - name: Compile the compatibility test
         run: cargo test --locked --lib --no-run
@@ -71,6 +82,7 @@ jobs:
           DBE_MATRIX_PROTOCOL: ${{ matrix.protocol }}
           DBE_MATRIX_IMAGE: ${{ matrix.image }}
           DBE_MATRIX_CONNECTOR: ${{ matrix.connector }}
+          DBE_MARIADB_CLI_IMAGE: ${{ matrix.protocol == 'mariadb' && matrix.image || 'mariadb:11.4' }}
           DBE_DRIVER_CASE_TIMEOUT: 12m
         run: |
           bash .github/ci/mysql-driver-matrix.sh \

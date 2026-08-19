@@ -28,7 +28,7 @@ CodeQL, and the release build run. The driver matrix runs each official MySQL
 an isolated parallel job. It exercises MariaDB CLI, Connector/J 8.4/9.2/9.7,
 MariaDB Connector/J, HikariCP, database-qualified and deferred-catalog
 connections, and standard CLIENT_SSL. Each case is compiled before its own
-12-minute runtime deadline begins and has a 25-minute total job deadline, so a
+12-minute runtime deadline begins and has a 20-minute total job deadline, so a
 stuck external client cannot consume the former one-hour serial matrix timeout.
 Configure the `main` branch ruleset to require the single `CI gate` status;
 that gate fails when any required stage fails or is skipped.
@@ -37,12 +37,17 @@ The release workflow independently repeats the locked lint and test gate and
 audits both Cargo lockfiles before it builds publishable artifacts. A release
 therefore cannot rely on a separate CI run that is still pending or failed.
 
-To run one driver case on a Linux host with Docker, Maven, JDK 21, OpenSSL, and
-the MariaDB CLI installed:
+To run one driver case on a Linux host with Docker, Maven, JDK 21, and OpenSSL
+installed:
 
 ```bash
 bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 9.7.0
 ```
+
+The MariaDB CLI runs from an official MariaDB container with host networking:
+the tested image for MariaDB cases and `mariadb:11.4` for MySQL cases. CI
+therefore does not depend on Ubuntu package mirrors or mutate each ephemeral
+runner with `apt-get`.
 
 The complete case list has one canonical definition in
 `.github/workflows/mysql-driver-matrix.yml`; CI and release both call that

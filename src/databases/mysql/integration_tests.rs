@@ -8,7 +8,9 @@ use std::{
 use base64::Engine;
 
 use super::provision::{reset_tenant_password_sql, tenant_user_sql};
-use crate::databases::mysql_wire_integration::{run_jdbc_smoke, start_gateway, test_tls_acceptor};
+use crate::databases::mysql_wire_integration::{
+    run_jdbc_smoke, run_mariadb_cli, start_gateway, test_tls_acceptor,
+};
 use crate::{
     instances::{
         metadata::{
@@ -29,7 +31,7 @@ const ROTATED_TENANT_PASSWORD: &str = "integration-rotated-password";
 const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker, a supported MySQL image, and the mariadb CLI"]
+#[ignore = "requires Docker, supported MySQL/MariaDB images, Maven, Java, and OpenSSL"]
 async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     let image = std::env::var("DBE_MYSQL_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
     let name = format!("dbev-mysql-test-{}", uuid::Uuid::new_v4().simple());
@@ -226,25 +228,13 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     let (tls_address, tls_gateway) =
         start_gateway(Protocol::Mysql, store, Some(tls), shutdown_rx).await;
 
-    let routed = Command::new("mariadb")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-P",
-            &address.port().to_string(),
-            "-u",
-            TENANT,
-            &format!("-p{TENANT_PASSWORD}"),
-            DATABASE,
-            "--skip-ssl",
-            "--connect-timeout=5",
-            "-N",
-            "-B",
-            "-e",
-            "SELECT value FROM restore_test WHERE id = 1",
-        ])
-        .output()
-        .expect("query through MySQL gateway");
+    let routed = run_mariadb_cli(
+        address.port(),
+        DATABASE,
+        TENANT,
+        TENANT_PASSWORD,
+        "SELECT value FROM restore_test WHERE id = 1",
+    );
     assert_success(&routed, "gateway-routed tenant query");
     assert_eq!(String::from_utf8_lossy(&routed.stdout).trim(), "before");
     run_jdbc_smoke(
@@ -255,23 +245,13 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
         TENANT_PASSWORD,
     );
 
-    let rejected = Command::new("mariadb")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-P",
-            &address.port().to_string(),
-            "-u",
-            TENANT,
-            "-pwrong-password",
-            DATABASE,
-            "--skip-ssl",
-            "--connect-timeout=5",
-            "-e",
-            "SELECT 1",
-        ])
-        .output()
-        .expect("attempt wrong-password MySQL gateway query");
+    let rejected = run_mariadb_cli(
+        address.port(),
+        DATABASE,
+        TENANT,
+        "wrong-password",
+        "SELECT 1",
+    );
     assert!(
         !rejected.status.success(),
         "gateway accepted a wrong password"

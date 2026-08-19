@@ -7,7 +7,9 @@ use std::{
 
 use super::provision::tenant_user_sql;
 use crate::{
-    databases::mysql_wire_integration::{run_jdbc_smoke, start_gateway, test_tls_acceptor},
+    databases::mysql_wire_integration::{
+        run_jdbc_smoke, run_mariadb_cli, start_gateway, test_tls_acceptor,
+    },
     instances::{
         metadata::{
             DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
@@ -26,7 +28,7 @@ const TENANT_PASSWORD: &str = "integration-tenant-password";
 const ROOT_PASSWORD: &str = "integration-root-password";
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker, a supported MariaDB image, OpenSSL, and the mariadb CLI"]
+#[ignore = "requires Docker, supported MariaDB images, Maven, Java, and OpenSSL"]
 async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() {
     let image =
         std::env::var("DBE_MARIADB_TEST_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
@@ -255,25 +257,7 @@ fn exec_with_input(name: &str, password: &str, input: &[u8]) -> Output {
 }
 
 fn host_mariadb(port: u16, password: &str, sql: &str) -> Output {
-    Command::new("mariadb")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-P",
-            &port.to_string(),
-            "-u",
-            TENANT,
-            &format!("-p{password}"),
-            DATABASE,
-            "--skip-ssl",
-            "--connect-timeout=5",
-            "-N",
-            "-B",
-            "-e",
-            sql,
-        ])
-        .output()
-        .expect("query through MariaDB gateway")
+    run_mariadb_cli(port, DATABASE, TENANT, password, sql)
 }
 
 fn assert_success(output: &Output, operation: &str) {

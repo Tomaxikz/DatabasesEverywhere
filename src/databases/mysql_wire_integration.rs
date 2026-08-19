@@ -11,6 +11,8 @@ use crate::{
     shared::protocol::Protocol,
 };
 
+const DEFAULT_MARIADB_CLI_IMAGE: &str = "mariadb:11.4";
+
 pub(super) async fn start_gateway(
     protocol: Protocol,
     store: InstanceStore,
@@ -116,4 +118,41 @@ pub(super) fn run_jdbc_smoke(
         "real JDBC/Hikari compatibility smoke test failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+pub(super) fn run_mariadb_cli(
+    port: u16,
+    database: &str,
+    username: &str,
+    password: &str,
+    sql: &str,
+) -> std::process::Output {
+    let image = std::env::var("DBE_MARIADB_CLI_IMAGE")
+        .unwrap_or_else(|_| DEFAULT_MARIADB_CLI_IMAGE.to_string());
+    let port = port.to_string();
+    let password = format!("-p{password}");
+    Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network=host",
+            "--entrypoint=mariadb",
+            &image,
+            "-h",
+            "127.0.0.1",
+            "-P",
+            &port,
+            "-u",
+            username,
+            &password,
+            database,
+            "--skip-ssl",
+            "--connect-timeout=5",
+            "-N",
+            "-B",
+            "-e",
+            sql,
+        ])
+        .output()
+        .expect("run the real MariaDB CLI in its official container")
 }
