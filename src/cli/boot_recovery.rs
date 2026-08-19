@@ -26,14 +26,28 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
     }
 
     let compatibility = crate::compatibility::reconcile_managed_compatibility_on_boot(&state).await;
-    tracing::info!(
-        checked = compatibility.checked,
-        attestations_reused = compatibility.attestations_reused,
-        probed = compatibility.probed,
-        images_upgraded = compatibility.images_upgraded,
-        failed = compatibility.failed,
-        "configured image reconciliation and database compatibility attestation complete; failed instances were isolated individually"
-    );
+    if compatibility.failed == 0 {
+        tracing::info!(
+            checked = compatibility.checked,
+            attestations_reused = compatibility.attestations_reused,
+            probed = compatibility.probed,
+            images_upgraded = compatibility.images_upgraded,
+            unchanged_images = compatibility
+                .checked
+                .saturating_sub(compatibility.images_upgraded),
+            failed = 0,
+            "configured image reconciliation and database compatibility attestation completed successfully"
+        );
+    } else {
+        tracing::warn!(
+            checked = compatibility.checked,
+            attestations_reused = compatibility.attestations_reused,
+            probed = compatibility.probed,
+            images_upgraded = compatibility.images_upgraded,
+            failed = compatibility.failed,
+            "configured image reconciliation completed with isolated instance failures"
+        );
+    }
     if !state.import_export_jobs.is_accepting() {
         return;
     }
@@ -69,16 +83,29 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
             "PostgreSQL boot-hardening failure included in the per-instance summary"
         );
     }
-    tracing::info!(
-        checked = postgres_role_hardening.checked,
-        hardened = postgres_role_hardening.hardened,
-        administrator_credentials_migrated =
-            postgres_role_hardening.administrator_credentials_migrated,
-        attestations_reused = postgres_role_hardening.attestations_reused,
-        deferred = postgres_role_hardening.deferred,
-        failed = postgres_role_hardening.failures.len(),
-        "PostgreSQL role and local authentication hardening complete; failed instances were isolated individually"
-    );
+    if postgres_role_hardening.failures.is_empty() {
+        tracing::info!(
+            checked = postgres_role_hardening.checked,
+            hardened = postgres_role_hardening.hardened,
+            administrator_credentials_migrated =
+                postgres_role_hardening.administrator_credentials_migrated,
+            attestations_reused = postgres_role_hardening.attestations_reused,
+            deferred = postgres_role_hardening.deferred,
+            failed = 0,
+            "PostgreSQL role and local authentication hardening completed successfully"
+        );
+    } else {
+        tracing::warn!(
+            checked = postgres_role_hardening.checked,
+            hardened = postgres_role_hardening.hardened,
+            administrator_credentials_migrated =
+                postgres_role_hardening.administrator_credentials_migrated,
+            attestations_reused = postgres_role_hardening.attestations_reused,
+            deferred = postgres_role_hardening.deferred,
+            failed = postgres_role_hardening.failures.len(),
+            "PostgreSQL authentication hardening completed with isolated instance failures"
+        );
+    }
     if !state.import_export_jobs.is_accepting() {
         return;
     }
@@ -92,14 +119,25 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
             "MySQL boot-hardening failure included in the per-instance summary"
         );
     }
-    tracing::info!(
-        checked = mysql_auth_hardening.checked,
-        root_credentials_migrated = mysql_auth_hardening.root_credentials_migrated,
-        verifiers_repaired = mysql_auth_hardening.verifiers_repaired,
-        attestations_reused = mysql_auth_hardening.attestations_reused,
-        failed = mysql_auth_hardening.failures.len(),
-        "MySQL caching_sha2_password migration complete; failed instances were isolated individually"
-    );
+    if mysql_auth_hardening.failures.is_empty() {
+        tracing::info!(
+            checked = mysql_auth_hardening.checked,
+            root_credentials_migrated = mysql_auth_hardening.root_credentials_migrated,
+            verifiers_repaired = mysql_auth_hardening.verifiers_repaired,
+            attestations_reused = mysql_auth_hardening.attestations_reused,
+            failed = 0,
+            "MySQL caching_sha2_password migration completed successfully"
+        );
+    } else {
+        tracing::warn!(
+            checked = mysql_auth_hardening.checked,
+            root_credentials_migrated = mysql_auth_hardening.root_credentials_migrated,
+            verifiers_repaired = mysql_auth_hardening.verifiers_repaired,
+            attestations_reused = mysql_auth_hardening.attestations_reused,
+            failed = mysql_auth_hardening.failures.len(),
+            "MySQL authentication migration completed with isolated instance failures"
+        );
+    }
     if !state.import_export_jobs.is_accepting() {
         return;
     }
