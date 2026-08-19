@@ -56,13 +56,14 @@ api:
   # trusted TLS reverse proxy outside isolated development/private networks.
   host: 127.0.0.1
   port: 8090
-  # Hostnames accepted in the HTTP Host header in addition to `remote` and the
-  # concrete bind host. Add the daemon/reverse-proxy hostname when it differs
-  # from the panel hostname. Ports are ignored during host comparison.
-  trusted_hosts: []
-  # Additional browser origins allowed for CORS and WebSocket upgrades.
-  # Unlike trusted_hosts, these are exact HTTP(S) origins: scheme, hostname,
-  # and effective port must all match. `remote` is always included.
+  # Canonical public DNS hostname only: no scheme, port, path, or wildcard.
+  # It is automatically accepted in the HTTP Host header. Leave empty for a
+  # loopback-only deployment; public nodes should set the hostname from their
+  # panel API URL (for example, db-node.example.com).
+  fqdn: ''
+  # Additional browser origins allowed to call DBEV through CORS and WebSocket
+  # upgrades. These are exact HTTP(S) origins: scheme, hostname, and effective
+  # port must all match. The primary `remote` panel origin is always included.
   trusted_origins: []
   ssl:
     enabled: false

@@ -204,18 +204,16 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
         failed.desired_state,
         crate::instances::metadata::DesiredInstanceState::Running
     );
-    assert!(
+    assert!(matches!(
+        store.resolve_mysql("legacy_user", Some("legacy_db")).await,
+        crate::instances::state::DatabaseRouteResolution::NotFound
+    ));
+    assert!(matches!(
         store
-            .resolve_mysql("legacy_user", "legacy_db")
-            .await
-            .is_none()
-    );
-    assert!(
-        store
-            .resolve_mysql("healthy_user", "healthy_db")
-            .await
-            .is_some()
-    );
+            .resolve_mysql("healthy_user", Some("healthy_db"))
+            .await,
+        crate::instances::state::DatabaseRouteResolution::Found { .. }
+    ));
 }
 
 #[test]

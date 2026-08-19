@@ -411,4 +411,23 @@ mod tests {
         assert!(!policy.allows_origin("http://localhost"));
         assert!(!policy.allows_origin("https://panel.example.com/path"));
     }
+
+    #[test]
+    fn fqdn_and_cors_origin_are_independent_trust_boundaries() {
+        let config = Config {
+            remote: "https://panel.example.com".to_string(),
+            api: crate::config::ApiConfig {
+                host: "0.0.0.0".to_string(),
+                fqdn: "db.example.com".to_string(),
+                ..crate::config::ApiConfig::default()
+            },
+            ..Config::default()
+        };
+        let policy = HostPolicy::from_config(&config);
+
+        assert!(policy.allows_request_host("db.example.com"));
+        assert!(!policy.allows_request_host("panel.example.com"));
+        assert!(policy.allows_origin("https://panel.example.com"));
+        assert!(!policy.allows_origin("https://db.example.com"));
+    }
 }

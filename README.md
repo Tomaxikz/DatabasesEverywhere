@@ -44,6 +44,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - One public gateway listener per database protocol — no port-per-instance chaos.
 - Database containers have no network interface (`network_mode=none`) and never publish backend ports.
 - The daemon reaches each instance through a private Unix socket; ClickHouse and Qdrant use a hash-verified, statically linked, loopback-only socket bridge inside their isolated containers.
+- PostgreSQL, MySQL, MariaDB, and ClickHouse accept both database-qualified clients and JDBC/Hikari clients that choose their catalog after connecting; database-less routing is allowed only for a uniquely matching username.
 - Legacy bridge-network/TCP instances are stopped and quarantined on upgrade; preserve required data, delete them explicitly, and recreate them before serving traffic again.
 - Per-instance CPU, memory, PID, and disk limits, with bounded unused-CPU burst
   credit to reduce short quota stalls without changing sustained CPU allocation.

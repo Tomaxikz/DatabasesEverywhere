@@ -20,6 +20,13 @@ pub struct MariadbRouteTarget {
     pub tenant_password: Option<SecretString>,
 }
 
+#[derive(Debug, Clone)]
+pub enum DatabaseRouteResolution<T> {
+    Found { database: String, target: T },
+    NotFound,
+    Ambiguous,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InstanceStore {
     inner: Arc<RwLock<InstanceState>>,
@@ -55,18 +62,13 @@ impl InstanceStore {
         self.inner.read().await.instances.get(instance_id).cloned()
     }
 
-    pub async fn resolve_postgres(&self, username: &str, database: &str) -> Option<RouteTarget> {
+    pub async fn resolve_postgres(
+        &self,
+        username: &str,
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<RouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state
-            .postgres_routes
-            .get(&(username.to_string(), database.to_string()))?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                endpoint: metadata.backend.clone(),
-            })
+        resolve_plain_database_route(&state, &state.postgres_routes, username, database)
     }
 
     pub async fn resolve_redis(&self, username: &str) -> Option<RouteTarget> {
@@ -96,43 +98,31 @@ impl InstanceStore {
     pub async fn resolve_mariadb(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<MariadbRouteTarget> {
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<MariadbRouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state
-            .mariadb_routes
-            .get(&(username.to_string(), database.to_string()))?;
-        let metadata = state.instances.get(instance_id)?;
-        Some(MariadbRouteTarget {
-            instance_id: metadata.instance_id.clone(),
-            endpoint: metadata.backend.clone(),
-            native_password_sha1_stage2: metadata.mariadb_native_password_sha1_stage2.clone(),
-            tenant_password: metadata
-                .tenant_password
-                .as_ref()
-                .map(|password| SecretString::from(password.clone())),
-        })
+        resolve_mariadb_route(
+            &state,
+            &state.mariadb_routes,
+            username,
+            database,
+            |metadata| metadata.mariadb_native_password_sha1_stage2.clone(),
+        )
     }
 
     pub async fn resolve_mysql(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<MariadbRouteTarget> {
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<MariadbRouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state
-            .mysql_routes
-            .get(&(username.to_string(), database.to_string()))?;
-        let metadata = state.instances.get(instance_id)?;
-        Some(MariadbRouteTarget {
-            instance_id: metadata.instance_id.clone(),
-            endpoint: metadata.backend.clone(),
-            native_password_sha1_stage2: metadata.mysql_native_password_sha1_stage2.clone(),
-            tenant_password: metadata
-                .tenant_password
-                .as_ref()
-                .map(|password| SecretString::from(password.clone())),
-        })
+        resolve_mariadb_route(
+            &state,
+            &state.mysql_routes,
+            username,
+            database,
+            |metadata| metadata.mysql_native_password_sha1_stage2.clone(),
+        )
     }
 
     pub async fn resolve_mongodb(&self, username: &str, database: &str) -> Option<RouteTarget> {
@@ -149,18 +139,13 @@ impl InstanceStore {
             })
     }
 
-    pub async fn resolve_clickhouse(&self, username: &str, database: &str) -> Option<RouteTarget> {
+    pub async fn resolve_clickhouse(
+        &self,
+        username: &str,
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<RouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state
-            .clickhouse_routes
-            .get(&(username.to_string(), database.to_string()))?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                endpoint: metadata.backend.clone(),
-            })
+        resolve_plain_database_route(&state, &state.clickhouse_routes, username, database)
     }
 
     pub async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<RouteTarget> {
@@ -173,6 +158,110 @@ impl InstanceStore {
                 instance_id: metadata.instance_id.clone(),
                 endpoint: metadata.backend.clone(),
             })
+    }
+}
+
+enum RouteKeyResolution<'a> {
+    Found {
+        database: &'a String,
+        instance_id: &'a String,
+    },
+    NotFound,
+    Ambiguous,
+}
+
+fn resolve_database_route<'a>(
+    routes: &'a HashMap<(String, String), String>,
+    username: &str,
+    database: Option<&str>,
+) -> RouteKeyResolution<'a> {
+    if let Some(database) = database.filter(|database| !database.is_empty()) {
+        let lookup = (username.to_string(), database.to_string());
+        return routes.get_key_value(&lookup).map_or(
+            RouteKeyResolution::NotFound,
+            |((_, database), instance_id)| RouteKeyResolution::Found {
+                database,
+                instance_id,
+            },
+        );
+    }
+
+    let mut matches = routes
+        .iter()
+        .filter(|((route_username, _), _)| route_username == username);
+    let Some(((_, database), instance_id)) = matches.next() else {
+        return RouteKeyResolution::NotFound;
+    };
+    if matches.next().is_some() {
+        return RouteKeyResolution::Ambiguous;
+    }
+    RouteKeyResolution::Found {
+        database,
+        instance_id,
+    }
+}
+
+fn resolve_mariadb_route(
+    state: &InstanceState,
+    routes: &HashMap<(String, String), String>,
+    username: &str,
+    database: Option<&str>,
+    verifier: impl FnOnce(&InstanceMetadata) -> Option<String>,
+) -> DatabaseRouteResolution<MariadbRouteTarget> {
+    match resolve_database_route(routes, username, database) {
+        RouteKeyResolution::Found {
+            database,
+            instance_id,
+        } => {
+            state
+                .instances
+                .get(instance_id)
+                .map_or(DatabaseRouteResolution::NotFound, |metadata| {
+                    DatabaseRouteResolution::Found {
+                        database: database.clone(),
+                        target: MariadbRouteTarget {
+                            instance_id: metadata.instance_id.clone(),
+                            endpoint: metadata.backend.clone(),
+                            native_password_sha1_stage2: verifier(metadata),
+                            tenant_password: metadata
+                                .tenant_password
+                                .as_ref()
+                                .map(|password| SecretString::from(password.clone())),
+                        },
+                    }
+                })
+        }
+        RouteKeyResolution::NotFound => DatabaseRouteResolution::NotFound,
+        RouteKeyResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
+    }
+}
+
+fn resolve_plain_database_route(
+    state: &InstanceState,
+    routes: &HashMap<(String, String), String>,
+    username: &str,
+    database: Option<&str>,
+) -> DatabaseRouteResolution<RouteTarget> {
+    match resolve_database_route(routes, username, database) {
+        RouteKeyResolution::Found {
+            database,
+            instance_id,
+        } => {
+            state
+                .instances
+                .get(instance_id)
+                .map_or(DatabaseRouteResolution::NotFound, |metadata| {
+                    DatabaseRouteResolution::Found {
+                        database: database.clone(),
+                        target: RouteTarget {
+                            instance_id: metadata.instance_id.clone(),
+                            endpoint: metadata.backend.clone(),
+                        },
+                    }
+                })
+        }
+        RouteKeyResolution::NotFound => DatabaseRouteResolution::NotFound,
+        RouteKeyResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
     }
 }
 
@@ -298,5 +387,45 @@ impl InstanceState {
     fn remove(&mut self, instance_id: &str) -> Option<InstanceMetadata> {
         self.remove_routes_for(instance_id);
         self.instances.remove(instance_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_route_prefers_exact_names_and_infers_only_unique_usernames() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            ("app".to_string(), "primary".to_string()),
+            "instance-primary".to_string(),
+        );
+
+        assert!(matches!(
+            resolve_database_route(&routes, "app", Some("primary")),
+            RouteKeyResolution::Found { database, .. } if database == "primary"
+        ));
+        assert!(matches!(
+            resolve_database_route(&routes, "app", None),
+            RouteKeyResolution::Found { database, .. } if database == "primary"
+        ));
+
+        routes.insert(
+            ("app".to_string(), "secondary".to_string()),
+            "instance-secondary".to_string(),
+        );
+        assert!(matches!(
+            resolve_database_route(&routes, "app", None),
+            RouteKeyResolution::Ambiguous
+        ));
+        assert!(matches!(
+            resolve_database_route(&routes, "app", Some("primary")),
+            RouteKeyResolution::Found { database, .. } if database == "primary"
+        ));
+        assert!(matches!(
+            resolve_database_route(&routes, "unknown", None),
+            RouteKeyResolution::NotFound
+        ));
     }
 }

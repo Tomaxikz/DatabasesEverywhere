@@ -1,6 +1,6 @@
 use crate::{
     api::resources::{NetworkCounter, ResourceCache},
-    instances::state::{InstanceStore, MariadbRouteTarget},
+    instances::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
     shared::backend::BackendEndpoint,
 };
 use secrecy::SecretString;
@@ -35,13 +35,10 @@ impl RouteResolver {
     pub(crate) async fn resolve_postgres(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<ResolvedRoute> {
-        let target = self.store.resolve_postgres(username, database).await?;
-        Some(
-            self.resolve_target(target.instance_id, target.endpoint)
-                .await,
-        )
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<ResolvedRoute> {
+        self.resolve_database_target(self.store.resolve_postgres(username, database).await)
+            .await
     }
 
     pub(crate) async fn resolve_redis(&self, username: &str) -> Option<ResolvedRoute> {
@@ -63,19 +60,19 @@ impl RouteResolver {
     pub(crate) async fn resolve_mariadb(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<ResolvedMariadbRoute> {
-        let target = self.store.resolve_mariadb(username, database).await?;
-        Some(self.resolve_mariadb_target(target).await)
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {
+        self.resolve_mariadb_database_target(self.store.resolve_mariadb(username, database).await)
+            .await
     }
 
     pub(crate) async fn resolve_mysql(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<ResolvedMariadbRoute> {
-        let target = self.store.resolve_mysql(username, database).await?;
-        Some(self.resolve_mariadb_target(target).await)
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {
+        self.resolve_mariadb_database_target(self.store.resolve_mysql(username, database).await)
+            .await
     }
 
     pub(crate) async fn resolve_mongodb(
@@ -93,13 +90,10 @@ impl RouteResolver {
     pub(crate) async fn resolve_clickhouse(
         &self,
         username: &str,
-        database: &str,
-    ) -> Option<ResolvedRoute> {
-        let target = self.store.resolve_clickhouse(username, database).await?;
-        Some(
-            self.resolve_target(target.instance_id, target.endpoint)
-                .await,
-        )
+        database: Option<&str>,
+    ) -> DatabaseRouteResolution<ResolvedRoute> {
+        self.resolve_database_target(self.store.resolve_clickhouse(username, database).await)
+            .await
     }
 
     pub(crate) async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<ResolvedRoute> {
@@ -120,6 +114,36 @@ impl RouteResolver {
             instance_id,
             endpoint,
             network,
+        }
+    }
+
+    async fn resolve_database_target(
+        &self,
+        resolution: DatabaseRouteResolution<RouteTarget>,
+    ) -> DatabaseRouteResolution<ResolvedRoute> {
+        match resolution {
+            DatabaseRouteResolution::Found { database, target } => DatabaseRouteResolution::Found {
+                database,
+                target: self
+                    .resolve_target(target.instance_id, target.endpoint)
+                    .await,
+            },
+            DatabaseRouteResolution::NotFound => DatabaseRouteResolution::NotFound,
+            DatabaseRouteResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
+        }
+    }
+
+    async fn resolve_mariadb_database_target(
+        &self,
+        resolution: DatabaseRouteResolution<MariadbRouteTarget>,
+    ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {
+        match resolution {
+            DatabaseRouteResolution::Found { database, target } => DatabaseRouteResolution::Found {
+                database,
+                target: self.resolve_mariadb_target(target).await,
+            },
+            DatabaseRouteResolution::NotFound => DatabaseRouteResolution::NotFound,
+            DatabaseRouteResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
         }
     }
 

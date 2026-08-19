@@ -1020,6 +1020,7 @@ mod tests {
     fn wildcard_listener_uses_loopback_and_an_allowed_host_header() {
         let mut config = Config::default();
         config.api.host = "0.0.0.0".to_string();
+        config.api.fqdn = "db.example.com".to_string();
         config.api.port = 8090;
         config.remote = "https://panel.example.com".to_string();
         let args = test_args();
@@ -1027,7 +1028,7 @@ mod tests {
         assert_eq!(default_api_url(&config), "http://127.0.0.1:8090");
         assert_eq!(
             benchmark_host_header(&config, &args).as_deref(),
-            Some("panel.example.com")
+            Some("db.example.com")
         );
     }
 

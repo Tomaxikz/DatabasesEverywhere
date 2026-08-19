@@ -34,11 +34,8 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     println!("token id: {}", config.token_id);
     println!("remote panel: {}", config.remote);
     println!("api listener: {}", config.api.bind_addr());
-    if config.api.host == "0.0.0.0" {
-        println!(
-            "panel api url: use the node domain or server IP with port {}",
-            config.api.port
-        );
+    if let Some(public_url) = config.api.public_url() {
+        println!("panel api url: {public_url}");
     }
     println!("service: enabled and started ({SERVICE_UNIT})");
     Ok(())

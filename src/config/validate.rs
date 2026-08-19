@@ -1,7 +1,4 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    path::Path,
-};
+use std::{net::SocketAddr, path::Path};
 
 use super::{
     ApiSslConfig, BackupStorageDriver, ClickhouseConfig, Config, ListenerConfig, TlsConfig,
@@ -9,8 +6,11 @@ use super::{
 };
 use crate::shared::images::is_pinned_image_reference;
 
+mod api;
 mod artifact_policy;
 mod import_export_scheduler;
+
+use api::{validate_api_host, validate_api_hosts};
 
 const MAX_REMOTE_IMPORT_JOBS: usize = 64;
 const MAX_REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: u64 = 5 * 60;
@@ -45,6 +45,12 @@ pub enum ConfigValidationError {
     InvalidRemoteUrl,
     #[error("api.host must be a host or IP address, not a URL/path: {value}")]
     InvalidApiHost { value: String },
+    #[error(
+        "api.fqdn must be a fully qualified DNS hostname without a scheme, port, path, wildcard, or trailing dot: {value}"
+    )]
+    InvalidApiFqdn { value: String },
+    #[error("api.fqdn is required when api.host binds all interfaces")]
+    MissingApiFqdn,
     #[error(
         "api.trusted_origins must contain only HTTP(S) origins without paths, queries, or credentials: {value}"
     )]
@@ -762,43 +768,6 @@ fn validate_bind(field: &'static str, value: &str) -> Result<(), ConfigValidatio
         })
 }
 
-fn validate_api_hosts(config: &Config) -> Result<(), ConfigValidationError> {
-    if super::url_host(&config.remote).is_none() {
-        return Err(ConfigValidationError::InvalidRemoteUrl);
-    }
-
-    for host in &config.api.trusted_hosts {
-        validate_api_host(host)?;
-    }
-    for origin in &config.api.trusted_origins {
-        if super::normalize_http_origin(origin).is_none() {
-            return Err(ConfigValidationError::InvalidApiOrigin {
-                value: origin.to_string(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_api_host(host: &str) -> Result<(), ConfigValidationError> {
-    let host = host.trim();
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-    if host.is_empty()
-        || host.contains("://")
-        || host.contains('/')
-        || host.contains('\\')
-        || host.contains(':')
-    {
-        return Err(ConfigValidationError::InvalidApiHost {
-            value: host.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn validate_tls_pair(
     field: &'static str,
     cert: &str,
@@ -1115,6 +1084,7 @@ mod tests {
     fn accepts_public_api_with_plain_http_or_native_tls() {
         let mut config = valid_config();
         config.api.host = "0.0.0.0".to_string();
+        config.api.fqdn = "db.example.com".to_string();
         validate_config(&config).unwrap();
 
         let directory = tempfile::tempdir().unwrap();
@@ -1365,16 +1335,13 @@ mod tests {
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443"]
         );
-        assert_eq!(
-            config.request_allowed_hosts(),
-            vec!["panel.example.com", "127.0.0.1"]
-        );
+        assert_eq!(config.request_allowed_hosts(), vec!["127.0.0.1"]);
     }
 
     #[test]
-    fn accepts_explicit_reverse_proxy_host() {
+    fn accepts_explicit_reverse_proxy_fqdn() {
         let mut config = valid_config();
-        config.api.trusted_hosts = vec!["node.example.com".to_string()];
+        config.api.fqdn = "node.example.com".to_string();
 
         validate_config(&config).unwrap();
 

@@ -713,6 +713,10 @@ mod tests {
             token_id: "test-token".to_string(),
             token: "secret".to_string(),
             jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
+            api: crate::config::ApiConfig {
+                fqdn: "panel.example.com".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         });
         AppState::new(AppStateData {
@@ -757,6 +761,10 @@ mod tests {
             token_id: "test-token".to_string(),
             token: "secret".to_string(),
             jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
+            api: crate::config::ApiConfig {
+                fqdn: "panel.example.com".to_string(),
+                ..Default::default()
+            },
             paths: crate::config::PathConfig {
                 data: root.join("data").display().to_string(),
                 sockets: root.join("sockets").display().to_string(),

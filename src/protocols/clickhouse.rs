@@ -16,8 +16,6 @@ pub struct ClickhouseHttpRoute {
 pub enum ClickhouseParseError {
     #[error("clickhouse native hello is missing username")]
     MissingUsername,
-    #[error("clickhouse native hello is missing database")]
-    MissingDatabase,
     #[error("clickhouse native hello packet is incomplete")]
     IncompleteNativeHello,
     #[error("clickhouse native packet is not a client hello")]
@@ -30,8 +28,6 @@ pub enum ClickhouseParseError {
     InvalidHttpRequest,
     #[error("clickhouse http request is missing username")]
     MissingHttpUsername,
-    #[error("clickhouse http request is missing database")]
-    MissingHttpDatabase,
     #[error("clickhouse http basic authorization is invalid")]
     InvalidHttpBasicAuth,
 }
@@ -54,11 +50,34 @@ pub fn parse_native_initial_route(bytes: &[u8]) -> Result<ClickhouseRoute, Click
     if username.is_empty() {
         return Err(ClickhouseParseError::MissingUsername);
     }
+    Ok(ClickhouseRoute { username, database })
+}
+
+pub fn native_hello_with_database(
+    bytes: &[u8],
+    database: &str,
+) -> Result<Vec<u8>, ClickhouseParseError> {
+    parse_native_initial_route(bytes)?;
     if database.is_empty() {
-        return Err(ClickhouseParseError::MissingDatabase);
+        return Err(ClickhouseParseError::InvalidNativeHello);
     }
 
-    Ok(ClickhouseRoute { username, database })
+    let mut reader = NativeReader::new(bytes);
+    reader.read_uvarint()?;
+    reader.read_string()?;
+    reader.read_uvarint()?;
+    reader.read_uvarint()?;
+    reader.read_uvarint()?;
+    let database_start = reader.offset;
+    reader.read_string()?;
+    let database_end = reader.offset;
+
+    let mut rewritten = Vec::with_capacity(bytes.len() + database.len());
+    rewritten.extend_from_slice(&bytes[..database_start]);
+    write_uvarint(&mut rewritten, database.len() as u64);
+    rewritten.extend_from_slice(database.as_bytes());
+    rewritten.extend_from_slice(&bytes[database_end..]);
+    Ok(rewritten)
 }
 
 pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, ClickhouseParseError> {
@@ -109,11 +128,79 @@ pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, Cli
     if username.is_empty() {
         return Err(ClickhouseParseError::MissingHttpUsername);
     }
-    let database = database.ok_or(ClickhouseParseError::MissingHttpDatabase)?;
-    if database.is_empty() {
-        return Err(ClickhouseParseError::MissingHttpDatabase);
-    }
+    let database = database.unwrap_or_default();
     Ok(ClickhouseHttpRoute { username, database })
+}
+
+pub fn http_request_with_database(
+    bytes: &[u8],
+    database: &str,
+) -> Result<Vec<u8>, ClickhouseParseError> {
+    parse_http_initial_route(bytes)?;
+    if database.is_empty() {
+        return Err(ClickhouseParseError::InvalidHttpRequest);
+    }
+    let header_end = find_header_end(bytes).ok_or(ClickhouseParseError::IncompleteHttpRequest)?;
+    let header_block = std::str::from_utf8(&bytes[..header_end - 4])
+        .map_err(|_| ClickhouseParseError::InvalidHttpRequest)?;
+    let mut lines = header_block.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+    let mut request_parts = request_line.splitn(3, ' ');
+    let method = request_parts
+        .next()
+        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+    let target = request_parts
+        .next()
+        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+    let version = request_parts
+        .next()
+        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+
+    let mut rewritten = format!(
+        "{method} {} {version}\r\n",
+        target_with_database(target, database)
+    );
+    let mut database_header_seen = false;
+    for line in lines {
+        let Some((name, _)) = line.split_once(':') else {
+            return Err(ClickhouseParseError::InvalidHttpRequest);
+        };
+        if name.trim().eq_ignore_ascii_case("x-clickhouse-database") {
+            rewritten.push_str("X-ClickHouse-Database: ");
+            rewritten.push_str(database);
+            rewritten.push_str("\r\n");
+            database_header_seen = true;
+        } else {
+            rewritten.push_str(line);
+            rewritten.push_str("\r\n");
+        }
+    }
+    if !database_header_seen {
+        rewritten.push_str("X-ClickHouse-Database: ");
+        rewritten.push_str(database);
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str("\r\n");
+
+    let mut output = rewritten.into_bytes();
+    output.extend_from_slice(&bytes[header_end..]);
+    Ok(output)
+}
+
+fn target_with_database(target: &str, database: &str) -> String {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut pairs: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !percent_decode(name).eq_ignore_ascii_case("database") && !pair.is_empty()
+        })
+        .collect();
+    let database_pair = format!("database={database}");
+    pairs.push(&database_pair);
+    format!("{path}?{}", pairs.join("&"))
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -243,6 +330,20 @@ impl<'a> NativeReader<'a> {
     }
 }
 
+fn write_uvarint(bytes: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +383,27 @@ mod tests {
 
         assert_eq!(route.username, "app");
         assert_eq!(route.database, "analytics");
+    }
+
+    #[test]
+    fn injects_unique_database_into_native_jdbc_hello() {
+        let mut packet = Vec::new();
+        write_uvarint(&mut packet, 0);
+        write_string(&mut packet, "ClickHouse JDBC");
+        write_uvarint(&mut packet, 25);
+        write_uvarint(&mut packet, 6);
+        write_uvarint(&mut packet, 54468);
+        write_string(&mut packet, "");
+        write_string(&mut packet, "app");
+        write_string(&mut packet, "secret");
+        packet.extend_from_slice(b"trailing hello fields");
+
+        let rewritten = native_hello_with_database(&packet, "analytics").unwrap();
+        let route = parse_native_initial_route(&rewritten).unwrap();
+
+        assert_eq!(route.username, "app");
+        assert_eq!(route.database, "analytics");
+        assert!(rewritten.ends_with(b"trailing hello fields"));
     }
 
     #[test]
@@ -336,35 +458,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_http_route_without_database() {
+    fn accepts_http_route_without_database_for_unique_username_routing() {
         let request = b"GET / HTTP/1.1\r\nAuthorization: Basic YXBwOnNlY3JldA==\r\n\r\n";
 
-        let error = parse_http_initial_route(request).unwrap_err();
+        let route = parse_http_initial_route(request).unwrap();
 
-        assert!(matches!(error, ClickhouseParseError::MissingHttpDatabase));
+        assert_eq!(route.username, "app");
+        assert!(route.database.is_empty());
     }
 
     #[test]
-    fn rejects_http_route_with_empty_database() {
+    fn accepts_http_route_with_empty_database_for_unique_username_routing() {
         let request = b"GET /?database= HTTP/1.1\r\nX-ClickHouse-User: app\r\n\r\n";
 
-        let error = parse_http_initial_route(request).unwrap_err();
+        let route = parse_http_initial_route(request).unwrap();
 
-        assert!(matches!(error, ClickhouseParseError::MissingHttpDatabase));
+        assert_eq!(route.username, "app");
+        assert!(route.database.is_empty());
     }
 
-    fn write_uvarint(bytes: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            bytes.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
+    #[test]
+    fn injects_unique_database_into_clickhouse_http_jdbc_request() {
+        let request = b"POST /?query_id=one&database=default HTTP/1.1\r\nHost: example\r\nX-ClickHouse-User: app\r\nX-ClickHouse-Database: default\r\n\r\nSELECT 1";
+
+        let rewritten = http_request_with_database(request, "analytics").unwrap();
+        let route = parse_http_initial_route(&rewritten).unwrap();
+        let text = String::from_utf8(rewritten.clone()).unwrap();
+
+        assert_eq!(route.username, "app");
+        assert_eq!(route.database, "analytics");
+        assert!(text.contains("query_id=one&database=analytics"));
+        assert!(text.contains("X-ClickHouse-Database: analytics\r\n"));
+        assert!(rewritten.ends_with(b"SELECT 1"));
     }
 
     fn write_string(bytes: &mut Vec<u8>, value: &str) {

@@ -26,6 +26,7 @@ use super::{
     tunnel,
 };
 use crate::{
+    instances::state::DatabaseRouteResolution,
     protocols::{clickhouse, mariadb, mongodb, postgres, qdrant, redis},
     shared::backend::BackendEndpoint,
 };
@@ -48,6 +49,8 @@ pub enum ListenerError {
     Qdrant(#[from] qdrant::QdrantProxyError),
     #[error("no backend route found")]
     RouteNotFound,
+    #[error("{protocol} database-less route is ambiguous")]
+    AmbiguousDatabaseRoute { protocol: &'static str },
     #[error("clickhouse backend endpoint is invalid")]
     InvalidClickhouseBackend,
     #[error("tunnel failed: {0}")]
@@ -626,13 +629,31 @@ async fn handle_postgres_client(
         };
 
         let route = postgres::parse_startup_route(&packet)?;
-        let target = resolver
-            .resolve_postgres(&route.user, &route.database)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
+        let mut resolution = resolver
+            .resolve_postgres(&route.user, route.database.as_deref())
+            .await;
+        if matches!(resolution, DatabaseRouteResolution::NotFound)
+            && route.database.as_deref() == Some(route.user.as_str())
+        {
+            resolution = resolver.resolve_postgres(&route.user, None).await;
+        }
+        let (database, target) = match resolution {
+            DatabaseRouteResolution::Found { database, target } => (database, target),
+            DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+            DatabaseRouteResolution::Ambiguous => {
+                return Err(ListenerError::AmbiguousDatabaseRoute {
+                    protocol: "postgres",
+                });
+            }
+        };
+        let packet = if route.database.as_deref() == Some(database.as_str()) {
+            packet
+        } else {
+            postgres::startup_packet_with_database(&packet, &database)?
+        };
         tracing::debug!(
             user = %route.user,
-            database = %route.database,
+            database = %database,
             endpoint = ?target.endpoint,
             "postgres route resolved"
         );
@@ -785,10 +806,15 @@ async fn prepare_mysql_wire_tunnel(
     let protocol = if mysql { "mysql" } else { "mariadb" };
     let mut client = accept_direct_tls(client, tls).await?;
     let gateway_seed = mariadb::new_gateway_auth_seed();
-    mariadb::send_gateway_handshake(&mut client, &gateway_seed).await?;
+    let flavor = if mysql {
+        mariadb::GatewayFlavor::Mysql
+    } else {
+        mariadb::GatewayFlavor::Mariadb
+    };
+    mariadb::send_gateway_handshake(&mut client, &gateway_seed, flavor).await?;
     let client_response =
         mariadb::read_packet_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
-    let route = match mariadb::parse_client_handshake_response(&client_response.payload) {
+    let mut route = match mariadb::parse_client_handshake_response(&client_response.payload) {
         Ok(route) => route,
         Err(error) => {
             let error_message = error.to_string();
@@ -797,24 +823,43 @@ async fn prepare_mysql_wire_tunnel(
         }
     };
 
-    let target = if mysql {
+    let resolution = if mysql {
         resolver
-            .resolve_mysql(&route.username, &route.database)
+            .resolve_mysql(
+                &route.username,
+                (!route.database.is_empty()).then_some(route.database.as_str()),
+            )
             .await
     } else {
         resolver
-            .resolve_mariadb(&route.username, &route.database)
+            .resolve_mariadb(
+                &route.username,
+                (!route.database.is_empty()).then_some(route.database.as_str()),
+            )
             .await
     };
-    let Some(target) = target else {
-        mariadb::write_packet(
-            &mut client,
-            2,
-            &mariadb::error_packet("Access denied for requested database"),
-        )
-        .await?;
-        return Err(ListenerError::RouteNotFound);
+    let (database, target) = match resolution {
+        DatabaseRouteResolution::Found { database, target } => (database, target),
+        DatabaseRouteResolution::NotFound => {
+            mariadb::write_packet(
+                &mut client,
+                2,
+                &mariadb::error_packet("Access denied for requested database"),
+            )
+            .await?;
+            return Err(ListenerError::RouteNotFound);
+        }
+        DatabaseRouteResolution::Ambiguous => {
+            mariadb::write_packet(
+                &mut client,
+                2,
+                &mariadb::error_packet("Database must be included for routing"),
+            )
+            .await?;
+            return Err(ListenerError::AmbiguousDatabaseRoute { protocol });
+        }
     };
+    route.database = database;
     let Some(native_password_sha1_stage2) = target.native_password_sha1_stage2.as_deref() else {
         let message = mariadb::MariadbProxyError::MissingNativePasswordVerifier.to_string();
         mariadb::write_packet(&mut client, 2, &mariadb::error_packet(&message)).await?;
@@ -1031,10 +1076,29 @@ async fn handle_clickhouse_client(
         let mut client = accept_direct_tls(client, tls).await?;
         let initial = read_clickhouse_hello(&mut client).await?;
         let route = clickhouse::parse_native_initial_route(&initial)?;
-        let target = resolver
-            .resolve_clickhouse(&route.username, &route.database)
-            .await
-            .ok_or(ListenerError::RouteNotFound)?;
+        let mut resolution = resolver
+            .resolve_clickhouse(
+                &route.username,
+                (!route.database.is_empty()).then_some(route.database.as_str()),
+            )
+            .await;
+        if matches!(resolution, DatabaseRouteResolution::NotFound) && route.database == "default" {
+            resolution = resolver.resolve_clickhouse(&route.username, None).await;
+        }
+        let (database, target) = match resolution {
+            DatabaseRouteResolution::Found { database, target } => (database, target),
+            DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+            DatabaseRouteResolution::Ambiguous => {
+                return Err(ListenerError::AmbiguousDatabaseRoute {
+                    protocol: "clickhouse",
+                });
+            }
+        };
+        let initial = if route.database == database {
+            initial
+        } else {
+            clickhouse::native_hello_with_database(&initial, &database)?
+        };
         Ok((client, target, initial))
     })
     .await?;
@@ -1059,10 +1123,31 @@ async fn handle_clickhouse_http_client(
             let mut client = accept_direct_tls(client, tls).await?;
             let initial = read_http_headers(&mut client).await?;
             let route = clickhouse::parse_http_initial_route(&initial)?;
-            let target = resolver
-                .resolve_clickhouse(&route.username, &route.database)
-                .await
-                .ok_or(ListenerError::RouteNotFound)?;
+            let mut resolution = resolver
+                .resolve_clickhouse(
+                    &route.username,
+                    (!route.database.is_empty()).then_some(route.database.as_str()),
+                )
+                .await;
+            if matches!(resolution, DatabaseRouteResolution::NotFound)
+                && route.database == "default"
+            {
+                resolution = resolver.resolve_clickhouse(&route.username, None).await;
+            }
+            let (database, target) = match resolution {
+                DatabaseRouteResolution::Found { database, target } => (database, target),
+                DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+                DatabaseRouteResolution::Ambiguous => {
+                    return Err(ListenerError::AmbiguousDatabaseRoute {
+                        protocol: "clickhouse_http",
+                    });
+                }
+            };
+            let initial = if route.database == database {
+                initial
+            } else {
+                clickhouse::http_request_with_database(&initial, &database)?
+            };
             let endpoint = clickhouse_http_endpoint(target.endpoint)?;
             Ok((
                 client,
@@ -1310,9 +1395,6 @@ mod tests {
 
     #[test]
     fn clickhouse_real_route_errors_remain_warnings() {
-        assert!(!expected_client_failure(&ListenerError::Clickhouse(
-            clickhouse::ClickhouseParseError::MissingHttpDatabase
-        )));
         assert!(!expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::InvalidNativeHello
         )));

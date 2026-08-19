@@ -113,11 +113,11 @@ jwt_signing_key: replace-with-a-different-32-byte-random-key
 api:
   host: 127.0.0.1
   port: 8090
-  trusted_hosts: [node-api.example.com] # when different from `remote`
-  trusted_origins: [] # extra exact browser origins, if any
+  fqdn: node-api.example.com # public DNS name; no scheme or port
+  trusted_origins: [] # extra exact browser callers, if any
 ```
 
-Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0` and configure `api.ssl` according to the node URL selected in the panel.
+Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and a private Unix socket. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0`, set `api.fqdn` to the hostname from the panel's node API URL, and configure `api.ssl` for that hostname. `api.host` controls the local bind while `api.fqdn` declares the canonical public request hostname, so clients must still include `api.port` when it is not the scheme default.
 
 `token` and `jwt_signing_key` are independent credentials and must each contain
 at least 32 random bytes. Generate them with a cryptographically secure secret
@@ -180,6 +180,17 @@ pair is unambiguous and the live database cryptographically or actively proves
 that it is correct; a missing plaintext that cannot be proved still requires one
 explicit password reset. Enable the database gateway's native TLS whenever the
 listener crosses an untrusted network.
+
+PostgreSQL, MySQL, MariaDB, and ClickHouse gateways support both traditional
+clients that name the database during their initial handshake and JDBC/Hikari
+clients that connect before choosing a catalog. Explicit database names always
+use exact username-plus-database routing. When the initial database is omitted
+(or a driver supplies its conventional username/default placeholder), DBE may
+infer it only when that protocol has exactly one running route for the supplied
+username, then rewrites the backend startup request with the resolved database.
+Ambiguous usernames fail closed and require the client URL to include the
+database. This fallback never grants access to another tenant or bypasses the
+database engine's own credentials and grants.
 
 Keep CPU, memory, and disk reservations inside the node's safe capacity:
 
@@ -542,7 +553,7 @@ Authorization: Bearer <token>
 The config token has the `*` scope, so it can do everything. Things to know:
 
 - Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is a temporary download URL returned by the download endpoint; it carries its own short-lived JWT.
-- The request `Host` must match `remote`, a concrete `api.host`, or an entry in `api.trusted_hosts`. Add the daemon/reverse-proxy hostname there when it differs from the panel hostname. If an `Origin` header is present, it is checked independently against the exact browser-origin allow-list made from `remote` plus `api.trusted_origins`; scheme, hostname, and effective port must all match (for example, implicit HTTPS port 443 equals explicit `:443`). A mismatch in either value returns `401`. Existing configs remain valid because `trusted_origins` defaults to an empty list.
+- The request `Host` must match `api.fqdn` or a concrete `api.host`; the panel's `remote` hostname is deliberately not treated as DBEV's own hostname. A wildcard bind (`0.0.0.0` or `::`) requires `api.fqdn`, which prevents a daemon from starting in a state that rejects its real public hostname. If an `Origin` header is present, it is checked independently against the exact browser-origin allow-list made from `remote` plus `api.trusted_origins`; scheme, hostname, and effective port must all match (for example, implicit HTTPS port 443 equals explicit `:443`). This strict origin list represents which browser hosts can use DBEV. Existing private/loopback configs remain valid because `fqdn` defaults to empty and `trusted_origins` defaults to an empty list.
 - Rate limit: 600 requests per minute per authenticated credential and
   transport-peer IP by default. IPv6 peers share a `/64`. Exceed it and you get
   `429`.

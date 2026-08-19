@@ -38,6 +38,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         remote = %config.remote,
         api_bind = %config.api.bind_addr(),
         api_host = %config.api.host,
+        api_fqdn = config.api.fqdn().unwrap_or("<unset>"),
         api_port = config.api.port,
         api_ssl = config.api.ssl.enabled,
         "startup phase 1/5: configuration loaded"

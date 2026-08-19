@@ -16,7 +16,23 @@ const GATEWAY_CONNECTION_ID: u32 = 1;
 const NATIVE_PASSWORD_PLUGIN: &str = "mysql_native_password";
 const CACHING_SHA2_PASSWORD_PLUGIN: &str = "caching_sha2_password";
 const GATEWAY_AUTH_PLUGIN: &str = NATIVE_PASSWORD_PLUGIN;
+const AUTH_SEED_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const OK_STATUS_AUTOCOMMIT: [u8; 2] = [0x02, 0x00];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayFlavor {
+    Mysql,
+    Mariadb,
+}
+
+impl GatewayFlavor {
+    fn server_version(self) -> &'static str {
+        match self {
+            Self::Mysql => "8.4.0-databases-everywhere",
+            Self::Mariadb => "12.3.2-MariaDB-databases-everywhere",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MariadbRoute {
@@ -39,8 +55,6 @@ pub enum MariadbProxyError {
     PacketTooLarge,
     #[error("mysql packet io failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("mysql client did not provide a database for routing")]
-    MissingDatabase,
     #[error("mysql client did not provide a password")]
     MissingPassword,
     #[error("mysql client did not use {NATIVE_PASSWORD_PLUGIN}")]
@@ -76,11 +90,12 @@ pub enum CachingSha2Continuation {
 pub async fn send_gateway_handshake<S>(
     stream: &mut S,
     gateway_seed: &[u8],
+    flavor: GatewayFlavor,
 ) -> Result<(), MariadbProxyError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    write_packet(stream, 0, &gateway_handshake_payload(gateway_seed)?).await
+    write_packet(stream, 0, &gateway_handshake_payload(gateway_seed, flavor)?).await
 }
 
 pub async fn read_packet<S>(stream: &mut S) -> Result<MysqlPacket, MariadbProxyError>
@@ -149,10 +164,6 @@ pub fn parse_client_handshake_response(payload: &[u8]) -> Result<MariadbRoute, M
     } else {
         String::new()
     };
-    if database.is_empty() {
-        return Err(MariadbProxyError::MissingDatabase);
-    }
-
     if capabilities & CLIENT_PLUGIN_AUTH != 0 && offset < payload.len() {
         let plugin = read_null_string(payload, &mut offset)?;
         if plugin != GATEWAY_AUTH_PLUGIN {
@@ -449,24 +460,36 @@ pub fn native_password_token_from_client_token(
 pub fn new_gateway_auth_seed() -> [u8; 20] {
     let left = uuid::Uuid::new_v4();
     let right = uuid::Uuid::new_v4();
+    let mut random = [0_u8; 20];
+    random[..16].copy_from_slice(left.as_bytes());
+    random[16..].copy_from_slice(&right.as_bytes()[..4]);
     let mut seed = [0_u8; 20];
-    seed[..16].copy_from_slice(left.as_bytes());
-    seed[16..].copy_from_slice(&right.as_bytes()[..4]);
+    for (output, input) in seed.iter_mut().zip(random) {
+        *output = AUTH_SEED_ALPHABET[usize::from(input) % AUTH_SEED_ALPHABET.len()];
+    }
     seed
 }
 
-fn gateway_handshake_payload(gateway_seed: &[u8]) -> Result<Vec<u8>, MariadbProxyError> {
+fn gateway_handshake_payload(
+    gateway_seed: &[u8],
+    flavor: GatewayFlavor,
+) -> Result<Vec<u8>, MariadbProxyError> {
     if gateway_seed.len() < 20 {
         return Err(MariadbProxyError::MalformedPacket);
     }
     let seed_1 = &gateway_seed[..8];
     let seed_2 = &gateway_seed[8..20];
-    let capabilities =
-        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
+    let capabilities = CLIENT_LONG_PASSWORD
+        | CLIENT_LONG_FLAG
+        | CLIENT_PROTOCOL_41
+        | CLIENT_SECURE_CONNECTION
+        | CLIENT_PLUGIN_AUTH
+        | CLIENT_CONNECT_WITH_DB;
 
     let mut payload = Vec::new();
     payload.push(10);
-    payload.extend_from_slice(b"8.0.0-databases-everywhere\0");
+    payload.extend_from_slice(flavor.server_version().as_bytes());
+    payload.push(0);
     payload.extend_from_slice(&GATEWAY_CONNECTION_ID.to_le_bytes());
     payload.extend_from_slice(seed_1);
     payload.push(0);
@@ -647,6 +670,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_jdbc_handshake_without_an_initial_database() {
+        let gateway_seed = new_gateway_auth_seed();
+        let mut payload = Vec::new();
+        let capabilities = CLIENT_PROTOCOL_41 | CLIENT_PLUGIN_AUTH | CLIENT_SECURE_CONNECTION;
+        payload.extend_from_slice(&capabilities.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.push(45);
+        payload.extend_from_slice(&[0_u8; 23]);
+        payload.extend_from_slice(b"app_mysql_1\0");
+        let auth_response = native_password_token("mysql-password-1", &gateway_seed);
+        payload.push(auth_response.len() as u8);
+        payload.extend_from_slice(&auth_response);
+        payload.extend_from_slice(b"mysql_native_password\0");
+
+        let route = parse_client_handshake_response(&payload).unwrap();
+
+        assert_eq!(route.username, "app_mysql_1");
+        assert!(route.database.is_empty());
+        assert_eq!(route.auth_response, auth_response);
+    }
+
+    #[test]
     fn derives_backend_token_from_client_native_token() {
         let gateway_seed = new_gateway_auth_seed();
         let password = "mysql-password-1";
@@ -685,24 +730,60 @@ mod tests {
     }
 
     #[test]
-    fn gateway_handshake_exposes_auth_plugin_name() {
+    fn gateway_handshake_exposes_flavor_version_and_auth_plugin() {
         let gateway_seed = new_gateway_auth_seed();
-        let payload = gateway_handshake_payload(&gateway_seed).unwrap();
-        let mut offset = 1;
-        let _server_version = read_null_string(&payload, &mut offset).unwrap();
-        offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
-        let auth_len = payload[offset] as usize;
-        offset += 1 + 10;
-        let auth_part_2_len = auth_len.saturating_sub(8).max(13);
-        offset += auth_part_2_len;
-        let plugin = read_null_string(&payload, &mut offset).unwrap();
+        for flavor in [GatewayFlavor::Mysql, GatewayFlavor::Mariadb] {
+            let payload = gateway_handshake_payload(&gateway_seed, flavor).unwrap();
+            let mut offset = 1;
+            let server_version = read_null_string(&payload, &mut offset).unwrap();
+            offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
+            let auth_len = payload[offset] as usize;
+            offset += 1 + 10;
+            let auth_part_2_len = auth_len.saturating_sub(8).max(13);
+            offset += auth_part_2_len;
+            let plugin = read_null_string(&payload, &mut offset).unwrap();
 
-        assert_eq!(plugin, GATEWAY_AUTH_PLUGIN);
+            assert_eq!(server_version, flavor.server_version());
+            assert_eq!(plugin, GATEWAY_AUTH_PLUGIN);
+        }
     }
 
     #[test]
     fn gateway_auth_seed_is_not_static() {
-        assert_ne!(new_gateway_auth_seed(), new_gateway_auth_seed());
+        let first = new_gateway_auth_seed();
+        let second = new_gateway_auth_seed();
+
+        assert_ne!(first, second);
+        assert!(first.iter().all(u8::is_ascii_alphanumeric));
+        assert!(second.iter().all(u8::is_ascii_alphanumeric));
+    }
+
+    #[test]
+    fn connector_j_ascii_seed_parsing_preserves_the_exact_challenge() {
+        let gateway_seed = new_gateway_auth_seed();
+        let payload = gateway_handshake_payload(&gateway_seed, GatewayFlavor::Mysql).unwrap();
+        let mut offset = 1;
+        assert_eq!(
+            read_null_string(&payload, &mut offset).unwrap(),
+            "8.4.0-databases-everywhere"
+        );
+        offset += 4;
+        let seed_1_start = offset;
+        offset += 8 + 1 + 2 + 1 + 2 + 2;
+        let auth_data_len = payload[offset];
+        assert_eq!(auth_data_len, 21);
+
+        let seed_1 = &payload[seed_1_start..seed_1_start + 8];
+        let seed_2_start = offset + 1 + 10;
+        let connector_fixed_seed_2 = &payload[seed_2_start..seed_2_start + 13];
+        let connector_seed_2 = connector_fixed_seed_2
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap();
+        let mut connector_seed = seed_1.to_vec();
+        connector_seed.extend_from_slice(connector_seed_2);
+
+        assert_eq!(connector_seed, gateway_seed);
     }
 
     #[test]

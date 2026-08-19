@@ -284,11 +284,17 @@ async fn desired_stopped_instances_are_never_published_to_gateways() {
     let mut metadata = recovery_test_metadata();
     metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
     store.upsert(metadata.clone()).await;
-    assert!(store.resolve_postgres("app", "app_db").await.is_none());
+    assert!(matches!(
+        store.resolve_postgres("app", Some("app_db")).await,
+        crate::instances::state::DatabaseRouteResolution::NotFound
+    ));
 
     metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Running;
     store.upsert(metadata).await;
-    assert!(store.resolve_postgres("app", "app_db").await.is_some());
+    assert!(matches!(
+        store.resolve_postgres("app", Some("app_db")).await,
+        crate::instances::state::DatabaseRouteResolution::Found { .. }
+    ));
 }
 
 #[test]

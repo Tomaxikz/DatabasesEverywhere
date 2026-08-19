@@ -863,18 +863,18 @@ mod tests {
 
         store.upsert(auth_failed_metadata(&failed)).await;
 
-        assert!(
+        assert!(matches!(
             store
-                .resolve_postgres("legacy_user", "legacy_db")
-                .await
-                .is_none()
-        );
-        assert!(
+                .resolve_postgres("legacy_user", Some("legacy_db"))
+                .await,
+            crate::instances::state::DatabaseRouteResolution::NotFound
+        ));
+        assert!(matches!(
             store
-                .resolve_postgres("healthy_user", "healthy_db")
-                .await
-                .is_some()
-        );
+                .resolve_postgres("healthy_user", Some("healthy_db"))
+                .await,
+            crate::instances::state::DatabaseRouteResolution::Found { .. }
+        ));
     }
 
     #[test]

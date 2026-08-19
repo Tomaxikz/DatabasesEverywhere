@@ -143,6 +143,7 @@ paths:
         assert_eq!(config.images.postgres, "postgres:18.4");
         assert_eq!(config.images.mongodb, "mongo:7.0.37");
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
+        assert!(config.api.fqdn.is_empty());
         assert!(config.api.trusted_origins.is_empty());
         assert_eq!(
             config.cors_allowed_origins(),
@@ -345,14 +346,16 @@ paths:
     }
 
     #[test]
-    fn rejects_legacy_api_allowed_hosts_field() {
+    fn rejects_removed_api_host_alias_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
+        for field in ["allowed_hosts", "trusted_hosts"] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
 api:
-  allowed_hosts:
+  {field}:
     - panel.example.com
 uuid: node-uuid
 token_id: token-id
@@ -362,13 +365,15 @@ paths:
   sockets: /run/databases-everywhere
   logs: /var/log/databases-everywhere
   artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
+"#
+                ),
+            )
+            .unwrap();
 
-        let error = load_config(&path).unwrap_err();
+            let error = load_config(&path).unwrap_err();
 
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
+            assert!(matches!(error, ConfigLoadError::Parse { .. }));
+        }
     }
 
     #[test]
@@ -407,6 +412,7 @@ paths:
 api:
   host: 127.0.0.1
   port: 8090
+  fqdn: db.example.com
   trusted_origins:
     - http://localhost:3000
 remote: https://panel.example.com
@@ -425,6 +431,7 @@ paths:
 
         let config = load_config(&path).unwrap();
 
+        assert_eq!(config.api.fqdn(), Some("db.example.com"));
         assert_eq!(
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443", "http://localhost:3000"]

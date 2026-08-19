@@ -159,7 +159,7 @@ impl Default for ListenerConfig {
 pub struct ApiConfig {
     pub host: String,
     pub port: u16,
-    pub trusted_hosts: Vec<String>,
+    pub fqdn: String,
     pub trusted_origins: Vec<String>,
     pub ssl: ApiSslConfig,
 }
@@ -169,7 +169,7 @@ impl Default for ApiConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: ports::API,
-            trusted_hosts: Vec::new(),
+            fqdn: String::new(),
             trusted_origins: Vec::new(),
             ssl: ApiSslConfig::default(),
         }
@@ -192,9 +192,8 @@ impl Config {
 
     pub fn request_allowed_hosts(&self) -> Vec<String> {
         let mut hosts = Vec::new();
-        push_url_host(&mut hosts, &self.remote);
-        for host in &self.api.trusted_hosts {
-            push_unique(&mut hosts, host.trim());
+        if let Some(fqdn) = self.api.fqdn() {
+            push_unique(&mut hosts, fqdn);
         }
         if !matches!(self.api.host.trim(), "0.0.0.0" | "::" | "[::]") {
             push_unique(&mut hosts, self.api.host.trim());
@@ -208,6 +207,18 @@ impl Config {
 }
 
 impl ApiConfig {
+    pub fn fqdn(&self) -> Option<&str> {
+        let fqdn = self.fqdn.trim();
+        (!fqdn.is_empty()).then_some(fqdn)
+    }
+
+    pub fn public_url(&self) -> Option<String> {
+        self.fqdn().map(|fqdn| {
+            let scheme = if self.ssl.enabled { "https" } else { "http" };
+            format!("{scheme}://{fqdn}:{}", self.port)
+        })
+    }
+
     pub fn bind_addr(&self) -> String {
         let host = self.host.trim();
         host.parse::<IpAddr>().map_or_else(
@@ -228,12 +239,6 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
         .any(|existing| existing.eq_ignore_ascii_case(&normalized))
     {
         values.push(normalized);
-    }
-}
-
-fn push_url_host(hosts: &mut Vec<String>, value: &str) {
-    if let Some(host) = url_host(value) {
-        push_unique(hosts, &host);
     }
 }
 

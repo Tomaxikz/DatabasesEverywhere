@@ -13,6 +13,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
     tracing::info!(
         api_bind = %config.api.bind_addr(),
         api_host = %config.api.host,
+        api_fqdn = config.api.fqdn().unwrap_or("<unset>"),
         api_port = config.api.port,
         remote = %config.remote,
         cors_allowed_origins = ?config.cors_allowed_origins(),
@@ -87,8 +88,9 @@ pub(super) fn log_api_host_resolution(config: &Config) {
     if config.api.host == "0.0.0.0" || config.api.host == "::" {
         tracing::info!(
             host = %config.api.host,
+            fqdn = config.api.fqdn().unwrap_or("<unset>"),
             port = config.api.port,
-            "api binds all local interfaces; clients should use the configured DNS name or server IP"
+            "api binds all local interfaces; clients must use the configured canonical fqdn"
         );
         return;
     }
