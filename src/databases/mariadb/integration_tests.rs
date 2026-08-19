@@ -173,8 +173,20 @@ impl Drop for TestContainer {
 fn wait_until_ready(name: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        if exec_mariadb(name, ROOT_PASSWORD, "root", "mysql", "SELECT 1")
-            .status
+        if Command::new("docker")
+            .args([
+                "exec",
+                "-e",
+                &format!("MARIADB_ROOT_PASSWORD={ROOT_PASSWORD}"),
+                name,
+                "sh",
+                "-c",
+                crate::runtime::docker::startup_readiness_script(Protocol::Mariadb),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run MariaDB final-server readiness probe")
             .success()
         {
             return;

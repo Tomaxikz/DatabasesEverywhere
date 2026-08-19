@@ -18,7 +18,7 @@ use crate::{
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
         ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
-        container_config::startup_readiness_script,
+        startup_readiness_script,
     },
     shared::protocol::Protocol,
 };

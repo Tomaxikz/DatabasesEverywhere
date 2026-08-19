@@ -15,6 +15,7 @@ mod transfer;
 use transfer::*;
 
 pub use command::CommandOutput;
+pub(crate) use container_config::startup_readiness_script;
 pub(crate) use cpu_burst::CpuBurstPolicyStatus;
 pub use engine::{DaemonEngineConnection, rootless_podman_uid_from_socket_path};
 pub use events::{ManagedContainerAction, ManagedContainerEvent};

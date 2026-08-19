@@ -80,6 +80,8 @@ mod tests {
     fn mariadb_readiness_uses_the_stable_internal_admin() {
         let script = startup_readiness_script(Protocol::Mariadb);
 
+        assert!(script.contains("/proc/1/comm"));
+        assert!(script.contains("mariadbd"));
         assert!(script.contains("DBE_MARIADB_ROOT_PASSWORD"));
         assert!(!script.contains("DBE_MARIADB_PASSWORD:-"));
         assert!(script.contains("SELECT 1"));
