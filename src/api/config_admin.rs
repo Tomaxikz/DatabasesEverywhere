@@ -249,48 +249,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_token_patch() {
-        let patch = serde_json::json!({ "token": "new" });
-
-        assert!(reject_forbidden_paths(&patch).is_err());
-    }
-
-    #[test]
-    fn rejects_jwt_signing_key_patch() {
-        let patch = serde_json::json!({ "jwt_signing_key": "new" });
-
-        assert!(reject_forbidden_paths(&patch).is_err());
-    }
-
-    #[test]
-    fn rejects_fuse_helper_executable_patch() {
-        let patch = serde_json::json!({
-            "disk": {
-                "fuse_quota_binary": "/var/lib/dbev/imports/attacker",
-                "fuse_quota_binary_sha256": "a".repeat(64)
-            }
-        });
-
-        assert!(reject_forbidden_paths(&patch).is_err());
-    }
-
-    #[test]
-    fn rejects_runtime_path_patch() {
-        assert!(
-            reject_forbidden_paths(&serde_json::json!({
-                "paths": { "data": "/tmp/attacker" }
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_kopia_executable_and_repository_config_patches() {
-        for field in ["executable", "config_file"] {
-            let patch = serde_json::json!({
-                "backups": { "storage": { "kopia": { (field): "/tmp/attacker" } } }
-            });
-            assert!(reject_forbidden_paths(&patch).is_err());
+    fn rejects_every_protected_config_patch_path() {
+        let cases = [
+            ("API token", serde_json::json!({ "token": "new" })),
+            (
+                "JWT signing key",
+                serde_json::json!({ "jwt_signing_key": "new" }),
+            ),
+            (
+                "FuseQuota helper",
+                serde_json::json!({
+                    "disk": {
+                        "fuse_quota_binary": "/var/lib/dbev/imports/attacker",
+                        "fuse_quota_binary_sha256": "a".repeat(64)
+                    }
+                }),
+            ),
+            (
+                "runtime data path",
+                serde_json::json!({ "paths": { "data": "/tmp/attacker" } }),
+            ),
+            (
+                "Kopia executable",
+                serde_json::json!({
+                    "backups": { "storage": { "kopia": { "executable": "/tmp/attacker" } } }
+                }),
+            ),
+            (
+                "Kopia repository config",
+                serde_json::json!({
+                    "backups": { "storage": { "kopia": { "config_file": "/tmp/attacker" } } }
+                }),
+            ),
+        ];
+        for (name, patch) in cases {
+            assert!(
+                reject_forbidden_paths(&patch).is_err(),
+                "accepted protected patch path: {name}"
+            );
         }
     }
 

@@ -536,7 +536,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn root_owned_paths_default_to_non_root_container_owner() {
+    fn default_owner_changes_only_root_owned_paths() {
         assert_eq!(
             default_owner_for(0, 0),
             Some(HostOwner {
@@ -544,11 +544,6 @@ mod tests {
                 gid: DEFAULT_CONTAINER_GID
             })
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_root_owned_paths_keep_existing_owner_during_initial_setup() {
         assert_eq!(default_owner_for(1001, 1002), None);
     }
 

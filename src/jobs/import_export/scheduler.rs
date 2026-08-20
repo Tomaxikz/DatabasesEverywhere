@@ -1086,15 +1086,17 @@ mod tests {
     }
 
     #[test]
-    fn recommendation_is_bounded_by_the_scarcest_resource() {
-        let capacity = dynamic_capacity(256, 16_384, 32_768, 64);
-        assert_eq!(capacity.recommended_active_jobs(cost(512, 4096, 2)), 8);
-    }
-
-    #[test]
-    fn recommendation_reports_zero_when_live_capacity_cannot_run_the_model() {
-        let capacity = dynamic_capacity(256, 1, 65_536, 128);
-        assert_eq!(capacity.recommended_active_jobs(cost(96, 1, 1)), 0);
+    fn recommendation_respects_scarce_and_unavailable_resources() {
+        for (capacity, job, expected) in [
+            (
+                dynamic_capacity(256, 16_384, 32_768, 64),
+                cost(512, 4096, 2),
+                8,
+            ),
+            (dynamic_capacity(256, 1, 65_536, 128), cost(96, 1, 1), 0),
+        ] {
+            assert_eq!(capacity.recommended_active_jobs(job), expected);
+        }
     }
 
     #[tokio::test]

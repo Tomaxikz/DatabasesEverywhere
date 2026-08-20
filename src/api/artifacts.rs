@@ -121,7 +121,7 @@ impl Default for ArtifactDownloadTickets {
 }
 
 impl ArtifactDownloadTickets {
-    pub async fn consume(&self, jti: &str, exp: i64) -> bool {
+    async fn consume(&self, jti: &str, exp: i64) -> bool {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let mut consumed = self.consumed.lock().await;
         consumed.retain(|_, expires_at| *expires_at > now);
@@ -302,16 +302,15 @@ pub async fn delete_artifact(
     let path = downloadable_artifact_path_for_instance(&state, &artifact_id, &instance_id)
         .await?
         .path;
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => {
-            remove_checksum_sidecar(&path).await;
+    match remove_artifact_with_sidecar(&path).await {
+        Ok(true) => {
             tracing::info!(event = "audit artifact_deleted", instance_id, artifact_id);
             Ok(ApiResponse::ok(DeleteArtifactResponse {
                 id: artifact_id,
                 deleted: true,
             }))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ApiError::NotFound),
+        Ok(false) => Err(ApiError::NotFound),
         Err(error) => Err(ApiError::Runtime(format!(
             "failed to delete artifact: {error}"
         ))),
@@ -339,12 +338,11 @@ pub async fn apply_retention(
             continue;
         }
         let path = verified_artifact_path_for_instance(&state, &artifact.id, &instance_id).await?;
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {
-                remove_checksum_sidecar(&path).await;
+        match remove_artifact_with_sidecar(&path).await {
+            Ok(true) => {
                 deleted.push(artifact.id);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(false) => {}
             Err(error) => {
                 return Err(ApiError::Runtime(format!(
                     "failed to delete artifact {}: {error}",
@@ -455,7 +453,6 @@ async fn create_download_url(
     kind: DownloadKind,
 ) -> ApiResult<DownloadUrlResponse> {
     validate_artifact_name(name)?;
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     ensure_instance_exists(state, instance_id).await?;
     let ttl_seconds = request
         .expires_in_seconds
@@ -500,10 +497,9 @@ async fn create_download_url(
         &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
     )
     .map_err(|error| ApiError::Runtime(format!("failed to issue download token: {error}")))?;
-    let path_url = kind.download_path(instance_id, name, &token);
     // Keep the credential-bearing URL origin-relative. Building an absolute URL
     // from Host or X-Forwarded-* would let an untrusted proxy/client poison it.
-    let url = path_url.clone();
+    let url = kind.download_path(instance_id, name, &token);
 
     tracing::info!(
         event = "audit artifact_download_url_created",
@@ -635,34 +631,44 @@ async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(
         .ok_or(ApiError::NotFound)
 }
 
-pub(crate) async fn read_instance_artifacts(
+async fn remove_artifact_with_sidecar(path: &FsPath) -> Result<bool, std::io::Error> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            remove_checksum_sidecar(path).await;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_real_directory(root: &FsPath) -> Result<Option<tokio::fs::ReadDir>, ApiError> {
+    match tokio::fs::symlink_metadata(root).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+            ApiError::Runtime("artifact root must be a real directory".to_string()),
+        ),
+        Ok(_) => match tokio::fs::read_dir(root).await {
+            Ok(entries) => Ok(Some(entries)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ApiError::Runtime(format!(
+                "failed to read artifact root: {error}"
+            ))),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApiError::Runtime(format!(
+            "failed to inspect artifact root: {error}"
+        ))),
+    }
+}
+
+async fn read_instance_artifacts(
     state: &AppState,
     instance_id: &str,
 ) -> Result<Vec<ArtifactInfo>, ApiError> {
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let instance_root = instance_export_root(state, instance_id);
-    match tokio::fs::symlink_metadata(&instance_root).await {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(ApiError::Runtime(
-                "instance artifact root must be a real directory".to_string(),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ApiError::Runtime(format!(
-                "failed to inspect instance artifact root: {error}"
-            )));
-        }
-    }
-    let mut entries = match tokio::fs::read_dir(&instance_root).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ApiError::Runtime(format!(
-                "failed to read artifacts: {error}"
-            )));
-        }
+    let Some(mut entries) = read_real_directory(&instance_root).await? else {
+        return Ok(Vec::new());
     };
 
     let mut artifacts = Vec::new();
@@ -698,7 +704,7 @@ pub(crate) async fn read_instance_artifacts(
     Ok(artifacts)
 }
 
-pub(crate) fn export_root(state: &AppState) -> PathBuf {
+fn export_root(state: &AppState) -> PathBuf {
     PathBuf::from(state.config.paths.exports_root())
 }
 
@@ -793,7 +799,7 @@ async fn verified_artifact_path_in_root(root: &FsPath, name: &str) -> Result<Pat
     Ok(canonical)
 }
 
-pub(crate) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
+async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
     let metadata = tokio::fs::metadata(&path)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to stat artifact: {error}")))?;
@@ -829,7 +835,7 @@ fn checksum_sidecar_path(path: &FsPath) -> Option<PathBuf> {
     Some(path.with_file_name(format!("{name}.sha256")))
 }
 
-pub(crate) fn is_checksum_sidecar(path: &FsPath) -> bool {
+fn is_checksum_sidecar(path: &FsPath) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.ends_with(".sha256"))
@@ -897,7 +903,7 @@ async fn write_checksum_sidecar(path: &FsPath, metadata: &std::fs::Metadata, has
     }
 }
 
-pub(crate) async fn remove_checksum_sidecar(path: &FsPath) {
+async fn remove_checksum_sidecar(path: &FsPath) {
     if let Some(sidecar) = checksum_sidecar_path(path) {
         match tokio::fs::remove_file(sidecar).await {
             Ok(()) => {}
@@ -919,7 +925,7 @@ fn system_time_unix_nanos(time: SystemTime) -> u128 {
         .unwrap_or_default()
 }
 
-pub(crate) fn system_time_rfc3339(time: SystemTime) -> String {
+fn system_time_rfc3339(time: SystemTime) -> String {
     OffsetDateTime::from(time)
         .format(&Rfc3339)
         .expect("Rfc3339 formatting works")
@@ -963,15 +969,16 @@ mod tests {
     }
 
     #[test]
-    fn download_streams_are_bounded_per_transport_peer() {
+    fn download_admission_normalizes_peers_and_releases_capacity() {
         let tickets = ArtifactDownloadTickets::default();
         let peer = Some("192.0.2.10:5000".parse().unwrap());
+        let mapped = Some("[::ffff:192.0.2.10]:5000".parse().unwrap());
         let permits = (0..MAX_ACTIVE_DOWNLOADS_PER_PEER)
             .map(|_| tickets.admit_download(peer).unwrap())
             .collect::<Vec<_>>();
 
         assert!(matches!(
-            tickets.admit_download(peer),
+            tickets.admit_download(mapped),
             Err(ApiError::RateLimited)
         ));
         assert!(
@@ -979,23 +986,6 @@ mod tests {
                 .admit_download(Some("192.0.2.11:5000".parse().unwrap()))
                 .is_ok()
         );
-        drop(permits);
-        assert!(tickets.admit_download(peer).is_ok());
-    }
-
-    #[test]
-    fn download_admission_maps_ipv4_mapped_ipv6_to_the_ipv4_peer() {
-        let tickets = ArtifactDownloadTickets::default();
-        let ipv4 = Some("192.0.2.10:5000".parse().unwrap());
-        let mapped = Some("[::ffff:192.0.2.10]:5000".parse().unwrap());
-        let permits = (0..MAX_ACTIVE_DOWNLOADS_PER_PEER)
-            .map(|_| tickets.admit_download(ipv4).unwrap())
-            .collect::<Vec<_>>();
-
-        assert!(matches!(
-            tickets.admit_download(mapped),
-            Err(ApiError::RateLimited)
-        ));
         drop(permits);
         assert!(tickets.admit_download(mapped).is_ok());
     }

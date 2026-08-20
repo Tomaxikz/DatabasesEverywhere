@@ -1,4 +1,4 @@
-pub mod allowed_hosts;
+pub(crate) mod allowed_hosts;
 pub mod api_response;
 pub mod artifacts;
 pub mod backups;

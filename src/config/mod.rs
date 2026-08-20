@@ -902,16 +902,13 @@ mod allocation_config_tests {
     use super::*;
 
     #[test]
-    fn overallocation_prevention_defaults_to_enabled() {
+    fn overallocation_prevention_defaults_to_enabled_for_new_and_legacy_configs() {
         let allocation = AllocationConfig::default();
 
         assert!(allocation.prevent_cpu_overallocation);
         assert!(allocation.prevent_memory_overallocation);
         assert!(allocation.prevent_disk_overallocation);
-    }
 
-    #[test]
-    fn legacy_allocation_config_enables_new_guards() {
         let allocation: AllocationConfig = serde_yaml::from_str(
             r#"
 max_memory_mib: null

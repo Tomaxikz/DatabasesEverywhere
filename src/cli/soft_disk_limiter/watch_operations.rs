@@ -476,13 +476,10 @@ mod tests {
     }
 
     #[test]
-    fn applied_remove_then_same_root_readd_unregisters_before_registering() {
-        assert_applied_remove_readd_order(desired("one"));
-    }
-
-    #[test]
-    fn applied_remove_then_changed_root_readd_unregisters_before_registering() {
-        assert_applied_remove_readd_order(desired("replacement"));
+    fn applied_remove_then_readd_unregisters_before_registering() {
+        for replacement in [desired("one"), desired("replacement")] {
+            assert_applied_remove_readd_order(replacement);
+        }
     }
 
     #[test]

@@ -462,41 +462,39 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn host_policy_checks_host_even_when_origin_is_allowed() {
-        let response = build_router(test_state().await)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/heartbeat")
-                    .header(header::HOST, "evil.example.com")
-                    .header(header::ORIGIN, "https://panel.example.com")
-                    .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    async fn host_and_browser_origin_policies_reject_each_invalid_boundary() {
+        for (name, host, origin) in [
+            (
+                "untrusted host with allowed origin",
+                "evil.example.com",
+                "https://panel.example.com",
+            ),
+            (
+                "trusted host with wrong origin scheme",
+                "panel.example.com",
+                "http://panel.example.com",
+            ),
+        ] {
+            let response = build_router(test_state().await)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/heartbeat")
+                        .header(header::HOST, host)
+                        .header(header::ORIGIN, origin)
+                        .header(header::AUTHORIZATION, "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(json_body(response).await["code"], "host_not_allowed");
-    }
-
-    #[tokio::test]
-    async fn browser_origin_policy_rejects_same_host_on_the_wrong_scheme() {
-        let response = build_router(test_state().await)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/heartbeat")
-                    .header(header::HOST, "panel.example.com")
-                    .header(header::ORIGIN, "http://panel.example.com")
-                    .header(header::AUTHORIZATION, "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(json_body(response).await["code"], "host_not_allowed");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+            assert_eq!(
+                json_body(response).await["code"],
+                "host_not_allowed",
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

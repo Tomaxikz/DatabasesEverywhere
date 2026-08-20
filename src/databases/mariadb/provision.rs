@@ -49,7 +49,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tenant_user_sql_uses_native_password_hash_without_plaintext() {
+    fn tenant_user_sql_accepts_only_native_password_hashes() {
         let sql = tenant_user_sql(
             "app_db",
             "app_user",
@@ -60,10 +60,6 @@ mod tests {
         assert!(sql.contains("CREATE DATABASE IF NOT EXISTS `app_db`"));
         assert!(sql.contains("ALTER USER `app_user`@'%'"));
         assert!(sql.contains("*0123456789ABCDEF0123456789ABCDEF01234567"));
-    }
-
-    #[test]
-    fn tenant_user_sql_rejects_invalid_hashes() {
         assert!(tenant_user_sql("db", "user", "not-a-hash").is_err());
     }
 }

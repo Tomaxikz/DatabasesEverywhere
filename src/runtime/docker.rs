@@ -1,7 +1,6 @@
 mod command;
 mod container_config;
 mod cpu_burst;
-mod disk_probe;
 mod engine;
 mod events;
 mod inspection;
@@ -12,7 +11,7 @@ mod spec;
 mod stream_exec;
 mod transfer;
 
-use transfer::*;
+use transfer::{CappedExecOutput, container_mounts, ensure_bind_mount_sources};
 
 pub use command::CommandOutput;
 pub(crate) use container_config::startup_readiness_script;
@@ -26,33 +25,31 @@ pub use stream_exec::ExecStreamResult;
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{Error as IoError, ErrorKind, Read, Write},
-    path::{Component, Path},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bollard::{
-    Docker, body_try_stream,
+    Docker,
     errors::Error as BollardError,
-    models::{ContainerCreateBody, ContainerUpdateBody, HostConfig, SystemInfoCgroupVersionEnum},
+    models::{
+        ContainerCreateBody, ContainerSummary, ContainerUpdateBody, HostConfig,
+        SystemInfoCgroupVersionEnum,
+    },
     query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-        DownloadFromContainerOptionsBuilder, KillContainerOptions, ListContainersOptionsBuilder,
-        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
-        UploadToContainerOptionsBuilder,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptions,
+        ListContainersOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        StopContainerOptions,
     },
 };
-use bytes::Bytes;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::TryStreamExt;
 use secrecy::ExposeSecret;
-use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
 
 use crate::{
     config::{DaemonConfig, DaemonEngine},
-    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROJECT_LABEL, PROTOCOL_LABEL},
-    runtime::docker::container_config::{
-        bind_mount, cpu_to_nano, disabled_healthcheck, mib_to_bytes,
+    constants::docker::{
+        DEFAULT_NETWORK, INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROJECT_LABEL, PROTOCOL_LABEL,
     },
+    runtime::docker::container_config::{cpu_to_nano, disabled_healthcheck, mib_to_bytes},
     runtime::socket_bridge::supervisor_arguments,
     shared::{
         backend::SOCKET_BRIDGE_CONTAINER_PATH,
@@ -113,7 +110,6 @@ pub struct DockerRuntime {
     docker: Docker,
     engine: DaemonEngine,
     socket_path: String,
-    legacy_network: String,
     enforce_disk_limits: bool,
     security: DockerSecurityPolicy,
     rootless_podman: bool,
@@ -136,25 +132,13 @@ pub struct DockerImagePullProgress {
 impl DockerRuntime {
     pub fn new(config: &DaemonConfig, enforce_disk_limits: bool) -> Result<Self, DockerError> {
         let connection = DaemonEngineConnection::from_config(config);
-        let rootless_podman = connection.engine == DaemonEngine::Podman
-            && connection.socket_path_for_logs().starts_with("/run/user/");
-        let rootless_podman_owner =
-            rootless_podman_uid_from_socket_path(connection.socket_path_for_logs())
-                .map(|uid| HostOwner { uid, gid: uid });
-        Ok(Self {
-            docker: connection.connect()?,
-            engine: connection.engine,
-            socket_path: connection.socket_path_for_logs().to_string(),
-            legacy_network: crate::constants::docker::DEFAULT_NETWORK.to_string(),
+        Ok(Self::from_client(
+            connection.connect()?,
+            connection.engine,
+            connection.socket_path_for_logs(),
             enforce_disk_limits,
-            security: DockerSecurityPolicy::from_config_for_engine(config, connection.engine),
-            rootless_podman,
-            rootless_podman_owner,
-            engine_version: None,
-            engine_api_version: None,
-            cgroup_version: None,
-            node_id: None,
-        })
+            DockerSecurityPolicy::from_config_for_engine(config, connection.engine),
+        ))
     }
 
     #[cfg(test)]
@@ -163,7 +147,7 @@ impl DockerRuntime {
         let docker =
             Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
                 .expect("the fixed offline Docker test endpoint must be a valid HTTP URL");
-        Self::with_client(
+        Self::from_client(
             docker,
             connection.engine,
             connection.socket_path_for_logs(),
@@ -172,8 +156,7 @@ impl DockerRuntime {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_client(
+    fn from_client(
         docker: Docker,
         engine: DaemonEngine,
         socket_path: impl Into<String>,
@@ -189,7 +172,6 @@ impl DockerRuntime {
             docker,
             engine,
             socket_path,
-            legacy_network: crate::constants::docker::DEFAULT_NETWORK.to_string(),
             enforce_disk_limits,
             security,
             rootless_podman,
@@ -314,13 +296,7 @@ impl DockerRuntime {
         if !self.uses_rootless_podman() {
             return None;
         }
-
-        Some(match protocol {
-            Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
-                "999:999"
-            }
-            Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => "0:0",
-        })
+        Some(rootless_podman_identity(protocol).0)
     }
 
     pub fn container_name(
@@ -412,14 +388,7 @@ impl DockerRuntime {
             return None;
         }
 
-        match protocol {
-            Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
-                Some("keep-id:uid=999,gid=999")
-            }
-            Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
-                Some("host")
-            }
-        }
+        Some(rootless_podman_identity(protocol).1)
     }
 
     pub fn update_limits_body(
@@ -510,11 +479,7 @@ impl DockerRuntime {
     }
 
     pub async fn pull_image(&self, image: &str) -> Result<CommandOutput, DockerError> {
-        self.ensure_image_with_progress(image, None).await?;
-        Ok(CommandOutput {
-            stdout: image.to_string(),
-            stderr: String::new(),
-        })
+        self.pull_image_inner(image, None).await
     }
 
     pub async fn pull_image_with_progress(
@@ -522,8 +487,15 @@ impl DockerRuntime {
         image: &str,
         progress: &(dyn Fn(DockerImagePullProgress) + Send + Sync),
     ) -> Result<CommandOutput, DockerError> {
-        self.ensure_image_with_progress(image, Some(progress))
-            .await?;
+        self.pull_image_inner(image, Some(progress)).await
+    }
+
+    async fn pull_image_inner(
+        &self,
+        image: &str,
+        progress: Option<&(dyn Fn(DockerImagePullProgress) + Send + Sync)>,
+    ) -> Result<CommandOutput, DockerError> {
+        self.ensure_image_with_progress(image, progress).await?;
         Ok(CommandOutput {
             stdout: image.to_string(),
             stderr: String::new(),
@@ -730,21 +702,6 @@ impl DockerRuntime {
         Ok(CommandOutput::empty())
     }
 
-    pub async fn inspect(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-    ) -> Result<CommandOutput, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
-            .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        Ok(CommandOutput {
-            stdout: serde_json::to_string(&response)?,
-            stderr: String::new(),
-        })
-    }
-
     pub async fn update_limits(
         &self,
         protocol: Protocol,
@@ -782,186 +739,9 @@ impl DockerRuntime {
         Ok(CommandOutput::empty())
     }
 
-    pub async fn upload_file(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        host_path: &Path,
-        container_path: &str,
-    ) -> Result<(), DockerError> {
-        let container = self
-            .required_managed_container_id(protocol, instance_id)
-            .await?;
-        let (container_parent, container_file_name) = container_file_parts(container_path)?;
-        let metadata = tokio::fs::symlink_metadata(host_path)
-            .await
-            .map_err(|source| DockerError::FileTransferIo {
-                path: host_path.display().to_string(),
-                source,
-            })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(DockerError::InvalidTransferSource {
-                path: host_path.display().to_string(),
-            });
-        }
-        if metadata.len() > MAX_CONTAINER_TRANSFER_BYTES {
-            return Err(DockerError::FileTransferTooLarge {
-                path: host_path.display().to_string(),
-                size: metadata.len(),
-                max_bytes: MAX_CONTAINER_TRANSFER_BYTES,
-            });
-        }
-
-        let (uid, gid) = self
-            .configured_container_user(protocol, instance_id)
-            .await?
-            .as_deref()
-            .and_then(numeric_container_user)
-            .unwrap_or((0, 0));
-
-        let file = tokio::fs::File::open(host_path).await.map_err(|source| {
-            DockerError::FileTransferIo {
-                path: host_path.display().to_string(),
-                source,
-            }
-        })?;
-        let header = transfer_tar_header(&container_file_name, metadata.len(), uid, gid)?;
-        let trailer_len = tar_padding(metadata.len()) + 1024;
-        let stream = stream::once(async move { Ok::<Bytes, IoError>(header) })
-            .chain(ReaderStream::new(tokio::io::AsyncReadExt::take(
-                file,
-                metadata.len(),
-            )))
-            .chain(stream::once(async move {
-                Ok::<Bytes, IoError>(Bytes::from(vec![0_u8; trailer_len]))
-            }));
-
-        match tokio::time::timeout(
-            FILE_TRANSFER_TIMEOUT,
-            self.docker.upload_to_container(
-                &container,
-                Some(
-                    UploadToContainerOptionsBuilder::default()
-                        .path(&container_parent)
-                        .no_overwrite_dir_non_dir("true")
-                        .copy_uidgid("true")
-                        .build(),
-                ),
-                body_try_stream(stream),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => {
-                return Err(DockerError::FileTransferTimedOut {
-                    direction: "upload",
-                    path: host_path.display().to_string(),
-                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn download_file(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        container_path: &str,
-        host_path: &Path,
-    ) -> Result<(), DockerError> {
-        self.download_file_bounded(
-            protocol,
-            instance_id,
-            container_path,
-            host_path,
-            MAX_CONTAINER_TRANSFER_BYTES,
-        )
-        .await
-    }
-
-    pub async fn download_file_bounded(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-        container_path: &str,
-        host_path: &Path,
-        max_bytes: u64,
-    ) -> Result<(), DockerError> {
-        let max_bytes = max_bytes.min(MAX_CONTAINER_TRANSFER_BYTES);
-        let container = self
-            .required_managed_container_id(protocol, instance_id)
-            .await?;
-        let (_, expected_file_name) = container_file_parts(container_path)?;
-        let async_deadline = tokio::time::Instant::now() + FILE_TRANSFER_TIMEOUT;
-        let blocking_deadline = Instant::now() + FILE_TRANSFER_TIMEOUT;
-        let stream = self
-            .docker
-            .download_from_container(
-                &container,
-                Some(
-                    DownloadFromContainerOptionsBuilder::default()
-                        .path(container_path)
-                        .build(),
-                ),
-            )
-            .map_err(IoError::other);
-        let stream = stream_with_deadline(stream, async_deadline).boxed();
-        let reader = StreamReader::new(stream);
-        let bridge = SyncIoBridge::new(reader);
-        let host_path = host_path.to_path_buf();
-        let error_path = host_path.display().to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            extract_single_regular_file_with_constraints(
-                bridge,
-                &expected_file_name,
-                &host_path,
-                max_bytes,
-                blocking_deadline,
-            )
-        })
-        .await
-        .map_err(|error| DockerError::FileTransferTask(error.to_string()))?;
-        match result {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == ErrorKind::TimedOut => {
-                Err(DockerError::FileTransferTimedOut {
-                    direction: "download",
-                    path: error_path,
-                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
-                })
-            }
-            Err(source) => Err(DockerError::FileTransferIo {
-                path: error_path,
-                source,
-            }),
-        }
-    }
-
     pub async fn remove_managed_containers(&self) -> Result<usize, DockerError> {
-        let node_id = self
-            .node_id
-            .as_deref()
-            .ok_or(DockerError::RuntimeNodeIdUnavailable)?;
-        let filters = managed_container_filters(node_id);
-        let containers = self
-            .docker
-            .list_containers(Some(
-                ListContainersOptionsBuilder::default()
-                    .all(true)
-                    .filters(&filters)
-                    .build(),
-            ))
-            .await?;
-
         let mut removed = 0;
-        for container in containers {
-            if !is_owned_managed_container(container.labels.as_ref(), node_id) {
-                continue;
-            }
+        for container in self.owned_managed_containers(true).await? {
             let Some(id) = container.id else {
                 continue;
             };
@@ -980,6 +760,13 @@ impl DockerRuntime {
     }
 
     pub async fn active_managed_container_count(&self) -> Result<usize, DockerError> {
+        Ok(self.owned_managed_containers(false).await?.len())
+    }
+
+    async fn owned_managed_containers(
+        &self,
+        all: bool,
+    ) -> Result<Vec<ContainerSummary>, DockerError> {
         let node_id = self
             .node_id
             .as_deref()
@@ -989,19 +776,19 @@ impl DockerRuntime {
             .docker
             .list_containers(Some(
                 ListContainersOptionsBuilder::default()
-                    .all(false)
+                    .all(all)
                     .filters(&filters)
                     .build(),
             ))
             .await?;
         Ok(containers
-            .iter()
+            .into_iter()
             .filter(|container| is_owned_managed_container(container.labels.as_ref(), node_id))
-            .count())
+            .collect())
     }
 
     pub async fn remove_network(&self) -> Result<(), DockerError> {
-        match self.docker.remove_network(&self.legacy_network).await {
+        match self.docker.remove_network(DEFAULT_NETWORK).await {
             Ok(()) => Ok(()),
             Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
@@ -1024,6 +811,17 @@ fn managed_container_filters(node_id: &str) -> HashMap<String, Vec<String>> {
 fn is_owned_managed_container(labels: Option<&HashMap<String, String>>, node_id: &str) -> bool {
     labels.and_then(|labels| labels.get(MANAGED_LABEL).map(String::as_str)) == Some("true")
         && labels.and_then(|labels| labels.get(NODE_LABEL).map(String::as_str)) == Some(node_id)
+}
+
+fn rootless_podman_identity(protocol: Protocol) -> (&'static str, &'static str) {
+    match protocol {
+        Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Mongodb => {
+            ("999:999", "keep-id:uid=999,gid=999")
+        }
+        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse | Protocol::Qdrant => {
+            ("0:0", "host")
+        }
+    }
 }
 
 fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
@@ -1220,23 +1018,10 @@ pub enum DockerError {
     },
     #[error("docker stats stream ended without data")]
     EmptyStatsStream,
-    #[error("docker disk limit probe failed for image {image}: {source}")]
-    DiskLimitUnsupported {
-        image: String,
-        source: Box<BollardError>,
-    },
-    #[error(
-        "docker disk limit probe wrote past the configured limit; bind-mounted database data is not quota-enforced"
-    )]
-    DiskLimitNotEnforced,
-    #[error("docker disk limit probe failed: {0}")]
-    DiskLimitProbeFailed(String),
     #[error("docker image pull failed for {image}: {message}")]
     ImagePullFailed { image: String, message: String },
     #[error("container image {image} has no command for the socket bridge to supervise")]
     MissingImageCommand { image: String },
-    #[error("docker disk limit probe io failed: {0}")]
-    DiskLimitProbeIo(std::io::Error),
     #[error(
         "container {instance_id} was not ready before timeout (status={status}, runtime_health={health:?}, startup_readiness={readiness_error:?})"
     )]
@@ -1326,8 +1111,6 @@ pub enum DockerError {
         operation: String,
         reason: String,
     },
-    #[error("docker json serialization failed: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
 impl DockerError {

@@ -250,15 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_mapped_ipv6_uses_the_native_ipv4_identity() {
+    fn ipv4_mapped_ipv6_uses_distinct_native_ipv4_identities() {
         let native = GatewayPeer::from_ip("203.0.113.10".parse().unwrap());
         let mapped = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
-
         assert_eq!(native, mapped);
-    }
 
-    #[test]
-    fn distinct_ipv4_mapped_peers_do_not_share_an_ipv6_prefix_bucket() {
         let first = GatewayPeer::from_ip("::ffff:203.0.113.10".parse().unwrap());
         let second = GatewayPeer::from_ip("::ffff:203.0.113.11".parse().unwrap());
 

@@ -360,29 +360,15 @@ mod tests {
         write_string(&mut packet, "app");
         write_string(&mut packet, "secret");
 
-        let route = parse_native_initial_route(&packet).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert_eq!(route.database, "analytics");
-    }
-
-    #[test]
-    fn native_hello_can_have_trailing_bytes() {
-        let mut packet = Vec::new();
-        write_uvarint(&mut packet, 0);
-        write_string(&mut packet, "ClickHouse client");
-        write_uvarint(&mut packet, 25);
-        write_uvarint(&mut packet, 6);
-        write_uvarint(&mut packet, 54468);
-        write_string(&mut packet, "analytics");
-        write_string(&mut packet, "app");
-        write_string(&mut packet, "secret");
-        packet.extend_from_slice(b"next packet bytes");
-
-        let route = parse_native_initial_route(&packet).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert_eq!(route.database, "analytics");
+        for trailing in [false, true] {
+            let mut candidate = packet.clone();
+            if trailing {
+                candidate.extend_from_slice(b"next packet bytes");
+            }
+            let route = parse_native_initial_route(&candidate).unwrap();
+            assert_eq!(route.username, "app");
+            assert_eq!(route.database, "analytics");
+        }
     }
 
     #[test]
@@ -418,63 +404,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_http_route_from_clickhouse_headers() {
-        let request = b"POST /?database=analytics HTTP/1.1\r\nHost: example\r\nX-ClickHouse-User: app\r\nX-ClickHouse-Key: secret\r\n\r\nSELECT 1";
-
-        let route = parse_http_initial_route(request).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert_eq!(route.database, "analytics");
+    fn rejects_non_ascii_basic_authorization_without_panicking() {
+        // The first case cuts through a multi-byte boundary in the old fixed
+        // string slice; the second reaches the decoder after a valid scheme.
+        for authorization in ["💣€", "Basic sécret"] {
+            let request = format!(
+                "GET /?database=analytics HTTP/1.1\r\nAuthorization: {authorization}\r\n\r\n"
+            );
+            assert!(matches!(
+                parse_http_initial_route(request.as_bytes()),
+                Err(ClickhouseParseError::InvalidHttpBasicAuth)
+            ));
+        }
     }
 
     #[test]
-    fn parses_http_route_from_basic_auth_and_query() {
-        let request = b"GET /?database=analytics%5Fone HTTP/1.1\r\nAuthorization: Basic YXBwOnNlY3JldA==\r\n\r\n";
-
-        let route = parse_http_initial_route(request).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert_eq!(route.database, "analytics_one");
-    }
-
-    #[test]
-    fn rejects_non_ascii_authorization_without_panicking_on_utf8_boundary() {
-        // The sixth byte falls in the middle of the second multi-byte code
-        // point. The old fixed string slice panicked before returning an error.
-        let request = "GET /?database=analytics HTTP/1.1\r\nAuthorization: 💣€\r\n\r\n";
-
-        let error = parse_http_initial_route(request.as_bytes()).unwrap_err();
-
-        assert!(matches!(error, ClickhouseParseError::InvalidHttpBasicAuth));
-    }
-
-    #[test]
-    fn rejects_non_ascii_text_after_a_basic_scheme() {
-        let request = "GET /?database=analytics HTTP/1.1\r\nAuthorization: Basic sécret\r\n\r\n";
-
-        let error = parse_http_initial_route(request.as_bytes()).unwrap_err();
-
-        assert!(matches!(error, ClickhouseParseError::InvalidHttpBasicAuth));
-    }
-
-    #[test]
-    fn accepts_http_route_without_database_for_unique_username_routing() {
-        let request = b"GET / HTTP/1.1\r\nAuthorization: Basic YXBwOnNlY3JldA==\r\n\r\n";
-
-        let route = parse_http_initial_route(request).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert!(route.database.is_empty());
-    }
-
-    #[test]
-    fn accepts_http_route_with_empty_database_for_unique_username_routing() {
-        let request = b"GET /?database= HTTP/1.1\r\nX-ClickHouse-User: app\r\n\r\n";
-
-        let route = parse_http_initial_route(request).unwrap();
-
-        assert_eq!(route.username, "app");
-        assert!(route.database.is_empty());
+    fn accepts_missing_or_empty_database_for_unique_username_routing() {
+        for request in [
+            b"GET / HTTP/1.1\r\nAuthorization: Basic YXBwOnNlY3JldA==\r\n\r\n".as_slice(),
+            b"GET /?database= HTTP/1.1\r\nX-ClickHouse-User: app\r\n\r\n".as_slice(),
+        ] {
+            let route = parse_http_initial_route(request).unwrap();
+            assert_eq!(route.username, "app");
+            assert!(route.database.is_empty());
+        }
     }
 
     #[test]

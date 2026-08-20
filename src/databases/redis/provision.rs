@@ -88,30 +88,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_acl_username_with_whitespace() {
-        let error = validate_acl_username("bad name").unwrap_err();
-
-        assert!(matches!(error, RedisProvisionError::InvalidUsername));
+    fn rejects_unsafe_or_reserved_acl_usernames() {
+        for username in ["bad name", "dbe_health"] {
+            assert!(
+                matches!(
+                    validate_acl_username(username),
+                    Err(RedisProvisionError::InvalidUsername)
+                ),
+                "accepted ACL username: {username}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_reserved_health_username() {
-        let error = validate_acl_username("dbe_health").unwrap_err();
-
-        assert!(matches!(error, RedisProvisionError::InvalidUsername));
-    }
-
-    #[test]
-    fn default_user_acl_does_not_duplicate_default() {
+    fn acl_generation_handles_default_and_named_tenants() {
         let acl = redis_acl("default", "abc123");
 
         assert_eq!(acl.matches("user default ").count(), 1);
         assert!(acl.contains("user default on #abc123 ~* &* +@all"));
         assert!(acl.contains("user dbe_health on nopass -@all +ping"));
-    }
 
-    #[test]
-    fn named_user_acl_disables_default_user() {
         let acl = redis_acl("app_redis", "abc123");
 
         assert!(acl.contains("user default off"));

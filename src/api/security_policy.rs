@@ -213,8 +213,7 @@ fn validate_allowed_request_hosts(
         return Err(ApiError::HostNotAllowed);
     }
 
-    let request_host =
-        allowed_hosts::request_host_with_uri(headers, Some(uri)).ok_or(ApiError::HostNotAllowed)?;
+    let request_host = allowed_hosts::request_host(headers, uri).ok_or(ApiError::HostNotAllowed)?;
     if !policy.allows_request_host(&request_host) {
         return Err(ApiError::HostNotAllowed);
     }

@@ -130,15 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_instance_scope_is_not_implicitly_node_wide() {
+    fn node_wide_scope_must_be_explicit_and_unambiguous() {
         assert!(matches!(
             validate_request(&request(Vec::new(), false)),
             Err(ApiError::BadRequest(_))
         ));
-    }
-
-    #[test]
-    fn node_wide_scope_must_be_explicit_and_unambiguous() {
         validate_request(&request(Vec::new(), true)).unwrap();
         assert!(validate_request(&request(vec!["inst_one"], true)).is_err());
     }

@@ -8,6 +8,7 @@ use clap::CommandFactory;
 
 use super::*;
 use crate::{
+    config::DaemonConfig,
     instances::metadata::{
         DatabaseIdentity, InstanceMetadata, PublicEndpoint, RuntimeKind, RuntimeMetadata,
         SCHEMA_VERSION,
@@ -15,6 +16,14 @@ use crate::{
     jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
     shared::{backend::BackendEndpoint, limits::InstanceLimits},
 };
+
+type SystemdCase<'a> = (
+    &'a str,
+    DaemonConfig,
+    &'a Path,
+    &'a [&'a str],
+    &'a [&'a str],
+);
 
 #[test]
 fn cli_exposes_the_package_version() {
@@ -39,7 +48,7 @@ fn startup_banner_identifies_the_release_and_security_model() {
 }
 
 #[test]
-fn api_connection_admission_is_per_ip_and_releases_capacity() {
+fn api_connection_admission_enforces_and_releases_peer_and_global_capacity() {
     let limiter = Arc::new(ApiConnectionLimiter::new(3, 2));
     let first_ip: IpAddr = "192.0.2.10".parse().unwrap();
     let second_ip: IpAddr = "192.0.2.11".parse().unwrap();
@@ -53,34 +62,7 @@ fn api_connection_admission_is_per_ip_and_releases_capacity() {
     assert!(limiter.try_acquire(first_ip).is_some());
     drop(second);
     drop(other_peer);
-}
 
-#[test]
-fn api_connection_admission_normalizes_ipv4_mapped_addresses() {
-    let limiter = Arc::new(ApiConnectionLimiter::new(2, 1));
-    let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
-    let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
-
-    let _permit = limiter.try_acquire(ipv4).unwrap();
-
-    assert!(limiter.try_acquire(mapped).is_none());
-}
-
-#[test]
-fn api_connection_admission_groups_ipv6_peers_by_64_bit_prefix() {
-    let limiter = Arc::new(ApiConnectionLimiter::new(3, 1));
-    let first: IpAddr = "2001:db8:1234:5678::1".parse().unwrap();
-    let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse().unwrap();
-    let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse().unwrap();
-
-    let _first = limiter.try_acquire(first).unwrap();
-
-    assert!(limiter.try_acquire(same_prefix).is_none());
-    assert!(limiter.try_acquire(other_prefix).is_some());
-}
-
-#[test]
-fn api_connection_admission_enforces_and_releases_global_capacity() {
     let limiter = Arc::new(ApiConnectionLimiter::new(2, 2));
     let first = limiter.try_acquire("192.0.2.10".parse().unwrap()).unwrap();
     let _second = limiter.try_acquire("192.0.2.11".parse().unwrap()).unwrap();
@@ -88,6 +70,23 @@ fn api_connection_admission_enforces_and_releases_global_capacity() {
     assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_none());
     drop(first);
     assert!(limiter.try_acquire("192.0.2.12".parse().unwrap()).is_some());
+}
+
+#[test]
+fn api_connection_admission_normalizes_ipv4_and_ipv6_peer_buckets() {
+    let limiter = Arc::new(ApiConnectionLimiter::new(2, 1));
+    let ipv4: IpAddr = "192.0.2.10".parse().unwrap();
+    let mapped: IpAddr = "::ffff:192.0.2.10".parse().unwrap();
+    let _permit = limiter.try_acquire(ipv4).unwrap();
+    assert!(limiter.try_acquire(mapped).is_none());
+
+    let limiter = Arc::new(ApiConnectionLimiter::new(3, 1));
+    let first: IpAddr = "2001:db8:1234:5678::1".parse().unwrap();
+    let same_prefix: IpAddr = "2001:db8:1234:5678:ffff::2".parse().unwrap();
+    let other_prefix: IpAddr = "2001:db8:1234:5679::1".parse().unwrap();
+    let _first = limiter.try_acquire(first).unwrap();
+    assert!(limiter.try_acquire(same_prefix).is_none());
+    assert!(limiter.try_acquire(other_prefix).is_some());
 }
 
 #[test]
@@ -672,62 +671,76 @@ fn managed_memory_sysctl_enables_overcommit_persistently() {
 }
 
 #[test]
-fn generated_systemd_service_runs_as_root_without_service_account_sandboxing() {
-    let daemon = crate::config::DaemonConfig::default();
-    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
+fn generated_systemd_service_tracks_engine_socket_and_security_policy() {
+    let cases: Vec<SystemdCase<'_>> = vec![
+        (
+            "root Docker service",
+            crate::config::DaemonConfig::default(),
+            Path::new(defaults::CONFIG_PATH),
+            &[
+                "User=root\n",
+                "ExecStart=/usr/local/bin/dbev daemon\n",
+                "KillMode=process\n",
+                "LimitNOFILE=1048576:1048576\n",
+                "PartOf=docker.service\n",
+            ],
+            &["SupplementaryGroups=", "ProtectSystem=", "DBE_USE_SUDO"],
+        ),
+        (
+            "rootful Podman service",
+            crate::config::DaemonConfig {
+                engine: DaemonEngine::Podman,
+                ..Default::default()
+            },
+            Path::new("/srv/dbev/config.yml"),
+            &[
+                "After=podman.socket\n",
+                "Requires=podman.socket\n",
+                "PartOf=podman.socket\n",
+                "ExecStart=/usr/local/bin/dbev --config /srv/dbev/config.yml daemon\n",
+            ],
+            &[],
+        ),
+        (
+            "rootless Podman service",
+            crate::config::DaemonConfig {
+                engine: DaemonEngine::Podman,
+                socket_path: "/run/user/1001/podman/podman.sock".to_string(),
+                ..Default::default()
+            },
+            Path::new(defaults::CONFIG_PATH),
+            &[
+                "After=user@1001.service\n",
+                "Requires=user@1001.service\n",
+                "RequiresMountsFor=/run/user/1001\n",
+            ],
+            &["Requires=podman.socket"],
+        ),
+        (
+            "external Podman socket",
+            crate::config::DaemonConfig {
+                engine: DaemonEngine::Podman,
+                socket_path: "/srv/podman/api.sock".to_string(),
+                ..Default::default()
+            },
+            Path::new(defaults::CONFIG_PATH),
+            &["After=network.target\n"],
+            &["Requires=podman.socket"],
+        ),
+    ];
 
-    assert!(unit.contains("User=root\n"));
-    assert!(unit.contains("ExecStart=/usr/local/bin/dbev daemon\n"));
-    assert!(unit.contains("KillMode=process\n"));
-    assert!(unit.contains("LimitNOFILE=1048576:1048576\n"));
-    assert!(unit.contains("PartOf=docker.service\n"));
-    assert!(!unit.contains("SupplementaryGroups="));
-    assert!(!unit.contains("ProtectSystem="));
-    assert!(!unit.contains("DBE_USE_SUDO"));
-}
-
-#[test]
-fn generated_systemd_service_uses_selected_engine_and_custom_config() {
-    let daemon = crate::config::DaemonConfig {
-        engine: DaemonEngine::Podman,
-        ..crate::config::DaemonConfig::default()
-    };
-    let unit = systemd_service_contents(Path::new("/srv/dbev/config.yml"), &daemon);
-
-    assert!(unit.contains("After=podman.socket\n"));
-    assert!(unit.contains("Requires=podman.socket\n"));
-    assert!(unit.contains("PartOf=podman.socket\n"));
-    assert!(unit.contains("ExecStart=/usr/local/bin/dbev --config /srv/dbev/config.yml daemon\n"));
-}
-
-#[test]
-fn generated_systemd_service_tracks_the_rootless_podman_user_manager() {
-    let daemon = crate::config::DaemonConfig {
-        engine: DaemonEngine::Podman,
-        socket_path: "/run/user/1001/podman/podman.sock".to_string(),
-        ..crate::config::DaemonConfig::default()
-    };
-
-    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
-
-    assert!(unit.contains("After=user@1001.service\n"));
-    assert!(unit.contains("Requires=user@1001.service\n"));
-    assert!(unit.contains("RequiresMountsFor=/run/user/1001\n"));
-    assert!(!unit.contains("Requires=podman.socket"));
-}
-
-#[test]
-fn generated_systemd_service_leaves_custom_podman_socket_lifecycle_external() {
-    let daemon = crate::config::DaemonConfig {
-        engine: DaemonEngine::Podman,
-        socket_path: "/srv/podman/api.sock".to_string(),
-        ..crate::config::DaemonConfig::default()
-    };
-
-    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
-
-    assert!(unit.contains("After=network.target\n"));
-    assert!(!unit.contains("Requires=podman.socket"));
+    for (name, daemon, path, required, forbidden) in cases {
+        let unit = systemd_service_contents(path, &daemon);
+        for value in required {
+            assert!(unit.contains(value), "{name} omitted {value:?}");
+        }
+        for value in forbidden {
+            assert!(
+                !unit.contains(value),
+                "{name} unexpectedly contained {value:?}"
+            );
+        }
+    }
 }
 
 #[test]

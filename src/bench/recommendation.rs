@@ -268,77 +268,74 @@ mod tests {
     }
 
     #[test]
-    fn workload_report_exposes_each_model_ceiling() {
-        let response = SchedulerRecommendationWire {
-            scheduler: SchedulerSnapshotWire {
-                capacity: SchedulerCapacityReport {
+    fn workload_report_preserves_available_and_blocked_model_ceilings() {
+        let cases = [
+            (
+                "representative_exported_dump",
+                "merge",
+                SchedulerCapacityReport {
                     mode: "dynamic".to_string(),
                     max_active_jobs: 64,
                     memory_budget_mib: 8_192,
                     io_budget_mib: 16_384,
                     cpu_units: 32,
                 },
-            },
-            estimate: SchedulerJobCostReport {
-                input_size_bytes: 4 * 1024 * 1024 * 1024,
-                memory_mib: 512,
-                io_mib: 4_096,
-                cpu_units: 4,
-            },
-            recommended_active_jobs: 4,
-            max_queued_jobs: 4_096,
-            max_queued_jobs_per_instance: 64,
-        };
-
-        let report = workload_recommendation(
-            "representative_exported_dump",
-            "mongodb",
-            "merge",
-            true,
-            &response,
-            mode_independent_recommendation(&response),
-        );
-
-        assert_eq!(report.memory_ceiling_jobs, 16);
-        assert_eq!(report.io_ceiling_jobs, 4);
-        assert_eq!(report.cpu_ceiling_jobs, 8);
-        assert_eq!(report.recommended_manual_max_active_jobs, 4);
-    }
-
-    #[test]
-    fn blocked_headroom_preserves_zero_raw_and_recommended_ceilings() {
-        let response = SchedulerRecommendationWire {
-            scheduler: SchedulerSnapshotWire {
-                capacity: SchedulerCapacityReport {
+                SchedulerJobCostReport {
+                    input_size_bytes: 4 * 1024 * 1024 * 1024,
+                    memory_mib: 512,
+                    io_mib: 4_096,
+                    cpu_units: 4,
+                },
+                4,
+                (16, 4, 8, 4),
+            ),
+            (
+                "configured_max_upload_worst_case",
+                "wipe",
+                SchedulerCapacityReport {
                     mode: "dynamic".to_string(),
                     max_active_jobs: 256,
                     memory_budget_mib: 128,
                     io_budget_mib: 256,
                     cpu_units: 1,
                 },
-            },
-            estimate: SchedulerJobCostReport {
-                input_size_bytes: 8 * 1024 * 1024 * 1024,
-                memory_mib: 640,
-                io_mib: 32_768,
-                cpu_units: 4,
-            },
-            recommended_active_jobs: 0,
-            max_queued_jobs: 4_096,
-            max_queued_jobs_per_instance: 64,
-        };
+                SchedulerJobCostReport {
+                    input_size_bytes: 8 * 1024 * 1024 * 1024,
+                    memory_mib: 640,
+                    io_mib: 32_768,
+                    cpu_units: 4,
+                },
+                0,
+                (0, 0, 0, 0),
+            ),
+        ];
 
-        let report = workload_recommendation(
-            "configured_max_upload_worst_case",
-            "mongodb",
-            "wipe",
-            true,
-            &response,
-            mode_independent_recommendation(&response),
-        );
-        assert_eq!(report.memory_ceiling_jobs, 0);
-        assert_eq!(report.io_ceiling_jobs, 0);
-        assert_eq!(report.cpu_ceiling_jobs, 0);
-        assert_eq!(report.recommended_manual_max_active_jobs, 0);
+        for (label, mode, capacity, estimate, recommended, expected) in cases {
+            let response = SchedulerRecommendationWire {
+                scheduler: SchedulerSnapshotWire { capacity },
+                estimate,
+                recommended_active_jobs: recommended,
+                max_queued_jobs: 4_096,
+                max_queued_jobs_per_instance: 64,
+            };
+            let report = workload_recommendation(
+                label,
+                "mongodb",
+                mode,
+                true,
+                &response,
+                mode_independent_recommendation(&response),
+            );
+            assert_eq!(
+                (
+                    report.memory_ceiling_jobs,
+                    report.io_ceiling_jobs,
+                    report.cpu_ceiling_jobs,
+                    report.recommended_manual_max_active_jobs,
+                ),
+                expected,
+                "workload case failed: {label}"
+            );
+        }
     }
 }

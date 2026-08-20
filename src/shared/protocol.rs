@@ -102,19 +102,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mysql_is_a_distinct_first_class_protocol() {
-        assert_eq!("mysql".parse::<Protocol>().unwrap(), Protocol::Mysql);
-        assert_eq!("mariadb".parse::<Protocol>().unwrap(), Protocol::Mariadb);
-        assert_ne!(Protocol::Mysql, Protocol::Mariadb);
-        assert!(Protocol::ALL.contains(&Protocol::Mysql));
-        assert_eq!(Protocol::Mysql.default_container_port(), 3306);
-    }
-
-    #[test]
-    fn valkey_is_a_distinct_first_class_protocol() {
-        assert_eq!("valkey".parse::<Protocol>().unwrap(), Protocol::Valkey);
-        assert_ne!(Protocol::Valkey, Protocol::Redis);
-        assert!(Protocol::ALL.contains(&Protocol::Valkey));
-        assert_eq!(Protocol::Valkey.default_container_port(), 6379);
+    fn compatibility_protocols_remain_distinct_first_class_variants() {
+        for (name, protocol, related, port) in [
+            ("mysql", Protocol::Mysql, Protocol::Mariadb, 3306),
+            ("valkey", Protocol::Valkey, Protocol::Redis, 6379),
+        ] {
+            assert_eq!(name.parse::<Protocol>().unwrap(), protocol);
+            assert_ne!(protocol, related);
+            assert!(Protocol::ALL.contains(&protocol));
+            assert_eq!(protocol.default_container_port(), port);
+        }
     }
 }

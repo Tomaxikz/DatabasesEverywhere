@@ -233,56 +233,32 @@ paths:
     }
 
     #[test]
-    fn rejects_legacy_api_bind_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
-api:
-  bind: 127.0.0.1:8090
-uuid: node-uuid
-token_id: token-id
-token: secret-token
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
-
-        let error = load_config(&path).unwrap_err();
-
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
-    }
-
-    #[test]
-    fn rejects_unknown_nested_config_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
-remote: https://panel.example.com
-uuid: node-uuid
-token_id: token-id
-token: secret-token
-daemon:
-  intenal_network: true
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
-
-        let error = load_config(&path).unwrap_err();
-
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
+    fn rejects_legacy_removed_and_unknown_config_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yml");
+        for (name, extra) in [
+            ("legacy API bind", "api:\n  bind: 127.0.0.1:8090"),
+            ("unknown nested field", "daemon:\n  intenal_network: true"),
+            (
+                "removed Docker section",
+                "docker:\n  network: databases-everywhere",
+            ),
+            (
+                "removed allowed hosts",
+                "api:\n  allowed_hosts:\n    - panel.example.com",
+            ),
+            (
+                "removed trusted hosts",
+                "api:\n  trusted_hosts:\n    - panel.example.com",
+            ),
+            ("removed API URL", "api:\n  url: https://dbe.example.com"),
+        ] {
+            std::fs::write(&path, config_document(extra)).unwrap();
+            assert!(
+                matches!(load_config(&path), Err(ConfigLoadError::Parse { .. })),
+                "accepted config case: {name}"
+            );
+        }
     }
 
     #[test]
@@ -319,90 +295,6 @@ paths:
     }
 
     #[test]
-    fn rejects_removed_docker_config_section() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
-remote: https://panel.example.com
-uuid: node-uuid
-token_id: token-id
-token: secret-token
-docker:
-  network: databases-everywhere
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
-
-        let error = load_config(&path).unwrap_err();
-
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
-    }
-
-    #[test]
-    fn rejects_removed_api_host_alias_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        for field in ["allowed_hosts", "trusted_hosts"] {
-            std::fs::write(
-                &path,
-                format!(
-                    r#"
-api:
-  {field}:
-    - panel.example.com
-uuid: node-uuid
-token_id: token-id
-token: secret-token
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#
-                ),
-            )
-            .unwrap();
-
-            let error = load_config(&path).unwrap_err();
-
-            assert!(matches!(error, ConfigLoadError::Parse { .. }));
-        }
-    }
-
-    #[test]
-    fn rejects_removed_api_url_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
-api:
-  url: https://dbe.example.com
-uuid: node-uuid
-token_id: token-id
-token: secret-token
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
-
-        let error = load_config(&path).unwrap_err();
-
-        assert!(matches!(error, ConfigLoadError::Parse { .. }));
-    }
-
-    #[test]
     fn loads_explicit_api_trusted_origins_without_breaking_legacy_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");
@@ -436,5 +328,22 @@ paths:
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443", "http://localhost:3000"]
         );
+    }
+
+    fn config_document(extra: &str) -> String {
+        format!(
+            r#"
+{extra}
+remote: https://panel.example.com
+uuid: node-uuid
+token_id: token-id
+token: secret-token
+paths:
+  data: /var/lib/databases-everywhere
+  sockets: /run/databases-everywhere
+  logs: /var/log/databases-everywhere
+  artifacts: /var/lib/databases-everywhere/artifacts
+"#
+        )
     }
 }

@@ -7,6 +7,8 @@ use axum::{
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
+const ERROR_ID_HEADER: &str = "x-error-id";
+
 /// The single JSON success response used by the HTTP API.
 ///
 /// Keeping status and header construction here prevents individual handlers from
@@ -20,19 +22,7 @@ pub struct ApiResponse<T> {
 
 impl<T> ApiResponse<T> {
     pub fn ok(body: T) -> Self {
-        Self {
-            status: StatusCode::OK,
-            location: None,
-            body,
-        }
-    }
-
-    pub fn accepted(body: T) -> Self {
-        Self {
-            status: StatusCode::ACCEPTED,
-            location: None,
-            body,
-        }
+        Self::with_status(StatusCode::OK, body)
     }
 
     pub fn accepted_at(body: T, location: impl Into<String>) -> Self {
@@ -135,6 +125,7 @@ impl ApiError {
             Self::NotImplemented(_) => "not_implemented",
             Self::Runtime(_) => "internal_error",
             Self::RequestRejected { status, .. } => match *status {
+                status if status.is_server_error() => "internal_error",
                 StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
                 StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
                 StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
@@ -146,6 +137,9 @@ impl ApiError {
     fn public_message(&self) -> String {
         match self {
             Self::Runtime(_) => "internal server error".to_string(),
+            Self::RequestRejected { status, .. } if status.is_server_error() => {
+                "internal server error".to_string()
+            }
             Self::InvalidWebSocketJwt(_) => "unauthorized".to_string(),
             _ => self.to_string(),
         }
@@ -163,30 +157,31 @@ impl IntoResponse for ApiError {
         if let Some(error_id) = error_id.as_deref() {
             tracing::error!(error_id, error = %self, "API request failed internally");
         }
+        let error_id_header = error_id.as_deref().map(|error_id| {
+            HeaderValue::from_str(error_id).expect("a UUID must be a valid HTTP header value")
+        });
         let mut response = (
             status,
             Json(ErrorBody {
                 error: self.public_message(),
                 code: self.code(),
-                error_id: error_id.clone(),
+                error_id,
             }),
         )
             .into_response();
-        if let Some(error_id) = error_id
-            && let Ok(value) = HeaderValue::from_str(&error_id)
-        {
-            response.headers_mut().insert("x-error-id", value);
+        if let Some(value) = error_id_header {
+            response.headers_mut().insert(ERROR_ID_HEADER, value);
         }
         response
     }
 }
 
 #[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub error: String,
-    pub code: &'static str,
+struct ErrorBody {
+    error: String,
+    code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_id: Option<String>,
+    error_id: Option<String>,
 }
 
 pub async fn route_not_found() -> ApiError {
@@ -194,10 +189,10 @@ pub async fn route_not_found() -> ApiError {
 }
 
 pub async fn method_not_allowed() -> ApiError {
-    ApiError::RequestRejected {
-        status: StatusCode::METHOD_NOT_ALLOWED,
-        message: "method not allowed".to_string(),
-    }
+    ApiError::from_rejection(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed".to_string(),
+    )
 }
 
 /// JSON extractor whose failures use the API's JSON error contract.
@@ -297,16 +292,6 @@ mod tests {
     use axum::body::{Body, to_bytes};
 
     #[test]
-    fn runtime_errors_have_a_safe_public_message() {
-        let error = ApiError::Runtime(
-            "docker failed; recent logs: password=hunter2 /var/lib/private".to_string(),
-        );
-
-        assert_eq!(error.public_message(), "internal server error");
-        assert_eq!(error.code(), "internal_error");
-    }
-
-    #[test]
     fn accepted_at_uses_the_shared_async_contract() {
         let response = ApiResponse::accepted_at(serde_json::json!({"queued": true}), "/jobs/1")
             .into_response();
@@ -316,23 +301,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_response_contains_only_an_opaque_error_id() {
-        let response = ApiError::Runtime(
-            "docker failed; recent logs: password=hunter2 /var/lib/private".to_string(),
-        )
-        .into_response();
-        let error_id = response.headers()["x-error-id"]
-            .to_str()
-            .unwrap()
-            .to_string();
-        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    async fn server_error_responses_contain_only_an_opaque_error_id() {
+        for error in [
+            ApiError::Runtime(
+                "docker failed; recent logs: password=hunter2 /var/lib/private".to_string(),
+            ),
+            ApiError::RequestRejected {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "extractor leaked password=hunter2 /var/lib/private".to_string(),
+            },
+        ] {
+            let response = error.into_response();
+            let error_id = response.headers()[ERROR_ID_HEADER]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(body["error"], "internal server error");
-        assert_eq!(body["code"], "internal_error");
-        assert_eq!(body["error_id"], error_id);
-        assert!(!body.to_string().contains("hunter2"));
-        assert!(!body.to_string().contains("/var/lib/private"));
+            assert_eq!(body["error"], "internal server error");
+            assert_eq!(body["code"], "internal_error");
+            assert_eq!(body["error_id"], error_id);
+            assert!(!body.to_string().contains("hunter2"));
+            assert!(!body.to_string().contains("/var/lib/private"));
+        }
     }
 
     #[tokio::test]

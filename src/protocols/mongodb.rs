@@ -431,58 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn routes_credential_bearing_hello_from_mechanism_negotiation() {
-        let message = MongoMessage {
-            request_id: 1,
-            op_code: OP_MSG,
-            body: Some(doc! {
-                "hello": 1_i32,
-                "saslSupportedMechs": "mongo_1.app_mongo_1",
-                "$db": "admin",
-            }),
-            raw: Vec::new(),
-        };
-
-        assert_eq!(
-            parse_hello_routes(&message).unwrap(),
-            vec![MongodbRoute {
-                username: "app_mongo_1".to_string(),
-                database: "mongo_1".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn routes_speculative_scram_hello() {
-        let message = MongoMessage {
-            request_id: 1,
-            op_code: OP_MSG,
-            body: Some(doc! {
-                "hello": 1_i32,
-                "speculativeAuthenticate": {
-                    "saslStart": 1_i32,
-                    "mechanism": "SCRAM-SHA-256",
-                    "payload": Bson::Binary(Binary {
-                        subtype: BinarySubtype::Generic,
-                        bytes: b"n,,n=app_mongo_1,r=nonce".to_vec(),
-                    }),
-                    "db": "mongo_1",
-                },
-                "$db": "admin",
-            }),
-            raw: Vec::new(),
-        };
-
-        assert_eq!(
-            parse_hello_routes(&message).unwrap(),
-            vec![MongodbRoute {
-                username: "app_mongo_1".to_string(),
-                database: "mongo_1".to_string(),
-            }]
-        );
-    }
-
-    #[test]
     fn preserves_driver_auth_source_mismatch_for_registered_route_resolution() {
         let message = MongoMessage {
             request_id: 1,

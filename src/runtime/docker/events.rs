@@ -178,17 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_podman_compatibility_exit_spelling() {
+    fn accepts_podman_compatibility_lifecycle_spellings() {
         assert!(matches!(
             ManagedContainerEvent::from_message(event("died"), None)
                 .unwrap()
                 .action,
             ManagedContainerAction::Exited { .. }
         ));
-    }
-
-    #[test]
-    fn accepts_the_podman_container_removal_spelling() {
         assert_eq!(
             ManagedContainerEvent::from_message(event("remove"), None)
                 .unwrap()

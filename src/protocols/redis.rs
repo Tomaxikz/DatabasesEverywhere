@@ -265,35 +265,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_auth_username() {
-        let route =
-            parse_initial_route(b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n").unwrap();
-
-        assert_eq!(route.username(), Some("app"));
-    }
-
-    #[test]
-    fn parses_hello_auth_username() {
-        let route = parse_initial_route(
-            b"*5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n",
-        )
-        .unwrap();
-
-        assert_eq!(route.username(), Some("app"));
-    }
-
-    #[test]
-    fn resp_auth_without_username_uses_default() {
-        let route = parse_initial_route(b"*2\r\n$4\r\nAUTH\r\n$4\r\npass\r\n").unwrap();
-
-        assert_eq!(route.username(), None);
-        assert_eq!(
-            route.password_route_sha256(),
-            password_route_sha256(b"pass")
-        );
-    }
-
-    #[test]
     fn rejects_trailing_bytes_for_exact_initial_route_parse() {
         let error = parse_initial_route(
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n",

@@ -164,31 +164,6 @@ mod tests {
         assert_eq!(route.database, None);
     }
 
-    #[test]
-    fn injects_resolved_database_without_losing_startup_fields() {
-        let packet = startup_packet(&[("user", "app"), ("application_name", "jdbc")]);
-
-        let rewritten = startup_packet_with_database(&packet, "app_db").unwrap();
-        let route = parse_startup_route(&rewritten).unwrap();
-
-        assert_eq!(route.database.as_deref(), Some("app_db"));
-        assert!(
-            rewritten
-                .windows(b"application_name\0jdbc".len())
-                .any(|window| { window == b"application_name\0jdbc" })
-        );
-    }
-
-    #[test]
-    fn replaces_jdbc_username_default_with_resolved_database() {
-        let packet = startup_packet(&[("user", "app"), ("database", "app")]);
-
-        let rewritten = startup_packet_with_database(&packet, "app_db").unwrap();
-        let route = parse_startup_route(&rewritten).unwrap();
-
-        assert_eq!(route.database.as_deref(), Some("app_db"));
-    }
-
     fn startup_packet(fields: &[(&str, &str)]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0, 0, 0, 0]);

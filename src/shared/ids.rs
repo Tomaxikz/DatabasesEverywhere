@@ -41,14 +41,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_path_like_ids() {
+    fn instance_id_policy_rejects_paths_and_sanitizes_safe_suffixes() {
         let error = validate_instance_id("../root").unwrap_err();
 
         assert!(matches!(error, IdError::Unsafe { .. }));
-    }
-
-    #[test]
-    fn converts_underscore_for_docker_names() {
         assert_eq!(sanitize_docker_suffix("inst_abc").unwrap(), "inst-abc");
     }
 }

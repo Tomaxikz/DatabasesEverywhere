@@ -732,21 +732,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_metadata_rejects_duplicate_database_routes() {
+    async fn durable_metadata_rejects_every_duplicate_route_identity() {
         let dir = tempfile::tempdir().unwrap();
         let pool = sqlite::connect(dir.path()).await.unwrap();
         let repository = InstanceRepository::new(pool);
-        let first = sample_metadata();
-        let mut duplicate = sample_metadata();
-        duplicate.instance_id = "inst_other".to_string();
-        duplicate.runtime.container_name = "dbe-postgres-inst_other".to_string();
+        for (index, protocol) in [
+            Protocol::Postgres,
+            Protocol::Redis,
+            Protocol::Valkey,
+            Protocol::Qdrant,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut first = sample_metadata();
+            first.instance_id = format!("inst_first_{index}");
+            first.protocol = protocol;
+            first.database.name = format!("database_{index}");
+            first.database.username = format!("user_{index}");
+            first.runtime.container_name = format!("dbe-{protocol}-first-{index}");
+            if protocol == Protocol::Qdrant {
+                first.route_key_sha256 = Some(format!("route-key-{index}"));
+            }
 
-        repository.upsert(&first).await.unwrap();
+            let mut duplicate = first.clone();
+            duplicate.instance_id = format!("inst_duplicate_{index}");
+            duplicate.runtime.container_name = format!("dbe-{protocol}-duplicate-{index}");
+            if matches!(
+                protocol,
+                Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+            ) {
+                duplicate.database.name = format!("other_database_{index}");
+            }
 
-        assert!(matches!(
-            repository.upsert(&duplicate).await,
-            Err(RepositoryError::Sqlx(sqlx::Error::Database(_)))
-        ));
+            repository.upsert(&first).await.unwrap();
+            assert!(
+                matches!(
+                    repository.upsert(&duplicate).await,
+                    Err(RepositoryError::Sqlx(sqlx::Error::Database(_)))
+                ),
+                "accepted duplicate {protocol} route"
+            );
+        }
     }
 
     #[tokio::test]
@@ -762,58 +789,6 @@ mod tests {
 
         repository.upsert(&first).await.unwrap();
         repository.upsert(&distinct_route).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn durable_metadata_rejects_duplicate_redis_usernames() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let repository = InstanceRepository::new(pool);
-        let mut first = sample_metadata();
-        first.protocol = Protocol::Redis;
-        let mut duplicate = first.clone();
-        duplicate.instance_id = "inst_other".to_string();
-        duplicate.database.name = "another_database".to_string();
-        duplicate.runtime.container_name = "dbe-redis-inst_other".to_string();
-
-        repository.upsert(&first).await.unwrap();
-
-        assert!(repository.upsert(&duplicate).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn durable_metadata_rejects_duplicate_valkey_usernames() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let repository = InstanceRepository::new(pool);
-        let mut first = sample_metadata();
-        first.protocol = Protocol::Valkey;
-        let mut duplicate = first.clone();
-        duplicate.instance_id = "inst_other".to_string();
-        duplicate.database.name = "another_database".to_string();
-        duplicate.runtime.container_name = "dbe-valkey-inst_other".to_string();
-
-        repository.upsert(&first).await.unwrap();
-
-        assert!(repository.upsert(&duplicate).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn durable_metadata_rejects_duplicate_qdrant_route_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let repository = InstanceRepository::new(pool);
-        let mut first = sample_metadata();
-        first.protocol = Protocol::Qdrant;
-        first.route_key_sha256 = Some("same-route-key".to_string());
-        let mut duplicate = first.clone();
-        duplicate.instance_id = "inst_other".to_string();
-        duplicate.database.name = "another_database".to_string();
-        duplicate.runtime.container_name = "dbe-qdrant-inst_other".to_string();
-
-        repository.upsert(&first).await.unwrap();
-
-        assert!(repository.upsert(&duplicate).await.is_err());
     }
 
     #[tokio::test]

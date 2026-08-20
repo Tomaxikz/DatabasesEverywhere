@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn create_user_script_creates_scoped_database_user() {
+    fn generated_user_scripts_scope_roles_and_keep_passwords_out_of_commands() {
         let script = create_user_script("mongo_1", "app_mongo_1", "secret").unwrap();
 
         assert!(!script.contains("getUser"));
@@ -148,19 +148,13 @@ mod tests {
         assert!(script.contains("readWrite"));
         assert!(script.contains("mongo_1"));
         assert!(script.contains("app_mongo_1"));
-    }
 
-    #[test]
-    fn create_root_user_script_creates_admin_root_user() {
         let script = create_root_user_script("dbe_root", "secret").unwrap();
 
         assert!(script.contains("getSiblingDB(\"admin\")"));
         assert!(script.contains("root"));
         assert!(script.contains("dbe_root"));
-    }
 
-    #[test]
-    fn password_update_reads_the_secret_from_the_container_environment() {
         let script = update_user_password_from_env_script("mongo_1", "app_mongo_1").unwrap();
 
         assert!(script.contains("db.updateUser"));

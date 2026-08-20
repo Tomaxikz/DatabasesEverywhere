@@ -1177,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_output_plan_supports_multiple_collections() {
+    fn mongodb_output_plan_names_single_and_multiple_collection_archives() {
         let selection = ImportExportSelection {
             mode: SelectionMode::Selective,
             include: vec!["orders".to_string(), "customers".to_string()],
@@ -1196,10 +1196,6 @@ mod tests {
                 "source.mongodb.0001.archive.gz"
             ]
         );
-    }
-
-    #[test]
-    fn mongodb_output_plan_keeps_the_single_archive_name() {
         let selection = ImportExportSelection {
             mode: SelectionMode::Selective,
             include: vec!["orders".to_string()],

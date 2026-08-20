@@ -18,7 +18,7 @@ const MAX_BSON_NESTING_DEPTH: usize = 128;
 const MAX_METADATA_DOCUMENTS: usize = 4_096;
 const MAX_PRELUDE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct MongoArchiveCatalog {
     pub(super) databases: Vec<String>,
     pub(super) complete: bool,
@@ -70,7 +70,7 @@ fn inspect_native_archive<R: Read>(
         let Some(metadata) = read_bson_document(reader, deadline, &mut prelude_bytes)? else {
             break;
         };
-        metadata_count = metadata_count.saturating_add(1);
+        metadata_count += 1;
         if metadata_count > MAX_METADATA_DOCUMENTS {
             return Err(InspectionError::Limit(
                 "MongoDB archive prelude contains too many collection records",
@@ -257,7 +257,7 @@ fn validate_bson_structure(
             _ => None,
         };
         if let Some(document) = nested {
-            let nested_depth = depth.saturating_add(1);
+            let nested_depth = depth + 1;
             if nested_depth > MAX_BSON_NESTING_DEPTH {
                 return Err(InspectionError::Limit(
                     "MongoDB archive BSON nesting exceeds its depth limit",
@@ -288,38 +288,38 @@ mod tests {
     use std::{io::Cursor, time::Duration};
 
     fn archive(metadata: &[(&str, &str)]) -> Vec<u8> {
-        let mut bytes = ARCHIVE_MAGIC.to_vec();
-        bytes.extend(header());
-        for (database, collection) in metadata {
-            bytes.extend(
-                bson::to_vec(&bson::doc! {
-                    "db": database,
-                    "collection": collection,
-                    "metadata": "{}",
-                    "size": 0_i32,
-                    "type": "collection",
-                })
-                .unwrap(),
-            );
-        }
-        bytes.extend(ARCHIVE_TERMINATOR.to_le_bytes());
-        bytes
+        archive_documents(
+            metadata
+                .iter()
+                .map(|(database, collection)| metadata_document(database, collection)),
+        )
     }
 
-    fn header() -> Vec<u8> {
+    fn metadata_document(database: &str, collection: &str) -> Vec<u8> {
         bson::to_vec(&bson::doc! {
-            "concurrent_collections": 4_i32,
-            "version": ARCHIVE_FORMAT_VERSION,
-            "server_version": "8.0.0",
-            "tool_version": "100.12.2",
+            "db": database,
+            "collection": collection,
+            "metadata": "{}",
+            "size": 0_i32,
+            "type": "collection",
         })
         .unwrap()
     }
 
-    fn archive_with_metadata(metadata: Vec<u8>) -> Vec<u8> {
+    fn archive_documents(documents: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
         let mut bytes = ARCHIVE_MAGIC.to_vec();
-        bytes.extend(header());
-        bytes.extend(metadata);
+        bytes.extend(
+            bson::to_vec(&bson::doc! {
+                "concurrent_collections": 4_i32,
+                "version": ARCHIVE_FORMAT_VERSION,
+                "server_version": "8.0.0",
+                "tool_version": "100.12.2",
+            })
+            .unwrap(),
+        );
+        for document in documents {
+            bytes.extend(document);
+        }
         bytes.extend(ARCHIVE_TERMINATOR.to_le_bytes());
         bytes
     }
@@ -361,13 +361,6 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn accepts_the_official_literal_magic_bytes() {
-        let bytes = archive(&[("tenant", "users")]);
-        assert_eq!(&bytes[..4], &[0x6d, 0xe2, 0x99, 0x81]);
-        assert_eq!(inspect(&bytes).unwrap().databases, ["tenant"]);
-    }
-
     fn inspect(bytes: &[u8]) -> Result<MongoArchiveCatalog, InspectionError> {
         inspect_native_archive(
             &mut Cursor::new(bytes),
@@ -375,48 +368,38 @@ mod tests {
         )
     }
 
-    #[test]
-    fn prelude_reports_sorted_unique_source_databases() {
-        let result = inspect(&archive(&[
-            ("zeta", "events"),
-            ("alpha", "users"),
-            ("zeta", "users"),
-        ]))
-        .unwrap();
-        assert_eq!(result.databases, ["alpha", "zeta"]);
-        assert!(result.complete);
+    fn assert_invalid_contains(bytes: &[u8], expected: &str) {
+        let error = inspect(bytes).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
     }
 
     #[test]
-    fn prelude_excludes_system_and_database_less_metadata() {
-        let result = inspect(&archive(&[
+    fn catalog_semantics_cover_official_safe_system_and_unsafe_databases() {
+        let bytes = archive(&[
+            ("zeta", "events"),
             ("admin", "system.users"),
+            ("alpha", "users"),
             ("config", "settings"),
             ("local", "oplog.rs"),
             ("", "oplog.bson"),
-        ]))
-        .unwrap();
-        assert!(result.databases.is_empty());
+            ("zeta", "users"),
+        ]);
+        assert_eq!(&bytes[..4], &[0x6d, 0xe2, 0x99, 0x81]);
+
+        let result = inspect(&bytes).unwrap();
+        assert_eq!(result.databases, ["alpha", "zeta"]);
         assert!(result.complete);
+
+        let incomplete = inspect(&archive(&[("safe", "users"), ("bad.name", "secrets")])).unwrap();
+        assert_eq!(incomplete.databases, ["safe"]);
+        assert!(!incomplete.complete);
     }
 
     #[test]
-    fn unsafe_source_names_are_omitted_and_make_catalog_incomplete() {
-        let result = inspect(&archive(&[("safe", "users"), ("bad.name", "secrets")])).unwrap();
-        assert_eq!(result.databases, ["safe"]);
-        assert!(!result.complete);
-    }
-
-    #[test]
-    fn malformed_magic_version_and_metadata_fail_closed() {
+    fn malformed_magic_version_and_bson_fail_closed() {
         let mut invalid_magic = archive(&[("tenant", "users")]);
         invalid_magic[0] ^= 0xff;
-        assert!(
-            inspect(&invalid_magic)
-                .unwrap_err()
-                .to_string()
-                .contains("native")
-        );
+        assert_invalid_contains(&invalid_magic, "native");
 
         let mut unsupported = ARCHIVE_MAGIC.to_vec();
         unsupported.extend(
@@ -429,33 +412,23 @@ mod tests {
             .unwrap(),
         );
         unsupported.extend(ARCHIVE_TERMINATOR.to_le_bytes());
-        assert!(
-            inspect(&unsupported)
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported")
-        );
+        assert_invalid_contains(&unsupported, "unsupported");
 
+        let empty_archive = archive(&[]);
         let mut missing_collection = ARCHIVE_MAGIC.to_vec();
-        missing_collection.extend(&archive(&[])[4..archive(&[]).len() - 4]);
+        missing_collection.extend(&empty_archive[4..empty_archive.len() - 4]);
         missing_collection.extend(bson::to_vec(&bson::doc! { "db": "tenant" }).unwrap());
         missing_collection.extend(ARCHIVE_TERMINATOR.to_le_bytes());
-        assert!(
-            inspect(&missing_collection)
-                .unwrap_err()
-                .to_string()
-                .contains("collection metadata")
-        );
-    }
+        assert_invalid_contains(&missing_collection, "collection metadata");
 
-    #[test]
-    fn duplicate_required_fields_fail_closed() {
-        let mut metadata = Vec::new();
-        append_string(&mut metadata, "db", "tenant");
-        append_string(&mut metadata, "db", "other");
-        append_string(&mut metadata, "collection", "users");
-        let error = inspect(&archive_with_metadata(test_document(metadata))).unwrap_err();
-        assert!(matches!(error, InspectionError::Invalid(_)));
+        let mut duplicate_metadata = Vec::new();
+        append_string(&mut duplicate_metadata, "db", "tenant");
+        append_string(&mut duplicate_metadata, "db", "other");
+        append_string(&mut duplicate_metadata, "collection", "users");
+        assert!(matches!(
+            inspect(&archive_documents([test_document(duplicate_metadata)])),
+            Err(InspectionError::Invalid(_))
+        ));
 
         let mut duplicate_header = Vec::new();
         append_i32(&mut duplicate_header, "concurrent_collections", 1);
@@ -467,16 +440,15 @@ mod tests {
         bytes.extend(test_document(duplicate_header));
         bytes.extend(ARCHIVE_TERMINATOR.to_le_bytes());
         assert!(matches!(inspect(&bytes), Err(InspectionError::Invalid(_))));
-    }
 
-    #[test]
-    fn raw_iterator_errors_fail_closed() {
-        let mut metadata = Vec::new();
-        append_string(&mut metadata, "db", "tenant");
-        append_string(&mut metadata, "collection", "users");
-        metadata.extend([0x42, b'x', 0]);
-        let error = inspect(&archive_with_metadata(test_document(metadata))).unwrap_err();
-        assert!(matches!(error, InspectionError::Invalid(_)));
+        let mut invalid_element = Vec::new();
+        append_string(&mut invalid_element, "db", "tenant");
+        append_string(&mut invalid_element, "collection", "users");
+        invalid_element.extend([0x42, b'x', 0]);
+        assert!(matches!(
+            inspect(&archive_documents([test_document(invalid_element)])),
+            Err(InspectionError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -487,20 +459,15 @@ mod tests {
         metadata.push(0x03);
         metadata.extend(b"payload\0");
         metadata.extend(deeply_nested_document(20_000));
-        let error = inspect(&archive_with_metadata(test_document(metadata))).unwrap_err();
+        let error = inspect(&archive_documents([test_document(metadata)])).unwrap_err();
         assert!(matches!(error, InspectionError::Limit(_)));
     }
 
     #[test]
     fn excessive_metadata_count_is_bounded() {
-        let metadata = (0..=MAX_METADATA_DOCUMENTS)
-            .map(|index| ("tenant".to_string(), format!("c{index}")))
-            .collect::<Vec<_>>();
-        let borrowed = metadata
-            .iter()
-            .map(|(database, collection)| (database.as_str(), collection.as_str()))
-            .collect::<Vec<_>>();
-        let error = inspect(&archive(&borrowed)).unwrap_err();
+        let documents = (0..=MAX_METADATA_DOCUMENTS)
+            .map(|index| metadata_document("tenant", &format!("c{index}")));
+        let error = inspect(&archive_documents(documents)).unwrap_err();
         assert!(matches!(error, InspectionError::Limit(_)));
     }
 }

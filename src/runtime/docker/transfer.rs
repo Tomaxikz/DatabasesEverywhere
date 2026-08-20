@@ -1,6 +1,184 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    io::{Error as IoError, ErrorKind, Read, Write},
+    path::{Component, Path},
+    time::Instant,
+};
 
-use super::*;
+use bollard::{
+    body_try_stream,
+    query_parameters::{DownloadFromContainerOptionsBuilder, UploadToContainerOptionsBuilder},
+};
+use bytes::Bytes;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
+use tokio_util::io::{ReaderStream, StreamReader, SyncIoBridge};
+
+use super::{
+    DockerError, DockerInstanceSpec, DockerRuntime, EXEC_OUTPUT_TRUNCATION_MARKER,
+    FILE_TRANSFER_TIMEOUT, MAX_CONTAINER_TRANSFER_BYTES, MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL,
+};
+use crate::{runtime::docker::container_config::bind_mount, shared::protocol::Protocol};
+
+impl DockerRuntime {
+    pub async fn upload_file(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        host_path: &Path,
+        container_path: &str,
+    ) -> Result<(), DockerError> {
+        let container = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let (container_parent, container_file_name) = container_file_parts(container_path)?;
+        let metadata = tokio::fs::symlink_metadata(host_path)
+            .await
+            .map_err(|source| DockerError::FileTransferIo {
+                path: host_path.display().to_string(),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DockerError::InvalidTransferSource {
+                path: host_path.display().to_string(),
+            });
+        }
+        if metadata.len() > MAX_CONTAINER_TRANSFER_BYTES {
+            return Err(DockerError::FileTransferTooLarge {
+                path: host_path.display().to_string(),
+                size: metadata.len(),
+                max_bytes: MAX_CONTAINER_TRANSFER_BYTES,
+            });
+        }
+
+        let (uid, gid) = self
+            .configured_container_user(protocol, instance_id)
+            .await?
+            .as_deref()
+            .and_then(numeric_container_user)
+            .unwrap_or((0, 0));
+
+        let file = tokio::fs::File::open(host_path).await.map_err(|source| {
+            DockerError::FileTransferIo {
+                path: host_path.display().to_string(),
+                source,
+            }
+        })?;
+        let header = transfer_tar_header(&container_file_name, metadata.len(), uid, gid)?;
+        let trailer_len = tar_padding(metadata.len()) + 1024;
+        let stream = stream::once(async move { Ok::<Bytes, IoError>(header) })
+            .chain(ReaderStream::new(tokio::io::AsyncReadExt::take(
+                file,
+                metadata.len(),
+            )))
+            .chain(stream::once(async move {
+                Ok::<Bytes, IoError>(Bytes::from(vec![0_u8; trailer_len]))
+            }));
+
+        match tokio::time::timeout(
+            FILE_TRANSFER_TIMEOUT,
+            self.docker.upload_to_container(
+                &container,
+                Some(
+                    UploadToContainerOptionsBuilder::default()
+                        .path(&container_parent)
+                        .no_overwrite_dir_non_dir("true")
+                        .copy_uidgid("true")
+                        .build(),
+                ),
+                body_try_stream(stream),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                return Err(DockerError::FileTransferTimedOut {
+                    direction: "upload",
+                    path: host_path.display().to_string(),
+                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn download_file(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container_path: &str,
+        host_path: &Path,
+    ) -> Result<(), DockerError> {
+        self.download_file_bounded(
+            protocol,
+            instance_id,
+            container_path,
+            host_path,
+            MAX_CONTAINER_TRANSFER_BYTES,
+        )
+        .await
+    }
+
+    pub async fn download_file_bounded(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container_path: &str,
+        host_path: &Path,
+        max_bytes: u64,
+    ) -> Result<(), DockerError> {
+        let max_bytes = max_bytes.min(MAX_CONTAINER_TRANSFER_BYTES);
+        let container = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let (_, expected_file_name) = container_file_parts(container_path)?;
+        let async_deadline = tokio::time::Instant::now() + FILE_TRANSFER_TIMEOUT;
+        let blocking_deadline = Instant::now() + FILE_TRANSFER_TIMEOUT;
+        let stream = self
+            .docker
+            .download_from_container(
+                &container,
+                Some(
+                    DownloadFromContainerOptionsBuilder::default()
+                        .path(container_path)
+                        .build(),
+                ),
+            )
+            .map_err(IoError::other);
+        let stream = stream_with_deadline(stream, async_deadline).boxed();
+        let reader = StreamReader::new(stream);
+        let bridge = SyncIoBridge::new(reader);
+        let host_path = host_path.to_path_buf();
+        let error_path = host_path.display().to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            extract_single_regular_file_with_constraints(
+                bridge,
+                &expected_file_name,
+                &host_path,
+                max_bytes,
+                blocking_deadline,
+            )
+        })
+        .await
+        .map_err(|error| DockerError::FileTransferTask(error.to_string()))?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == ErrorKind::TimedOut => {
+                Err(DockerError::FileTransferTimedOut {
+                    direction: "download",
+                    path: error_path,
+                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
+                })
+            }
+            Err(source) => Err(DockerError::FileTransferIo {
+                path: error_path,
+                source,
+            }),
+        }
+    }
+}
 
 pub(super) fn container_mounts(spec: &DockerInstanceSpec) -> Vec<bollard::models::Mount> {
     let mut mounts = vec![

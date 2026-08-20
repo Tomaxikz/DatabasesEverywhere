@@ -110,36 +110,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_matching_bearer_token() {
+    fn accepts_only_the_matching_bearer_token() {
         let token = ApiToken::new("secret");
 
-        assert!(
-            token
-                .accepted_from_authorization_header(Some("Bearer secret"))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn rejects_wrong_token() {
-        let token = ApiToken::new("secret");
-
-        assert!(
-            token
-                .accepted_from_authorization_header(Some("Bearer other"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn rejects_missing_bearer_prefix() {
-        let token = ApiToken::new("secret");
-
-        assert!(
-            token
-                .accepted_from_authorization_header(Some("secret"))
-                .is_none()
-        );
+        for (header, accepted) in [
+            (Some("Bearer secret"), true),
+            (Some("Bearer other"), false),
+            (Some("secret"), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                token.accepted_from_authorization_header(header).is_some(),
+                accepted,
+                "unexpected authorization result for {header:?}"
+            );
+        }
     }
 
     #[test]

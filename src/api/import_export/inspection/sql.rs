@@ -7,19 +7,27 @@ use super::{
     MAX_SQL_TOKENS_PER_STATEMENT, Protocol,
 };
 
-#[derive(Clone, Debug)]
-struct SqlIdentifier {
-    text: String,
-}
-
-#[derive(Clone, Debug)]
 enum SqlToken {
-    Identifier(SqlIdentifier),
+    Identifier(String),
     OversizedIdentifier,
     Dot,
     Semicolon,
     Other,
 }
+
+const MAX_CAPTURED_COMMENT_BYTES: usize = 256;
+const MAX_DOLLAR_TAG_BYTES: usize = 64;
+const SQL_READ_BUFFER_BYTES: usize = 64 * 1024;
+const TABLE_MODIFIERS: &[&str] = &[
+    "OR",
+    "REPLACE",
+    "TEMP",
+    "TEMPORARY",
+    "UNLOGGED",
+    "GLOBAL",
+    "LOCAL",
+];
+const NAMESPACE_MODIFIERS: &[&str] = &["OR", "REPLACE", "TEMP", "TEMPORARY"];
 
 pub(super) fn inspect_sql_reader<R: Read>(
     reader: R,
@@ -33,7 +41,6 @@ pub(super) fn inspect_sql_reader<R: Read>(
             LexEvent::Comment(comment) => catalog.observe_comment(&comment),
             LexEvent::Token(SqlToken::Semicolon) => {
                 let copy_data = statement.finish(protocol, catalog)?;
-                statement = Statement::default();
                 if copy_data {
                     lexer.skip_postgres_copy_data()?;
                 }
@@ -53,7 +60,6 @@ enum LexEvent {
 struct SqlLexer<R> {
     input: ByteInput<R>,
     backslash_strings: bool,
-    escape_next_string: bool,
 }
 
 impl<R: Read> SqlLexer<R> {
@@ -64,7 +70,6 @@ impl<R: Read> SqlLexer<R> {
                 protocol,
                 Protocol::Mariadb | Protocol::Mysql | Protocol::Clickhouse
             ),
-            escape_next_string: false,
         }
     }
 
@@ -93,17 +98,14 @@ impl<R: Read> SqlLexer<R> {
                 return Ok(Some(LexEvent::Comment(self.read_block_comment()?)));
             }
             if byte == b'\'' {
-                let backslash_escapes = self.backslash_strings || self.escape_next_string;
-                self.escape_next_string = false;
-                self.skip_string(backslash_escapes)?;
+                self.skip_string(self.backslash_strings)?;
                 return Ok(Some(LexEvent::Token(SqlToken::Other)));
             }
             if matches!(byte, b'"' | b'`') {
                 let identifier = self.read_quoted_identifier(byte)?;
-                return Ok(Some(LexEvent::Token(match identifier {
-                    Some(identifier) => SqlToken::Identifier(SqlIdentifier { text: identifier }),
-                    None => SqlToken::OversizedIdentifier,
-                })));
+                return Ok(Some(LexEvent::Token(
+                    identifier.map_or(SqlToken::OversizedIdentifier, SqlToken::Identifier),
+                )));
             }
             if byte == b'$'
                 && let Some(delimiter) = self.try_dollar_delimiter()?
@@ -113,14 +115,18 @@ impl<R: Read> SqlLexer<R> {
             }
             if is_word_byte(byte) {
                 let identifier = self.read_word(byte)?;
-                self.escape_next_string = identifier
+                if identifier
                     .as_deref()
                     .is_some_and(|word| word.eq_ignore_ascii_case("E"))
-                    && self.input.peek()? == Some(b'\'');
-                return Ok(Some(LexEvent::Token(match identifier {
-                    Some(identifier) => SqlToken::Identifier(SqlIdentifier { text: identifier }),
-                    None => SqlToken::OversizedIdentifier,
-                })));
+                    && self.input.peek()? == Some(b'\'')
+                {
+                    self.input.next()?;
+                    self.skip_string(true)?;
+                    return Ok(Some(LexEvent::Token(SqlToken::Other)));
+                }
+                return Ok(Some(LexEvent::Token(
+                    identifier.map_or(SqlToken::OversizedIdentifier, SqlToken::Identifier),
+                )));
             }
             return Ok(Some(LexEvent::Token(match byte {
                 b'.' => SqlToken::Dot,
@@ -136,7 +142,7 @@ impl<R: Read> SqlLexer<R> {
             if byte == b'\n' {
                 break;
             }
-            if comment.len() < 256 {
+            if comment.len() < MAX_CAPTURED_COMMENT_BYTES {
                 comment.push(byte.to_ascii_lowercase());
             }
         }
@@ -163,7 +169,7 @@ impl<R: Read> SqlLexer<R> {
                 }
                 continue;
             }
-            if comment.len() < 256 {
+            if comment.len() < MAX_CAPTURED_COMMENT_BYTES {
                 comment.push(byte.to_ascii_lowercase());
             }
         }
@@ -232,7 +238,7 @@ impl<R: Read> SqlLexer<R> {
 
     fn try_dollar_delimiter(&mut self) -> Result<Option<Vec<u8>>, InspectionError> {
         let mut delimiter = vec![b'$'];
-        for index in 0..=64 {
+        for index in 0..=MAX_DOLLAR_TAG_BYTES {
             let Some(byte) = self.input.peek_n(index)? else {
                 return Ok(None);
             };
@@ -320,10 +326,10 @@ impl<R: Read> ByteInput<R> {
     fn new(reader: R) -> Self {
         Self {
             reader,
-            buffer: vec![0_u8; 64 * 1024].into_boxed_slice(),
+            buffer: vec![0_u8; SQL_READ_BUFFER_BYTES].into_boxed_slice(),
             start: 0,
             end: 0,
-            lookahead: VecDeque::with_capacity(64),
+            lookahead: VecDeque::with_capacity(MAX_DOLLAR_TAG_BYTES + 1),
         }
     }
 
@@ -365,24 +371,21 @@ impl<R: Read> ByteInput<R> {
 #[derive(Default)]
 struct Statement {
     tokens: Vec<SqlToken>,
-    previous_word: Option<String>,
+    previous_identifier_was_from: bool,
     copy_from_stdin: bool,
 }
 
 impl Statement {
     fn push(&mut self, token: SqlToken) {
-        if let SqlToken::Identifier(identifier) = &token {
-            if self
-                .previous_word
-                .as_deref()
-                .is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
-                && identifier.text.eq_ignore_ascii_case("STDIN")
-            {
-                self.copy_from_stdin = true;
+        match &token {
+            SqlToken::Identifier(identifier) => {
+                if self.previous_identifier_was_from && identifier.eq_ignore_ascii_case("STDIN") {
+                    self.copy_from_stdin = true;
+                }
+                self.previous_identifier_was_from = identifier.eq_ignore_ascii_case("FROM");
             }
-            self.previous_word = Some(identifier.text.clone());
-        } else if !matches!(token, SqlToken::Other) {
-            self.previous_word = None;
+            SqlToken::Other => {}
+            _ => self.previous_identifier_was_from = false,
         }
         if self.tokens.len() < MAX_SQL_TOKENS_PER_STATEMENT {
             self.tokens.push(token);
@@ -390,7 +393,7 @@ impl Statement {
     }
 
     fn finish(
-        &self,
+        &mut self,
         protocol: Protocol,
         catalog: &mut CatalogBuilder,
     ) -> Result<bool, InspectionError> {
@@ -415,16 +418,16 @@ impl Statement {
         }
         let first_is_copy =
             identifier_at(&self.tokens, 0).is_some_and(|word| word.eq_ignore_ascii_case("COPY"));
-        Ok(protocol == Protocol::Postgres && first_is_copy && self.copy_from_stdin)
+        let copy_data = protocol == Protocol::Postgres && first_is_copy && self.copy_from_stdin;
+        self.tokens.clear();
+        self.previous_identifier_was_from = false;
+        self.copy_from_stdin = false;
+        Ok(copy_data)
     }
 }
 
 fn is_table_statement(tokens: &[SqlToken]) -> bool {
-    identifier_at(tokens, 0).is_some_and(|word| {
-        word.eq_ignore_ascii_case("CREATE")
-            || word.eq_ignore_ascii_case("COPY")
-            || word.eq_ignore_ascii_case("INSERT")
-    })
+    identifier_at(tokens, 0).is_some_and(|word| is_any_keyword(word, &["CREATE", "COPY", "INSERT"]))
 }
 
 fn parse_create_table(tokens: &[SqlToken]) -> Option<(Option<String>, String)> {
@@ -432,21 +435,7 @@ fn parse_create_table(tokens: &[SqlToken]) -> Option<(Option<String>, String)> {
     if !take_word(tokens, &mut index, "CREATE") {
         return None;
     }
-    while identifier_at(tokens, index).is_some_and(|word| {
-        [
-            "OR",
-            "REPLACE",
-            "TEMP",
-            "TEMPORARY",
-            "UNLOGGED",
-            "GLOBAL",
-            "LOCAL",
-        ]
-        .iter()
-        .any(|modifier| word.eq_ignore_ascii_case(modifier))
-    }) {
-        index += 1;
-    }
+    skip_modifiers(tokens, &mut index, TABLE_MODIFIERS);
     if !take_word(tokens, &mut index, "TABLE") {
         return None;
     }
@@ -483,13 +472,7 @@ fn parse_insert_table(tokens: &[SqlToken]) -> Option<(Option<String>, String)> {
 fn parse_namespace(tokens: &[SqlToken]) -> Option<String> {
     let mut index = 0;
     if take_word(tokens, &mut index, "CREATE") {
-        while identifier_at(tokens, index).is_some_and(|word| {
-            ["OR", "REPLACE", "TEMP", "TEMPORARY"]
-                .iter()
-                .any(|modifier| word.eq_ignore_ascii_case(modifier))
-        }) {
-            index += 1;
-        }
+        skip_modifiers(tokens, &mut index, NAMESPACE_MODIFIERS);
         if !(take_word(tokens, &mut index, "SCHEMA") || take_word(tokens, &mut index, "DATABASE")) {
             return None;
         }
@@ -520,9 +503,21 @@ fn parse_qualified_identifier(
 
 fn identifier_at(tokens: &[SqlToken], index: usize) -> Option<&str> {
     match tokens.get(index) {
-        Some(SqlToken::Identifier(identifier)) => Some(&identifier.text),
+        Some(SqlToken::Identifier(identifier)) => Some(identifier),
         _ => None,
     }
+}
+
+fn skip_modifiers(tokens: &[SqlToken], index: &mut usize, modifiers: &[&str]) {
+    while identifier_at(tokens, *index).is_some_and(|word| is_any_keyword(word, modifiers)) {
+        *index += 1;
+    }
+}
+
+fn is_any_keyword(word: &str, expected: &[&str]) -> bool {
+    expected
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
 }
 
 fn take_word(tokens: &[SqlToken], index: &mut usize, expected: &str) -> bool {

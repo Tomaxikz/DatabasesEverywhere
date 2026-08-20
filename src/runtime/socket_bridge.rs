@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emits_strict_supervisor_arguments() {
+    fn validates_bridges_before_emitting_strict_supervisor_arguments() {
         let bridge = SocketBridge {
             socket_path: "/run/dbev/native.sock".to_string(),
             target: loopback_target(9000),
@@ -88,10 +88,6 @@ mod tests {
                 "/entrypoint.sh"
             ]
         );
-    }
-
-    #[test]
-    fn rejects_non_loopback_and_nested_bridges() {
         assert!(!is_valid_bridge(&SocketBridge {
             socket_path: "/run/dbev/nested/native.sock".to_string(),
             target: loopback_target(9000),

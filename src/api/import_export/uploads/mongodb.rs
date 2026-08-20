@@ -115,23 +115,16 @@ mod tests {
     }
 
     #[test]
-    fn one_complete_candidate_is_inferred() {
+    fn source_database_resolution_handles_inferred_explicit_and_inconclusive_catalogs() {
         assert_eq!(
             resolve_mongodb_source_database(Some(&catalog(&["tenant"], true)), None).unwrap(),
             Some("tenant".to_string())
         );
-    }
-
-    #[test]
-    fn multiple_candidates_require_an_explicit_choice() {
         assert!(matches!(
             resolve_mongodb_source_database(Some(&catalog(&["alpha", "beta"], true)), None),
             Err(ApiError::Conflict(_))
         ));
-    }
 
-    #[test]
-    fn empty_incomplete_or_missing_discovery_requires_manual_input() {
         for catalog in [
             Some(catalog(&[], true)),
             Some(catalog(&["detected"], false)),
@@ -142,23 +135,17 @@ mod tests {
                 Err(ApiError::Conflict(_))
             ));
         }
-    }
 
-    #[test]
-    fn provided_database_must_match_a_complete_nonempty_catalog() {
-        let catalog = catalog(&["alpha", "beta"], true);
+        let authoritative_catalog = catalog(&["alpha", "beta"], true);
         assert_eq!(
-            resolve_mongodb_source_database(Some(&catalog), Some("alpha")).unwrap(),
+            resolve_mongodb_source_database(Some(&authoritative_catalog), Some("alpha")).unwrap(),
             Some("alpha".to_string())
         );
         assert!(matches!(
-            resolve_mongodb_source_database(Some(&catalog), Some("gamma")),
+            resolve_mongodb_source_database(Some(&authoritative_catalog), Some("gamma")),
             Err(ApiError::Conflict(_))
         ));
-    }
 
-    #[test]
-    fn provided_database_is_the_fallback_for_inconclusive_discovery() {
         for catalog in [
             Some(catalog(&[], true)),
             Some(catalog(&["hint"], false)),

@@ -150,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resource_update_uses_oci_cgroup_units() {
+    fn resource_update_uses_versioned_route_and_oci_cgroup_units() {
         let body = update_limits_body(0.5, 96).unwrap();
         let json = serde_json::to_value(body).unwrap();
 
@@ -158,10 +158,6 @@ mod tests {
         assert_eq!(json["cpu"]["quota"], 50_000);
         assert_eq!(json["memory"]["limit"], 96 * 1024 * 1024);
         assert_eq!(json["memory"]["swap"], json["memory"]["limit"]);
-    }
-
-    #[test]
-    fn resource_update_url_uses_the_versioned_libpod_route() {
         let url = update_limits_url("dbev_redis_instance-one").unwrap();
 
         assert_eq!(

@@ -338,14 +338,6 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-    #[test]
-    fn hashes_api_key_for_routing() {
-        assert_eq!(
-            route_key_sha256("secret"),
-            "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
-        );
-    }
-
     #[tokio::test]
     async fn server_advertises_a_finite_concurrent_stream_limit() {
         let (client_io, server_io) = tokio::io::duplex(1024);

@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_registry_rejects_id_and_path_conflicts() {
+    fn project_registries_reject_id_path_and_name_conflicts() {
         let project = project();
 
         let id_conflict = updated_projects("200123:/srv/external\n", &project).unwrap_err();
@@ -480,11 +480,6 @@ mod tests {
 
         assert_eq!(id_conflict.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(path_conflict.kind(), std::io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn projid_registry_rejects_id_and_name_conflicts() {
-        let project = project();
 
         let id_conflict = updated_projid("external:200123\n", &project).unwrap_err();
         let name_conflict = updated_projid("dbe_200123:42\n", &project).unwrap_err();

@@ -94,17 +94,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_fqdn_is_allowed_for_a_concrete_bind_host() {
+    fn fqdn_is_optional_for_concrete_binds_and_required_for_wildcards() {
         validate_api_fqdn("").unwrap();
         validate_api_hosts(&Config {
             remote: "https://panel.example.com".to_string(),
             ..Config::default()
         })
         .unwrap();
-    }
 
-    #[test]
-    fn wildcard_bind_requires_a_canonical_fqdn() {
         let config = Config {
             remote: "https://panel.example.com".to_string(),
             api: crate::config::ApiConfig {

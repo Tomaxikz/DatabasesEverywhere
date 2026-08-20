@@ -817,12 +817,19 @@ mod tests {
     use crate::config::Config;
 
     #[test]
-    fn rejects_empty_api_token() {
+    fn rejects_missing_node_identity_and_api_token() {
         let config = Config::default();
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::EmptyUuid)
+        ));
 
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(error, ConfigValidationError::EmptyUuid));
+        let mut config = valid_config();
+        config.token.clear();
+        assert!(matches!(
+            validate_config(&config),
+            Err(ConfigValidationError::EmptyApiToken)
+        ));
     }
 
     #[test]
@@ -836,11 +843,6 @@ mod tests {
             error,
             ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::Relative { .. })
         ));
-    }
-
-    #[test]
-    fn accepts_simple_valid_config() {
-        validate_config(&valid_config()).unwrap();
     }
 
     #[test]
@@ -1021,16 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_token() {
-        let mut config = valid_config();
-        config.token = String::new();
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(error, ConfigValidationError::EmptyApiToken));
-    }
-
-    #[test]
     fn rejects_weak_or_placeholder_secrets() {
         let mut config = valid_config();
         config.token = "short-token".to_string();
@@ -1099,18 +1091,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_hostname_api_bind_without_native_tls() {
-        for host in ["localhost", "dbe.internal"] {
-            let mut config = valid_config();
-            config.api.host = host.to_string();
-
-            validate_config(&config).unwrap();
-        }
-    }
-
-    #[test]
-    fn accepts_literal_ipv4_and_ipv6_loopback_api_binds() {
-        for host in ["127.0.0.1", "::1"] {
+    fn accepts_supported_hostname_and_loopback_api_binds() {
+        for host in ["localhost", "dbe.internal", "127.0.0.1", "::1"] {
             let mut config = valid_config();
             config.api.host = host.to_string();
 
@@ -1139,11 +1121,22 @@ mod tests {
     }
 
     #[test]
-    fn accepts_absolute_container_engine_socket_path() {
+    fn container_engine_socket_path_must_be_absolute() {
         let mut config = valid_config();
         config.daemon.socket_path = "/run/podman/podman.sock".to_string();
 
         validate_config(&config).unwrap();
+        config.daemon.socket_path = "podman.sock".to_string();
+
+        let error = validate_config(&config).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigValidationError::RelativePath {
+                field: "daemon.socket_path",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1181,30 +1174,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_relative_container_engine_socket_path() {
-        let mut config = valid_config();
-        config.daemon.socket_path = "podman.sock".to_string();
-
-        let error = validate_config(&config).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ConfigValidationError::RelativePath {
-                field: "daemon.socket_path",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn identifies_kernels_affected_by_mongodb_8_incompatibility() {
+    fn identifies_mongodb_8_images_and_incompatible_kernels() {
         assert!(!kernel_is_6_19_or_newer("6.18.20"));
         assert!(kernel_is_6_19_or_newer("6.19.0"));
         assert!(kernel_is_6_19_or_newer("7.0.12-1-cachyos"));
-    }
-
-    #[test]
-    fn identifies_mongodb_8_or_latest_images() {
         assert!(!mongodb_image_is_8_or_newer("mongo:7.0.37"));
         assert!(mongodb_image_is_8_or_newer("mongo:8.3.4"));
         assert!(mongodb_image_is_8_or_newer(
@@ -1415,11 +1388,6 @@ mod tests {
         let error = validate_config(&config).unwrap_err();
 
         assert!(matches!(error, ConfigValidationError::InvalidRemoteUrl));
-    }
-
-    #[test]
-    fn accepts_default_import_upload_limits() {
-        validate_config(&valid_config()).unwrap();
     }
 
     #[test]

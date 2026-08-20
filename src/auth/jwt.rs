@@ -171,37 +171,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_instance() {
+    fn instance_scope_rejects_foreign_and_empty_instance_claims() {
         let secret = b"secret";
-        let token = encode(
-            &Header::default(),
-            &claims(scopes::LOGS_READ, "inst_abc", 3600),
-            &EncodingKey::from_secret(secret),
-        )
-        .unwrap();
-
-        let error =
-            validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other")).unwrap_err();
-
-        assert!(matches!(error, JwtAuthError::MissingInstance { .. }));
-    }
-
-    #[test]
-    fn empty_instance_list_does_not_grant_node_wide_access() {
-        let secret = b"secret";
-        let mut claims = claims(scopes::LOGS_READ, "inst_abc", 3600);
-        claims.instances.clear();
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret),
-        )
-        .unwrap();
-
-        let error =
-            validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other")).unwrap_err();
-
-        assert!(matches!(error, JwtAuthError::MissingInstance { .. }));
+        for instances in [vec!["inst_abc".to_string()], Vec::new()] {
+            let mut claims = claims(scopes::LOGS_READ, "inst_abc", 3600);
+            claims.instances = instances;
+            let token = encode(
+                &Header::default(),
+                &claims,
+                &EncodingKey::from_secret(secret),
+            )
+            .unwrap();
+            assert!(matches!(
+                validate_ws_token(&token, secret, scopes::LOGS_READ, Some("inst_other")),
+                Err(JwtAuthError::MissingInstance { .. })
+            ));
+        }
     }
 
     #[test]

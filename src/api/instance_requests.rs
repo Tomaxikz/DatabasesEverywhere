@@ -220,48 +220,38 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_requires_startup_memory_floor() {
-        let error = validate_protocol_limits(Protocol::Mongodb, &limits(512, 1024)).unwrap_err();
-
-        assert!(error.to_string().contains("memory_mib"));
+    fn protocol_startup_resource_floors_are_enforced() {
+        for protocol in [Protocol::Mongodb, Protocol::Clickhouse] {
+            for (name, requested, field) in [
+                ("low memory", limits(512, 1024), "memory_mib"),
+                ("low disk", limits(1024, 768), "disk_mib"),
+            ] {
+                let error = validate_protocol_limits(protocol, &requested).unwrap_err();
+                assert!(
+                    error.to_string().contains(field),
+                    "{protocol:?} {name} reported the wrong field: {error}"
+                );
+            }
+            validate_protocol_limits(protocol, &limits(1024, 1024)).unwrap();
+        }
     }
 
     #[test]
-    fn mongodb_requires_startup_disk_floor() {
-        let error = validate_protocol_limits(Protocol::Mongodb, &limits(1024, 768)).unwrap_err();
-
-        assert!(error.to_string().contains("disk_mib"));
-    }
-
-    #[test]
-    fn mongodb_accepts_startup_resource_floor() {
-        validate_protocol_limits(Protocol::Mongodb, &limits(1024, 1024)).unwrap();
-    }
-
-    #[test]
-    fn clickhouse_requires_startup_resource_floor() {
-        let memory_error =
-            validate_protocol_limits(Protocol::Clickhouse, &limits(512, 1024)).unwrap_err();
-        let disk_error =
-            validate_protocol_limits(Protocol::Clickhouse, &limits(1024, 768)).unwrap_err();
-
-        assert!(memory_error.to_string().contains("memory_mib"));
-        assert!(disk_error.to_string().contains("disk_mib"));
-    }
-
-    #[test]
-    fn rejects_database_and_username_metacharacters() {
-        assert!(validate_database_name("bad.name").is_err());
-        assert!(validate_username("bad user").is_err());
-        assert!(validate_username("-bad").is_err());
-    }
-
-    #[test]
-    fn rejects_reserved_database_and_usernames() {
-        assert!(validate_database_name("postgres").is_err());
-        assert!(validate_username("root").is_err());
-        assert!(validate_username("dbe_admin").is_err());
-        assert!(validate_username("dbe_health").is_err());
+    fn database_and_username_identifier_policy_is_enforced() {
+        for database in ["bad.name", "postgres"] {
+            assert!(
+                validate_database_name(database).is_err(),
+                "accepted database name: {database}"
+            );
+        }
+        for username in ["bad user", "-bad", "root", "dbe_admin", "dbe_health"] {
+            assert!(
+                validate_username(username).is_err(),
+                "accepted username: {username}"
+            );
+        }
+        validate_database_name("app_db-1").unwrap();
+        validate_username("app_user-1").unwrap();
     }
 
     #[test]
@@ -277,12 +267,6 @@ mod tests {
         }
         assert!(validate_database_password(Protocol::Qdrant, "bad\u{7f}header").is_err());
         assert!(validate_database_password(Protocol::Postgres, "valid password").is_ok());
-    }
-
-    #[test]
-    fn accepts_database_and_username_identifiers() {
-        validate_database_name("app_db-1").unwrap();
-        validate_username("app_user-1").unwrap();
     }
 
     #[test]

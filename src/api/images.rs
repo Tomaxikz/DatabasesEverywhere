@@ -107,30 +107,33 @@ mod tests {
     };
 
     #[test]
-    fn rejects_custom_latest_or_untagged_images() {
-        assert!(validate_image("postgres").is_err());
-        assert!(validate_image("postgres:latest").is_err());
-        assert!(validate_image("registry.example.com:5000/postgres:latest").is_err());
-    }
-
-    #[test]
-    fn accepts_custom_tagged_or_digest_pinned_images() {
+    fn validates_custom_image_references() {
         let digest = format!("postgres@sha256:{}", "a".repeat(64));
-
-        assert_eq!(validate_image("postgres:18.4").unwrap(), "postgres:18.4");
-        assert_eq!(
-            validate_image("registry.example.com:5000/postgres:18.4").unwrap(),
-            "registry.example.com:5000/postgres:18.4"
-        );
-        assert_eq!(validate_image(&digest).unwrap(), digest);
+        for (image, valid) in [
+            ("postgres", false),
+            ("postgres:latest", false),
+            ("registry.example.com:5000/postgres:latest", false),
+            ("postgres:18.4", true),
+            ("registry.example.com:5000/postgres:18.4", true),
+            (&digest, true),
+        ] {
+            assert_eq!(
+                validate_image(image).is_ok(),
+                valid,
+                "unexpected image validation result: {image}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn image_allowlist_implicitly_allows_configured_image() {
+    async fn image_allowlist_accepts_configured_and_protocol_entries_only() {
         let state = test_state(Config {
             images: crate::config::ImageConfig {
                 postgres: "postgres:18.4".to_string(),
-                allowed: ImageAllowlistConfig::default(),
+                allowed: ImageAllowlistConfig {
+                    postgres: vec!["postgres:18.5".to_string()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -138,41 +141,7 @@ mod tests {
         .await;
 
         ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.4").unwrap();
-    }
-
-    #[tokio::test]
-    async fn image_allowlist_allows_protocol_specific_entries() {
-        let state = test_state(Config {
-            images: crate::config::ImageConfig {
-                postgres: "postgres:18.4".to_string(),
-                allowed: ImageAllowlistConfig {
-                    postgres: vec!["postgres:18.5".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await;
-
         ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.5").unwrap();
-    }
-
-    #[tokio::test]
-    async fn image_allowlist_rejects_unlisted_pinned_image() {
-        let state = test_state(Config {
-            images: crate::config::ImageConfig {
-                postgres: "postgres:18.4".to_string(),
-                allowed: ImageAllowlistConfig {
-                    postgres: vec!["postgres:18.5".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await;
-
         let error = ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.6").unwrap_err();
 
         assert!(error.to_string().contains("is not allowed"));

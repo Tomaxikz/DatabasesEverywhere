@@ -124,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provisions_with_caching_sha2_without_embedding_plaintext() {
+    fn tenant_provisioning_uses_one_protected_caching_sha2_password() {
         let sql = tenant_user_sql("app_db", "app_user");
 
         assert!(sql.contains("CREATE DATABASE IF NOT EXISTS `app_db`"));
@@ -132,17 +132,17 @@ mod tests {
         assert!(sql.contains("GRANT ALL PRIVILEGES ON `app_db`.*"));
         assert!(sql.contains(PASSWORD_B64_PLACEHOLDER));
         assert!(!sql.contains("mysql_native_password"));
-    }
-
-    #[test]
-    fn disables_logs_before_materializing_the_password() {
-        let sql = tenant_user_sql("app_db", "app_user");
         let disable_binlog = sql.find("SET SESSION sql_log_bin = 0;").unwrap();
         let disable_general_log = sql.find("SET SESSION sql_log_off = 1;").unwrap();
         let password = sql.find("SET @dbev_password").unwrap();
 
         assert!(disable_binlog < password);
         assert!(disable_general_log < password);
+        let (before, after) = password_sql_fragments(&sql).unwrap();
+
+        assert!(!before.contains(PASSWORD_B64_PLACEHOLDER));
+        assert!(!after.contains(PASSWORD_B64_PLACEHOLDER));
+        assert_eq!(sql.matches(PASSWORD_B64_PLACEHOLDER).count(), 1);
     }
 
     #[test]
@@ -153,16 +153,6 @@ mod tests {
         assert!(!sql.contains("CREATE DATABASE"));
         assert!(!sql.contains("CREATE USER"));
         assert!(!sql.contains("GRANT "));
-    }
-
-    #[test]
-    fn splits_the_single_protected_password_placeholder() {
-        let sql = tenant_user_sql("app_db", "app_user");
-        let (before, after) = password_sql_fragments(&sql).unwrap();
-
-        assert!(!before.contains(PASSWORD_B64_PLACEHOLDER));
-        assert!(!after.contains(PASSWORD_B64_PLACEHOLDER));
-        assert_eq!(sql.matches(PASSWORD_B64_PLACEHOLDER).count(), 1);
     }
 
     #[test]

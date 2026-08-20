@@ -120,15 +120,11 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_http_socket_is_a_sibling_of_native_socket() {
+    fn secondary_protocol_sockets_are_distinct_siblings() {
         assert_eq!(
             clickhouse_http_socket_path(Path::new("/run/private/clickhouse-native.sock")),
             Some(PathBuf::from("/run/private/clickhouse-http.sock"))
         );
-    }
-
-    #[test]
-    fn qdrant_http_socket_is_a_sibling_of_grpc_socket() {
         assert_eq!(
             qdrant_http_socket_path(Path::new("/run/private/qdrant-grpc.sock")),
             Some(PathBuf::from("/run/private/qdrant-http.sock"))

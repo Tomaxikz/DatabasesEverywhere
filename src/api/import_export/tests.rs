@@ -169,17 +169,13 @@ async fn compressed_export_cannot_write_past_its_reserved_bound() {
 }
 
 #[test]
-fn physical_operation_preserves_primary_error_over_restart_error() {
+fn physical_operation_preserves_primary_or_restart_error_order() {
     let result = preserve_primary_error(
         Err(ApiError::BadRequest("restore failed".to_string())),
         Err(ApiError::Runtime("restart failed".to_string())),
     );
 
     assert!(matches!(result, Err(ApiError::BadRequest(message)) if message == "restore failed"));
-}
-
-#[test]
-fn physical_operation_returns_restart_error_after_primary_success() {
     let result =
         preserve_primary_error(Ok(()), Err(ApiError::Runtime("restart failed".to_string())));
 
@@ -957,7 +953,7 @@ fn legacy_archive_flags_are_rejected_instead_of_ignored() {
 }
 
 #[test]
-fn export_selection_accepts_legacy_empty_fields_array() {
+fn export_selection_accepts_only_the_legacy_empty_fields_array() {
     let request = serde_json::from_value::<ExportRequest>(serde_json::json!({
         "selection": {
             "mode": "selective",
@@ -969,10 +965,6 @@ fn export_selection_accepts_legacy_empty_fields_array() {
     .unwrap();
 
     assert!(request.selection.unwrap().fields.is_empty());
-}
-
-#[test]
-fn export_selection_rejects_nonempty_fields_array() {
     let error = serde_json::from_value::<ExportRequest>(serde_json::json!({
         "selection": {
             "mode": "selective",

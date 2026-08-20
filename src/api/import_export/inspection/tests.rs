@@ -111,6 +111,7 @@ fn postgres_catalog_handles_quotes_copy_and_ignored_sql_text() {
 CREATE SCHEMA "public";
 CREATE TABLE "public"."Users" (id bigint);
 INSERT INTO "audit"."events" VALUES ('CREATE TABLE fake.inside_string (id int);');
+INSERT INTO "audit"."events" VALUES (E'CREATE TABLE fake.inside_escape_string (id int);');
 COPY public.orders (id, note) FROM stdin;
 1	CREATE TABLE fake.copy_data
 \.
@@ -168,19 +169,7 @@ CREATE TABLE analytics.metrics (value Float64) ENGINE = TinyLog;
 }
 
 #[test]
-fn quoted_portable_names_are_unquoted_and_unsupported_names_are_omitted() {
-    let sql = br#"
-CREATE TABLE "public"."normal-name" (id int);
-CREATE TABLE "public"."not selectable" (id int);
-"#;
-    let result = scan_sql(Protocol::Postgres, sql).unwrap();
-    assert_eq!(result.objects.len(), 1);
-    assert_eq!(result.objects[0].selection_key, "public.normal-name");
-    assert_eq!(result.unselectable_object_count, 1);
-}
-
-#[test]
-fn dialect_markers_reject_protocol_mismatches_without_echoing_content() {
+fn sql_failures_reject_mismatches_malformed_contexts_and_binary_data() {
     let error = scan_sql(
         Protocol::Postgres,
         b"-- MySQL dump secret-marker-which-must-not-leak\nCREATE TABLE users(id int);",
@@ -189,10 +178,7 @@ fn dialect_markers_reject_protocol_mismatches_without_echoing_content() {
     let message = error.to_string();
     assert!(message.contains("does not match"));
     assert!(!message.contains("secret-marker"));
-}
 
-#[test]
-fn malformed_sql_contexts_fail_closed() {
     for sql in [
         b"CREATE TABLE users (value text DEFAULT 'unterminated);".as_slice(),
         b"/* unterminated CREATE TABLE users(id int);".as_slice(),
@@ -201,10 +187,7 @@ fn malformed_sql_contexts_fail_closed() {
     ] {
         assert!(scan_sql(Protocol::Postgres, sql).is_err());
     }
-}
 
-#[test]
-fn binary_sql_input_is_rejected() {
     let error = scan_sql(
         Protocol::Postgres,
         b"CREATE TABLE users(id int);\0CREATE TABLE hidden(id int);",
@@ -214,7 +197,16 @@ fn binary_sql_input_is_rejected() {
 }
 
 #[test]
-fn identifier_and_object_count_limits_are_enforced() {
+fn sql_identifier_and_catalog_limits_are_bounded() {
+    let sql = br#"
+CREATE TABLE "public"."normal-name" (id int);
+CREATE TABLE "public"."not selectable" (id int);
+"#;
+    let result = scan_sql(Protocol::Postgres, sql).unwrap();
+    assert_eq!(result.objects.len(), 1);
+    assert_eq!(result.objects[0].selection_key, "public.normal-name");
+    assert_eq!(result.unselectable_object_count, 1);
+
     let long_name = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
     let result = scan_sql(
         Protocol::Postgres,
@@ -231,10 +223,7 @@ fn identifier_and_object_count_limits_are_enforced() {
     let result = scan_sql(Protocol::Postgres, many.as_bytes()).unwrap();
     assert_eq!(result.objects.len(), MAX_OBJECTS);
     assert!(!result.catalog_complete);
-}
 
-#[test]
-fn long_unquoted_data_tokens_do_not_exhaust_identifier_memory() {
     let value = "a".repeat(MAX_IDENTIFIER_BYTES * 8);
     let sql = format!(
         "-- MySQL dump\nCREATE TABLE `payloads` (`value` longblob); INSERT INTO `payloads` VALUES (0x{value});"

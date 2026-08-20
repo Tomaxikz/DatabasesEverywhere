@@ -932,72 +932,83 @@ mod tests {
     }
 
     #[test]
-    fn scoped_claims_filter_foreign_jobs_when_query_is_omitted() {
-        let claims = claims_for_instances(vec!["inst_allowed"]);
-        let foreign_job = sample_job("job-foreign", "inst_foreign");
+    fn websocket_job_access_obeys_scoped_and_node_wide_claims() {
+        let cases = [
+            (
+                "foreign job without query",
+                vec!["inst_allowed"],
+                false,
+                "job-foreign",
+                "inst_foreign",
+                "inst_allowed",
+                false,
+                false,
+            ),
+            (
+                "foreign job ID lookup",
+                vec!["inst_allowed"],
+                false,
+                "job-foreign",
+                "inst_foreign",
+                "inst_allowed",
+                true,
+                false,
+            ),
+            (
+                "own job event",
+                vec!["inst_allowed"],
+                false,
+                "job-own",
+                "inst_allowed",
+                "inst_allowed",
+                false,
+                true,
+            ),
+            (
+                "node-wide claim",
+                Vec::new(),
+                true,
+                "job-any",
+                "inst_any",
+                "inst_any",
+                false,
+                true,
+            ),
+            (
+                "empty scoped claim",
+                Vec::new(),
+                false,
+                "job-any",
+                "inst_any",
+                "inst_any",
+                false,
+                false,
+            ),
+        ];
 
-        assert!(!job_matches_access(
-            &foreign_job,
-            "inst_allowed",
-            &ImportExportQuery::default(),
-            &claims,
-        ));
-    }
-
-    #[test]
-    fn scoped_claims_filter_foreign_job_id_lookup() {
-        let claims = claims_for_instances(vec!["inst_allowed"]);
-        let foreign_job = sample_job("job-foreign", "inst_foreign");
-        let query = ImportExportQuery {
-            job_id: Some(foreign_job.job_id.clone()),
-        };
-
-        assert!(!job_matches_access(
-            &foreign_job,
-            "inst_allowed",
-            &query,
-            &claims
-        ));
-    }
-
-    #[test]
-    fn scoped_claims_allow_own_job_events() {
-        let claims = claims_for_instances(vec!["inst_allowed"]);
-        let own_job = sample_job("job-own", "inst_allowed");
-
-        assert!(job_matches_access(
-            &own_job,
-            "inst_allowed",
-            &ImportExportQuery::default(),
-            &claims,
-        ));
-    }
-
-    #[test]
-    fn explicit_node_wide_claim_allows_foreign_jobs() {
-        let mut claims = claims_for_instances(Vec::new());
-        claims.all_instances = true;
-        let job = sample_job("job-any", "inst_any");
-
-        assert!(job_matches_access(
-            &job,
-            "inst_any",
-            &ImportExportQuery::default(),
-            &claims,
-        ));
-    }
-
-    #[test]
-    fn empty_instance_claims_do_not_grant_access() {
-        let claims = claims_for_instances(Vec::new());
-        let job = sample_job("job-any", "inst_any");
-
-        assert!(!job_matches_access(
-            &job,
-            "inst_any",
-            &ImportExportQuery::default(),
-            &claims,
-        ));
+        for (
+            name,
+            instances,
+            all_instances,
+            job_id,
+            job_instance,
+            route_instance,
+            query,
+            expected,
+        ) in cases
+        {
+            let mut claims = claims_for_instances(instances);
+            claims.all_instances = all_instances;
+            let job = sample_job(job_id, job_instance);
+            let query = ImportExportQuery {
+                job_id: query.then(|| job.job_id.clone()),
+            };
+            assert_eq!(
+                job_matches_access(&job, route_instance, &query, &claims),
+                expected,
+                "access case failed: {name}"
+            );
+        }
     }
 
     fn claims_for_instances(instances: Vec<&str>) -> Claims {

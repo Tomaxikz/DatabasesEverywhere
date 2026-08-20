@@ -58,42 +58,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_production_limit_boundaries() {
-        validate_runtime_limits(MIN_CPU_CORES, 1).unwrap();
-        validate_runtime_limits(MAX_CPU_CORES, MAX_MEMORY_MIB).unwrap();
-    }
-
-    #[test]
-    fn rejects_non_finite_cpu_limits() {
-        for cpu_cores in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    fn validates_all_production_limit_boundaries() {
+        let cases = [
+            (MIN_CPU_CORES, 1, Ok(())),
+            (MAX_CPU_CORES, MAX_MEMORY_MIB, Ok(())),
+            (f64::NAN, 1024, Err(ResourceLimitError::InvalidCpuCores)),
+            (
+                f64::INFINITY,
+                1024,
+                Err(ResourceLimitError::InvalidCpuCores),
+            ),
+            (
+                f64::NEG_INFINITY,
+                1024,
+                Err(ResourceLimitError::InvalidCpuCores),
+            ),
+            (
+                MAX_CPU_CORES + 0.1,
+                1024,
+                Err(ResourceLimitError::CpuCoresTooHigh),
+            ),
+            (
+                1.0,
+                MAX_MEMORY_MIB + 1,
+                Err(ResourceLimitError::MemoryTooHigh),
+            ),
+            (1.0, 1_u64 << 44, Err(ResourceLimitError::MemoryTooHigh)),
+            (
+                MIN_CPU_CORES / 2.0,
+                1024,
+                Err(ResourceLimitError::InvalidCpuCores),
+            ),
+        ];
+        for (cpu_cores, memory_mib, expected) in cases {
             assert_eq!(
-                validate_runtime_limits(cpu_cores, 1024),
-                Err(ResourceLimitError::InvalidCpuCores)
+                validate_runtime_limits(cpu_cores, memory_mib),
+                expected,
+                "cpu={cpu_cores:?}, memory_mib={memory_mib}"
             );
         }
-    }
-
-    #[test]
-    fn rejects_limits_above_production_caps() {
-        assert_eq!(
-            validate_runtime_limits(MAX_CPU_CORES + 0.1, 1024),
-            Err(ResourceLimitError::CpuCoresTooHigh)
-        );
-        assert_eq!(
-            validate_runtime_limits(1.0, MAX_MEMORY_MIB + 1),
-            Err(ResourceLimitError::MemoryTooHigh)
-        );
-        assert_eq!(
-            validate_runtime_limits(1.0, 1_u64 << 44),
-            Err(ResourceLimitError::MemoryTooHigh)
-        );
-    }
-
-    #[test]
-    fn rejects_cpu_values_below_docker_minimum() {
-        assert_eq!(
-            validate_runtime_limits(MIN_CPU_CORES / 2.0, 1024),
-            Err(ResourceLimitError::InvalidCpuCores)
-        );
     }
 }

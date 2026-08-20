@@ -169,44 +169,39 @@ mod tests {
     }
 
     #[test]
-    fn redacts_urls_with_passwords() {
-        assert_eq!(
-            redact_connection_url("postgres://user:pass@localhost/db"),
-            "postgres://[redacted]@localhost/db"
-        );
-    }
-
-    #[test]
-    fn redacts_multiple_urls_without_removing_surrounding_text() {
-        assert_eq!(
-            redact_connection_url(
-                "first=postgres://user:pass@db/a second=mysql://root:secret@db/b"
+    fn redacts_connection_secrets_without_damaging_safe_text() {
+        for (name, input, expected) in [
+            (
+                "URL password",
+                "postgres://user:pass@localhost/db",
+                "postgres://[redacted]@localhost/db",
             ),
-            "first=postgres://[redacted]@db/a second=mysql://[redacted]@db/b"
-        );
-    }
-
-    #[test]
-    fn redacts_environment_and_json_secret_assignments() {
-        assert_eq!(
-            redact_connection_url("PASSWORD=hunter2 safe=value {\"api_token\": \"token-value\"}"),
-            "PASSWORD=[redacted] safe=value {\"api_token\": \"[redacted]\"}"
-        );
-    }
-
-    #[test]
-    fn redacts_quoted_escapes_and_unquoted_commas() {
-        assert_eq!(
-            redact_connection_url("PASSWORD=one,two {\"token\":\"a\\\"b\"}"),
-            "PASSWORD=[redacted] {\"token\":\"[redacted]\"}"
-        );
-    }
-
-    #[test]
-    fn leaves_urls_without_userinfo_unchanged() {
-        assert_eq!(
-            redact_connection_url("https://example.com/path"),
-            "https://example.com/path"
-        );
+            (
+                "multiple URLs",
+                "first=postgres://user:pass@db/a second=mysql://root:secret@db/b",
+                "first=postgres://[redacted]@db/a second=mysql://[redacted]@db/b",
+            ),
+            (
+                "environment and JSON",
+                "PASSWORD=hunter2 safe=value {\"api_token\": \"token-value\"}",
+                "PASSWORD=[redacted] safe=value {\"api_token\": \"[redacted]\"}",
+            ),
+            (
+                "quoted escapes and commas",
+                "PASSWORD=one,two {\"token\":\"a\\\"b\"}",
+                "PASSWORD=[redacted] {\"token\":\"[redacted]\"}",
+            ),
+            (
+                "safe URL",
+                "https://example.com/path",
+                "https://example.com/path",
+            ),
+        ] {
+            assert_eq!(
+                redact_connection_url(input),
+                expected,
+                "redaction case failed: {name}"
+            );
+        }
     }
 }

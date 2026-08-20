@@ -11,25 +11,7 @@ use crate::{
 };
 
 #[tokio::test]
-async fn create_request_allows_configured_image_override() {
-    let state = test_state(Config {
-        images: ImageConfig {
-            postgres: "postgres:18.4".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .await;
-    let mut request = create_request(Protocol::Postgres);
-    request.image = Some("postgres:18.4".to_string());
-
-    let image = requested_or_configured_image(&state, &request).unwrap();
-
-    assert_eq!(image, "postgres:18.4");
-}
-
-#[tokio::test]
-async fn create_request_allows_protocol_allowlisted_image_override() {
+async fn create_request_enforces_configured_and_allowlisted_images() {
     let state = test_state(Config {
         images: ImageConfig {
             postgres: "postgres:18.4".to_string(),
@@ -42,34 +24,22 @@ async fn create_request_allows_protocol_allowlisted_image_override() {
         ..Default::default()
     })
     .await;
-    let mut request = create_request(Protocol::Postgres);
-    request.image = Some("postgres:18.5".to_string());
-
-    let image = requested_or_configured_image(&state, &request).unwrap();
-
-    assert_eq!(image, "postgres:18.5");
-}
-
-#[tokio::test]
-async fn create_request_rejects_unlisted_image_override_before_pull() {
-    let state = test_state(Config {
-        images: ImageConfig {
-            postgres: "postgres:18.4".to_string(),
-            allowed: ImageAllowlistConfig {
-                postgres: vec!["postgres:18.5".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .await;
+    for image in ["postgres:18.4", "postgres:18.5"] {
+        let mut request = create_request(Protocol::Postgres);
+        request.image = Some(image.to_string());
+        assert_eq!(
+            requested_or_configured_image(&state, &request).unwrap(),
+            image
+        );
+    }
     let mut request = create_request(Protocol::Postgres);
     request.image = Some("postgres:18.6".to_string());
-
-    let error = requested_or_configured_image(&state, &request).unwrap_err();
-
-    assert!(error.to_string().contains("is not allowed"));
+    assert!(
+        requested_or_configured_image(&state, &request)
+            .unwrap_err()
+            .to_string()
+            .contains("is not allowed")
+    );
 }
 
 #[test]
@@ -101,61 +71,34 @@ async fn create_request_allows_same_database_name_for_a_distinct_route_user() {
 }
 
 #[tokio::test]
-async fn create_request_rejects_existing_redis_route_for_username() {
-    let state = test_state(Config::default()).await;
-    state
-        .instances
-        .upsert(sample_metadata(
-            "inst_existing_redis",
-            Protocol::Redis,
-            "first_cache",
-            "shared_user",
-        ))
-        .await;
-    let mut request = create_request(Protocol::Redis);
-    request.instance_id = "inst_new_redis".to_string();
-    request.database = "second_cache".to_string();
-    request.username = "shared_user".to_string();
+async fn create_request_rejects_existing_cache_route_for_username() {
+    for protocol in [Protocol::Redis, Protocol::Valkey] {
+        let state = test_state(Config::default()).await;
+        state
+            .instances
+            .upsert(sample_metadata(
+                "inst_existing_cache",
+                protocol,
+                "first_cache",
+                "shared_user",
+            ))
+            .await;
+        let mut request = create_request(protocol);
+        request.instance_id = "inst_new_cache".to_string();
+        request.database = "second_cache".to_string();
+        request.username = "shared_user".to_string();
 
-    let error = reject_duplicate_instance(&state, &request)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, ApiError::Conflict(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("redis route already exists for username shared_user")
-    );
-}
-
-#[tokio::test]
-async fn create_request_rejects_existing_valkey_route_for_username() {
-    let state = test_state(Config::default()).await;
-    state
-        .instances
-        .upsert(sample_metadata(
-            "inst_existing_valkey",
-            Protocol::Valkey,
-            "first_cache",
-            "shared_user",
-        ))
-        .await;
-    let mut request = create_request(Protocol::Valkey);
-    request.instance_id = "inst_new_valkey".to_string();
-    request.database = "second_cache".to_string();
-    request.username = "shared_user".to_string();
-
-    let error = reject_duplicate_instance(&state, &request)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, ApiError::Conflict(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("valkey route already exists for username shared_user")
-    );
+        let error = reject_duplicate_instance(&state, &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Conflict(_)));
+        assert!(
+            error.to_string().contains(&format!(
+                "{protocol} route already exists for username shared_user"
+            )),
+            "wrong conflict for {protocol}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -217,41 +160,41 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
 }
 
 #[test]
-fn allocation_guard_rejects_a_projected_limit_over_the_node_pool() {
-    let error = enforce_resource_allocation(
-        "memory",
-        mib_to_bytes(7_000),
-        0,
-        mib_to_bytes(2_000),
-        mib_to_bytes(8_000),
-        mib_to_bytes(16_000),
-        mib_to_bytes(512),
-    )
-    .unwrap_err();
+fn allocation_guard_rejects_pool_and_free_reserve_overcommit() {
+    for (resource, allocated, requested, pool, free, reserve, diagnostic) in [
+        (
+            "memory",
+            7_000,
+            2_000,
+            8_000,
+            16_000,
+            512,
+            "projected allocation 9000 MiB",
+        ),
+        (
+            "disk",
+            10_000,
+            1_500,
+            20_000,
+            3_000,
+            2_048,
+            "safety reserve would be breached",
+        ),
+    ] {
+        let error = enforce_resource_allocation(
+            resource,
+            mib_to_bytes(allocated),
+            0,
+            mib_to_bytes(requested),
+            mib_to_bytes(pool),
+            mib_to_bytes(free),
+            mib_to_bytes(reserve),
+        )
+        .unwrap_err();
 
-    assert!(matches!(error, ApiError::ServiceUnavailable(_)));
-    assert!(error.to_string().contains("projected allocation 9000 MiB"));
-}
-
-#[test]
-fn allocation_guard_rejects_an_increase_that_breaches_actual_free_reserve() {
-    let error = enforce_resource_allocation(
-        "disk",
-        mib_to_bytes(10_000),
-        0,
-        mib_to_bytes(1_500),
-        mib_to_bytes(20_000),
-        mib_to_bytes(3_000),
-        mib_to_bytes(2_048),
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, ApiError::ServiceUnavailable(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("safety reserve would be breached")
-    );
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+        assert!(error.to_string().contains(diagnostic));
+    }
 }
 
 #[test]
