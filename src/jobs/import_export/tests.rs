@@ -47,7 +47,14 @@ fn physical_extraction_enforces_expansion_limit() {
         deadline: Duration::from_secs(10),
     };
 
-    let error = extract_archive_entries(&mut archive, &target, "data", limits).unwrap_err();
+    let error = extract_archive_entries(
+        &mut archive,
+        &target,
+        "data",
+        limits,
+        ArchiveSymlinkPolicy::PreserveValidated,
+    )
+    .unwrap_err();
 
     assert!(error.to_string().contains("expands beyond"));
 }
@@ -64,6 +71,7 @@ fn bounded_physical_extraction_accepts_exact_limit() {
         &target,
         "data",
         DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES + 8,
+        ArchiveSymlinkPolicy::PreserveValidated,
     )
     .unwrap();
 
@@ -81,8 +89,14 @@ fn bounded_physical_extraction_rejects_before_oversized_file_is_written() {
     write_archive(&archive_path, "data/file.txt", b"12345678");
 
     let limit = DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES + 7;
-    let error =
-        extract_data_archive_bounded_blocking(&archive_path, &target, "data", limit).unwrap_err();
+    let error = extract_data_archive_bounded_blocking(
+        &archive_path,
+        &target,
+        "data",
+        limit,
+        ArchiveSymlinkPolicy::PreserveValidated,
+    )
+    .unwrap_err();
 
     assert!(
         error
@@ -192,14 +206,29 @@ fn mysql_physical_backup_rejects_unexpected_socket_link_targets() {
 }
 
 #[test]
-fn physical_restore_rejects_archive_symlinks_that_escape_data_root() {
+fn physical_restore_enforces_trusted_and_untrusted_symlink_policies() {
     let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("malicious.tar.gz");
-    write_symlink_archive(&archive, "data/escape", "../secret");
+    let escaping = dir.path().join("escaping.tar.gz");
+    write_symlink_archive(&escaping, "data/escape", "../secret");
 
-    let error = validate_archive_blocking(&archive, "data").unwrap_err();
-
+    let error = validate_archive_blocking(&escaping, "data").unwrap_err();
     assert!(error.to_string().contains("escapes data root"));
+
+    let lexically_safe = dir.path().join("lexically-safe.tar.gz");
+    let target = dir.path().join("target");
+    write_symlink_archive(&lexically_safe, "data/self", ".");
+
+    let error = extract_data_archive_bounded_blocking(
+        &lexically_safe,
+        &target,
+        "data",
+        MAX_DATA_ARCHIVE_BYTES,
+        ArchiveSymlinkPolicy::Reject,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("symbolic link"));
+    assert!(!target.join("data/self").exists());
 }
 
 #[cfg(unix)]

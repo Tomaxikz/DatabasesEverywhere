@@ -518,6 +518,12 @@ pub mod import_export {
         MysqlDataDirectory,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ArchiveSymlinkPolicy {
+        Reject,
+        PreserveValidated,
+    }
+
     pub async fn create_data_archive_with_policy(
         data_dir: PathBuf,
         artifact_path: PathBuf,
@@ -568,6 +574,7 @@ pub mod import_export {
             data_parent,
             expected_root,
             MAX_DATA_ARCHIVE_BYTES,
+            ArchiveSymlinkPolicy::PreserveValidated,
         )
         .await
     }
@@ -577,6 +584,7 @@ pub mod import_export {
         data_parent: PathBuf,
         expected_root: String,
         max_extracted_bytes: u64,
+        symlink_policy: ArchiveSymlinkPolicy,
     ) -> Result<(), ImportExportError> {
         tokio::task::spawn_blocking(move || {
             extract_data_archive_bounded_blocking(
@@ -584,6 +592,7 @@ pub mod import_export {
                 &data_parent,
                 &expected_root,
                 max_extracted_bytes,
+                symlink_policy,
             )
         })
         .await
@@ -685,6 +694,7 @@ pub mod import_export {
             data_parent,
             expected_root,
             MAX_DATA_ARCHIVE_BYTES,
+            ArchiveSymlinkPolicy::PreserveValidated,
         )
     }
 
@@ -693,6 +703,7 @@ pub mod import_export {
         data_parent: &Path,
         expected_root: &str,
         max_extracted_bytes: u64,
+        symlink_policy: ArchiveSymlinkPolicy,
     ) -> Result<(), ImportExportError> {
         if max_extracted_bytes == 0 {
             return Err(ImportExportError::InvalidArchive(
@@ -707,7 +718,13 @@ pub mod import_export {
             bytes: max_extracted_bytes.min(MAX_DATA_ARCHIVE_BYTES),
             ..DATA_ARCHIVE_LIMITS
         };
-        extract_archive_entries(&mut archive, data_parent, expected_root, limits)?;
+        extract_archive_entries(
+            &mut archive,
+            data_parent,
+            expected_root,
+            limits,
+            symlink_policy,
+        )?;
         Ok(())
     }
 
@@ -728,7 +745,7 @@ pub mod import_export {
             validate_archive_limits(started, entries, bytes, DATA_ARCHIVE_LIMITS)?;
             validate_archive_path(&path, expected_root, DATA_ARCHIVE_LIMITS.depth)?;
             let entry_type = entry.header().entry_type();
-            validate_entry_type(entry_type)?;
+            validate_entry_type(entry_type, ArchiveSymlinkPolicy::PreserveValidated)?;
             if entry_type.is_symlink() {
                 if entry.header().size()? != 0 {
                     return Err(ImportExportError::InvalidArchive(format!(
@@ -782,12 +799,19 @@ pub mod import_export {
         Ok(())
     }
 
-    fn validate_entry_type(entry_type: EntryType) -> Result<(), ImportExportError> {
-        if entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink() {
+    fn validate_entry_type(
+        entry_type: EntryType,
+        symlink_policy: ArchiveSymlinkPolicy,
+    ) -> Result<(), ImportExportError> {
+        if entry_type.is_file()
+            || entry_type.is_dir()
+            || (entry_type.is_symlink()
+                && symlink_policy == ArchiveSymlinkPolicy::PreserveValidated)
+        {
             Ok(())
         } else {
             Err(ImportExportError::InvalidArchive(
-                "archive may only contain files, directories, and safe symbolic links".to_string(),
+                "archive contains a symbolic link or unsupported special entry".to_string(),
             ))
         }
     }
@@ -854,6 +878,7 @@ pub mod import_export {
         data_parent: &Path,
         expected_root: &str,
         limits: ArchiveLimits,
+        symlink_policy: ArchiveSymlinkPolicy,
     ) -> Result<(), ImportExportError> {
         ensure_real_directory(data_parent)?;
         let started = Instant::now();
@@ -867,7 +892,7 @@ pub mod import_export {
             let path = entry.path()?.to_path_buf();
             validate_archive_path(&path, expected_root, limits.depth)?;
             let entry_type = entry.header().entry_type();
-            validate_entry_type(entry_type)?;
+            validate_entry_type(entry_type, symlink_policy)?;
             let entry_size = entry.header().size()?;
             bytes = account_extracted_entry(bytes, entry_size)?;
             validate_archive_limits(started, entries, bytes, limits)?;

@@ -1553,6 +1553,9 @@ Heartbeat reports management API liveness only. It always returns
 `{"status":"ok"}` once an authenticated request reaches the handler, regardless
 of database instance or gateway state. Clients should use each instance's status
 for instance readiness and `/api/system.gateways` for listener startup state.
+Heartbeat uses a dedicated bounded concurrency pool, so saturation by ordinary API
+requests cannot consume its admission capacity. Non-streaming handler execution is
+bounded to 15 minutes; request-body streaming retains its separate body/upload deadlines.
 Database gateways open after background startup and legacy PostgreSQL role
 hardening complete.
 
@@ -1570,7 +1573,7 @@ instance metadata. Failure to read or write this optimization never bypasses
 hardening: DBEV runs the full check and merely retries attestation persistence
 on a later successful pass.
 
-Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, `token`, `jwt_signing_key`, and the Fuse helper path/digest; those security boundaries must be changed deliberately in the host config. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, path, image, or runtime changes to take effect.
+Config patches are JSON object merges against the current config. `null` removes a key. The daemon rejects edits to `uuid`, `token_id`, `token`, `jwt_signing_key`, managed paths, container images, the S3 endpoint, executable backup helpers, and the Fuse helper path/digest. Replacing or nulling an ancestor of any protected field is rejected as well. Those security boundaries must be changed deliberately in the host config. A successful patch writes the config file only — restart the daemon before expecting listener, TLS, or other permitted runtime changes to take effect.
 
 API-triggered self-upgrade is intentionally unsupported: accepting an executable and its digest from the same administrative request does not provide an independent trust anchor. Keep `security.self_upgrade_enabled: false` and deploy signed packages or immutable, digest-pinned container images through the host's normal rollout mechanism.
 

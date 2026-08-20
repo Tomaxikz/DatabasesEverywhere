@@ -24,10 +24,10 @@ use crate::{
         paths::InstancePaths,
     },
     jobs::import_export::{
-        ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
-        JobAdmissionError, JobEstimateInput, JobResourceCost, SchedulerAcquireError,
-        conservative_import_input_bytes, extract_data_archive_bounded, protocol_uses_logical_dumps,
-        protocol_uses_native_compression,
+        ArchiveSymlinkPolicy, ImportExportAction, ImportExportJob, ImportExportJobPermit,
+        ImportExportStatus, JobAdmissionError, JobEstimateInput, JobResourceCost,
+        SchedulerAcquireError, conservative_import_input_bytes, extract_data_archive_bounded,
+        protocol_uses_logical_dumps, protocol_uses_native_compression,
     },
     shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
 };

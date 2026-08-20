@@ -1,7 +1,8 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::{self, BufWriter, Read, Write},
     path::Path,
+    time::{Duration, Instant},
 };
 
 use crate::api::api_response::ApiError;
@@ -22,8 +23,17 @@ pub(super) async fn rewrite_mysql_schema_qualifiers(
     source_database: &str,
     target_database: &str,
     max_staged_bytes: u64,
+    operation_timeout: Duration,
 ) -> Result<(), ApiError> {
-    rewrite_schema_qualifiers(path, source_database, target_database, max_staged_bytes, 64).await
+    rewrite_schema_qualifiers(
+        path,
+        source_database,
+        target_database,
+        max_staged_bytes,
+        64,
+        operation_timeout,
+    )
+    .await
 }
 
 pub(super) async fn rewrite_clickhouse_schema_qualifiers(
@@ -31,6 +41,7 @@ pub(super) async fn rewrite_clickhouse_schema_qualifiers(
     source_database: &str,
     target_database: &str,
     max_staged_bytes: u64,
+    operation_timeout: Duration,
 ) -> Result<(), ApiError> {
     rewrite_schema_qualifiers(
         path,
@@ -38,6 +49,7 @@ pub(super) async fn rewrite_clickhouse_schema_qualifiers(
         target_database,
         max_staged_bytes,
         128,
+        operation_timeout,
     )
     .await
 }
@@ -48,6 +60,7 @@ async fn rewrite_schema_qualifiers(
     target_database: &str,
     max_staged_bytes: u64,
     max_database_chars: usize,
+    operation_timeout: Duration,
 ) -> Result<(), ApiError> {
     validate_database_name_with_limit(source_database, "source database", max_database_chars)
         .map_err(rewrite_api_error)?;
@@ -61,6 +74,7 @@ async fn rewrite_schema_qualifiers(
     let source_database = source_database.as_bytes().to_vec();
     let quoted_target_database = quote_identifier(target_database.as_bytes(), b'`');
     let double_quoted_target_database = quote_identifier(target_database.as_bytes(), b'"');
+    let deadline = Instant::now() + operation_timeout;
     tokio::task::spawn_blocking(move || {
         rewrite_mysql_schema_qualifiers_atomic(
             &path,
@@ -68,6 +82,7 @@ async fn rewrite_schema_qualifiers(
             &quoted_target_database,
             &double_quoted_target_database,
             max_staged_bytes,
+            deadline,
         )
     })
     .await
@@ -91,6 +106,9 @@ fn rewrite_api_error(error: MysqlSqlRewriteError) -> ApiError {
         MysqlSqlRewriteError::Io(error) => {
             ApiError::Runtime(format!("failed to rewrite SQL dump safely: {error}"))
         }
+        MysqlSqlRewriteError::Timeout => ApiError::ServiceUnavailable(
+            "SQL dump rewrite exceeded the configured operation timeout".to_string(),
+        ),
     }
 }
 
@@ -104,6 +122,8 @@ enum MysqlSqlRewriteError {
     OutputLimit { limit: u64 },
     #[error("malformed SQL dump: {0}")]
     Malformed(&'static str),
+    #[error("SQL dump rewrite exceeded its operation timeout")]
+    Timeout,
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -150,6 +170,7 @@ fn rewrite_mysql_schema_qualifiers_atomic(
     quoted_target_database: &[u8],
     double_quoted_target_database: &[u8],
     max_bytes: u64,
+    deadline: Instant,
 ) -> Result<u64, MysqlSqlRewriteError> {
     use std::fs::File;
 
@@ -204,7 +225,7 @@ fn rewrite_mysql_schema_qualifiers_atomic(
 
     let rewrite_result = (|| {
         let replacements = {
-            let mut input = BoundedInput::new(&mut source, max_bytes);
+            let mut input = BoundedInput::new(&mut source, max_bytes, deadline);
             let mut output = BoundedOutput::new(&mut temporary, max_bytes);
             let mut context = SqlContext::default();
             let identifiers = RewriteIdentifiers {
@@ -254,6 +275,7 @@ fn rewrite_mysql_schema_qualifiers_atomic(
     _quoted_target_database: &[u8],
     _double_quoted_target_database: &[u8],
     _max_bytes: u64,
+    _deadline: Instant,
 ) -> Result<u64, MysqlSqlRewriteError> {
     Err(MysqlSqlRewriteError::Io(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -278,10 +300,11 @@ struct BoundedInput<R> {
     lookahead: VecDeque<u8>,
     bytes_read: u64,
     max_bytes: u64,
+    deadline: Instant,
 }
 
 impl<R: Read> BoundedInput<R> {
-    fn new(reader: R, max_bytes: u64) -> Self {
+    fn new(reader: R, max_bytes: u64, deadline: Instant) -> Self {
         Self {
             reader,
             buffer: vec![0; STREAM_BUFFER_BYTES].into_boxed_slice(),
@@ -290,6 +313,7 @@ impl<R: Read> BoundedInput<R> {
             lookahead: VecDeque::with_capacity(4),
             bytes_read: 0,
             max_bytes,
+            deadline,
         }
     }
 
@@ -347,6 +371,9 @@ impl<R: Read> BoundedInput<R> {
     fn fill_buffer(&mut self) -> Result<(), MysqlSqlRewriteError> {
         if self.start < self.end {
             return Ok(());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(MysqlSqlRewriteError::Timeout);
         }
         self.start = 0;
         self.end = 0;
@@ -447,7 +474,7 @@ struct SqlContext {
     trigger_on_seen: bool,
     table_list: bool,
     parenthesis_depth: usize,
-    from_table_list_depths: Vec<usize>,
+    from_table_list_depths: HashSet<usize>,
 }
 
 impl SqlContext {
@@ -470,8 +497,7 @@ impl SqlContext {
             return;
         }
         if is_from_clause_boundary(word) {
-            self.from_table_list_depths
-                .retain(|depth| *depth != self.parenthesis_depth);
+            self.from_table_list_depths.remove(&self.parenthesis_depth);
         }
         if self.object_expected && is_object_modifier(word) {
             return;
@@ -492,10 +518,8 @@ impl SqlContext {
         let from_or_join = word.eq_ignore_ascii_case(b"FROM") || word.eq_ignore_ascii_case(b"JOIN");
         if from_or_join || word.eq_ignore_ascii_case(b"REFERENCES") {
             self.object_expected = true;
-            if from_or_join
-                && self.from_table_list_depths.last().copied() != Some(self.parenthesis_depth)
-            {
-                self.from_table_list_depths.push(self.parenthesis_depth);
+            if from_or_join {
+                self.from_table_list_depths.insert(self.parenthesis_depth);
             }
         } else if (word.eq_ignore_ascii_case(b"INTO")
             && matches!(
@@ -541,13 +565,14 @@ impl SqlContext {
             self.parenthesis_depth = self.parenthesis_depth.saturating_add(1);
             self.object_expected = false;
         } else if byte == b')' {
+            self.from_table_list_depths.remove(&self.parenthesis_depth);
             self.parenthesis_depth = self.parenthesis_depth.saturating_sub(1);
-            self.from_table_list_depths
-                .retain(|depth| *depth <= self.parenthesis_depth);
             self.object_expected = false;
         } else if byte == b','
             && (self.table_list
-                || self.from_table_list_depths.last().copied() == Some(self.parenthesis_depth))
+                || self
+                    .from_table_list_depths
+                    .contains(&self.parenthesis_depth))
         {
             self.object_expected = true;
         } else if !byte.is_ascii_whitespace() {

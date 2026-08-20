@@ -332,7 +332,8 @@ async fn reset_instance_password_inner(
         .await;
     }
 
-    apply_new_route_auth(&mut metadata, &new_password, &previous);
+    let qdrant_route_secret = state.config.websocket_jwt_secret();
+    apply_new_route_auth(&mut metadata, &new_password, &previous, qdrant_route_secret);
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state
@@ -514,7 +515,8 @@ async fn reset_password_in_place(
         }
     }
 
-    apply_new_route_auth(&mut metadata, new_password, previous);
+    let qdrant_route_secret = state.config.websocket_jwt_secret();
+    apply_new_route_auth(&mut metadata, new_password, previous, qdrant_route_secret);
     metadata.status = InstanceStatus::Running;
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state
@@ -637,7 +639,10 @@ async fn ensure_qdrant_route_is_available(
     if metadata.protocol != Protocol::Qdrant {
         return Ok(());
     }
-    let route_key = crate::protocols::qdrant::route_key_sha256(new_password.expose_secret());
+    let route_key = crate::protocols::qdrant::route_key_fingerprint(
+        state.config.websocket_jwt_secret(),
+        new_password.expose_secret(),
+    );
     if state.instances.list().await.iter().any(|existing| {
         existing.instance_id != metadata.instance_id
             && existing.route_key_sha256.as_deref() == Some(route_key.as_str())
@@ -1336,6 +1341,7 @@ fn apply_new_route_auth(
     metadata: &mut InstanceMetadata,
     password: &SecretString,
     previous: &PreviousCredential,
+    qdrant_route_secret: &[u8],
 ) {
     metadata.tenant_password = Some(password.expose_secret().to_string());
     match metadata.protocol {
@@ -1360,7 +1366,8 @@ fn apply_new_route_auth(
                 ));
         }
         Protocol::Qdrant => {
-            metadata.route_key_sha256 = Some(crate::protocols::qdrant::route_key_sha256(
+            metadata.route_key_sha256 = Some(crate::protocols::qdrant::route_key_fingerprint(
+                qdrant_route_secret,
                 password.expose_secret(),
             ));
         }

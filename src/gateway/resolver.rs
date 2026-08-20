@@ -1,3 +1,4 @@
+use crate::protocols::qdrant::QdrantRouteKey;
 use crate::{
     api::resources::{NetworkCounter, ResourceCache},
     instances::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
@@ -25,11 +26,20 @@ pub(crate) struct ResolvedMariadbRoute {
 pub struct RouteResolver {
     store: InstanceStore,
     resources: ResourceCache,
+    qdrant_route_key: QdrantRouteKey,
 }
 
 impl RouteResolver {
-    pub(crate) fn new(store: InstanceStore, resources: ResourceCache) -> Self {
-        Self { store, resources }
+    pub(crate) fn new(
+        store: InstanceStore,
+        resources: ResourceCache,
+        qdrant_route_key: QdrantRouteKey,
+    ) -> Self {
+        Self {
+            store,
+            resources,
+            qdrant_route_key,
+        }
     }
 
     pub(crate) async fn resolve_postgres(
@@ -144,6 +154,10 @@ impl RouteResolver {
             self.resolve_target(target.instance_id, target.endpoint)
                 .await,
         )
+    }
+
+    pub(crate) fn qdrant_route_fingerprint(&self, api_key: &str) -> String {
+        self.qdrant_route_key.fingerprint(api_key)
     }
 
     async fn resolve_target(

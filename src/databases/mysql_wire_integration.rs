@@ -30,7 +30,11 @@ pub(super) async fn start_gateway(
     let connections = supervisor.connection_tracker();
     let bind = address.to_string();
     let gateway = tokio::spawn(async move {
-        let resolver = RouteResolver::new(store, crate::api::resources::ResourceCache::default());
+        let resolver = RouteResolver::new(
+            store,
+            crate::api::resources::ResourceCache::default(),
+            crate::protocols::qdrant::QdrantRouteKey::new(b"mysql-wire-integration"),
+        );
         match protocol {
             Protocol::Mariadb => {
                 run_mariadb_listener(

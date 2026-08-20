@@ -145,6 +145,16 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .load_from_storage()
         .await
         .context("failed to load local instance metadata from sqlite")?;
+    let migrated_qdrant_routes =
+        migrate_qdrant_route_fingerprints(&manager, config.websocket_jwt_secret())
+            .await
+            .context("failed to migrate Qdrant route fingerprints")?;
+    if migrated_qdrant_routes > 0 {
+        tracing::info!(
+            migrated_qdrant_routes,
+            "migrated Qdrant routes to keyed fingerprints"
+        );
+    }
     let quarantined_interrupted_instances =
         quarantine_interrupted_job_instances(&manager, &interrupted_running_import_instances)
             .await?;
@@ -473,6 +483,29 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!("active import/export jobs drained");
     tracing::info!("active instance creations drained");
     server_result
+}
+
+async fn migrate_qdrant_route_fingerprints(
+    manager: &InstanceManager,
+    daemon_secret: &[u8],
+) -> anyhow::Result<usize> {
+    let mut migrated = 0;
+    for mut metadata in manager.store().list().await {
+        if metadata.protocol != crate::shared::protocol::Protocol::Qdrant {
+            continue;
+        }
+        let Some(api_key) = metadata.tenant_password.as_deref() else {
+            continue;
+        };
+        let fingerprint = crate::protocols::qdrant::route_key_fingerprint(daemon_secret, api_key);
+        if metadata.route_key_sha256.as_deref() == Some(fingerprint.as_str()) {
+            continue;
+        }
+        metadata.route_key_sha256 = Some(fingerprint);
+        manager.upsert(metadata).await?;
+        migrated += 1;
+    }
+    Ok(migrated)
 }
 
 async fn drain_daemon_task(

@@ -686,8 +686,12 @@ async fn create_instance_from_validated_request(
             name: request.database,
             username: request.username,
         },
-        route_key_sha256: (request.protocol == Protocol::Qdrant)
-            .then(|| crate::protocols::qdrant::route_key_sha256(&request.password)),
+        route_key_sha256: (request.protocol == Protocol::Qdrant).then(|| {
+            crate::protocols::qdrant::route_key_fingerprint(
+                state.config.websocket_jwt_secret(),
+                &request.password,
+            )
+        }),
         mariadb_native_password_sha1_stage2: (request.protocol == Protocol::Mariadb)
             .then(|| crate::protocols::mariadb::native_password_sha1_stage2_hex(&request.password)),
         mariadb_root_password,
@@ -872,13 +876,18 @@ pub(crate) async fn provision_mariadb_tenant_user(
     let sql = databases::mariadb::provision::tenant_user_sql(database, username, &verifier)
         .map_err(|error| fail_bad_request(state, instance_id, error))?;
     let script = format!(
-        "set -eu\nexport MYSQL_PWD={}\nprintf %s {} | mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -uroot\n",
-        sh_quote(root_password),
+        "set -eu\nprintf %s {} | MYSQL_PWD=\"$DBE_MARIADB_ROOT_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -uroot\n",
         sh_quote(&sql)
     );
+    let root_password = SecretString::from(root_password.to_string());
     state
         .docker
-        .exec_shell(Protocol::Mariadb, instance_id, &script)
+        .exec_shell_with_secret_env(
+            Protocol::Mariadb,
+            instance_id,
+            &script,
+            &[("DBE_MARIADB_ROOT_PASSWORD", &root_password)],
+        )
         .await
         .map_err(|error| fail_runtime(state, instance_id, error))?;
     Ok(())
@@ -1198,7 +1207,10 @@ async fn reject_duplicate_instance(
                 && metadata.database.name == request.database
         }
         Protocol::Qdrant => {
-            let route_key_sha256 = crate::protocols::qdrant::route_key_sha256(&request.password);
+            let route_key_sha256 = crate::protocols::qdrant::route_key_fingerprint(
+                state.config.websocket_jwt_secret(),
+                &request.password,
+            );
             metadata.protocol == request.protocol
                 && metadata.route_key_sha256.as_deref() == Some(route_key_sha256.as_str())
         }

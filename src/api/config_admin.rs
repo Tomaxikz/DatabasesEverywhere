@@ -26,8 +26,10 @@ const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
     &["token_id"],
     &["uuid"],
     &["paths"],
+    &["images"],
     &["disk", "fuse_quota_binary"],
     &["disk", "fuse_quota_binary_sha256"],
+    &["backups", "storage", "s3", "endpoint"],
     &["backups", "storage", "kopia", "executable"],
     &["backups", "storage", "kopia", "config_file"],
 ];
@@ -202,7 +204,7 @@ fn merge_json(target: &mut Value, patch: Value) {
 
 fn reject_forbidden_paths(patch: &Value) -> Result<(), ApiError> {
     for path in FORBIDDEN_PATCH_PATHS {
-        if value_has_path(patch, path) {
+        if value_touches_path(patch, path) {
             return Err(ApiError::BadRequest(format!(
                 "config patch may not modify {}",
                 path.join(".")
@@ -212,12 +214,15 @@ fn reject_forbidden_paths(patch: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn value_has_path(value: &Value, path: &[&str]) -> bool {
+fn value_touches_path(value: &Value, path: &[&str]) -> bool {
     let mut current = value;
-    for segment in path {
+    for (index, segment) in path.iter().enumerate() {
         let Some(next) = current.get(*segment) else {
             return false;
         };
+        if index + 1 < path.len() && !next.is_object() {
+            return true;
+        }
         current = next;
     }
     true
@@ -270,6 +275,16 @@ mod tests {
                 serde_json::json!({ "paths": { "data": "/tmp/attacker" } }),
             ),
             (
+                "database image",
+                serde_json::json!({ "images": { "postgres": "attacker/image:1" } }),
+            ),
+            (
+                "S3 endpoint",
+                serde_json::json!({
+                    "backups": { "storage": { "s3": { "endpoint": "https://attacker.example" } } }
+                }),
+            ),
+            (
                 "Kopia executable",
                 serde_json::json!({
                     "backups": { "storage": { "kopia": { "executable": "/tmp/attacker" } } }
@@ -280,6 +295,11 @@ mod tests {
                 serde_json::json!({
                     "backups": { "storage": { "kopia": { "config_file": "/tmp/attacker" } } }
                 }),
+            ),
+            ("disk ancestor removal", serde_json::json!({ "disk": null })),
+            (
+                "Kopia ancestor replacement",
+                serde_json::json!({ "backups": { "storage": { "kopia": null } } }),
             ),
         ];
         for (name, patch) in cases {

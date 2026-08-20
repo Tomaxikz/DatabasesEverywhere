@@ -34,7 +34,11 @@ fn rewrite_bytes_with_limit(
     if source_database == target_database {
         return Ok(input.to_vec());
     }
-    let mut reader = BoundedInput::new(Cursor::new(input), max_bytes);
+    let mut reader = BoundedInput::new(
+        Cursor::new(input),
+        max_bytes,
+        Instant::now() + Duration::from_secs(30),
+    );
     let mut rewritten = Vec::new();
     {
         let mut writer = BoundedOutput::new(&mut rewritten, max_bytes);
@@ -303,6 +307,16 @@ fn rejects_input_and_output_size_overruns() {
         rewrite_bytes_with_limit(expanding, "a", "longer", limit),
         Err(MysqlSqlRewriteError::OutputLimit { limit: actual }) if actual == limit
     ));
+
+    let mut expired = BoundedInput::new(
+        Cursor::new(b"SELECT 1"),
+        1024,
+        Instant::now() - Duration::from_secs(1),
+    );
+    assert!(matches!(
+        expired.next_byte(),
+        Err(MysqlSqlRewriteError::Timeout)
+    ));
 }
 
 #[test]
@@ -359,9 +373,15 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
     std::fs::write(&dump, b"SELECT * FROM `source`.`table`;\n").unwrap();
     std::fs::set_permissions(&dump, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-    rewrite_mysql_schema_qualifiers(&dump, "source", "target", 1024 * 1024)
-        .await
-        .unwrap();
+    rewrite_mysql_schema_qualifiers(
+        &dump,
+        "source",
+        "target",
+        1024 * 1024,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         std::fs::read(&dump).unwrap(),
@@ -382,9 +402,15 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
     symlink(&victim, &linked).unwrap();
 
     assert!(
-        rewrite_mysql_schema_qualifiers(&linked, "source", "target", 1024 * 1024)
-            .await
-            .is_err()
+        rewrite_mysql_schema_qualifiers(
+            &linked,
+            "source",
+            "target",
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
         std::fs::read(&victim).unwrap(),
@@ -395,9 +421,15 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
     let malformed_contents = b"SELECT * FROM `source`.`table` WHERE value='unterminated";
     std::fs::write(&malformed, malformed_contents).unwrap();
     assert!(
-        rewrite_mysql_schema_qualifiers(&malformed, "source", "target", 1024 * 1024)
-            .await
-            .is_err()
+        rewrite_mysql_schema_qualifiers(
+            &malformed,
+            "source",
+            "target",
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .is_err()
     );
     assert_eq!(std::fs::read(&malformed).unwrap(), malformed_contents);
 
@@ -405,9 +437,15 @@ async fn atomically_replaces_regular_files_and_rejects_symlink_inputs() {
     let ambiguous_contents = b"SELECT `source`.`id` FROM `other`.`orders` AS `source`;\n";
     std::fs::write(&ambiguous, ambiguous_contents).unwrap();
     assert!(
-        rewrite_mysql_schema_qualifiers(&ambiguous, "source", "target", 1024 * 1024)
-            .await
-            .is_err()
+        rewrite_mysql_schema_qualifiers(
+            &ambiguous,
+            "source",
+            "target",
+            1024 * 1024,
+            Duration::from_secs(30),
+        )
+        .await
+        .is_err()
     );
     assert_eq!(std::fs::read(&ambiguous).unwrap(), ambiguous_contents);
 

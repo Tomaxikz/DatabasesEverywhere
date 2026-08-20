@@ -30,6 +30,7 @@ const MAX_API_RATE_LIMIT_KEYS_PER_SHARD: usize = MAX_API_RATE_LIMIT_KEYS / API_R
 const UNAUTHENTICATED_RATE_LIMIT_BUCKETS: u16 = 4096;
 const MAX_ACTIVE_WEBSOCKETS: usize = 1024;
 const MAX_ACTIVE_API_REQUESTS: usize = 1024;
+const MAX_ACTIVE_HEARTBEAT_REQUESTS: usize = 16;
 const MAX_CONSUMED_WEBSOCKET_JTIS: usize = 65_536;
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ pub struct ApiRateLimiter {
     active_websockets: Arc<Semaphore>,
     websocket_drain: Arc<Notify>,
     active_requests: Arc<Semaphore>,
+    active_heartbeat_requests: Arc<Semaphore>,
     request_capacity_logged: Arc<AtomicBool>,
     max_requests: u32,
 }
@@ -59,6 +61,7 @@ impl ApiRateLimiter {
             active_websockets: Arc::new(Semaphore::new(MAX_ACTIVE_WEBSOCKETS)),
             websocket_drain: Arc::default(),
             active_requests: Arc::new(Semaphore::new(MAX_ACTIVE_API_REQUESTS)),
+            active_heartbeat_requests: Arc::new(Semaphore::new(MAX_ACTIVE_HEARTBEAT_REQUESTS)),
             request_capacity_logged: Arc::new(AtomicBool::new(false)),
             max_requests: max_requests.max(1),
         }
@@ -93,8 +96,13 @@ impl ApiRateLimiter {
         Ok(connection)
     }
 
-    fn admit_request(&self) -> Result<ApiRequestPermit, ApiError> {
-        match Arc::clone(&self.active_requests).try_acquire_owned() {
+    fn admit_request(&self, heartbeat: bool) -> Result<ApiRequestPermit, ApiError> {
+        let admission = if heartbeat {
+            Arc::clone(&self.active_heartbeat_requests)
+        } else {
+            Arc::clone(&self.active_requests)
+        };
+        match admission.try_acquire_owned() {
             Ok(permit) => Ok(ApiRequestPermit {
                 _permit: permit,
                 capacity_logged: Arc::clone(&self.request_capacity_logged),
@@ -353,7 +361,8 @@ pub async fn rate_limit(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let _request = state.api_rate_limiter.admit_request()?;
+    let heartbeat = request.uri().path() == "/api/heartbeat";
+    let _request = state.api_rate_limiter.admit_request(heartbeat)?;
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -748,14 +757,15 @@ mod tests {
         let limiter = ApiRateLimiter::default();
         let mut permits = Vec::with_capacity(MAX_ACTIVE_API_REQUESTS);
         for _ in 0..MAX_ACTIVE_API_REQUESTS {
-            permits.push(limiter.admit_request().unwrap());
+            permits.push(limiter.admit_request(false).unwrap());
         }
 
         assert!(matches!(
-            limiter.admit_request(),
+            limiter.admit_request(false),
             Err(ApiError::RateLimited)
         ));
+        assert!(limiter.admit_request(true).is_ok());
         drop(permits.pop());
-        assert!(limiter.admit_request().is_ok());
+        assert!(limiter.admit_request(false).is_ok());
     }
 }

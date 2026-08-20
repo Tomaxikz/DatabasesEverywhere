@@ -4,6 +4,7 @@ use crate::protocols::qdrant;
 
 #[test]
 fn grpc_and_rest_api_key_headers_share_one_route_hash() {
+    let route_key = qdrant::QdrantRouteKey::new(b"test-qdrant-route-key");
     for request in [
         Request::builder()
             .method("POST")
@@ -19,9 +20,10 @@ fn grpc_and_rest_api_key_headers_share_one_route_hash() {
             .unwrap(),
     ] {
         let key = qdrant::api_key_from_request(&request).unwrap();
-        assert_eq!(
-            qdrant::route_key_sha256(&key),
-            "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        assert_eq!(route_key.fingerprint(&key), route_key.fingerprint("secret"));
+        assert_ne!(
+            route_key.fingerprint(&key),
+            qdrant::route_key_fingerprint(b"different-daemon", &key)
         );
     }
 }

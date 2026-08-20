@@ -1,3 +1,4 @@
+use aws_lc_rs::hmac;
 use bytes::Bytes;
 use h2::{
     RecvStream, SendStream,
@@ -5,8 +6,7 @@ use h2::{
     server::SendResponse,
 };
 use http::{HeaderMap, Request, Response};
-use sha2::{Digest, Sha256};
-use std::{future::Future, future::poll_fn, time::Duration};
+use std::{fmt, future::Future, future::poll_fn, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
@@ -15,6 +15,41 @@ const MAX_CONCURRENT_STREAMS: u32 = 128;
 const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 const MAX_SEND_BUFFER_SIZE: usize = 64 * 1024;
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const ROUTE_FINGERPRINT_DOMAIN: &[u8] = b"databases-everywhere qdrant route fingerprint v1";
+
+#[derive(Clone)]
+pub struct QdrantRouteKey {
+    key: Arc<hmac::Key>,
+}
+
+impl QdrantRouteKey {
+    pub fn new(daemon_secret: &[u8]) -> Self {
+        let derivation_key = hmac::Key::new(hmac::HMAC_SHA256, daemon_secret);
+        let derived = hmac::sign(&derivation_key, ROUTE_FINGERPRINT_DOMAIN);
+        Self {
+            key: Arc::new(hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref())),
+        }
+    }
+
+    pub fn fingerprint(&self, api_key: &str) -> String {
+        let tag = hmac::sign(&self.key, api_key.as_bytes());
+        let mut encoded = String::with_capacity(tag.as_ref().len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in tag.as_ref() {
+            encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+        }
+        encoded
+    }
+}
+
+impl fmt::Debug for QdrantRouteKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QdrantRouteKey")
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QdrantProxyError {
@@ -68,9 +103,8 @@ fn outbound_stream_error(error: h2::Error) -> QdrantProxyError {
     }
 }
 
-pub fn route_key_sha256(api_key: &str) -> String {
-    let digest = Sha256::digest(api_key.as_bytes());
-    format!("{digest:x}")
+pub fn route_key_fingerprint(daemon_secret: &[u8], api_key: &str) -> String {
+    QdrantRouteKey::new(daemon_secret).fingerprint(api_key)
 }
 
 pub fn api_key_from_headers(headers: &HeaderMap) -> Result<String, QdrantProxyError> {

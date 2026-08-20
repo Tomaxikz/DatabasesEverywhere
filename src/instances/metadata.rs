@@ -31,6 +31,8 @@ pub struct InstanceMetadata {
     pub backend: BackendEndpoint,
     pub runtime: RuntimeMetadata,
     pub database: DatabaseIdentity,
+    /// Keyed HMAC-SHA256 used only as the Qdrant gateway route index. The
+    /// legacy field name is retained for durable/API compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_key_sha256: Option<String>,
     #[serde(default, skip_serializing)]

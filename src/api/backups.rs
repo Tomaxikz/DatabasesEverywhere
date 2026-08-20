@@ -26,8 +26,9 @@ use crate::{
     },
     instances::metadata::{InstanceMetadata, InstanceStatus},
     jobs::import_export::{
-        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError, JobEstimateInput,
-        JobResourceCost, SchedulerAcquireError, create_data_archive_with_policy_bounded,
+        ArchiveSymlinkPolicy, DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError,
+        JobEstimateInput, JobResourceCost, SchedulerAcquireError,
+        create_data_archive_with_policy_bounded,
     },
     shared::{ids::validate_instance_id, protocol::Protocol},
 };
@@ -385,6 +386,7 @@ async fn restore_instance_backup_admitted(
         &materialized.path,
         was_running,
         extracted_capacity,
+        ArchiveSymlinkPolicy::PreserveValidated,
     )
     .await;
     materialized.cleanup().await;

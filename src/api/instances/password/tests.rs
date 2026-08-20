@@ -179,11 +179,15 @@ fn route_auth_updates_only_protocol_specific_hidden_material() {
         &mut metadata,
         &SecretString::from("new-key"),
         &PreviousCredential::default(),
+        b"test-qdrant-route-key",
     );
 
     assert_eq!(
         metadata.route_key_sha256.as_deref(),
-        Some(crate::protocols::qdrant::route_key_sha256("new-key").as_str())
+        Some(
+            crate::protocols::qdrant::route_key_fingerprint(b"test-qdrant-route-key", "new-key")
+                .as_str()
+        )
     );
     assert!(metadata.mariadb_native_password_sha1_stage2.is_none());
     assert_eq!(metadata.tenant_password.as_deref(), Some("new-key"));
@@ -201,6 +205,7 @@ fn mysql_route_auth_adopts_the_verified_maintenance_credential() {
         &mut metadata,
         &SecretString::from("replacement-password"),
         &previous,
+        b"test-qdrant-route-key",
     );
 
     assert_eq!(

@@ -73,6 +73,7 @@ pub(super) async fn import_physical_archive(
         artifact_path,
         was_running,
         max_extracted_bytes,
+        ArchiveSymlinkPolicy::Reject,
     )
     .await
 }
@@ -138,6 +139,12 @@ struct PendingDataReplacement {
     backup_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PhysicalRestorePolicy {
+    recover_current_after_preparation_failure: bool,
+    symlinks: ArchiveSymlinkPolicy,
+}
+
 impl PendingDataReplacement {
     async fn commit(self) {
         cleanup_dir(&self.workspace).await;
@@ -172,6 +179,7 @@ pub(crate) async fn restore_data_from_archive_bounded(
     artifact_path: &FsPath,
     should_be_running: bool,
     max_extracted_bytes: u64,
+    symlink_policy: ArchiveSymlinkPolicy,
 ) -> Result<(), ApiError> {
     restore_data_from_archive_with_policy(
         state,
@@ -179,8 +187,11 @@ pub(crate) async fn restore_data_from_archive_bounded(
         paths,
         artifact_path,
         should_be_running,
-        true,
         max_extracted_bytes,
+        PhysicalRestorePolicy {
+            recover_current_after_preparation_failure: true,
+            symlinks: symlink_policy,
+        },
     )
     .await
 }
@@ -197,8 +208,11 @@ pub(crate) async fn rollback_data_from_archive(
         paths,
         artifact_path,
         true,
-        false,
         crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+        PhysicalRestorePolicy {
+            recover_current_after_preparation_failure: false,
+            symlinks: ArchiveSymlinkPolicy::PreserveValidated,
+        },
     )
     .await
 }
@@ -209,8 +223,8 @@ async fn restore_data_from_archive_with_policy(
     paths: InstancePaths,
     artifact_path: &FsPath,
     should_be_running: bool,
-    recover_current_after_preparation_failure: bool,
     max_extracted_bytes: u64,
+    policy: PhysicalRestorePolicy,
 ) -> Result<(), ApiError> {
     let metadata = state
         .instances
@@ -239,37 +253,43 @@ async fn restore_data_from_archive_with_policy(
             "the original runtime",
         ));
     }
-    let replacement =
-        match prepare_data_replacement(paths.clone(), artifact_path, max_extracted_bytes).await {
-            Ok(replacement) => replacement,
-            Err(failure)
-                if failure.original_restored && recover_current_after_preparation_failure =>
-            {
-                if detached_fuse {
-                    let recovery = recover_detached_physical_runtime(
-                        state,
-                        &metadata,
-                        &paths,
-                        should_be_running,
-                        &disk_limiter,
-                    )
-                    .await;
-                    return Err(physical_recovery_error(
-                        failure.error,
-                        recovery,
-                        "the original runtime",
-                    ));
-                }
-                return finish_physical_operation(
+    let replacement = match prepare_data_replacement(
+        paths.clone(),
+        artifact_path,
+        max_extracted_bytes,
+        policy.symlinks,
+    )
+    .await
+    {
+        Ok(replacement) => replacement,
+        Err(failure)
+            if failure.original_restored && policy.recover_current_after_preparation_failure =>
+        {
+            if detached_fuse {
+                let recovery = recover_detached_physical_runtime(
                     state,
-                    instance_id,
+                    &metadata,
+                    &paths,
                     should_be_running,
-                    Err(failure.error),
+                    &disk_limiter,
                 )
                 .await;
+                return Err(physical_recovery_error(
+                    failure.error,
+                    recovery,
+                    "the original runtime",
+                ));
             }
-            Err(failure) => return Err(failure.error),
-        };
+            return finish_physical_operation(
+                state,
+                instance_id,
+                should_be_running,
+                Err(failure.error),
+            )
+            .await;
+        }
+        Err(failure) => return Err(failure.error),
+    };
 
     let validation = async {
         reapply_instance_data_owner(state, &paths).await?;
@@ -348,6 +368,7 @@ async fn prepare_data_replacement(
     paths: InstancePaths,
     artifact_path: &FsPath,
     max_extracted_bytes: u64,
+    symlink_policy: ArchiveSymlinkPolicy,
 ) -> Result<PendingDataReplacement, DataReplacementPreparationError> {
     let import_id = uuid::Uuid::new_v4();
     let expected_root = paths
@@ -391,6 +412,7 @@ async fn prepare_data_replacement(
         staging_dir.clone(),
         expected_root,
         max_extracted_bytes,
+        symlink_policy,
     )
     .await
     {

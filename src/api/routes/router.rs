@@ -20,6 +20,8 @@ use axum::{
 use tokio::sync::{Notify, watch};
 use tower_http::timeout::TimeoutBody;
 
+const API_REQUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 use crate::{
     api::{
         api_response, artifacts, backups, config_admin, images, import_export,
@@ -202,6 +204,7 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             apply_request_body_timeout,
         ))
+        .layer(middleware::from_fn(apply_request_execution_timeout))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_mutating_request,
@@ -227,7 +230,19 @@ async fn apply_request_body_timeout(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_import_upload = request.method() == Method::POST
+    if is_streaming_import_upload(&request) {
+        // The streaming upload handler applies both its configured idle and
+        // total deadlines and maps either one to a stable 408 response.
+        return next.run(request).await;
+    }
+    let timeout = Duration::from_secs(60);
+    let (parts, body) = request.into_parts();
+    let body = Body::new(TimeoutBody::new(timeout, body));
+    next.run(Request::from_parts(parts, body)).await
+}
+
+fn is_streaming_import_upload(request: &Request) -> bool {
+    request.method() == Method::POST
         && request.uri().path().ends_with("/import")
         && request
             .headers()
@@ -239,16 +254,20 @@ async fn apply_request_body_timeout(
                         .trim()
                         .eq_ignore_ascii_case("application/octet-stream")
                 })
-            });
-    if is_import_upload {
-        // The streaming upload handler applies both its configured idle and
-        // total deadlines and maps either one to a stable 408 response.
+            })
+}
+
+async fn apply_request_execution_timeout(request: Request, next: Next) -> Response {
+    if is_streaming_import_upload(&request) {
         return next.run(request).await;
     }
-    let timeout = Duration::from_secs(60);
-    let (parts, body) = request.into_parts();
-    let body = Body::new(TimeoutBody::new(timeout, body));
-    next.run(Request::from_parts(parts, body)).await
+    match tokio::time::timeout(API_REQUEST_EXECUTION_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => crate::api::api_response::ApiError::ServiceUnavailable(
+            "API request exceeded the 900-second execution deadline".to_string(),
+        )
+        .into_response(),
+    }
 }
 
 async fn track_mutating_request(

@@ -161,7 +161,7 @@ components:
               type: string
         route_key_sha256:
           type: string
-          description: Optional SHA-256 fingerprint of the instance gateway route key.
+          description: Optional daemon-keyed HMAC-SHA256 fingerprint used as the Qdrant gateway route index; it cannot be used for offline API-key guessing without the daemon secret.
         limits:
           $ref: "#/components/schemas/InstanceLimits"
         image:
@@ -1208,7 +1208,7 @@ paths:
   /api/system/config:
     patch:
       summary: Merge a validated config patch into the daemon config file.
-      description: Writes config.yml and returns restart_required=true. Refuses uuid, token_id, and token edits. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
+      description: Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, and Fuse helper edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
       x-required-scope: config:admin
       requestBody:
         required: true

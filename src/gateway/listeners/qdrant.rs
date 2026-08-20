@@ -112,6 +112,7 @@ async fn handle_qdrant_h2_client(
     client: PrefixedGatewayStream,
     resolver: RouteResolver,
 ) -> Result<(), ListenerError> {
+    let request_verifier = resolver.clone();
     let (mut server, backend, first_request, first_respond, route_key_sha256) =
         client_handshake("qdrant", async move {
             let mut server = qdrant::server_handshake(client).await?;
@@ -120,7 +121,7 @@ async fn handle_qdrant_h2_client(
             };
             let (request, respond) = first_request.map_err(qdrant::QdrantProxyError::from)?;
             let api_key = qdrant::api_key_from_request(&request)?;
-            let route_key_sha256 = qdrant::route_key_sha256(&api_key);
+            let route_key_sha256 = resolver.qdrant_route_fingerprint(&api_key);
             let target = resolver
                 .resolve_qdrant(&route_key_sha256)
                 .await
@@ -164,7 +165,7 @@ async fn handle_qdrant_h2_client(
                         return Err(error.into());
                     }
                 };
-                if !request_matches_qdrant_route(&request, &route_key_sha256) {
+                if !request_matches_qdrant_route(&request, &route_key_sha256, &request_verifier) {
                     let response = http::Response::builder()
                         .status(http::StatusCode::UNAUTHORIZED)
                         .version(http::Version::HTTP_2)
@@ -191,9 +192,13 @@ async fn handle_qdrant_h2_client(
     }
 }
 
-fn request_matches_qdrant_route<B>(request: &http::Request<B>, route_key_sha256: &str) -> bool {
+fn request_matches_qdrant_route<B>(
+    request: &http::Request<B>,
+    route_key_sha256: &str,
+    resolver: &RouteResolver,
+) -> bool {
     qdrant::api_key_from_request(request)
-        .map(|api_key| qdrant::route_key_sha256(&api_key) == route_key_sha256)
+        .map(|api_key| resolver.qdrant_route_fingerprint(&api_key) == route_key_sha256)
         .unwrap_or(false)
 }
 
@@ -234,10 +239,8 @@ async fn proxy_qdrant_http1_request(
             ));
         }
     };
-    let Some(target) = resolver
-        .resolve_qdrant(&qdrant::route_key_sha256(&api_key))
-        .await
-    else {
+    let route_key_sha256 = resolver.qdrant_route_fingerprint(&api_key);
+    let Some(target) = resolver.resolve_qdrant(&route_key_sha256).await else {
         return Ok(qdrant_http_error(
             http::StatusCode::UNAUTHORIZED,
             "authentication failed",
@@ -492,7 +495,12 @@ mod tests {
 
     #[test]
     fn every_h2_stream_must_repeat_the_same_route_key() {
-        let route = qdrant::route_key_sha256("secret");
+        let resolver = RouteResolver::new(
+            InstanceStore::default(),
+            ResourceCache::default(),
+            test_qdrant_route_key(),
+        );
+        let route = resolver.qdrant_route_fingerprint("secret");
         let valid = http::Request::builder()
             .header("api-key", "secret")
             .body(())
@@ -502,9 +510,9 @@ mod tests {
             .body(())
             .unwrap();
         let missing = http::Request::new(());
-        assert!(request_matches_qdrant_route(&valid, &route));
-        assert!(!request_matches_qdrant_route(&wrong, &route));
-        assert!(!request_matches_qdrant_route(&missing, &route));
+        assert!(request_matches_qdrant_route(&valid, &route, &resolver));
+        assert!(!request_matches_qdrant_route(&wrong, &route, &resolver));
+        assert!(!request_matches_qdrant_route(&missing, &route, &resolver));
     }
 
     #[tokio::test]
@@ -531,7 +539,7 @@ mod tests {
 
         let store = InstanceStore::default();
         store.upsert(qdrant_metadata(&grpc_socket)).await;
-        let resolver = RouteResolver::new(store, ResourceCache::default());
+        let resolver = RouteResolver::new(store, ResourceCache::default(), test_qdrant_route_key());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let gateway = tokio::spawn(async move {
@@ -603,7 +611,7 @@ mod tests {
                 name: "qdrant".to_string(),
                 username: "tenant".to_string(),
             },
-            route_key_sha256: Some(qdrant::route_key_sha256("secret")),
+            route_key_sha256: Some(test_qdrant_route_key().fingerprint("secret")),
             mariadb_native_password_sha1_stage2: None,
             mariadb_root_password: None,
             mysql_native_password_sha1_stage2: None,
@@ -617,5 +625,9 @@ mod tests {
             created_at: "2026-08-19T00:00:00Z".to_string(),
             updated_at: "2026-08-19T00:00:00Z".to_string(),
         }
+    }
+
+    fn test_qdrant_route_key() -> qdrant::QdrantRouteKey {
+        qdrant::QdrantRouteKey::new(b"test-qdrant-route-key")
     }
 }

@@ -477,6 +477,13 @@ pub(crate) async fn acquire_logical_dump(
             source_database,
             target_database,
             state.config.security.remote_import.max_staged_bytes,
+            std::time::Duration::from_secs(
+                state
+                    .config
+                    .security
+                    .remote_import
+                    .operation_timeout_seconds,
+            ),
         )
         .await
         {
@@ -497,6 +504,13 @@ pub(crate) async fn acquire_logical_dump(
             source_database,
             target_database,
             state.config.security.remote_import.max_staged_bytes,
+            std::time::Duration::from_secs(
+                state
+                    .config
+                    .security
+                    .remote_import
+                    .operation_timeout_seconds,
+            ),
         )
         .await
         {

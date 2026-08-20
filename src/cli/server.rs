@@ -212,7 +212,11 @@ pub(super) async fn start_gateway_listeners(
     if supervisor.is_stopping() {
         anyhow::bail!("daemon shutdown started while gateway listeners were binding");
     }
-    let resolver = RouteResolver::new(store, resources);
+    let resolver = RouteResolver::new(
+        store,
+        resources,
+        crate::protocols::qdrant::QdrantRouteKey::new(config.websocket_jwt_secret()),
+    );
     let mut listeners = tokio::task::JoinSet::new();
     for listener in prepared {
         let protocol = listener.kind.as_str();
