@@ -901,7 +901,7 @@ pub(crate) async fn provision_mysql_tenant_user(
     root_password: &str,
 ) -> Result<(), ApiError> {
     let root_password_secret = SecretString::from(root_password.to_string());
-    mysql_hardening::verify_mysql_root_auth(
+    mysql_hardening::probe_mysql_root_auth(
         state,
         instance_id,
         &root_password_secret,

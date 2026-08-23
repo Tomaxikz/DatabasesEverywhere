@@ -800,16 +800,16 @@ mod tests {
             InterruptedImportAction::Block
         );
 
-        assert!(is_active_import_job(
+        assert!(job_is_active(
             &upload,
             Some(&job(ImportExportStatus::Queued, None))
         ));
-        assert!(is_active_import_job(
+        assert!(job_is_active(
             &upload,
             Some(&job(ImportExportStatus::Running, None))
         ));
-        assert!(!is_active_import_job(&upload, Some(&failed)));
-        assert!(!is_active_import_job(&upload, Some(&mismatched)));
+        assert!(!job_is_active(&upload, Some(&failed)));
+        assert!(!job_is_active(&upload, Some(&mismatched)));
     }
 
     #[test]
