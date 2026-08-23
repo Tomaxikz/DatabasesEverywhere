@@ -16,7 +16,7 @@ pub(crate) struct CompatibilityAttestation {
 }
 
 impl InstanceRepository {
-    pub(crate) async fn delete_compatibility_attestation(
+    pub(crate) async fn delete_compatibility(
         &self,
         instance_id: &str,
     ) -> Result<(), RepositoryError> {
@@ -50,10 +50,10 @@ impl InstanceRepository {
         .bind(instance_id)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(compatibility_attestation_from_row).transpose()
+        row.map(compatibility_from_row).transpose()
     }
 
-    pub(crate) async fn record_compatibility_attestation(
+    pub(crate) async fn record_compatibility(
         &self,
         attestation: &CompatibilityAttestation,
     ) -> Result<(), RepositoryError> {
@@ -97,7 +97,7 @@ impl InstanceRepository {
     }
 }
 
-fn compatibility_attestation_from_row(
+fn compatibility_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> Result<CompatibilityAttestation, RepositoryError> {
     let protocol_text = row.try_get::<String, _>("protocol")?;
@@ -149,7 +149,7 @@ mod tests {
         repository.upsert(&metadata).await.unwrap();
 
         repository
-            .record_compatibility_attestation(&CompatibilityAttestation {
+            .record_compatibility(&CompatibilityAttestation {
                 instance_id: metadata.instance_id.clone(),
                 protocol: metadata.protocol,
                 container_id: "123456789012abcdef".to_string(),
@@ -162,7 +162,7 @@ mod tests {
             .await
             .unwrap();
         repository
-            .record_compatibility_attestation(&CompatibilityAttestation {
+            .record_compatibility(&CompatibilityAttestation {
                 instance_id: metadata.instance_id.clone(),
                 protocol: metadata.protocol,
                 container_id: "abcdef123456789012".to_string(),

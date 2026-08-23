@@ -4,8 +4,8 @@ const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
 
 pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
     let pool = sqlite::connect(std::path::Path::new(&config.paths.metadata_root()))
         .await
         .context("failed to initialize sqlite storage")?;
@@ -16,8 +16,8 @@ pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()>
 
 pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?
         .with_node_id(config.uuid.clone());
@@ -39,8 +39,8 @@ pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
 
 pub(super) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
     let metadata_root = config.paths.metadata_root();
     let data_root = std::path::Path::new(&metadata_root);
     let mut removed = 0;
@@ -73,9 +73,9 @@ pub(super) async fn repair_protected_secret(
     }
     validate_instance_id(&instance_id)?;
     let config = load_config(&config_path)?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
-    let known_plaintext = read_protected_secret_from_stdin()?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
+    let known_plaintext = read_secret_from_stdin()?;
     let metadata_root = config.paths.metadata_root();
     let pool = sqlite::connect(Path::new(&metadata_root))
         .await
@@ -83,7 +83,7 @@ pub(super) async fn repair_protected_secret(
     let repository = InstanceRepository::encrypted(pool, Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
     let repaired = repository
-        .repair_ambiguous_protected_secret(&instance_id, field, &known_plaintext)
+        .repair_ambiguous_secret(&instance_id, field, &known_plaintext)
         .await
         .context("protected-secret repair failed")?;
 
@@ -105,7 +105,7 @@ pub(super) async fn repair_protected_secret(
     Ok(())
 }
 
-fn read_protected_secret_from_stdin() -> anyhow::Result<SecretString> {
+fn read_secret_from_stdin() -> anyhow::Result<SecretString> {
     if io::stdin().is_terminal() {
         anyhow::bail!(
             "refusing to echo a secret in an interactive terminal; pipe the exact known plaintext to stdin"
@@ -142,8 +142,8 @@ pub(super) async fn migrate_paths(
     force: bool,
 ) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
     let plan = PathMigrationPlan::new(&config);
     let actions = plan.actions();
 
@@ -166,10 +166,10 @@ pub(super) async fn migrate_paths(
     }
 
     if !force {
-        ensure_no_active_managed_containers(&config).await?;
+        require_idle_host(&config).await?;
     }
 
-    for root in configured_runtime_roots(&config) {
+    for root in runtime_roots(&config) {
         tokio::fs::create_dir_all(&root)
             .await
             .with_context(|| format!("failed to create migration target root {root}"))?;
@@ -288,7 +288,7 @@ impl<'a> PathMigrationPlan<'a> {
     }
 }
 
-pub(super) async fn ensure_no_active_managed_containers(config: &Config) -> anyhow::Result<()> {
+pub(super) async fn require_idle_host(config: &Config) -> anyhow::Result<()> {
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API for migration safety check")?
         .with_node_id(config.uuid.clone());
@@ -322,7 +322,7 @@ pub(super) fn migrate_path_action(action: &PathMigrationAction, force: bool) -> 
         migrate_symlink(&action.from, &action.to, force)
     } else if metadata.is_dir() {
         if action.to.exists() {
-            migrate_directory_contents(&action.from, &action.to, force)
+            migrate_dir(&action.from, &action.to, force)
         } else {
             migrate_directory(&action.from, &action.to, force)
         }
@@ -359,11 +359,7 @@ pub(super) fn migrate_directory(from: &Path, to: &Path, force: bool) -> anyhow::
     }
 }
 
-pub(super) fn migrate_directory_contents(
-    from: &Path,
-    to: &Path,
-    force: bool,
-) -> anyhow::Result<()> {
+pub(super) fn migrate_dir(from: &Path, to: &Path, force: bool) -> anyhow::Result<()> {
     fs::create_dir_all(to)
         .with_context(|| format!("failed to create migration target {}", to.display()))?;
     let entries = fs::read_dir(from)
@@ -456,7 +452,7 @@ pub(super) fn migrate_symlink(from: &Path, to: &Path, force: bool) -> anyhow::Re
                 to.display()
             );
         }
-        remove_path_for_replace(to)?;
+        remove_replace_target(to)?;
     }
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
@@ -492,7 +488,7 @@ pub(super) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> 
     std::os::windows::fs::symlink_file(target, link)
 }
 
-pub(super) fn remove_path_for_replace(path: &Path) -> anyhow::Result<()> {
+pub(super) fn remove_replace_target(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect replacement target {}", path.display()))?;
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -526,12 +522,12 @@ pub(super) async fn disk_test(
     }
 
     let mut config = load_config(&config_path)?;
-    ensure_runtime_directories(&config)
+    prepare_runtime_dirs(&config)
         .await
         .context("failed to create runtime directories")?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
-    detect_and_log_disk_mode(&mut config)?;
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
+    log_disk_mode(&mut config)?;
     validate_runtime_support(&config).await?;
 
     let limiter = DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root());

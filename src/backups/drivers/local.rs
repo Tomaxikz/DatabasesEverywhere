@@ -5,10 +5,10 @@ use std::{
 
 use crate::backups::{
     BACKUP_MANIFEST_SCHEMA_VERSION, BackupBundle, BackupStoreError, MaterializedBackup,
-    StoredBackup, catalog_file_name, ensure_private_directory, io_error, is_sha256,
-    metadata_file_name, remove_file_if_exists, sha256_file, system_time_fields, validate_backup_id,
+    StoredBackup, catalog_file_name, io_error, is_sha256, metadata_file_name, prepare_private_dir,
+    remove_file_if_exists, sha256_file, system_time_fields, validate_backup_id,
 };
-use crate::shared::{files::read_private_regular_file_bounded, ids::validate_instance_id};
+use crate::shared::{files::read_bounded_private_file, ids::validate_instance_id};
 
 const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
@@ -23,7 +23,7 @@ impl LocalBackupDriver {
     }
 
     pub async fn preflight(&self) -> Result<(), BackupStoreError> {
-        ensure_private_directory(&self.root, "backup root").await
+        prepare_private_dir(&self.root, "backup root").await
     }
 
     pub async fn commit(
@@ -39,7 +39,7 @@ impl LocalBackupDriver {
         }
 
         let destination = self.instance_root(&manifest.instance_id)?;
-        ensure_private_directory(&destination, "instance backup directory").await?;
+        prepare_private_dir(&destination, "instance backup directory").await?;
         let archive = destination.join(&manifest.backup_id);
         let metadata = destination.join(metadata_file_name(&manifest.backup_id));
         let catalog = destination.join(catalog_file_name(&manifest.backup_id));
@@ -165,7 +165,7 @@ impl LocalBackupDriver {
             .join(catalog_file_name(backup_id));
         let path_for_read = path.clone();
         match tokio::task::spawn_blocking(move || {
-            read_private_regular_file_bounded(&path_for_read, max_bytes)
+            read_bounded_private_file(&path_for_read, max_bytes)
         })
         .await
         .map_err(|error| BackupStoreError::Runtime(format!("catalog read task failed: {error}")))?
@@ -267,11 +267,12 @@ impl LocalBackupDriver {
 
 async fn read_manifest(path: &Path) -> Result<Option<StoredBackup>, BackupStoreError> {
     let path = path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || {
-        read_private_regular_file_bounded(&path, MAX_METADATA_BYTES)
-    })
-    .await
-    .map_err(|error| BackupStoreError::Runtime(format!("metadata read task failed: {error}")))?;
+    let result =
+        tokio::task::spawn_blocking(move || read_bounded_private_file(&path, MAX_METADATA_BYTES))
+            .await
+            .map_err(|error| {
+                BackupStoreError::Runtime(format!("metadata read task failed: {error}"))
+            })?;
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

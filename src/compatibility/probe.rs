@@ -45,7 +45,7 @@ pub(crate) enum CompatibilityProbeError {
     Storage(String),
 }
 
-pub(crate) async fn compatibility_attestation(
+pub(crate) async fn cached_compatibility(
     manager: &InstanceManager,
     docker: &DockerRuntime,
     metadata: &InstanceMetadata,
@@ -62,7 +62,7 @@ pub(crate) async fn compatibility_attestation(
         return Ok(None);
     };
     let Some(identity) = docker
-        .verified_managed_compatibility_identity(metadata.protocol, &metadata.instance_id)
+        .verified_compatibility_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
     else {
@@ -81,7 +81,7 @@ pub(crate) async fn probe_instance_compatibility(
     force: bool,
 ) -> Result<CompatibilityProbeOutcome, CompatibilityProbeError> {
     let mut identity = docker
-        .verified_managed_compatibility_identity(metadata.protocol, &metadata.instance_id)
+        .verified_compatibility_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
         .ok_or(CompatibilityProbeError::ContainerMissing)?;
@@ -97,7 +97,7 @@ pub(crate) async fn probe_instance_compatibility(
         && attestation.probe_revision == COMPATIBILITY_PROBE_REVISION
     {
         let confirmed = docker
-            .verified_managed_compatibility_identity(metadata.protocol, &metadata.instance_id)
+            .verified_compatibility_identity(metadata.protocol, &metadata.instance_id)
             .await
             .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
             .ok_or(CompatibilityProbeError::ContainerMissing)?;
@@ -119,7 +119,7 @@ pub(crate) async fn probe_instance_compatibility(
         // proof before executing. If the command then fails, callers and the
         // next boot see "not attested" rather than trusting stale evidence.
         manager
-            .delete_compatibility_attestation(&metadata.instance_id)
+            .delete_compatibility(&metadata.instance_id)
             .await
             .map_err(|error| CompatibilityProbeError::Storage(error.to_string()))?;
     }
@@ -139,7 +139,7 @@ pub(crate) async fn probe_instance_compatibility(
         return Err(CompatibilityProbeError::Unparseable);
     }
     let confirmed_identity = docker
-        .verified_managed_compatibility_identity(metadata.protocol, &metadata.instance_id)
+        .verified_compatibility_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
         .ok_or(CompatibilityProbeError::ContainerMissing)?;
@@ -152,7 +152,7 @@ pub(crate) async fn probe_instance_compatibility(
         Err(error) => (false, Some(error.to_string())),
     };
     manager
-        .record_compatibility_attestation(&CompatibilityAttestation {
+        .record_compatibility(&CompatibilityAttestation {
             instance_id: metadata.instance_id.clone(),
             protocol: metadata.protocol,
             container_id: identity.id.clone(),
@@ -165,7 +165,7 @@ pub(crate) async fn probe_instance_compatibility(
         .await
         .map_err(|error| CompatibilityProbeError::Storage(error.to_string()))?;
     let recorded_identity = docker
-        .verified_managed_compatibility_identity(metadata.protocol, &metadata.instance_id)
+        .verified_compatibility_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
         .ok_or(CompatibilityProbeError::ContainerMissing)?;

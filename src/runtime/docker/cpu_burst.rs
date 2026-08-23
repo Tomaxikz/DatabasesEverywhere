@@ -115,11 +115,7 @@ impl DockerRuntime {
     /// Clears an earlier burst before changing the quota. Linux rejects a new
     /// quota smaller than the currently configured burst, so this must happen
     /// before a downward CPU-limit update.
-    pub(super) async fn clear_cpu_burst_before_limit_update(
-        &self,
-        protocol: Protocol,
-        instance_id: &str,
-    ) {
+    pub(super) async fn clear_cpu_burst(&self, protocol: Protocol, instance_id: &str) {
         match self
             .set_cpu_burst_policy(protocol, instance_id, CpuBurstMode::Disabled)
             .await
@@ -142,22 +138,18 @@ impl DockerRuntime {
         mode: CpuBurstMode,
     ) -> Result<CpuBurstPolicyStatus, DockerError> {
         for _ in 0..GENERATION_RETRIES {
-            let Some(generation) = self
-                .managed_process_generation(protocol, instance_id)
-                .await?
-            else {
+            let Some(generation) = self.process_generation(protocol, instance_id).await? else {
                 return Ok(CpuBurstPolicyStatus::Inactive);
             };
             let pid = generation.pid;
             let container_id = generation.container_id.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                apply_cpu_burst_for_process(pid, &container_id, mode)
-            })
-            .await
-            .map_err(|error| DockerError::CpuBurstPolicy {
-                instance_id: instance_id.to_string(),
-                reason: format!("CPU cgroup worker failed: {error}"),
-            })?;
+            let result =
+                tokio::task::spawn_blocking(move || apply_cpu_burst(pid, &container_id, mode))
+                    .await
+                    .map_err(|error| DockerError::CpuBurstPolicy {
+                        instance_id: instance_id.to_string(),
+                        reason: format!("CPU cgroup worker failed: {error}"),
+                    })?;
             let result = match result {
                 Ok(result) => result,
                 Err(CpuBurstError::ProcessGone) => continue,
@@ -169,7 +161,7 @@ impl DockerRuntime {
                 }
             };
             if self
-                .managed_process_generation(protocol, instance_id)
+                .process_generation(protocol, instance_id)
                 .await?
                 .as_ref()
                 == Some(&generation)
@@ -180,13 +172,13 @@ impl DockerRuntime {
         Ok(CpuBurstPolicyStatus::Inactive)
     }
 
-    async fn managed_process_generation(
+    async fn process_generation(
         &self,
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<ManagedProcessGeneration>, DockerError> {
         let Some(response) = self
-            .verified_managed_container_inspection(protocol, instance_id)
+            .inspect_verified_container(protocol, instance_id)
             .await?
         else {
             return Ok(None);
@@ -220,7 +212,7 @@ impl DockerRuntime {
     }
 }
 
-fn apply_cpu_burst_for_process(
+fn apply_cpu_burst(
     pid: u32,
     container_id: &str,
     mode: CpuBurstMode,
@@ -242,7 +234,7 @@ fn apply_cpu_burst_for_process(
                 });
             }
         };
-        if !cgroup_metadata_identifies_container(&cgroups, container_id) {
+        if !cgroup_matches_container(&cgroups, container_id) {
             continue;
         }
         let mountinfo_path = Path::new(mountinfo);
@@ -263,7 +255,7 @@ fn apply_cpu_burst_for_process(
     }
 }
 
-fn cgroup_metadata_identifies_container(cgroups: &str, container_id: &str) -> bool {
+fn cgroup_matches_container(cgroups: &str, container_id: &str) -> bool {
     !container_id.is_empty()
         && [
             membership_path(cgroups, None),
@@ -695,11 +687,11 @@ mod tests {
     #[test]
     fn process_membership_must_contain_the_exact_container_id() {
         let container_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert!(cgroup_metadata_identifies_container(
+        assert!(cgroup_matches_container(
             &format!("0::/system.slice/docker-{container_id}.scope\n"),
             container_id
         ));
-        assert!(!cgroup_metadata_identifies_container(
+        assert!(!cgroup_matches_container(
             "0::/system.slice/docker-unrelated.scope\n",
             container_id
         ));

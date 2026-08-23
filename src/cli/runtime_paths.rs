@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn ensure_instance_runtime_paths(
+pub(super) async fn prepare_instance_paths(
     config: &Config,
     docker: &DockerRuntime,
     protocol: Protocol,
@@ -18,7 +18,7 @@ pub(super) async fn ensure_instance_runtime_paths(
     );
 
     if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
-        paths.apply_rootless_podman_owner(uid, gid).await?;
+        paths.apply_rootless_owner(uid, gid).await?;
         tracing::info!(
             instance_id,
             protocol = %protocol,
@@ -33,7 +33,7 @@ pub(super) async fn ensure_instance_runtime_paths(
             .await
             .ok()
             .flatten()
-            .and_then(|user| parse_numeric_container_user(&user))
+            .and_then(|user| parse_container_user(&user))
         {
             tracing::info!(
                 instance_id,
@@ -68,7 +68,7 @@ pub(super) async fn ensure_instance_runtime_paths(
     Ok(())
 }
 
-pub(super) fn prepare_rootless_podman_runtime_paths(
+pub(super) fn prepare_rootless_paths(
     config: &Config,
     docker: &DockerRuntime,
 ) -> anyhow::Result<()> {
@@ -99,23 +99,24 @@ pub(super) fn prepare_rootless_podman_runtime_paths(
     ]);
     let daemon_uid = rustix::process::geteuid().as_raw();
     for path in &paths {
-        create_runtime_directory_tree(path).with_context(|| {
+        create_runtime_dirs(path).with_context(|| {
             format!(
                 "failed to create rootless Podman traversal path {}",
                 path.display()
             )
         })?;
-        harden_runtime_directory(path)?;
-        crate::shared::ownership::share_directory_for_traversal(path, daemon_uid, gid)
-            .with_context(|| {
+        harden_runtime_dir(path)?;
+        crate::shared::ownership::allow_directory_traversal(path, daemon_uid, gid).with_context(
+            || {
                 format!(
                     "failed to grant rootless Podman gid {gid} traversal access to {}",
                     path.display()
                 )
-            })?;
+            },
+        )?;
     }
     for path in &paths {
-        validate_rootless_podman_ancestor_traversal(path, uid, gid)?;
+        check_rootless_path_access(path, uid, gid)?;
     }
     tracing::info!(
         uid,
@@ -125,11 +126,7 @@ pub(super) fn prepare_rootless_podman_runtime_paths(
     Ok(())
 }
 
-pub(super) fn validate_rootless_podman_ancestor_traversal(
-    path: &Path,
-    uid: u32,
-    gid: u32,
-) -> anyhow::Result<()> {
+pub(super) fn check_rootless_path_access(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -174,7 +171,7 @@ pub(super) fn validate_rootless_podman_ancestor_traversal(
     Ok(())
 }
 
-pub(super) fn parse_numeric_container_user(user: &str) -> Option<(u32, u32)> {
+pub(super) fn parse_container_user(user: &str) -> Option<(u32, u32)> {
     let user = user.trim();
     if user.is_empty() || user == "root" {
         return None;
@@ -200,12 +197,12 @@ pub(super) struct RuntimeDirectoryStatus {
     pub(super) existed: bool,
 }
 
-pub(super) async fn ensure_runtime_directories(
+pub(super) async fn prepare_runtime_dirs(
     config: &Config,
 ) -> anyhow::Result<Vec<RuntimeDirectoryStatus>> {
     let mut statuses = Vec::new();
-    for path in configured_runtime_roots(config) {
-        validate_runtime_path_ancestors(Path::new(&path), false)?;
+    for path in runtime_roots(config) {
+        validate_runtime_ancestors(Path::new(&path), false)?;
         let existed = match fs::symlink_metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == ErrorKind::NotFound => false,
@@ -214,16 +211,16 @@ pub(super) async fn ensure_runtime_directories(
                     .with_context(|| format!("failed to inspect configured directory {path}"));
             }
         };
-        create_runtime_directory_tree(Path::new(&path))
+        create_runtime_dirs(Path::new(&path))
             .with_context(|| format!("failed to securely create configured directory {path}"))?;
-        harden_runtime_directory(Path::new(&path))?;
-        validate_runtime_path_ancestors(Path::new(&path), true)?;
+        harden_runtime_dir(Path::new(&path))?;
+        validate_runtime_ancestors(Path::new(&path), true)?;
         statuses.push(RuntimeDirectoryStatus { path, existed });
     }
     Ok(statuses)
 }
 
-pub(super) fn create_runtime_directory_tree(path: &Path) -> anyhow::Result<()> {
+pub(super) fn create_runtime_dirs(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::path::Component;
@@ -287,7 +284,7 @@ pub(super) fn create_runtime_directory_tree(path: &Path) -> anyhow::Result<()> {
                     });
                 }
             };
-            validate_runtime_directory_fd(&child, &traversed, daemon_uid)?;
+            validate_runtime_dir(&child, &traversed, daemon_uid)?;
             directory = child;
         }
     }
@@ -305,7 +302,7 @@ pub(super) fn create_runtime_directory_tree(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn validate_runtime_directory_fd(
+pub(super) fn validate_runtime_dir(
     directory: &impl std::os::fd::AsFd,
     path: &Path,
     daemon_uid: u32,
@@ -340,10 +337,7 @@ pub(super) fn validate_runtime_directory_fd(
     Ok(())
 }
 
-pub(super) fn validate_runtime_path_ancestors(
-    path: &Path,
-    include_target: bool,
-) -> anyhow::Result<()> {
+pub(super) fn validate_runtime_ancestors(path: &Path, include_target: bool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -410,7 +404,7 @@ pub(super) fn validate_runtime_path_ancestors(
     Ok(())
 }
 
-pub(super) fn harden_runtime_directory(path: &Path) -> anyhow::Result<()> {
+pub(super) fn harden_runtime_dir(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use rustix::fs::{FileType, Mode, OFlags, fchmod, open};
@@ -433,7 +427,7 @@ pub(super) fn harden_runtime_directory(path: &Path) -> anyhow::Result<()> {
         if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
             anyhow::bail!("runtime path {} must be a real directory", path.display());
         }
-        require_runtime_directory_owner(path, stat.st_uid, rustix::process::geteuid().as_raw())?;
+        require_runtime_owner(path, stat.st_uid, rustix::process::geteuid().as_raw())?;
         fchmod(&directory, Mode::RWXU)
             .map_err(std::io::Error::from)
             .with_context(|| {
@@ -459,7 +453,7 @@ pub(super) fn harden_runtime_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn require_runtime_directory_owner(
+pub(super) fn require_runtime_owner(
     path: &Path,
     actual_uid: u32,
     expected_uid: u32,
@@ -486,12 +480,12 @@ impl Drop for DaemonLock {
     }
 }
 
-pub(super) async fn acquire_configured_daemon_lock(config: &Config) -> anyhow::Result<DaemonLock> {
+pub(super) async fn lock_daemon(config: &Config) -> anyhow::Result<DaemonLock> {
     let locks_root = Path::new(&config.paths.locks);
     tokio::fs::create_dir_all(locks_root)
         .await
         .with_context(|| format!("failed to create lock directory {}", locks_root.display()))?;
-    harden_runtime_directory(locks_root)?;
+    harden_runtime_dir(locks_root)?;
     acquire_daemon_lock(locks_root).context("failed to acquire the process-lifetime daemon lock")
 }
 
@@ -571,7 +565,7 @@ pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLoc
     }
 }
 
-pub(super) fn configured_runtime_roots(config: &Config) -> Vec<String> {
+pub(super) fn runtime_roots(config: &Config) -> Vec<String> {
     vec![
         config.paths.data.clone(),
         config.paths.metadata_root(),
@@ -605,7 +599,7 @@ pub(super) async fn validate_runtime_support(config: &Config) -> anyhow::Result<
         .context("failed to verify disk limiter support")
 }
 
-pub(super) fn detect_and_log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
+pub(super) fn log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
     let detection = crate::disk::detect_disk_mode(&config.paths, config.disk.selection)
         .context("failed to inspect configured filesystems for disk-limit selection")?;
     for filesystem in &detection.filesystems {

@@ -51,7 +51,7 @@ impl DockerRuntime {
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
         let Some(response) = self
-            .verified_managed_container_inspection(protocol, instance_id)
+            .inspect_verified_container(protocol, instance_id)
             .await?
         else {
             return Ok(None);
@@ -64,7 +64,7 @@ impl DockerRuntime {
         Ok(Some(id))
     }
 
-    pub(super) async fn verified_managed_container_inspection(
+    pub(super) async fn inspect_verified_container(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -96,13 +96,13 @@ impl DockerRuntime {
     /// Returns a hardening-safe runtime identity. Container IDs survive a
     /// stop/start, so the start timestamp is included to distinguish a fresh
     /// database process from a daemon-only restart.
-    pub(crate) async fn verified_managed_container_identity(
+    pub(crate) async fn verified_container_identity(
         &self,
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<ManagedContainerIdentity>, DockerError> {
         let Some(response) = self
-            .verified_managed_container_inspection(protocol, instance_id)
+            .inspect_verified_container(protocol, instance_id)
             .await?
         else {
             return Ok(None);
@@ -126,13 +126,13 @@ impl DockerRuntime {
 
     /// Reads both immutable IDs from one verified inspection. Callers re-read
     /// this after probing to reject an external replacement during the exec.
-    pub(crate) async fn verified_managed_compatibility_identity(
+    pub(crate) async fn verified_compatibility_identity(
         &self,
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<ManagedContainerCompatibilityIdentity>, DockerError> {
         let Some(response) = self
-            .verified_managed_container_inspection(protocol, instance_id)
+            .inspect_verified_container(protocol, instance_id)
             .await?
         else {
             return Ok(None);
@@ -324,7 +324,7 @@ impl DockerRuntime {
         Ok((username, SecretString::from(password)))
     }
 
-    pub(crate) async fn postgres_legacy_tenant_credentials(
+    pub(crate) async fn postgres_legacy_credentials(
         &self,
         instance_id: &str,
     ) -> Result<Option<(String, SecretString)>, DockerError> {
@@ -367,20 +367,20 @@ impl DockerRuntime {
             .unwrap_or_default();
         let mut credential = None;
         for (username_key, password_key) in key_pairs {
-            let username = optional_unique_environment_value(&environment, username_key).map_err(
-                |reason| DockerError::InvalidLegacyCredentialEnvironment {
+            let username = unique_optional_env(&environment, username_key).map_err(|reason| {
+                DockerError::InvalidLegacyCredentialEnvironment {
                     instance_id: instance_id.to_string(),
                     protocol: protocol.as_str().to_string(),
                     reason,
-                },
-            )?;
-            let password = optional_unique_environment_value(&environment, password_key).map_err(
-                |reason| DockerError::InvalidLegacyCredentialEnvironment {
+                }
+            })?;
+            let password = unique_optional_env(&environment, password_key).map_err(|reason| {
+                DockerError::InvalidLegacyCredentialEnvironment {
                     instance_id: instance_id.to_string(),
                     protocol: protocol.as_str().to_string(),
                     reason,
-                },
-            )?;
+                }
+            })?;
             match (username, password) {
                 (None, None) => {}
                 (Some(username), Some(password))
@@ -465,7 +465,7 @@ impl DockerRuntime {
     /// to the data source selected by the effective disk-limit mode. Merely
     /// preparing a quota mount cannot protect a container that still uses the
     /// old raw path (or vice versa).
-    pub async fn verify_container_data_bind(
+    pub async fn verify_data_bind(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -731,10 +731,7 @@ fn environment_value(environment: &[String], key: &str) -> Option<String> {
     })
 }
 
-fn optional_unique_environment_value(
-    environment: &[String],
-    key: &str,
-) -> Result<Option<String>, String> {
+fn unique_optional_env(environment: &[String], key: &str) -> Result<Option<String>, String> {
     let prefix = format!("{key}=");
     let mut values = environment
         .iter()

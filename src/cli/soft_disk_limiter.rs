@@ -68,7 +68,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
         .as_ref()
         .map_or(0, |watcher| watcher.current_change_sequence());
 
-    reconcile_soft_disk_targets(
+    sync_soft_disk_targets(
         &state,
         &watcher,
         &mut planner,
@@ -90,7 +90,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
 
     loop {
         while let Some(result) = scans.try_join_next() {
-            complete_soft_disk_scan_task(
+            finish_soft_disk_scan(
                 result,
                 &watcher,
                 &targets,
@@ -101,7 +101,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
             );
         }
         while let Some(result) = watch_tasks.try_join_next() {
-            forced_watch_refresh.include(complete_watch_operation(
+            forced_watch_refresh.include(finish_watch(
                 result,
                 RootObservationContext {
                     watcher: &watcher,
@@ -123,7 +123,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
             monitor_started.elapsed(),
             observed_watcher_sequence,
         );
-        dispatch_watch_operation(
+        dispatch_watch(
             &watcher,
             &mut watch_queue,
             &mut watch_tasks,
@@ -172,7 +172,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
         }
 
         if let Some(result) = completed {
-            complete_soft_disk_scan_task(
+            finish_soft_disk_scan(
                 result,
                 &watcher,
                 &targets,
@@ -183,7 +183,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
             );
         }
         if let Some(result) = watch_completed {
-            forced_watch_refresh.include(complete_watch_operation(
+            forced_watch_refresh.include(finish_watch(
                 result,
                 RootObservationContext {
                     watcher: &watcher,
@@ -197,7 +197,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
             ));
         }
         if reconcile {
-            reconcile_soft_disk_targets(
+            sync_soft_disk_targets(
                 &state,
                 &watcher,
                 &mut planner,
@@ -239,7 +239,7 @@ pub(super) async fn monitor_soft_disk_limits(state: AppState) {
     }
 }
 
-async fn reconcile_soft_disk_targets(
+async fn sync_soft_disk_targets(
     state: &AppState,
     watcher: &Option<Arc<SoftDiskWatcher>>,
     planner: &mut HybridScanPlanner,
@@ -462,7 +462,7 @@ impl PendingWatchRefresh {
     }
 }
 
-fn dispatch_watch_operation(
+fn dispatch_watch(
     watcher: &Option<Arc<SoftDiskWatcher>>,
     queue: &mut WatchOperationQueue,
     tasks: &mut tokio::task::JoinSet<CompletedWatchOperation>,
@@ -521,7 +521,7 @@ fn dispatch_watch_operation(
     });
 }
 
-fn complete_watch_operation(
+fn finish_watch(
     completed: Result<CompletedWatchOperation, tokio::task::JoinError>,
     mut context: RootObservationContext<'_>,
     now: Duration,
@@ -800,7 +800,7 @@ struct CompletedSoftDiskScan {
     result: Result<HybridScanExecution, String>,
 }
 
-fn complete_soft_disk_scan_task(
+fn finish_soft_disk_scan(
     result: Result<CompletedSoftDiskScan, tokio::task::JoinError>,
     watcher: &Option<Arc<SoftDiskWatcher>>,
     targets: &HashMap<String, SoftDiskTarget>,
@@ -810,7 +810,7 @@ fn complete_soft_disk_scan_task(
     now: Duration,
 ) {
     match result {
-        Ok(completed) => complete_soft_disk_scan(
+        Ok(completed) => apply_soft_disk_scan(
             completed,
             watcher,
             targets,
@@ -828,7 +828,7 @@ fn complete_soft_disk_scan_task(
     }
 }
 
-fn complete_soft_disk_scan(
+fn apply_soft_disk_scan(
     completed: CompletedSoftDiskScan,
     watcher: &Option<Arc<SoftDiskWatcher>>,
     targets: &HashMap<String, SoftDiskTarget>,
@@ -975,11 +975,11 @@ impl AppStateSoftDiskRuntime {
         metadata: &crate::instances::metadata::InstanceMetadata,
         target: &SoftDiskTarget,
     ) -> bool {
-        soft_disk_target_is_current(metadata, target, self.state.config.disk.mode)
+        is_current_target(metadata, target, self.state.config.disk.mode)
     }
 }
 
-pub(super) fn soft_disk_target_is_current(
+pub(super) fn is_current_target(
     metadata: &crate::instances::metadata::InstanceMetadata,
     target: &SoftDiskTarget,
     global_mode: crate::config::DiskLimitMode,

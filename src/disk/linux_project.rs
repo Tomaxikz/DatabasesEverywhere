@@ -9,7 +9,7 @@ pub(super) async fn verify_startup(
     fstype: &str,
     options: &[String],
 ) -> Result<(), DiskLimitError> {
-    require_project_quota_mount_option(data_root, mount, source, fstype, options)?;
+    require_project_quota(data_root, mount, source, fstype, options)?;
     require_command("quotaon").await?;
     require_command("setquota").await?;
     require_command("chattr").await?;
@@ -37,7 +37,7 @@ async fn require_command(command: &'static str) -> Result<(), DiskLimitError> {
         .map_err(|source| DiskLimitError::CommandIo { command, source })
 }
 
-fn require_project_quota_mount_option(
+fn require_project_quota(
     data_root: &Path,
     mount: &Path,
     source: &str,
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn rejects_mount_without_project_quota_option() {
-        let error = require_project_quota_mount_option(
+        let error = require_project_quota(
             Path::new("/var/lib/databases-everywhere"),
             Path::new("/"),
             "/dev/vda3",
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn accepts_project_quota_mount_option_aliases() {
-        require_project_quota_mount_option(
+        require_project_quota(
             Path::new("/var/lib/databases-everywhere"),
             Path::new("/"),
             "/dev/vda3",
@@ -177,7 +177,7 @@ mod tests {
             &["rw".to_string(), "prjquota".to_string()],
         )
         .unwrap();
-        require_project_quota_mount_option(
+        require_project_quota(
             Path::new("/var/lib/databases-everywhere"),
             Path::new("/"),
             "/dev/vda3",

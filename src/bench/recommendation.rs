@@ -28,7 +28,7 @@ struct SchedulerSnapshotWire {
     capacity: SchedulerCapacityReport,
 }
 
-pub(super) async fn build_manual_active_jobs_recommendation(
+pub(super) async fn recommend_job_limit(
     client: &BenchClient,
     config: &Config,
     system: &serde_json::Value,
@@ -64,7 +64,7 @@ pub(super) async fn build_manual_active_jobs_recommendation(
         ],
     };
 
-    if let Err(reason) = verify_benchmark_daemon_identity(config, system) {
+    if let Err(reason) = verify_benchmark_daemon(config, system) {
         report.unavailable_reason = Some(reason);
         return report;
     }
@@ -79,7 +79,7 @@ pub(super) async fn build_manual_active_jobs_recommendation(
     let worst_case_path = format!(
         "{ENDPOINT}?protocol={protocol_name}&action=import&target_disk_mib={target_disk_mib}&mode=wipe&compressed=true"
     );
-    let worst_case = match request_scheduler_recommendation(
+    let worst_case = match scheduler_recommendation(
         client,
         &worst_case_path,
         "scheduler configured-maximum recommendation",
@@ -92,7 +92,7 @@ pub(super) async fn build_manual_active_jobs_recommendation(
             return report;
         }
     };
-    let worst_recommended = mode_independent_recommendation(&worst_case);
+    let worst_recommended = base_recommendation(&worst_case);
     report.scheduler_capacity = Some(worst_case.scheduler.capacity.clone());
     report.max_queued_jobs = Some(worst_case.max_queued_jobs);
     report.max_queued_jobs_per_instance = Some(worst_case.max_queued_jobs_per_instance);
@@ -115,16 +115,16 @@ pub(super) async fn build_manual_active_jobs_recommendation(
             Some("the benchmark export did not produce a non-empty artifact size".to_string());
         return report;
     };
-    let representative_mode = if representative_import_replaces_data(protocol) {
+    let representative_mode = if import_is_destructive(protocol) {
         "wipe"
     } else {
         "merge"
     };
-    let representative_compressed = native_export_is_compressed(protocol);
+    let representative_compressed = is_native_export_compressed(protocol);
     let representative_path = format!(
         "{ENDPOINT}?protocol={protocol_name}&action=import&size_bytes={representative_size}&target_disk_mib={target_disk_mib}&mode={representative_mode}&compressed={representative_compressed}"
     );
-    match request_scheduler_recommendation(
+    match scheduler_recommendation(
         client,
         &representative_path,
         "scheduler representative-dump recommendation",
@@ -132,7 +132,7 @@ pub(super) async fn build_manual_active_jobs_recommendation(
     .await
     {
         Ok(response) => {
-            let recommended = mode_independent_recommendation(&response);
+            let recommended = base_recommendation(&response);
             report.representative_exported_dump = Some(workload_recommendation(
                 "representative_exported_dump",
                 protocol_name,
@@ -147,10 +147,7 @@ pub(super) async fn build_manual_active_jobs_recommendation(
     report
 }
 
-fn verify_benchmark_daemon_identity(
-    config: &Config,
-    system: &serde_json::Value,
-) -> Result<(), String> {
+fn verify_benchmark_daemon(config: &Config, system: &serde_json::Value) -> Result<(), String> {
     let server_uuid = system["uuid"]
         .as_str()
         .ok_or_else(|| "system response did not contain the daemon UUID".to_string())?;
@@ -172,7 +169,7 @@ fn verify_benchmark_daemon_identity(
     Ok(())
 }
 
-async fn request_scheduler_recommendation(
+async fn scheduler_recommendation(
     client: &BenchClient,
     path: &str,
     phase: &str,
@@ -182,7 +179,7 @@ async fn request_scheduler_recommendation(
         .with_context(|| format!("{phase} response did not match the scheduler contract"))
 }
 
-fn mode_independent_recommendation(response: &SchedulerRecommendationWire) -> usize {
+fn base_recommendation(response: &SchedulerRecommendationWire) -> usize {
     response.recommended_active_jobs
 }
 
@@ -216,14 +213,14 @@ fn resource_ratio(total: u64, per_job: u64) -> usize {
     usize::try_from(total / per_job.max(1)).unwrap_or(usize::MAX)
 }
 
-fn native_export_is_compressed(protocol: Protocol) -> bool {
+fn is_native_export_compressed(protocol: Protocol) -> bool {
     matches!(
         protocol,
         Protocol::Mongodb | Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
     )
 }
 
-fn representative_import_replaces_data(protocol: Protocol) -> bool {
+fn import_is_destructive(protocol: Protocol) -> bool {
     matches!(
         protocol,
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
@@ -245,14 +242,14 @@ mod tests {
             "uuid": "node-one",
             "token_id": "token-one"
         });
-        assert!(verify_benchmark_daemon_identity(&config, &matching).is_ok());
+        assert!(verify_benchmark_daemon(&config, &matching).is_ok());
 
         let wrong_node = serde_json::json!({
             "uuid": "node-two",
             "token_id": "token-one"
         });
         assert!(
-            verify_benchmark_daemon_identity(&config, &wrong_node)
+            verify_benchmark_daemon(&config, &wrong_node)
                 .unwrap_err()
                 .contains("does not match")
         );
@@ -261,7 +258,7 @@ mod tests {
             "token_id": "token-two"
         });
         assert!(
-            verify_benchmark_daemon_identity(&config, &wrong_token)
+            verify_benchmark_daemon(&config, &wrong_token)
                 .unwrap_err()
                 .contains("token_id")
         );
@@ -324,7 +321,7 @@ mod tests {
                 mode,
                 true,
                 &response,
-                mode_independent_recommendation(&response),
+                base_recommendation(&response),
             );
             assert_eq!(
                 (

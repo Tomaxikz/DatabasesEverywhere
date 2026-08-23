@@ -29,7 +29,7 @@ pub(super) async fn run_helper(
         .images
         .configured_for_protocol(protocol)
         .to_string();
-    if let Err(error) = state.docker.ensure_remote_import_image(&image).await {
+    if let Err(error) = state.docker.prepare_import_image(&image).await {
         return Err(remote_helper_error(protocol, &error));
     }
 
@@ -90,7 +90,7 @@ pub(super) async fn run_helper(
         ),
         max_output_bytes: state.config.security.remote_import.max_staged_bytes,
     };
-    match state.docker.run_remote_import_helper(&spec).await {
+    match state.docker.run_import_helper(&spec).await {
         Ok(_) => Ok(()),
         Err(error) => Err(remote_helper_error(protocol, &error)),
     }
@@ -185,7 +185,7 @@ fi
     } else {
         ""
     };
-    let schema_query = sh_quote(&postgres_schema_creation_query(selection));
+    let schema_query = sh_quote(&postgres_schema_query(selection));
     let toc_filter = sh_quote(POSTGRES_TOC_FILTER_PROGRAM);
     Ok(format!(
         r#"set -eu
@@ -222,7 +222,7 @@ async fn prepare_mariadb(
     )
     .await?;
     let (filters, tables) = mysql_selection_args(selection, database, "--ignore-table")?;
-    let database_objects = mysql_database_object_args(selection);
+    let database_objects = mysql_extra_args(selection);
     let definer_filter =
         mysql_definer_filter_script("/work/source.mariadb.raw.sql", "/work/source.mariadb.sql");
     Ok(format!(
@@ -256,8 +256,8 @@ async fn prepare_mysql(
     )
     .await?;
     let (filters, tables) = mysql_selection_args(selection, database, "--ignore-table")?;
-    let database_objects = mysql_database_object_args(selection);
-    let definer_filter = mysql_target_definer_filter_script(
+    let database_objects = mysql_extra_args(selection);
+    let definer_filter = mysql_definer_filter(
         "/work/source.mysql.raw.sql",
         "/work/source.mysql.sql",
         target_username,
@@ -530,7 +530,7 @@ fn mysql_selection_table<'a>(item: &'a str, database: &str) -> Result<&'a str, A
     Ok(table)
 }
 
-fn mysql_database_object_args(selection: &ImportExportSelection) -> &'static str {
+fn mysql_extra_args(selection: &ImportExportSelection) -> &'static str {
     if selection.mode == SelectionMode::Full {
         " --routines --events"
     } else {
@@ -602,7 +602,7 @@ fn mysql_definer_filter_script(input: &str, output: &str) -> String {
     )
 }
 
-fn mysql_target_definer_filter_script(
+fn mysql_definer_filter(
     input: &str,
     output: &str,
     target_username: &str,
@@ -649,7 +649,7 @@ s#^([[:space:]]*(CREATE|ALTER)[[:space:]]+((OR[[:space:]]+REPLACE|ALGORITHM=[^[:
 // schema while leaving SQL bodies and COPY data completely untouched.
 const POSTGRES_TOC_FILTER_PROGRAM: &str = r#"!($0 ~ /^[0-9]+;/ && $0 ~ / SCHEMA - /) { print }"#;
 
-fn postgres_schema_creation_query(selection: &ImportExportSelection) -> String {
+fn postgres_schema_query(selection: &ImportExportSelection) -> String {
     let scope = if selection.mode == SelectionMode::Full {
         String::new()
     } else {
@@ -967,8 +967,8 @@ mod tests {
             ..ImportExportSelection::default()
         };
 
-        assert_eq!(mysql_database_object_args(&full), " --routines --events");
-        assert_eq!(mysql_database_object_args(&selective), "");
+        assert_eq!(mysql_extra_args(&full), " --routines --events");
+        assert_eq!(mysql_extra_args(&selective), "");
     }
 
     #[test]
@@ -1061,7 +1061,7 @@ mod tests {
         let input = directory.path().join("dump.sql");
         let output = directory.path().join("filtered.sql");
         std::fs::write(&input, fixture).unwrap();
-        let script = mysql_target_definer_filter_script(
+        let script = mysql_definer_filter(
             input.to_str().unwrap(),
             output.to_str().unwrap(),
             "target_user",
@@ -1095,7 +1095,7 @@ mod tests {
             "CREATE SQL SECURITY DEFINER VIEW `unsafe_view` AS SELECT 1;\n",
         )
         .unwrap();
-        let script = mysql_target_definer_filter_script(
+        let script = mysql_definer_filter(
             input.to_str().unwrap(),
             output.to_str().unwrap(),
             "target_user",
@@ -1153,7 +1153,7 @@ mod tests {
             ..ImportExportSelection::default()
         };
 
-        let query = postgres_schema_creation_query(&selection);
+        let query = postgres_schema_query(&selection);
 
         assert!(query.contains("n.nspname = 'reporting'"));
         assert!(query.contains("c.relname = 'orders'"));

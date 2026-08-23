@@ -47,7 +47,7 @@ impl DockerRuntime {
         instance_id: &str,
         command: Vec<String>,
     ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             command,
@@ -71,7 +71,7 @@ impl DockerRuntime {
         if timeout.is_zero() {
             return Err(DockerError::InvalidExecTimeout);
         }
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             command,
@@ -91,7 +91,7 @@ impl DockerRuntime {
         instance_id: &str,
         script: &str,
     ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -105,7 +105,7 @@ impl DockerRuntime {
         .await
     }
 
-    pub(crate) async fn exec_readiness_probe_with_secret_env_timeout(
+    pub(crate) async fn exec_secret_readiness_probe(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -120,7 +120,7 @@ impl DockerRuntime {
             .iter()
             .map(|(key, value)| format!("{key}={}", value.expose_secret()))
             .collect();
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -138,7 +138,7 @@ impl DockerRuntime {
     /// environment values. Secrets stay out of the command line and DBE's
     /// diagnostics; Docker/Podman retains them only for the lifetime of the
     /// exec operation.
-    pub async fn exec_shell_with_secret_env(
+    pub async fn exec_shell_with_secrets(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -149,7 +149,7 @@ impl DockerRuntime {
             .iter()
             .map(|(key, value)| format!("{key}={}", value.expose_secret()))
             .collect();
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -163,7 +163,7 @@ impl DockerRuntime {
         .await
     }
 
-    pub async fn exec_shell_with_secret_env_timeout(
+    pub async fn exec_shell_with_secrets_timeout(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -178,7 +178,7 @@ impl DockerRuntime {
             .iter()
             .map(|(key, value)| format!("{key}={}", value.expose_secret()))
             .collect();
-        self.exec_with_failure_logging(
+        self.exec_logged(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -192,7 +192,7 @@ impl DockerRuntime {
         .await
     }
 
-    async fn exec_with_failure_logging(
+    async fn exec_logged(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -230,7 +230,7 @@ impl DockerRuntime {
         {
             Ok(result) => result?,
             Err(_) => {
-                self.recover_timed_out_exec(
+                self.recover_exec_timeout(
                     protocol,
                     instance_id,
                     &name,
@@ -265,7 +265,7 @@ impl DockerRuntime {
                 match tokio::time::timeout_at(deadline, drain).await {
                     Ok(result) => result?,
                     Err(_) => {
-                        self.recover_timed_out_exec(
+                        self.recover_exec_timeout(
                             protocol,
                             instance_id,
                             &name,
@@ -319,7 +319,7 @@ impl DockerRuntime {
         }
     }
 
-    async fn recover_timed_out_exec(
+    async fn recover_exec_timeout(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -334,7 +334,7 @@ impl DockerRuntime {
             timeout_seconds = timeout.as_secs(),
             "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
         );
-        self.restart_after_exec_interruption(
+        self.restart_after_exec(
             protocol,
             instance_id,
             container,
@@ -357,7 +357,7 @@ impl DockerRuntime {
             %operation,
             "docker exec was interrupted before exit could be confirmed; restarting the managed container"
         );
-        self.restart_after_exec_interruption(
+        self.restart_after_exec(
             protocol,
             instance_id,
             container,
@@ -367,7 +367,7 @@ impl DockerRuntime {
         .await
     }
 
-    async fn restart_after_exec_interruption(
+    async fn restart_after_exec(
         &self,
         protocol: Protocol,
         instance_id: &str,

@@ -58,7 +58,7 @@ pub fn embedded_fusequota_available() -> bool {
         && !FUSEQUOTA_SHA256.trim().is_empty()
 }
 
-pub fn embedded_socket_bridge_available() -> bool {
+pub fn has_socket_bridge() -> bool {
     !SOCKET_BRIDGE_BIN.is_empty()
         && !SOCKET_BRIDGE_VERSION.trim().is_empty()
         && !SOCKET_BRIDGE_SHA256.trim().is_empty()
@@ -89,7 +89,7 @@ pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Erro
 }
 
 pub async fn get_socket_bridge_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
-    if !embedded_socket_bridge_available() {
+    if !has_socket_bridge() {
         return Err(Error::new(
             ErrorKind::NotFound,
             "embedded socket bridge binary is not available for this target",

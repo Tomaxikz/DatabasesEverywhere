@@ -37,7 +37,7 @@ impl SecretEnvironment {
     }
 }
 
-pub(crate) fn logical_export_environment(
+pub(crate) fn logical_export_env(
     metadata: &InstanceMetadata,
 ) -> Result<SecretEnvironment, CredentialUnavailable> {
     match metadata.protocol {
@@ -54,7 +54,7 @@ pub(crate) fn logical_export_environment(
     }
 }
 
-pub(crate) fn logical_import_environment(
+pub(crate) fn logical_import_env(
     metadata: &InstanceMetadata,
     database_definition_in_dump: bool,
 ) -> Result<SecretEnvironment, CredentialUnavailable> {
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn postgres_export_uses_the_current_protected_tenant_credential() {
-        let environment = logical_export_environment(&metadata(Protocol::Postgres)).unwrap();
+        let environment = logical_export_env(&metadata(Protocol::Postgres)).unwrap();
         let values = environment.references();
 
         assert_eq!(values[0].0, "DBE_POSTGRES_USER");
@@ -210,11 +210,11 @@ mod tests {
 
     #[test]
     fn mysql_root_and_tenant_paths_use_different_current_credentials() {
-        let export = logical_export_environment(&metadata(Protocol::Mysql)).unwrap();
+        let export = logical_export_env(&metadata(Protocol::Mysql)).unwrap();
         assert_eq!(export.references()[0].0, "MYSQL_ROOT_PASSWORD");
         assert_eq!(export.references()[0].1.expose_secret(), "mysql-root");
 
-        let import = logical_import_environment(&metadata(Protocol::Mysql), false).unwrap();
+        let import = logical_import_env(&metadata(Protocol::Mysql), false).unwrap();
         assert_eq!(import.references()[1].0, "DBE_IMPORT_PASSWORD");
         assert_eq!(import.references()[1].1.expose_secret(), "latest-tenant");
     }
@@ -224,9 +224,7 @@ mod tests {
         let mut metadata = metadata(Protocol::Postgres);
         metadata.tenant_password = None;
 
-        let error = logical_export_environment(&metadata)
-            .unwrap_err()
-            .to_string();
+        let error = logical_export_env(&metadata).unwrap_err().to_string();
         assert!(error.contains("current encrypted tenant password is missing"));
     }
 }

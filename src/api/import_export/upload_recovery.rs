@@ -82,7 +82,7 @@ enum InterruptedImportAction {
     Block,
 }
 
-pub(crate) async fn reconcile_import_uploads_once(
+pub(crate) async fn reconcile_import_uploads(
     state: &AppState,
 ) -> Result<ImportUploadRecoverySummary, ImportUploadRecoveryError> {
     let mut summary = ImportUploadRecoverySummary::default();
@@ -90,7 +90,7 @@ pub(crate) async fn reconcile_import_uploads_once(
     loop {
         let uploads = state
             .import_uploads
-            .repository()
+            .repo()
             .list_recoverable_after(after_upload_id.as_deref(), RECOVERY_BATCH_SIZE)
             .await?;
         let Some(next_cursor) = uploads.last().map(|upload| upload.upload_id.clone()) else {
@@ -108,7 +108,7 @@ pub(crate) async fn reconcile_import_uploads_once(
     Ok(summary)
 }
 
-pub(crate) async fn run_import_upload_sweeper(state: AppState) {
+pub(crate) async fn run_upload_sweeper(state: AppState) {
     let mut shutdown = state.daemon_shutdown.subscribe();
     if *shutdown.borrow() {
         return;
@@ -132,14 +132,14 @@ pub(crate) async fn run_import_upload_sweeper(state: AppState) {
                         continue;
                     }
                 };
-                match retry_terminal_cleanup_batch(&state).await {
+                match retry_cleanup_batch(&state).await {
                     Ok(retries) => summary.merge(retries),
                     Err(_) => {
                         summary.failures = summary.failures.saturating_add(1);
                         tracing::error!("temporary import upload cleanup retry could not query durable state");
                     }
                 }
-                match retry_nonterminal_recovery_batch(&state).await {
+                match retry_recovery_batch(&state).await {
                     Ok(retries) => summary.merge(retries),
                     Err(_) => {
                         summary.failures = summary.failures.saturating_add(1);
@@ -163,7 +163,7 @@ async fn recover_one(state: &AppState, snapshot: ImportUpload) -> Result<Recover
     let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
     let current = match state
         .import_uploads
-        .repository()
+        .repo()
         .get(&snapshot.instance_id, &snapshot.upload_id)
         .await
     {
@@ -185,12 +185,12 @@ async fn recover_one(state: &AppState, snapshot: ImportUpload) -> Result<Recover
 }
 
 async fn recover_uploading(state: &AppState, upload: &ImportUpload) -> Result<RecoveryOutcome, ()> {
-    if remove_known_upload_files(state, upload).await.is_err() {
+    if remove_upload_files(state, upload).await.is_err() {
         return recovery_failed(upload, "remove_incomplete");
     }
     match state
         .import_uploads
-        .repository()
+        .repo()
         .abort_uploading(&upload.instance_id, &upload.upload_id)
         .await
     {
@@ -222,7 +222,7 @@ async fn recover_uploaded(state: &AppState, upload: &ImportUpload) -> Result<Rec
     }
     match state
         .import_uploads
-        .repository()
+        .repo()
         .mark_ready(
             &upload.instance_id,
             &upload.upload_id,
@@ -243,8 +243,8 @@ async fn recover_processing(
 ) -> Result<RecoveryOutcome, ()> {
     match state
         .import_uploads
-        .repository()
-        .restore_ready_after_processing(
+        .repo()
+        .restore_ready(
             &upload.instance_id,
             &upload.upload_id,
             upload.archive_format,
@@ -277,7 +277,7 @@ async fn recover_importing(state: &AppState, upload: &ImportUpload) -> Result<Re
         InterruptedImportAction::Consume => {
             match state
                 .import_uploads
-                .repository()
+                .repo()
                 .mark_consumed(
                     &upload.instance_id,
                     &upload.upload_id,
@@ -330,8 +330,8 @@ async fn reconcile_interrupted_claim(
 ) -> Result<RecoveryOutcome, ()> {
     match state
         .import_uploads
-        .repository()
-        .reconcile_interrupted_importing(
+        .repo()
+        .reconcile_interrupted(
             &upload.instance_id,
             &upload.upload_id,
             job_id,
@@ -377,7 +377,7 @@ async fn sweep_expired_batch(
 ) -> Result<ImportUploadRecoverySummary, ImportUploadRecoveryError> {
     let uploads = state
         .import_uploads
-        .repository()
+        .repo()
         .list_expired(&now_rfc3339(), SWEEP_BATCH_SIZE)
         .await?;
     let mut summary = ImportUploadRecoverySummary::default();
@@ -385,7 +385,7 @@ async fn sweep_expired_batch(
         let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
         let current = match state
             .import_uploads
-            .repository()
+            .repo()
             .get(&snapshot.instance_id, &snapshot.upload_id)
             .await
         {
@@ -414,7 +414,7 @@ async fn sweep_expired_batch(
     Ok(summary)
 }
 
-async fn retry_terminal_cleanup_batch(
+async fn retry_cleanup_batch(
     state: &AppState,
 ) -> Result<ImportUploadRecoverySummary, ImportUploadRecoveryError> {
     let mut summary = ImportUploadRecoverySummary::default();
@@ -422,8 +422,8 @@ async fn retry_terminal_cleanup_batch(
     loop {
         let uploads = state
             .import_uploads
-            .repository()
-            .list_terminal_cleanup_after(after_upload_id.as_deref(), SWEEP_BATCH_SIZE)
+            .repo()
+            .list_cleanup_after(after_upload_id.as_deref(), SWEEP_BATCH_SIZE)
             .await?;
         let Some(next_cursor) = uploads.last().map(|upload| upload.upload_id.clone()) else {
             break;
@@ -432,7 +432,7 @@ async fn retry_terminal_cleanup_batch(
             let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
             let current = match state
                 .import_uploads
-                .repository()
+                .repo()
                 .get(&snapshot.instance_id, &snapshot.upload_id)
                 .await
             {
@@ -463,7 +463,7 @@ async fn retry_terminal_cleanup_batch(
     Ok(summary)
 }
 
-async fn retry_nonterminal_recovery_batch(
+async fn retry_recovery_batch(
     state: &AppState,
 ) -> Result<ImportUploadRecoverySummary, ImportUploadRecoveryError> {
     let mut summary = ImportUploadRecoverySummary::default();
@@ -472,8 +472,8 @@ async fn retry_nonterminal_recovery_batch(
     loop {
         let uploads = state
             .import_uploads
-            .repository()
-            .list_nonterminal_recovery_after(
+            .repo()
+            .list_recovery_after(
                 after_upload_id.as_deref(),
                 &recovery_now,
                 NONTERMINAL_RETRY_MINIMUM_AGE_SECONDS,
@@ -491,7 +491,7 @@ async fn retry_nonterminal_recovery_batch(
                     .await
                     .is_some_and(|metadata| metadata.status == InstanceStatus::Quarantined);
                 if !target_quarantined {
-                    match importing_job_is_active(state, &upload).await {
+                    match is_active_import_job(state, &upload).await {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(()) => {
@@ -511,17 +511,17 @@ async fn retry_nonterminal_recovery_batch(
     Ok(summary)
 }
 
-async fn importing_job_is_active(state: &AppState, upload: &ImportUpload) -> Result<bool, ()> {
+async fn is_active_import_job(state: &AppState, upload: &ImportUpload) -> Result<bool, ()> {
     let Some(job_id) = upload.claimed_job_id.as_deref() else {
         return Ok(false);
     };
     match state.import_export_jobs.get(job_id).await {
-        Ok(job) => Ok(is_active_import_job(upload, job.as_ref())),
+        Ok(job) => Ok(job_is_active(upload, job.as_ref())),
         Err(_) => recovery_failed(upload, "probe_active_job"),
     }
 }
 
-fn is_active_import_job(upload: &ImportUpload, job: Option<&ImportExportJob>) -> bool {
+fn job_is_active(upload: &ImportUpload, job: Option<&ImportExportJob>) -> bool {
     job.is_some_and(|job| {
         upload.claimed_job_id.as_deref() == Some(job.job_id.as_str())
             && job.instance_id == upload.instance_id
@@ -536,7 +536,7 @@ fn is_active_import_job(upload: &ImportUpload, job: Option<&ImportExportJob>) ->
 async fn claim_and_delete(state: &AppState, upload: &ImportUpload) -> Result<RecoveryOutcome, ()> {
     match state
         .import_uploads
-        .repository()
+        .repo()
         .claim_for_deletion(&upload.instance_id, &upload.upload_id, &now_rfc3339())
         .await
     {
@@ -568,19 +568,19 @@ async fn delete_deleting_upload(
     state: &AppState,
     upload: &ImportUpload,
 ) -> Result<RecoveryOutcome, ()> {
-    if remove_known_upload_files(state, upload).await.is_err() {
+    if remove_upload_files(state, upload).await.is_err() {
         return recovery_failed(upload, "remove_terminal");
     }
     match state
         .import_uploads
-        .repository()
+        .repo()
         .finalize_delete(&upload.instance_id, &upload.upload_id)
         .await
     {
         Ok(true) => Ok(RecoveryOutcome::Deleted),
         Ok(false) => match state
             .import_uploads
-            .repository()
+            .repo()
             .get(&upload.instance_id, &upload.upload_id)
             .await
         {
@@ -591,10 +591,7 @@ async fn delete_deleting_upload(
     }
 }
 
-async fn remove_known_upload_files(
-    state: &AppState,
-    upload: &ImportUpload,
-) -> Result<(), ApiError> {
+async fn remove_upload_files(state: &AppState, upload: &ImportUpload) -> Result<(), ApiError> {
     remove_upload_file(state, upload).await?;
     let partial_path = managed_partial_path(state, upload)?;
     tokio::task::spawn_blocking(move || {

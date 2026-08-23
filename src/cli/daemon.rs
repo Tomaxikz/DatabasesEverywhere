@@ -1,21 +1,21 @@
 use super::*;
 
 pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
-    let (mut config, config_load_report) = load_config_with_report(&config_path)?;
-    let runtime_directories = ensure_runtime_directories(&config)
+    let (mut config, config_load_report) = load_config_report(&config_path)?;
+    let runtime_directories = prepare_runtime_dirs(&config)
         .await
         .context("failed to create runtime directories")?;
-    let _daemon_lock = acquire_configured_daemon_lock(&config).await?;
-    init_configured_logging(&config)?;
-    if config_load_report.used_import_export_scheduler_defaults() {
+    let _daemon_lock = lock_daemon(&config).await?;
+    init_logging(&config)?;
+    if config_load_report.applied_scheduler_defaults() {
         tracing::warn!(
             config = %config_path.display(),
             fields = ?config_load_report.defaulted_import_export_scheduler_fields,
             "missing import/export scheduler settings were filled with backward-compatible in-memory defaults; the config file was not rewritten; copy artifacts.import_export_scheduler from config.example.yml to make the defaults explicit"
         );
     }
-    warn_if_memory_overcommit_disabled();
-    detect_and_log_disk_mode(&mut config)?;
+    warn_memory_overcommit();
+    log_disk_mode(&mut config)?;
     let config = Arc::new(config);
     let socket_bridge_helper = crate::runtime::socket_bridge::install_helper(&config.paths)
         .await
@@ -50,9 +50,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         path = %socket_bridge_helper.display(),
         "private container socket bridge helper ready"
     );
-    log_boot_configuration(&config, &config_path);
-    ensure_fuse_quota_host_config(&config)
-        .context("failed to prepare fuse quota host configuration")?;
+    log_boot_config(&config, &config_path);
+    configure_fuse_host(&config).context("failed to prepare fuse quota host configuration")?;
     tracing::info!(
         phase = "host_preflight",
         "startup phase 2/5: validating host capabilities and storage"
@@ -102,11 +101,10 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
     let job_repository = ImportExportJobRepository::new(pool.clone());
-    let interrupted_running_import_instances =
-        job_repository
-            .running_import_instance_ids()
-            .await
-            .context("failed to identify interrupted running import jobs")?;
+    let interrupted_running_import_instances = job_repository
+        .running_import_ids()
+        .await
+        .context("failed to identify interrupted running import jobs")?;
     let failed_jobs = job_repository
         .fail_unfinished(
             "daemon restarted before import/export job completed",
@@ -119,7 +117,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     let job_repository_for_prune = job_repository.clone();
     let import_export_jobs =
-        ImportExportJobs::with_repository_and_config(job_repository, &config.artifacts);
+        ImportExportJobs::with_repo_and_config(job_repository, &config.artifacts);
     let scheduler_capacity = import_export_jobs.scheduler_snapshot().capacity;
     tracing::info!(
         mode = ?scheduler_capacity.mode,
@@ -145,7 +143,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .await
         .context("failed to load local instance metadata from sqlite")?;
     let migrated_qdrant_routes =
-        migrate_qdrant_route_fingerprints(&manager, config.websocket_jwt_secret())
+        migrate_qdrant_fingerprints(&manager, config.websocket_jwt_secret())
             .await
             .context("failed to migrate Qdrant route fingerprints")?;
     if migrated_qdrant_routes > 0 {
@@ -155,8 +153,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         );
     }
     let quarantined_interrupted_instances =
-        quarantine_interrupted_job_instances(&manager, &interrupted_running_import_instances)
-            .await?;
+        quarantine_interrupted_jobs(&manager, &interrupted_running_import_instances).await?;
     if quarantined_interrupted_instances > 0 {
         tracing::warn!(
             quarantined_interrupted_instances,
@@ -165,7 +162,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     let volumes_root = config.paths.volumes_root();
     let quarantined_physical_restore_instances =
-        quarantine_retained_physical_restore_workspaces(&manager, Path::new(&volumes_root))
+        quarantine_restore_workspaces(&manager, Path::new(&volumes_root))
             .await
             .context("failed to quarantine instances with retained physical restore workspaces")?;
     if quarantined_physical_restore_instances > 0 {
@@ -174,22 +171,19 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "quarantined instances with retained physical restore rollback state"
         );
     }
-    let quarantined_recovery_instances = quarantine_retained_import_recovery_manifests(
-        &manager,
-        Path::new(&config.paths.tmp_root()),
-    )
-    .await
-    .context("failed to quarantine instances with retained import recovery manifests")?;
+    let quarantined_recovery_instances =
+        quarantine_import_manifests(&manager, Path::new(&config.paths.tmp_root()))
+            .await
+            .context("failed to quarantine instances with retained import recovery manifests")?;
     if quarantined_recovery_instances > 0 {
         tracing::warn!(
             quarantined_recovery_instances,
             "quarantined instances with retained import recovery manifests"
         );
     }
-    let import_temp_cleanup =
-        cleanup_orphaned_import_export_staging(Path::new(&config.paths.tmp_root()))
-            .await
-            .context("failed to clean orphaned logical import staging")?;
+    let import_temp_cleanup = cleanup_orphaned_staging(Path::new(&config.paths.tmp_root()))
+        .await
+        .context("failed to clean orphaned logical import staging")?;
     tracing::info!(
         scanned_entries = import_temp_cleanup.scanned_entries,
         removed_files = import_temp_cleanup.removed_files,
@@ -210,12 +204,12 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .ping()
         .await
         .context("failed to ping container engine API")?;
-    prepare_rootless_podman_runtime_paths(&config, &docker)
+    prepare_rootless_paths(&config, &docker)
         .context("failed to prepare rootless Podman bind-mount paths")?;
-    reconcile::validate_configured_runtime(&manager, &docker)
+    reconcile::validate_runtime(&manager, &docker)
         .await
         .context("configured container engine is incompatible with stored instances")?;
-    let remote_import_helper_reconciliation = docker.reconcile_remote_import_helpers().await;
+    let remote_import_helper_reconciliation = docker.reconcile_import_helpers().await;
     match &remote_import_helper_reconciliation {
         Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
             tracing::warn!(
@@ -233,12 +227,11 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     let remote_import_tmp_root = PathBuf::from(config.paths.tmp_root());
     let remove_orphaned_remote_import_staging = remote_import_helper_reconciliation.is_ok();
-    let stale_credential_cleanup =
-        crate::api::remote_import::cleanup_stale_remote_import_credentials(
-            &remote_import_tmp_root,
-            remove_orphaned_remote_import_staging,
-        )
-        .await;
+    let stale_credential_cleanup = crate::api::remote_import::cleanup_stale_import_secrets(
+        &remote_import_tmp_root,
+        remove_orphaned_remote_import_staging,
+    )
+    .await;
     if stale_credential_cleanup.errors > 0 {
         tracing::warn!(
             scanned_entries = stale_credential_cleanup.scanned_entries,
@@ -282,7 +275,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .verify_startup(std::path::Path::new(&volumes_root))
         .await
         .context("failed to verify disk limiter support")?;
-    reapply_instance_disk_limits(&config, &manager, &docker, &disk_limiter)
+    restore_disk_limits(&config, &manager, &docker, &disk_limiter)
         .await
         .context("failed to reapply instance disk limits")?;
     tracing::info!("instance disk limits reconciled");
@@ -299,7 +292,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         quarantined = reconcile_summary.quarantined,
         "startup phase 4/5: managed instance state reconciled"
     );
-    reconcile_running_cpu_burst_limits(&manager, &docker).await;
+    sync_cpu_burst_limits(&manager, &docker).await;
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress = InstallProgressStore::default();
     let shutdown_creations = install_progress.clone();
@@ -329,7 +322,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::routes::DaemonShutdown::default(),
     });
-    let expired_one_use_exports = crate::api::artifacts::reconcile_one_use_exports_once(&state)
+    let expired_one_use_exports = crate::api::artifacts::sweep_one_use_exports(&state)
         .await
         .context("failed to reconcile one-use export spools")?;
     if expired_one_use_exports > 0 {
@@ -338,7 +331,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "expired one-use exports removed during startup"
         );
     }
-    let upload_recovery = crate::api::import_export::reconcile_import_uploads_once(&state)
+    let upload_recovery = crate::api::import_export::reconcile_import_uploads(&state)
         .await
         .context("failed to reconcile temporary import uploads")?;
     if upload_recovery.examined > 0 || upload_recovery.failures > 0 {
@@ -359,12 +352,10 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
     }
     crate::api::resources::start_resource_sampler(state.clone());
-    let one_use_export_sweeper = tokio::spawn(crate::api::artifacts::run_one_use_export_sweeper(
-        state.clone(),
-    ));
-    let import_upload_sweeper = tokio::spawn(crate::api::import_export::run_import_upload_sweeper(
-        state.clone(),
-    ));
+    let one_use_export_sweeper =
+        tokio::spawn(crate::api::artifacts::run_export_sweeper(state.clone()));
+    let import_upload_sweeper =
+        tokio::spawn(crate::api::import_export::run_upload_sweeper(state.clone()));
     let soft_disk_limits = tokio::spawn(monitor_soft_disk_limits(state.clone()));
     tracing::info!(
         phase = "service_start",
@@ -375,9 +366,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         api = %config.api.bind_addr(),
         "DBEV is ready; the management API is accepting requests while managed databases finish recovery in the background"
     );
-    let mut managed_container_events =
-        tokio::spawn(monitor_managed_container_events(state.clone()));
-    let mut managed_runtime_boot = tokio::spawn(complete_managed_runtime_boot(state.clone()));
+    let mut managed_container_events = tokio::spawn(monitor_container_events(state.clone()));
+    let mut managed_runtime_boot = tokio::spawn(finish_runtime_boot(state.clone()));
     let gateway_supervisor = state.gateway_supervisor.clone();
     let daemon_shutdown = state.daemon_shutdown.clone();
     let server_result = serve_api(
@@ -484,7 +474,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     server_result
 }
 
-async fn migrate_qdrant_route_fingerprints(
+async fn migrate_qdrant_fingerprints(
     manager: &InstanceManager,
     daemon_secret: &[u8],
 ) -> anyhow::Result<usize> {

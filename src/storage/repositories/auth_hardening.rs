@@ -4,14 +4,14 @@ use super::{InstanceRepository, RepositoryError};
 use crate::{instances::metadata::InstanceMetadata, shared::protocol::Protocol};
 
 impl InstanceRepository {
-    pub(crate) async fn auth_hardening_attestation_is_current(
+    pub(crate) async fn hardening_is_current(
         &self,
         metadata: &InstanceMetadata,
         container_id: &str,
         container_started_at: &str,
         hardening_revision: u32,
     ) -> Result<bool, RepositoryError> {
-        let credential_binding = self.auth_hardening_credential_binding(
+        let credential_binding = self.hardening_credential_binding(
             metadata,
             container_id,
             container_started_at,
@@ -46,14 +46,14 @@ impl InstanceRepository {
         )
     }
 
-    pub(crate) async fn record_auth_hardening_attestation(
+    pub(crate) async fn record_hardening_attestation(
         &self,
         metadata: &InstanceMetadata,
         container_id: &str,
         container_started_at: &str,
         hardening_revision: u32,
     ) -> Result<(), RepositoryError> {
-        let credential_binding = self.auth_hardening_credential_binding(
+        let credential_binding = self.hardening_credential_binding(
             metadata,
             container_id,
             container_started_at,
@@ -92,7 +92,7 @@ impl InstanceRepository {
         Ok(())
     }
 
-    fn auth_hardening_credential_binding(
+    fn hardening_credential_binding(
         &self,
         metadata: &InstanceMetadata,
         container_id: &str,

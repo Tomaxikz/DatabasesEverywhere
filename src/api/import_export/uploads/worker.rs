@@ -56,7 +56,7 @@ pub(super) struct UploadWorkerOptions {
     pub(super) total_timeout: Duration,
 }
 
-pub(super) fn spawn_owned_upload_worker(
+pub(super) fn spawn_upload_worker(
     recovery: UploadWorkerRecovery,
     guards: Arc<UploadWorkerGuards>,
     body: Body,
@@ -64,11 +64,7 @@ pub(super) fn spawn_owned_upload_worker(
 ) -> tokio::task::JoinHandle<Result<ImportUpload, ApiError>> {
     let operation_recovery = recovery.clone();
     spawn_owned_upload_task(guards, async move {
-        finish_upload_operation(
-            recovery,
-            receive_and_finalize_upload(operation_recovery, body, options),
-        )
-        .await
+        run_upload_safely(recovery, receive_upload(operation_recovery, body, options)).await
     })
 }
 
@@ -85,7 +81,7 @@ where
     })
 }
 
-async fn finish_upload_operation(
+async fn run_upload_safely(
     recovery: UploadWorkerRecovery,
     operation: impl Future<Output = Result<ImportUpload, ApiError>>,
 ) -> Result<ImportUpload, ApiError> {
@@ -108,7 +104,7 @@ async fn finish_upload_operation(
     result
 }
 
-async fn receive_and_finalize_upload(
+async fn receive_upload(
     recovery: UploadWorkerRecovery,
     body: Body,
     options: UploadWorkerOptions,
@@ -135,14 +131,12 @@ async fn receive_and_finalize_upload(
             ApiError::Runtime(format!("failed to publish completed upload: {error}"))
         })?;
     let durable_path = recovery.final_path.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::shared::files::sync_private_regular_file_durable(&durable_path)
-    })
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to join durable upload sync: {error}")))?
-    .map_err(|error| {
-        ApiError::Runtime(format!("failed to make completed upload durable: {error}"))
-    })?;
+    tokio::task::spawn_blocking(move || crate::shared::files::sync_private_file(&durable_path))
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to join durable upload sync: {error}")))?
+        .map_err(|error| {
+            ApiError::Runtime(format!("failed to make completed upload durable: {error}"))
+        })?;
 
     let repository = &recovery.repository;
     let upload = &recovery.upload;

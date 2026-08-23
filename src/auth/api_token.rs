@@ -66,10 +66,7 @@ impl ApiToken {
         }
     }
 
-    pub fn accepted_from_authorization_header(
-        &self,
-        header: Option<&str>,
-    ) -> Option<AcceptedApiToken> {
+    pub fn from_auth_header(&self, header: Option<&str>) -> Option<AcceptedApiToken> {
         let header = header?;
         let token = header.strip_prefix("Bearer ")?;
         self.accepted_token(token)
@@ -120,7 +117,7 @@ mod tests {
             (None, false),
         ] {
             assert_eq!(
-                token.accepted_from_authorization_header(header).is_some(),
+                token.from_auth_header(header).is_some(),
                 accepted,
                 "unexpected authorization result for {header:?}"
             );
@@ -135,9 +132,7 @@ mod tests {
             ..Default::default()
         });
 
-        let accepted = token
-            .accepted_from_authorization_header(Some("Bearer secret-a"))
-            .unwrap();
+        let accepted = token.from_auth_header(Some("Bearer secret-a")).unwrap();
         assert_eq!(accepted.name.as_ref(), "panel-a");
         assert!(accepted.has_scope(scopes::INSTANCES_READ));
     }

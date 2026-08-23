@@ -75,7 +75,7 @@ impl BackupBundle {
             .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
         validate_backup_id(backup_id)?;
         let staging = backups_root.join(".staging").join(instance_id);
-        ensure_private_directory(&staging, "backup staging directory").await?;
+        prepare_private_dir(&staging, "backup staging directory").await?;
         let directory = staging.join(format!(".{}.bundle", uuid::Uuid::new_v4()));
         create_private_directory(&directory, "backup bundle directory").await?;
         Ok(Self {
@@ -110,20 +110,20 @@ impl BackupBundle {
 }
 
 pub async fn cleanup_staging(backups_root: &Path) -> Result<bool, BackupStoreError> {
-    cleanup_internal_directory(&backups_root.join(".staging"), "backup staging").await
+    cleanup_internal_dir(&backups_root.join(".staging"), "backup staging").await
 }
 
 pub async fn cleanup_materializations(tmp_root: &Path) -> Result<usize, BackupStoreError> {
     let mut removed = 0;
     for name in ["backup-materialized", "backup-catalogs"] {
-        if cleanup_internal_directory(&tmp_root.join(name), "backup materialization").await? {
+        if cleanup_internal_dir(&tmp_root.join(name), "backup materialization").await? {
             removed += 1;
         }
     }
     Ok(removed)
 }
 
-async fn cleanup_internal_directory(path: &Path, label: &str) -> Result<bool, BackupStoreError> {
+async fn cleanup_internal_dir(path: &Path, label: &str) -> Result<bool, BackupStoreError> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -379,10 +379,7 @@ pub fn validate_backup_id(backup_id: &str) -> Result<(), BackupStoreError> {
     Ok(())
 }
 
-pub(crate) async fn ensure_private_directory(
-    path: &Path,
-    label: &str,
-) -> Result<(), BackupStoreError> {
+pub(crate) async fn prepare_private_dir(path: &Path, label: &str) -> Result<(), BackupStoreError> {
     tokio::fs::create_dir_all(path)
         .await
         .map_err(|source| io_error(format!("create {label}"), source))?;
@@ -432,7 +429,7 @@ async fn materialization_path(
     validate_instance_id(instance_id)
         .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
     let root = tmp_root.join("backup-materialized").join(instance_id);
-    ensure_private_directory(&root, "backup materialization directory").await?;
+    prepare_private_dir(&root, "backup materialization directory").await?;
     Ok(root.join(format!("{}.{}", uuid::Uuid::new_v4(), backup_id)))
 }
 

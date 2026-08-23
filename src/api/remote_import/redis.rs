@@ -12,12 +12,12 @@ use tokio::time::Instant;
 use crate::{
     api::{
         api_response::ApiError,
-        import_export::{rollback_data_from_archive, verify_physical_data_replacement},
-        instances::{LifecycleAction, lifecycle_instance_locked},
+        import_export::{check_restore_layout, rollback_from_archive},
+        instances::{LifecycleAction, change_instance_state_locked},
         routes::AppState,
     },
     instances::paths::InstancePaths,
-    jobs::import_export::create_data_archive_bounded,
+    jobs::import_export::create_bounded_archive,
     shared::{backend::backend_socket_path, protocol::Protocol},
 };
 
@@ -26,7 +26,7 @@ use super::{
     redis_resp::{
         RedisRelayError, RedisRespError, RedisRestoreExpiration, RespConnection, RespLimits,
     },
-    remote_staging_directory, sync_recovery_file,
+    staging_directory, sync_recovery_file,
 };
 
 const REDIS_SCAN_COUNT: u32 = 1_000;
@@ -47,7 +47,7 @@ struct RedisRecoveryManifest<'a> {
     created_at: String,
 }
 
-fn redis_operation_deadlines(started: Instant, timeout: Duration) -> (Instant, Instant) {
+fn operation_deadlines(started: Instant, timeout: Duration) -> (Instant, Instant) {
     let operation_deadline = started + timeout;
     let rollback_budget = timeout / 4;
     let work_deadline = operation_deadline - rollback_budget;
@@ -70,7 +70,7 @@ fn remaining_redis_timeout_at(
 ) -> Result<Duration, ApiError> {
     let remaining = deadline.saturating_duration_since(now);
     if remaining.is_zero() {
-        return Err(redis_operation_timeout_error(phase));
+        return Err(operation_timeout_error(phase));
     }
     Ok(maximum.min(remaining))
 }
@@ -82,10 +82,10 @@ async fn redis_with_deadline<T>(
 ) -> Result<T, ApiError> {
     tokio::time::timeout_at(deadline, operation)
         .await
-        .map_err(|_| redis_operation_timeout_error(phase))?
+        .map_err(|_| operation_timeout_error(phase))?
 }
 
-fn redis_operation_timeout_error(phase: &'static str) -> ApiError {
+fn operation_timeout_error(phase: &'static str) -> ApiError {
     ApiError::ServiceUnavailable(format!("remote RESP import timed out during {phase}"))
 }
 
@@ -120,7 +120,7 @@ async fn import_resp(
     let policy = &state.config.security.remote_import;
     let operation_timeout = Duration::from_secs(policy.operation_timeout_seconds);
     let (work_deadline, operation_deadline) =
-        redis_operation_deadlines(Instant::now(), operation_timeout);
+        operation_deadlines(Instant::now(), operation_timeout);
     let connect_timeout = Duration::from_secs(policy.connect_timeout_seconds);
     let limits = RespLimits {
         max_bulk_len: MAX_REDIS_CONTROL_BULK_BYTES,
@@ -156,8 +156,8 @@ async fn import_resp(
         }
         let paths = InstancePaths::new(&state.config.paths, instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        verify_physical_data_replacement(state, &metadata, &paths)?;
-        let staging = remote_staging_directory(state).await?;
+        check_restore_layout(state, &metadata, &paths)?;
+        let staging = staging_directory(state).await?;
         Ok((paths, staging))
     })
     .await?;
@@ -172,22 +172,15 @@ async fn import_resp(
     if let Err(error) = redis_with_deadline(
         work_deadline,
         "target stop",
-        lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop),
+        change_instance_state_locked(state, instance_id, LifecycleAction::Stop),
     )
     .await
     {
-        return restart_redis_after_preparation_failure(
-            state,
-            instance_id,
-            &staging,
-            operation_deadline,
-            error,
-        )
-        .await;
+        return recover_redis_prep(state, instance_id, &staging, operation_deadline, error).await;
     }
 
     let original_acl = match redis_with_deadline(work_deadline, "rollback preparation", async {
-        create_data_archive_bounded(
+        create_bounded_archive(
             paths.data.clone(),
             rollback.clone(),
             policy.max_staged_bytes,
@@ -196,10 +189,10 @@ async fn import_resp(
         .map_err(|error| {
             ApiError::Runtime(format!("failed to create RESP rollback archive: {error}"))
         })?;
-        validate_redis_rollback_archive(&rollback, policy.max_staged_bytes).await?;
+        validate_rollback_archive(&rollback, policy.max_staged_bytes).await?;
         let original_acl = read_acl_file(&paths.data.join("users.acl")).await?;
         sync_recovery_file(&rollback).await?;
-        write_redis_recovery_manifest(
+        write_recovery_manifest(
             &recovery_manifest,
             instance_id,
             target_protocol,
@@ -213,14 +206,8 @@ async fn import_resp(
     {
         Ok(original_acl) => original_acl,
         Err(error) => {
-            return restart_redis_after_preparation_failure(
-                state,
-                instance_id,
-                &staging,
-                operation_deadline,
-                error,
-            )
-            .await;
+            return recover_redis_prep(state, instance_id, &staging, operation_deadline, error)
+                .await;
         }
     };
     let temporary_username = format!("dbe_import_{}", uuid::Uuid::new_v4().simple());
@@ -240,7 +227,7 @@ async fn import_resp(
         let target_io_timeout =
             remaining_redis_timeout(work_deadline, operation_timeout, "target connection")?;
         let target_connect_timeout = connect_timeout.min(target_io_timeout);
-        let mut target = RespConnection::connect_unix_with_options(
+        let mut target = RespConnection::connect_unix_limited(
             &socket,
             target_connect_timeout,
             target_io_timeout,
@@ -255,7 +242,7 @@ async fn import_resp(
             .map_err(target_error)?;
         target.ping().await.map_err(target_error)?;
         let cluster_info = target.info_cluster().await.map_err(target_error)?;
-        ensure_redis_standalone(&cluster_info, false)?;
+        check_standalone(&cluster_info, false)?;
         let mut remote = connect_redis_source(
             source,
             connect_timeout,
@@ -266,7 +253,7 @@ async fn import_resp(
         .await?;
         let source_info = remote.info_server().await.map_err(source_error)?;
         let target_info = target.info_server().await.map_err(target_error)?;
-        ensure_redis_versions_compatible(target_protocol, &source_info, &target_info)?;
+        check_redis_versions(target_protocol, &source_info, &target_info)?;
         if mode == ImportMode::Wipe {
             target.flushdb().await.map_err(target_error)?;
         }
@@ -276,7 +263,7 @@ async fn import_resp(
         replace_acl_file(&paths, &original_acl, preserve_acl_owner).await?;
         target.acl_load().await.map_err(target_error)?;
         drop(target);
-        lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+        change_instance_state_locked(state, instance_id, LifecycleAction::Start)
             .await
             .map(|_| ())
     })
@@ -291,11 +278,9 @@ async fn import_resp(
             )
             .await
             {
-                let quarantine = crate::api::import_export::quarantine_after_uncertain_import(
-                    state,
-                    instance_id,
-                )
-                .await;
+                let quarantine =
+                    crate::api::import_export::quarantine_uncertain_import(state, instance_id)
+                        .await;
                 let quarantine = match quarantine {
                     Ok(()) => "target was stopped and quarantined".to_string(),
                     Err(error) => format!(
@@ -307,7 +292,7 @@ async fn import_resp(
                     staging.display()
                 )));
             }
-            cleanup_redis_staging_until(&staging, operation_deadline).await;
+            cleanup_staging_until(&staging, operation_deadline).await;
             Ok(())
         }
         Err(primary_error) => {
@@ -326,12 +311,11 @@ async fn import_resp(
                     )
                     .await
                     {
-                        let quarantine =
-                            crate::api::import_export::quarantine_after_uncertain_import(
-                                state,
-                                instance_id,
-                            )
-                            .await;
+                        let quarantine = crate::api::import_export::quarantine_uncertain_import(
+                            state,
+                            instance_id,
+                        )
+                        .await;
                         let quarantine = match quarantine {
                             Ok(()) => "target was stopped and quarantined".to_string(),
                             Err(error) => format!(
@@ -343,15 +327,13 @@ async fn import_resp(
                             staging.display()
                         )));
                     }
-                    cleanup_redis_staging_until(&staging, operation_deadline).await;
+                    cleanup_staging_until(&staging, operation_deadline).await;
                     Err(primary_error)
                 }
                 Err(rollback_error) => {
-                    let quarantine = crate::api::import_export::quarantine_after_uncertain_import(
-                        state,
-                        instance_id,
-                    )
-                    .await;
+                    let quarantine =
+                        crate::api::import_export::quarantine_uncertain_import(state, instance_id)
+                            .await;
                     let quarantine = match quarantine {
                         Ok(()) => "target was stopped and quarantined".to_string(),
                         Err(error) => format!(
@@ -368,7 +350,7 @@ async fn import_resp(
     }
 }
 
-async fn write_redis_recovery_manifest(
+async fn write_recovery_manifest(
     path: &Path,
     instance_id: &str,
     protocol: Protocol,
@@ -411,7 +393,7 @@ async fn connect_redis_source(
     let io_timeout = remaining_redis_timeout(deadline, Duration::MAX, phase)?;
     let connect_timeout = connect_timeout.min(io_timeout);
     redis_with_deadline(deadline, phase, async {
-        let mut remote = RespConnection::connect_source_with_options(
+        let mut remote = RespConnection::connect_source_limited(
             &source.endpoint,
             connect_timeout,
             io_timeout,
@@ -428,9 +410,9 @@ async fn connect_redis_source(
         }
         remote.ping().await.map_err(source_error)?;
         let info = remote.info_server().await.map_err(source_error)?;
-        ensure_supported_redis_version(&info)?;
+        check_redis_version(&info)?;
         let cluster_info = remote.info_cluster().await.map_err(source_error)?;
-        ensure_redis_standalone(&cluster_info, true)?;
+        check_standalone(&cluster_info, true)?;
         remote
             .select(source.database_index)
             .await
@@ -440,7 +422,7 @@ async fn connect_redis_source(
     .await
 }
 
-async fn validate_redis_rollback_archive(path: &Path, max_bytes: u64) -> Result<(), ApiError> {
+async fn validate_rollback_archive(path: &Path, max_bytes: u64) -> Result<(), ApiError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
         ApiError::Runtime(format!("failed to inspect RESP rollback archive: {error}"))
     })?;
@@ -453,7 +435,7 @@ async fn validate_redis_rollback_archive(path: &Path, max_bytes: u64) -> Result<
     Ok(())
 }
 
-async fn restart_redis_after_preparation_failure(
+async fn recover_redis_prep(
     state: &AppState,
     instance_id: &str,
     staging: &Path,
@@ -464,7 +446,7 @@ async fn restart_redis_after_preparation_failure(
         deadline,
         "target restart after preparation failure",
         async {
-            lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+            change_instance_state_locked(state, instance_id, LifecycleAction::Start)
                 .await
                 .map(|_| ())
         },
@@ -472,7 +454,7 @@ async fn restart_redis_after_preparation_failure(
     .await
     {
         Ok(()) => {
-            cleanup_redis_staging_until(staging, deadline).await;
+            cleanup_staging_until(staging, deadline).await;
             Err(primary_error)
         }
         Err(restart_error) => Err(ApiError::Runtime(format!(
@@ -494,7 +476,7 @@ async fn cleanup_redis_staging(staging: &Path) {
     }
 }
 
-async fn cleanup_redis_staging_until(staging: &Path, deadline: Instant) {
+async fn cleanup_staging_until(staging: &Path, deadline: Instant) {
     if tokio::time::timeout_at(deadline, cleanup_redis_staging(staging))
         .await
         .is_err()
@@ -524,7 +506,7 @@ async fn copy_redis_keys(
             // PTTL and DUMP are separate Redis operations. Operators must quiesce source writes
             // during migration so a concurrently replaced value cannot inherit the prior TTL.
             let _restored = source
-                .relay_dump_to_restore_replace(target, &key, expiration, MAX_REDIS_DUMP_BYTES)
+                .relay_restore_replace(target, &key, expiration, MAX_REDIS_DUMP_BYTES)
                 .await
                 .map_err(relay_error)?;
         }
@@ -594,7 +576,7 @@ async fn rollback_redis_target(
             "failed to stop {protocol} before rollback: {error}"
         )));
     }
-    rollback_data_from_archive(state, instance_id, paths.clone(), rollback).await
+    rollback_from_archive(state, instance_id, paths.clone(), rollback).await
 }
 
 async fn start_private_redis(
@@ -779,7 +761,7 @@ async fn apply_acl_metadata(
         })
 }
 
-fn ensure_supported_redis_version(info: &[u8]) -> Result<(), ApiError> {
+fn check_redis_version(info: &[u8]) -> Result<(), ApiError> {
     let server = parse_resp_server_version(info).ok_or_else(|| {
         ApiError::BadRequest("remote RESP INFO did not report a valid server version".to_string())
     })?;
@@ -791,7 +773,7 @@ fn ensure_supported_redis_version(info: &[u8]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn ensure_redis_versions_compatible(
+fn check_redis_versions(
     target_protocol: Protocol,
     source: &[u8],
     target: &[u8],
@@ -919,7 +901,7 @@ fn parse_semver_triplet(version: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-fn ensure_redis_standalone(info: &[u8], source: bool) -> Result<(), ApiError> {
+fn check_standalone(info: &[u8], source: bool) -> Result<(), ApiError> {
     match parse_redis_cluster_enabled(info) {
         Some(false) => Ok(()),
         Some(true) if source => Err(ApiError::BadRequest(
@@ -1025,7 +1007,7 @@ mod tests {
     fn unsupported_remote_version_is_not_exposed() {
         let hostile = b"redis_version:1.0.0-attacker-controlled\r\n";
 
-        let error = ensure_supported_redis_version(hostile).unwrap_err();
+        let error = check_redis_version(hostile).unwrap_err();
 
         assert!(!error.to_string().contains("attacker-controlled"));
     }
@@ -1047,7 +1029,7 @@ mod tests {
             })
         );
         assert!(
-            ensure_redis_versions_compatible(
+            check_redis_versions(
                 Protocol::Redis,
                 b"redis_version:7.2.4\r\n",
                 b"redis_version:8.0.0\r\n"
@@ -1055,7 +1037,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            ensure_redis_versions_compatible(
+            check_redis_versions(
                 Protocol::Redis,
                 b"redis_version:8.0.1\r\n",
                 b"redis_version:8.0.0\r\n"
@@ -1065,7 +1047,7 @@ mod tests {
             .contains("same or a newer version")
         );
         assert!(
-            ensure_redis_versions_compatible(
+            check_redis_versions(
                 Protocol::Redis,
                 b"redis_version:4.0.14\r\n",
                 b"redis_version:4.0.14\r\n"
@@ -1087,32 +1069,19 @@ mod tests {
             })
         );
         assert!(
-            ensure_redis_versions_compatible(
-                Protocol::Valkey,
-                b"redis_version:7.2.4\r\n",
-                valkey_9,
-            )
-            .is_ok()
+            check_redis_versions(Protocol::Valkey, b"redis_version:7.2.4\r\n", valkey_9,).is_ok()
         );
         assert!(
-            ensure_redis_versions_compatible(
-                Protocol::Valkey,
-                b"redis_version:8.0.0\r\n",
-                valkey_9,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("through version 7.2")
+            check_redis_versions(Protocol::Valkey, b"redis_version:8.0.0\r\n", valkey_9,)
+                .unwrap_err()
+                .to_string()
+                .contains("through version 7.2")
         );
         assert!(
-            ensure_redis_versions_compatible(
-                Protocol::Redis,
-                valkey_9,
-                b"redis_version:8.0.0\r\n",
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("Valkey-to-Redis")
+            check_redis_versions(Protocol::Redis, valkey_9, b"redis_version:8.0.0\r\n",)
+                .unwrap_err()
+                .to_string()
+                .contains("Valkey-to-Redis")
         );
     }
 
@@ -1161,7 +1130,7 @@ mod tests {
     fn redis_deadlines_reserve_the_final_quarter_for_rollback() {
         let started = Instant::now();
         let (work_deadline, operation_deadline) =
-            redis_operation_deadlines(started, Duration::from_secs(100));
+            operation_deadlines(started, Duration::from_secs(100));
 
         assert_eq!(
             work_deadline.duration_since(started),

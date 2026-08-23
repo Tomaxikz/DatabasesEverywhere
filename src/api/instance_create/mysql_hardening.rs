@@ -19,7 +19,7 @@ const MYSQL_AUTH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const MYSQL_AUTH_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const MYSQL_AUTH_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) async fn execute_mysql_protected_sql(
+pub(super) async fn run_protected_mysql_sql(
     state: &AppState,
     instance_id: &str,
     sql: &str,
@@ -39,7 +39,7 @@ pub(super) async fn execute_mysql_protected_sql(
     let root_password = SecretString::from(root_password.to_string());
     state
         .docker
-        .exec_shell_with_secret_env(
+        .exec_shell_with_secrets(
             Protocol::Mysql,
             instance_id,
             &script,
@@ -93,7 +93,7 @@ pub(crate) async fn harden_mysql_tenant_auth(
         None
     };
     let root_password = SecretString::from(root_password.to_string());
-    verify_mysql_root_auth_with_timeout(
+    probe_mysql_root_auth(
         state,
         instance_id,
         &root_password,
@@ -140,7 +140,7 @@ async fn apply_mysql_tenant_auth(
     root_password: &str,
 ) -> Result<(), ApiError> {
     let sql = databases::mysql::provision::reset_tenant_password_sql(username);
-    execute_mysql_protected_sql(state, instance_id, &sql, password, root_password).await?;
+    run_protected_mysql_sql(state, instance_id, &sql, password, root_password).await?;
     verify_mysql_tenant_auth(state, instance_id, username, password).await
 }
 
@@ -149,7 +149,7 @@ pub(crate) async fn verify_mysql_root_auth(
     instance_id: &str,
     root_password: &SecretString,
 ) -> Result<(), ApiError> {
-    verify_mysql_root_auth_with_timeout(
+    probe_mysql_root_auth(
         state,
         instance_id,
         root_password,
@@ -158,7 +158,7 @@ pub(crate) async fn verify_mysql_root_auth(
     .await
 }
 
-pub(super) async fn verify_mysql_root_auth_with_timeout(
+pub(super) async fn probe_mysql_root_auth(
     state: &AppState,
     instance_id: &str,
     root_password: &SecretString,
@@ -169,12 +169,12 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
     let command = "set -eu\ntest \"$(cat /proc/1/comm)\" = mysqld\nMYSQL_PWD=\"$DBE_MYSQL_ROOT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot -N -B -e 'SELECT 1' >/dev/null\n";
     let deadline = Instant::now() + readiness_timeout;
     loop {
-        let Some(attempt_timeout) = mysql_auth_attempt_timeout(deadline) else {
-            return Err(mysql_auth_readiness_error(state, instance_id, None));
+        let Some(attempt_timeout) = auth_attempt_timeout(deadline) else {
+            return Err(auth_readiness_error(state, instance_id, None));
         };
         let first_candidate = state
             .docker
-            .exec_readiness_probe_with_secret_env_timeout(
+            .exec_secret_readiness_probe(
                 Protocol::Mysql,
                 instance_id,
                 command,
@@ -183,7 +183,7 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
             )
             .await;
         if let Err(error) = first_candidate {
-            match classify_mysql_candidate_auth_failure(&error) {
+            match classify_mysql_auth_error(&error) {
                 MysqlCandidateAuthFailure::CredentialRejected => {
                     return Err(ApiError::Conflict(
                         "the MySQL maintenance credential was rejected; refusing to retry a known-invalid credential"
@@ -203,12 +203,12 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
                 }
             }
         }
-        let Some(attempt_timeout) = mysql_auth_attempt_timeout(deadline) else {
-            return Err(mysql_auth_readiness_error(state, instance_id, None));
+        let Some(attempt_timeout) = auth_attempt_timeout(deadline) else {
+            return Err(auth_readiness_error(state, instance_id, None));
         };
         let invalid_result = state
             .docker
-            .exec_readiness_probe_with_secret_env_timeout(
+            .exec_secret_readiness_probe(
                 Protocol::Mysql,
                 instance_id,
                 command,
@@ -223,21 +223,21 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
                         .to_string(),
                 ));
             }
-            Err(error) if is_definite_mysql_auth_rejection(&error) => {}
+            Err(error) if is_mysql_auth_rejection(&error) => {}
             Err(_) if Instant::now() >= deadline => {
-                return Err(mysql_auth_readiness_error(state, instance_id, None));
+                return Err(auth_readiness_error(state, instance_id, None));
             }
             Err(_) => {
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
         }
-        let Some(attempt_timeout) = mysql_auth_attempt_timeout(deadline) else {
-            return Err(mysql_auth_readiness_error(state, instance_id, None));
+        let Some(attempt_timeout) = auth_attempt_timeout(deadline) else {
+            return Err(auth_readiness_error(state, instance_id, None));
         };
         match state
             .docker
-            .exec_readiness_probe_with_secret_env_timeout(
+            .exec_secret_readiness_probe(
                 Protocol::Mysql,
                 instance_id,
                 command,
@@ -248,7 +248,7 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
         {
             Ok(_) => return Ok(()),
             Err(error) if Instant::now() >= deadline => {
-                return Err(mysql_auth_readiness_error(
+                return Err(auth_readiness_error(
                     state,
                     instance_id,
                     Some(error.to_string()),
@@ -262,7 +262,7 @@ pub(super) async fn verify_mysql_root_auth_with_timeout(
     }
 }
 
-fn is_definite_mysql_auth_rejection(error: &DockerError) -> bool {
+fn is_mysql_auth_rejection(error: &DockerError) -> bool {
     let DockerError::ExecFailed { failure_output, .. } = error else {
         return false;
     };
@@ -277,24 +277,20 @@ enum MysqlCandidateAuthFailure {
     Retryable,
 }
 
-fn classify_mysql_candidate_auth_failure(error: &DockerError) -> MysqlCandidateAuthFailure {
-    if is_definite_mysql_auth_rejection(error) {
+fn classify_mysql_auth_error(error: &DockerError) -> MysqlCandidateAuthFailure {
+    if is_mysql_auth_rejection(error) {
         MysqlCandidateAuthFailure::CredentialRejected
     } else {
         MysqlCandidateAuthFailure::Retryable
     }
 }
 
-fn mysql_auth_attempt_timeout(deadline: Instant) -> Option<Duration> {
+fn auth_attempt_timeout(deadline: Instant) -> Option<Duration> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
     (!remaining.is_zero()).then_some(remaining.min(MYSQL_AUTH_ATTEMPT_TIMEOUT))
 }
 
-fn mysql_auth_readiness_error(
-    state: &AppState,
-    instance_id: &str,
-    detail: Option<String>,
-) -> ApiError {
+fn auth_readiness_error(state: &AppState, instance_id: &str, detail: Option<String>) -> ApiError {
     let detail = detail.unwrap_or_else(|| "the verification deadline expired".to_string());
     fail_runtime(
         state,
@@ -313,7 +309,7 @@ async fn verify_mysql_tenant_auth(
     let password = SecretString::from(password.to_string());
     state
         .docker
-        .exec_readiness_probe_with_secret_env_timeout(
+        .exec_secret_readiness_probe(
             Protocol::Mysql,
             instance_id,
             "set -eu\nMYSQL_PWD=\"$DBE_MYSQL_TENANT_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u\"$DBE_MYSQL_TENANT_USER\" \"$MYSQL_DATABASE\" -N -B -e 'SELECT 1' >/dev/null\n",
@@ -328,7 +324,7 @@ async fn verify_mysql_tenant_auth(
     Ok(())
 }
 
-async fn verify_mysql_tenant_auth_for_adoption(
+async fn check_mysql_tenant_auth(
     state: &AppState,
     instance_id: &str,
     username: &str,
@@ -341,7 +337,7 @@ async fn verify_mysql_tenant_auth_for_adoption(
     let environment = mysql_tenant_probe_environment(&username, password);
     if state
         .docker
-        .exec_readiness_probe_with_secret_env_timeout(
+        .exec_secret_readiness_probe(
             Protocol::Mysql,
             instance_id,
             command,
@@ -356,7 +352,7 @@ async fn verify_mysql_tenant_auth_for_adoption(
     let invalid_environment = mysql_tenant_probe_environment(&username, &invalid_password);
     match state
         .docker
-        .exec_readiness_probe_with_secret_env_timeout(
+        .exec_secret_readiness_probe(
             Protocol::Mysql,
             instance_id,
             command,
@@ -365,7 +361,7 @@ async fn verify_mysql_tenant_auth_for_adoption(
         )
         .await
     {
-        Err(error) if is_definite_mysql_auth_rejection(&error) => {}
+        Err(error) if is_mysql_auth_rejection(&error) => {}
         Ok(_) => {
             return Err(ApiError::Conflict(
                 "MySQL tenant authentication accepted a deliberately invalid password; refusing to adopt an unverifiable legacy credential"
@@ -377,7 +373,7 @@ async fn verify_mysql_tenant_auth_for_adoption(
     let environment = mysql_tenant_probe_environment(&username, password);
     Ok(state
         .docker
-        .exec_readiness_probe_with_secret_env_timeout(
+        .exec_secret_readiness_probe(
             Protocol::Mysql,
             instance_id,
             command,
@@ -413,21 +409,21 @@ pub(crate) struct MysqlAuthHardeningSummary {
     pub failures: Vec<MysqlAuthHardeningFailure>,
 }
 
-pub(crate) async fn harden_mysql_accounts_on_boot(state: &AppState) -> MysqlAuthHardeningSummary {
+pub(crate) async fn harden_mysql_accounts(state: &AppState) -> MysqlAuthHardeningSummary {
     let instances = state.manager.store().list().await;
     let outcomes = futures::stream::iter(
         instances
             .into_iter()
             .filter(|metadata| metadata.protocol == Protocol::Mysql),
     )
-    .map(|snapshot| harden_mysql_account_on_boot(state, snapshot))
+    .map(|snapshot| harden_mysql_account(state, snapshot))
     .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    aggregate_mysql_auth_hardening_summaries(outcomes)
+    merge_hardening_summaries(outcomes)
 }
 
-async fn harden_mysql_account_on_boot(
+async fn harden_mysql_account(
     state: &AppState,
     snapshot: InstanceMetadata,
 ) -> MysqlAuthHardeningSummary {
@@ -463,7 +459,7 @@ async fn harden_mysql_account_on_boot(
             check
         }
         Err(error) => {
-            record_mysql_auth_failure(
+            record_auth_failure(
                 state,
                 &metadata,
                 format!("could not bind MySQL hardening to one container generation: {error}"),
@@ -493,7 +489,7 @@ async fn harden_mysql_account_on_boot(
         .map(|password| SecretString::from(password.to_string()));
     let mut migrate_root_password = false;
     let root_password = if let Some(persisted) = persisted_root_password {
-        if verify_mysql_root_auth_with_timeout(
+        if probe_mysql_root_auth(
             state,
             &metadata.instance_id,
             &persisted,
@@ -505,7 +501,7 @@ async fn harden_mysql_account_on_boot(
             persisted
         } else if let Some(container) = container_root_password {
             if container.expose_secret() != persisted.expose_secret()
-                && verify_mysql_root_auth_with_timeout(
+                && probe_mysql_root_auth(
                     state,
                     &metadata.instance_id,
                     &container,
@@ -517,7 +513,7 @@ async fn harden_mysql_account_on_boot(
                 migrate_root_password = true;
                 container
             } else {
-                record_mysql_auth_failure(
+                record_auth_failure(
                     state,
                     &metadata,
                     "neither the encrypted nor legacy MySQL maintenance credential matches the live database"
@@ -528,7 +524,7 @@ async fn harden_mysql_account_on_boot(
                 return summary;
             }
         } else {
-            record_mysql_auth_failure(
+            record_auth_failure(
                 state,
                 &metadata,
                 "the encrypted MySQL maintenance credential was rejected and no legacy container credential is available"
@@ -539,7 +535,7 @@ async fn harden_mysql_account_on_boot(
             return summary;
         }
     } else if let Some(container) = container_root_password {
-        if verify_mysql_root_auth_with_timeout(
+        if probe_mysql_root_auth(
             state,
             &metadata.instance_id,
             &container,
@@ -551,7 +547,7 @@ async fn harden_mysql_account_on_boot(
             migrate_root_password = true;
             container
         } else {
-            record_mysql_auth_failure(
+            record_auth_failure(
                 state,
                 &metadata,
                 "the legacy MySQL maintenance credential could not be verified safely; reset or recreate this instance"
@@ -562,7 +558,7 @@ async fn harden_mysql_account_on_boot(
             return summary;
         }
     } else {
-        record_mysql_auth_failure(
+        record_auth_failure(
             state,
             &metadata,
             "the encrypted MySQL maintenance credential is missing and the managed container does not expose a recoverable root credential; reset or recreate this legacy instance"
@@ -585,7 +581,7 @@ async fn harden_mysql_account_on_boot(
                     password
                 }
                 Ok(Some(_)) => {
-                    record_mysql_auth_failure(
+                    record_auth_failure(
                         state,
                         &metadata,
                         "the legacy MySQL tenant username does not match protected instance metadata; refusing to adopt it"
@@ -596,7 +592,7 @@ async fn harden_mysql_account_on_boot(
                     return summary;
                 }
                 Ok(None) | Err(_) => {
-                    record_mysql_auth_failure(
+                    record_auth_failure(
                         state,
                         &metadata,
                         "the encrypted MySQL tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway"
@@ -607,7 +603,7 @@ async fn harden_mysql_account_on_boot(
                     return summary;
                 }
             };
-            match verify_mysql_tenant_auth_for_adoption(
+            match check_mysql_tenant_auth(
                 state,
                 &metadata.instance_id,
                 &metadata.database.username,
@@ -620,7 +616,7 @@ async fn harden_mysql_account_on_boot(
                     candidate.expose_secret().to_string()
                 }
                 _ => {
-                    record_mysql_auth_failure(
+                    record_auth_failure(
                         state,
                         &metadata,
                         "the legacy MySQL tenant credential could not be verified against the live database; reset this legacy instance before opening its gateway"
@@ -643,7 +639,7 @@ async fn harden_mysql_account_on_boot(
     .await
     .is_err()
     {
-        record_mysql_auth_failure(
+        record_auth_failure(
             state,
             &metadata,
             "MySQL tenant authentication hardening or verification failed; reset the instance credential before reopening its route"
@@ -665,13 +661,13 @@ async fn harden_mysql_account_on_boot(
         let persistence = if migrate_root_password || migrate_tenant_password {
             state
                 .manager
-                .upsert_recovered_protected_secrets(metadata.clone())
+                .upsert_recovered_secrets(metadata.clone())
                 .await
         } else {
             state.manager.upsert(metadata.clone()).await
         };
         if let Err(error) = persistence {
-            record_mysql_auth_failure(
+            record_auth_failure(
                 state,
                 &metadata,
                 format!(
@@ -710,7 +706,7 @@ async fn harden_mysql_account_on_boot(
                 "MySQL hardening succeeded, but its optimization attestation could not be persisted"
             );
         } else {
-            record_mysql_auth_failure(
+            record_auth_failure(
                 state,
                 &metadata,
                 format!("MySQL container generation changed during hardening: {error}"),
@@ -723,7 +719,7 @@ async fn harden_mysql_account_on_boot(
     summary
 }
 
-fn aggregate_mysql_auth_hardening_summaries(
+fn merge_hardening_summaries(
     outcomes: Vec<MysqlAuthHardeningSummary>,
 ) -> MysqlAuthHardeningSummary {
     let mut summary = MysqlAuthHardeningSummary::default();
@@ -742,13 +738,13 @@ fn aggregate_mysql_auth_hardening_summaries(
     summary
 }
 
-async fn record_mysql_auth_failure(
+async fn record_auth_failure(
     state: &AppState,
     metadata: &InstanceMetadata,
     reason: String,
     summary: &mut MysqlAuthHardeningSummary,
 ) {
-    let failed = mysql_auth_failed_metadata(metadata);
+    let failed = failed_auth_metadata(metadata);
     state.instances.upsert(failed.clone()).await;
     let persistence_error = state.manager.upsert(failed).await.err();
     let reason = match persistence_error {
@@ -770,7 +766,7 @@ async fn record_mysql_auth_failure(
     });
 }
 
-pub(super) fn mysql_auth_failed_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
+pub(super) fn failed_auth_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
     let mut failed = metadata.clone();
     failed.status = InstanceStatus::Failed;
     failed.updated_at = crate::shared::time::now_rfc3339();
@@ -803,26 +799,26 @@ mod tests {
             timeout_seconds: 5,
         };
 
-        assert!(is_definite_mysql_auth_rejection(&rejected));
-        assert!(!is_definite_mysql_auth_rejection(&socket_failure));
-        assert!(!is_definite_mysql_auth_rejection(&timeout));
+        assert!(is_mysql_auth_rejection(&rejected));
+        assert!(!is_mysql_auth_rejection(&socket_failure));
+        assert!(!is_mysql_auth_rejection(&timeout));
         assert_eq!(
-            classify_mysql_candidate_auth_failure(&rejected),
+            classify_mysql_auth_error(&rejected),
             MysqlCandidateAuthFailure::CredentialRejected
         );
         assert_eq!(
-            classify_mysql_candidate_auth_failure(&socket_failure),
+            classify_mysql_auth_error(&socket_failure),
             MysqlCandidateAuthFailure::Retryable
         );
         assert_eq!(
-            classify_mysql_candidate_auth_failure(&timeout),
+            classify_mysql_auth_error(&timeout),
             MysqlCandidateAuthFailure::Retryable
         );
     }
 
     #[test]
     fn concurrent_outcomes_are_aggregated_deterministically() {
-        let summary = aggregate_mysql_auth_hardening_summaries(vec![
+        let summary = merge_hardening_summaries(vec![
             MysqlAuthHardeningSummary {
                 checked: 1,
                 root_credentials_migrated: 0,

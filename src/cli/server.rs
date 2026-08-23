@@ -584,7 +584,7 @@ pub(super) async fn shutdown_signal(
     daemon_shutdown: crate::api::routes::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) {
-    let signal = wait_for_termination_signal().await;
+    let signal = wait_for_shutdown().await;
     let active_api_requests = api_rate_limiter.active_request_count();
     let active_websockets = api_rate_limiter.active_websocket_count();
     let active_mutations = daemon_shutdown.active_mutation_count();
@@ -666,7 +666,7 @@ pub(super) async fn shutdown_signal(
 }
 
 #[cfg(unix)]
-pub(super) async fn wait_for_termination_signal() -> &'static str {
+pub(super) async fn wait_for_shutdown() -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
 
     match signal(SignalKind::terminate()) {
@@ -685,7 +685,7 @@ pub(super) async fn wait_for_termination_signal() -> &'static str {
 }
 
 #[cfg(not(unix))]
-pub(super) async fn wait_for_termination_signal() -> &'static str {
+pub(super) async fn wait_for_shutdown() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
     "CTRL_C"
 }
@@ -702,10 +702,10 @@ pub(super) fn init_stdout_logging() {
         .try_init();
 }
 
-pub(super) fn init_configured_logging(config: &Config) -> anyhow::Result<()> {
+pub(super) fn init_logging(config: &Config) -> anyhow::Result<()> {
     fs::create_dir_all(&config.paths.logs)
         .with_context(|| format!("failed to create log directory {}", config.paths.logs))?;
-    harden_runtime_directory(Path::new(&config.paths.logs))?;
+    harden_runtime_dir(Path::new(&config.paths.logs))?;
 
     let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
         .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));

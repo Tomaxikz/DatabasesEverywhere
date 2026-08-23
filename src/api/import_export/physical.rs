@@ -17,7 +17,7 @@ pub(super) async fn export_physical_archive(
         .ok_or(ApiError::NotFound)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
+        let _ = change_instance_state_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
 
     let paths = InstancePaths::new(&state.config.paths, instance_id)
@@ -28,14 +28,14 @@ pub(super) async fn export_physical_archive(
         .saturating_mul(1024 * 1024)
         .saturating_add(64 * 1024 * 1024)
         .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
-    let result = crate::jobs::import_export::create_data_archive_bounded(
+    let result = crate::jobs::import_export::create_bounded_archive(
         paths.data,
         artifact_path,
         max_output_bytes,
     )
     .await
     .map_err(|error| ApiError::Runtime(error.to_string()));
-    finish_physical_operation(state, instance_id, was_running, result).await
+    finish_physical_change(state, instance_id, was_running, result).await
 }
 
 pub(super) async fn import_physical_archive(
@@ -61,12 +61,12 @@ pub(super) async fn import_physical_archive(
         .ok_or(ApiError::NotFound)?;
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    verify_physical_data_replacement(state, &metadata, &paths)?;
+    check_restore_layout(state, &metadata, &paths)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        let _ = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await?;
+        let _ = change_instance_state_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
-    restore_data_from_archive_bounded(
+    restore_bounded_archive(
         state,
         instance_id,
         paths,
@@ -78,7 +78,7 @@ pub(super) async fn import_physical_archive(
     .await
 }
 
-pub(crate) fn verify_physical_data_replacement(
+pub(crate) fn check_restore_layout(
     state: &AppState,
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
@@ -88,22 +88,22 @@ pub(crate) fn verify_physical_data_replacement(
         state.config.paths.fuse_root(),
     )
     .for_persisted_method(&metadata.limits.disk_enforcement_method)
-    .verify_physical_data_replacement(&paths.data)
+    .check_restore_layout(&paths.data)
     .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
-pub(crate) async fn reapply_instance_data_owner(
+pub(crate) async fn restore_instance_data_owner(
     state: &AppState,
     paths: &InstancePaths,
 ) -> Result<(), ApiError> {
     if let Some((uid, gid)) = state.docker.rootless_podman_host_owner() {
         paths
-            .reapply_rootless_podman_data_owner(uid, gid)
+            .set_rootless_owner(uid, gid)
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))
     } else {
         paths
-            .reapply_data_owner()
+            .restore_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))
     }
@@ -151,14 +151,12 @@ impl PendingDataReplacement {
     }
 
     async fn rollback(self) -> Result<(), ApiError> {
-        remove_directory_contents(&self.data_dir)
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to clear rejected restored data: {error}; previous data was retained at {}",
-                    self.backup_dir.display()
-                ))
-            })?;
+        clear_directory(&self.data_dir).await.map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to clear rejected restored data: {error}; previous data was retained at {}",
+                self.backup_dir.display()
+            ))
+        })?;
         move_directory_entries(&self.backup_dir, &self.data_dir)
             .await
             .map_err(|error| {
@@ -172,7 +170,7 @@ impl PendingDataReplacement {
     }
 }
 
-pub(crate) async fn restore_data_from_archive_bounded(
+pub(crate) async fn restore_bounded_archive(
     state: &AppState,
     instance_id: &str,
     paths: InstancePaths,
@@ -181,7 +179,7 @@ pub(crate) async fn restore_data_from_archive_bounded(
     max_extracted_bytes: u64,
     symlink_policy: ArchiveSymlinkPolicy,
 ) -> Result<(), ApiError> {
-    restore_data_from_archive_with_policy(
+    restore_archive(
         state,
         instance_id,
         paths,
@@ -196,13 +194,13 @@ pub(crate) async fn restore_data_from_archive_bounded(
     .await
 }
 
-pub(crate) async fn rollback_data_from_archive(
+pub(crate) async fn rollback_from_archive(
     state: &AppState,
     instance_id: &str,
     paths: InstancePaths,
     artifact_path: &FsPath,
 ) -> Result<(), ApiError> {
-    restore_data_from_archive_with_policy(
+    restore_archive(
         state,
         instance_id,
         paths,
@@ -217,7 +215,7 @@ pub(crate) async fn rollback_data_from_archive(
     .await
 }
 
-async fn restore_data_from_archive_with_policy(
+async fn restore_archive(
     state: &AppState,
     instance_id: &str,
     paths: InstancePaths,
@@ -231,20 +229,15 @@ async fn restore_data_from_archive_with_policy(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    verify_physical_data_replacement(state, &metadata, &paths)?;
-    let disk_limiter = persisted_physical_disk_limiter(state, &metadata);
-    let detached_fuse = physical_replacement_requires_mount_detach(&disk_limiter);
+    check_restore_layout(state, &metadata, &paths)?;
+    let disk_limiter = physical_disk_limiter(state, &metadata);
+    let detached_fuse = needs_physical_mount_detach(&disk_limiter);
     if detached_fuse
         && let Err(detach_error) = disk_limiter.teardown_instance_mount(&paths.data).await
     {
-        let recovery = recover_detached_physical_runtime(
-            state,
-            &metadata,
-            &paths,
-            should_be_running,
-            &disk_limiter,
-        )
-        .await;
+        let recovery =
+            recover_detached_runtime(state, &metadata, &paths, should_be_running, &disk_limiter)
+                .await;
         return Err(physical_recovery_error(
             ApiError::Runtime(format!(
                 "failed to detach FuseQuota before physical data replacement: {detach_error}"
@@ -253,7 +246,7 @@ async fn restore_data_from_archive_with_policy(
             "the original runtime",
         ));
     }
-    let replacement = match prepare_data_replacement(
+    let replacement = match prepare_restore(
         paths.clone(),
         artifact_path,
         max_extracted_bytes,
@@ -266,7 +259,7 @@ async fn restore_data_from_archive_with_policy(
             if failure.original_restored && policy.recover_current_after_preparation_failure =>
         {
             if detached_fuse {
-                let recovery = recover_detached_physical_runtime(
+                let recovery = recover_detached_runtime(
                     state,
                     &metadata,
                     &paths,
@@ -280,7 +273,7 @@ async fn restore_data_from_archive_with_policy(
                     "the original runtime",
                 ));
             }
-            return finish_physical_operation(
+            return finish_physical_change(
                 state,
                 instance_id,
                 should_be_running,
@@ -292,8 +285,8 @@ async fn restore_data_from_archive_with_policy(
     };
 
     let validation = async {
-        reapply_instance_data_owner(state, &paths).await?;
-        validate_replaced_instance(state, instance_id, &paths, should_be_running).await
+        restore_instance_data_owner(state, &paths).await?;
+        validate_replacement(state, instance_id, &paths, should_be_running).await
     }
     .await;
 
@@ -303,7 +296,7 @@ async fn restore_data_from_archive_with_policy(
             Ok(())
         }
         Err(primary_error) => {
-            rollback_rejected_replacement(
+            rollback_replacement(
                 state,
                 instance_id,
                 &paths,
@@ -316,7 +309,7 @@ async fn restore_data_from_archive_with_policy(
     }
 }
 
-fn persisted_physical_disk_limiter(
+fn physical_disk_limiter(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> crate::disk::DiskLimiter {
@@ -327,11 +320,11 @@ fn persisted_physical_disk_limiter(
     .for_persisted_method(&metadata.limits.disk_enforcement_method)
 }
 
-fn physical_replacement_requires_mount_detach(limiter: &crate::disk::DiskLimiter) -> bool {
+fn needs_physical_mount_detach(limiter: &crate::disk::DiskLimiter) -> bool {
     limiter.mode() == crate::config::DiskLimitMode::FuseQuota
 }
 
-async fn recover_detached_physical_runtime(
+async fn recover_detached_runtime(
     state: &AppState,
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
@@ -339,7 +332,7 @@ async fn recover_detached_physical_runtime(
     limiter: &crate::disk::DiskLimiter,
 ) -> Result<(), ApiError> {
     if should_be_running {
-        return lifecycle_instance_locked(state, &metadata.instance_id, LifecycleAction::Start)
+        return change_instance_state_locked(state, &metadata.instance_id, LifecycleAction::Start)
             .await
             .map(|_| ());
     }
@@ -364,7 +357,7 @@ fn physical_recovery_error(
     }
 }
 
-async fn prepare_data_replacement(
+async fn prepare_restore(
     paths: InstancePaths,
     artifact_path: &FsPath,
     max_extracted_bytes: u64,
@@ -395,19 +388,18 @@ async fn prepare_data_replacement(
         ))
     })?;
     let workspace = data_parent.join(format!(".dbe-restore-{}-{import_id}", paths.instance_id));
-    create_private_directory(&workspace, "physical restore workspace")
+    prepare_private_dir(&workspace, "physical restore workspace")
         .await
         .map_err(DataReplacementPreparationError::safe)?;
     let staging_dir = workspace.join("staging");
     let staged_data = staging_dir.join(&expected_root);
     let backup_dir = workspace.join("previous-data");
-    if let Err(error) =
-        create_private_directory(&staging_dir, "physical import staging directory").await
+    if let Err(error) = prepare_private_dir(&staging_dir, "physical import staging directory").await
     {
         cleanup_dir(&workspace).await;
         return Err(DataReplacementPreparationError::safe(error));
     }
-    if let Err(error) = extract_data_archive_bounded(
+    if let Err(error) = extract_bounded_archive(
         artifact_path.to_path_buf(),
         staging_dir.clone(),
         expected_root,
@@ -422,8 +414,7 @@ async fn prepare_data_replacement(
         )));
     }
 
-    if let Err(error) =
-        create_private_directory(&backup_dir, "physical import rollback directory").await
+    if let Err(error) = prepare_private_dir(&backup_dir, "physical import rollback directory").await
     {
         cleanup_dir(&workspace).await;
         return Err(DataReplacementPreparationError::safe(error));
@@ -445,7 +436,7 @@ async fn prepare_data_replacement(
     }
 
     if let Err(error) = move_directory_entries(&staged_data, &paths.data).await {
-        if let Err(cleanup_error) = remove_directory_contents(&paths.data).await {
+        if let Err(cleanup_error) = clear_directory(&paths.data).await {
             return Err(DataReplacementPreparationError::uncertain(
                 ApiError::Runtime(format!(
                     "failed to install imported data contents: {error}; failed to clear the partial replacement: {cleanup_error}; recovery data was retained at {}",
@@ -478,10 +469,10 @@ pub(super) async fn move_directory_entries(
     from: &FsPath,
     to: &FsPath,
 ) -> Result<(), std::io::Error> {
-    move_directory_entries_except(from, to, &[]).await
+    move_dir_entries_except(from, to, &[]).await
 }
 
-pub(super) async fn move_directory_entries_except(
+pub(super) async fn move_dir_entries_except(
     from: &FsPath,
     to: &FsPath,
     exclude: &[&FsPath],
@@ -503,7 +494,7 @@ pub(super) async fn move_directory_entries_except(
     Ok(())
 }
 
-async fn remove_directory_contents(path: &FsPath) -> Result<(), std::io::Error> {
+async fn clear_directory(path: &FsPath) -> Result<(), std::io::Error> {
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -521,14 +512,14 @@ async fn remove_directory_contents(path: &FsPath) -> Result<(), std::io::Error> 
     Ok(())
 }
 
-async fn validate_replaced_instance(
+async fn validate_replacement(
     state: &AppState,
     instance_id: &str,
     paths: &InstancePaths,
     should_be_running: bool,
 ) -> Result<(), ApiError> {
     if should_be_running {
-        return lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+        return change_instance_state_locked(state, instance_id, LifecycleAction::Start)
             .await
             .map(|_| ());
     }
@@ -557,13 +548,13 @@ async fn validate_replaced_instance(
         .await
         .map(|_| ())
         .map_err(|error| ApiError::Runtime(error.to_string()));
-    let stopped = lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop)
+    let stopped = change_instance_state_locked(state, instance_id, LifecycleAction::Stop)
         .await
         .map(|_| ());
     preserve_primary_error(readiness, stopped)
 }
 
-async fn rollback_rejected_replacement(
+async fn rollback_replacement(
     state: &AppState,
     instance_id: &str,
     paths: &InstancePaths,
@@ -572,7 +563,7 @@ async fn rollback_rejected_replacement(
     primary_error: ApiError,
 ) -> Result<(), ApiError> {
     if let Err(stop_error) =
-        lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop).await
+        change_instance_state_locked(state, instance_id, LifecycleAction::Stop).await
     {
         return Err(ApiError::Runtime(format!(
             "physical restore failed: {primary_error}; rejected database could not be stopped safely: {stop_error}; previous data was retained at {}",
@@ -584,8 +575,8 @@ async fn rollback_rejected_replacement(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let disk_limiter = persisted_physical_disk_limiter(state, &metadata);
-    let detached_fuse = physical_replacement_requires_mount_detach(&disk_limiter);
+    let disk_limiter = physical_disk_limiter(state, &metadata);
+    let detached_fuse = needs_physical_mount_detach(&disk_limiter);
     if detached_fuse
         && let Err(detach_error) = disk_limiter.teardown_instance_mount(&paths.data).await
     {
@@ -599,21 +590,20 @@ async fn rollback_rejected_replacement(
             "physical restore failed: {primary_error}; rollback failed: {rollback_error}"
         )));
     }
-    if let Err(owner_error) = reapply_instance_data_owner(state, paths).await {
+    if let Err(owner_error) = restore_instance_data_owner(state, paths).await {
         return Err(ApiError::Runtime(format!(
             "physical restore failed: {primary_error}; previous data was restored but its ownership could not be reapplied: {owner_error}"
         )));
     }
 
     let recovery = if detached_fuse {
-        recover_detached_physical_runtime(state, &metadata, paths, should_be_running, &disk_limiter)
-            .await
+        recover_detached_runtime(state, &metadata, paths, should_be_running, &disk_limiter).await
     } else if should_be_running {
-        lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+        change_instance_state_locked(state, instance_id, LifecycleAction::Start)
             .await
             .map(|_| ())
     } else {
-        lifecycle_instance_locked(state, instance_id, LifecycleAction::Stop)
+        change_instance_state_locked(state, instance_id, LifecycleAction::Stop)
             .await
             .map(|_| ())
     };
@@ -632,7 +622,7 @@ async fn rollback_rejected_replacement(
     Err(primary_error)
 }
 
-pub(crate) async fn finish_physical_operation(
+pub(crate) async fn finish_physical_change(
     state: &AppState,
     instance_id: &str,
     was_running: bool,
@@ -642,7 +632,7 @@ pub(crate) async fn finish_physical_operation(
         return primary_result;
     }
 
-    let restart_result = lifecycle_instance_locked(state, instance_id, LifecycleAction::Start)
+    let restart_result = change_instance_state_locked(state, instance_id, LifecycleAction::Start)
         .await
         .map(|_| ());
     if let (Err(primary_error), Err(restart_error)) = (&primary_result, &restart_result) {
@@ -682,7 +672,7 @@ mod transaction_tests {
                 ..crate::config::DiskConfig::default()
             });
             assert_eq!(
-                physical_replacement_requires_mount_detach(&limiter),
+                needs_physical_mount_detach(&limiter),
                 expected,
                 "unexpected mount-detach policy for {mode:?}"
             );

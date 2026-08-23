@@ -26,7 +26,7 @@ mv -f -- {pid_temp} {pid}
     )
 }
 
-fn qdrant_bridge_process_helpers_script() -> String {
+fn qdrant_bridge_helpers() -> String {
     format!(
         r#"qdrant_bridge_process_start_time() {{
   qdrant_bridge_stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
@@ -125,7 +125,7 @@ done
 [ "$qdrant_bridge_cleanup_failed" -eq 0 ] || exit 1
 rm -f -- {socket} {pid} {pid_temp} {log}
 "#,
-        helpers = qdrant_bridge_process_helpers_script(),
+        helpers = qdrant_bridge_helpers(),
         pid = sh_quote(TARGET_BRIDGE_PID),
         pid_temp = sh_quote(&format!("{TARGET_BRIDGE_PID}.new")),
         socket = sh_quote(TARGET_BRIDGE_SOCKET),

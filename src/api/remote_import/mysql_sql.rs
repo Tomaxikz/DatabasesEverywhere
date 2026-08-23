@@ -36,7 +36,7 @@ pub(super) async fn rewrite_mysql_schema_qualifiers(
     .await
 }
 
-pub(super) async fn rewrite_clickhouse_schema_qualifiers(
+pub(super) async fn rewrite_clickhouse_schema(
     path: &Path,
     source_database: &str,
     target_database: &str,

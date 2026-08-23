@@ -5,8 +5,8 @@ use std::fmt;
 
 use crate::shared::protocol::Protocol;
 
-pub(crate) use boot::reconcile_managed_compatibility_on_boot;
-pub(crate) use probe::{compatibility_attestation, probe_instance_compatibility};
+pub(crate) use boot::sync_compatibility;
+pub(crate) use probe::{cached_compatibility, probe_instance_compatibility};
 
 /// Increment when the probe command, normalization, or compatibility policy
 /// changes in a way that requires every managed container to be checked again.

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::BackupBrowsingConfig, instances::credentials::logical_export_environment,
+    config::BackupBrowsingConfig, instances::credentials::logical_export_env,
     instances::metadata::InstanceMetadata, runtime::docker::DockerRuntime,
     shared::protocol::Protocol,
 };
@@ -151,11 +151,7 @@ impl BackupCatalog {
         Ok(encoded)
     }
 
-    pub fn decode_and_validate(
-        bytes: &[u8],
-        instance_id: &str,
-        backup_id: &str,
-    ) -> Result<Self, String> {
+    pub fn decode(bytes: &[u8], instance_id: &str, backup_id: &str) -> Result<Self, String> {
         let catalog: Self = serde_json::from_slice(bytes)
             .map_err(|error| format!("invalid backup catalog JSON: {error}"))?;
         if catalog.schema_version != BACKUP_CATALOG_SCHEMA_VERSION
@@ -175,24 +171,26 @@ async fn capture_schema(
 ) -> Result<Vec<BackupCatalogObject>, String> {
     match metadata.protocol {
         Protocol::Postgres => {
-            let output = execute(docker, metadata, &postgres_schema_script(max_objects)).await?;
+            let output = run_query(docker, metadata, &postgres_schema_script(max_objects)).await?;
             parse_postgres_schema(&output)
         }
         Protocol::Mariadb => {
             let output =
-                execute(docker, metadata, &mysql_schema_script(false, max_objects)).await?;
+                run_query(docker, metadata, &mysql_schema_script(false, max_objects)).await?;
             parse_mysql_schema(&output)
         }
         Protocol::Mysql => {
-            let output = execute(docker, metadata, &mysql_schema_script(true, max_objects)).await?;
+            let output =
+                run_query(docker, metadata, &mysql_schema_script(true, max_objects)).await?;
             parse_mysql_schema(&output)
         }
         Protocol::Mongodb => {
-            let output = execute(docker, metadata, &mongodb_schema_script(max_objects)).await?;
+            let output = run_query(docker, metadata, &mongodb_schema_script(max_objects)).await?;
             parse_mongodb_schema(&output)
         }
         Protocol::Clickhouse => {
-            let output = execute(docker, metadata, &clickhouse_schema_script(max_objects)).await?;
+            let output =
+                run_query(docker, metadata, &clickhouse_schema_script(max_objects)).await?;
             parse_clickhouse_schema(&output)
         }
         Protocol::Redis => Ok(vec![schema_less_object(metadata, "keyspace")]),
@@ -245,7 +243,7 @@ async fn capture_previews(
             catalog.objects[index].preview_truncated = true;
             continue;
         };
-        match execute(docker, metadata, &script).await {
+        match run_query(docker, metadata, &script).await {
             Ok(output) => {
                 let (rows, truncated) = parse_preview_rows(
                     metadata.protocol,
@@ -278,15 +276,15 @@ async fn capture_previews(
     }
 }
 
-async fn execute(
+async fn run_query(
     docker: &DockerRuntime,
     metadata: &InstanceMetadata,
     script: &str,
 ) -> Result<String, String> {
-    let credentials = logical_export_environment(metadata).map_err(|error| error.to_string())?;
+    let credentials = logical_export_env(metadata).map_err(|error| error.to_string())?;
     let environment = credentials.references();
     docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             metadata.protocol,
             &metadata.instance_id,
             script,

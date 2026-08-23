@@ -30,7 +30,7 @@ mod unix {
 
     use super::super::{
         ImportMode, REMOTE_IMPORT_LIMITER, RemoteImportSource, commit_recovery_manifest,
-        remote_staging_directory, sync_recovery_file,
+        staging_directory, sync_recovery_file,
     };
 
     const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -87,14 +87,14 @@ mod unix {
         let rollback_budget = timeout / 4;
         let work_deadline = operation_deadline - rollback_budget;
         let source_client = QdrantHttp::source(source, policy)?;
-        let staging = remote_staging_directory(state).await?;
+        let staging = staging_directory(state).await?;
         let recovery_manifest = staging.join("recovery-manifest.json");
         let mut source_snapshots = Vec::new();
         let mut staged_bytes = 0_u64;
 
         let acquire_result = tokio::time::timeout_at(work_deadline, async {
             let source_version = source_client.version().await?;
-            source_client.ensure_standalone_topology().await?;
+            source_client.check_standalone().await?;
             let source_collections =
                 selected_collections(source_client.collections().await?, selection)?;
             if source_collections.is_empty() && selection.mode == SelectionMode::Selective {
@@ -202,16 +202,11 @@ mod unix {
         let mut retain_staging = false;
         let preparation = tokio::time::timeout_at(work_deadline, async {
             let target_version = target_client.version().await?;
-            target_client.ensure_standalone_topology().await?;
-            ensure_snapshot_compatible(&source_version, &target_version)?;
+            target_client.check_standalone().await?;
+            check_snapshot_compatibility(&source_version, &target_version)?;
             let existing = target_client.collections().await?;
             let target_aliases = target_client.aliases().await?;
-            ensure_no_qdrant_name_collisions(
-                &source_names,
-                &source_aliases,
-                &existing,
-                &target_aliases,
-            )?;
+            check_qdrant_names(&source_names, &source_aliases, &existing, &target_aliases)?;
             let affected = if mode == ImportMode::Wipe {
                 existing.clone()
             } else {
@@ -244,7 +239,7 @@ mod unix {
                 target_snapshots.pop();
                 rollback.push((collection.clone(), path));
             }
-            write_qdrant_recovery_manifest(
+            write_recovery_manifest(
                 &recovery_manifest,
                 instance_id,
                 mode,
@@ -294,51 +289,49 @@ mod unix {
                     Err(_) => Err(operation_timeout_error("target mutation")),
                 };
                 if let Err(primary) = mutation {
-                    let rollback_succeeded =
-                        if qdrant_rollback_requires_quiescence(mutation_started) {
-                            match quiesce_target_for_rollback(
-                                state,
-                                instance_id,
-                                &paths,
-                                &target_key,
-                                timeout,
+                    let rollback_succeeded = if qdrant_rollback_needs_stop(mutation_started) {
+                        match quiesce_rollback_target(
+                            state,
+                            instance_id,
+                            &paths,
+                            &target_key,
+                            timeout,
+                            operation_deadline,
+                            &mut bridge,
+                        )
+                        .await
+                        {
+                            Ok(rollback_client) => tokio::time::timeout_at(
                                 operation_deadline,
-                                &mut bridge,
+                                rollback_target(
+                                    &rollback_client,
+                                    &source_names,
+                                    mode,
+                                    &rollback,
+                                    &target_aliases,
+                                ),
                             )
                             .await
-                            {
-                                Ok(rollback_client) => tokio::time::timeout_at(
-                                    operation_deadline,
-                                    rollback_target(
-                                        &rollback_client,
-                                        &source_names,
-                                        mode,
-                                        &rollback,
-                                        &target_aliases,
-                                    ),
-                                )
-                                .await
-                                .is_ok_and(|result| result.is_ok()),
-                                Err(error) => {
-                                    tracing::error!(
-                                        instance_id,
-                                        %error,
-                                        "could not quiesce qdrant before remote import rollback"
-                                    );
-                                    false
-                                }
+                            .is_ok_and(|result| result.is_ok()),
+                            Err(error) => {
+                                tracing::error!(
+                                    instance_id,
+                                    %error,
+                                    "could not quiesce qdrant before remote import rollback"
+                                );
+                                false
                             }
-                        } else {
-                            true
-                        };
+                        }
+                    } else {
+                        true
+                    };
                     if !rollback_succeeded {
                         retain_staging = true;
-                        let quarantine =
-                            crate::api::import_export::quarantine_after_uncertain_import(
-                                state,
-                                instance_id,
-                            )
-                            .await;
+                        let quarantine = crate::api::import_export::quarantine_uncertain_import(
+                            state,
+                            instance_id,
+                        )
+                        .await;
                         if quarantine.is_ok()
                             && let Some(stopped_bridge) = bridge.take()
                         {
@@ -370,11 +363,9 @@ mod unix {
         cleanup_source_snapshots(&source_client, &source_snapshots).await;
         if !retain_staging {
             if let Err(commit_error) = commit_recovery_manifest(&recovery_manifest).await {
-                let quarantine = crate::api::import_export::quarantine_after_uncertain_import(
-                    state,
-                    instance_id,
-                )
-                .await;
+                let quarantine =
+                    crate::api::import_export::quarantine_uncertain_import(state, instance_id)
+                        .await;
                 let quarantine = match quarantine {
                     Ok(()) => "target was stopped and quarantined".to_string(),
                     Err(error) => format!(
@@ -397,11 +388,11 @@ mod unix {
         result
     }
 
-    fn qdrant_rollback_requires_quiescence(mutation_started: bool) -> bool {
+    fn qdrant_rollback_needs_stop(mutation_started: bool) -> bool {
         mutation_started
     }
 
-    async fn quiesce_target_for_rollback(
+    async fn quiesce_rollback_target(
         state: &AppState,
         instance_id: &str,
         paths: &InstancePaths,
@@ -564,7 +555,7 @@ mod unix {
         }
     }
 
-    async fn write_qdrant_recovery_manifest(
+    async fn write_recovery_manifest(
         path: &Path,
         instance_id: &str,
         mode: ImportMode,
@@ -659,7 +650,7 @@ mod unix {
         Ok(selected)
     }
 
-    fn ensure_no_qdrant_name_collisions(
+    fn check_qdrant_names(
         source_collections: &HashSet<String>,
         source_aliases: &[QdrantAlias],
         target_collections: &[String],
@@ -833,9 +824,9 @@ mod unix {
                 .ok_or_else(|| self.bad_response("qdrant did not report its version"))
         }
 
-        async fn ensure_standalone_topology(&self) -> Result<(), ApiError> {
+        async fn check_standalone(&self) -> Result<(), ApiError> {
             let json = self.json(Method::GET, "/cluster", None).await?;
-            match qdrant_topology_is_standalone(&json) {
+            match topology_is_standalone(&json) {
                 Some(true) => Ok(()),
                 Some(false) if self.source => Err(ApiError::BadRequest(
                     "remote qdrant distributed mode is unsupported because a snapshot from one endpoint can omit shards held by other nodes; use a standalone source or Qdrant's distributed migration tooling"
@@ -1141,7 +1132,7 @@ mod unix {
         instance_id: String,
     }
 
-    pub(crate) async fn cleanup_stale_qdrant_bridge(
+    pub(crate) async fn cleanup_stale_bridge(
         state: &AppState,
         instance_id: &str,
     ) -> Result<(), ApiError> {
@@ -1257,7 +1248,7 @@ mod unix {
 
     impl QdrantBridgeCleanup {
         async fn run(self) {
-            if let Err(error) = cleanup_stale_qdrant_bridge(&self.state, &self.instance_id).await {
+            if let Err(error) = cleanup_stale_bridge(&self.state, &self.instance_id).await {
                 tracing::warn!(
                     instance_id = self.instance_id,
                     %error,
@@ -1315,7 +1306,7 @@ mod unix {
         Ok(Some(value))
     }
 
-    fn ensure_snapshot_compatible(source: &str, target: &str) -> Result<(), ApiError> {
+    fn check_snapshot_compatibility(source: &str, target: &str) -> Result<(), ApiError> {
         let source_parts = version_triplet(source).ok_or_else(|| {
             ApiError::BadRequest("remote qdrant reported an invalid version".to_string())
         })?;
@@ -1333,7 +1324,7 @@ mod unix {
         Ok(())
     }
 
-    fn qdrant_topology_is_standalone(response: &Value) -> Option<bool> {
+    fn topology_is_standalone(response: &Value) -> Option<bool> {
         let result = response.get("result")?.as_object()?;
         let status = result.get("status")?.as_str()?;
         let peer_count = match result.get("peers") {
@@ -1396,12 +1387,12 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::cleanup_stale_qdrant_bridge;
+pub(crate) use unix::cleanup_stale_bridge;
 #[cfg(unix)]
 pub use unix::import_qdrant;
 
 #[cfg(not(unix))]
-pub(crate) async fn cleanup_stale_qdrant_bridge(
+pub(crate) async fn cleanup_stale_bridge(
     _state: &crate::api::routes::AppState,
     _instance_id: &str,
 ) -> Result<(), crate::api::api_response::ApiError> {

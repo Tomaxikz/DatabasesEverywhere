@@ -38,8 +38,8 @@ pub async fn pull_image(
         .map(validate_image)
         .transpose()?
         .map(str::to_string)
-        .unwrap_or_else(|| configured_image(&state, request.protocol).to_string());
-    ensure_image_allowed(&state, request.protocol, &image)?;
+        .unwrap_or_else(|| image_for_protocol(&state, request.protocol).to_string());
+    check_image_allowed(&state, request.protocol, &image)?;
 
     state
         .docker
@@ -54,7 +54,7 @@ pub async fn pull_image(
     }))
 }
 
-pub(crate) fn ensure_image_allowed(
+pub(crate) fn check_image_allowed(
     state: &AppState,
     protocol: Protocol,
     image: &str,
@@ -88,7 +88,7 @@ pub(crate) fn validate_image(image: &str) -> Result<&str, ApiError> {
     Ok(image)
 }
 
-fn configured_image(state: &AppState, protocol: Protocol) -> &str {
+fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
     state.config.images.configured_for_protocol(protocol)
 }
 
@@ -140,9 +140,9 @@ mod tests {
         })
         .await;
 
-        ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.4").unwrap();
-        ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.5").unwrap();
-        let error = ensure_image_allowed(&state, Protocol::Postgres, "postgres:18.6").unwrap_err();
+        check_image_allowed(&state, Protocol::Postgres, "postgres:18.4").unwrap();
+        check_image_allowed(&state, Protocol::Postgres, "postgres:18.5").unwrap();
+        let error = check_image_allowed(&state, Protocol::Postgres, "postgres:18.6").unwrap_err();
 
         assert!(error.to_string().contains("is not allowed"));
     }

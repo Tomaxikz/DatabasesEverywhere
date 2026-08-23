@@ -407,10 +407,10 @@ fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -
             );
             let _ = writeln!(output, "  {}", ".".repeat(92));
             if let Some(workload) = &recommendation.configured_max_upload_worst_case {
-                terminal_recommendation_row(&mut output, workload);
+                final_recommendation_row(&mut output, workload);
             }
             if let Some(workload) = &recommendation.representative_exported_dump {
-                terminal_recommendation_row(&mut output, workload);
+                final_recommendation_row(&mut output, workload);
             }
         }
         if let Some(reason) = &recommendation.representative_unavailable_reason {
@@ -525,7 +525,7 @@ fn terminal_resource_row(output: &mut String, scope: &str, cpu: Option<f64>, mem
     );
 }
 
-fn terminal_recommendation_row(
+fn final_recommendation_row(
     output: &mut String,
     workload: &crate::bench::metrics::ManualActiveJobsWorkloadReport,
 ) {
@@ -1153,7 +1153,7 @@ mod tests {
         };
 
         let mut terminal = String::new();
-        terminal_recommendation_row(&mut terminal, &workload);
+        final_recommendation_row(&mut terminal, &workload);
         assert!(terminal.contains("configured maximum upload"));
         assert!(terminal.contains("4.00 GiB"));
         assert!(terminal.trim_end().ends_with('4'));

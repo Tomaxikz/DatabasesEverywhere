@@ -21,7 +21,7 @@ pub struct ConfigLoadReport {
 }
 
 impl ConfigLoadReport {
-    pub fn used_import_export_scheduler_defaults(&self) -> bool {
+    pub fn applied_scheduler_defaults(&self) -> bool {
         !self.defaulted_import_export_scheduler_fields.is_empty()
     }
 }
@@ -50,7 +50,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigLoadError> {
     Ok(config)
 }
 
-pub fn load_config_with_report(
+pub fn load_config_report(
     path: impl AsRef<Path>,
 ) -> Result<(Config, ConfigLoadReport), ConfigLoadError> {
     let path = path.as_ref();
@@ -137,7 +137,7 @@ paths:
         .unwrap();
 
         let original = std::fs::read_to_string(&path).unwrap();
-        let (config, report) = load_config_with_report(&path).unwrap();
+        let (config, report) = load_config_report(&path).unwrap();
 
         assert_eq!(config.daemon.engine, crate::config::DaemonEngine::Docker);
         assert_eq!(config.images.postgres, "postgres:18.4");
@@ -149,7 +149,7 @@ paths:
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443"]
         );
-        assert!(report.used_import_export_scheduler_defaults());
+        assert!(report.applied_scheduler_defaults());
         assert_eq!(
             report.defaulted_import_export_scheduler_fields.len(),
             IMPORT_EXPORT_SCHEDULER_FIELDS.len()
@@ -195,7 +195,7 @@ paths:
 "#;
         std::fs::write(&path, original).unwrap();
 
-        let (config, report) = load_config_with_report(&path).unwrap();
+        let (config, report) = load_config_report(&path).unwrap();
 
         assert_eq!(config.uuid, "preserved-node-uuid");
         assert_eq!(config.token_id, "preserved-token-id");

@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use super::{docker_error, instance_image_update_spec};
+use super::{docker_error, image_update_spec};
 use crate::{
     api::{
         api_response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
@@ -29,8 +29,7 @@ use crate::{
     instances::{metadata::InstanceMetadata, metadata::InstanceStatus, paths::InstancePaths},
     runtime::docker::{DockerContainerStatus, DockerInstanceSpec},
     shared::{
-        files::read_private_regular_file_bounded, protocol::Protocol, shell::sh_quote,
-        time::now_rfc3339,
+        files::read_bounded_private_file, protocol::Protocol, shell::sh_quote, time::now_rfc3339,
     },
 };
 
@@ -134,12 +133,12 @@ pub async fn reset_instance_password(
         let recovery_state = state.clone();
         let worker_state = state.clone();
         let recovery_instance_id = worker_instance_id.clone();
-        let result = run_password_worker_with_panic_recovery(
+        let result = run_password_worker(
             &state.instance_locks,
             &worker_instance_id,
             reset_instance_password_inner(worker_state, instance_id, request),
             move |error| async move {
-                let quarantine_summary = recover_password_worker_panic(
+                let quarantine_summary = recover_password_panic(
                     &recovery_state,
                     &recovery_instance_id,
                 )
@@ -218,7 +217,7 @@ async fn reset_instance_password_inner(
     let previous = capture_previous_credential(&state, &metadata, &credential_data_path).await?;
     if !requires_container_recreation(metadata.protocol, &previous) {
         attest_password_reset_target(&state, &metadata).await?;
-        return reset_password_in_place(
+        return reset_live_password(
             &state,
             metadata,
             &paths,
@@ -258,7 +257,7 @@ async fn reset_instance_password_inner(
 
     let new_spec_password = spec_password(metadata.protocol, &new_password, &previous, false)?;
     let old_spec_password = spec_password(metadata.protocol, &new_password, &previous, true)?;
-    let mut new_spec = instance_image_update_spec(
+    let mut new_spec = image_update_spec(
         &metadata,
         &paths,
         container_data_path.clone(),
@@ -267,7 +266,7 @@ async fn reset_instance_password_inner(
         protocol_pids_limit(&state, metadata.protocol),
     )
     .await?;
-    let mut old_spec = instance_image_update_spec(
+    let mut old_spec = image_update_spec(
         &metadata,
         &paths,
         container_data_path,
@@ -290,7 +289,7 @@ async fn reset_instance_password_inner(
     );
     delete_managed_container(&state, metadata.protocol, &metadata.instance_id).await?;
     state.instances.fence_routes(&metadata.instance_id).await;
-    let result = perform_password_reset(
+    let result = reset_password(
         &state,
         &metadata,
         ResetExecution {
@@ -338,7 +337,7 @@ async fn reset_instance_password_inner(
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state
         .manager
-        .upsert_recovered_protected_secrets(metadata.clone())
+        .upsert_recovered_secrets(metadata.clone())
         .await
     {
         let commit_error = error.to_string();
@@ -439,7 +438,7 @@ fn classify_password_metadata_commit(
     previous: &InstanceMetadata,
     intended: &InstanceMetadata,
 ) -> PasswordMetadataCommitResolution {
-    match super::major_upgrade::classify_major_upgrade_commit(&persisted, previous, intended) {
+    match super::major_upgrade::classify_upgrade_commit(&persisted, previous, intended) {
         super::major_upgrade::MajorUpgradeCommitResolution::Committed => {
             PasswordMetadataCommitResolution::Committed
         }
@@ -478,7 +477,7 @@ async fn fail_password_metadata_commit_uncertain(
     )))
 }
 
-async fn reset_password_in_place(
+async fn reset_live_password(
     state: &AppState,
     mut metadata: InstanceMetadata,
     paths: &InstancePaths,
@@ -499,7 +498,7 @@ async fn reset_password_in_place(
             new_password,
             previous,
         };
-        if let Err(error) = perform_in_place_password_reset(
+        if let Err(error) = reset_password_in_place(
             &context,
             new_verifier.as_deref(),
             Arc::clone(&credential_changed),
@@ -521,7 +520,7 @@ async fn reset_password_in_place(
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state
         .manager
-        .upsert_recovered_protected_secrets(metadata.clone())
+        .upsert_recovered_secrets(metadata.clone())
         .await
     {
         let commit_error = error.to_string();
@@ -689,9 +688,7 @@ async fn capture_previous_credential(
         }
     }
     previous.native_password_verifier = match metadata.protocol {
-        Protocol::Postgres => {
-            Some(capture_postgres_password_verifier(state, metadata, &previous).await?)
-        }
+        Protocol::Postgres => Some(capture_postgres_verifier(state, metadata, &previous).await?),
         Protocol::Mariadb => metadata.mariadb_native_password_sha1_stage2.clone(),
         Protocol::Mysql => metadata.mysql_native_password_sha1_stage2.clone(),
         _ => None,
@@ -712,7 +709,7 @@ async fn capture_previous_credential(
         let path = credential_data_path.join("users.acl");
         previous.acl = Some(
             tokio::task::spawn_blocking(move || {
-                read_private_regular_file_bounded(&path, MAX_ACL_FILE_BYTES)
+                read_bounded_private_file(&path, MAX_ACL_FILE_BYTES)
             })
             .await
             .map_err(|error| ApiError::Runtime(format!("failed to read current ACL: {error}")))?
@@ -766,7 +763,7 @@ fn native_password_verifier(protocol: Protocol, password: &SecretString) -> Opti
     })
 }
 
-async fn perform_in_place_password_reset(
+async fn reset_password_in_place(
     context: &InPlaceResetContext<'_>,
     new_verifier: Option<&str>,
     credential_changed: Arc<AtomicBool>,
@@ -784,7 +781,7 @@ async fn perform_in_place_password_reset(
         .await?;
         context
             .paths
-            .reapply_data_owner()
+            .restore_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         activate_resp_acl(
@@ -869,7 +866,7 @@ async fn rollback_in_place_password_reset(
         restore_resp_acl(context.metadata.protocol, context.credential_data_path, acl).await?;
         context
             .paths
-            .reapply_data_owner()
+            .restore_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         let previous_password = context.previous.environment.as_ref().ok_or_else(|| {
@@ -916,7 +913,7 @@ async fn rollback_in_place_password_reset(
         None,
     )
     .await?;
-    verify_rolled_back_credential(context).await
+    verify_rollback_credential(context).await
 }
 
 async fn activate_resp_acl(
@@ -940,7 +937,7 @@ async fn activate_resp_acl(
     let tenant_user = SecretString::from(metadata.database.username.clone());
     state
         .docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             metadata.protocol,
             &metadata.instance_id,
             command,
@@ -955,7 +952,7 @@ async fn activate_resp_acl(
     Ok(())
 }
 
-async fn perform_password_reset(
+async fn reset_password(
     state: &AppState,
     metadata: &InstanceMetadata,
     execution: ResetExecution<'_>,
@@ -970,7 +967,7 @@ async fn perform_password_reset(
         .await?;
         execution
             .paths
-            .reapply_data_owner()
+            .restore_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
     }
@@ -1005,12 +1002,12 @@ async fn rotate_database_password_to_container_environment(
     native_password_verifier: Option<&str>,
     credential_change_possible: Option<&AtomicBool>,
 ) -> Result<(), ApiError> {
-    wait_for_rotation_admin(state, metadata, previous).await?;
+    wait_for_admin_auth(state, metadata, previous).await?;
     let script = match metadata.protocol {
         Protocol::Postgres if target_password.is_some() => {
             postgres_rotation_script(&metadata.database.username, &metadata.database.name)
         }
-        Protocol::Postgres => postgres_verifier_restore_script(metadata),
+        Protocol::Postgres => verifier_restore_script(metadata),
         Protocol::Mariadb => mysql_family_rotation_script(
             metadata.protocol,
             &metadata.database.name,
@@ -1091,7 +1088,7 @@ async fn rotate_database_password_to_container_environment(
     }
     state
         .docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             metadata.protocol,
             &metadata.instance_id,
             &script,
@@ -1182,7 +1179,7 @@ async fn validate_rotated_credential(
     };
     state
         .docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             metadata.protocol,
             &metadata.instance_id,
             &script,
@@ -1302,7 +1299,7 @@ async fn rollback_password_reset(
         })?;
         restore_resp_acl(metadata.protocol, credential_data_path, acl).await?;
         paths
-            .reapply_data_owner()
+            .restore_data_owner()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
     }

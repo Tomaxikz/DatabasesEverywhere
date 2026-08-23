@@ -43,7 +43,7 @@ impl OriginPolicy {
 ///
 /// Handlers still name their required scope explicitly, but token and
 /// query-token policy is evaluated before path, query, or body deserialization.
-/// Browser Origin policy is enforced globally by `enforce_request_origin_policy`.
+/// Browser Origin policy is enforced globally by `check_request_origin`.
 #[derive(Debug, Clone)]
 pub struct ApiRequestContext {
     actor: AcceptedApiToken,
@@ -138,13 +138,13 @@ impl FromRequestParts<AppState> for ApiRequestContext {
             .and_then(|value| value.to_str().ok());
         let actor = state
             .api_token
-            .accepted_from_authorization_header(authorization)
+            .from_auth_header(authorization)
             .ok_or(ApiError::Unauthorized)?;
         Ok(Self { actor })
     }
 }
 
-pub async fn enforce_request_origin_policy(
+pub async fn check_request_origin(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,

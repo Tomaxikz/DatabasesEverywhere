@@ -9,25 +9,25 @@ const SERVICE_UNIT: &str = "databases-everywhere.service";
 const LEGACY_LOGS_PATH: &str = "/var/log/dbev";
 
 pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
-    ensure_root()?;
-    validate_setup_config_path(&config_path)?;
+    require_root()?;
+    validate_setup_config(&config_path)?;
     require_existing_config(&config_path)?;
     let mut config = load_config(&config_path)?;
-    ensure_required_setup_commands(&config.daemon)?;
+    check_setup_commands(&config.daemon)?;
     install_current_binary(Path::new(INSTALL_PATH))?;
-    secure_config_permissions(&config_path)?;
-    migrate_unsafe_legacy_logs_path(&config_path, &mut config)?;
-    ensure_system_directories(&config).await?;
-    ensure_memory_overcommit_host_config()?;
-    detect_and_log_disk_mode(&mut config)?;
-    ensure_fuse_quota_host_config(&config)?;
-    remove_obsolete_managed_sudoers()?;
-    prepare_configured_podman_socket(&config.daemon)?;
+    secure_config_file(&config_path)?;
+    migrate_legacy_logs(&config_path, &mut config)?;
+    prepare_system_dirs(&config).await?;
+    configure_overcommit()?;
+    log_disk_mode(&mut config)?;
+    configure_fuse_host(&config)?;
+    remove_old_sudoers()?;
+    prepare_podman_socket(&config.daemon)?;
     validate_runtime_support(&config).await?;
-    validate_configured_container_engine(&config).await?;
+    check_container_engine(&config).await?;
     write_systemd_service(&config_path, &config.daemon)?;
     reload_systemd()?;
-    enable_and_restart_systemd_service()?;
+    install_systemd_service()?;
     println!("system setup complete");
     println!("config read from: {}", config_path.display());
     println!("node uuid: {}", config.uuid);
@@ -38,7 +38,7 @@ pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<()> {
+pub(super) fn validate_setup_config(config_path: &Path) -> anyhow::Result<()> {
     if !config_path.is_absolute()
         || config_path
             .components()
@@ -60,11 +60,9 @@ pub(super) fn validate_setup_config_path(config_path: &Path) -> anyhow::Result<(
     Ok(())
 }
 
-pub(super) fn ensure_required_setup_commands(
-    config: &crate::config::DaemonConfig,
-) -> anyhow::Result<()> {
+pub(super) fn check_setup_commands(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
     let mut commands = vec!["chown", "sysctl", "systemctl"];
-    if configured_rootless_podman_uid(config).is_some() {
+    if rootless_podman_uid(config).is_some() {
         commands.extend(["getent", "loginctl", "runuser"]);
     }
     for command in commands {
@@ -75,10 +73,10 @@ pub(super) fn ensure_required_setup_commands(
     Ok(())
 }
 
-pub(super) fn ensure_memory_overcommit_host_config() -> anyhow::Result<()> {
+pub(super) fn configure_overcommit() -> anyhow::Result<()> {
     let path = Path::new(MEMORY_OVERCOMMIT_SYSCTL_PATH);
-    atomic_replace_setup_file(path, 0o644, "DBEV memory sysctl configuration", |file| {
-        file.write_all(memory_overcommit_sysctl_contents().as_bytes())
+    replace_setup_file(path, 0o644, "DBEV memory sysctl configuration", |file| {
+        file.write_all(memory_overcommit_sysctl().as_bytes())
     })?;
     run_setup_command("sysctl", &["-w", "vm.overcommit_memory=1"])?;
     let effective = fs::read_to_string(MEMORY_OVERCOMMIT_PROC_PATH)
@@ -93,7 +91,7 @@ pub(super) fn ensure_memory_overcommit_host_config() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn warn_if_memory_overcommit_disabled() {
+pub(super) fn warn_memory_overcommit() {
     match fs::read_to_string(MEMORY_OVERCOMMIT_PROC_PATH) {
         Ok(value) if value.trim() == "1" => {}
         Ok(value) => tracing::warn!(
@@ -109,20 +107,20 @@ pub(super) fn warn_if_memory_overcommit_disabled() {
     }
 }
 
-pub(super) fn memory_overcommit_sysctl_contents() -> &'static str {
+pub(super) fn memory_overcommit_sysctl() -> &'static str {
     "# Managed by DatabasesEverywhere --setup.\nvm.overcommit_memory = 1\n"
 }
 
-fn configured_rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {
+fn rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {
     if config.engine != DaemonEngine::Podman {
         return None;
     }
     config
         .configured_socket_path()
-        .and_then(crate::runtime::docker::rootless_podman_uid_from_socket_path)
+        .and_then(crate::runtime::docker::rootless_uid_from_socket)
 }
 
-fn prepare_configured_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
+fn prepare_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
     if config.engine != DaemonEngine::Podman {
         return Ok(());
     }
@@ -133,7 +131,7 @@ fn prepare_configured_podman_socket(config: &crate::config::DaemonConfig) -> any
         println!("enabled rootful Podman API socket");
         return Ok(());
     }
-    let Some(uid) = configured_rootless_podman_uid(config) else {
+    let Some(uid) = rootless_podman_uid(config) else {
         println!(
             "podman socket mode: externally managed custom socket; dbev will validate it but not control its lifecycle"
         );
@@ -190,7 +188,7 @@ fn username_for_uid(uid: u32) -> anyhow::Result<String> {
     Ok(username.to_string())
 }
 
-async fn validate_configured_container_engine(config: &Config) -> anyhow::Result<()> {
+async fn check_container_engine(config: &Config) -> anyhow::Result<()> {
     let mut runtime = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to the configured container engine")?;
     runtime
@@ -201,7 +199,7 @@ async fn validate_configured_container_engine(config: &Config) -> anyhow::Result
         .ping()
         .await
         .context("configured container engine did not answer ping")?;
-    prepare_rootless_podman_runtime_paths(config, &runtime)?;
+    prepare_rootless_paths(config, &runtime)?;
     println!(
         "container engine ok: {} {} via {}{}",
         runtime.engine_name(),
@@ -216,13 +214,13 @@ async fn validate_configured_container_engine(config: &Config) -> anyhow::Result
     Ok(())
 }
 
-pub(super) fn ensure_fuse_quota_host_config(config: &Config) -> anyhow::Result<()> {
+pub(super) fn configure_fuse_host(config: &Config) -> anyhow::Result<()> {
     if config.disk.mode != DiskLimitMode::FuseQuota {
         return Ok(());
     }
 
-    ensure_fuse_device_supported()?;
-    warn_if_fuse_not_listed_in_proc_filesystems();
+    check_fuse_device()?;
+    warn_if_fuse_missing();
 
     let path = Path::new("/etc/fuse.conf");
     let mut contents = match fs::read_to_string(path) {
@@ -233,7 +231,7 @@ pub(super) fn ensure_fuse_quota_host_config(config: &Config) -> anyhow::Result<(
         }
     };
 
-    match ensure_fuse_conf_allow_other(&contents) {
+    match enable_fuse_allow_other(&contents) {
         FuseConfUpdate::AlreadyEnabled => {
             println!("fuse quota host config ok: /etc/fuse.conf has user_allow_other");
             return Ok(());
@@ -241,7 +239,7 @@ pub(super) fn ensure_fuse_quota_host_config(config: &Config) -> anyhow::Result<(
         FuseConfUpdate::Updated(updated) => contents = updated,
     }
 
-    atomic_replace_setup_file(path, 0o644, "fuse configuration", |file| {
+    replace_setup_file(path, 0o644, "fuse configuration", |file| {
         file.write_all(contents.as_bytes())
     })
     .with_context(|| {
@@ -259,15 +257,15 @@ pub(super) enum FuseConfUpdate {
     Updated(String),
 }
 
-pub(super) fn ensure_fuse_conf_allow_other(contents: &str) -> FuseConfUpdate {
-    if contents.lines().any(is_active_user_allow_other_line) {
+pub(super) fn enable_fuse_allow_other(contents: &str) -> FuseConfUpdate {
+    if contents.lines().any(is_active_allow_other) {
         return FuseConfUpdate::AlreadyEnabled;
     }
 
     let mut uncommented = false;
     let mut updated = String::new();
     for line in contents.lines() {
-        if !uncommented && is_commented_user_allow_other_line(line) {
+        if !uncommented && is_commented_allow_other(line) {
             let indent = line
                 .chars()
                 .take_while(|character| character.is_whitespace())
@@ -292,12 +290,12 @@ pub(super) fn ensure_fuse_conf_allow_other(contents: &str) -> FuseConfUpdate {
     FuseConfUpdate::Updated(updated)
 }
 
-pub(super) fn is_active_user_allow_other_line(line: &str) -> bool {
+pub(super) fn is_active_allow_other(line: &str) -> bool {
     let line = line.trim();
     !line.starts_with('#') && line == "user_allow_other"
 }
 
-pub(super) fn is_commented_user_allow_other_line(line: &str) -> bool {
+pub(super) fn is_commented_allow_other(line: &str) -> bool {
     let line = line.trim_start();
     let Some(line) = line.strip_prefix('#') else {
         return false;
@@ -305,7 +303,7 @@ pub(super) fn is_commented_user_allow_other_line(line: &str) -> bool {
     line.trim() == "user_allow_other"
 }
 
-pub(super) fn ensure_fuse_device_supported() -> anyhow::Result<()> {
+pub(super) fn check_fuse_device() -> anyhow::Result<()> {
     let path = Path::new("/dev/fuse");
     let metadata = fs::metadata(path).with_context(|| {
         "automatic disk-limit detection selected FuseQuota, but /dev/fuse is unavailable; install/enable host FUSE support, then rerun dbev --setup"
@@ -332,7 +330,7 @@ pub(super) fn ensure_fuse_device_supported() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn warn_if_fuse_not_listed_in_proc_filesystems() {
+pub(super) fn warn_if_fuse_missing() {
     let mut contents = String::new();
     let Ok(mut file) = fs::File::open("/proc/filesystems") else {
         return;
@@ -352,7 +350,7 @@ pub(super) fn warn_if_fuse_not_listed_in_proc_filesystems() {
     }
 }
 
-pub(super) fn ensure_root() -> anyhow::Result<()> {
+pub(super) fn require_root() -> anyhow::Result<()> {
     let output = StdCommand::new("id")
         .arg("-u")
         .output()
@@ -389,7 +387,7 @@ pub(super) fn install_current_binary(destination: &Path) -> anyhow::Result<()> {
             );
         }
         let mut source = fs::File::from(source_fd);
-        atomic_replace_setup_file(destination, 0o755, "installed daemon binary", |target| {
+        replace_setup_file(destination, 0o755, "installed daemon binary", |target| {
             std::io::copy(&mut source, target).map(|_| ())
         })
         .with_context(|| {
@@ -402,8 +400,8 @@ pub(super) fn install_current_binary(destination: &Path) -> anyhow::Result<()> {
     } else {
         use std::os::unix::fs::MetadataExt;
 
-        validate_setup_replace_target(destination, "installed daemon binary")?;
-        validate_setup_parent_directory(
+        validate_replace_target(destination, "installed daemon binary")?;
+        validate_setup_parent(
             destination
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("installed daemon path has no parent"))?,
@@ -430,7 +428,7 @@ pub(super) fn require_existing_config(config_path: &Path) -> anyhow::Result<()> 
     }
 }
 
-pub(super) fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()> {
+pub(super) fn secure_config_file(config_path: &Path) -> anyhow::Result<()> {
     let config_metadata = fs::symlink_metadata(config_path)
         .with_context(|| format!("failed to inspect config {}", config_path.display()))?;
     if config_metadata.file_type().is_symlink() || !config_metadata.is_file() {
@@ -478,16 +476,16 @@ pub(super) fn secure_config_permissions(config_path: &Path) -> anyhow::Result<()
     Ok(())
 }
 
-pub(super) async fn ensure_system_directories(config: &Config) -> anyhow::Result<()> {
-    ensure_runtime_directories(config)
+pub(super) async fn prepare_system_dirs(config: &Config) -> anyhow::Result<()> {
+    prepare_runtime_dirs(config)
         .await
         .context("failed to securely prepare configured runtime directories")?;
     Ok(())
 }
 
-fn migrate_unsafe_legacy_logs_path(config_path: &Path, config: &mut Config) -> anyhow::Result<()> {
+fn migrate_legacy_logs(config_path: &Path, config: &mut Config) -> anyhow::Result<()> {
     let Some((migrated, replacement, legacy_error)) =
-        build_legacy_logs_migration(config, Path::new(LEGACY_LOGS_PATH))?
+        plan_legacy_logs_migration(config, Path::new(LEGACY_LOGS_PATH))?
     else {
         return Ok(());
     };
@@ -500,14 +498,14 @@ fn migrate_unsafe_legacy_logs_path(config_path: &Path, config: &mut Config) -> a
     Ok(())
 }
 
-pub(super) fn build_legacy_logs_migration(
+pub(super) fn plan_legacy_logs_migration(
     config: &Config,
     legacy_logs_path: &Path,
 ) -> anyhow::Result<Option<(Config, String, String)>> {
     if Path::new(&config.paths.logs) != legacy_logs_path {
         return Ok(None);
     }
-    let legacy_error = match validate_runtime_path_ancestors(legacy_logs_path, false) {
+    let legacy_error = match validate_runtime_ancestors(legacy_logs_path, false) {
         Ok(()) => return Ok(None),
         Err(error) => format!("{error:#}"),
     };
@@ -517,7 +515,7 @@ pub(super) fn build_legacy_logs_migration(
     migrated.paths.logs = replacement.clone();
     crate::config::validate::validate_config(&migrated)
         .context("the safe setup log-path replacement is not valid")?;
-    validate_runtime_path_ancestors(Path::new(&replacement), false).with_context(|| {
+    validate_runtime_ancestors(Path::new(&replacement), false).with_context(|| {
         format!(
             "legacy log path {} is unsafe ({legacy_error}); replacement {replacement} is also unsafe",
             legacy_logs_path.display()
@@ -528,13 +526,13 @@ pub(super) fn build_legacy_logs_migration(
 
 fn persist_setup_config(config_path: &Path, config: &Config) -> anyhow::Result<()> {
     let yaml = serde_yaml::to_string(config).context("failed to encode migrated setup config")?;
-    atomic_replace_setup_file(config_path, 0o600, "daemon config", |file| {
+    replace_setup_file(config_path, 0o600, "daemon config", |file| {
         file.write_all(yaml.as_bytes())
     })
     .with_context(|| format!("failed to update config {}", config_path.display()))
 }
 
-pub(super) fn remove_obsolete_managed_sudoers() -> anyhow::Result<()> {
+pub(super) fn remove_old_sudoers() -> anyhow::Result<()> {
     let path = Path::new(SUDOERS_PATH);
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -565,7 +563,7 @@ pub(super) fn write_systemd_service(
     daemon: &crate::config::DaemonConfig,
 ) -> anyhow::Result<()> {
     let contents = systemd_service_contents(config_path, daemon);
-    atomic_replace_setup_file(Path::new(SERVICE_PATH), 0o644, "systemd service", |file| {
+    replace_setup_file(Path::new(SERVICE_PATH), 0o644, "systemd service", |file| {
         file.write_all(contents.as_bytes())
     })
     .context("failed to write systemd service")?;
@@ -585,7 +583,7 @@ pub(super) fn systemd_service_contents(
         DaemonEngine::Docker => {
             "After=docker.service\nRequires=docker.service\nPartOf=docker.service".to_string()
         }
-        DaemonEngine::Podman => match configured_rootless_podman_uid(daemon) {
+        DaemonEngine::Podman => match rootless_podman_uid(daemon) {
             Some(uid) => format!(
                 "After=user@{uid}.service\nRequires=user@{uid}.service\nRequiresMountsFor=/run/user/{uid}"
             ),
@@ -624,7 +622,7 @@ pub(super) fn reload_systemd() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn enable_and_restart_systemd_service() -> anyhow::Result<()> {
+pub(super) fn install_systemd_service() -> anyhow::Result<()> {
     run_setup_command("systemctl", &["enable", SERVICE_UNIT])?;
     // `enable --now` leaves an already-running service on its old resource
     // limits. An explicit restart makes setup upgrades apply LimitNOFILE and
@@ -633,7 +631,7 @@ pub(super) fn enable_and_restart_systemd_service() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn atomic_replace_setup_file(
+pub(super) fn replace_setup_file(
     path: &Path,
     mode: u32,
     label: &str,
@@ -641,11 +639,11 @@ pub(super) fn atomic_replace_setup_file(
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    validate_setup_replace_target(path, label)?;
+    validate_replace_target(path, label)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{label} path has no parent directory"))?;
-    validate_setup_parent_directory(parent, label)?;
+    validate_setup_parent(parent, label)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("{label} path has no file name"))?;
@@ -693,7 +691,7 @@ pub(super) fn atomic_replace_setup_file(
     result
 }
 
-pub(super) fn validate_setup_replace_target(path: &Path, label: &str) -> anyhow::Result<()> {
+pub(super) fn validate_replace_target(path: &Path, label: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     match fs::symlink_metadata(path) {
@@ -713,7 +711,7 @@ pub(super) fn validate_setup_replace_target(path: &Path, label: &str) -> anyhow:
     }
 }
 
-pub(super) fn validate_setup_parent_directory(parent: &Path, label: &str) -> anyhow::Result<()> {
+pub(super) fn validate_setup_parent(parent: &Path, label: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(parent)

@@ -12,13 +12,11 @@ use tokio::io::AsyncReadExt;
 
 use crate::{
     backups::{
-        BackupBundle, BackupStoreError, StoredBackup, catalog_file_name, ensure_private_directory,
-        io_error, is_sha256, remove_file_if_exists, sha256_file, validate_backup_id,
+        BackupBundle, BackupStoreError, StoredBackup, catalog_file_name, io_error, is_sha256,
+        prepare_private_dir, remove_file_if_exists, sha256_file, validate_backup_id,
     },
     config::BackupKopiaConfig,
-    shared::{
-        files::read_private_regular_file_bounded, ids::validate_instance_id, protocol::Protocol,
-    },
+    shared::{files::read_bounded_private_file, ids::validate_instance_id, protocol::Protocol},
 };
 
 const TAG_INSTANCE: &str = "dbev-instance";
@@ -261,7 +259,7 @@ impl KopiaBackupDriver {
             return Ok(None);
         }
         let root = tmp_root.join("backup-catalogs").join(instance_id);
-        ensure_private_directory(&root, "backup catalog materialization directory").await?;
+        prepare_private_dir(&root, "backup catalog materialization directory").await?;
         let destination = root.join(format!("{}.json", uuid::Uuid::new_v4()));
         self.restore_object(
             &format!(
@@ -273,10 +271,9 @@ impl KopiaBackupDriver {
         )
         .await?;
         let read_path = destination.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            read_private_regular_file_bounded(&read_path, max_bytes)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || read_bounded_private_file(&read_path, max_bytes))
+                .await;
         remove_file_if_exists(&destination).await;
         let result = result.map_err(|error| {
             BackupStoreError::Runtime(format!("catalog read task failed: {error}"))

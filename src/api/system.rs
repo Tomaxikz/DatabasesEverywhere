@@ -132,7 +132,7 @@ pub struct ImportExportSchedulerRecommendationResponse {
     pub max_queued_jobs_per_instance: usize,
 }
 
-pub async fn import_export_scheduler_recommendation(
+pub async fn scheduler_recommendation(
     State(state): State<AppState>,
     auth: ApiRequestContext,
     ApiQuery(query): ApiQuery<ImportExportSchedulerEstimateQuery>,

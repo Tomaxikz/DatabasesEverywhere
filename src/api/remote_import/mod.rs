@@ -19,7 +19,7 @@ use crate::{
     shared::protocol::Protocol,
 };
 
-pub(crate) use qdrant::{cleanup_stale_qdrant_bridge, import_qdrant};
+pub(crate) use qdrant::{cleanup_stale_bridge, import_qdrant};
 pub(crate) use redis::{import_redis, import_valkey};
 pub use security::RemoteEndpointRequest;
 
@@ -430,7 +430,7 @@ pub(crate) async fn acquire_logical_dump(
     let permit = REMOTE_IMPORT_LIMITER
         .acquire(state.config.security.remote_import.max_concurrent_jobs)
         .await;
-    let root = remote_staging_directory(state).await?;
+    let root = staging_directory(state).await?;
     let mut staging = RemoteStagingGuard::new(root.clone());
     let output_names = logical::output_names(protocol, selection)?;
     let outputs = output_names
@@ -447,7 +447,7 @@ pub(crate) async fn acquire_logical_dump(
         &output_names,
     )
     .await;
-    let credential_cleanup = remove_remote_credential_files(&root).await;
+    let credential_cleanup = remove_credential_files(&root).await;
     if let Err(error) = helper_result {
         if let Err(cleanup_error) = credential_cleanup {
             tracing::warn!(
@@ -499,7 +499,7 @@ pub(crate) async fn acquire_logical_dump(
                 "clickhouse remote import requires a source database".to_string(),
             ));
         };
-        if let Err(error) = mysql_sql::rewrite_clickhouse_schema_qualifiers(
+        if let Err(error) = mysql_sql::rewrite_clickhouse_schema(
             output,
             source_database,
             target_database,
@@ -549,7 +549,7 @@ pub(crate) async fn acquire_logical_dump(
 mod logical;
 mod mysql_sql;
 
-async fn remove_remote_credential_files(root: &Path) -> Result<(), ApiError> {
+async fn remove_credential_files(root: &Path) -> Result<(), ApiError> {
     for name in REMOTE_CREDENTIAL_FILES {
         let path = root.join(name);
         match tokio::fs::remove_file(&path).await {
@@ -575,7 +575,7 @@ async fn remove_remote_credential_files(root: &Path) -> Result<(), ApiError> {
 /// The walk is limited to immediate UUID-named job directories beneath the
 /// configured remote-import staging root. Symlinks and special files are never
 /// followed or removed.
-pub(crate) async fn cleanup_stale_remote_import_credentials(
+pub(crate) async fn cleanup_stale_import_secrets(
     tmp_root: &Path,
     remove_orphaned_staging: bool,
 ) -> StaleRemoteCredentialCleanup {
@@ -642,7 +642,7 @@ pub(crate) async fn cleanup_stale_remote_import_credentials(
         }
 
         let job_path = entry.path();
-        if !is_generated_remote_import_job_name(&entry.file_name()) {
+        if !is_generated_import_job(&entry.file_name()) {
             summary.skipped_entries += 1;
             continue;
         }
@@ -752,7 +752,7 @@ pub(crate) async fn cleanup_stale_remote_import_credentials(
     summary
 }
 
-fn is_generated_remote_import_job_name(name: &std::ffi::OsStr) -> bool {
+fn is_generated_import_job(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -819,15 +819,15 @@ impl Drop for RemoteStagingGuard {
     }
 }
 
-async fn remote_staging_directory(state: &AppState) -> Result<PathBuf, ApiError> {
+async fn staging_directory(state: &AppState) -> Result<PathBuf, ApiError> {
     let root = PathBuf::from(state.config.paths.tmp_root())
         .join("remote-import")
         .join(uuid::Uuid::new_v4().to_string());
-    create_private_directory(&root).await?;
+    prepare_private_dir(&root).await?;
     Ok(root)
 }
 
-async fn create_private_directory(path: &Path) -> Result<(), ApiError> {
+async fn prepare_private_dir(path: &Path) -> Result<(), ApiError> {
     tokio::fs::create_dir_all(path).await.map_err(|error| {
         ApiError::Runtime(format!("failed to create import staging area: {error}"))
     })?;
@@ -887,12 +887,10 @@ async fn commit_recovery_manifest(path: &Path) -> Result<(), ApiError> {
 
 async fn sync_recovery_file(path: &Path) -> Result<(), ApiError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        crate::shared::files::sync_private_regular_file_durable(&path)
-    })
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to sync recovery data: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to sync recovery data: {error}")))
+    tokio::task::spawn_blocking(move || crate::shared::files::sync_private_file(&path))
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to sync recovery data: {error}")))?
+        .map_err(|error| ApiError::Runtime(format!("failed to sync recovery data: {error}")))
 }
 
 async fn validate_staged_file(path: &Path, max_bytes: u64) -> Result<u64, ApiError> {
@@ -1151,7 +1149,7 @@ mod tests {
             tokio::fs::write(root.join(name), b"secret").await.unwrap();
         }
 
-        remove_remote_credential_files(root).await.unwrap();
+        remove_credential_files(root).await.unwrap();
 
         assert!(dump.is_file());
         for name in REMOTE_CREDENTIAL_FILES {
@@ -1192,7 +1190,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = cleanup_stale_remote_import_credentials(directory.path(), true).await;
+        let summary = cleanup_stale_import_secrets(directory.path(), true).await;
 
         assert_eq!(summary.job_directories, 1);
         assert_eq!(summary.removed_files, REMOTE_CREDENTIAL_FILES.len());
@@ -1243,7 +1241,7 @@ mod tests {
             .unwrap();
         symlink(&outside_file, real_job.join("pgpass")).unwrap();
 
-        let summary = cleanup_stale_remote_import_credentials(directory.path(), true).await;
+        let summary = cleanup_stale_import_secrets(directory.path(), true).await;
 
         assert_eq!(summary.removed_files, 0);
         assert_eq!(summary.errors, 0);
@@ -1263,11 +1261,11 @@ mod tests {
             .await
             .unwrap();
 
-        let deferred = cleanup_stale_remote_import_credentials(directory.path(), false).await;
+        let deferred = cleanup_stale_import_secrets(directory.path(), false).await;
         assert_eq!(deferred.removed_directories, 0);
         assert!(orphan.is_dir());
 
-        let removed = cleanup_stale_remote_import_credentials(directory.path(), true).await;
+        let removed = cleanup_stale_import_secrets(directory.path(), true).await;
         assert_eq!(removed.removed_directories, 1);
         assert!(!orphan.exists());
     }

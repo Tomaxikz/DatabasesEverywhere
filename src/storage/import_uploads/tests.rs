@@ -89,7 +89,7 @@ async fn creates_and_reads_with_instance_isolation() {
     );
     assert!(
         repository
-            .list_active_for_instance("inst_other", 100)
+            .list_active("inst_other", 100)
             .await
             .unwrap()
             .is_empty()
@@ -134,7 +134,7 @@ async fn enforces_lifecycle_and_exact_job_claim() {
     );
     assert!(
         repository
-            .restore_ready_after_processing(
+            .restore_ready(
                 "inst_abc",
                 "upl_1",
                 Some(ImportUploadArchiveFormat::Plain),
@@ -147,7 +147,7 @@ async fn enforces_lifecycle_and_exact_job_claim() {
     );
     assert!(
         repository
-            .claim_ready_for_job("inst_abc", "upl_1", "job_1", "2026-08-10T10:05:00Z",)
+            .claim_for_job("inst_abc", "upl_1", "job_1", "2026-08-10T10:05:00Z",)
             .await
             .unwrap()
     );
@@ -159,7 +159,7 @@ async fn enforces_lifecycle_and_exact_job_claim() {
     );
     assert!(
         repository
-            .release_claim_after_failed_job(
+            .release_failed_claim(
                 "inst_abc",
                 "upl_1",
                 "job_1",
@@ -171,7 +171,7 @@ async fn enforces_lifecycle_and_exact_job_claim() {
     );
     assert!(
         repository
-            .claim_ready_for_job("inst_abc", "upl_1", "job_2", "2026-08-10T10:07:00Z",)
+            .claim_for_job("inst_abc", "upl_1", "job_2", "2026-08-10T10:07:00Z",)
             .await
             .unwrap()
     );
@@ -194,13 +194,13 @@ async fn only_one_concurrent_claim_wins() {
     let second_repository = repository.clone();
     let first = tokio::spawn(async move {
         first_repository
-            .claim_ready_for_job("inst_abc", "upl_1", "job_a", LATER)
+            .claim_for_job("inst_abc", "upl_1", "job_a", LATER)
             .await
             .unwrap()
     });
     let second = tokio::spawn(async move {
         second_repository
-            .claim_ready_for_job("inst_abc", "upl_1", "job_b", LATER)
+            .claim_for_job("inst_abc", "upl_1", "job_b", LATER)
             .await
             .unwrap()
     });
@@ -221,13 +221,13 @@ async fn concurrent_admission_cannot_exceed_instance_count() {
     let second_repository = repository.clone();
     let first = tokio::spawn(async move {
         first_repository
-            .insert_if_within_limits(sample_new(), 1, 1_000)
+            .insert_within_limits(sample_new(), 1, 1_000)
             .await
             .unwrap()
     });
     let second = tokio::spawn(async move {
         second_repository
-            .insert_if_within_limits(second, 1, 1_000)
+            .insert_within_limits(second, 1, 1_000)
             .await
             .unwrap()
     });
@@ -247,7 +247,7 @@ async fn concurrent_admission_cannot_exceed_instance_count() {
 async fn admission_reserves_declared_bytes_and_actual_size_must_match() {
     let repository = repository().await;
     let admitted = repository
-        .insert_if_within_limits(sample_new(), 10, 42)
+        .insert_within_limits(sample_new(), 10, 42)
         .await
         .unwrap();
     assert!(matches!(admitted, ImportUploadAdmission::Admitted(_)));
@@ -256,7 +256,7 @@ async fn admission_reserves_declared_bytes_and_actual_size_must_match() {
     second.stored_filename = "upl_2.dump".to_string();
     assert!(matches!(
         repository
-            .insert_if_within_limits(second, 10, 84)
+            .insert_within_limits(second, 10, 84)
             .await
             .unwrap(),
         ImportUploadAdmission::Admitted(_)
@@ -301,13 +301,13 @@ async fn expiry_skips_importing_and_prevents_late_claims() {
         .unwrap();
     assert!(
         repository
-            .claim_ready_for_job("inst_abc", "upl_1", "job_active", LATER)
+            .claim_for_job("inst_abc", "upl_1", "job_active", LATER)
             .await
             .unwrap()
     );
     assert!(
         !repository
-            .claim_ready_for_job("inst_abc", "upl_expired", "job_late", LATER)
+            .claim_for_job("inst_abc", "upl_expired", "job_late", LATER)
             .await
             .unwrap()
     );
@@ -344,7 +344,7 @@ async fn active_usage_keeps_consumed_bytes_reserved_until_deletion() {
         .await
         .unwrap();
     repository
-        .claim_ready_for_job("inst_other", "upl_2", "job_2", "2026-08-10T10:03:00Z")
+        .claim_for_job("inst_other", "upl_2", "job_2", "2026-08-10T10:03:00Z")
         .await
         .unwrap();
     repository
@@ -373,13 +373,13 @@ async fn reconciles_interrupted_imports_to_requested_state() {
     let repository = repository().await;
     make_ready(&repository).await;
     repository
-        .claim_ready_for_job("inst_abc", "upl_1", "job_1", LATER)
+        .claim_for_job("inst_abc", "upl_1", "job_1", LATER)
         .await
         .unwrap();
 
     assert!(
         !repository
-            .reconcile_interrupted_importing(
+            .reconcile_interrupted(
                 "inst_abc",
                 "upl_1",
                 "job_wrong",
@@ -393,7 +393,7 @@ async fn reconciles_interrupted_imports_to_requested_state() {
 
     assert!(
         repository
-            .reconcile_interrupted_importing(
+            .reconcile_interrupted(
                 "inst_abc",
                 "upl_1",
                 "job_1",
@@ -410,11 +410,11 @@ async fn reconciles_interrupted_imports_to_requested_state() {
     assert_eq!(stored.last_error.as_deref(), Some("daemon restarted"));
 
     repository
-        .claim_ready_for_job("inst_abc", "upl_1", "job_2", "2026-08-10T10:03:00Z")
+        .claim_for_job("inst_abc", "upl_1", "job_2", "2026-08-10T10:03:00Z")
         .await
         .unwrap();
     repository
-        .reconcile_interrupted_importing(
+        .reconcile_interrupted(
             "inst_abc",
             "upl_1",
             "job_2",
@@ -462,7 +462,7 @@ async fn deletion_is_scoped_and_refuses_active_imports() {
             .unwrap()
     );
     repository
-        .claim_ready_for_job("inst_abc", "upl_1", "job_1", LATER)
+        .claim_for_job("inst_abc", "upl_1", "job_1", LATER)
         .await
         .unwrap();
     assert!(
@@ -501,7 +501,7 @@ async fn transient_catalog_failure_restores_importable_ready_state() {
     );
     assert!(
         repository
-            .restore_ready_after_processing(
+            .restore_ready(
                 "inst_abc",
                 "upl_1",
                 None,
@@ -573,12 +573,9 @@ async fn lists_recoverable_states_and_deletes_instance_rows() {
             .is_empty()
     );
 
-    let terminal_first = repository
-        .list_terminal_cleanup_after(None, 1)
-        .await
-        .unwrap();
+    let terminal_first = repository.list_cleanup_after(None, 1).await.unwrap();
     let terminal_second = repository
-        .list_terminal_cleanup_after(Some(&terminal_first[0].upload_id), 1)
+        .list_cleanup_after(Some(&terminal_first[0].upload_id), 1)
         .await
         .unwrap();
     assert_eq!(terminal_first[0].upload_id, "upl_4");
@@ -587,7 +584,7 @@ async fn lists_recoverable_states_and_deletes_instance_rows() {
     assert_eq!(terminal_second[0].state, ImportUploadState::Deleting);
     assert_eq!(
         repository
-            .list_nonterminal_recovery_after(None, "2026-08-10T10:05:00Z", 120, 100)
+            .list_recovery_after(None, "2026-08-10T10:05:00Z", 120, 100)
             .await
             .unwrap()
             .iter()
@@ -597,7 +594,7 @@ async fn lists_recoverable_states_and_deletes_instance_rows() {
     );
     assert_eq!(
         repository
-            .list_nonterminal_recovery_after(None, "2026-08-10T10:02:00Z", 120, 100)
+            .list_recovery_after(None, "2026-08-10T10:02:00Z", 120, 100)
             .await
             .unwrap()
             .iter()
@@ -609,7 +606,7 @@ async fn lists_recoverable_states_and_deletes_instance_rows() {
     assert_eq!(repository.delete_for_instance("inst_abc").await.unwrap(), 5);
     assert!(
         repository
-            .list_active_for_instance("inst_abc", 100)
+            .list_active("inst_abc", 100)
             .await
             .unwrap()
             .is_empty()
@@ -693,7 +690,7 @@ async fn make_consumed(
         .await
         .unwrap();
     repository
-        .claim_ready_for_job("inst_abc", upload_id, job_id, "2026-08-10T10:03:00Z")
+        .claim_for_job("inst_abc", upload_id, job_id, "2026-08-10T10:03:00Z")
         .await
         .unwrap();
     repository

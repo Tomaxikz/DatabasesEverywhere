@@ -204,7 +204,7 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             apply_request_body_timeout,
         ))
-        .layer(middleware::from_fn(apply_request_execution_timeout))
+        .layer(middleware::from_fn(apply_request_timeout))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             track_mutating_request,
@@ -212,7 +212,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::api::security_policy::enforce_request_origin_policy,
+            crate::api::security_policy::check_request_origin,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -257,7 +257,7 @@ fn is_streaming_import_upload(request: &Request) -> bool {
             })
 }
 
-async fn apply_request_execution_timeout(request: Request, next: Next) -> Response {
+async fn apply_request_timeout(request: Request, next: Next) -> Response {
     if is_streaming_import_upload(&request) {
         return next.run(request).await;
     }
@@ -295,7 +295,7 @@ fn system_routes() -> Router<AppState> {
         .route("/api/system", get(system::system))
         .route(
             "/api/system/import-export-scheduler/recommendation",
-            get(system::import_export_scheduler_recommendation),
+            get(system::scheduler_recommendation),
         )
         .route("/api/system/config", patch(config_admin::patch_config))
         .route("/api/heartbeat", get(system::heartbeat))
@@ -633,7 +633,7 @@ mod tests {
             .to_string();
         let upload = state
             .import_uploads
-            .repository()
+            .repo()
             .get("inst_upload", &upload_id)
             .await
             .unwrap()
@@ -668,7 +668,7 @@ mod tests {
         assert!(
             state
                 .import_uploads
-                .repository()
+                .repo()
                 .get("inst_upload", &upload_id)
                 .await
                 .unwrap()

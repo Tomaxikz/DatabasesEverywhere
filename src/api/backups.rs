@@ -22,13 +22,13 @@ use crate::{
         BackupBundle, BackupStorage, BackupStoreError, MaterializedBackup, StoredBackup,
         build_manifest,
         catalog::{BackupCatalog, BackupCatalogColumn},
-        ensure_private_directory, new_backup_id,
+        new_backup_id, prepare_private_dir,
     },
     instances::metadata::{InstanceMetadata, InstanceStatus},
     jobs::import_export::{
         ArchiveSymlinkPolicy, DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError,
         JobEstimateInput, JobResourceCost, SchedulerAcquireError,
-        create_data_archive_with_policy_bounded,
+        create_bounded_archive_with_policy,
     },
     shared::{ids::validate_instance_id, protocol::Protocol},
 };
@@ -134,7 +134,7 @@ pub async fn list_instance_backups(
     ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<Vec<ArtifactInfo>> {
     auth.require_scope(scopes::BACKUPS_READ)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let storage = backup_storage(&state)?;
     let backups = storage
         .list(&instance_id)
@@ -153,7 +153,7 @@ pub async fn browse_instance_backup(
     ApiQuery(query): ApiQuery<BackupContentsQuery>,
 ) -> ApiResult<BackupContentsResponse> {
     auth.require_scope(scopes::BACKUPS_READ)?;
-    let metadata = ensure_instance_exists(&state, &instance_id).await?;
+    let metadata = require_instance(&state, &instance_id).await?;
     let limit = query.limit.unwrap_or(25);
     if limit == 0 || limit > 100 {
         return Err(ApiError::BadRequest(
@@ -202,8 +202,8 @@ pub async fn browse_instance_backup(
             selection: None,
         }));
     };
-    let catalog = BackupCatalog::decode_and_validate(&bytes, &instance_id, &backup_id)
-        .map_err(ApiError::Runtime)?;
+    let catalog =
+        BackupCatalog::decode(&bytes, &instance_id, &backup_id).map_err(ApiError::Runtime)?;
     let selection = select_catalog_object(&catalog, query.object.as_deref(), query.offset, limit)?;
     let objects = catalog
         .objects
@@ -259,7 +259,7 @@ pub async fn delete_instance_backup(
     ApiPath((instance_id, backup_id)): ApiPath<(String, String)>,
 ) -> ApiResult<DeleteArtifactResponse> {
     auth.require_scope(scopes::BACKUPS_WRITE)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let storage = backup_storage(&state)?;
     storage
         .delete(&instance_id, &backup_id)
@@ -285,17 +285,17 @@ pub async fn restore_instance_backup(
 ) -> ApiResult<RestoreBackupResponse> {
     auth.require_scope(scopes::RECOVERY_ADMIN)?;
     let authorization = DestructiveActionPolicy::authorize("backup restore", &confirmation)?;
-    let admission = admit_backup_operation(&state, &instance_id)?;
+    let admission = admit_backup(&state, &instance_id)?;
     let state = state.clone();
     let reason = authorization.reason().to_string();
-    tokio::spawn(async move {
-        restore_instance_backup_admitted(state, instance_id, backup_id, reason, admission).await
-    })
+    tokio::spawn(
+        async move { restore_backup(state, instance_id, backup_id, reason, admission).await },
+    )
     .await
     .map_err(|error| ApiError::Runtime(format!("backup restore task failed: {error}")))?
 }
 
-async fn restore_instance_backup_admitted(
+async fn restore_backup(
     state: AppState,
     instance_id: String,
     backup_id: String,
@@ -303,11 +303,11 @@ async fn restore_instance_backup_admitted(
     _admission: ImportExportJobPermit,
 ) -> ApiResult<RestoreBackupResponse> {
     let _operation = state.instance_locks.lock(&instance_id).await;
-    ensure_operation_can_start(&state)?;
+    check_backup_service(&state)?;
     let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
     let paths = crate::instances::paths::InstancePaths::new(&state.config.paths, &instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    crate::api::import_export::verify_physical_data_replacement(&state, &metadata, &paths)?;
+    crate::api::import_export::check_restore_layout(&state, &metadata, &paths)?;
     let storage = backup_storage(&state)?;
     let stored = storage
         .find(&instance_id, &backup_id)
@@ -331,7 +331,7 @@ async fn restore_instance_backup_admitted(
             export: false,
         }))
         .await
-        .map_err(scheduler_execution_error)?;
+        .map_err(scheduler_error)?;
     let data_parent = paths.data.parent().ok_or_else(|| {
         ApiError::Runtime("backup restore data directory has no parent".to_string())
     })?;
@@ -348,7 +348,7 @@ async fn restore_instance_backup_admitted(
         None
     } else {
         let temporary_root = PathBuf::from(state.config.paths.tmp_root());
-        ensure_private_directory(&temporary_root, "backup materialization directory")
+        prepare_private_dir(&temporary_root, "backup materialization directory")
             .await
             .map_err(store_error)?;
         Some(
@@ -369,7 +369,7 @@ async fn restore_instance_backup_admitted(
     let _temporary_capacity = temporary_capacity;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running
-        && let Err(error) = crate::api::instances::lifecycle_instance_locked(
+        && let Err(error) = crate::api::instances::change_instance_state_locked(
             &state,
             &instance_id,
             crate::api::instances::LifecycleAction::Stop,
@@ -379,7 +379,7 @@ async fn restore_instance_backup_admitted(
         materialized.cleanup().await;
         return Err(error);
     }
-    let finished = crate::api::import_export::restore_data_from_archive_bounded(
+    let finished = crate::api::import_export::restore_bounded_archive(
         &state,
         &instance_id,
         paths,
@@ -409,23 +409,23 @@ pub(crate) async fn backup_instance(
     state: &AppState,
     instance_id: &str,
 ) -> Result<ArtifactInfo, ApiError> {
-    let admission = admit_backup_operation(state, instance_id)?;
+    let admission = admit_backup(state, instance_id)?;
     let state = state.clone();
     let instance_id = instance_id.to_string();
-    tokio::spawn(async move { backup_instance_admitted(state, instance_id, admission).await })
+    tokio::spawn(async move { run_backup(state, instance_id, admission).await })
         .await
         .map_err(|error| ApiError::Runtime(format!("backup task failed: {error}")))?
 }
 
-async fn backup_instance_admitted(
+async fn run_backup(
     state: AppState,
     instance_id: String,
     _admission: ImportExportJobPermit,
 ) -> Result<ArtifactInfo, ApiError> {
     let _operation = state.instance_locks.lock(&instance_id).await;
-    ensure_operation_can_start(&state)?;
+    check_backup_service(&state)?;
     let metadata = crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
-    validate_backup_eligible(&metadata)?;
+    check_backup_ready(&metadata)?;
     let _execution = state
         .import_export_jobs
         .acquire_execution(JobResourceCost::estimate(JobEstimateInput {
@@ -437,7 +437,7 @@ async fn backup_instance_admitted(
             export: true,
         }))
         .await
-        .map_err(scheduler_execution_error)?;
+        .map_err(scheduler_error)?;
     let storage = backup_storage(&state)?;
     let backup_id = new_backup_id();
     let catalog = if state.config.backups.browsing.enabled {
@@ -543,7 +543,7 @@ async fn create_physical_archive(
     let instance_id = &metadata.instance_id;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
-        crate::api::instances::lifecycle_instance_locked(
+        crate::api::instances::change_instance_state_locked(
             state,
             instance_id,
             crate::api::instances::LifecycleAction::Stop,
@@ -557,7 +557,7 @@ async fn create_physical_archive(
     } else {
         DataArchiveSourcePolicy::Strict
     };
-    let result = create_data_archive_with_policy_bounded(
+    let result = create_bounded_archive_with_policy(
         paths.data,
         archive.to_path_buf(),
         archive_policy,
@@ -574,8 +574,7 @@ async fn create_physical_archive(
             "failed to archive stopped instance data"
         );
     }
-    crate::api::import_export::finish_physical_operation(state, instance_id, was_running, result)
-        .await
+    crate::api::import_export::finish_physical_change(state, instance_id, was_running, result).await
 }
 
 pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse {
@@ -624,7 +623,7 @@ pub fn start_scheduler(state: AppState) {
             "automatic backups enabled"
         );
         if run_on_startup && !*shutdown.borrow() {
-            run_scheduled_backup_pass(&state).await;
+            run_scheduled_backups(&state).await;
         }
         loop {
             tokio::select! {
@@ -635,13 +634,13 @@ pub fn start_scheduler(state: AppState) {
                         break;
                     }
                 }
-                () = sleep(interval) => run_scheduled_backup_pass(&state).await,
+                () = sleep(interval) => run_scheduled_backups(&state).await,
             }
         }
     });
 }
 
-pub(crate) async fn materialize_backup_for_download(
+pub(crate) async fn prepare_backup_download(
     state: &AppState,
     instance_id: &str,
     backup_id: &str,
@@ -657,7 +656,7 @@ pub(crate) async fn materialize_backup_for_download(
         .map_err(store_error)
 }
 
-pub(crate) async fn ensure_backup_exists(
+pub(crate) async fn require_backup(
     state: &AppState,
     instance_id: &str,
     backup_id: &str,
@@ -769,7 +768,7 @@ fn artifact_info(backup: StoredBackup) -> ArtifactInfo {
     }
 }
 
-fn validate_backup_eligible(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+fn check_backup_ready(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.status != InstanceStatus::Running {
         return Err(ApiError::BadRequest(format!(
             "instance is not running (status={:?})",
@@ -779,7 +778,7 @@ fn validate_backup_eligible(metadata: &InstanceMetadata) -> Result<(), ApiError>
     Ok(())
 }
 
-async fn ensure_instance_exists(
+async fn require_instance(
     state: &AppState,
     instance_id: &str,
 ) -> Result<InstanceMetadata, ApiError> {
@@ -791,10 +790,7 @@ async fn ensure_instance_exists(
         .ok_or(ApiError::NotFound)
 }
 
-fn admit_backup_operation(
-    state: &AppState,
-    instance_id: &str,
-) -> Result<ImportExportJobPermit, ApiError> {
+fn admit_backup(state: &AppState, instance_id: &str) -> Result<ImportExportJobPermit, ApiError> {
     state
         .import_export_jobs
         .try_admit_exclusive(instance_id)
@@ -809,7 +805,7 @@ fn admit_backup_operation(
         })
 }
 
-fn scheduler_execution_error(error: SchedulerAcquireError) -> ApiError {
+fn scheduler_error(error: SchedulerAcquireError) -> ApiError {
     match error {
         SchedulerAcquireError::Closed => {
             ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
@@ -821,7 +817,7 @@ fn scheduler_execution_error(error: SchedulerAcquireError) -> ApiError {
     }
 }
 
-fn ensure_operation_can_start(state: &AppState) -> Result<(), ApiError> {
+fn check_backup_service(state: &AppState) -> Result<(), ApiError> {
     if state.import_export_jobs.is_accepting() {
         Ok(())
     } else {
@@ -831,7 +827,7 @@ fn ensure_operation_can_start(state: &AppState) -> Result<(), ApiError> {
     }
 }
 
-async fn run_scheduled_backup_pass(state: &AppState) {
+async fn run_scheduled_backups(state: &AppState) {
     let response = backup_all_instances(state).await;
     tracing::info!(
         event = "audit scheduled_backup_pass",

@@ -165,7 +165,7 @@ async fn handle_qdrant_h2_client(
                         return Err(error.into());
                     }
                 };
-                if !request_matches_qdrant_route(&request, &route_key_sha256, &request_verifier) {
+                if !matches_qdrant_route(&request, &route_key_sha256, &request_verifier) {
                     let response = http::Response::builder()
                         .status(http::StatusCode::UNAUTHORIZED)
                         .version(http::Version::HTTP_2)
@@ -186,13 +186,13 @@ async fn handle_qdrant_h2_client(
                     .map_err(|error| IoError::other(format!(
                         "qdrant proxy request task failed: {error}"
                     )))?;
-                handle_qdrant_stream_result(Some(stream_id), result)?;
+                handle_qdrant_stream(Some(stream_id), result)?;
             }
         }
     }
 }
 
-fn request_matches_qdrant_route<B>(
+fn matches_qdrant_route<B>(
     request: &http::Request<B>,
     route_key_sha256: &str,
     resolver: &RouteResolver,
@@ -211,7 +211,7 @@ async fn handle_qdrant_http1_client(
 ) -> Result<(), ListenerError> {
     let service = service_fn(move |request| {
         let resolver = resolver.clone();
-        async move { proxy_qdrant_http1_request(request, resolver).await }
+        async move { proxy_qdrant_http1(request, resolver).await }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -226,7 +226,7 @@ async fn handle_qdrant_http1_client(
     Ok(())
 }
 
-async fn proxy_qdrant_http1_request(
+async fn proxy_qdrant_http1(
     mut request: http::Request<Incoming>,
     resolver: RouteResolver,
 ) -> Result<http::Response<QdrantHttpBody>, Infallible> {
@@ -369,7 +369,7 @@ fn qdrant_http_error(
         .expect("static qdrant HTTP error response is valid")
 }
 
-fn handle_qdrant_stream_result(
+fn handle_qdrant_stream(
     stream_id: Option<h2::StreamId>,
     result: Result<(), qdrant::QdrantProxyError>,
 ) -> Result<(), ListenerError> {
@@ -436,18 +436,18 @@ mod tests {
     #[test]
     fn stream_local_failures_do_not_close_the_multiplexed_connection() {
         assert!(
-            handle_qdrant_stream_result(
+            handle_qdrant_stream(
                 None,
                 Err(qdrant::QdrantProxyError::InactivityTimeout { timeout_secs: 60 }),
             )
             .is_ok()
         );
         assert!(
-            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::OutboundStreamClosed),)
+            handle_qdrant_stream(None, Err(qdrant::QdrantProxyError::OutboundStreamClosed),)
                 .is_ok()
         );
         assert!(
-            handle_qdrant_stream_result(
+            handle_qdrant_stream(
                 None,
                 Err(qdrant::QdrantProxyError::StreamReset {
                     reason: h2::Reason::CANCEL,
@@ -456,7 +456,7 @@ mod tests {
             .is_ok()
         );
         assert!(matches!(
-            handle_qdrant_stream_result(None, Err(qdrant::QdrantProxyError::MissingApiKey)),
+            handle_qdrant_stream(None, Err(qdrant::QdrantProxyError::MissingApiKey)),
             Err(ListenerError::Qdrant(
                 qdrant::QdrantProxyError::MissingApiKey
             ))
@@ -510,9 +510,9 @@ mod tests {
             .body(())
             .unwrap();
         let missing = http::Request::new(());
-        assert!(request_matches_qdrant_route(&valid, &route, &resolver));
-        assert!(!request_matches_qdrant_route(&wrong, &route, &resolver));
-        assert!(!request_matches_qdrant_route(&missing, &route, &resolver));
+        assert!(matches_qdrant_route(&valid, &route, &resolver));
+        assert!(!matches_qdrant_route(&wrong, &route, &resolver));
+        assert!(!matches_qdrant_route(&missing, &route, &resolver));
     }
 
     #[tokio::test]

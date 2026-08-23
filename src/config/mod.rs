@@ -837,16 +837,16 @@ impl Default for AllocationConfig {
 }
 
 impl AllocationConfig {
-    pub fn effective_memory_limit_bytes(&self, physical_total_bytes: u64) -> u64 {
-        effective_allocation_limit_bytes(
+    pub fn memory_allocation_cap_bytes(&self, physical_total_bytes: u64) -> u64 {
+        allocation_cap_bytes(
             physical_total_bytes,
             self.max_memory_mib,
             self.reserved_memory_mib,
         )
     }
 
-    pub fn effective_disk_limit_bytes(&self, physical_total_bytes: u64) -> u64 {
-        effective_allocation_limit_bytes(
+    pub fn disk_allocation_cap_bytes(&self, physical_total_bytes: u64) -> u64 {
+        allocation_cap_bytes(
             physical_total_bytes,
             self.max_disk_mib,
             self.reserved_disk_mib,
@@ -854,27 +854,27 @@ impl AllocationConfig {
     }
 
     pub fn reserved_memory_bytes(&self) -> u64 {
-        mib_to_bytes_saturating(self.reserved_memory_mib)
+        mib_to_bytes(self.reserved_memory_mib)
     }
 
     pub fn reserved_disk_bytes(&self) -> u64 {
-        mib_to_bytes_saturating(self.reserved_disk_mib)
+        mib_to_bytes(self.reserved_disk_mib)
     }
 }
 
-fn effective_allocation_limit_bytes(
+fn allocation_cap_bytes(
     physical_total_bytes: u64,
     configured_max_mib: Option<u64>,
     reserved_mib: u64,
 ) -> u64 {
-    let after_reserve = physical_total_bytes.saturating_sub(mib_to_bytes_saturating(reserved_mib));
+    let after_reserve = physical_total_bytes.saturating_sub(mib_to_bytes(reserved_mib));
     configured_max_mib
-        .map(mib_to_bytes_saturating)
+        .map(mib_to_bytes)
         .unwrap_or(after_reserve)
         .min(after_reserve)
 }
 
-fn mib_to_bytes_saturating(mib: u64) -> u64 {
+fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(1024 * 1024)
 }
 
@@ -913,7 +913,7 @@ reserved_disk_mib: 2048
         };
 
         assert_eq!(
-            allocation.effective_memory_limit_bytes(8 * 1024 * 1024 * 1024),
+            allocation.memory_allocation_cap_bytes(8 * 1024 * 1024 * 1024),
             7_680 * 1024 * 1024
         );
     }
@@ -927,7 +927,7 @@ reserved_disk_mib: 2048
         };
 
         assert_eq!(
-            allocation.effective_disk_limit_bytes(16_000 * 1024 * 1024),
+            allocation.disk_allocation_cap_bytes(16_000 * 1024 * 1024),
             13_952 * 1024 * 1024
         );
     }

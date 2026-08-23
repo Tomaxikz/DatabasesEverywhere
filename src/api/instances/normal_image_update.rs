@@ -1,7 +1,7 @@
 use super::*;
 use futures::FutureExt;
 
-pub(super) async fn run_normal_image_update_supervisor(
+pub(super) async fn run_image_update(
     state: AppState,
     operation: tokio::sync::OwnedMutexGuard<()>,
     metadata: InstanceMetadata,
@@ -41,7 +41,7 @@ pub(super) async fn run_normal_image_update_supervisor(
                     .ok()
                     .flatten()
                     .unwrap_or(recovery);
-                let quarantine = quarantine_after_image_update_uncertainty(
+                let quarantine = quarantine_image_update(
                     &state,
                     &durable,
                     "normal image-update worker panicked during a potentially destructive replacement",
@@ -49,7 +49,7 @@ pub(super) async fn run_normal_image_update_supervisor(
                 .await;
                 Err(ApiError::Runtime(format!(
                     "normal image-update worker stopped unexpectedly; {}",
-                    image_update_quarantine_summary(&quarantine)
+                    image_quarantine_summary(&quarantine)
                 )))
             }
         }
@@ -79,7 +79,7 @@ where
     tokio::spawn(future)
 }
 
-pub(super) async fn rollback_normal_image_update_or_quarantine(
+pub(super) async fn recover_image_update(
     state: &AppState,
     rollback_metadata: &InstanceMetadata,
     rollback_spec: &DockerInstanceSpec,
@@ -93,7 +93,7 @@ pub(super) async fn rollback_normal_image_update_or_quarantine(
     );
     let rollback = tokio::time::timeout(
         IMAGE_UPDATE_ROLLBACK_TIMEOUT,
-        restore_normal_image_update(state, rollback_metadata, rollback_spec),
+        restore_image_update(state, rollback_metadata, rollback_spec),
     )
     .await;
     let rollback_error = match rollback {
@@ -114,7 +114,7 @@ pub(super) async fn rollback_normal_image_update_or_quarantine(
         ),
     };
 
-    let quarantine = quarantine_after_image_update_uncertainty(
+    let quarantine = quarantine_image_update(
         state,
         rollback_metadata,
         "normal image update rollback failed",
@@ -131,16 +131,16 @@ pub(super) async fn rollback_normal_image_update_or_quarantine(
     );
     ApiError::Runtime(format!(
         "image update failed ({original_message}) and rollback failed ({rollback_error}); {}",
-        image_update_quarantine_summary(&quarantine)
+        image_quarantine_summary(&quarantine)
     ))
 }
 
-async fn restore_normal_image_update(
+async fn restore_image_update(
     state: &AppState,
     rollback_metadata: &InstanceMetadata,
     rollback_spec: &DockerInstanceSpec,
 ) -> Result<(), ApiError> {
-    delete_image_update_container(
+    delete_update_container(
         state,
         rollback_metadata.protocol,
         &rollback_metadata.instance_id,
@@ -169,18 +169,18 @@ async fn restore_normal_image_update(
         })?;
     state
         .manager
-        .delete_compatibility_attestation(&rollback_metadata.instance_id)
+        .delete_compatibility(&rollback_metadata.instance_id)
         .await
         .map_err(|error| {
             ApiError::Runtime(format!(
                 "previous container was restored but its stale compatibility attestation could not be invalidated: {error}"
             ))
         })?;
-    invalidate_image_update_caches(state, &rollback_metadata.instance_id).await;
+    clear_image_update_caches(state, &rollback_metadata.instance_id).await;
     Ok(())
 }
 
-async fn delete_image_update_container(
+async fn delete_update_container(
     state: &AppState,
     protocol: Protocol,
     instance_id: &str,
@@ -192,21 +192,21 @@ async fn delete_image_update_container(
     }
 }
 
-pub(super) async fn quarantine_after_image_update_uncertainty(
+pub(super) async fn quarantine_image_update(
     state: &AppState,
     metadata: &InstanceMetadata,
     reason: &str,
 ) -> Result<(), ApiError> {
-    let quarantined = quarantined_image_update_metadata(metadata);
+    let quarantined = quarantine_image_metadata(metadata);
 
     // Remove gateway routes before waiting for Docker or SQLite. A failed
     // durable quarantine must not leave the process routing to an uncertain
     // replacement during this daemon lifetime.
     state.instances.upsert(quarantined.clone()).await;
-    invalidate_image_update_caches(state, &quarantined.instance_id).await;
+    clear_image_update_caches(state, &quarantined.instance_id).await;
 
     let (runtime_result, persistence_result) = tokio::join!(
-        stop_image_update_target_fail_closed(state, &quarantined),
+        stop_uncertain_image_update(state, &quarantined),
         state.manager.upsert(quarantined.clone()),
     );
     let persistence_result = persistence_result
@@ -236,7 +236,7 @@ pub(super) async fn quarantine_after_image_update_uncertainty(
     }
 }
 
-async fn stop_image_update_target_fail_closed(
+async fn stop_uncertain_image_update(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<(), String> {
@@ -280,13 +280,13 @@ async fn stop_image_update_target_fail_closed(
     }
 }
 
-async fn invalidate_image_update_caches(state: &AppState, instance_id: &str) {
+async fn clear_image_update_caches(state: &AppState, instance_id: &str) {
     state.instance_runtime_cache.remove(instance_id).await;
     state.resource_cache.remove(instance_id).await;
     state.monitoring_cache.invalidate().await;
 }
 
-pub(super) fn quarantined_image_update_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
+pub(super) fn quarantine_image_metadata(metadata: &InstanceMetadata) -> InstanceMetadata {
     let mut quarantined = metadata.clone();
     quarantined.status = InstanceStatus::Quarantined;
     quarantined.desired_state = DesiredInstanceState::Stopped;
@@ -294,7 +294,7 @@ pub(super) fn quarantined_image_update_metadata(metadata: &InstanceMetadata) -> 
     quarantined
 }
 
-pub(super) fn image_update_quarantine_summary(result: &Result<(), ApiError>) -> String {
+pub(super) fn image_quarantine_summary(result: &Result<(), ApiError>) -> String {
     match result {
         Ok(()) => "the instance was stopped and quarantined".to_string(),
         Err(error) => format!(
@@ -303,7 +303,7 @@ pub(super) fn image_update_quarantine_summary(result: &Result<(), ApiError>) -> 
     }
 }
 
-pub(super) async fn instance_image_update_spec(
+pub(super) async fn image_update_spec(
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
     container_data_path: std::path::PathBuf,

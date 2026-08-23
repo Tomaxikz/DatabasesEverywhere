@@ -11,7 +11,7 @@ use crate::{
 
 const RECONCILE_CONCURRENCY: usize = 8;
 
-pub async fn validate_configured_runtime(
+pub async fn validate_runtime(
     manager: &InstanceManager,
     docker: &DockerRuntime,
 ) -> Result<(), anyhow::Error> {
@@ -142,7 +142,7 @@ async fn stop_inactive_instance(
                     quarantined = metadata.status == InstanceStatus::Quarantined,
                     "stopped an instance whose durable desired state is inactive"
                 ),
-                Err(error) if inactive_stop_error_is_benign(&error) => tracing::debug!(
+                Err(error) if is_benign_stop_error(&error) => tracing::debug!(
                     instance_id = %metadata.instance_id,
                     protocol = %metadata.protocol,
                     "inactive instance container was already not running"
@@ -157,7 +157,7 @@ async fn stop_inactive_instance(
     Ok(())
 }
 
-fn inactive_stop_error_is_benign(error: &DockerError) -> bool {
+fn is_benign_stop_error(error: &DockerError) -> bool {
     error.is_not_running()
 }
 
@@ -196,7 +196,7 @@ async fn reconcile_metadata(
                 metadata.updated_at = now_rfc3339();
                 return metadata;
             }
-            metadata.status = classify_container_status(inspection.status);
+            metadata.status = classify_status(inspection.status);
             metadata.runtime.network_mode = "none".to_string();
         }
         Err(error) if error.is_not_found() => {
@@ -211,7 +211,7 @@ async fn reconcile_metadata(
     metadata
 }
 
-pub fn classify_container_status(status: DockerContainerStatus) -> InstanceStatus {
+pub fn classify_status(status: DockerContainerStatus) -> InstanceStatus {
     match status {
         DockerContainerStatus::Running => InstanceStatus::Running,
         // `created` means the replacement exists but has never been started.
@@ -231,23 +231,23 @@ mod tests {
     #[test]
     fn classifies_live_container_statuses_for_the_api() {
         assert_eq!(
-            classify_container_status(DockerContainerStatus::Starting),
+            classify_status(DockerContainerStatus::Starting),
             InstanceStatus::Booting
         );
         assert_eq!(
-            classify_container_status(DockerContainerStatus::Created),
+            classify_status(DockerContainerStatus::Created),
             InstanceStatus::Stopped
         );
         assert_eq!(
-            classify_container_status(DockerContainerStatus::Running),
+            classify_status(DockerContainerStatus::Running),
             InstanceStatus::Running
         );
         assert_eq!(
-            classify_container_status(DockerContainerStatus::Stopped),
+            classify_status(DockerContainerStatus::Stopped),
             InstanceStatus::Stopped
         );
         assert_eq!(
-            classify_container_status(DockerContainerStatus::Failed),
+            classify_status(DockerContainerStatus::Failed),
             InstanceStatus::Failed
         );
     }
@@ -271,6 +271,6 @@ mod tests {
             message: "container is already stopped".to_string(),
         });
 
-        assert!(inactive_stop_error_is_benign(&error));
+        assert!(is_benign_stop_error(&error));
     }
 }

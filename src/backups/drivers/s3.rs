@@ -644,9 +644,7 @@ impl S3BackupDriver {
         destination: &Path,
         manifest: &StoredBackup,
     ) -> Result<(), BackupStoreError> {
-        let response = self
-            .get_response_with_retry(key, "download backup archive")
-            .await?;
+        let response = self.get_with_retry(key, "download backup archive").await?;
         if response
             .content_length()
             .is_some_and(|length| length != manifest.size_bytes)
@@ -710,7 +708,7 @@ impl S3BackupDriver {
         result
     }
 
-    async fn get_response_with_retry(
+    async fn get_with_retry(
         &self,
         key: &str,
         operation: &str,
@@ -801,7 +799,7 @@ impl S3BackupDriver {
             if let Some(token) = continuation.as_ref() {
                 query.push(("continuation-token".to_string(), token.clone()));
             }
-            let response = tokio::time::timeout_at(deadline, self.list_response_with_retry(&query))
+            let response = tokio::time::timeout_at(deadline, self.list_with_retry(&query))
                 .await
                 .map_err(|_| {
                     BackupStoreError::Remote(
@@ -823,7 +821,7 @@ impl S3BackupDriver {
             })?;
             let keys_before_page = keys.len();
             for value in xml_values(xml, "Key") {
-                keys.push(decode_listed_key_in_prefix(&value, prefix)?);
+                keys.push(decode_listed_key(&value, prefix)?);
                 if keys.len() > MAX_LISTED_OBJECT_KEYS {
                     return Err(BackupStoreError::Remote(format!(
                         "S3 backup prefix contains more than {MAX_LISTED_OBJECT_KEYS} objects"
@@ -857,7 +855,7 @@ impl S3BackupDriver {
         Ok(keys)
     }
 
-    async fn list_response_with_retry(
+    async fn list_with_retry(
         &self,
         query: &[(String, String)],
     ) -> Result<reqwest::Response, BackupStoreError> {
@@ -1281,7 +1279,7 @@ fn percent_decode(value: &str) -> Result<String, BackupStoreError> {
         .map_err(|_| BackupStoreError::Corrupt("S3 returned a non-UTF-8 object key".to_string()))
 }
 
-fn decode_listed_key_in_prefix(
+fn decode_listed_key(
     encoded_key: &str,
     requested_prefix: &str,
 ) -> Result<String, BackupStoreError> {
@@ -1364,12 +1362,12 @@ async fn response_bytes_bounded(
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         BackupStoreError::Remote(format!("failed to read S3 {operation} response: {error}"))
     })? {
-        append_response_chunk_bounded(&mut bytes, &chunk, max_bytes, operation)?;
+        append_bounded_chunk(&mut bytes, &chunk, max_bytes, operation)?;
     }
     Ok(Bytes::from(bytes))
 }
 
-fn append_response_chunk_bounded(
+fn append_bounded_chunk(
     bytes: &mut Vec<u8>,
     chunk: &[u8],
     max_bytes: u64,
@@ -1417,11 +1415,10 @@ mod tests {
     #[test]
     fn listed_s3_keys_must_remain_inside_the_requested_instance_prefix() {
         assert_eq!(
-            decode_listed_key_in_prefix("dbev/instances/a/backup", "dbev/instances/a/").unwrap(),
+            decode_listed_key("dbev/instances/a/backup", "dbev/instances/a/").unwrap(),
             "dbev/instances/a/backup"
         );
-        let error = decode_listed_key_in_prefix("dbev/instances/b/backup", "dbev/instances/a/")
-            .unwrap_err();
+        let error = decode_listed_key("dbev/instances/b/backup", "dbev/instances/a/").unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1445,7 +1442,7 @@ mod tests {
     fn bounded_response_chunks_reject_overflow_before_buffering_it() {
         let mut bytes = vec![1_u8, 2];
 
-        let error = append_response_chunk_bounded(&mut bytes, &[3, 4], 3, "test").unwrap_err();
+        let error = append_bounded_chunk(&mut bytes, &[3, 4], 3, "test").unwrap_err();
 
         assert!(error.to_string().contains("exceeded its safety limit"));
         assert_eq!(bytes, [1, 2]);

@@ -240,7 +240,7 @@ pub async fn list_instances(
 ) -> ApiResult<Vec<InstanceMetadata>> {
     auth.require_scope(scopes::INSTANCES_READ)?;
     let instances = futures::stream::iter(state.instances.list().await)
-        .map(|metadata| enrich_instance_runtime_info(&state, metadata))
+        .map(|metadata| enrich_runtime_info(&state, metadata))
         .buffered(INSTANCE_RUNTIME_FANOUT_LIMIT)
         .collect()
         .await;
@@ -260,7 +260,7 @@ pub async fn create_instance(
             "instance_id {instance_id} already exists"
         )));
     }
-    let image = requested_or_configured_image(&state, &request)?;
+    let image = resolve_image(&state, &request)?;
     let creation_permit = state
         .install_progress
         .try_begin_creation(&instance_id, request.protocol, &image)
@@ -339,21 +339,19 @@ pub async fn get_instance(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    Ok(ApiResponse::ok(
-        enrich_instance_runtime_info(&state, metadata).await,
-    ))
+    Ok(ApiResponse::ok(enrich_runtime_info(&state, metadata).await))
 }
 
-pub(super) async fn enrich_instance_runtime_info(
+pub(super) async fn enrich_runtime_info(
     state: &AppState,
     mut metadata: InstanceMetadata,
 ) -> InstanceMetadata {
     let cache_epoch = state.instance_runtime_cache.epoch().await;
-    let inspection = live_instance_inspection(state, &metadata).await;
+    let inspection = inspect_live_instance(state, &metadata).await;
     metadata.status = if state.instances.routes_fenced(&metadata.instance_id).await {
         InstanceStatus::Booting
     } else {
-        classify_live_instance_status(&metadata, inspection.as_ref())
+        classify_live_status(&metadata, inspection.as_ref())
     };
     let configured = state
         .config
@@ -365,7 +363,7 @@ pub(super) async fn enrich_instance_runtime_info(
         .await
     {
         metadata.image = Some(image);
-        metadata.database_version = Some(current_database_version(state, &metadata).await);
+        metadata.database_version = Some(database_version(state, &metadata).await);
         return metadata;
     }
 
@@ -386,7 +384,7 @@ pub(super) async fn enrich_instance_runtime_info(
         configured: configured.to_string(),
         update_available,
     };
-    let database_version = current_database_version(state, &metadata).await;
+    let database_version = database_version(state, &metadata).await;
     state
         .instance_runtime_cache
         .store_if_epoch(metadata.instance_id.clone(), image.clone(), cache_epoch)
@@ -403,11 +401,11 @@ pub(super) async fn live_instance_status(
     if state.instances.routes_fenced(&metadata.instance_id).await {
         return InstanceStatus::Booting;
     }
-    let inspection = live_instance_inspection(state, metadata).await;
-    classify_live_instance_status(metadata, inspection.as_ref())
+    let inspection = inspect_live_instance(state, metadata).await;
+    classify_live_status(metadata, inspection.as_ref())
 }
 
-pub(super) async fn live_instance_inspection(
+pub(super) async fn inspect_live_instance(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Option<Result<DockerInstanceInspection, DockerError>> {
@@ -426,7 +424,7 @@ pub(super) async fn live_instance_inspection(
     )
 }
 
-pub(super) fn classify_live_instance_status(
+pub(super) fn classify_live_status(
     metadata: &InstanceMetadata,
     inspection: Option<&Result<DockerInstanceInspection, DockerError>>,
 ) -> InstanceStatus {
@@ -443,7 +441,7 @@ pub(super) fn classify_live_instance_status(
     }
     match inspection {
         None => metadata.status,
-        Some(Ok(inspection)) => reconcile::classify_container_status(inspection.status),
+        Some(Ok(inspection)) => reconcile::classify_status(inspection.status),
         Some(Err(error)) if error.is_not_found() && metadata.status == InstanceStatus::Creating => {
             InstanceStatus::Creating
         }
@@ -459,12 +457,11 @@ pub(super) fn classify_live_instance_status(
     }
 }
 
-pub(super) async fn current_database_version(
+pub(super) async fn database_version(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> InstanceDatabaseVersion {
-    match crate::compatibility::compatibility_attestation(&state.manager, &state.docker, metadata)
-        .await
+    match crate::compatibility::cached_compatibility(&state.manager, &state.docker, metadata).await
     {
         Ok(Some(attestation)) => InstanceDatabaseVersion {
             current: Some(attestation.version),

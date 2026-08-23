@@ -58,7 +58,7 @@ db.createUser({{
 /// Builds a tenant password rotation script which reads the replacement
 /// password from the managed container environment. Keeping the password out
 /// of generated JavaScript also keeps it out of diagnostics and test output.
-pub fn update_user_password_from_env_script(
+pub fn password_update_script(
     database: &str,
     username: &str,
 ) -> Result<String, MongodbProvisionError> {
@@ -155,7 +155,7 @@ mod tests {
         assert!(script.contains("root"));
         assert!(script.contains("dbe_root"));
 
-        let script = update_user_password_from_env_script("mongo_1", "app_mongo_1").unwrap();
+        let script = password_update_script("mongo_1", "app_mongo_1").unwrap();
 
         assert!(script.contains("db.updateUser"));
         assert!(script.contains("process.env.DBE_ROTATED_PASSWORD"));

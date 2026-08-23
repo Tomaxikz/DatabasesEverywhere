@@ -93,8 +93,8 @@ fn archive_copy_stops_at_expired_deadline() {
 
 #[test]
 fn logical_archive_accounting_includes_empty_entry_filesystem_overhead() {
-    let accounted = (0..MAX_ARCHIVE_ENTRIES)
-        .try_fold(0_u64, |total, _| logical_archive_accounted_bytes(total, 0));
+    let accounted =
+        (0..MAX_ARCHIVE_ENTRIES).try_fold(0_u64, |total, _| archive_accounted_bytes(total, 0));
 
     assert_eq!(
         accounted,
@@ -117,39 +117,36 @@ fn compressed_export_capacity_covers_worst_case_expansion() {
 #[test]
 fn logical_export_capacity_tracks_managed_database_usage() {
     const MIB: u64 = 1024 * 1024;
+    assert_eq!(jobs::estimate_export_bytes(Protocol::Mongodb, 0), 64 * MIB);
     assert_eq!(
-        jobs::estimated_logical_export_capacity_bytes(Protocol::Mongodb, 0),
-        64 * MIB
-    );
-    assert_eq!(
-        jobs::estimated_logical_export_capacity_bytes(Protocol::Mongodb, 10 * MIB),
+        jobs::estimate_export_bytes(Protocol::Mongodb, 10 * MIB),
         84 * MIB
     );
     assert_eq!(
-        jobs::estimated_logical_export_capacity_bytes(Protocol::Postgres, 10 * MIB),
+        jobs::estimate_export_bytes(Protocol::Postgres, 10 * MIB),
         104 * MIB
     );
     assert_eq!(
-        jobs::estimated_logical_export_capacity_bytes(Protocol::Postgres, 7 * MIB),
+        jobs::estimate_export_bytes(Protocol::Postgres, 7 * MIB),
         92 * MIB
     );
     assert_eq!(
-        jobs::estimated_logical_export_capacity_bytes(Protocol::Mysql, 3 * 1024 * MIB),
+        jobs::estimate_export_bytes(Protocol::Mysql, 3 * 1024 * MIB),
         MAX_UNARCHIVED_BYTES
     );
 }
 
 #[test]
 fn plain_export_on_one_filesystem_does_not_reserve_the_dump_twice() {
-    assert!(!jobs::logical_export_needs_separate_staging_reservation(
+    assert!(!jobs::needs_separate_export_staging(
         ExportArchiveFormat::Plain,
         true,
     ));
-    assert!(jobs::logical_export_needs_separate_staging_reservation(
+    assert!(jobs::needs_separate_export_staging(
         ExportArchiveFormat::Plain,
         false,
     ));
-    assert!(jobs::logical_export_needs_separate_staging_reservation(
+    assert!(jobs::needs_separate_export_staging(
         ExportArchiveFormat::Gzip,
         true,
     ));
@@ -187,20 +184,20 @@ fn physical_upload_expansion_is_capped_by_the_instance_disk_limit() {
     let one_gib = 1024_u64 * 1024 * 1024;
     for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
         assert_eq!(
-            physical_staging_bytes_for(protocol, 1024).unwrap(),
+            physical_staging_bytes(protocol, 1024).unwrap(),
             Some(one_gib)
         );
         assert_eq!(
-            physical_staging_bytes_for(protocol, u64::MAX / (1024 * 1024)).unwrap(),
+            physical_staging_bytes(protocol, u64::MAX / (1024 * 1024)).unwrap(),
             Some(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
         );
     }
     assert_eq!(
-        physical_staging_bytes_for(Protocol::Postgres, 1024).unwrap(),
+        physical_staging_bytes(Protocol::Postgres, 1024).unwrap(),
         None
     );
-    assert!(physical_staging_bytes_for(Protocol::Redis, 0).is_err());
-    assert!(physical_staging_bytes_for(Protocol::Redis, u64::MAX).is_err());
+    assert!(physical_staging_bytes(Protocol::Redis, 0).is_err());
+    assert!(physical_staging_bytes(Protocol::Redis, u64::MAX).is_err());
 }
 
 #[test]
@@ -230,25 +227,25 @@ fn upload_staging_is_bound_to_target_generation_and_disk_limit() {
 
 #[test]
 fn allows_only_supported_import_artifact_extensions() {
-    assert!(artifact_has_allowed_extension(FsPath::new(
+    assert!(has_allowed_artifact_extension(FsPath::new(
         "instance-1.postgres.sql"
     )));
-    assert!(artifact_has_allowed_extension(FsPath::new(
+    assert!(has_allowed_artifact_extension(FsPath::new(
         "instance-1.redis.tar.gz"
     )));
-    assert!(artifact_has_allowed_extension(FsPath::new(
+    assert!(has_allowed_artifact_extension(FsPath::new(
         "instance-1.valkey.tar.gz"
     )));
-    assert!(artifact_has_allowed_extension(FsPath::new(
+    assert!(has_allowed_artifact_extension(FsPath::new(
         "instance-1.mongodb.archive.gz"
     )));
-    assert!(artifact_has_allowed_extension(FsPath::new(
+    assert!(has_allowed_artifact_extension(FsPath::new(
         "instance-1.qdrant.tar.gz"
     )));
-    assert!(!artifact_has_allowed_extension(FsPath::new(
+    assert!(!has_allowed_artifact_extension(FsPath::new(
         "instance-1.sh"
     )));
-    assert!(!artifact_has_allowed_extension(FsPath::new(
+    assert!(!has_allowed_artifact_extension(FsPath::new(
         "instance-1.sql.exe"
     )));
 }
@@ -323,17 +320,17 @@ fn remote_sql_rewrite_reserves_both_the_source_and_atomic_replacement() {
     const MIB: u64 = 1024 * 1024;
     for protocol in [Protocol::Mariadb, Protocol::Mysql, Protocol::Clickhouse] {
         assert_eq!(
-            jobs::remote_import_staging_reservation_bytes(protocol, 8 * MIB).unwrap(),
+            jobs::import_staging_bytes(protocol, 8 * MIB).unwrap(),
             16 * MIB
         );
     }
     for protocol in [Protocol::Postgres, Protocol::Mongodb, Protocol::Redis] {
         assert_eq!(
-            jobs::remote_import_staging_reservation_bytes(protocol, 8 * MIB).unwrap(),
+            jobs::import_staging_bytes(protocol, 8 * MIB).unwrap(),
             8 * MIB
         );
     }
-    assert!(jobs::remote_import_staging_reservation_bytes(Protocol::Mysql, u64::MAX).is_err());
+    assert!(jobs::import_staging_bytes(Protocol::Mysql, u64::MAX).is_err());
 }
 
 #[test]
@@ -345,15 +342,15 @@ fn qdrant_uses_physical_archive_extension() {
 #[test]
 fn mongodb_gzip_export_is_normalized_to_its_native_gzip_archive() {
     assert_eq!(
-        normalized_export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Gzip),
+        export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Gzip),
         ExportArchiveFormat::Plain
     );
     assert_eq!(
-        normalized_export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Bzip2),
+        export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Bzip2),
         ExportArchiveFormat::Bzip2
     );
     assert_eq!(
-        normalized_export_archive_format(Protocol::Postgres, ExportArchiveFormat::Gzip),
+        export_archive_format(Protocol::Postgres, ExportArchiveFormat::Gzip),
         ExportArchiveFormat::Gzip
     );
 }
@@ -373,12 +370,9 @@ fn stored_native_uploads_use_conservative_compressed_scheduler_costs() {
         Protocol::Valkey,
         Protocol::Qdrant,
     ] {
-        assert!(jobs::import_source_is_compressed(protocol, &options));
+        assert!(jobs::is_compressed_import(protocol, &options));
     }
-    assert!(!jobs::import_source_is_compressed(
-        Protocol::Postgres,
-        &options
-    ));
+    assert!(!jobs::is_compressed_import(Protocol::Postgres, &options));
 
     let prepared_ceiling = 8 * 1024 * 1024 * 1024;
     assert_eq!(
@@ -403,7 +397,7 @@ fn prepared_scheduler_ceilings_follow_each_source_specific_limit() {
         ..ImportOptions::default()
     };
     assert_eq!(
-        jobs::import_prepared_ceiling_bytes(&artifact, upload_limit, remote_limit, true),
+        jobs::prepared_import_bytes(&artifact, upload_limit, remote_limit, true),
         MAX_UNARCHIVED_BYTES
     );
 
@@ -424,7 +418,7 @@ fn prepared_scheduler_ceilings_follow_each_source_specific_limit() {
         ..ImportOptions::default()
     };
     assert_eq!(
-        jobs::import_prepared_ceiling_bytes(&upload, upload_limit, remote_limit, true),
+        jobs::prepared_import_bytes(&upload, upload_limit, remote_limit, true),
         upload_limit
     );
 
@@ -443,7 +437,7 @@ fn prepared_scheduler_ceilings_follow_each_source_specific_limit() {
         ..ImportOptions::default()
     };
     assert_eq!(
-        jobs::import_prepared_ceiling_bytes(&remote, upload_limit, remote_limit, true),
+        jobs::prepared_import_bytes(&remote, upload_limit, remote_limit, true),
         remote_limit
     );
 }
@@ -472,14 +466,14 @@ fn queued_replay_payloads_have_a_bounded_node_wide_memory_envelope() {
 
 #[test]
 fn mongodb_namespace_pattern_escapes_literal_database_wildcards() {
-    assert_eq!(mongodb_namespace_pattern("analytics"), "analytics.*");
+    assert_eq!(mongodb_database_pattern("analytics"), "analytics.*");
     assert_eq!(
-        mongodb_namespace_pattern("tenant*archive"),
+        mongodb_database_pattern("tenant*archive"),
         r"tenant\*archive.*"
     );
-    assert_eq!(mongodb_namespace_pattern(r"legacy\name"), r"legacy\\name.*");
+    assert_eq!(mongodb_database_pattern(r"legacy\name"), r"legacy\\name.*");
     assert_eq!(
-        sh_quote(&mongodb_namespace_pattern("tenant*archive")),
+        sh_quote(&mongodb_database_pattern("tenant*archive")),
         r"'tenant\*archive.*'"
     );
 }
@@ -878,7 +872,7 @@ fn mongodb_upload_source_database_is_validated_and_preserved_for_replay() {
     let options = ImportOptions::from(&request);
 
     assert_eq!(options.source_database.as_deref(), Some("legacy_tenant"));
-    validate_upload_source_database(Protocol::Mongodb, &options).unwrap();
+    validate_source_database(Protocol::Mongodb, &options).unwrap();
     let replay = serde_json::to_string(&ReplayDescriptor::UploadImport {
         upload_id: "upload-1".to_string(),
         source_database: options.source_database.clone(),
@@ -901,13 +895,13 @@ fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
         },
         ..ImportOptions::default()
     };
-    validate_upload_source_database(Protocol::Mongodb, &missing).unwrap();
+    validate_source_database(Protocol::Mongodb, &missing).unwrap();
 
     let invalid = ImportOptions {
         source_database: Some("unsafe.name".to_string()),
         ..missing.clone()
     };
-    let error = validate_upload_source_database(Protocol::Mongodb, &invalid).unwrap_err();
+    let error = validate_source_database(Protocol::Mongodb, &invalid).unwrap_err();
     assert!(matches!(error, ApiError::BadRequest(_)));
     assert!(error.to_string().contains("1-63 UTF-8 bytes"));
 
@@ -915,7 +909,7 @@ fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
         source_database: Some("legacy_tenant".to_string()),
         ..missing
     };
-    let error = validate_upload_source_database(Protocol::Postgres, &wrong_protocol).unwrap_err();
+    let error = validate_source_database(Protocol::Postgres, &wrong_protocol).unwrap_err();
     assert!(error.to_string().contains("only for mongodb"));
 }
 
@@ -1029,7 +1023,7 @@ fn only_mongodb_logical_artifacts_accept_selective_imports() {
         ..ImportExportSelection::default()
     };
 
-    validate_logical_artifact_selection(Protocol::Mongodb, &selection).unwrap();
+    validate_artifact_selection(Protocol::Mongodb, &selection).unwrap();
     for protocol in [
         Protocol::Postgres,
         Protocol::Mariadb,
@@ -1039,7 +1033,7 @@ fn only_mongodb_logical_artifacts_accept_selective_imports() {
         Protocol::Valkey,
         Protocol::Qdrant,
     ] {
-        let error = validate_logical_artifact_selection(protocol, &selection).unwrap_err();
+        let error = validate_artifact_selection(protocol, &selection).unwrap_err();
         assert!(error.to_string().contains("selection.mode=full"));
     }
 }

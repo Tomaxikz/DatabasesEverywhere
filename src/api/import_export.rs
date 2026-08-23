@@ -8,7 +8,7 @@ use std::{
 use crate::{
     api::{
         api_response::{ApiError, ApiOptionalJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
-        instances::{LifecycleAction, lifecycle_instance_locked},
+        instances::{LifecycleAction, change_instance_state_locked},
         public_diagnostic::PublicDiagnostic,
         remote_import::{
             ImportMode, RemoteImportRequest, RemoteImportSource, RemoteJobAdmissionPermit,
@@ -26,7 +26,7 @@ use crate::{
     jobs::import_export::{
         ArchiveSymlinkPolicy, ImportExportAction, ImportExportJob, ImportExportJobPermit,
         ImportExportStatus, JobAdmissionError, JobEstimateInput, JobResourceCost,
-        SchedulerAcquireError, conservative_import_input_bytes, extract_data_archive_bounded,
+        SchedulerAcquireError, conservative_import_input_bytes, extract_bounded_archive,
         protocol_uses_logical_dumps, protocol_uses_native_compression,
     },
     shared::{files::is_safe_flat_file_name, protocol::Protocol, shell::sh_quote},
@@ -253,7 +253,7 @@ impl ExportArchiveFormat {
     }
 }
 
-fn normalized_export_archive_format(
+fn export_archive_format(
     protocol: Protocol,
     archive_format: ExportArchiveFormat,
 ) -> ExportArchiveFormat {
@@ -417,17 +417,16 @@ mod protocol;
 mod upload_recovery;
 mod uploads;
 
-pub use jobs::{export_instance, get_import_export_job, list_import_export_jobs};
 pub(crate) use jobs::{
-    export_instance_to_default_artifact, import_default_artifact_into_metadata,
-    public_job_response, queue_import_instance, replay_failed_job,
+    export_default_artifact, public_job_response, queue_import_instance, register_default_artifact,
+    replay_failed_job,
 };
-pub(crate) use logical::quarantine_after_uncertain_import;
+pub use jobs::{export_instance, get_import_export_job, list_import_export_jobs};
+pub(crate) use logical::quarantine_uncertain_import;
 pub(crate) use physical::{
-    finish_physical_operation, restore_data_from_archive_bounded, rollback_data_from_archive,
-    verify_physical_data_replacement,
+    check_restore_layout, finish_physical_change, restore_bounded_archive, rollback_from_archive,
 };
-pub(crate) use upload_recovery::{reconcile_import_uploads_once, run_import_upload_sweeper};
+pub(crate) use upload_recovery::{reconcile_import_uploads, run_upload_sweeper};
 pub(crate) use uploads::{DiskCapacityReservation, ImportUploadService};
 pub(crate) use uploads::{
     delete_import_upload, get_import_upload, import_entry, inspect_import_upload,

@@ -31,8 +31,7 @@ use uuid::Uuid;
 
 mod one_use;
 pub(crate) use one_use::{
-    ensure_client_export_slot, instance_one_use_export_root, reconcile_one_use_exports_once,
-    run_one_use_export_sweeper,
+    check_export_slot, instance_spool_root, run_export_sweeper, sweep_one_use_exports,
 };
 
 use crate::api::{
@@ -232,7 +231,7 @@ impl Drop for DownloadStream {
         let Some(path) = self.cleanup.take() else {
             return;
         };
-        if let Err(error) = one_use::remove_download_spool_blocking(&path) {
+        if let Err(error) = one_use::remove_download_spool_sync(&path) {
             tracing::warn!(
                 path = %path.display(),
                 %error,
@@ -286,7 +285,7 @@ pub async fn list_instance_artifacts(
     ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<Vec<ArtifactInfo>> {
     auth.require_scope(scopes::ARTIFACTS_READ)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     Ok(ApiResponse::ok(
         read_instance_artifacts(&state, &instance_id).await?,
     ))
@@ -298,11 +297,11 @@ pub async fn delete_artifact(
     ApiPath((instance_id, artifact_id)): ApiPath<(String, String)>,
 ) -> ApiResult<DeleteArtifactResponse> {
     auth.require_scope(scopes::ARTIFACTS_WRITE)?;
-    ensure_instance_exists(&state, &instance_id).await?;
-    let path = downloadable_artifact_path_for_instance(&state, &artifact_id, &instance_id)
+    require_instance(&state, &instance_id).await?;
+    let path = downloadable_artifact_path(&state, &artifact_id, &instance_id)
         .await?
         .path;
-    match remove_artifact_with_sidecar(&path).await {
+    match remove_artifact_files(&path).await {
         Ok(true) => {
             tracing::info!(event = "audit artifact_deleted", instance_id, artifact_id);
             Ok(ApiResponse::ok(DeleteArtifactResponse {
@@ -323,7 +322,7 @@ pub async fn apply_retention(
     ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<RetentionResponse> {
     auth.require_scope(scopes::ARTIFACTS_WRITE)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let mut artifacts = read_instance_artifacts(&state, &instance_id).await?;
     artifacts.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
     let cutoff = OffsetDateTime::now_utc()
@@ -337,8 +336,8 @@ pub async fn apply_retention(
         if index < keep_latest && modified >= cutoff {
             continue;
         }
-        let path = verified_artifact_path_for_instance(&state, &artifact.id, &instance_id).await?;
-        match remove_artifact_with_sidecar(&path).await {
+        let path = verified_artifact_path(&state, &artifact.id, &instance_id).await?;
+        match remove_artifact_files(&path).await {
             Ok(true) => {
                 deleted.push(artifact.id);
             }
@@ -390,7 +389,7 @@ pub async fn create_backup_download(
     .await
 }
 
-pub(crate) async fn create_artifact_download_url(
+pub(crate) async fn artifact_download_url(
     state: &AppState,
     name: &str,
     instance_id: &str,
@@ -453,7 +452,7 @@ async fn create_download_url(
     kind: DownloadKind,
 ) -> ApiResult<DownloadUrlResponse> {
     validate_artifact_name(name)?;
-    ensure_instance_exists(state, instance_id).await?;
+    require_instance(state, instance_id).await?;
     let ttl_seconds = request
         .expires_in_seconds
         .unwrap_or(DEFAULT_DOWNLOAD_TTL_SECONDS);
@@ -464,12 +463,12 @@ async fn create_download_url(
     }
     let one_use = match kind {
         DownloadKind::Artifact => {
-            downloadable_artifact_path_for_instance(state, name, instance_id)
+            downloadable_artifact_path(state, name, instance_id)
                 .await?
                 .one_use
         }
         DownloadKind::Backup => {
-            crate::api::backups::ensure_backup_exists(state, instance_id, name).await?;
+            crate::api::backups::require_backup(state, instance_id, name).await?;
             false
         }
     };
@@ -542,17 +541,13 @@ async fn download(
     }
     let (path, cleanup) = match kind {
         DownloadKind::Artifact => {
-            let artifact = downloadable_artifact_path_for_instance(
-                state,
-                &claims.artifact,
-                &claims.instance_id,
-            )
-            .await?;
+            let artifact =
+                downloadable_artifact_path(state, &claims.artifact, &claims.instance_id).await?;
             let cleanup = artifact.one_use.then(|| artifact.path.clone());
             (artifact.path, cleanup)
         }
         DownloadKind::Backup => {
-            let backup = crate::api::backups::materialize_backup_for_download(
+            let backup = crate::api::backups::prepare_backup_download(
                 state,
                 &claims.instance_id,
                 &claims.artifact,
@@ -621,7 +616,7 @@ fn validate_download_token(state: &AppState, token: &str) -> Result<DownloadClai
     Ok(claims)
 }
 
-async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
+async fn require_instance(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     state
         .instances
@@ -631,7 +626,7 @@ async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(
         .ok_or(ApiError::NotFound)
 }
 
-async fn remove_artifact_with_sidecar(path: &FsPath) -> Result<bool, std::io::Error> {
+async fn remove_artifact_files(path: &FsPath) -> Result<bool, std::io::Error> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => {
             remove_checksum_sidecar(path).await;
@@ -719,7 +714,7 @@ fn validate_artifact_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub(crate) async fn verified_artifact_path_for_instance(
+pub(crate) async fn verified_artifact_path(
     state: &AppState,
     name: &str,
     instance_id: &str,
@@ -727,21 +722,18 @@ pub(crate) async fn verified_artifact_path_for_instance(
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     validate_artifact_name(name)?;
     let root = instance_export_root(state, instance_id);
-    verified_artifact_path_in_root(&root, name).await
+    verified_path_in_root(&root, name).await
 }
 
-async fn downloadable_artifact_path_for_instance(
+async fn downloadable_artifact_path(
     state: &AppState,
     name: &str,
     instance_id: &str,
 ) -> Result<DownloadableArtifact, ApiError> {
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     validate_artifact_name(name)?;
-    let retained =
-        verified_artifact_path_in_root(&instance_export_root(state, instance_id), name).await;
-    let one_use =
-        verified_artifact_path_in_root(&instance_one_use_export_root(state, instance_id), name)
-            .await;
+    let retained = verified_path_in_root(&instance_export_root(state, instance_id), name).await;
+    let one_use = verified_path_in_root(&instance_spool_root(state, instance_id), name).await;
     match (retained, one_use) {
         (Ok(_), Ok(_)) => Err(ApiError::Conflict(
             "artifact identifier exists in both retained and one-use storage".to_string(),
@@ -759,7 +751,7 @@ async fn downloadable_artifact_path_for_instance(
     }
 }
 
-async fn verified_artifact_path_in_root(root: &FsPath, name: &str) -> Result<PathBuf, ApiError> {
+async fn verified_path_in_root(root: &FsPath, name: &str) -> Result<PathBuf, ApiError> {
     let root_metadata =
         tokio::fs::symlink_metadata(&root)
             .await
@@ -872,10 +864,7 @@ async fn cached_sha256(
         return Ok(None);
     };
     if size == Some(metadata.len())
-        && modified_nanos
-            == Some(system_time_unix_nanos(
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-            ))
+        && modified_nanos == Some(unix_nanos(metadata.modified().unwrap_or(UNIX_EPOCH)))
     {
         Ok(Some(hash))
     } else {
@@ -887,7 +876,7 @@ async fn write_checksum_sidecar(path: &FsPath, metadata: &std::fs::Metadata, has
     let Some(sidecar) = checksum_sidecar_path(path) else {
         return;
     };
-    let modified = system_time_unix_nanos(metadata.modified().unwrap_or(UNIX_EPOCH));
+    let modified = unix_nanos(metadata.modified().unwrap_or(UNIX_EPOCH));
     let content = format!(
         "sha256 {hash}\nsize {}\nmodified_unix_nanos {modified}\n",
         metadata.len()
@@ -919,7 +908,7 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn system_time_unix_nanos(time: SystemTime) -> u128 {
+fn unix_nanos(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default()
@@ -1153,7 +1142,7 @@ mod tests {
     async fn one_use_export_is_hidden_forced_single_use_and_deleted_with_stream() {
         let state = test_state_with_policy(true, 20).await;
         let artifact_name = "one-use.mongodb.archive.gz";
-        let artifact = instance_one_use_export_root(&state, "inst_abc").join(artifact_name);
+        let artifact = instance_spool_root(&state, "inst_abc").join(artifact_name);
         tokio::fs::create_dir_all(artifact.parent().unwrap())
             .await
             .unwrap();
@@ -1201,7 +1190,7 @@ mod tests {
         let state = test_state_with_policy(false, 2).await;
         for path in [
             instance_export_root(&state, "inst_abc").join("retained.sql"),
-            instance_one_use_export_root(&state, "inst_abc").join("pending.sql"),
+            instance_spool_root(&state, "inst_abc").join("pending.sql"),
         ] {
             tokio::fs::create_dir_all(path.parent().unwrap())
                 .await
@@ -1209,16 +1198,14 @@ mod tests {
             tokio::fs::write(path, b"dump").await.unwrap();
         }
 
-        let error = ensure_client_export_slot(&state, "inst_abc")
-            .await
-            .unwrap_err();
+        let error = check_export_slot(&state, "inst_abc").await.unwrap_err();
         assert!(matches!(error, ApiError::Conflict(_)));
     }
 
     #[tokio::test]
     async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() {
         let state = test_state_with_policy(true, 20).await;
-        let root = instance_one_use_export_root(&state, "inst_abc");
+        let root = instance_spool_root(&state, "inst_abc");
         tokio::fs::create_dir_all(&root).await.unwrap();
         let stale = root.join("stale.sql");
         let active = root.join("active.sql");
@@ -1249,7 +1236,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reconcile_one_use_exports_once(&state).await.unwrap(), 1);
+        assert_eq!(sweep_one_use_exports(&state).await.unwrap(), 1);
         assert!(!stale.exists());
         assert!(active.exists());
     }
@@ -1264,7 +1251,7 @@ mod tests {
             .unwrap();
         std::os::unix::fs::symlink("/etc/passwd", &artifact).unwrap();
 
-        let error = verified_artifact_path_for_instance(&state, "link.sql", "inst_abc")
+        let error = verified_artifact_path(&state, "link.sql", "inst_abc")
             .await
             .unwrap_err();
         assert!(matches!(error, ApiError::BadRequest(_)));

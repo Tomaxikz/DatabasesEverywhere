@@ -131,9 +131,7 @@ impl ImportExportJobRepository {
         Ok(())
     }
 
-    pub async fn running_import_instance_ids(
-        &self,
-    ) -> Result<Vec<String>, ImportExportJobStorageError> {
+    pub async fn running_import_ids(&self) -> Result<Vec<String>, ImportExportJobStorageError> {
         let rows = sqlx::query(
             r#"
             SELECT DISTINCT instance_id
@@ -344,7 +342,7 @@ mod tests {
         repository.insert(&job).await.unwrap();
 
         assert_eq!(
-            repository.running_import_instance_ids().await.unwrap(),
+            repository.running_import_ids().await.unwrap(),
             vec!["inst_abc".to_string(), "inst_other".to_string()]
         );
     }

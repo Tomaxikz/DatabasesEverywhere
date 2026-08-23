@@ -268,7 +268,7 @@ fn allocations_include_running_and_stopped_instances() {
         },
     );
 
-    let summary = aggregate_allocations_and_statuses(&[running, stopped]);
+    let summary = summarize_allocations(&[running, stopped]);
 
     assert_eq!(summary.allocated_cpu_cores, 2.0);
     assert_eq!(summary.allocated_memory_bytes, mib_to_bytes(768));

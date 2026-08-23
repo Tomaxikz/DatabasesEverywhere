@@ -27,15 +27,12 @@ async fn create_request_enforces_configured_and_allowlisted_images() {
     for image in ["postgres:18.4", "postgres:18.5"] {
         let mut request = create_request(Protocol::Postgres);
         request.image = Some(image.to_string());
-        assert_eq!(
-            requested_or_configured_image(&state, &request).unwrap(),
-            image
-        );
+        assert_eq!(resolve_image(&state, &request).unwrap(), image);
     }
     let mut request = create_request(Protocol::Postgres);
     request.image = Some("postgres:18.6".to_string());
     assert!(
-        requested_or_configured_image(&state, &request)
+        resolve_image(&state, &request)
             .unwrap_err()
             .to_string()
             .contains("is not allowed")
@@ -139,7 +136,7 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
     store.upsert(legacy.clone()).await;
     store.upsert(healthy).await;
 
-    let failed = mysql_auth_failed_metadata(&legacy);
+    let failed = failed_auth_metadata(&legacy);
     store.upsert(failed.clone()).await;
 
     assert_eq!(failed.status, InstanceStatus::Failed);

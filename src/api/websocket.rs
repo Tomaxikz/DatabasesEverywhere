@@ -21,7 +21,7 @@ use tokio::time::{
 use crate::{
     api::{
         api_response::{ApiError, ApiPath, ApiQuery},
-        artifacts::{DownloadUrlResponse, create_artifact_download_url},
+        artifacts::{DownloadUrlResponse, artifact_download_url},
         import_export::{ImportExportJobResponse, public_job_response},
         progress::InstallProgress,
         public_diagnostic::PublicDiagnostic,
@@ -54,7 +54,7 @@ const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 32 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const MONITORING_SNAPSHOT_TTL: Duration = Duration::from_millis(400);
 
-fn secure_websocket_upgrade(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
+fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket
         .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
         .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES)
@@ -69,7 +69,7 @@ pub async fn monitoring(
 ) -> Result<Response, ApiError> {
     let claims = auth.require_scope(scopes::MONITOR_READ, None)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(secure_websocket_upgrade(websocket)
+    Ok(upgrade_websocket(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| stream_monitoring(socket, state, claims, connection)))
 }
@@ -152,7 +152,7 @@ impl MonitoringSnapshotCache {
         if let Some(snapshot) = self.fresh().await {
             return snapshot;
         }
-        let snapshot = Arc::new(build_monitoring_snapshot(state).await);
+        let snapshot = Arc::new(monitoring_snapshot(state).await);
         *self.inner.lock().await = Some(CachedMonitoringSnapshot {
             snapshot: Arc::clone(&snapshot),
             sampled_at: Instant::now(),
@@ -170,7 +170,7 @@ impl MonitoringSnapshotCache {
     }
 }
 
-async fn build_monitoring_snapshot(state: &AppState) -> MonitoringSnapshotData {
+async fn monitoring_snapshot(state: &AppState) -> MonitoringSnapshotData {
     use futures::StreamExt;
 
     let mut instances = futures::stream::iter(state.instances.list().await)
@@ -342,7 +342,7 @@ pub async fn logs(
         .await
         .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(secure_websocket_upgrade(websocket)
+    Ok(upgrade_websocket(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
             stream_logs(socket, state, metadata, query.tail, claims.exp, connection)
@@ -363,7 +363,7 @@ pub async fn import_export(
         .await
         .ok_or(ApiError::NotFound)?;
     let connection = admit_websocket(&state, &claims).await?;
-    Ok(secure_websocket_upgrade(websocket)
+    Ok(upgrade_websocket(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
             stream_import_export(socket, state, instance_id, query, claims, connection)
@@ -764,9 +764,7 @@ async fn download_ticket_for_job(
         .as_deref()
         .and_then(|path| std::path::Path::new(path).file_name())
         .and_then(|name| name.to_str())?;
-    match create_artifact_download_url(state, artifact_name, &job.instance_id, Some(120), true)
-        .await
-    {
+    match artifact_download_url(state, artifact_name, &job.instance_id, Some(120), true).await {
         Ok(ticket) => Some(ticket),
         Err(error) => {
             tracing::warn!(

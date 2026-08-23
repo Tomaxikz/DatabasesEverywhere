@@ -43,16 +43,16 @@ impl Default for ScanLimits {
 }
 
 pub async fn scan_directory(path: PathBuf, limits: ScanLimits) -> Result<DirectoryUsage, Error> {
-    tokio::task::spawn_blocking(move || scan_directory_blocking(&path, limits))
+    tokio::task::spawn_blocking(move || scan_directory_sync(&path, limits))
         .await
         .map_err(Error::other)?
 }
 
-pub fn scan_directory_blocking(path: &Path, limits: ScanLimits) -> Result<DirectoryUsage, Error> {
-    scan_directory_blocking_identified(path, limits).map(|(usage, _)| usage)
+pub fn scan_directory_sync(path: &Path, limits: ScanLimits) -> Result<DirectoryUsage, Error> {
+    scan_directory_with_id(path, limits).map(|(usage, _)| usage)
 }
 
-pub(crate) fn scan_directory_blocking_identified(
+pub(crate) fn scan_directory_with_id(
     path: &Path,
     limits: ScanLimits,
 ) -> Result<(DirectoryUsage, DirectoryIdentity), Error> {
@@ -232,7 +232,7 @@ mod tests {
         fs::write(outside.join("secret.bin"), [0_u8; 101]).unwrap();
         symlink(&outside, data.join("outside-link")).unwrap();
 
-        let usage = scan_directory_blocking(&data, ScanLimits::default()).unwrap();
+        let usage = scan_directory_sync(&data, ScanLimits::default()).unwrap();
         assert_eq!(usage.logical_bytes, 18);
         assert!(usage.physical_bytes >= 18);
         assert_eq!(usage.entries, 4);
@@ -248,14 +248,12 @@ mod tests {
         fs::write(root.join("old"), b"old").unwrap();
         fs::write(replacement.join("new"), b"replacement").unwrap();
 
-        let (_, old_identity) =
-            scan_directory_blocking_identified(&root, ScanLimits::default()).unwrap();
+        let (_, old_identity) = scan_directory_with_id(&root, ScanLimits::default()).unwrap();
         assert_eq!(old_identity, directory_identity(&root).unwrap());
 
         fs::rename(&root, temporary.path().join("retired")).unwrap();
         fs::rename(&replacement, &root).unwrap();
-        let (usage, new_identity) =
-            scan_directory_blocking_identified(&root, ScanLimits::default()).unwrap();
+        let (usage, new_identity) = scan_directory_with_id(&root, ScanLimits::default()).unwrap();
         assert_ne!(old_identity, new_identity);
         assert_eq!(new_identity, directory_identity(&root).unwrap());
         assert_eq!(usage.logical_bytes, b"replacement".len() as u64);
@@ -267,7 +265,7 @@ mod tests {
         fs::write(temporary.path().join("one"), b"1").unwrap();
         fs::write(temporary.path().join("two"), b"2").unwrap();
 
-        let error = scan_directory_blocking(
+        let error = scan_directory_sync(
             temporary.path(),
             ScanLimits {
                 max_entries: 1,
@@ -285,7 +283,7 @@ mod tests {
             fs::create_dir(temporary.path().join(format!("child-{index}"))).unwrap();
         }
 
-        let usage = scan_directory_blocking(temporary.path(), ScanLimits::default()).unwrap();
+        let usage = scan_directory_sync(temporary.path(), ScanLimits::default()).unwrap();
         assert_eq!(usage.entries, 1_024);
     }
 

@@ -41,7 +41,7 @@ use crate::{
     auth::api_token::ApiToken,
     config::{
         Config, DaemonEngine, DiskLimitMode,
-        load::{load_config, load_config_with_report},
+        load::{load_config, load_config_report},
     },
     constants::{self, MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
     disk::DiskLimiter,
@@ -330,7 +330,7 @@ enum Command {
 pub async fn run() -> anyhow::Result<()> {
     // Keep this call for library consumers that invoke the CLI without using
     // the bundled binary entry point. Setting the same mask twice is harmless.
-    harden_process_file_creation();
+    set_safe_umask();
     let cli = Cli::parse();
     if cli.bench.bench {
         if cli.setup || cli.move_new_config || cli.command.is_some() {
@@ -351,7 +351,7 @@ pub async fn run() -> anyhow::Result<()> {
         Command::Daemon => run_daemon(cli.config).await,
         Command::CheckConfig => {
             let mut config = load_config(&cli.config)?;
-            detect_and_log_disk_mode(&mut config)?;
+            log_disk_mode(&mut config)?;
             validate_runtime_support(&config).await?;
             println!("config ok");
             Ok(())
@@ -376,7 +376,7 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// Restrict default permissions before the process creates logs, state, or
 /// runtime files. Explicitly requested modes can still be tightened further.
-pub fn harden_process_file_creation() {
+pub fn set_safe_umask() {
     #[cfg(unix)]
     {
         use rustix::fs::Mode;

@@ -115,11 +115,11 @@ fn maintenance_negative_probe_accepts_only_protocol_auth_rejections() {
         timeout_seconds: 5,
     };
 
-    assert!(definite_password_rejection(Protocol::Postgres, &postgres));
-    assert!(definite_password_rejection(Protocol::Mariadb, &mariadb));
-    assert!(definite_password_rejection(Protocol::Mongodb, &mongodb));
-    assert!(!definite_password_rejection(Protocol::Postgres, &transport));
-    assert!(!definite_password_rejection(Protocol::Postgres, &timeout));
+    assert!(is_password_rejection(Protocol::Postgres, &postgres));
+    assert!(is_password_rejection(Protocol::Mariadb, &mariadb));
+    assert!(is_password_rejection(Protocol::Mongodb, &mongodb));
+    assert!(!is_password_rejection(Protocol::Postgres, &transport));
+    assert!(!is_password_rejection(Protocol::Postgres, &timeout));
 }
 
 #[test]
@@ -303,7 +303,7 @@ async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
     let supervisor = tokio::spawn({
         let locks = locks.clone();
         async move {
-            run_password_worker_with_panic_recovery(
+            run_password_worker(
                 &locks,
                 "inst_password_panic",
                 async { panic!("injected password worker panic") },
@@ -342,7 +342,7 @@ fn panic_recovery_prefers_newly_committed_durable_auth_over_stale_store_auth() {
     durable.tenant_password = Some("new-password".to_string());
     durable.mysql_root_password = Some("new-root".to_string());
 
-    match classify_password_worker_panic_recovery(Ok(Some(durable)), Some(&stale)) {
+    match plan_panic_recovery(Ok(Some(durable)), Some(&stale)) {
         PasswordWorkerPanicRecoveryPlan::QuarantineDurable(metadata) => {
             assert_eq!(metadata.tenant_password.as_deref(), Some("new-password"));
             assert_eq!(metadata.mysql_root_password.as_deref(), Some("new-root"));
@@ -358,7 +358,7 @@ fn unreadable_durable_state_never_carries_stale_credentials_into_recovery() {
     let mut stale = test_metadata(Protocol::Postgres);
     stale.tenant_password = Some("stale-password".to_string());
 
-    match classify_password_worker_panic_recovery(
+    match plan_panic_recovery(
         Err("injected durable read failure".to_string()),
         Some(&stale),
     ) {

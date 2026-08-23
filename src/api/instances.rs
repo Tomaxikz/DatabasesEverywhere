@@ -35,14 +35,13 @@ use tokio::{
 use crate::{
     api::{
         api_response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
-        images::{ensure_image_allowed, validate_image},
+        images::{check_image_allowed, validate_image},
         instance_create::{
-            backend_endpoint_for_instance, create_instance_from_request,
-            enforce_node_allocation_policy, harden_mysql_tenant_auth,
-            harden_postgres_instance_auth, launch_container_from_spec,
+            backend_endpoint, create_instance_from_request, enforce_node_allocation_policy,
+            harden_mysql_tenant_auth, harden_postgres_instance_auth, launch_container_from_spec,
             prepare_instance_container_user, protocol_pids_limit, provision_mariadb_tenant_user,
             provision_mongodb_tenant_user, provision_mysql_tenant_user,
-            provision_postgres_tenant_role, requested_or_configured_image,
+            provision_postgres_tenant_role, resolve_image,
         },
         instance_requests::{
             CreateInstanceRequest, LimitsRequest, limits_from_request, validate_create_request,
@@ -120,7 +119,7 @@ pub async fn power_instance(
 ) -> ApiResult<PowerResponse> {
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     let action = request.action;
-    let instance = lifecycle_instance(&state, &instance_id, action)
+    let instance = change_instance_state(&state, &instance_id, action)
         .await?
         .into_body();
     Ok(ApiResponse::ok(PowerResponse { instance, action }))
@@ -190,9 +189,9 @@ pub(crate) async fn update_instance_image_locked(
     major_upgrade: bool,
     password: Option<String>,
 ) -> Result<UpdateInstanceImageResponse, ApiError> {
-    ensure_image_allowed(&state, metadata.protocol, &image)?;
+    check_image_allowed(&state, metadata.protocol, &image)?;
     if major_upgrade {
-        return run_major_upgrade_supervisor(
+        return run_upgrade_supervisor(
             state.clone(),
             operation,
             metadata,
@@ -202,8 +201,7 @@ pub(crate) async fn update_instance_image_locked(
         )
         .await;
     }
-    run_normal_image_update_supervisor(state, operation, metadata, current_image, image, password)
-        .await
+    run_image_update(state, operation, metadata, current_image, image, password).await
 }
 
 pub(super) async fn update_instance_image_normal(
@@ -215,7 +213,7 @@ pub(super) async fn update_instance_image_normal(
 ) -> Result<UpdateInstanceImageResponse, ApiError> {
     let image_change = classify_image_update(metadata.protocol, &current_image, &image)?;
     if image_change == ImageVersionChange::Major {
-        return Err(major_upgrade_required_error(
+        return Err(upgrade_required_error(
             metadata.protocol,
             &current_image,
             &image,
@@ -247,7 +245,7 @@ pub(super) async fn update_instance_image_normal(
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
             .for_protocol(metadata.protocol);
     disk_limiter
-        .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+        .check_method_change(&metadata.limits.disk_enforcement_method)
         .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
     if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
         != Some(disk_limiter.mode())
@@ -295,7 +293,7 @@ pub(super) async fn update_instance_image_normal(
         .await
         .map_err(docker_error)
         .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
-    let mut spec = instance_image_update_spec(
+    let mut spec = image_update_spec(
         &metadata,
         &paths,
         container_data_path.clone(),
@@ -305,7 +303,7 @@ pub(super) async fn update_instance_image_normal(
     )
     .await
     .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
-    let mut rollback_spec = instance_image_update_spec(
+    let mut rollback_spec = image_update_spec(
         &metadata,
         &paths,
         container_data_path,
@@ -440,7 +438,7 @@ pub(super) async fn update_instance_image_normal(
             "resolving backend endpoint",
         );
         metadata.backend =
-            backend_endpoint_for_instance(&state, metadata.protocol, &metadata.instance_id)?;
+            backend_endpoint(&state, metadata.protocol, &metadata.instance_id)?;
         if metadata.protocol == Protocol::Mariadb
             && let Some(password) = effective_password.as_deref()
         {
@@ -494,13 +492,7 @@ pub(super) async fn update_instance_image_normal(
     }
     .await;
     if let Err(error) = replacement_result {
-        let error = rollback_normal_image_update_or_quarantine(
-            &state,
-            &rollback_metadata,
-            &rollback_spec,
-            error,
-        )
-        .await;
+        let error = recover_image_update(&state, &rollback_metadata, &rollback_spec, error).await;
         return Err(fail_image_update_api(&state, &metadata.instance_id, error));
     }
     state
@@ -590,7 +582,7 @@ pub async fn delete_instance(
         .map_err(|error| ApiError::Runtime(format!("failed to purge instance jobs: {error}")))?;
     state
         .import_uploads
-        .repository()
+        .repo()
         .delete_for_instance(&metadata.instance_id)
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to purge import uploads: {error}")))?;
@@ -663,7 +655,7 @@ pub async fn update_instance_limits(
             .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
     if let Some(paths) = paths.as_ref() {
         effective_disk_limiter
-            .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+            .check_method_change(&metadata.limits.disk_enforcement_method)
             .map_err(|error| ApiError::Conflict(error.to_string()))?;
         if crate::config::DiskLimitMode::from_persisted_method(
             &metadata.limits.disk_enforcement_method,
@@ -680,7 +672,7 @@ pub async fn update_instance_limits(
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         match state
             .docker
-            .verify_container_data_bind(
+            .verify_data_bind(
                 metadata.protocol,
                 &metadata.instance_id,
                 &expected_data_source,
@@ -892,7 +884,7 @@ pub enum LifecycleAction {
     Kill,
 }
 
-pub(crate) async fn lifecycle_instance(
+pub(crate) async fn change_instance_state(
     state: &AppState,
     instance_id: &str,
     action: LifecycleAction,
@@ -920,9 +912,9 @@ pub(crate) async fn lifecycle_instance(
                     &metadata.limits.disk_enforcement_method,
                 );
         disk_limiter
-            .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+            .check_method_change(&metadata.limits.disk_enforcement_method)
             .map_err(|error| ApiError::Conflict(error.to_string()))?;
-        ensure_limiter_matches_persisted_method(&disk_limiter, &metadata)?;
+        check_disk_method(&disk_limiter, &metadata)?;
         let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
         let expected_data_source = disk_limiter
@@ -930,7 +922,7 @@ pub(crate) async fn lifecycle_instance(
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         match state
             .docker
-            .verify_container_data_bind(
+            .verify_data_bind(
                 metadata.protocol,
                 &metadata.instance_id,
                 &expected_data_source,
@@ -1005,7 +997,7 @@ pub(crate) async fn lifecycle_instance(
                         ))
                     })?;
             }
-            lifecycle_instance_locked(&worker_state, &worker_instance_id, action).await
+            change_instance_state_locked(&worker_state, &worker_instance_id, action).await
         };
         match std::panic::AssertUnwindSafe(lifecycle).catch_unwind().await {
             Ok(result) => result,
@@ -1017,7 +1009,7 @@ pub(crate) async fn lifecycle_instance(
                     .ok()
                     .flatten()
                     .unwrap_or(recovery);
-                let quarantine = quarantine_after_image_update_uncertainty(
+                let quarantine = quarantine_image_update(
                     &worker_state,
                     &durable,
                     "lifecycle worker panicked after runtime mutation may have begun",
@@ -1025,7 +1017,7 @@ pub(crate) async fn lifecycle_instance(
                 .await;
                 Err(ApiError::Runtime(format!(
                     "lifecycle worker stopped unexpectedly; {}",
-                    image_update_quarantine_summary(&quarantine)
+                    image_quarantine_summary(&quarantine)
                 )))
             }
         }
@@ -1037,10 +1029,7 @@ pub(crate) async fn lifecycle_instance(
     })?
 }
 
-fn ensure_limiter_matches_persisted_method(
-    limiter: &DiskLimiter,
-    metadata: &InstanceMetadata,
-) -> Result<(), ApiError> {
+fn check_disk_method(limiter: &DiskLimiter, metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
         == Some(limiter.mode())
     {
@@ -1053,7 +1042,7 @@ fn ensure_limiter_matches_persisted_method(
     )))
 }
 
-pub(crate) async fn lifecycle_instance_locked(
+pub(crate) async fn change_instance_state_locked(
     state: &AppState,
     instance_id: &str,
     action: LifecycleAction,
@@ -1103,15 +1092,15 @@ pub(crate) async fn lifecycle_instance_locked(
                     &metadata.limits.disk_enforcement_method,
                 );
                 disk_limiter
-                    .validate_persisted_method_transition(&metadata.limits.disk_enforcement_method)
+                    .check_method_change(&metadata.limits.disk_enforcement_method)
                     .map_err(|error| ApiError::Conflict(error.to_string()))?;
-                ensure_limiter_matches_persisted_method(&disk_limiter, &metadata)?;
+                check_disk_method(&disk_limiter, &metadata)?;
                 let expected_data_source = disk_limiter
                     .container_data_path(&paths.data)
                     .map_err(|error| ApiError::Runtime(error.to_string()))?;
                 match state
                     .docker
-                    .verify_container_data_bind(
+                    .verify_data_bind(
                         metadata.protocol,
                         &metadata.instance_id,
                         &expected_data_source,
@@ -1321,7 +1310,7 @@ pub(crate) async fn lifecycle_instance_locked(
         (Ok(()), Ok(())) => {}
         (Err(operation_error), Ok(())) => return Err(operation_error),
         (operation_result, Err(persistence_error)) => {
-            let rollback = rollback_lifecycle_runtime(
+            let rollback = rollback_runtime_state(
                 state,
                 &metadata,
                 matches!(
@@ -1343,7 +1332,7 @@ pub(crate) async fn lifecycle_instance_locked(
     Ok(ApiResponse::ok(metadata))
 }
 
-async fn rollback_lifecycle_runtime(
+async fn rollback_runtime_state(
     state: &AppState,
     metadata: &InstanceMetadata,
     should_be_running: bool,
@@ -1408,7 +1397,7 @@ pub(crate) async fn purge_instance_paths(
         paths.imports,
         paths.backups,
         paths.runtime_config,
-        crate::api::artifacts::instance_one_use_export_root(state, instance_id),
+        crate::api::artifacts::instance_spool_root(state, instance_id),
     ];
     let retained_volumes = retained_instance_volume_paths(&purge_paths[0])
         .await
@@ -1428,7 +1417,7 @@ pub(crate) async fn purge_instance_paths(
     }
     purge_paths.extend(retained_volumes);
     for path in purge_paths {
-        cleanup_path_if_exists(&path).await?;
+        remove_path_if_exists(&path).await?;
     }
     Ok(())
 }

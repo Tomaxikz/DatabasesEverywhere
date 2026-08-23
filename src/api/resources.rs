@@ -289,7 +289,7 @@ pub async fn node_resource_summary(
 ) -> ApiResult<NodeResourceSummary> {
     auth.require_scope(scopes::RESOURCES_ADMIN)?;
     let instances = state.instances.list().await;
-    let allocations = aggregate_allocations_and_statuses(&instances);
+    let allocations = summarize_allocations(&instances);
     let resource_reports = futures::stream::iter(instances)
         .map(|metadata| {
             let state = state.clone();
@@ -326,7 +326,7 @@ pub async fn node_resource_summary(
             allocation_limit_bytes: state
                 .config
                 .allocation
-                .effective_memory_limit_bytes(host_memory.total_bytes),
+                .memory_allocation_cap_bytes(host_memory.total_bytes),
             reserved_bytes: state.config.allocation.reserved_memory_bytes(),
             allocated_bytes: allocations.allocated_memory_bytes,
             host_used_bytes: host_memory.used_bytes,
@@ -338,7 +338,7 @@ pub async fn node_resource_summary(
             allocation_limit_bytes: state
                 .config
                 .allocation
-                .effective_disk_limit_bytes(host_disk.total_bytes),
+                .disk_allocation_cap_bytes(host_disk.total_bytes),
             reserved_bytes: state.config.allocation.reserved_disk_bytes(),
             allocated_bytes: allocations.allocated_disk_bytes,
             host_used_bytes: host_disk.used_bytes,
@@ -496,7 +496,7 @@ struct ManagedUsageSummary {
     disk_used_bytes: Option<u64>,
 }
 
-fn aggregate_allocations_and_statuses(instances: &[InstanceMetadata]) -> AllocationSummary {
+fn summarize_allocations(instances: &[InstanceMetadata]) -> AllocationSummary {
     let mut allocated_cpu_cores = 0.0;
     let mut allocated_memory_bytes = 0_u64;
     let mut allocated_disk_bytes = 0_u64;
@@ -762,7 +762,7 @@ fn host_disk_from_statvfs(stats: &rustix::fs::StatVfs) -> Result<HostDiskSample,
 }
 
 async fn directory_size(path: PathBuf, budget: Duration) -> Result<u64, std::io::Error> {
-    tokio::task::spawn_blocking(move || directory_size_blocking(&path, budget))
+    tokio::task::spawn_blocking(move || directory_size_sync(&path, budget))
         .await
         .map_err(std::io::Error::other)?
 }
@@ -850,7 +850,7 @@ impl ResourceCache {
         true
     }
 
-    async fn finish_runtime_stats_worker(&self, instance_id: &str, worker: u64) {
+    async fn finish_stats_worker(&self, instance_id: &str, worker: u64) {
         let mut inner = self.inner.lock().await;
         if inner.runtime_stats_workers.get(instance_id) == Some(&worker) {
             inner.runtime_stats_workers.remove(instance_id);
@@ -883,12 +883,8 @@ impl ResourceCache {
             if sample.sampled_at.elapsed() < DISK_REFRESH_INTERVAL {
                 return Ok(sample);
             }
-            self.refresh_disk_usage_background(
-                Arc::new(config.clone()),
-                instance_id.to_string(),
-                path,
-            )
-            .await;
+            self.queue_disk_refresh(Arc::new(config.clone()), instance_id.to_string(), path)
+                .await;
             return Ok(sample);
         }
 
@@ -924,12 +920,8 @@ impl ResourceCache {
                 Ok(sample)
             }
             Err(error) if error.kind() == ErrorKind::TimedOut => {
-                self.refresh_disk_usage_background(
-                    Arc::new(config.clone()),
-                    instance_id.to_string(),
-                    path,
-                )
-                .await;
+                self.queue_disk_refresh(Arc::new(config.clone()), instance_id.to_string(), path)
+                    .await;
                 Err("disk usage scan is still in progress".to_string())
             }
             Err(error) => Err(error.to_string()),
@@ -1031,12 +1023,7 @@ impl ResourceCache {
         directory_size(path, budget).await
     }
 
-    async fn refresh_disk_usage_background(
-        &self,
-        config: Arc<Config>,
-        instance_id: String,
-        path: PathBuf,
-    ) {
+    async fn queue_disk_refresh(&self, config: Arc<Config>, instance_id: String, path: PathBuf) {
         {
             let mut inner = self.inner.lock().await;
             if inner
@@ -1193,7 +1180,7 @@ impl ResourceCache {
 }
 
 pub fn start_resource_sampler(state: AppState) {
-    start_runtime_stats_sampler(state.clone());
+    start_stats_sampler(state.clone());
     start_disk_usage_sampler(state);
 }
 
@@ -1202,7 +1189,7 @@ struct RuntimeStatsTask {
     handle: JoinHandle<()>,
 }
 
-fn start_runtime_stats_sampler(state: AppState) {
+fn start_stats_sampler(state: AppState) {
     let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
         let mut tasks = HashMap::<String, RuntimeStatsTask>::new();
@@ -1223,7 +1210,7 @@ fn start_runtime_stats_sampler(state: AppState) {
                     }
                 }
                 _ = ticker.tick() => {
-                    reconcile_runtime_stats_tasks(&state, &mut tasks).await;
+                    sync_stats_tasks(&state, &mut tasks).await;
                 }
             }
         }
@@ -1236,10 +1223,7 @@ fn start_runtime_stats_sampler(state: AppState) {
     });
 }
 
-async fn reconcile_runtime_stats_tasks(
-    state: &AppState,
-    tasks: &mut HashMap<String, RuntimeStatsTask>,
-) {
+async fn sync_stats_tasks(state: &AppState, tasks: &mut HashMap<String, RuntimeStatsTask>) {
     let desired = state
         .instances
         .list()
@@ -1271,7 +1255,7 @@ async fn reconcile_runtime_stats_tasks(
         } else {
             state
                 .resource_cache
-                .finish_runtime_stats_worker(&instance_id, task.worker)
+                .finish_stats_worker(&instance_id, task.worker)
                 .await;
         }
         if let Err(error) = task.handle.await
@@ -1307,9 +1291,7 @@ async fn reconcile_runtime_stats_tasks(
                         %error,
                         "could not bind the container resource sampler; retrying"
                     );
-                    cache
-                        .finish_runtime_stats_worker(&task_instance_id, worker)
-                        .await;
+                    cache.finish_stats_worker(&task_instance_id, worker).await;
                     return;
                 }
             };
@@ -1355,9 +1337,7 @@ async fn reconcile_runtime_stats_tasks(
                     break;
                 }
             }
-            cache
-                .finish_runtime_stats_worker(&task_instance_id, worker)
-                .await;
+            cache.finish_stats_worker(&task_instance_id, worker).await;
         });
         tasks.insert(instance_id, RuntimeStatsTask { worker, handle });
     }
@@ -1397,7 +1377,7 @@ impl Drop for ResourceMonitorGuard {
     }
 }
 
-fn directory_size_blocking(path: &FsPath, budget: Duration) -> Result<u64, std::io::Error> {
+fn directory_size_sync(path: &FsPath, budget: Duration) -> Result<u64, std::io::Error> {
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, openat, statat};
 
     let started = std::time::Instant::now();
@@ -1412,10 +1392,10 @@ fn directory_size_blocking(path: &FsPath, budget: Duration) -> Result<u64, std::
     let mut total = 0_u64;
 
     while let Some((directory, depth)) = directories.pop() {
-        ensure_scan_budget(started, budget, visited_entries)?;
+        check_scan_budget(started, budget, visited_entries)?;
         let entries = Dir::read_from(&directory).map_err(IoError::from)?;
         for entry in entries {
-            ensure_scan_budget(started, budget, visited_entries)?;
+            check_scan_budget(started, budget, visited_entries)?;
             let entry = entry.map_err(IoError::from)?;
             let name = entry.file_name();
             if matches!(name.to_bytes(), b"." | b"..") {
@@ -1465,7 +1445,7 @@ fn directory_size_blocking(path: &FsPath, budget: Duration) -> Result<u64, std::
     Ok(total)
 }
 
-fn ensure_scan_budget(
+fn check_scan_budget(
     started: std::time::Instant,
     budget: Duration,
     visited_entries: usize,

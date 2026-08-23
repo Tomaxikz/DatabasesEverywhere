@@ -348,7 +348,7 @@ pub async fn run_clickhouse_http_listener(
             shutdown,
             connections,
         },
-        handle_clickhouse_http_client,
+        handle_clickhouse_http,
     )
     .await
 }
@@ -459,7 +459,7 @@ where
                         log_connection_failure(protocol, peer, &error);
                     }
                 }
-                _ = wait_for_connection_shutdown(&mut force_shutdown) => {
+                _ = wait_for_shutdown(&mut force_shutdown) => {
                     tracing::debug!(%peer, protocol, "database connection closed for daemon shutdown");
                 }
             }
@@ -467,7 +467,7 @@ where
     }
 }
 
-async fn wait_for_connection_shutdown(shutdown: &mut watch::Receiver<bool>) {
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
             return;
@@ -507,7 +507,7 @@ fn log_connection_failure(
         source,
     } = error
     {
-        match backend_failure_log_permit(protocol, instance_id) {
+        match backend_log_permit(protocol, instance_id) {
             Some(suppressed) => tracing::warn!(
                 event = "database_backend_connection_failed",
                 %peer,
@@ -530,7 +530,7 @@ fn log_connection_failure(
     }
 }
 
-fn backend_failure_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
+fn backend_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
     let now = StdInstant::now();
     let key = format!("{protocol}\0{instance_id}");
     let mut windows = BACKEND_FAILURE_LOGS
@@ -625,7 +625,7 @@ async fn handle_postgres_client(
     }
 
     let initial = client_handshake("postgres", async move {
-        let direct_tls = tls.is_some() && postgres_direct_tls_requested(&client).await?;
+        let direct_tls = tls.is_some() && postgres_wants_direct_tls(&client).await?;
         let (mut client, mut packet, encrypted) = if direct_tls {
             let tls = tls
                 .clone()
@@ -635,11 +635,11 @@ async fn handle_postgres_client(
                 return Err(postgres::PostgresParseError::DirectTlsAlpnRequired.into());
             }
             let mut client = GatewayStream::Tls(Box::new(tls_stream));
-            let packet = read_postgres_startup_packet(&mut client).await?;
+            let packet = read_postgres_startup(&mut client).await?;
             (client, packet, true)
         } else {
             let mut client = GatewayStream::Plain(client);
-            let packet = read_postgres_startup_packet(&mut client).await?;
+            let packet = read_postgres_startup(&mut client).await?;
             (client, packet, false)
         };
 
@@ -647,7 +647,7 @@ async fn handle_postgres_client(
         // terminate GSS, so reply N and continue the same startup negotiation.
         while postgres::is_gssenc_request(&packet) {
             client.write_all(b"N").await?;
-            packet = read_postgres_startup_packet(&mut client).await?;
+            packet = read_postgres_startup(&mut client).await?;
         }
 
         if postgres::is_ssl_request(&packet) {
@@ -660,12 +660,12 @@ async fn handle_postgres_client(
             if let Some(tls) = tls {
                 raw_client.write_all(b"S").await?;
                 let mut upgraded = GatewayStream::Tls(Box::new(tls.accept(raw_client).await?));
-                packet = read_postgres_startup_packet(&mut upgraded).await?;
+                packet = read_postgres_startup(&mut upgraded).await?;
                 client = upgraded;
             } else {
                 raw_client.write_all(b"N").await?;
                 client = GatewayStream::Plain(raw_client);
-                packet = read_postgres_startup_packet(&mut client).await?;
+                packet = read_postgres_startup(&mut client).await?;
             }
         } else if tls.is_some() && !encrypted {
             return Err(postgres::PostgresParseError::UnsupportedStartupRequest.into());
@@ -752,13 +752,13 @@ async fn handle_postgres_client(
     Ok(())
 }
 
-async fn postgres_direct_tls_requested(client: &TcpStream) -> Result<bool, std::io::Error> {
+async fn postgres_wants_direct_tls(client: &TcpStream) -> Result<bool, std::io::Error> {
     let mut first = [0_u8; 1];
     let read = client.peek(&mut first).await?;
     Ok(read == 1 && first[0] == 0x16)
 }
 
-async fn read_postgres_startup_packet<S>(client: &mut S) -> Result<Vec<u8>, ListenerError>
+async fn read_postgres_startup<S>(client: &mut S) -> Result<Vec<u8>, ListenerError>
 where
     S: AsyncRead + Unpin,
 {
@@ -902,7 +902,7 @@ async fn prepare_mariadb_tunnel(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
-    prepare_mysql_wire_tunnel(client, resolver, tls, false).await
+    prepare_mysql_connection(client, resolver, tls, false).await
 }
 
 async fn prepare_mysql_tunnel(
@@ -910,10 +910,10 @@ async fn prepare_mysql_tunnel(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<Option<(GatewayStream, tunnel::MeteredBackend<tunnel::BackendStream>)>, ListenerError> {
-    prepare_mysql_wire_tunnel(client, resolver, tls, true).await
+    prepare_mysql_connection(client, resolver, tls, true).await
 }
 
-async fn prepare_mysql_wire_tunnel(
+async fn prepare_mysql_connection(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
@@ -1297,7 +1297,7 @@ async fn handle_clickhouse_client(
     Ok(())
 }
 
-async fn handle_clickhouse_http_client(
+async fn handle_clickhouse_http(
     client: TcpStream,
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
@@ -1481,7 +1481,7 @@ mod tests {
         });
 
         assert!(matches!(
-            read_postgres_startup_packet(&mut gateway).await,
+            read_postgres_startup(&mut gateway).await,
             Err(ListenerError::Postgres(
                 postgres::PostgresParseError::InvalidLength
             ))

@@ -51,7 +51,7 @@ pub(crate) async fn begin_attestation(
     })?;
     let identity = required_identity(docker, metadata).await?;
     let (mut current, cache_warning) = match manager
-        .auth_hardening_attestation_is_current(metadata, &identity, revision)
+        .hardening_is_current(metadata, &identity, revision)
         .await
     {
         Ok(current) => (current, None),
@@ -96,7 +96,7 @@ pub(crate) async fn complete_attestation(
     }
     ensure_generation(docker, metadata, &generation.identity).await?;
     let storage = manager
-        .record_auth_hardening_attestation(metadata, &generation.identity, generation.revision)
+        .record_hardening_attestation(metadata, &generation.identity, generation.revision)
         .await
         .map_err(|error| AuthHardeningCompletionError::Storage(error.to_string()));
     // A restart can race the SQLite write. A stale row is harmless because it
@@ -127,7 +127,7 @@ async fn required_identity(
     metadata: &InstanceMetadata,
 ) -> Result<ManagedContainerIdentity, String> {
     docker
-        .verified_managed_container_identity(metadata.protocol, &metadata.instance_id)
+        .verified_container_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "the managed container is missing".to_string())
@@ -139,7 +139,7 @@ async fn ensure_generation(
     expected: &ManagedContainerIdentity,
 ) -> Result<(), AuthHardeningCompletionError> {
     let actual = docker
-        .verified_managed_container_identity(metadata.protocol, &metadata.instance_id)
+        .verified_container_identity(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(|error| AuthHardeningCompletionError::Runtime(error.to_string()))?
         .ok_or(AuthHardeningCompletionError::ContainerMissing)?;

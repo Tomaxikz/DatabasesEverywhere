@@ -2,7 +2,7 @@ use super::*;
 use futures::FutureExt;
 use std::collections::HashSet;
 
-pub(super) async fn monitor_managed_container_events(state: AppState) {
+pub(super) async fn monitor_container_events(state: AppState) {
     let mut shutdown = state.daemon_shutdown.subscribe();
     let mut reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
     let mut first_subscription = true;
@@ -32,7 +32,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
         let mut pending_events = HashMap::new();
         let stream_error = loop {
             if reconciliations.len() >= MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY {
-                if let Err(error) = complete_event_reconciliation(
+                if let Err(error) = wait_for_event_reconcile(
                     &state,
                     &mut reconciliations,
                     &mut active_instances,
@@ -47,7 +47,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
             let next = tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        drain_event_reconciliations(
+                        drain_event_tasks(
                             &state,
                             &mut reconciliations,
                             &mut active_instances,
@@ -59,7 +59,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
                 }
                 completed = reconciliations.join_next(), if !reconciliations.is_empty() => {
                     if let Some(result) = completed
-                        && let Err(error) = finish_event_reconciliation(
+                        && let Err(error) = finish_event_reconcile(
                             &state,
                             &mut reconciliations,
                             &mut active_instances,
@@ -76,7 +76,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
             match next {
                 Some(Ok(event)) => {
                     reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
-                    schedule_event_reconciliation(
+                    schedule_event_reconcile(
                         &state,
                         &mut reconciliations,
                         &mut active_instances,
@@ -88,7 +88,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
                 None => break None,
             }
         };
-        drain_event_reconciliations(
+        drain_event_tasks(
             &state,
             &mut reconciliations,
             &mut active_instances,
@@ -107,7 +107,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
                 "managed container event stream ended; reconciling a runtime snapshot before reconnecting"
             ),
         }
-        reconcile_managed_container_snapshot(&state).await;
+        reconcile_snapshot(&state).await;
 
         tokio::select! {
             changed = shutdown.changed() => {
@@ -123,7 +123,7 @@ pub(super) async fn monitor_managed_container_events(state: AppState) {
     }
 }
 
-fn schedule_event_reconciliation(
+fn schedule_event_reconcile(
     state: &AppState,
     reconciliations: &mut tokio::task::JoinSet<String>,
     active_instances: &mut HashSet<String>,
@@ -138,10 +138,10 @@ fn schedule_event_reconciliation(
         pending_events.insert(instance_id, event);
         return;
     }
-    spawn_event_reconciliation(state, reconciliations, event);
+    spawn_event_reconcile(state, reconciliations, event);
 }
 
-fn spawn_event_reconciliation(
+fn spawn_event_reconcile(
     state: &AppState,
     reconciliations: &mut tokio::task::JoinSet<String>,
     event: ManagedContainerEvent,
@@ -149,7 +149,7 @@ fn spawn_event_reconciliation(
     let event_state = state.clone();
     let instance_id = event.instance_id.clone();
     reconciliations.spawn(async move {
-        match std::panic::AssertUnwindSafe(reconcile_managed_container_event(&event_state, event))
+        match std::panic::AssertUnwindSafe(reconcile_container_event(&event_state, event))
             .catch_unwind()
             .await
         {
@@ -167,7 +167,7 @@ fn spawn_event_reconciliation(
     });
 }
 
-async fn complete_event_reconciliation(
+async fn wait_for_event_reconcile(
     state: &AppState,
     reconciliations: &mut tokio::task::JoinSet<String>,
     active_instances: &mut HashSet<String>,
@@ -176,7 +176,7 @@ async fn complete_event_reconciliation(
     let Some(result) = reconciliations.join_next().await else {
         return Ok(());
     };
-    finish_event_reconciliation(
+    finish_event_reconcile(
         state,
         reconciliations,
         active_instances,
@@ -185,7 +185,7 @@ async fn complete_event_reconciliation(
     )
 }
 
-fn finish_event_reconciliation(
+fn finish_event_reconcile(
     state: &AppState,
     reconciliations: &mut tokio::task::JoinSet<String>,
     active_instances: &mut HashSet<String>,
@@ -200,21 +200,21 @@ fn finish_event_reconciliation(
         error.to_string()
     })?;
     if let Some(event) = pending_events.remove(&instance_id) {
-        spawn_event_reconciliation(state, reconciliations, event);
+        spawn_event_reconcile(state, reconciliations, event);
     } else {
         active_instances.remove(&instance_id);
     }
     Ok(())
 }
 
-async fn drain_event_reconciliations(
+async fn drain_event_tasks(
     state: &AppState,
     reconciliations: &mut tokio::task::JoinSet<String>,
     active_instances: &mut HashSet<String>,
     pending_events: &mut HashMap<String, ManagedContainerEvent>,
 ) {
     while !reconciliations.is_empty() {
-        if complete_event_reconciliation(state, reconciliations, active_instances, pending_events)
+        if wait_for_event_reconcile(state, reconciliations, active_instances, pending_events)
             .await
             .is_err()
         {
@@ -227,19 +227,19 @@ async fn drain_event_reconciliations(
     pending_events.clear();
 }
 
-pub(super) async fn reconcile_managed_container_event(
+pub(super) async fn reconcile_container_event(
     state: &AppState,
     event: ManagedContainerEvent,
 ) -> anyhow::Result<()> {
     let instance_id = event.instance_id.clone();
-    reconcile_managed_container_state(state, &instance_id, Some(event)).await
+    reconcile_container_state(state, &instance_id, Some(event)).await
 }
 
-pub(super) async fn reconcile_managed_container_snapshot(state: &AppState) {
+pub(super) async fn reconcile_snapshot(state: &AppState) {
     let instances = state.instances.list().await;
     let outcomes = futures::stream::iter(instances)
         .map(|metadata| async move {
-            reconcile_managed_container_state(state, &metadata.instance_id, None).await
+            reconcile_container_state(state, &metadata.instance_id, None).await
         })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -254,7 +254,7 @@ pub(super) async fn reconcile_managed_container_snapshot(state: &AppState) {
     }
 }
 
-pub(super) async fn reconcile_managed_container_state(
+pub(super) async fn reconcile_container_state(
     state: &AppState,
     instance_id: &str,
     event: Option<ManagedContainerEvent>,
@@ -354,7 +354,7 @@ pub(super) async fn reconcile_managed_container_state(
             .docker
             .verified_managed_container_id(metadata.protocol, &metadata.instance_id)
             .await?;
-        if event_targets_superseded_container(event, current_container_id.as_deref()) {
+        if targets_old_container(event, current_container_id.as_deref()) {
             tracing::debug!(
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
@@ -401,8 +401,8 @@ pub(super) async fn reconcile_managed_container_state(
             )
             .await
         {
-            Ok(_) => match harden_activated_instance_auth(state, &metadata).await {
-                Ok(()) => compatibility_after_activation(state, &metadata).await.err(),
+            Ok(_) => match harden_instance_auth(state, &metadata).await {
+                Ok(()) => probe_after_activation(state, &metadata).await.err(),
                 Err(error) => Some(error),
             },
             Err(error) => Some(error.to_string()),
@@ -417,7 +417,7 @@ pub(super) async fn reconcile_managed_container_state(
             .await
         {
             Ok(inspection) if inspection.status == DockerContainerStatus::Running => {
-                activation_error = compatibility_after_activation(state, &metadata).await.err();
+                activation_error = probe_after_activation(state, &metadata).await.err();
             }
             Ok(_) => {}
             Err(error) if error.is_not_found() => {}
@@ -501,7 +501,7 @@ pub(super) async fn reconcile_managed_container_state(
     Ok(())
 }
 
-async fn compatibility_after_activation(
+async fn probe_after_activation(
     state: &AppState,
     metadata: &crate::instances::metadata::InstanceMetadata,
 ) -> Result<(), String> {
@@ -522,7 +522,7 @@ async fn compatibility_after_activation(
     }
 }
 
-async fn harden_activated_instance_auth(
+async fn harden_instance_auth(
     state: &AppState,
     metadata: &crate::instances::metadata::InstanceMetadata,
 ) -> Result<(), String> {
@@ -567,7 +567,7 @@ async fn harden_activated_instance_auth(
     }
 }
 
-fn event_targets_superseded_container(
+fn targets_old_container(
     event: &ManagedContainerEvent,
     current_container_id: Option<&str>,
 ) -> bool {
@@ -619,10 +619,7 @@ mod tests {
                 ManagedContainerAction::Destroyed,
             ] {
                 let event = event(protocol, action, Some("old-container-id"));
-                assert!(event_targets_superseded_container(
-                    &event,
-                    Some("new-container-id")
-                ));
+                assert!(targets_old_container(&event, Some("new-container-id")));
             }
         }
     }
@@ -637,11 +634,8 @@ mod tests {
             Some("0123456789abcdef"),
         );
 
-        assert!(!event_targets_superseded_container(
-            &event,
-            Some("0123456789abcdef")
-        ));
-        assert!(!event_targets_superseded_container(
+        assert!(!targets_old_container(&event, Some("0123456789abcdef")));
+        assert!(!targets_old_container(
             &event,
             Some("0123456789abcdef0123456789abcdef")
         ));
@@ -656,15 +650,12 @@ mod tests {
             Some("old-container-id"),
         );
 
-        assert!(!event_targets_superseded_container(
+        assert!(!targets_old_container(
             &unidentified,
             Some("new-container-id")
         ));
-        assert!(event_targets_superseded_container(
-            &activation,
-            Some("new-container-id")
-        ));
-        assert!(!event_targets_superseded_container(
+        assert!(targets_old_container(&activation, Some("new-container-id")));
+        assert!(!targets_old_container(
             &activation,
             Some("old-container-id")
         ));

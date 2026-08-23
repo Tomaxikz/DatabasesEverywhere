@@ -6,7 +6,7 @@ pub struct HostOwner {
     pub gid: u32,
 }
 
-pub fn chown_directory_recursive(path: &Path, owner: HostOwner) -> std::io::Result<()> {
+pub fn chown_recursive(path: &Path, owner: HostOwner) -> std::io::Result<()> {
     use rustix::fs::{Mode, OFlags, open};
 
     let directory = match open(
@@ -86,11 +86,7 @@ fn chown_directory_fd(
 
 /// Keeps a daemon-owned directory non-listable while allowing one trusted
 /// runtime group to traverse known bind-mount paths beneath it.
-pub fn share_directory_for_traversal(
-    path: &Path,
-    daemon_uid: u32,
-    gid: u32,
-) -> std::io::Result<()> {
+pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std::io::Result<()> {
     use rustix::{
         fs::{FileType, Mode, OFlags, fchmod, fchown, fstat, open},
         process::{Gid, Uid},
@@ -138,7 +134,7 @@ mod tests {
         symlink(&outside, managed.join("outside-link")).unwrap();
         let metadata = std::fs::metadata(&managed).unwrap();
 
-        chown_directory_recursive(
+        chown_recursive(
             &managed,
             HostOwner {
                 uid: metadata.uid(),
@@ -164,7 +160,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let metadata = std::fs::metadata(temp.path()).unwrap();
 
-        share_directory_for_traversal(temp.path(), metadata.uid(), metadata.gid()).unwrap();
+        allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid()).unwrap();
 
         assert_eq!(
             std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,

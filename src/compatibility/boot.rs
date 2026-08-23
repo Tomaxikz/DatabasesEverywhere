@@ -4,9 +4,7 @@ use std::os::unix::fs::FileTypeExt;
 use crate::{
     api::{
         instances::{
-            major_upgrade::{
-                ImageVersionChange, classify_image_update, ensure_major_upgrade_supported,
-            },
+            major_upgrade::{ImageVersionChange, check_major_upgrade, classify_image_update},
             update_instance_image_locked,
         },
         routes::AppState,
@@ -35,9 +33,7 @@ struct InstanceBootOutcome {
     failed: bool,
 }
 
-pub(crate) async fn reconcile_managed_compatibility_on_boot(
-    state: &AppState,
-) -> CompatibilityBootSummary {
+pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSummary {
     let instances = state
         .instances
         .list()
@@ -151,7 +147,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
             }
         };
         let major_upgrade = change == ImageVersionChange::Major;
-        if major_upgrade && ensure_major_upgrade_supported(metadata.protocol).is_err() {
+        if major_upgrade && check_major_upgrade(metadata.protocol).is_err() {
             tracing::error!(
                 event = "audit boot_major_upgrade_unsupported",
                 instance_id = %metadata.instance_id,

@@ -96,7 +96,7 @@ pub(super) async fn capture_maintenance_credential(
     Ok(())
 }
 
-pub(super) async fn capture_postgres_password_verifier(
+pub(super) async fn capture_postgres_verifier(
     state: &AppState,
     metadata: &InstanceMetadata,
     previous: &PreviousCredential,
@@ -119,7 +119,7 @@ pub(super) async fn capture_postgres_password_verifier(
     );
     let output = state
         .docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             &metadata.instance_id,
             &script,
@@ -161,7 +161,7 @@ pub(super) async fn capture_mysql_tenant_auth(
     );
     let output = state
         .docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Mysql,
             &metadata.instance_id,
             &script,
@@ -206,7 +206,7 @@ pub(super) async fn capture_mysql_tenant_auth(
     ))
 }
 
-pub(super) async fn wait_for_rotation_admin(
+pub(super) async fn wait_for_admin_auth(
     state: &AppState,
     metadata: &InstanceMetadata,
     previous: &PreviousCredential,
@@ -226,7 +226,7 @@ pub(super) async fn wait_for_rotation_admin(
         .await;
     }
     if metadata.protocol == Protocol::Postgres {
-        return match databases::postgres::hardening::verify_internal_admin_password(
+        return match databases::postgres::hardening::verify_admin_password(
             &state.docker,
             &metadata.instance_id,
             maintenance,
@@ -261,7 +261,7 @@ pub(super) async fn wait_for_rotation_admin(
     while Instant::now() < deadline {
         match state
             .docker
-            .exec_readiness_probe_with_secret_env_timeout(
+            .exec_secret_readiness_probe(
                 metadata.protocol,
                 &metadata.instance_id,
                 &command,
@@ -275,7 +275,7 @@ pub(super) async fn wait_for_rotation_admin(
                     SecretString::from(format!("dbe-invalid-{}", uuid::Uuid::new_v4().simple()));
                 match state
                     .docker
-                    .exec_readiness_probe_with_secret_env_timeout(
+                    .exec_secret_readiness_probe(
                         metadata.protocol,
                         &metadata.instance_id,
                         &command,
@@ -284,7 +284,7 @@ pub(super) async fn wait_for_rotation_admin(
                     )
                     .await
                 {
-                    Err(error) if definite_password_rejection(metadata.protocol, &error) => {}
+                    Err(error) if is_password_rejection(metadata.protocol, &error) => {}
                     Err(error) => {
                         return Err(ApiError::Runtime(format!(
                             "incorrect-password enforcement verification failed ambiguously: {error}"
@@ -299,7 +299,7 @@ pub(super) async fn wait_for_rotation_admin(
                 }
                 return match state
                     .docker
-                    .exec_readiness_probe_with_secret_env_timeout(
+                    .exec_secret_readiness_probe(
                         metadata.protocol,
                         &metadata.instance_id,
                         &command,
@@ -328,7 +328,7 @@ pub(super) async fn wait_for_rotation_admin(
     )))
 }
 
-pub(super) fn definite_password_rejection(protocol: Protocol, error: &DockerError) -> bool {
+pub(super) fn is_password_rejection(protocol: Protocol, error: &DockerError) -> bool {
     let DockerError::ExecFailed { failure_output, .. } = error else {
         return false;
     };
@@ -353,17 +353,14 @@ pub(super) fn protected_value_matches(expected: &str, actual: &str) -> bool {
     bool::from(expected.as_bytes().ct_eq(actual.as_bytes()))
 }
 
-pub(super) async fn verify_rolled_back_credential(
+pub(super) async fn verify_rollback_credential(
     context: &InPlaceResetContext<'_>,
 ) -> Result<(), ApiError> {
     match context.metadata.protocol {
         Protocol::Postgres => {
-            let actual = capture_postgres_password_verifier(
-                context.state,
-                context.metadata,
-                context.previous,
-            )
-            .await?;
+            let actual =
+                capture_postgres_verifier(context.state, context.metadata, context.previous)
+                    .await?;
             let expected = context
                 .previous
                 .native_password_verifier
@@ -435,10 +432,8 @@ pub(super) fn postgres_rotation_script(username: &str, database: &str) -> String
     )
 }
 
-pub(super) fn postgres_verifier_restore_script(metadata: &InstanceMetadata) -> String {
-    let sql = databases::postgres::provision::restore_tenant_password_verifier_sql(
-        &metadata.database.username,
-    );
+pub(super) fn verifier_restore_script(metadata: &InstanceMetadata) -> String {
+    let sql = databases::postgres::provision::restore_verifier_sql(&metadata.database.username);
     format!(
         "set -eu\n{{ printf '%s\\n' '\\getenv tenant_password_verifier DBE_PREVIOUS_PASSWORD_VERIFIER'; printf '%s\\n' {}; }} | PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U {} -d {} -v ON_ERROR_STOP=1\n",
         sh_quote(&sql),
@@ -495,7 +490,7 @@ pub(super) fn mysql_auth_restore_script(username: &str, plugin: &str) -> Result<
 }
 
 pub(super) fn mongodb_rotation_script(metadata: &InstanceMetadata) -> Result<String, ApiError> {
-    let javascript = databases::mongodb::provision::update_user_password_from_env_script(
+    let javascript = databases::mongodb::provision::password_update_script(
         &metadata.database.name,
         &metadata.database.username,
     )

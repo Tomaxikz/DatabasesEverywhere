@@ -161,10 +161,10 @@ pub async fn proxy_request(
     respond: SendResponse<Bytes>,
     backend: &mut H2SendRequest<Bytes>,
 ) -> Result<(), QdrantProxyError> {
-    proxy_request_with_stall_timeout(request, respond, backend, STREAM_STALL_TIMEOUT).await
+    proxy_request_timed(request, respond, backend, STREAM_STALL_TIMEOUT).await
 }
 
-async fn proxy_request_with_stall_timeout(
+async fn proxy_request_timed(
     request: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
     backend: &mut H2SendRequest<Bytes>,
@@ -275,7 +275,7 @@ async fn forward_body(
         let chunk = chunk?;
         let received = chunk.len();
         let end_stream = incoming.is_end_stream();
-        send_data_with_backpressure(outgoing, chunk, end_stream, stall_timeout).await?;
+        send_with_backpressure(outgoing, chunk, end_stream, stall_timeout).await?;
         incoming.flow_control().release_capacity(received)?;
         sent_end_stream = end_stream;
     }
@@ -310,7 +310,7 @@ async fn forward_body(
     Ok(())
 }
 
-async fn send_data_with_backpressure(
+async fn send_with_backpressure(
     outgoing: &mut SendStream<Bytes>,
     mut chunk: Bytes,
     end_stream: bool,
@@ -472,7 +472,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let (response, mut body) = client.send_request(request, false).unwrap();
-            send_data_with_backpressure(&mut body, Bytes::from(request_body), true, TEST_TIMEOUT)
+            send_with_backpressure(&mut body, Bytes::from(request_body), true, TEST_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -511,7 +511,7 @@ mod tests {
                     .body(())
                     .unwrap();
                 let mut response_body = respond.send_response(response, false).unwrap();
-                send_data_with_backpressure(
+                send_with_backpressure(
                     &mut response_body,
                     Bytes::from_static(b"rejected"),
                     true,
@@ -544,7 +544,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let (response, mut request_body) = client.send_request(request, false).unwrap();
-            send_data_with_backpressure(
+            send_with_backpressure(
                 &mut request_body,
                 Bytes::from_static(b"request-before-response"),
                 false,
@@ -592,7 +592,7 @@ mod tests {
                     .body(())
                     .unwrap();
                 let mut response_body = respond.send_response(response, false).unwrap();
-                send_data_with_backpressure(
+                send_with_backpressure(
                     &mut response_body,
                     Bytes::from_static(b"response-one"),
                     false,
@@ -602,7 +602,7 @@ mod tests {
                 .unwrap();
 
                 assert_eq!(read_body(request_body).await, b"request-two");
-                send_data_with_backpressure(
+                send_with_backpressure(
                     &mut response_body,
                     Bytes::from_static(b"response-two"),
                     true,
@@ -626,7 +626,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let (response, mut request_body) = client.send_request(request, false).unwrap();
-            send_data_with_backpressure(
+            send_with_backpressure(
                 &mut request_body,
                 Bytes::from_static(b"request-one"),
                 false,
@@ -645,7 +645,7 @@ mod tests {
                 .release_capacity(received)
                 .unwrap();
 
-            send_data_with_backpressure(
+            send_with_backpressure(
                 &mut request_body,
                 Bytes::from_static(b"request-two"),
                 true,
@@ -678,8 +678,7 @@ mod tests {
             let mut server = server_handshake(proxy_client_io).await.unwrap();
             let (request, respond) = server.accept().await.unwrap().unwrap();
             let mut backend = client_handshake(proxy_backend_io).await.unwrap();
-            let proxy =
-                proxy_request_with_stall_timeout(request, respond, &mut backend, stall_timeout);
+            let proxy = proxy_request_timed(request, respond, &mut backend, stall_timeout);
             tokio::pin!(proxy);
 
             tokio::select! {
@@ -745,7 +744,7 @@ mod tests {
         let mut server = server_handshake(client_io).await.unwrap();
         let (request, respond) = server.accept().await.unwrap().unwrap();
         let mut backend = client_handshake(backend_io).await.unwrap();
-        let proxy = proxy_request_with_stall_timeout(request, respond, &mut backend, TEST_TIMEOUT);
+        let proxy = proxy_request_timed(request, respond, &mut backend, TEST_TIMEOUT);
         tokio::pin!(proxy);
 
         tokio::select! {
@@ -785,7 +784,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let mut body = respond.send_response(response, false).unwrap();
-            send_data_with_backpressure(&mut body, Bytes::from(response_body), true, TEST_TIMEOUT)
+            send_with_backpressure(&mut body, Bytes::from(response_body), true, TEST_TIMEOUT)
                 .await
                 .unwrap();
         })

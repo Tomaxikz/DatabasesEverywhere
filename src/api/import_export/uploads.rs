@@ -33,9 +33,7 @@ use crate::{
 
 use super::{
     ImportRequest,
-    files::{
-        artifact_has_allowed_extension, create_private_directory, create_private_file_blocking,
-    },
+    files::{create_private_file_sync, has_allowed_artifact_extension, prepare_private_dir},
     inspection::{
         DumpArchiveFormat, DumpInspection, DumpInspectionFailure, inspect_uploaded_dump_with_format,
     },
@@ -56,10 +54,10 @@ mod mongodb;
 mod tests;
 mod worker;
 
-pub(super) use mongodb::resolve_upload_source_database_catalog;
+pub(super) use mongodb::resolve_upload_catalog;
 use worker::{
     UploadWorkerGuards, UploadWorkerOptions, UploadWorkerRecovery, recover_interrupted_upload,
-    spawn_owned_upload_worker,
+    spawn_upload_worker,
 };
 
 #[derive(Debug, Clone)]
@@ -99,7 +97,7 @@ impl ImportUploadService {
         }
     }
 
-    pub fn repository(&self) -> &ImportUploadRepository {
+    pub fn repo(&self) -> &ImportUploadRepository {
         &self.repository
     }
 
@@ -108,7 +106,7 @@ impl ImportUploadService {
         root: &std::path::Path,
         requested: u64,
     ) -> Result<ImportStagingPermit, ApiError> {
-        create_private_directory(root, "logical import staging directory").await?;
+        prepare_private_dir(root, "logical import staging directory").await?;
         self.acquire_staging_on_existing_root(root, requested).await
     }
 
@@ -249,11 +247,11 @@ pub(crate) async fn list_import_uploads(
     ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<Vec<ImportUploadResponse>> {
     auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let uploads = state
         .import_uploads
-        .repository()
-        .list_active_for_instance(&instance_id, MAX_LISTED_UPLOADS)
+        .repo()
+        .list_active(&instance_id, MAX_LISTED_UPLOADS)
         .await
         .map_err(upload_storage_error)?;
     uploads
@@ -269,7 +267,7 @@ pub(crate) async fn get_import_upload(
     ApiPath((instance_id, upload_id)): ApiPath<(String, String)>,
 ) -> ApiResult<ImportUploadResponse> {
     auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let upload = load_upload(&state, &instance_id, &upload_id).await?;
     Ok(ApiResponse::ok(public_upload(upload)?))
 }
@@ -310,7 +308,7 @@ pub(crate) async fn inspect_import_upload(
     let now = now_rfc3339();
     if !state
         .import_uploads
-        .repository()
+        .repo()
         .mark_processing(&instance_id, &upload_id, &now)
         .await
         .map_err(upload_storage_error)?
@@ -331,8 +329,8 @@ pub(crate) async fn inspect_import_upload(
             let message = "dump inspection worker stopped before it could finalize durable state";
             let restored = state
                 .import_uploads
-                .repository()
-                .restore_ready_after_processing(
+                .repo()
+                .restore_ready(
                     &instance_id,
                     &upload_id,
                     None,
@@ -393,7 +391,7 @@ async fn inspect_and_finalize_upload(
                 let message = "temporary import upload changed after reception";
                 let _ = state
                     .import_uploads
-                    .repository()
+                    .repo()
                     .mark_failed(instance_id, &upload_id, message, &now_rfc3339())
                     .await
                     .map_err(upload_storage_error)?;
@@ -406,8 +404,8 @@ async fn inspect_and_finalize_upload(
                 confirmed_storage_archive_format(upload.protocol, catalog.detected_archive_format);
             if !state
                 .import_uploads
-                .repository()
-                .restore_ready_after_processing(
+                .repo()
+                .restore_ready(
                     instance_id,
                     &upload_id,
                     confirmed_archive_format,
@@ -430,7 +428,7 @@ async fn inspect_and_finalize_upload(
             let message = PublicDiagnostic::from_api_error("dump inspection", &error).message;
             let _ = state
                 .import_uploads
-                .repository()
+                .repo()
                 .mark_failed(instance_id, &upload_id, &message, &now_rfc3339())
                 .await
                 .map_err(upload_storage_error)?;
@@ -445,8 +443,8 @@ async fn inspect_and_finalize_upload(
                 .and_then(|format| confirmed_storage_archive_format(upload.protocol, format));
             let restored = state
                 .import_uploads
-                .repository()
-                .restore_ready_after_processing(
+                .repo()
+                .restore_ready(
                     instance_id,
                     &upload_id,
                     confirmed_archive_format,
@@ -476,11 +474,11 @@ pub(crate) async fn delete_import_upload(
 ) -> ApiResult<ImportUploadDeleteResponse> {
     auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
     let _instance_operation = state.instance_locks.lock(&instance_id).await;
-    ensure_instance_exists(&state, &instance_id).await?;
+    require_instance(&state, &instance_id).await?;
     let upload = load_upload(&state, &instance_id, &upload_id).await?;
     if !state
         .import_uploads
-        .repository()
+        .repo()
         .claim_for_deletion(&instance_id, &upload_id, &now_rfc3339())
         .await
         .map_err(upload_storage_error)?
@@ -492,7 +490,7 @@ pub(crate) async fn delete_import_upload(
     remove_upload_file(&state, &upload).await?;
     if !state
         .import_uploads
-        .repository()
+        .repo()
         .finalize_delete(&instance_id, &upload_id)
         .await
         .map_err(upload_storage_error)?
@@ -539,7 +537,7 @@ async fn upload_dump(
             ),
         });
     }
-    if !artifact_has_allowed_extension(std::path::Path::new(&filename)) {
+    if !has_allowed_artifact_extension(std::path::Path::new(&filename)) {
         return Err(ApiError::BadRequest(
             "the uploaded filename has no supported database dump extension".to_string(),
         ));
@@ -559,7 +557,7 @@ async fn upload_dump(
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let root = paths.imports.join(".uploads");
-    create_private_directory(&root, "managed import upload directory").await?;
+    prepare_private_dir(&root, "managed import upload directory").await?;
     let disk_reservation = reserve_upload_disk_space(state, &root, declared_size).await?;
 
     let upload_id = format!("upl_{}", uuid::Uuid::new_v4().simple());
@@ -569,8 +567,8 @@ async fn upload_dump(
     let expires_at = expiration_timestamp(config.import_upload_ttl_hours)?;
     let upload = match state
         .import_uploads
-        .repository()
-        .insert_if_within_limits(
+        .repo()
+        .insert_within_limits(
             NewImportUpload {
                 upload_id: upload_id.clone(),
                 instance_id: instance_id.to_string(),
@@ -603,7 +601,7 @@ async fn upload_dump(
     let partial_path = root.join(format!(".{stored_filename}.partial"));
     let final_path = root.join(&stored_filename);
     let recovery = UploadWorkerRecovery::new(
-        state.import_uploads.repository().clone(),
+        state.import_uploads.repo().clone(),
         upload,
         partial_path,
         final_path,
@@ -613,7 +611,7 @@ async fn upload_dump(
         instance_operation,
         disk_reservation,
     ));
-    let worker = spawn_owned_upload_worker(
+    let worker = spawn_upload_worker(
         recovery.clone(),
         guards.clone(),
         request.into_body(),
@@ -704,7 +702,7 @@ async fn receive_upload_body(
     idle_timeout: Duration,
 ) -> Result<String, ApiError> {
     let path_owned = path.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || create_private_file_blocking(&path_owned))
+    let file = tokio::task::spawn_blocking(move || create_private_file_sync(&path_owned))
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to create upload file: {error}")))?
         .map_err(|error| ApiError::Runtime(format!("failed to create upload file: {error}")))?;
@@ -874,14 +872,14 @@ async fn load_upload(
 ) -> Result<ImportUpload, ApiError> {
     state
         .import_uploads
-        .repository()
+        .repo()
         .get(instance_id, upload_id)
         .await
         .map_err(upload_storage_error)?
         .ok_or(ApiError::NotFound)
 }
 
-async fn ensure_instance_exists(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
+async fn require_instance(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
     state
         .instances
         .get(instance_id)
@@ -984,7 +982,7 @@ pub(super) async fn validate_upload_selection_capability(
     }
     let upload = state
         .import_uploads
-        .repository()
+        .repo()
         .get(instance_id, upload_id)
         .await
         .map_err(upload_storage_error)?
@@ -1057,8 +1055,8 @@ pub(super) async fn finish_upload_import_job(
     if !succeeded {
         match state
             .import_uploads
-            .repository()
-            .release_claim_after_failed_job(
+            .repo()
+            .release_failed_claim(
                 instance_id,
                 upload_id,
                 job_id,
@@ -1082,7 +1080,7 @@ pub(super) async fn finish_upload_import_job(
     }
     match state
         .import_uploads
-        .repository()
+        .repo()
         .mark_consumed(instance_id, upload_id, job_id, &now)
         .await
     {
@@ -1110,7 +1108,7 @@ pub(super) async fn finish_upload_import_job(
     };
     match state
         .import_uploads
-        .repository()
+        .repo()
         .claim_for_deletion(instance_id, upload_id, &now_rfc3339())
         .await
     {
@@ -1135,7 +1133,7 @@ pub(super) async fn finish_upload_import_job(
     }
     if let Err(error) = state
         .import_uploads
-        .repository()
+        .repo()
         .finalize_delete(instance_id, upload_id)
         .await
     {

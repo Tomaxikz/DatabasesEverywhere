@@ -3,7 +3,7 @@
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Seek, SeekFrom};
 
 use super::{archive::*, files::*, physical::*, protocol::*, *};
-use crate::instances::credentials::{logical_export_environment, logical_import_environment};
+use crate::instances::credentials::{logical_export_env, logical_import_env};
 
 const LOGICAL_STREAM_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POSTGRES_DUMP_WRAPPER_SCAN_BYTES: u64 = 64 * 1024;
@@ -60,7 +60,7 @@ pub(super) async fn upload_logical_staging_budget(
         .min(state.config.artifacts.import_upload_max_bytes)
         .min(MAX_UNARCHIVED_BYTES);
     let rollback_bytes = if mode == ImportMode::Wipe {
-        super::jobs::measured_logical_export_capacity_bytes(state, metadata).await?
+        super::jobs::measure_export_bytes(state, metadata).await?
     } else {
         0
     };
@@ -82,10 +82,10 @@ pub(super) async fn upload_logical_staging_budget(
 pub(super) fn upload_physical_staging_bytes(
     metadata: &InstanceMetadata,
 ) -> Result<Option<u64>, ApiError> {
-    physical_staging_bytes_for(metadata.protocol, metadata.limits.disk_mib)
+    physical_staging_bytes(metadata.protocol, metadata.limits.disk_mib)
 }
 
-pub(super) fn physical_staging_bytes_for(
+pub(super) fn physical_staging_bytes(
     protocol: Protocol,
     disk_mib: u64,
 ) -> Result<Option<u64>, ApiError> {
@@ -117,7 +117,7 @@ pub(super) async fn import_instance_source(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    validate_logical_operation_eligible(&metadata)?;
+    check_logical_ready(&metadata)?;
     let upload_staging = validated_upload_staging(&metadata, options)?;
     match &options.source {
         ImportSourceOptions::Artifact(path)
@@ -127,7 +127,7 @@ pub(super) async fn import_instance_source(
                     Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
                 ) =>
         {
-            import_logical_with_rollback(
+            import_logical(
                 state,
                 &metadata,
                 path,
@@ -138,7 +138,7 @@ pub(super) async fn import_instance_source(
             .await
         }
         ImportSourceOptions::Artifact(path) => {
-            import_instance_artifact(state, instance_id, &metadata, path, options, None).await
+            import_artifact(state, instance_id, &metadata, path, options, None).await
         }
         ImportSourceOptions::Upload { path, .. }
             if options.mode == ImportMode::Wipe
@@ -155,7 +155,7 @@ pub(super) async fn import_instance_source(
                     ));
                 }
             };
-            import_logical_with_rollback(
+            import_logical(
                 state,
                 &metadata,
                 path,
@@ -239,7 +239,7 @@ pub(super) async fn import_instance_source(
                         .iter()
                         .map(PathBuf::as_path)
                         .collect::<Vec<_>>();
-                    let result = import_logical_artifacts_with_rollback(
+                    let result = import_logical_batch(
                         state,
                         &metadata,
                         &artifact_paths,
@@ -305,9 +305,7 @@ pub(super) fn upload_staging_matches_target(
     target_created_at == current_created_at && disk_mib == current_disk_mib
 }
 
-pub(super) fn validate_logical_operation_eligible(
-    metadata: &InstanceMetadata,
-) -> Result<(), ApiError> {
+pub(super) fn check_logical_ready(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if matches!(
         metadata.protocol,
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
@@ -322,7 +320,7 @@ pub(super) fn validate_logical_operation_eligible(
     }
 }
 
-pub(super) async fn import_instance_artifact(
+pub(super) async fn import_artifact(
     state: &AppState,
     instance_id: &str,
     metadata: &InstanceMetadata,
@@ -333,11 +331,8 @@ pub(super) async fn import_instance_artifact(
     let protocol = metadata.protocol;
     match protocol {
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
-            let max_extracted_bytes = physical_staging_bytes_for(
-                protocol,
-                metadata.limits.disk_mib,
-            )?
-            .ok_or_else(|| {
+            let max_extracted_bytes = physical_staging_bytes(protocol, metadata.limits.disk_mib)?
+                .ok_or_else(|| {
                 ApiError::Runtime("physical import extraction budget was unavailable".to_string())
             })?;
             import_physical_archive(
@@ -366,7 +361,7 @@ pub(super) async fn import_instance_artifact(
     }
 }
 
-async fn import_logical_with_rollback(
+async fn import_logical(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_path: &FsPath,
@@ -374,7 +369,7 @@ async fn import_logical_with_rollback(
     source_database: Option<&str>,
     staging: LogicalStagingLimits,
 ) -> Result<(), ApiError> {
-    import_logical_artifacts_with_rollback(
+    import_logical_batch(
         state,
         metadata,
         &[artifact_path],
@@ -396,7 +391,7 @@ pub(super) fn logical_apply_options(
     apply_options
 }
 
-async fn import_logical_artifacts_with_rollback(
+async fn import_logical_batch(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_paths: &[&FsPath],
@@ -558,11 +553,11 @@ async fn import_logical_artifacts_with_rollback(
     cleanup_prepared_logical_imports(state, metadata, &prepared).await;
     if primary.is_ok() {
         if let Err(error) = commit_recovery_manifest(&recovery_manifest).await {
-            let quarantine = quarantine_after_uncertain_import(state, &metadata.instance_id).await;
+            let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
             return Err(ApiError::Runtime(format!(
                 "{} import was applied, but its recovery commit marker could not be removed: {error}; target was failed closed{}; rollback data and manifest were retained for review",
                 metadata.protocol.as_str(),
-                quarantine_result_suffix(&quarantine)
+                quarantine_suffix(&quarantine)
             )));
         }
         cleanup_path(&rollback_path).await;
@@ -573,14 +568,12 @@ async fn import_logical_artifacts_with_rollback(
         Ok(()) => unreachable!(),
         Err(primary) => primary,
     };
-    if let Err(fence_error) =
-        fence_logical_target_for_rollback(state, metadata, remote_exec_timeout).await
-    {
-        let quarantine = quarantine_after_uncertain_import(state, &metadata.instance_id).await;
+    if let Err(fence_error) = fence_import_target(state, metadata, remote_exec_timeout).await {
+        let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
         return Err(ApiError::Runtime(format!(
             "{} import failed: {primary}; the target process could not be generation-fenced before rollback: {fence_error}; rollback was not attempted to avoid racing an ambiguous import command; target was failed closed{}; rollback dump retained at {} with recovery manifest {}",
             metadata.protocol.as_str(),
-            quarantine_result_suffix(&quarantine),
+            quarantine_suffix(&quarantine),
             rollback_path.display(),
             recovery_manifest.display()
         )));
@@ -608,23 +601,22 @@ async fn import_logical_artifacts_with_rollback(
     match rollback {
         Ok(()) => {
             if let Err(commit_error) = commit_recovery_manifest(&recovery_manifest).await {
-                let quarantine =
-                    quarantine_after_uncertain_import(state, &metadata.instance_id).await;
+                let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
                 return Err(ApiError::Runtime(format!(
                     "{} import failed: {primary}; rollback succeeded, but recovery metadata could not be committed: {commit_error}; target was failed closed{}; rollback data and manifest were retained",
                     metadata.protocol.as_str(),
-                    quarantine_result_suffix(&quarantine)
+                    quarantine_suffix(&quarantine)
                 )));
             }
             cleanup_path(&rollback_path).await;
             Err(primary)
         }
         Err(rollback) => {
-            let quarantine = quarantine_after_uncertain_import(state, &metadata.instance_id).await;
+            let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
             Err(ApiError::Runtime(format!(
                 "{} import failed: {primary}; rollback failed: {rollback}; target was failed closed{}; rollback dump retained at {} with recovery manifest {}",
                 metadata.protocol.as_str(),
-                quarantine_result_suffix(&quarantine),
+                quarantine_suffix(&quarantine),
                 rollback_path.display(),
                 recovery_manifest.display()
             )))
@@ -632,7 +624,7 @@ async fn import_logical_artifacts_with_rollback(
     }
 }
 
-pub(super) async fn fence_logical_target_for_rollback(
+pub(super) async fn fence_import_target(
     state: &AppState,
     metadata: &InstanceMetadata,
     operation_timeout: Option<Duration>,
@@ -640,7 +632,7 @@ pub(super) async fn fence_logical_target_for_rollback(
     // A Docker transport/attach failure can leave the command running even after its client future
     // is gone. A confirmed stop is the process-generation fence: rollback is only safe after the
     // old database process is dead and a fresh one has reached startup readiness.
-    stop_import_target_process(state, metadata, "before logical import rollback")
+    stop_import_target(state, metadata, "before logical import rollback")
         .await
         .map_err(ApiError::Runtime)?;
 
@@ -673,7 +665,7 @@ pub(super) async fn fence_logical_target_for_rollback(
         .map(|_| ())
 }
 
-pub(crate) async fn quarantine_after_uncertain_import(
+pub(crate) async fn quarantine_uncertain_import(
     state: &AppState,
     instance_id: &str,
 ) -> Result<(), ApiError> {
@@ -697,7 +689,7 @@ pub(crate) async fn quarantine_after_uncertain_import(
     state.monitoring_cache.invalidate().await;
 
     let (runtime_result, persistence_result) = tokio::join!(
-        stop_import_target_process(
+        stop_import_target(
             state,
             &metadata,
             "after an import lost durable commit or rollback certainty",
@@ -731,7 +723,7 @@ pub(crate) async fn quarantine_after_uncertain_import(
     }
 }
 
-pub(super) async fn stop_import_target_process(
+pub(super) async fn stop_import_target(
     state: &AppState,
     metadata: &InstanceMetadata,
     reason: &'static str,
@@ -778,7 +770,7 @@ pub(super) async fn stop_import_target_process(
     }
 }
 
-pub(super) fn quarantine_result_suffix(result: &Result<(), ApiError>) -> String {
+pub(super) fn quarantine_suffix(result: &Result<(), ApiError>) -> String {
     match result {
         Ok(()) => " and quarantined".to_string(),
         Err(error) => format!(
@@ -821,12 +813,10 @@ pub(super) async fn write_logical_recovery_manifest(
     mode: ImportMode,
 ) -> Result<(), ApiError> {
     let durable_rollback = rollback_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        crate::shared::files::sync_private_regular_file_durable(&durable_rollback)
-    })
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?;
+    tokio::task::spawn_blocking(move || crate::shared::files::sync_private_file(&durable_rollback))
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?
+        .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?;
     let rollback_file = rollback_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -917,7 +907,7 @@ pub(super) async fn export_logical_dump(
     controls: LogicalExportControls,
 ) -> Result<(), ApiError> {
     let instance_id = &metadata.instance_id;
-    create_private_directory(
+    prepare_private_dir(
         artifact_path
             .parent()
             .ok_or_else(|| ApiError::Runtime("invalid artifact path".to_string()))?,
@@ -946,13 +936,13 @@ pub(super) async fn export_logical_dump(
             "logical export output limit must be nonzero".to_string(),
         ));
     }
-    let credentials = logical_export_environment(metadata)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let credentials =
+        logical_export_env(metadata).map_err(|error| ApiError::Conflict(error.to_string()))?;
     let environment = credentials.references();
     let result = async {
         state
             .docker
-            .exec_shell_to_file_with_secret_env(
+            .exec_shell_to_file(
                 protocol,
                 instance_id,
                 &script,
@@ -1203,7 +1193,7 @@ pub(super) async fn prepare_logical_import(
     options: &ImportOptions,
     controls: LogicalImportControls<'_>,
 ) -> Result<PreparedLogicalImport, ApiError> {
-    validate_logical_artifact_selection(protocol, &options.selection)?;
+    validate_artifact_selection(protocol, &options.selection)?;
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-import-{}.{}", uuid::Uuid::new_v4(), extension);
     let staging_root = logical_staging_root(state).await?;
@@ -1217,10 +1207,10 @@ pub(super) async fn prepare_logical_import(
         .unwrap_or(MAX_UNARCHIVED_BYTES)
         .min(MAX_UNARCHIVED_BYTES);
     let prepared_source_bytes = if controls.reuse_staged_artifact {
-        ensure_import_file_size(&host_temp).await?
+        check_import_file_size(&host_temp).await?
     } else {
         cleanup_path(&host_temp).await;
-        if let Err(error) = prepare_logical_import_artifact(
+        if let Err(error) = prepare_import_artifact(
             protocol,
             artifact_path,
             &host_temp,
@@ -1233,7 +1223,7 @@ pub(super) async fn prepare_logical_import(
             cleanup_path(&host_temp).await;
             return Err(error);
         }
-        ensure_import_file_size(&host_temp).await?
+        check_import_file_size(&host_temp).await?
     };
     if prepared_source_bytes > max_prepared_bytes {
         if !controls.reuse_staged_artifact {
@@ -1339,7 +1329,7 @@ pub(super) async fn apply_prepared_logical_imports(
         )
         .await?;
     }
-    let credentials = logical_import_environment(metadata, first.database_definition_in_dump)
+    let credentials = logical_import_env(metadata, first.database_definition_in_dump)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let environment = credentials.references();
     let import_started = Instant::now();
@@ -1358,7 +1348,7 @@ pub(super) async fn apply_prepared_logical_imports(
         };
         state
             .docker
-            .exec_shell_with_file_stdin_and_secret_env(
+            .exec_shell_with_input(
                 artifact.protocol,
                 instance_id,
                 &artifact.script,

@@ -10,7 +10,7 @@ use crate::{
     shared::{
         backend::{
             CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH,
-            container_backend_socket_path, container_qdrant_http_socket_path,
+            container_backend_socket_path, qdrant_http_socket,
         },
         protocol::Protocol,
     },
@@ -59,7 +59,7 @@ pub fn instance_spec(
                 target: loopback_target(6334),
             },
             SocketBridge {
-                socket_path: container_qdrant_http_socket_path(),
+                socket_path: qdrant_http_socket(),
                 target: loopback_target(6333),
             },
         ],

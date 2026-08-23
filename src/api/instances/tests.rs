@@ -5,7 +5,7 @@ async fn dropping_major_upgrade_waiter_does_not_cancel_owned_operation() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let owned = spawn_owned_major_upgrade_task(async move {
+    let owned = spawn_upgrade_task(async move {
         let _ = started_tx.send(());
         let _ = release_rx.await;
         let _ = finished_tx.send(());
@@ -104,7 +104,7 @@ fn live_runtime_cannot_publish_a_durable_pre_ready_or_failed_state() {
         let mut metadata = sample_lifecycle_metadata();
         metadata.status = status;
         assert_eq!(
-            runtime_info::classify_live_instance_status(&metadata, Some(&running_inspection)),
+            runtime_info::classify_live_status(&metadata, Some(&running_inspection)),
             status
         );
     }
@@ -112,7 +112,7 @@ fn live_runtime_cannot_publish_a_durable_pre_ready_or_failed_state() {
     let mut stopping = sample_lifecycle_metadata();
     stopping.desired_state = DesiredInstanceState::Stopped;
     assert_eq!(
-        runtime_info::classify_live_instance_status(&stopping, Some(&running_inspection)),
+        runtime_info::classify_live_status(&stopping, Some(&running_inspection)),
         InstanceStatus::Stopped
     );
 }
@@ -165,14 +165,14 @@ fn major_upgrade_commit_resolution_accepts_only_the_exact_intended_row() {
     intended.tenant_password = Some("replacement-password".to_string());
 
     assert_eq!(
-        classify_major_upgrade_commit(&intended, &previous, &intended),
+        classify_upgrade_commit(&intended, &previous, &intended),
         MajorUpgradeCommitResolution::Committed
     );
 
     let mut mismatched_secret = intended.clone();
     mismatched_secret.tenant_password = Some("unexpected-password".to_string());
     assert!(matches!(
-        classify_major_upgrade_commit(&mismatched_secret, &previous, &intended),
+        classify_upgrade_commit(&mismatched_secret, &previous, &intended),
         MajorUpgradeCommitResolution::Uncertain(_)
     ));
 }
@@ -184,14 +184,14 @@ fn major_upgrade_commit_resolution_rolls_back_only_the_exact_previous_row() {
     intended.updated_at = "2026-01-02T00:00:00Z".to_string();
 
     assert_eq!(
-        classify_major_upgrade_commit(&previous, &previous, &intended),
+        classify_upgrade_commit(&previous, &previous, &intended),
         MajorUpgradeCommitResolution::NotCommitted
     );
 
     let mut divergent = previous.clone();
     divergent.status = InstanceStatus::Failed;
     assert!(matches!(
-        classify_major_upgrade_commit(&divergent, &previous, &intended),
+        classify_upgrade_commit(&divergent, &previous, &intended),
         MajorUpgradeCommitResolution::Uncertain(_)
     ));
 }
@@ -199,7 +199,7 @@ fn major_upgrade_commit_resolution_rolls_back_only_the_exact_previous_row() {
 #[test]
 fn failed_image_update_quarantine_is_fail_closed() {
     let metadata = sample_lifecycle_metadata();
-    let quarantined = quarantined_image_update_metadata(&metadata);
+    let quarantined = quarantine_image_metadata(&metadata);
 
     assert_eq!(quarantined.status, InstanceStatus::Quarantined);
     assert_eq!(quarantined.desired_state, DesiredInstanceState::Stopped);
@@ -240,34 +240,22 @@ async fn major_upgrade_rollback_location_never_guesses_which_volume_is_authorita
 
     tokio::fs::create_dir(&data).await.unwrap();
     assert_eq!(
-        classify_major_upgrade_rollback_location(&data, &backup)
-            .await
-            .unwrap(),
+        classify_upgrade_rollback(&data, &backup).await.unwrap(),
         MajorUpgradeRollbackLocation::OriginalDataInPlace
     );
 
     tokio::fs::rename(&data, &backup).await.unwrap();
     assert_eq!(
-        classify_major_upgrade_rollback_location(&data, &backup)
-            .await
-            .unwrap(),
+        classify_upgrade_rollback(&data, &backup).await.unwrap(),
         MajorUpgradeRollbackLocation::OldVolumeBackup
     );
 
     tokio::fs::create_dir(&data).await.unwrap();
-    assert!(
-        classify_major_upgrade_rollback_location(&data, &backup)
-            .await
-            .is_err()
-    );
+    assert!(classify_upgrade_rollback(&data, &backup).await.is_err());
 
     tokio::fs::remove_dir(&data).await.unwrap();
     tokio::fs::remove_dir(&backup).await.unwrap();
-    assert!(
-        classify_major_upgrade_rollback_location(&data, &backup)
-            .await
-            .is_err()
-    );
+    assert!(classify_upgrade_rollback(&data, &backup).await.is_err());
 }
 
 #[test]
@@ -309,9 +297,9 @@ fn rejects_unpinned_images_for_existing_instance_updates() {
 
 #[test]
 fn parses_major_version_values() {
-    assert_eq!(parse_major_version_value("8.3"), Some(8));
-    assert_eq!(parse_major_version_value("v7.0"), None);
-    assert_eq!(parse_major_version_value("latest"), None);
+    assert_eq!(parse_major_version("8.3"), Some(8));
+    assert_eq!(parse_major_version("v7.0"), None);
+    assert_eq!(parse_major_version("latest"), None);
 }
 
 #[test]
@@ -333,46 +321,45 @@ fn requires_parseable_tags_for_different_existing_images() {
 
 #[test]
 fn major_upgrade_path_blocks_downgrades() {
-    let error = validate_major_upgrade_path(Protocol::Postgres, 18, 17).unwrap_err();
+    let error = validate_upgrade_path(Protocol::Postgres, 18, 17).unwrap_err();
     assert!(error.to_string().contains("downgrade is blocked"));
 }
 
 #[test]
 fn mongodb_major_upgrade_path_blocks_skipped_versions() {
-    let error = validate_major_upgrade_path(Protocol::Mongodb, 6, 8).unwrap_err();
+    let error = validate_upgrade_path(Protocol::Mongodb, 6, 8).unwrap_err();
     assert!(error.to_string().contains("cannot skip versions"));
 
-    assert!(validate_major_upgrade_path(Protocol::Mongodb, 7, 8).is_ok());
+    assert!(validate_upgrade_path(Protocol::Mongodb, 7, 8).is_ok());
 }
 
 #[test]
 fn non_mongodb_dump_upgrade_path_allows_skipped_versions() {
-    assert!(validate_major_upgrade_path(Protocol::Postgres, 14, 18).is_ok());
+    assert!(validate_upgrade_path(Protocol::Postgres, 14, 18).is_ok());
 }
 
 #[test]
 fn major_migration_support_is_limited_to_logical_dump_protocols() {
-    assert!(ensure_major_upgrade_supported(Protocol::Postgres).is_ok());
-    assert!(ensure_major_upgrade_supported(Protocol::Mysql).is_ok());
-    assert!(ensure_major_upgrade_supported(Protocol::Mongodb).is_ok());
-    assert!(ensure_major_upgrade_supported(Protocol::Redis).is_err());
-    assert!(ensure_major_upgrade_supported(Protocol::Valkey).is_err());
-    assert!(ensure_major_upgrade_supported(Protocol::Qdrant).is_err());
+    assert!(check_major_upgrade(Protocol::Postgres).is_ok());
+    assert!(check_major_upgrade(Protocol::Mysql).is_ok());
+    assert!(check_major_upgrade(Protocol::Mongodb).is_ok());
+    assert!(check_major_upgrade(Protocol::Redis).is_err());
+    assert!(check_major_upgrade(Protocol::Valkey).is_err());
+    assert!(check_major_upgrade(Protocol::Qdrant).is_err());
 }
 
 #[test]
 fn replacement_validation_uses_managed_database_unix_sockets() {
-    let postgres =
-        replacement_validation_command(Protocol::Postgres, "app_user", "app_db").unwrap();
+    let postgres = replacement_check_command(Protocol::Postgres, "app_user", "app_db").unwrap();
     assert!(postgres.contains("-h /var/run/postgresql"));
     assert!(!postgres.contains("-h 127.0.0.1"));
 
-    let mariadb = replacement_validation_command(Protocol::Mariadb, "app_user", "app_db").unwrap();
+    let mariadb = replacement_check_command(Protocol::Mariadb, "app_user", "app_db").unwrap();
     assert!(mariadb.contains("--protocol=socket"));
     assert!(mariadb.contains("--socket=/run/mysqld/mysqld.sock"));
     assert!(!mariadb.contains("-h 127.0.0.1"));
 
-    let mysql = replacement_validation_command(Protocol::Mysql, "app_user", "app_db").unwrap();
+    let mysql = replacement_check_command(Protocol::Mysql, "app_user", "app_db").unwrap();
     assert!(mysql.contains("--protocol=socket"));
     assert!(mysql.contains("--socket=/var/run/mysqld/mysqld.sock"));
 }

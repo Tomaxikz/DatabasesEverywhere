@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
+pub(super) fn log_boot_config(config: &Config, config_path: &Path) {
     tracing::info!(
         config = %config_path.display(),
         data = %config.paths.data,
@@ -26,7 +26,7 @@ pub(super) fn log_boot_configuration(config: &Config, config_path: &Path) {
         );
     }
     log_api_host_resolution(config);
-    log_tls_configuration(config);
+    log_tls_config(config);
     tracing::info!(
         default_pids_limit = config.security.pids_limit,
         postgres = ?config.security.pids_limits.postgres,
@@ -128,7 +128,7 @@ pub(super) fn log_api_host_resolution(config: &Config) {
     }
 }
 
-pub(super) fn log_tls_configuration(config: &Config) {
+pub(super) fn log_tls_config(config: &Config) {
     if config.api.ssl.enabled {
         log_tls_file("api tls certificate", &config.api.ssl.cert);
         log_tls_file("api tls private key", &config.api.ssl.key);
@@ -159,7 +159,7 @@ pub(super) fn log_tls_configuration(config: &Config) {
         }
     }
 
-    if any_database_listener_tls_enabled(config) {
+    if database_tls_enabled(config) {
         log_tls_file("database listener tls certificate", &config.tls.cert);
         log_tls_file("database listener tls private key", &config.tls.key);
         tracing::info!("database gateway tls enabled for at least one protocol");
@@ -189,7 +189,7 @@ pub(super) fn log_tls_file(label: &'static str, path: &str) {
     }
 }
 
-pub(super) fn any_database_listener_tls_enabled(config: &Config) -> bool {
+pub(super) fn database_tls_enabled(config: &Config) -> bool {
     config.postgres.tls
         || config.redis.tls
         || config.valkey.tls
@@ -208,7 +208,7 @@ pub(super) fn empty_as_unset(value: &str) -> &str {
     }
 }
 
-pub(super) fn log_gateway_listener_summary(config: &Config) {
+pub(super) fn log_gateway_listeners(config: &Config) {
     log_listener(
         "postgres",
         &config.postgres.bind,
@@ -284,7 +284,7 @@ pub(super) fn log_listener(protocol: &'static str, bind: &str, enabled: bool, tl
     }
 }
 
-pub(super) async fn reapply_instance_disk_limits(
+pub(super) async fn restore_disk_limits(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
@@ -305,7 +305,7 @@ pub(super) async fn reapply_instance_disk_limits(
                         )
                     })?;
                     paths
-                        .apply_rootless_podman_owner(uid, gid)
+                        .apply_rootless_owner(uid, gid)
                         .await
                         .with_context(|| {
                             format!(
@@ -315,14 +315,7 @@ pub(super) async fn reapply_instance_disk_limits(
                         })?;
                 }
                 let legacy_qdrant_fuse_retained = if metadata.protocol == Protocol::Qdrant {
-                    !migrate_legacy_qdrant_fuse_storage(
-                        config,
-                        docker,
-                        disk_limiter,
-                        &metadata,
-                        &paths,
-                    )
-                    .await?
+                    !migrate_qdrant_storage(config, docker, disk_limiter, &metadata, &paths).await?
                 } else {
                     false
                 };
@@ -334,18 +327,10 @@ pub(super) async fn reapply_instance_disk_limits(
                 } else {
                     disk_limiter.for_protocol(metadata.protocol)
                 };
-                effective_limiter.validate_persisted_method_transition(
-                    &metadata.limits.disk_enforcement_method,
-                )?;
-                ensure_container_uses_effective_disk_path(
-                    docker,
-                    &metadata,
-                    &paths,
-                    &effective_limiter,
-                )
-                .await?;
+                effective_limiter.check_method_change(&metadata.limits.disk_enforcement_method)?;
+                ensure_disk_mounted(docker, &metadata, &paths, &effective_limiter).await?;
                 if !effective_limiter
-                    .instance_runtime_is_healthy(&paths.data)
+                    .runtime_is_healthy(&paths.data)
                     .await
                     .with_context(|| {
                         format!(
@@ -427,7 +412,7 @@ pub(super) async fn reapply_instance_disk_limits(
                 true
             }
         };
-        isolate_disk_reconciliation_failure(&mut metadata, stop_failed);
+        isolate_disk_failure(&mut metadata, stop_failed);
         metadata.updated_at = now_rfc3339();
         manager.upsert(metadata).await?;
     }
@@ -440,7 +425,7 @@ pub(super) async fn reapply_instance_disk_limits(
     Ok(())
 }
 
-pub(super) fn isolate_disk_reconciliation_failure(
+pub(super) fn isolate_disk_failure(
     metadata: &mut crate::instances::metadata::InstanceMetadata,
     stop_failed: bool,
 ) {
@@ -456,7 +441,7 @@ pub(super) fn isolate_disk_reconciliation_failure(
     };
 }
 
-async fn ensure_container_uses_effective_disk_path(
+async fn ensure_disk_mounted(
     docker: &DockerRuntime,
     metadata: &crate::instances::metadata::InstanceMetadata,
     paths: &InstancePaths,
@@ -464,7 +449,7 @@ async fn ensure_container_uses_effective_disk_path(
 ) -> anyhow::Result<()> {
     let expected_source = effective_limiter.container_data_path(&paths.data)?;
     match docker
-        .verify_container_data_bind(metadata.protocol, &metadata.instance_id, &expected_source)
+        .verify_data_bind(metadata.protocol, &metadata.instance_id, &expected_source)
         .await
     {
         Ok(()) => Ok(()),
@@ -478,7 +463,7 @@ async fn ensure_container_uses_effective_disk_path(
 /// Move a pre-exclusion Qdrant instance from its FuseQuota bind source to the
 /// raw backing directory. Every destructive runtime step has a remount/recreate
 /// rollback; the backing data directory is never renamed or deleted.
-async fn migrate_legacy_qdrant_fuse_storage(
+async fn migrate_qdrant_storage(
     config: &Config,
     docker: &DockerRuntime,
     disk_limiter: &DiskLimiter,
@@ -486,7 +471,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
     paths: &InstancePaths,
 ) -> anyhow::Result<bool> {
     let legacy_mount = disk_limiter.legacy_fuse_container_path(&paths.data)?;
-    let legacy_mount_present = disk_limiter.legacy_fuse_mount_is_present(&paths.data)?;
+    let legacy_mount_present = disk_limiter.has_legacy_fuse_mount(&paths.data)?;
     let bound_source = match docker
         .container_bind_source(metadata.protocol, &metadata.instance_id, "/dbe-qdrant")
         .await
@@ -495,9 +480,9 @@ async fn migrate_legacy_qdrant_fuse_storage(
         Err(error) if error.is_not_found() => None,
         Err(error) => return Err(error.into()),
     };
-    if !legacy_qdrant_container_uses_fuse(bound_source.as_deref(), &legacy_mount) {
+    if !legacy_qdrant_uses_fuse(bound_source.as_deref(), &legacy_mount) {
         if legacy_mount_present {
-            disk_limiter.teardown_legacy_fuse_mount(&paths.data).await?;
+            disk_limiter.unmount_legacy_fuse(&paths.data).await?;
             tracing::info!(
                 event = "audit qdrant_stale_fuse_mount_removed",
                 instance_id = %metadata.instance_id,
@@ -509,7 +494,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
         return Ok(true);
     }
     let migration_target_mode = disk_limiter.mode_for_protocol(metadata.protocol);
-    if !qdrant_fuse_migration_target_is_safe(migration_target_mode) {
+    if !qdrant_migration_is_safe(migration_target_mode) {
         tracing::error!(
             event = "audit qdrant_fuse_migration_deferred",
             instance_id = %metadata.instance_id,
@@ -553,7 +538,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
         .inspect_instance(metadata.protocol, &metadata.instance_id)
         .await?;
     let (stop_existing, should_run) =
-        qdrant_migration_runtime_actions(inspection.status, metadata.desired_state);
+        qdrant_migration_actions(inspection.status, metadata.desired_state);
     let container_user = crate::api::instance_create::prepare_instance_container_user(
         docker,
         paths,
@@ -602,7 +587,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
         docker
             .delete(metadata.protocol, &metadata.instance_id)
             .await?;
-        disk_limiter.teardown_legacy_fuse_mount(&paths.data).await?;
+        disk_limiter.unmount_legacy_fuse(&paths.data).await?;
         disk_limiter
             .for_protocol(metadata.protocol)
             .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
@@ -635,7 +620,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
                 Err(error) => return Err(anyhow::Error::from(error)),
             }
             disk_limiter
-                .apply_legacy_fuse_limit(&paths.data, metadata.limits.disk_mib)
+                .set_legacy_fuse_limit(&paths.data, metadata.limits.disk_mib)
                 .await?;
             docker.create(&legacy_spec).await?;
             if should_run {
@@ -680,7 +665,7 @@ async fn migrate_legacy_qdrant_fuse_storage(
     Ok(true)
 }
 
-pub(super) fn qdrant_migration_runtime_actions(
+pub(super) fn qdrant_migration_actions(
     observed: DockerContainerStatus,
     desired: crate::instances::metadata::DesiredInstanceState,
 ) -> (bool, bool) {
@@ -692,14 +677,11 @@ pub(super) fn qdrant_migration_runtime_actions(
     (stop_existing, start_replacement)
 }
 
-pub(super) fn qdrant_fuse_migration_target_is_safe(mode: crate::config::DiskLimitMode) -> bool {
+pub(super) fn qdrant_migration_is_safe(mode: crate::config::DiskLimitMode) -> bool {
     mode != crate::config::DiskLimitMode::ProjectQuota
 }
 
-pub(super) fn legacy_qdrant_container_uses_fuse(
-    bound_source: Option<&Path>,
-    legacy_mount: &Path,
-) -> bool {
+pub(super) fn legacy_qdrant_uses_fuse(bound_source: Option<&Path>, legacy_mount: &Path) -> bool {
     bound_source == Some(legacy_mount)
 }
 
@@ -741,7 +723,7 @@ pub(super) fn qdrant_migration_spec(
     spec
 }
 
-pub(super) async fn start_known_instances_on_boot(
+pub(super) async fn start_known_instances(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
@@ -750,7 +732,7 @@ pub(super) async fn start_known_instances_on_boot(
     let instances = manager.store().list().await;
     let outcomes = futures::stream::iter(instances)
         .map(|snapshot| async move {
-            start_known_instance_on_boot(config, manager, docker, instance_locks, snapshot).await
+            start_known_instance(config, manager, docker, instance_locks, snapshot).await
         })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -796,10 +778,7 @@ pub(super) async fn start_known_instances_on_boot(
     Ok(())
 }
 
-pub(super) async fn reconcile_running_cpu_burst_limits(
-    manager: &InstanceManager,
-    docker: &DockerRuntime,
-) {
+pub(super) async fn sync_cpu_burst_limits(manager: &InstanceManager, docker: &DockerRuntime) {
     let instances = manager
         .store()
         .list()
@@ -858,7 +837,7 @@ pub(super) async fn reconcile_running_cpu_burst_limits(
     );
 }
 
-pub(super) async fn start_known_instance_on_boot(
+pub(super) async fn start_known_instance(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
@@ -897,8 +876,7 @@ pub(super) async fn start_known_instance_on_boot(
     let mut disk_blocked = false;
     let mut disk_bind_blocked = false;
     if let Err(error) =
-        ensure_instance_runtime_paths(config, docker, metadata.protocol, &metadata.instance_id)
-            .await
+        prepare_instance_paths(config, docker, metadata.protocol, &metadata.instance_id).await
     {
         boot_failed = true;
         tracing::warn!(
@@ -918,7 +896,7 @@ pub(super) async fn start_known_instance_on_boot(
                 );
         let expected_data_source = disk_limiter.container_data_path(&paths.data)?;
         if let Err(error) = docker
-            .verify_container_data_bind(
+            .verify_data_bind(
                 metadata.protocol,
                 &metadata.instance_id,
                 &expected_data_source,

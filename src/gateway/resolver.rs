@@ -105,7 +105,7 @@ impl RouteResolver {
         username: &str,
         database: Option<&str>,
     ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {
-        self.resolve_mariadb_database_target(self.store.resolve_mariadb(username, database).await)
+        self.resolve_mariadb_route(self.store.resolve_mariadb(username, database).await)
             .await
     }
 
@@ -114,7 +114,7 @@ impl RouteResolver {
         username: &str,
         database: Option<&str>,
     ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {
-        self.resolve_mariadb_database_target(self.store.resolve_mysql(username, database).await)
+        self.resolve_mariadb_route(self.store.resolve_mysql(username, database).await)
             .await
     }
 
@@ -189,7 +189,7 @@ impl RouteResolver {
         }
     }
 
-    async fn resolve_mariadb_database_target(
+    async fn resolve_mariadb_route(
         &self,
         resolution: DatabaseRouteResolution<MariadbRouteTarget>,
     ) -> DatabaseRouteResolution<ResolvedMariadbRoute> {

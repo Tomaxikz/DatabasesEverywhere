@@ -9,7 +9,7 @@ use crate::{
     shared::protocol::Protocol,
 };
 
-pub(super) async fn run_password_worker_with_panic_recovery<T, W, R, RF>(
+pub(super) async fn run_password_worker<T, W, R, RF>(
     locks: &InstanceLocks,
     instance_id: &str,
     worker: W,
@@ -36,7 +36,7 @@ pub(super) enum PasswordWorkerPanicRecoveryPlan {
     },
 }
 
-pub(super) fn classify_password_worker_panic_recovery(
+pub(super) fn plan_panic_recovery(
     persisted: Result<Option<InstanceMetadata>, String>,
     stale_store: Option<&InstanceMetadata>,
 ) -> PasswordWorkerPanicRecoveryPlan {
@@ -55,7 +55,7 @@ pub(super) fn classify_password_worker_panic_recovery(
     }
 }
 
-pub(super) async fn recover_password_worker_panic(state: &AppState, instance_id: &str) -> String {
+pub(super) async fn recover_password_panic(state: &AppState, instance_id: &str) -> String {
     // This durable read runs while the supervisor still owns the instance
     // operation lock. A successful credential commit may have happened just
     // before the worker panicked, while the in-memory store is still stale.
@@ -65,20 +65,19 @@ pub(super) async fn recover_password_worker_panic(state: &AppState, instance_id:
         .await
         .map_err(|error| error.to_string());
     let stale_store = state.instances.get(instance_id).await;
-    match classify_password_worker_panic_recovery(persisted, stale_store.as_ref()) {
+    match plan_panic_recovery(persisted, stale_store.as_ref()) {
         PasswordWorkerPanicRecoveryPlan::QuarantineDurable(metadata) => {
             let result = quarantine_instance(state, &metadata).await;
             password_quarantine_summary(&result)
         }
         PasswordWorkerPanicRecoveryPlan::StopWithoutPersistence { protocol, reason } => {
-            let stop_summary =
-                stop_without_persisting_stale_credentials(state, instance_id, protocol).await;
+            let stop_summary = stop_stale_runtime(state, instance_id, protocol).await;
             format!("{reason}; {stop_summary}")
         }
     }
 }
 
-async fn stop_without_persisting_stale_credentials(
+async fn stop_stale_runtime(
     state: &AppState,
     instance_id: &str,
     protocol: Option<Protocol>,

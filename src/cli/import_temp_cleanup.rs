@@ -59,18 +59,16 @@ struct LogicalRecoveryManifest {
     rollback_file: String,
 }
 
-pub(super) async fn cleanup_orphaned_import_export_staging(
+pub(super) async fn cleanup_orphaned_staging(
     tmp_root: &Path,
 ) -> anyhow::Result<ImportTempCleanupSummary> {
     let root = tmp_root.join("import-export");
-    tokio::task::spawn_blocking(move || {
-        cleanup_root_with_limits(&root, MAX_ROOT_ENTRIES, MAX_TREE_ENTRIES)
-    })
-    .await
-    .context("failed to join logical import staging cleanup")?
+    tokio::task::spawn_blocking(move || cleanup_root(&root, MAX_ROOT_ENTRIES, MAX_TREE_ENTRIES))
+        .await
+        .context("failed to join logical import staging cleanup")?
 }
 
-fn cleanup_root_with_limits(
+fn cleanup_root(
     root: &Path,
     max_root_entries: usize,
     max_tree_entries: usize,
@@ -124,7 +122,7 @@ fn cleanup_root_with_limits(
                 }
             }
             EntryKind::UnarchiveDirectory => {
-                if remove_allowlisted_directory(&entry, max_tree_entries)? {
+                if remove_allowed_dir(&entry, max_tree_entries)? {
                     summary.removed_directories += 1;
                 } else {
                     summary.skipped_entries += 1;
@@ -181,7 +179,7 @@ fn classify_entry(name: &str) -> EntryKind {
     if let Some(recovery_id) = wrapped_v4_uuid(name, ".dbe-import-recovery-", ".json") {
         return EntryKind::Manifest { recovery_id };
     }
-    if atomic_manifest_temporary(name) {
+    if is_temporary_manifest(name) {
         return EntryKind::AtomicManifestTemporary;
     }
     if wrapped_v4_uuid(name, ".dbe-unarchive-", "").is_some() {
@@ -206,7 +204,7 @@ fn dump_temporary(name: &str, prefix: &str) -> bool {
     })
 }
 
-fn atomic_manifest_temporary(name: &str) -> bool {
+fn is_temporary_manifest(name: &str) -> bool {
     let Some(value) = name.strip_prefix("..dbe-import-recovery-") else {
         return false;
     };
@@ -232,11 +230,8 @@ fn is_canonical_v4_uuid(value: &str) -> bool {
 }
 
 fn validate_manifest(entry: &RootEntry, recovery_id: &str) -> anyhow::Result<String> {
-    let contents =
-        crate::shared::files::read_private_regular_file_bounded(&entry.path, MAX_MANIFEST_BYTES)
-            .with_context(|| {
-                format!("failed to read recovery manifest {}", entry.path.display())
-            })?;
+    let contents = crate::shared::files::read_bounded_private_file(&entry.path, MAX_MANIFEST_BYTES)
+        .with_context(|| format!("failed to read recovery manifest {}", entry.path.display()))?;
     let manifest: LogicalRecoveryManifest = serde_json::from_slice(&contents)
         .with_context(|| format!("invalid recovery manifest {}", entry.path.display()))?;
     if manifest.schema_version != 1 || manifest.recovery_kind != "logical_remote_import" {
@@ -282,10 +277,10 @@ fn logical_dump_extension(protocol: Protocol) -> Option<&'static str> {
 
 fn validate_directory_tree(root: &Path, max_entries: usize) -> anyhow::Result<()> {
     let mut scanned = 0_usize;
-    validate_directory_tree_at(root, 0, max_entries, &mut scanned)
+    validate_directory_tree_from(root, 0, max_entries, &mut scanned)
 }
 
-fn validate_directory_tree_at(
+fn validate_directory_tree_from(
     root: &Path,
     depth: usize,
     max_entries: usize,
@@ -319,7 +314,7 @@ fn validate_directory_tree_at(
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect unarchive entry {}", path.display()))?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            validate_directory_tree_at(&path, depth + 1, max_entries, scanned)?;
+            validate_directory_tree_from(&path, depth + 1, max_entries, scanned)?;
         }
     }
     Ok(())
@@ -345,7 +340,7 @@ fn remove_allowlisted_file(entry: &RootEntry) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn remove_allowlisted_directory(entry: &RootEntry, max_entries: usize) -> anyhow::Result<bool> {
+fn remove_allowed_dir(entry: &RootEntry, max_entries: usize) -> anyhow::Result<bool> {
     if entry.file_type.is_symlink() || !entry.file_type.is_dir() {
         return Ok(false);
     }

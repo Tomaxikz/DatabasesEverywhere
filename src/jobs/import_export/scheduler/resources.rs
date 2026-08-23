@@ -126,7 +126,7 @@ fn resource_sample_from_cgroups(
 
     SchedulerResourceSample {
         available_memory_mib: minimum_present(host_memory, memory.value),
-        cpu_units: effective_cpu_sample(host_cpu, cpu.value),
+        cpu_units: cpu_sample(host_cpu, cpu.value),
         memory_valid: memory.valid() && host_memory.is_some(),
         cpu_valid: cpu.valid() && host_cpu.is_some(),
     }
@@ -164,7 +164,7 @@ fn merge_cgroup_readings<T: Ord + Copy>(
     CgroupReading::absent()
 }
 
-fn effective_cpu_sample(host: Option<usize>, cgroup: Option<usize>) -> Option<usize> {
+fn cpu_sample(host: Option<usize>, cgroup: Option<usize>) -> Option<usize> {
     match (host, cgroup) {
         (Some(host), Some(cgroup)) => Some(host.min(cgroup).max(1)),
         (Some(host), None) => Some(host.max(1)),

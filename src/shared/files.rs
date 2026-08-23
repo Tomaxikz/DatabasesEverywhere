@@ -118,7 +118,7 @@ pub fn remove_private_file_durable(_path: &Path) -> Result<(), std::io::Error> {
 /// Opens a private file without following symlinks, verifies it is regular,
 /// flushes its contents, and then flushes the containing directory.
 #[cfg(unix)]
-pub fn sync_private_regular_file_durable(path: &Path) -> Result<(), std::io::Error> {
+pub fn sync_private_file(path: &Path) -> Result<(), std::io::Error> {
     use rustix::fs::{Mode, OFlags};
 
     let parent = path.parent().ok_or_else(|| {
@@ -152,7 +152,7 @@ pub fn sync_private_regular_file_durable(path: &Path) -> Result<(), std::io::Err
 }
 
 #[cfg(not(unix))]
-pub fn sync_private_regular_file_durable(_path: &Path) -> Result<(), std::io::Error> {
+pub fn sync_private_file(_path: &Path) -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "durable private file sync is only available on Unix",
@@ -162,10 +162,7 @@ pub fn sync_private_regular_file_durable(_path: &Path) -> Result<(), std::io::Er
 /// Reads a private regular file through a no-follow descriptor and enforces a hard byte limit
 /// even if the file grows after it is opened.
 #[cfg(unix)]
-pub fn read_private_regular_file_bounded(
-    path: &Path,
-    max_bytes: u64,
-) -> Result<Vec<u8>, std::io::Error> {
+pub fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     use rustix::fs::{Mode, OFlags};
 
     let parent = path.parent().ok_or_else(|| {
@@ -215,10 +212,7 @@ pub fn read_private_regular_file_bounded(
 }
 
 #[cfg(not(unix))]
-pub fn read_private_regular_file_bounded(
-    _path: &Path,
-    _max_bytes: u64,
-) -> Result<Vec<u8>, std::io::Error> {
+pub fn read_bounded_private_file(_path: &Path, _max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "private no-follow reads are only available on Unix",
@@ -290,11 +284,8 @@ mod tests {
         std::fs::write(&regular, b"contents").unwrap();
         symlink(&regular, &linked).unwrap();
 
-        assert_eq!(
-            read_private_regular_file_bounded(&regular, 8).unwrap(),
-            b"contents"
-        );
-        assert!(read_private_regular_file_bounded(&regular, 7).is_err());
-        assert!(read_private_regular_file_bounded(&linked, 8).is_err());
+        assert_eq!(read_bounded_private_file(&regular, 8).unwrap(), b"contents");
+        assert!(read_bounded_private_file(&regular, 7).is_err());
+        assert!(read_bounded_private_file(&linked, 8).is_err());
     }
 }

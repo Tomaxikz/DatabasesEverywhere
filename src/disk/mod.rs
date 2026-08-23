@@ -221,10 +221,7 @@ impl DiskLimiter {
     /// Validate method changes that share the same raw bind path. A native
     /// project quota remains active until explicitly removed; relabelling it
     /// as soft enforcement would be false telemetry and surprising policy.
-    pub fn validate_persisted_method_transition(
-        &self,
-        persisted_method: &str,
-    ) -> Result<(), DiskLimitError> {
+    pub fn check_method_change(&self, persisted_method: &str) -> Result<(), DiskLimitError> {
         if DiskLimitMode::from_persisted_method(persisted_method)
             == Some(DiskLimitMode::ProjectQuota)
             && self.mode() == DiskLimitMode::SoftScanner
@@ -333,10 +330,7 @@ impl DiskLimiter {
     /// Reports whether the per-instance enforcement runtime can be reused
     /// without interrupting its container. Non-FUSE modes have no persistent
     /// helper process to recover.
-    pub async fn instance_runtime_is_healthy(
-        &self,
-        data_path: &Path,
-    ) -> Result<bool, DiskLimitError> {
+    pub async fn runtime_is_healthy(&self, data_path: &Path) -> Result<bool, DiskLimitError> {
         match self.config.mode {
             DiskLimitMode::FuseQuota => {
                 fuse_quota::runtime_is_healthy(data_path, self.fuse_root.as_deref()).await
@@ -349,7 +343,7 @@ impl DiskLimiter {
     /// Detect a legacy FuseQuota mount independently of the per-protocol
     /// effective mode. This is used to migrate Qdrant containers that predate
     /// its FUSE safety exclusion without guessing from metadata.
-    pub fn legacy_fuse_mount_is_present(&self, data_path: &Path) -> Result<bool, DiskLimitError> {
+    pub fn has_legacy_fuse_mount(&self, data_path: &Path) -> Result<bool, DiskLimitError> {
         let mount_path = fuse_quota::mount_path_with_root(data_path, self.fuse_root.as_deref())?;
         mounts::is_mountpoint(&mount_path)
     }
@@ -358,11 +352,11 @@ impl DiskLimiter {
         fuse_quota::mount_path_with_root(data_path, self.fuse_root.as_deref())
     }
 
-    pub async fn teardown_legacy_fuse_mount(&self, data_path: &Path) -> Result<(), DiskLimitError> {
+    pub async fn unmount_legacy_fuse(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         fuse_quota::destroy_with_root(data_path, self.fuse_root.as_deref()).await
     }
 
-    pub async fn apply_legacy_fuse_limit(
+    pub async fn set_legacy_fuse_limit(
         &self,
         data_path: &Path,
         disk_mib: u64,
@@ -448,10 +442,7 @@ impl DiskLimiter {
     /// registry entries, or fail outright for a mounted dataset. Fail before
     /// export or old-container removal until each backend has a transactional
     /// native cutover.
-    pub fn verify_major_upgrade_directory_cutover(
-        &self,
-        data_path: &Path,
-    ) -> Result<(), DiskLimitError> {
+    pub fn check_upgrade_cutover(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode != DiskLimitMode::ProjectQuota {
             return Ok(());
         }
@@ -471,12 +462,12 @@ impl DiskLimiter {
     /// and ZFS attach enforcement to a subvolume/dataset boundary. Reject
     /// those layouts before any data is moved rather than silently admitting
     /// uncharged restored files or relying on a cross-boundary rename.
-    pub fn verify_physical_data_replacement(&self, data_path: &Path) -> Result<(), DiskLimitError> {
+    pub fn check_restore_layout(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode != DiskLimitMode::ProjectQuota {
             return Ok(());
         }
         let mount = mounts::find_mount(data_path)?;
-        verify_project_quota_physical_replacement(data_path, &mount.fstype)
+        check_project_quota_restore(data_path, &mount.fstype)
     }
 
     pub async fn instance_usage_bytes(
@@ -496,7 +487,7 @@ impl DiskLimiter {
 }
 
 pub(super) fn privileged_command(program: &'static str) -> Command {
-    if use_sudo_for_disk_commands() {
+    if should_use_sudo() {
         let mut command = Command::new("sudo");
         command.arg("-n").arg(program);
         command
@@ -505,10 +496,7 @@ pub(super) fn privileged_command(program: &'static str) -> Command {
     }
 }
 
-fn verify_project_quota_physical_replacement(
-    data_path: &Path,
-    fstype: &str,
-) -> Result<(), DiskLimitError> {
+fn check_project_quota_restore(data_path: &Path, fstype: &str) -> Result<(), DiskLimitError> {
     if fstype == "xfs" {
         return Ok(());
     }
@@ -520,14 +508,14 @@ fn verify_project_quota_physical_replacement(
 
 pub(super) fn displayed_privileged_command(program: &str, args: impl AsRef<str>) -> String {
     let args = args.as_ref();
-    if use_sudo_for_disk_commands() {
+    if should_use_sudo() {
         format!("sudo -n {program} {args}")
     } else {
         format!("{program} {args}")
     }
 }
 
-fn use_sudo_for_disk_commands() -> bool {
+fn should_use_sudo() -> bool {
     matches!(
         std::env::var("DBE_USE_SUDO").as_deref(),
         Ok("1" | "true" | "yes")
@@ -747,9 +735,7 @@ mod detection_tests {
             "host_zfs_refquota",
         ] {
             assert!(
-                limiter
-                    .validate_persisted_method_transition(method)
-                    .is_err(),
+                limiter.check_method_change(method).is_err(),
                 "{method} must remain a native project-quota mode"
             );
             assert_eq!(
@@ -757,20 +743,16 @@ mod detection_tests {
                 DiskLimitMode::ProjectQuota
             );
         }
-        assert!(
-            limiter
-                .validate_persisted_method_transition("soft_scanner")
-                .is_ok()
-        );
+        assert!(limiter.check_method_change("soft_scanner").is_ok());
     }
 
     #[test]
     fn physical_replacement_rejects_non_recursive_native_quota_backends() {
         let data = Path::new("/srv/dbev/volumes/inst_1");
 
-        assert!(verify_project_quota_physical_replacement(data, "xfs").is_ok());
+        assert!(check_project_quota_restore(data, "xfs").is_ok());
         for fstype in ["ext4", "f2fs", "btrfs", "zfs"] {
-            let error = verify_project_quota_physical_replacement(data, fstype).unwrap_err();
+            let error = check_project_quota_restore(data, fstype).unwrap_err();
             assert!(matches!(
                 error,
                 DiskLimitError::UnsupportedPhysicalDataReplacement {
@@ -789,9 +771,7 @@ mod detection_tests {
             ..DiskConfig::default()
         });
 
-        let error = limiter
-            .verify_major_upgrade_directory_cutover(data)
-            .unwrap_err();
+        let error = limiter.check_upgrade_cutover(data).unwrap_err();
         assert!(error.to_string().contains("transactional native-quota"));
     }
 

@@ -166,7 +166,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
 
     HostPathPolicy::validate(&config.paths)?;
     validate_images(&config.images)?;
-    validate_mongodb_kernel_compatibility(&config.images.mongodb)?;
+    check_mongodb_kernel(&config.images.mongodb)?;
 
     Ok(())
 }
@@ -473,7 +473,7 @@ fn validate_image_reference(field: &'static str, image: &str) -> Result<(), Conf
     })
 }
 
-fn validate_mongodb_kernel_compatibility(image: &str) -> Result<(), ConfigValidationError> {
+fn check_mongodb_kernel(image: &str) -> Result<(), ConfigValidationError> {
     let Some(kernel) = linux_kernel_release() else {
         return Ok(());
     };

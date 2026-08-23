@@ -265,7 +265,7 @@ pub fn backend_handshake_response(
     // Authenticate the public client before trusting any backend response. This
     // is required even when MySQL advertises caching_sha2_password first and
     // will subsequently switch this native-password tenant to its real plugin.
-    let _ = native_password_token_from_client_token(
+    let _ = derive_native_backend_token(
         &route.auth_response,
         gateway_seed,
         gateway_seed,
@@ -281,7 +281,7 @@ pub fn backend_handshake_response(
     }
 
     let auth_response = if handshake.auth_plugin == NATIVE_PASSWORD_PLUGIN {
-        native_password_token_from_client_token(
+        derive_native_backend_token(
             &route.auth_response,
             gateway_seed,
             &handshake.auth_seed,
@@ -326,7 +326,7 @@ pub fn backend_auth_switch_response(
     backend_password: Option<&str>,
 ) -> Result<Vec<u8>, MariadbProxyError> {
     match handshake.auth_plugin.as_str() {
-        NATIVE_PASSWORD_PLUGIN => native_password_token_from_client_token(
+        NATIVE_PASSWORD_PLUGIN => derive_native_backend_token(
             &route.auth_response,
             gateway_seed,
             &handshake.auth_seed,
@@ -442,7 +442,7 @@ pub fn caching_sha2_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-pub fn native_password_token_from_client_token(
+pub fn derive_native_backend_token(
     client_token: &[u8],
     gateway_seed: &[u8],
     backend_seed: &[u8],
@@ -718,13 +718,9 @@ mod tests {
         let client_token = native_password_token(password, &gateway_seed);
         let stage_2 = native_password_sha1_stage2_hex(password);
 
-        let derived = native_password_token_from_client_token(
-            &client_token,
-            &gateway_seed,
-            backend_seed,
-            &stage_2,
-        )
-        .unwrap();
+        let derived =
+            derive_native_backend_token(&client_token, &gateway_seed, backend_seed, &stage_2)
+                .unwrap();
 
         assert_eq!(derived, native_password_token(password, backend_seed));
     }
@@ -737,7 +733,7 @@ mod tests {
         client_token[0] ^= 0x55;
         let stage_2 = native_password_sha1_stage2_hex(password);
 
-        let error = native_password_token_from_client_token(
+        let error = derive_native_backend_token(
             &client_token,
             &gateway_seed,
             b"backend-seed-1234567",

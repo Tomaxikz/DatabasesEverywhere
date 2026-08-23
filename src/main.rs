@@ -8,7 +8,7 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    databases_everywhere::cli::harden_process_file_creation();
+    databases_everywhere::cli::set_safe_umask();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

@@ -7,9 +7,7 @@ use std::sync::{
 };
 
 mod supervision;
-use supervision::{
-    block_uncertain_upload, spawn_export_job_supervisor, spawn_import_job_supervisor,
-};
+use supervision::{block_uncertain_upload, spawn_export_supervisor, spawn_import_supervisor};
 
 pub(super) const MAX_REPLAY_OPTIONS_BYTES: usize = 64 * 1024;
 const IMPORT_WORKER_QUEUED: u8 = 0;
@@ -18,7 +16,7 @@ const IMPORT_WORKER_FINISHED: u8 = 2;
 const MAX_ENQUEUE_READBACK_DELAY_MS: u64 = 1_000;
 const LOGICAL_EXPORT_BASE_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn fixed_scheduler_capacity_error() -> ApiError {
+fn scheduler_capacity_error() -> ApiError {
     ApiError::Conflict(
         "the estimated operation exceeds a fixed dynamic import/export scheduler budget; increase the configured dynamic memory, I/O, or CPU budget, reduce the operation size, or use a deliberate manual concurrency limit"
             .to_string(),
@@ -40,7 +38,7 @@ pub async fn export_instance(
         Some(request) => ExportArchiveFormat::detect(request.archive_format.as_deref())?,
         None => ExportArchiveFormat::Plain,
     };
-    queue_export_instance_with_options(
+    queue_export(
         &state,
         &instance_id,
         ExportOptions {
@@ -52,7 +50,7 @@ pub async fn export_instance(
     .await
 }
 
-pub(crate) async fn export_instance_to_default_artifact(
+pub(crate) async fn export_default_artifact(
     state: &AppState,
     instance_id: &str,
 ) -> Result<PathBuf, ApiError> {
@@ -69,7 +67,7 @@ pub(crate) async fn export_instance_to_default_artifact(
         ExportDelivery::InternalRetained,
     )
     .await?;
-    export_instance_artifact(
+    export_artifact(
         state,
         &metadata.instance_id,
         artifact_path.clone(),
@@ -79,12 +77,12 @@ pub(crate) async fn export_instance_to_default_artifact(
     Ok(artifact_path)
 }
 
-pub(crate) async fn import_default_artifact_into_metadata(
+pub(crate) async fn register_default_artifact(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_path: &FsPath,
 ) -> Result<(), ApiError> {
-    import_instance_artifact(
+    import_artifact(
         state,
         &metadata.instance_id,
         metadata,
@@ -95,7 +93,7 @@ pub(crate) async fn import_default_artifact_into_metadata(
     .await
 }
 
-pub(crate) async fn queue_export_instance_with_options(
+pub(crate) async fn queue_export(
     state: &AppState,
     instance_id: &str,
     mut options: ExportOptions,
@@ -105,8 +103,7 @@ pub(crate) async fn queue_export_instance_with_options(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    options.archive_format =
-        normalized_export_archive_format(metadata.protocol, options.archive_format);
+    options.archive_format = export_archive_format(metadata.protocol, options.archive_format);
     options.delivery = ExportDelivery::for_client(state);
     if matches!(
         metadata.protocol,
@@ -119,7 +116,7 @@ pub(crate) async fn queue_export_instance_with_options(
         )));
     }
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Export)?;
-    crate::api::artifacts::ensure_client_export_slot(state, &metadata.instance_id).await?;
+    crate::api::artifacts::check_export_slot(state, &metadata.instance_id).await?;
     let artifact_path = export_artifact_path(
         state,
         &metadata.instance_id,
@@ -142,7 +139,7 @@ pub(crate) async fn queue_export_instance_with_options(
             Some(replay_options),
         )
         .await?;
-        spawn_export_job_supervisor(
+        spawn_export_supervisor(
             owned_state,
             job.job_id.clone(),
             metadata.instance_id,
@@ -153,7 +150,7 @@ pub(crate) async fn queue_export_instance_with_options(
         audit_import_export(&job, "queued");
         Ok::<_, ApiError>(job)
     });
-    let job = await_enqueue_supervisor(supervisor).await?;
+    let job = wait_for_enqueue(supervisor).await?;
     Ok(accepted_job_response(job).await)
 }
 
@@ -170,7 +167,7 @@ pub(crate) async fn queue_import_instance(
     let mut options =
         harden_import_options(state, &metadata.instance_id, metadata.protocol, options).await?;
     validate_selection(metadata.protocol, &options.selection, SelectionUse::Import)?;
-    let resolved_source_database = super::uploads::resolve_upload_source_database_catalog(
+    let resolved_source_database = super::uploads::resolve_upload_catalog(
         state,
         &metadata.instance_id,
         &options.source,
@@ -186,7 +183,7 @@ pub(crate) async fn queue_import_instance(
     )
     .await?;
     let upload_staging = if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
-        let prepared_bytes = upload_prepared_reservation_bytes(state, &options).await;
+        let prepared_bytes = prepared_upload_bytes(state, &options).await;
         match upload_logical_staging_budget(state, &metadata, options.mode, prepared_bytes).await? {
             Some(budget) => Some(UploadStagingBudget::Logical {
                 budget,
@@ -255,7 +252,7 @@ pub(crate) async fn queue_import_instance(
             replay_options,
         )
         .await?;
-        spawn_import_job_supervisor(
+        spawn_import_supervisor(
             owned_state,
             job.job_id.clone(),
             metadata.instance_id,
@@ -266,11 +263,11 @@ pub(crate) async fn queue_import_instance(
         audit_import_export(&job, "queued");
         Ok::<_, ApiError>(job)
     });
-    let job = await_enqueue_supervisor(supervisor).await?;
+    let job = wait_for_enqueue(supervisor).await?;
     Ok(accepted_job_response(job).await)
 }
 
-async fn await_enqueue_supervisor(
+async fn wait_for_enqueue(
     supervisor: tokio::task::JoinHandle<Result<ImportExportJob, ApiError>>,
 ) -> Result<ImportExportJob, ApiError> {
     supervisor.await.map_err(|error| {
@@ -278,7 +275,7 @@ async fn await_enqueue_supervisor(
     })?
 }
 
-async fn upload_prepared_reservation_bytes(state: &AppState, options: &ImportOptions) -> u64 {
+async fn prepared_upload_bytes(state: &AppState, options: &ImportOptions) -> u64 {
     let maximum = state.config.artifacts.import_upload_max_bytes;
     let ImportSourceOptions::Upload { path, .. } = &options.source else {
         return maximum;
@@ -488,7 +485,7 @@ pub(crate) async fn replay_failed_job(
                 archive_format,
             },
         ) => {
-            queue_export_instance_with_options(
+            queue_export(
                 state,
                 &job.instance_id,
                 ExportOptions {
@@ -565,7 +562,7 @@ pub(super) async fn run_export_job_locked(
         match crate::api::instances::reconcile_instance_locked(&state, &metadata.instance_id).await
         {
             Ok(_) => {
-                export_instance_artifact_reserved(
+                write_reserved_export(
                     &state,
                     &metadata,
                     artifact_path.clone(),
@@ -608,7 +605,7 @@ pub(super) async fn run_import_job_locked(
             .await;
             if !persisted
                 && let Err(quarantine_error) =
-                    quarantine_after_uncertain_import(&state, &instance_id).await
+                    quarantine_uncertain_import(&state, &instance_id).await
             {
                 tracing::error!(%job_id, %instance_id, %quarantine_error, "failed to quarantine a target after unresolved import status became uncertain");
             }
@@ -642,7 +639,7 @@ pub(super) async fn run_import_job_locked(
             )
             .await;
         }
-        if let Err(error) = quarantine_after_uncertain_import(&state, &instance_id).await {
+        if let Err(error) = quarantine_uncertain_import(&state, &instance_id).await {
             tracing::error!(%job_id, instance_id, %error, "failed to fully quarantine an import with uncertain terminal job persistence");
         }
         return;
@@ -737,7 +734,7 @@ async fn acquire_upload_staging(
     }
     let requested = match &options.source {
         ImportSourceOptions::Artifact(path) => {
-            let prepared = if import_source_is_compressed(metadata.protocol, options) {
+            let prepared = if is_compressed_import(metadata.protocol, options) {
                 MAX_UNARCHIVED_BYTES
             } else {
                 tokio::fs::metadata(path)
@@ -748,7 +745,7 @@ async fn acquire_upload_staging(
                     .unwrap_or(MAX_UNARCHIVED_BYTES)
             };
             let rollback = if options.mode == ImportMode::Wipe {
-                measured_logical_export_capacity_bytes(state, &metadata).await?
+                measure_export_bytes(state, &metadata).await?
             } else {
                 0
             };
@@ -756,7 +753,7 @@ async fn acquire_upload_staging(
                 ApiError::Conflict("logical import staging reservation overflowed".to_string())
             })?
         }
-        ImportSourceOptions::Remote(_) => remote_import_staging_reservation_bytes(
+        ImportSourceOptions::Remote(_) => import_staging_bytes(
             metadata.protocol,
             state.config.security.remote_import.max_staged_bytes,
         )?,
@@ -779,7 +776,7 @@ async fn acquire_upload_staging(
         .map(Some)
 }
 
-pub(super) fn remote_import_staging_reservation_bytes(
+pub(super) fn import_staging_bytes(
     protocol: Protocol,
     max_staged_bytes: u64,
 ) -> Result<u64, ApiError> {
@@ -796,7 +793,7 @@ pub(super) fn remote_import_staging_reservation_bytes(
     })
 }
 
-pub(super) fn import_source_is_compressed(protocol: Protocol, options: &ImportOptions) -> bool {
+pub(super) fn is_compressed_import(protocol: Protocol, options: &ImportOptions) -> bool {
     protocol_uses_native_compression(protocol)
         || options.archive_format.is_some()
         || match &options.source {
@@ -811,7 +808,7 @@ pub(super) fn import_source_is_compressed(protocol: Protocol, options: &ImportOp
         }
 }
 
-async fn estimate_export_execution_cost(
+async fn estimate_export_cost(
     state: &AppState,
     metadata: &InstanceMetadata,
     options: &ExportOptions,
@@ -842,7 +839,7 @@ async fn estimate_export_execution_cost(
     })
 }
 
-async fn estimate_import_execution_cost(
+async fn estimate_import_cost(
     state: &AppState,
     metadata: &InstanceMetadata,
     options: &ImportOptions,
@@ -860,9 +857,8 @@ async fn estimate_import_execution_cost(
         }
         ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => remote_limit,
     };
-    let compressed = import_source_is_compressed(metadata.protocol, options);
-    let prepared_ceiling =
-        import_prepared_ceiling_bytes(options, upload_limit, remote_limit, compressed);
+    let compressed = is_compressed_import(metadata.protocol, options);
+    let prepared_ceiling = prepared_import_bytes(options, upload_limit, remote_limit, compressed);
     // A compressed dump has no trustworthy expansion ratio until bounded
     // extraction completes. Charge the configured prepared-data ceiling so a
     // tiny gzip bomb cannot evade resource scheduling.
@@ -875,7 +871,7 @@ async fn estimate_import_execution_cost(
     );
     let rollback_size_bytes =
         if options.mode == ImportMode::Wipe && protocol_uses_logical_dumps(metadata.protocol) {
-            estimated_logical_rollback_bytes(metadata)
+            estimate_rollback_bytes(metadata)
         } else {
             0
         };
@@ -889,7 +885,7 @@ async fn estimate_import_execution_cost(
     })
 }
 
-pub(super) fn import_prepared_ceiling_bytes(
+pub(super) fn prepared_import_bytes(
     options: &ImportOptions,
     upload_limit: u64,
     remote_limit: u64,
@@ -913,7 +909,7 @@ pub(super) fn import_prepared_ceiling_bytes(
     .max(1)
 }
 
-fn estimated_logical_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
+fn estimate_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
     metadata
         .limits
         .disk_mib
@@ -936,7 +932,7 @@ pub(super) async fn begin_import_export_job(state: &AppState, job_id: &str) -> J
                 "shutdown",
                 "daemon shutdown began before the queued job started",
             );
-            return if persist_terminal_job_status(
+            return if save_terminal_job_status(
                 state,
                 job_id,
                 ImportExportStatus::Failed,
@@ -977,7 +973,7 @@ pub(super) async fn update_job_result(
     match result {
         Ok(()) => {
             tracing::info!(%job_id, "audit import_export_job_succeeded");
-            persist_terminal_job_status(
+            save_terminal_job_status(
                 state,
                 job_id,
                 ImportExportStatus::Succeeded,
@@ -989,7 +985,7 @@ pub(super) async fn update_job_result(
         Err(error) => {
             tracing::warn!(%job_id, %error, "audit import_export_job_failed");
             let diagnostic = PublicDiagnostic::from_api_error("import/export operation", &error);
-            persist_terminal_job_status(
+            save_terminal_job_status(
                 state,
                 job_id,
                 ImportExportStatus::Failed,
@@ -1001,7 +997,7 @@ pub(super) async fn update_job_result(
     }
 }
 
-async fn persist_terminal_job_status(
+async fn save_terminal_job_status(
     state: &AppState,
     job_id: &str,
     status: ImportExportStatus,
@@ -1035,7 +1031,7 @@ async fn persist_terminal_job_status(
     }
 }
 
-pub(super) async fn export_instance_artifact(
+pub(super) async fn export_artifact(
     state: &AppState,
     instance_id: &str,
     artifact_path: PathBuf,
@@ -1046,9 +1042,8 @@ pub(super) async fn export_instance_artifact(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let reservations =
-        acquire_export_output_capacity(state, &metadata, &artifact_path, options).await?;
-    export_instance_artifact_reserved(
+    let reservations = reserve_export_capacity(state, &metadata, &artifact_path, options).await?;
+    write_reserved_export(
         state,
         &metadata,
         artifact_path,
@@ -1064,10 +1059,7 @@ pub(super) struct ExportOutputReservations {
     logical_output_capacity: Option<u64>,
 }
 
-pub(super) fn estimated_logical_export_capacity_bytes(
-    protocol: Protocol,
-    database_used_bytes: u64,
-) -> u64 {
+pub(super) fn estimate_export_bytes(protocol: Protocol, database_used_bytes: u64) -> u64 {
     let expansion_factor = match protocol {
         Protocol::Mongodb => 2,
         Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Clickhouse => 4,
@@ -1079,14 +1071,14 @@ pub(super) fn estimated_logical_export_capacity_bytes(
         .clamp(LOGICAL_EXPORT_BASE_ALLOWANCE_BYTES, MAX_UNARCHIVED_BYTES)
 }
 
-pub(super) fn logical_export_needs_separate_staging_reservation(
+pub(super) fn needs_separate_export_staging(
     archive_format: ExportArchiveFormat,
     roots_share_filesystem: bool,
 ) -> bool {
     archive_format != ExportArchiveFormat::Plain || !roots_share_filesystem
 }
 
-pub(super) async fn measured_logical_export_capacity_bytes(
+pub(super) async fn measure_export_bytes(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<u64, ApiError> {
@@ -1102,21 +1094,21 @@ pub(super) async fn measured_logical_export_capacity_bytes(
             ))
         })?
         .used_bytes;
-    Ok(estimated_logical_export_capacity_bytes(
+    Ok(estimate_export_bytes(
         metadata.protocol,
         database_used_bytes,
     ))
 }
 
-pub(super) async fn acquire_export_output_capacity(
+pub(super) async fn reserve_export_capacity(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_path: &FsPath,
     options: &ExportOptions,
 ) -> Result<ExportOutputReservations, ApiError> {
-    validate_logical_operation_eligible(metadata)?;
+    check_logical_ready(metadata)?;
     if options.delivery.is_client() {
-        crate::api::artifacts::ensure_client_export_slot(state, &metadata.instance_id).await?;
+        crate::api::artifacts::check_export_slot(state, &metadata.instance_id).await?;
     }
     let artifact_root = artifact_path
         .parent()
@@ -1128,7 +1120,7 @@ pub(super) async fn acquire_export_output_capacity(
     let logical_output_capacity = if physical {
         None
     } else {
-        Some(measured_logical_export_capacity_bytes(state, metadata).await?)
+        Some(measure_export_bytes(state, metadata).await?)
     };
     let output_capacity = match logical_output_capacity {
         None => metadata
@@ -1154,10 +1146,7 @@ pub(super) async fn acquire_export_output_capacity(
             .import_uploads
             .output_roots_share_filesystem(artifact_root, &staging_root)
             .await?;
-        if logical_export_needs_separate_staging_reservation(
-            options.archive_format,
-            roots_share_filesystem,
-        ) {
+        if needs_separate_export_staging(options.archive_format, roots_share_filesystem) {
             Some(
                 state
                     .import_uploads
@@ -1177,7 +1166,7 @@ pub(super) async fn acquire_export_output_capacity(
     })
 }
 
-pub(super) async fn export_instance_artifact_reserved(
+pub(super) async fn write_reserved_export(
     state: &AppState,
     metadata: &InstanceMetadata,
     artifact_path: PathBuf,
@@ -1214,11 +1203,11 @@ pub(super) async fn export_artifact_path(
     crate::shared::ids::validate_instance_id(instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let export_root = if delivery.is_one_use() {
-        crate::api::artifacts::instance_one_use_export_root(state, instance_id)
+        crate::api::artifacts::instance_spool_root(state, instance_id)
     } else {
         crate::api::artifacts::instance_export_root(state, instance_id)
     };
-    create_private_directory(&export_root, "export directory").await?;
+    prepare_private_dir(&export_root, "export directory").await?;
     let artifact_id = uuid::Uuid::new_v4();
     Ok(export_root.join(format!(
         "{}.{}{}",

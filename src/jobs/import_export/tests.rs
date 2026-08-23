@@ -25,7 +25,7 @@ fn extracts_archive_entries_without_unpack() {
     let target = dir.path().join("target");
     write_archive(&archive_path, "data/file.txt", b"ok");
 
-    extract_data_archive_blocking(&archive_path, &target, "data").unwrap();
+    extract_archive_blocking(&archive_path, &target, "data").unwrap();
 
     assert_eq!(std::fs::read(target.join("data/file.txt")).unwrap(), b"ok");
 }
@@ -66,7 +66,7 @@ fn bounded_physical_extraction_accepts_exact_limit() {
     let target = dir.path().join("target");
     write_archive(&archive_path, "data/file.txt", b"12345678");
 
-    extract_data_archive_bounded_blocking(
+    extract_bounded_archive_blocking(
         &archive_path,
         &target,
         "data",
@@ -89,7 +89,7 @@ fn bounded_physical_extraction_rejects_before_oversized_file_is_written() {
     write_archive(&archive_path, "data/file.txt", b"12345678");
 
     let limit = DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES + 7;
-    let error = extract_data_archive_bounded_blocking(
+    let error = extract_bounded_archive_blocking(
         &archive_path,
         &target,
         "data",
@@ -122,8 +122,8 @@ fn physical_backup_preserves_internal_source_symlinks() {
     let artifact = dir.path().join("backup.tar.gz");
     let restored = dir.path().join("restored");
 
-    create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap();
-    extract_data_archive_blocking(&artifact, &restored, "data").unwrap();
+    create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap();
+    extract_archive_blocking(&artifact, &restored, "data").unwrap();
 
     let link = restored.join("data/metadata/database/table");
     assert_eq!(
@@ -148,8 +148,8 @@ fn physical_backup_rejects_source_symlinks_that_escape_data_root() {
     symlink("../secret", data.join("escape")).unwrap();
     let artifact = dir.path().join("backup.tar.gz");
 
-    let error = create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict)
-        .unwrap_err();
+    let error =
+        create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap_err();
 
     assert!(error.to_string().contains("escapes data root"));
     assert!(!artifact.exists());
@@ -168,13 +168,13 @@ fn mysql_physical_backup_omits_only_the_image_runtime_socket_link() {
     std::fs::write(data.join("ibdata1"), b"mysql data").unwrap();
     symlink("/var/run/mysqld/mysqld.sock", data.join("mysql.sock")).unwrap();
 
-    create_data_archive_blocking(
+    create_archive_blocking(
         &data,
         &artifact,
         DataArchiveSourcePolicy::MysqlDataDirectory,
     )
     .unwrap();
-    extract_data_archive_blocking(&artifact, &restored, "data").unwrap();
+    extract_archive_blocking(&artifact, &restored, "data").unwrap();
 
     assert_eq!(
         std::fs::read(restored.join("data/ibdata1")).unwrap(),
@@ -194,7 +194,7 @@ fn mysql_physical_backup_rejects_unexpected_socket_link_targets() {
     std::fs::create_dir(&data).unwrap();
     symlink("/tmp/untrusted.sock", data.join("mysql.sock")).unwrap();
 
-    let error = create_data_archive_blocking(
+    let error = create_archive_blocking(
         &data,
         &artifact,
         DataArchiveSourcePolicy::MysqlDataDirectory,
@@ -218,7 +218,7 @@ fn physical_restore_enforces_trusted_and_untrusted_symlink_policies() {
     let target = dir.path().join("target");
     write_symlink_archive(&lexically_safe, "data/self", ".");
 
-    let error = extract_data_archive_bounded_blocking(
+    let error = extract_bounded_archive_blocking(
         &lexically_safe,
         &target,
         "data",
@@ -242,7 +242,7 @@ fn physical_backup_artifact_is_owner_only() {
     std::fs::create_dir(&data).unwrap();
     std::fs::write(data.join("file"), b"contents").unwrap();
 
-    create_data_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap();
+    create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap();
 
     assert_eq!(
         std::fs::metadata(artifact).unwrap().permissions().mode() & 0o777,
@@ -259,7 +259,7 @@ fn bounded_physical_backup_removes_partial_artifact() {
     std::fs::write(data.join("file"), b"contents").unwrap();
 
     let error =
-        create_data_archive_bounded_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict, 1)
+        create_bounded_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict, 1)
             .unwrap_err();
 
     assert!(

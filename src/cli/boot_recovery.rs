@@ -1,10 +1,10 @@
 use super::*;
 
-pub(super) async fn complete_managed_runtime_boot(state: AppState) {
+pub(super) async fn finish_runtime_boot(state: AppState) {
     let Some(_mutation) = state.daemon_shutdown.try_admit_background_mutation() else {
         return;
     };
-    if let Err(error) = start_known_instances_on_boot(
+    if let Err(error) = start_known_instances(
         &state.config,
         &state.manager,
         &state.docker,
@@ -25,7 +25,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
-    let compatibility = crate::compatibility::reconcile_managed_compatibility_on_boot(&state).await;
+    let compatibility = crate::compatibility::sync_compatibility(&state).await;
     if compatibility.failed == 0 {
         tracing::info!(
             checked = compatibility.checked,
@@ -53,7 +53,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
     }
 
     let (qdrant_bridges_checked, qdrant_bridge_cleanup_errors) =
-        cleanup_stale_qdrant_import_bridges_on_boot(&state).await;
+        cleanup_stale_qdrant_bridges(&state).await;
     if qdrant_bridge_cleanup_errors > 0 {
         tracing::warn!(
             qdrant_bridges_checked,
@@ -110,8 +110,7 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         return;
     }
 
-    let mysql_auth_hardening =
-        crate::api::instance_create::harden_mysql_accounts_on_boot(&state).await;
+    let mysql_auth_hardening = crate::api::instance_create::harden_mysql_accounts(&state).await;
     for failure in &mysql_auth_hardening.failures {
         tracing::debug!(
             instance_id = %failure.instance_id,
@@ -156,13 +155,11 @@ pub(super) async fn complete_managed_runtime_boot(state: AppState) {
         );
         return;
     }
-    log_gateway_listener_summary(&state.config);
+    log_gateway_listeners(&state.config);
     crate::api::backups::start_scheduler(state);
 }
 
-pub(super) async fn cleanup_stale_qdrant_import_bridges_on_boot(
-    state: &AppState,
-) -> (usize, usize) {
+pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, usize) {
     let instance_ids = state
         .instances
         .list()
@@ -180,7 +177,7 @@ pub(super) async fn cleanup_stale_qdrant_import_bridges_on_boot(
             if metadata.protocol != Protocol::Qdrant || metadata.status != InstanceStatus::Running {
                 return Ok(false);
             }
-            crate::api::remote_import::cleanup_stale_qdrant_bridge(state, &instance_id)
+            crate::api::remote_import::cleanup_stale_bridge(state, &instance_id)
                 .await
                 .map(|()| true)
                 .map_err(|error| (instance_id, error))
@@ -208,7 +205,7 @@ pub(super) async fn cleanup_stale_qdrant_import_bridges_on_boot(
     (checked, errors)
 }
 
-pub(super) async fn quarantine_interrupted_job_instances(
+pub(super) async fn quarantine_interrupted_jobs(
     manager: &InstanceManager,
     instance_ids: &[String],
 ) -> anyhow::Result<usize> {
@@ -240,7 +237,7 @@ pub(super) async fn quarantine_interrupted_job_instances(
     Ok(quarantined)
 }
 
-pub(super) async fn quarantine_retained_physical_restore_workspaces(
+pub(super) async fn quarantine_restore_workspaces(
     manager: &InstanceManager,
     volumes_root: &Path,
 ) -> anyhow::Result<usize> {
@@ -275,7 +272,7 @@ pub(super) async fn quarantine_retained_physical_restore_workspaces(
                 MAX_SCANNED_ENTRIES
             );
         }
-        let Some(instance_id) = physical_restore_workspace_instance_id(&entry.file_name()) else {
+        let Some(instance_id) = workspace_instance_id(&entry.file_name()) else {
             continue;
         };
         let file_type = entry.file_type().await.with_context(|| {
@@ -326,7 +323,7 @@ pub(super) async fn quarantine_retained_physical_restore_workspaces(
     Ok(quarantined)
 }
 
-pub(super) fn physical_restore_workspace_instance_id(name: &std::ffi::OsStr) -> Option<String> {
+pub(super) fn workspace_instance_id(name: &std::ffi::OsStr) -> Option<String> {
     const PREFIX: &str = ".dbe-restore-";
     const UUID_LENGTH: usize = 36;
 
@@ -356,7 +353,7 @@ pub(super) struct RetainedImportRecoveryIdentity {
     protocol: String,
 }
 
-pub(super) async fn quarantine_retained_import_recovery_manifests(
+pub(super) async fn quarantine_import_manifests(
     manager: &InstanceManager,
     tmp_root: &Path,
 ) -> anyhow::Result<usize> {
@@ -366,7 +363,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
 
     let root = tmp_root.join("import-export");
     let mut manifests = Vec::new();
-    collect_logical_recovery_manifests(
+    collect_logical_manifests(
         &root,
         &mut manifests,
         MAX_MANIFESTS,
@@ -374,7 +371,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
     )
     .await?;
     let remote_root = tmp_root.join("remote-import");
-    collect_remote_recovery_manifests(
+    collect_remote_manifests(
         &remote_root,
         &mut manifests,
         MAX_MANIFESTS,
@@ -387,10 +384,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
     for path in manifests {
         let manifest_path = path.clone();
         let contents = tokio::task::spawn_blocking(move || {
-            crate::shared::files::read_private_regular_file_bounded(
-                &manifest_path,
-                MAX_MANIFEST_BYTES,
-            )
+            crate::shared::files::read_bounded_private_file(&manifest_path, MAX_MANIFEST_BYTES)
         })
         .await
         .with_context(|| format!("failed to join recovery manifest read {}", path.display()))?
@@ -417,7 +411,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
             .protocol
             .parse::<Protocol>()
             .with_context(|| format!("invalid protocol in {}", path.display()))?;
-        if !recovery_kind_matches_protocol(&identity.recovery_kind, manifest_protocol) {
+        if !recovery_matches_protocol(&identity.recovery_kind, manifest_protocol) {
             anyhow::bail!(
                 "recovery kind and protocol do not match in {}",
                 path.display()
@@ -467,7 +461,7 @@ pub(super) async fn quarantine_retained_import_recovery_manifests(
     Ok(quarantined)
 }
 
-pub(super) async fn collect_logical_recovery_manifests(
+pub(super) async fn collect_logical_manifests(
     root: &Path,
     manifests: &mut Vec<PathBuf>,
     max_manifests: usize,
@@ -496,14 +490,14 @@ pub(super) async fn collect_logical_recovery_manifests(
             );
         }
         let name = entry.file_name();
-        if is_generated_logical_recovery_manifest_name(&name) {
+        if is_recovery_manifest(&name) {
             push_recovery_manifest(manifests, entry.path(), max_manifests)?;
         }
     }
     Ok(())
 }
 
-pub(super) async fn collect_remote_recovery_manifests(
+pub(super) async fn collect_remote_manifests(
     root: &Path,
     manifests: &mut Vec<PathBuf>,
     max_manifests: usize,
@@ -531,7 +525,7 @@ pub(super) async fn collect_remote_recovery_manifests(
                 max_scanned_entries
             );
         }
-        if !is_canonical_uuid_file_name(&entry.file_name()) {
+        if !is_uuid_filename(&entry.file_name()) {
             continue;
         }
         let directory = entry.path();
@@ -575,7 +569,7 @@ pub(super) fn push_recovery_manifest(
     Ok(())
 }
 
-pub(super) fn is_generated_logical_recovery_manifest_name(name: &std::ffi::OsStr) -> bool {
+pub(super) fn is_recovery_manifest(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -588,7 +582,7 @@ pub(super) fn is_generated_logical_recovery_manifest_name(name: &std::ffi::OsStr
     is_canonical_uuid(uuid)
 }
 
-pub(super) fn is_canonical_uuid_file_name(name: &std::ffi::OsStr) -> bool {
+pub(super) fn is_uuid_filename(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(is_canonical_uuid)
 }
 
@@ -597,7 +591,7 @@ pub(super) fn is_canonical_uuid(value: &str) -> bool {
         && uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
 }
 
-pub(super) fn recovery_kind_matches_protocol(kind: &str, protocol: Protocol) -> bool {
+pub(super) fn recovery_matches_protocol(kind: &str, protocol: Protocol) -> bool {
     match kind {
         "logical_remote_import" => !matches!(
             protocol,

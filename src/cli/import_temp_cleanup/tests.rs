@@ -39,16 +39,16 @@ fn missing_and_empty_roots_are_idempotent() {
     let missing = temp.path().join("missing");
 
     assert_eq!(
-        cleanup_root_with_limits(&missing, 8, 8).unwrap(),
+        cleanup_root(&missing, 8, 8).unwrap(),
         ImportTempCleanupSummary::default()
     );
     fs::create_dir(&missing).unwrap();
     assert_eq!(
-        cleanup_root_with_limits(&missing, 8, 8).unwrap(),
+        cleanup_root(&missing, 8, 8).unwrap(),
         ImportTempCleanupSummary::default()
     );
     assert_eq!(
-        cleanup_root_with_limits(&missing, 8, 8).unwrap(),
+        cleanup_root(&missing, 8, 8).unwrap(),
         ImportTempCleanupSummary::default()
     );
 }
@@ -64,13 +64,13 @@ fn root_must_be_a_real_directory() {
     symlink(&real, &linked).unwrap();
 
     assert!(
-        cleanup_root_with_limits(&linked, 8, 8)
+        cleanup_root(&linked, 8, 8)
             .unwrap_err()
             .to_string()
             .contains("real directory")
     );
     assert!(
-        cleanup_root_with_limits(&regular, 8, 8)
+        cleanup_root(&regular, 8, 8)
             .unwrap_err()
             .to_string()
             .contains("real directory")
@@ -107,7 +107,7 @@ fn cleanup_removes_only_exact_v4_allowlisted_names() {
     let unknown_directory = root.join(".dbe-unarchive-manual");
     fs::create_dir(&unknown_directory).unwrap();
 
-    let summary = cleanup_root_with_limits(&root, 32, 32).unwrap();
+    let summary = cleanup_root(&root, 32, 32).unwrap();
 
     assert_eq!(summary.removed_files, 3);
     assert_eq!(summary.removed_directories, 1);
@@ -134,7 +134,7 @@ fn matching_symlinks_are_preserved_and_recursive_cleanup_never_follows_links() {
     fs::create_dir(&unarchive).unwrap();
     symlink(&victim, unarchive.join("outside-link")).unwrap();
 
-    let summary = cleanup_root_with_limits(&root, 8, 8).unwrap();
+    let summary = cleanup_root(&root, 8, 8).unwrap();
 
     assert_eq!(summary.removed_directories, 1);
     assert_eq!(summary.removed_files, 0);
@@ -160,7 +160,7 @@ fn valid_manifest_protects_only_its_exact_rollback() {
     fs::write(&protected, b"rollback").unwrap();
     fs::write(&orphan, b"orphan").unwrap();
 
-    let summary = cleanup_root_with_limits(&root, 8, 8).unwrap();
+    let summary = cleanup_root(&root, 8, 8).unwrap();
 
     assert_eq!(summary.protected_rollbacks, 1);
     assert_eq!(summary.removed_files, 1);
@@ -188,7 +188,7 @@ fn malformed_or_mismatched_manifest_aborts_before_deletion() {
             fs::write(&manifest, b"not-json").unwrap();
         }
 
-        assert!(cleanup_root_with_limits(&root, 8, 8).is_err());
+        assert!(cleanup_root(&root, 8, 8).is_err());
         assert_eq!(fs::read(&orphan).unwrap(), b"must survive");
         assert!(manifest.exists());
     }
@@ -205,12 +205,7 @@ fn root_scan_limit_accepts_boundary_and_overflow_deletes_nothing() {
         )
         .unwrap();
     }
-    assert_eq!(
-        cleanup_root_with_limits(&boundary_root, 2, 8)
-            .unwrap()
-            .removed_files,
-        2
-    );
+    assert_eq!(cleanup_root(&boundary_root, 2, 8).unwrap().removed_files, 2);
 
     let overflow = tempfile::tempdir().unwrap();
     let overflow_root = staging_root(&overflow);
@@ -219,7 +214,7 @@ fn root_scan_limit_accepts_boundary_and_overflow_deletes_nothing() {
     fs::write(overflow_root.join("unknown-1"), b"unknown").unwrap();
     fs::write(overflow_root.join("unknown-2"), b"unknown").unwrap();
 
-    assert!(cleanup_root_with_limits(&overflow_root, 2, 8).is_err());
+    assert!(cleanup_root(&overflow_root, 2, 8).is_err());
     assert_eq!(fs::read(&candidate).unwrap(), b"must survive");
 }
 
@@ -235,7 +230,7 @@ fn recursive_scan_limit_is_preflighted_before_any_deletion() {
         fs::write(unarchive.join(format!("entry-{index}")), b"data").unwrap();
     }
 
-    assert!(cleanup_root_with_limits(&root, 8, 2).is_err());
+    assert!(cleanup_root(&root, 8, 2).is_err());
     assert_eq!(fs::read(&candidate).unwrap(), b"must survive");
     assert!(unarchive.exists());
 }
@@ -254,7 +249,7 @@ fn exact_manifest_symlink_aborts_without_touching_other_entries() {
     )
     .unwrap();
 
-    assert!(cleanup_root_with_limits(&root, 8, 8).is_err());
+    assert!(cleanup_root(&root, 8, 8).is_err());
     assert!(candidate.exists());
     assert_eq!(fs::read(&victim).unwrap(), b"{}");
 }

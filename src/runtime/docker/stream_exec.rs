@@ -68,7 +68,7 @@ impl DockerRuntime {
     /// is being read fails the operation. Secret values exist only in the exec
     /// environment and are never included in diagnostics.
     #[allow(clippy::too_many_arguments)]
-    pub async fn exec_with_file_stdin_and_secret_env(
+    pub async fn exec_with_input(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -92,9 +92,9 @@ impl DockerRuntime {
         .await
     }
 
-    /// Shell counterpart of [`Self::exec_with_file_stdin_and_secret_env`].
+    /// Shell counterpart of [`Self::exec_with_input`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn exec_shell_with_file_stdin_and_secret_env(
+    pub async fn exec_shell_with_input(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -104,7 +104,7 @@ impl DockerRuntime {
         max_input_bytes: u64,
         timeout: Duration,
     ) -> Result<ExecStreamResult, DockerError> {
-        self.exec_with_file_stdin_and_secret_env(
+        self.exec_with_input(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -122,7 +122,7 @@ impl DockerRuntime {
     /// already-open parent descriptor unless the command exits successfully,
     /// stays within `max_output_bytes`, and the file and directory are synced.
     #[allow(clippy::too_many_arguments)]
-    pub async fn exec_to_file_with_secret_env(
+    pub async fn exec_to_file(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -146,9 +146,9 @@ impl DockerRuntime {
         .await
     }
 
-    /// Shell counterpart of [`Self::exec_to_file_with_secret_env`].
+    /// Shell counterpart of [`Self::exec_to_file`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn exec_shell_to_file_with_secret_env(
+    pub async fn exec_shell_to_file(
         &self,
         protocol: Protocol,
         instance_id: &str,
@@ -158,7 +158,7 @@ impl DockerRuntime {
         max_output_bytes: u64,
         timeout: Duration,
     ) -> Result<ExecStreamResult, DockerError> {
-        self.exec_to_file_with_secret_env(
+        self.exec_to_file(
             protocol,
             instance_id,
             vec!["sh".to_string(), "-c".to_string(), script.to_string()],
@@ -190,7 +190,7 @@ impl DockerRuntime {
             .collect::<Vec<_>>();
         secret_values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
         secret_values.dedup();
-        let environment = encode_secret_environment(environment)?;
+        let environment = encode_secrets(environment)?;
         let container = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
@@ -235,7 +235,7 @@ impl DockerRuntime {
         cancel_receiver: oneshot::Receiver<()>,
     ) -> Result<ExecStreamResult, DockerError> {
         let active = Arc::new(AtomicBool::new(false));
-        let execution = self.execute_streaming_exec(
+        let execution = self.stream_exec(
             container,
             command,
             environment,
@@ -272,7 +272,7 @@ impl DockerRuntime {
         result
     }
 
-    async fn execute_streaming_exec(
+    async fn stream_exec(
         &self,
         container: &str,
         command: Vec<String>,
@@ -368,7 +368,7 @@ impl DockerRuntime {
             }
         };
 
-        let exit_code = self.wait_for_streaming_exec_exit(&exec.id, &active).await?;
+        let exit_code = self.wait_for_stream_exit(&exec.id, &active).await?;
         if exit_code != 0 {
             return Err(DockerError::ExecStreamFailed {
                 container: container.to_string(),
@@ -382,7 +382,7 @@ impl DockerRuntime {
         Ok(ExecStreamResult { transferred_bytes })
     }
 
-    async fn wait_for_streaming_exec_exit(
+    async fn wait_for_stream_exit(
         &self,
         exec_id: &str,
         active: &AtomicBool,
@@ -426,9 +426,7 @@ fn streaming_exec_options(
     }
 }
 
-fn encode_secret_environment(
-    environment: &[(&str, &SecretString)],
-) -> Result<Vec<String>, DockerError> {
+fn encode_secrets(environment: &[(&str, &SecretString)]) -> Result<Vec<String>, DockerError> {
     let mut names = HashSet::with_capacity(environment.len());
     let mut encoded = Vec::with_capacity(environment.len());
     for (name, value) in environment {
@@ -827,20 +825,18 @@ mod tests {
     fn secret_environment_is_validated_without_echoing_values() {
         let secret = SecretString::from("correct horse battery staple");
         assert_eq!(
-            encode_secret_environment(&[("PGPASSWORD", &secret)]).unwrap(),
+            encode_secrets(&[("PGPASSWORD", &secret)]).unwrap(),
             vec!["PGPASSWORD=correct horse battery staple"]
         );
         assert!(
-            encode_secret_environment(&[("BAD=KEY", &secret)])
+            encode_secrets(&[("BAD=KEY", &secret)])
                 .unwrap_err()
                 .to_string()
                 .contains("environment")
         );
-        assert!(
-            encode_secret_environment(&[("PGPASSWORD", &secret), ("PGPASSWORD", &secret)]).is_err()
-        );
+        assert!(encode_secrets(&[("PGPASSWORD", &secret), ("PGPASSWORD", &secret)]).is_err());
         let nul = SecretString::from("secret\0tail");
-        let error = encode_secret_environment(&[("PGPASSWORD", &nul)]).unwrap_err();
+        let error = encode_secrets(&[("PGPASSWORD", &nul)]).unwrap_err();
         assert!(!error.to_string().contains("secret"));
     }
 

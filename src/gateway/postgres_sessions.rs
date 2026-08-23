@@ -107,7 +107,7 @@ where
             return Ok(CancelRegistration { key: None });
         }
 
-        if authentication_requires_frontend_response(&backend_message)? {
+        if auth_needs_frontend_reply(&backend_message)? {
             let frontend_message = read_message(client).await?;
             backend.write_all(&frontend_message).await?;
         }
@@ -182,7 +182,7 @@ async fn read_message(
     Ok(message)
 }
 
-fn authentication_requires_frontend_response(message: &[u8]) -> Result<bool, PostgresSessionError> {
+fn auth_needs_frontend_reply(message: &[u8]) -> Result<bool, PostgresSessionError> {
     if message.first() != Some(&b'R') {
         return Ok(false);
     }
@@ -207,13 +207,13 @@ mod tests {
             let mut message = vec![b'R'];
             message.extend_from_slice(&8_u32.to_be_bytes());
             message.extend_from_slice(&code.to_be_bytes());
-            assert!(authentication_requires_frontend_response(&message).unwrap());
+            assert!(auth_needs_frontend_reply(&message).unwrap());
         }
         for code in [0_i32, 2, 6, 12] {
             let mut message = vec![b'R'];
             message.extend_from_slice(&8_u32.to_be_bytes());
             message.extend_from_slice(&code.to_be_bytes());
-            assert!(!authentication_requires_frontend_response(&message).unwrap());
+            assert!(!auth_needs_frontend_reply(&message).unwrap());
         }
     }
 

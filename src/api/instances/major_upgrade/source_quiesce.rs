@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn quiesce_major_upgrade_source(
+pub(super) async fn quiesce_upgrade_source(
     state: &AppState,
     metadata: &InstanceMetadata,
     password: &str,
@@ -14,10 +14,10 @@ pub(super) async fn quiesce_major_upgrade_source(
         .restart(metadata.protocol, &metadata.instance_id)
         .await
         .map_err(docker_error)?;
-    verify_major_upgrade_source(state, metadata, password).await
+    verify_upgrade_source(state, metadata, password).await
 }
 
-async fn verify_major_upgrade_source(
+async fn verify_upgrade_source(
     state: &AppState,
     metadata: &InstanceMetadata,
     password: &str,
@@ -81,7 +81,7 @@ async fn verify_major_upgrade_source(
     Ok(())
 }
 
-pub(super) async fn harden_major_upgrade_target(
+pub(super) async fn harden_upgrade_target(
     state: &AppState,
     metadata: &InstanceMetadata,
     password: &str,
@@ -119,14 +119,14 @@ pub(super) async fn harden_major_upgrade_target(
     Ok(())
 }
 
-pub(super) async fn restore_major_upgrade_source_route(
+pub(super) async fn restore_upgrade_route(
     state: &AppState,
     metadata: &InstanceMetadata,
     password: &str,
     original_error: ApiError,
 ) -> ApiError {
     let original_message = original_error.to_string();
-    match verify_major_upgrade_source(state, metadata, password).await {
+    match verify_upgrade_source(state, metadata, password).await {
         Ok(()) => {
             state.instances.upsert(metadata.clone()).await;
             state
@@ -145,7 +145,7 @@ pub(super) async fn restore_major_upgrade_source_route(
             fail_image_update_api(state, &metadata.instance_id, original_error)
         }
         Err(recovery_error) => {
-            let quarantine = quarantine_after_image_update_uncertainty(
+            let quarantine = quarantine_image_update(
                 state,
                 metadata,
                 "major-upgrade source could not be reverified after a pre-cutover failure",
@@ -156,7 +156,7 @@ pub(super) async fn restore_major_upgrade_source_route(
                 &metadata.instance_id,
                 format!(
                     "major upgrade failed before cutover ({original_message}), source recovery failed ({recovery_error}); {}",
-                    image_update_quarantine_summary(&quarantine)
+                    image_quarantine_summary(&quarantine)
                 ),
             )
         }

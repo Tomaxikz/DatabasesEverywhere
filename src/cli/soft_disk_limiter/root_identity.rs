@@ -97,8 +97,8 @@ pub(super) fn watch_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CompletedSoftDiskScan, CompletedWatchOperation, WatchOperationResult,
-        complete_soft_disk_scan, complete_watch_operation,
+        CompletedSoftDiskScan, CompletedWatchOperation, WatchOperationResult, apply_soft_disk_scan,
+        finish_watch,
         watch_operations::{DesiredWatch, WatchOperationQueue},
     };
     use super::*;
@@ -248,7 +248,7 @@ mod tests {
         };
         let mut planner = planner(new_identity);
         let targets = HashMap::from([("one".to_string(), target)]);
-        complete_watch_operation(
+        finish_watch(
             Ok(completed),
             super::super::RootObservationContext {
                 watcher: &None,
@@ -310,7 +310,7 @@ mod tests {
                 root_identity: Some(old_identity),
             }),
         };
-        complete_soft_disk_scan(
+        apply_soft_disk_scan(
             completed,
             &None,
             &HashMap::from([("one".to_string(), target)]),

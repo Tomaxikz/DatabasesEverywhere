@@ -13,7 +13,7 @@ const MAX_PROJECT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(super) async fn verify_startup(mount: &Path) -> Result<(), DiskLimitError> {
     run_quota(mount, "state").await?;
-    verify_project_files_writable().await
+    check_project_files_writable().await
 }
 
 pub(super) async fn apply(
@@ -30,7 +30,7 @@ pub(super) async fn apply(
         path: data_path.to_path_buf(),
     };
 
-    ensure_project_files(project.clone()).await?;
+    prepare_project_files(project.clone()).await?;
     run_quota(mount, &format!("project -s {}", project.name)).await?;
     run_quota(
         mount,
@@ -47,24 +47,24 @@ struct ProjectQuota {
     path: PathBuf,
 }
 
-async fn verify_project_files_writable() -> Result<(), DiskLimitError> {
+async fn check_project_files_writable() -> Result<(), DiskLimitError> {
     tokio::task::spawn_blocking(|| {
         let _lock = lock_project_files()?;
-        verify_regular_file_writable(PROJECTS_FILE)?;
-        verify_regular_file_writable(PROJID_FILE)?;
+        check_regular_file_writable(PROJECTS_FILE)?;
+        check_regular_file_writable(PROJID_FILE)?;
         Ok(())
     })
     .await
     .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
-async fn ensure_project_files(project: ProjectQuota) -> Result<(), DiskLimitError> {
-    tokio::task::spawn_blocking(move || ensure_project_files_blocking(&project))
+async fn prepare_project_files(project: ProjectQuota) -> Result<(), DiskLimitError> {
+    tokio::task::spawn_blocking(move || prepare_project_files_sync(&project))
         .await
         .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
-fn ensure_project_files_blocking(project: &ProjectQuota) -> Result<(), DiskLimitError> {
+fn prepare_project_files_sync(project: &ProjectQuota) -> Result<(), DiskLimitError> {
     validate_project_path(project).map_err(|source| DiskLimitError::ProjectFile {
         path: PROJECTS_FILE,
         source,
@@ -88,7 +88,7 @@ fn ensure_project_files_blocking(project: &ProjectQuota) -> Result<(), DiskLimit
         })?;
 
     if let Some(contents) = projects_update {
-        atomic_replace_project_file(Path::new(PROJECTS_FILE), &contents).map_err(|source| {
+        replace_project_file(Path::new(PROJECTS_FILE), &contents).map_err(|source| {
             DiskLimitError::ProjectFile {
                 path: PROJECTS_FILE,
                 source,
@@ -96,7 +96,7 @@ fn ensure_project_files_blocking(project: &ProjectQuota) -> Result<(), DiskLimit
         })?;
     }
     if let Some(contents) = projid_update {
-        atomic_replace_project_file(Path::new(PROJID_FILE), &contents).map_err(|source| {
+        replace_project_file(Path::new(PROJID_FILE), &contents).map_err(|source| {
             DiskLimitError::ProjectFile {
                 path: PROJID_FILE,
                 source,
@@ -144,7 +144,7 @@ fn acquire_exclusive_lock(path: &Path) -> Result<File, std::io::Error> {
     Ok(lock)
 }
 
-fn verify_regular_file_writable(path: &'static str) -> Result<(), DiskLimitError> {
+fn check_regular_file_writable(path: &'static str) -> Result<(), DiskLimitError> {
     let path_ref = Path::new(path);
     match std::fs::symlink_metadata(path_ref) {
         Ok(metadata) => {
@@ -321,7 +321,7 @@ fn project_conflict(message: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::AlreadyExists, message)
 }
 
-fn atomic_replace_project_file(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+fn replace_project_file(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -499,7 +499,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let original_inode = std::fs::metadata(&path).unwrap().ino();
 
-        atomic_replace_project_file(&path, "after\n").unwrap();
+        replace_project_file(&path, "after\n").unwrap();
 
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");

@@ -16,23 +16,20 @@ const ONE_USE_EXPORT_TTL: Duration = Duration::from_secs(60 * 60);
 const ONE_USE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_SWEEP_ENTRIES: usize = 10_000;
 
-fn one_use_export_root(state: &AppState) -> PathBuf {
+fn export_spool_root(state: &AppState) -> PathBuf {
     PathBuf::from(state.config.paths.tmp_root()).join("export-downloads")
 }
 
-pub(crate) fn instance_one_use_export_root(state: &AppState, instance_id: &str) -> PathBuf {
-    one_use_export_root(state).join(instance_id)
+pub(crate) fn instance_spool_root(state: &AppState, instance_id: &str) -> PathBuf {
+    export_spool_root(state).join(instance_id)
 }
 
-pub(crate) async fn ensure_client_export_slot(
-    state: &AppState,
-    instance_id: &str,
-) -> Result<(), ApiError> {
+pub(crate) async fn check_export_slot(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
     validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let active = active_one_use_export_paths(state).await;
-    sweep_instance_one_use_exports(state, instance_id, &active).await?;
+    let active = active_spool_paths(state).await;
+    sweep_instance_exports(state, instance_id, &active).await?;
     let retained = count_regular_exports(&instance_export_root(state, instance_id)).await?;
-    let pending = count_regular_exports(&instance_one_use_export_root(state, instance_id)).await?;
+    let pending = count_regular_exports(&instance_spool_root(state, instance_id)).await?;
     let total = retained + pending;
     let maximum = state.config.artifacts.max_artifacts_per_instance;
     if total >= maximum {
@@ -43,12 +40,12 @@ pub(crate) async fn ensure_client_export_slot(
     Ok(())
 }
 
-pub(crate) async fn reconcile_one_use_exports_once(state: &AppState) -> Result<usize, ApiError> {
-    let root = one_use_export_root(state);
+pub(crate) async fn sweep_one_use_exports(state: &AppState) -> Result<usize, ApiError> {
+    let root = export_spool_root(state);
     let Some(mut entries) = read_real_directory(&root).await? else {
         return Ok(0);
     };
-    let active = active_one_use_export_paths(state).await;
+    let active = active_spool_paths(state).await;
     let mut examined = 0_usize;
     let mut removed = 0_usize;
     while let Some(entry) = entries.next_entry().await.map_err(|error| {
@@ -69,12 +66,12 @@ pub(crate) async fn reconcile_one_use_exports_once(state: &AppState) -> Result<u
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        removed += sweep_instance_one_use_exports(state, &name, &active).await?;
+        removed += sweep_instance_exports(state, &name, &active).await?;
     }
     Ok(removed)
 }
 
-pub(crate) async fn run_one_use_export_sweeper(state: AppState) {
+pub(crate) async fn run_export_sweeper(state: AppState) {
     let mut shutdown = state.daemon_shutdown.subscribe();
     if *shutdown.borrow() {
         return;
@@ -90,7 +87,7 @@ pub(crate) async fn run_one_use_export_sweeper(state: AppState) {
                 }
             }
             _ = interval.tick() => {
-                match reconcile_one_use_exports_once(&state).await {
+                match sweep_one_use_exports(&state).await {
                     Ok(removed) if removed > 0 => tracing::info!(removed, "expired one-use exports removed"),
                     Ok(_) => {}
                     Err(error) => tracing::error!(%error, "one-use export sweep failed"),
@@ -100,12 +97,12 @@ pub(crate) async fn run_one_use_export_sweeper(state: AppState) {
     }
 }
 
-async fn sweep_instance_one_use_exports(
+async fn sweep_instance_exports(
     state: &AppState,
     instance_id: &str,
     active: &HashSet<PathBuf>,
 ) -> Result<usize, ApiError> {
-    let root = instance_one_use_export_root(state, instance_id);
+    let root = instance_spool_root(state, instance_id);
     let Some(mut entries) = read_real_directory(&root).await? else {
         return Ok(0);
     };
@@ -139,12 +136,9 @@ async fn sweep_instance_one_use_exports(
     Ok(removed)
 }
 
-async fn active_one_use_export_paths(state: &AppState) -> HashSet<PathBuf> {
-    let paths = state
-        .import_export_jobs
-        .active_export_artifact_paths()
-        .await;
-    let root = one_use_export_root(state);
+async fn active_spool_paths(state: &AppState) -> HashSet<PathBuf> {
+    let paths = state.import_export_jobs.active_export_paths().await;
+    let root = export_spool_root(state);
     paths
         .into_iter()
         .map(PathBuf::from)
@@ -184,21 +178,21 @@ fn record_bounded_entry(examined: &mut usize, context: &'static str) -> Result<(
 }
 
 async fn remove_download_spool(path: PathBuf) -> Result<(), ApiError> {
-    tokio::task::spawn_blocking(move || remove_download_spool_blocking(&path))
+    tokio::task::spawn_blocking(move || remove_download_spool_sync(&path))
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to join export cleanup: {error}")))?
         .map_err(|error| ApiError::Runtime(format!("failed to remove one-use export: {error}")))
 }
 
-pub(super) fn remove_download_spool_blocking(path: &FsPath) -> Result<(), std::io::Error> {
-    remove_private_file_if_exists(path)?;
+pub(super) fn remove_download_spool_sync(path: &FsPath) -> Result<(), std::io::Error> {
+    remove_private_file(path)?;
     if let Some(sidecar) = checksum_sidecar_path(path) {
-        remove_private_file_if_exists(&sidecar)?;
+        remove_private_file(&sidecar)?;
     }
     Ok(())
 }
 
-fn remove_private_file_if_exists(path: &FsPath) -> Result<(), std::io::Error> {
+fn remove_private_file(path: &FsPath) -> Result<(), std::io::Error> {
     match crate::shared::files::remove_private_file_durable(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

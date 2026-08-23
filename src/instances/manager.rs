@@ -34,10 +34,7 @@ impl InstanceManager {
             );
         }
         let metadata = loaded.metadata;
-        let encrypted_rows = self
-            .repository
-            .rewrite_protected_route_auth(&metadata)
-            .await?;
+        let encrypted_rows = self.repository.rewrite_route_auth(&metadata).await?;
         if encrypted_rows > 0 {
             tracing::info!(
                 encrypted_rows,
@@ -56,13 +53,11 @@ impl InstanceManager {
 
     /// Commits live-verified replacement credentials and clears any protected
     /// secret recovery marker in the same durable transaction.
-    pub(crate) async fn upsert_recovered_protected_secrets(
+    pub(crate) async fn upsert_recovered_secrets(
         &self,
         metadata: InstanceMetadata,
     ) -> Result<(), RepositoryError> {
-        self.repository
-            .upsert_recovered_protected_secrets(&metadata)
-            .await?;
+        self.repository.upsert_recovered_secrets(&metadata).await?;
         self.store.upsert(metadata).await;
         Ok(())
     }
@@ -78,14 +73,14 @@ impl InstanceManager {
         self.repository.get(instance_id).await
     }
 
-    pub(crate) async fn auth_hardening_attestation_is_current(
+    pub(crate) async fn hardening_is_current(
         &self,
         metadata: &InstanceMetadata,
         identity: &ManagedContainerIdentity,
         hardening_revision: u32,
     ) -> Result<bool, RepositoryError> {
         self.repository
-            .auth_hardening_attestation_is_current(
+            .hardening_is_current(
                 metadata,
                 &identity.id,
                 &identity.started_at,
@@ -94,14 +89,14 @@ impl InstanceManager {
             .await
     }
 
-    pub(crate) async fn record_auth_hardening_attestation(
+    pub(crate) async fn record_hardening_attestation(
         &self,
         metadata: &InstanceMetadata,
         identity: &ManagedContainerIdentity,
         hardening_revision: u32,
     ) -> Result<(), RepositoryError> {
         self.repository
-            .record_auth_hardening_attestation(
+            .record_hardening_attestation(
                 metadata,
                 &identity.id,
                 &identity.started_at,
@@ -117,22 +112,18 @@ impl InstanceManager {
         self.repository.compatibility_attestation(instance_id).await
     }
 
-    pub(crate) async fn delete_compatibility_attestation(
+    pub(crate) async fn delete_compatibility(
         &self,
         instance_id: &str,
     ) -> Result<(), RepositoryError> {
-        self.repository
-            .delete_compatibility_attestation(instance_id)
-            .await
+        self.repository.delete_compatibility(instance_id).await
     }
 
-    pub(crate) async fn record_compatibility_attestation(
+    pub(crate) async fn record_compatibility(
         &self,
         attestation: &CompatibilityAttestation,
     ) -> Result<(), RepositoryError> {
-        self.repository
-            .record_compatibility_attestation(attestation)
-            .await
+        self.repository.record_compatibility(attestation).await
     }
 
     pub async fn delete(&self, instance_id: &str) -> Result<bool, RepositoryError> {

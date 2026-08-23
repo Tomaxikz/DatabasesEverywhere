@@ -54,7 +54,7 @@ async fn dump_restore_relay_preserves_binary_keys_and_payloads() {
     let mut target = connection(target_client);
 
     let restored = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::Persistent,
@@ -130,7 +130,7 @@ async fn dump_restore_relay_streams_payload_larger_than_its_buffer_exactly() {
     let mut target = connection(target_client);
 
     let restored = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::AbsoluteUnixMilliseconds(1_900_000_000_123),
@@ -158,7 +158,7 @@ async fn dump_restore_relay_skips_null_dump_without_touching_target() {
     let mut target = connection(target_client);
 
     let restored = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::Persistent,
@@ -196,7 +196,7 @@ async fn dump_restore_relay_requires_restore_ok() {
     let mut target = connection(target_client);
 
     let error = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::Persistent,
@@ -243,7 +243,7 @@ async fn dump_restore_relay_decouples_streamed_and_control_bulk_limits() {
     let mut target = connection_with_limits(target_client, control_limits);
 
     let restored = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::Persistent,
@@ -277,7 +277,7 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
     let mut target = connection(target_client);
 
     let error = source
-        .relay_dump_to_restore_replace(&mut target, key, RedisRestoreExpiration::Persistent, 8)
+        .relay_restore_replace(&mut target, key, RedisRestoreExpiration::Persistent, 8)
         .await
         .unwrap_err();
 
@@ -313,7 +313,7 @@ async fn dump_restore_relay_enforces_source_and_target_bulk_limits_before_copyin
     );
 
     let error = source
-        .relay_dump_to_restore_replace(
+        .relay_restore_replace(
             &mut target,
             key,
             RedisRestoreExpiration::Persistent,

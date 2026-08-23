@@ -93,7 +93,7 @@ impl InstanceStore {
         database: Option<&str>,
     ) -> DatabaseRouteResolution<RouteTarget> {
         let state = self.inner.read().await;
-        resolve_plain_database_route(&state, &state.postgres_routes, username, database)
+        resolve_plain_route(&state, &state.postgres_routes, username, database)
     }
 
     pub async fn resolve_redis(&self, username: &str) -> Option<RouteTarget> {
@@ -186,7 +186,7 @@ impl InstanceStore {
         database: Option<&str>,
     ) -> DatabaseRouteResolution<RouteTarget> {
         let state = self.inner.read().await;
-        resolve_plain_database_route(&state, &state.clickhouse_routes, username, database)
+        resolve_plain_route(&state, &state.clickhouse_routes, username, database)
     }
 
     pub async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<RouteTarget> {
@@ -277,7 +277,7 @@ fn resolve_mariadb_route(
     }
 }
 
-fn resolve_plain_database_route(
+fn resolve_plain_route(
     state: &InstanceState,
     routes: &HashMap<(String, String), String>,
     username: &str,

@@ -16,7 +16,7 @@ use transfer::{CappedExecOutput, container_mounts, ensure_bind_mount_sources};
 pub use command::CommandOutput;
 pub(crate) use container_config::startup_readiness_script;
 pub(crate) use cpu_burst::CpuBurstPolicyStatus;
-pub use engine::{DaemonEngineConnection, rootless_podman_uid_from_socket_path};
+pub use engine::{DaemonEngineConnection, rootless_uid_from_socket};
 pub use events::{ManagedContainerAction, ManagedContainerEvent};
 pub use remote_import::RemoteImportHelperSpec;
 pub use security::DockerSecurityPolicy;
@@ -166,8 +166,8 @@ impl DockerRuntime {
         let socket_path = socket_path.into();
         let rootless_podman =
             engine == DaemonEngine::Podman && socket_path.starts_with("/run/user/");
-        let rootless_podman_owner = rootless_podman_uid_from_socket_path(&socket_path)
-            .map(|uid| HostOwner { uid, gid: uid });
+        let rootless_podman_owner =
+            rootless_uid_from_socket(&socket_path).map(|uid| HostOwner { uid, gid: uid });
         Self {
             docker,
             engine,
@@ -279,7 +279,7 @@ impl DockerRuntime {
         });
         self.rootless_podman = security_rootless
             || socket_owner.uid != 0
-            || rootless_podman_uid_from_socket_path(&self.socket_path).is_some();
+            || rootless_uid_from_socket(&self.socket_path).is_some();
         self.rootless_podman_owner = self.rootless_podman.then_some(socket_owner);
         if self.rootless_podman && socket_owner.uid == 0 {
             return Err(DockerError::RootlessPodmanOwnerUnavailable {
@@ -718,8 +718,7 @@ impl DockerRuntime {
         } else {
             None
         };
-        self.clear_cpu_burst_before_limit_update(protocol, instance_id)
-            .await;
+        self.clear_cpu_burst(protocol, instance_id).await;
         let update_result: Result<(), DockerError> = match self.engine {
             DaemonEngine::Docker => self
                 .docker

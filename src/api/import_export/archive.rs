@@ -2,7 +2,7 @@
 
 use super::{files::*, *};
 
-pub(super) async fn prepare_logical_import_artifact(
+pub(super) async fn prepare_import_artifact(
     protocol: Protocol,
     artifact_path: &FsPath,
     host_temp: &FsPath,
@@ -11,7 +11,7 @@ pub(super) async fn prepare_logical_import_artifact(
     max_unarchived_bytes: u64,
 ) -> Result<(), ApiError> {
     let Some(requested_format) = options.archive_format.as_deref() else {
-        ensure_source_within_limit(artifact_path, max_unarchived_bytes).await?;
+        check_source_size(artifact_path, max_unarchived_bytes).await?;
         copy_file(artifact_path, host_temp).await?;
         return Ok(());
     };
@@ -19,7 +19,7 @@ pub(super) async fn prepare_logical_import_artifact(
     let format = ImportArchiveFormat::parse(requested_format)?;
     match format {
         ImportArchiveFormat::Plain => {
-            ensure_source_within_limit(artifact_path, max_unarchived_bytes).await?;
+            check_source_size(artifact_path, max_unarchived_bytes).await?;
             copy_file(artifact_path, host_temp).await
         }
         ImportArchiveFormat::Gzip => {
@@ -57,8 +57,8 @@ pub(super) async fn prepare_logical_import_artifact(
     }
 }
 
-async fn ensure_source_within_limit(path: &FsPath, limit: u64) -> Result<(), ApiError> {
-    let size = ensure_import_file_size(path).await?;
+async fn check_source_size(path: &FsPath, limit: u64) -> Result<(), ApiError> {
+    let size = check_import_file_size(path).await?;
     if size > limit {
         return Err(ApiError::BadRequest(format!(
             "import artifact is too large after preparation: {size} bytes exceeds {limit} bytes"
@@ -74,7 +74,7 @@ pub(super) async fn decompress_gzip(
 ) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
-    run_archive_file_operation(
+    run_file_task(
         "decompress gzip",
         true,
         move |deadline| -> Result<(), std::io::Error> {
@@ -96,7 +96,7 @@ pub(super) async fn decompress_bzip2(
 ) -> Result<(), ApiError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
-    run_archive_file_operation(
+    run_file_task(
         "decompress bzip2",
         true,
         move |deadline| -> Result<(), std::io::Error> {
@@ -121,8 +121,8 @@ pub(super) async fn extract_tar_archive(
     let target_dir = target_dir.to_path_buf();
     tokio::task::spawn_blocking(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let deadline = archive_operation_deadline();
-            create_private_directory_blocking(&target_dir)?;
+            let deadline = archive_deadline();
+            create_private_dir(&target_dir)?;
             let input = std::fs::File::open(source)?;
             if gzipped {
                 let decoder = flate2::read::GzDecoder::new(input);
@@ -149,8 +149,8 @@ pub(super) async fn extract_zip_archive(
     let target_dir = target_dir.to_path_buf();
     tokio::task::spawn_blocking(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let deadline = archive_operation_deadline();
-            create_private_directory_blocking(&target_dir)?;
+            let deadline = archive_deadline();
+            create_private_dir(&target_dir)?;
             let input = std::fs::File::open(source)?;
             let mut archive = zip::ZipArchive::new(input)?;
             if archive.len() > MAX_ARCHIVE_ENTRIES {
@@ -158,14 +158,14 @@ pub(super) async fn extract_zip_archive(
             }
             let mut total = 0_u64;
             for index in 0..archive.len() {
-                ensure_archive_deadline(deadline)?;
+                check_archive_deadline(deadline)?;
                 let mut file = archive.by_index(index)?;
                 let enclosed = file
                     .enclosed_name()
                     .ok_or_else(|| format!("zip entry {} has unsafe path", file.name()))?
                     .to_path_buf();
                 validate_relative_archive_path(&enclosed)?;
-                total = logical_archive_accounted_bytes(total, file.size())
+                total = archive_accounted_bytes(total, file.size())
                     .ok_or("archive uncompressed size overflow")?;
                 if total > max_unarchived_bytes {
                     return Err(
@@ -175,13 +175,13 @@ pub(super) async fn extract_zip_archive(
                 let size = file.size();
                 let target = target_dir.join(enclosed);
                 if file.is_dir() {
-                    create_private_directory_blocking(&target)?;
+                    create_private_dir(&target)?;
                     continue;
                 }
                 if let Some(parent) = target.parent() {
-                    create_private_directory_blocking(parent)?;
+                    create_private_dir(parent)?;
                 }
-                let mut output = create_private_file_blocking(&target)?;
+                let mut output = create_private_file_sync(&target)?;
                 copy_limited_until(&mut file, &mut output, size, deadline)?;
             }
             Ok(())
@@ -201,7 +201,7 @@ pub(super) fn unpack_tar_safely<R: Read>(
     let mut total = 0_u64;
     let mut entries = 0_usize;
     for entry in archive.entries()? {
-        ensure_archive_deadline(deadline)?;
+        check_archive_deadline(deadline)?;
         entries += 1;
         if entries > MAX_ARCHIVE_ENTRIES {
             return Err(format!("archive has more than {MAX_ARCHIVE_ENTRIES} entries").into());
@@ -214,26 +214,25 @@ pub(super) fn unpack_tar_safely<R: Read>(
         let path = entry.path()?.to_path_buf();
         validate_relative_archive_path(&path)?;
         let size = entry.header().size()?;
-        total = logical_archive_accounted_bytes(total, size)
-            .ok_or("archive uncompressed size overflow")?;
+        total = archive_accounted_bytes(total, size).ok_or("archive uncompressed size overflow")?;
         if total > max_unarchived_bytes {
             return Err(format!("archive expands beyond {max_unarchived_bytes} bytes").into());
         }
         let target = target_dir.join(&path);
         if kind.is_dir() {
-            create_private_directory_blocking(&target)?;
+            create_private_dir(&target)?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            create_private_directory_blocking(parent)?;
+            create_private_dir(parent)?;
         }
-        let mut output = create_private_file_blocking(&target)?;
+        let mut output = create_private_file_sync(&target)?;
         copy_limited_until(&mut entry, &mut output, size, deadline)?;
     }
     Ok(())
 }
 
-pub(super) fn logical_archive_accounted_bytes(current: u64, entry_size: u64) -> Option<u64> {
+pub(super) fn archive_accounted_bytes(current: u64, entry_size: u64) -> Option<u64> {
     current
         .checked_add(entry_size)?
         .checked_add(ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES)
@@ -263,11 +262,11 @@ pub(super) fn validate_relative_archive_path(
     Ok(())
 }
 
-pub(super) fn archive_operation_deadline() -> Instant {
+pub(super) fn archive_deadline() -> Instant {
     Instant::now() + ARCHIVE_OPERATION_TIMEOUT
 }
 
-pub(super) fn ensure_archive_deadline(deadline: Instant) -> Result<(), std::io::Error> {
+pub(super) fn check_archive_deadline(deadline: Instant) -> Result<(), std::io::Error> {
     if Instant::now() >= deadline {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -286,7 +285,7 @@ pub(super) fn copy_limited_until<R: Read, W: Write>(
     let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        ensure_archive_deadline(deadline)?;
+        check_archive_deadline(deadline)?;
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             return Ok(total);

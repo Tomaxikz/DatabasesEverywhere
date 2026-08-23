@@ -30,7 +30,7 @@ pub fn tenant_password_verifier_sql(username: &str) -> String {
     )
 }
 
-pub fn restore_tenant_password_verifier_sql(username: &str) -> String {
+pub fn restore_verifier_sql(username: &str) -> String {
     format!(
         "ALTER ROLE {} PASSWORD :'tenant_password_verifier';",
         quote_ident(username),
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn password_verifier_capture_and_restore_quote_the_role() {
         let capture = tenant_password_verifier_sql("user'name");
-        let restore = restore_tenant_password_verifier_sql("user\"name");
+        let restore = restore_verifier_sql("user\"name");
 
         assert!(capture.contains("rolname = 'user''name'"));
         assert_eq!(

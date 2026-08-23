@@ -74,7 +74,7 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
     recovered.tenant_password = Some("verified-replacement".to_string());
 
     let error = encrypted
-        .upsert_recovered_protected_secrets(&recovered)
+        .upsert_recovered_secrets(&recovered)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -89,7 +89,7 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
 
     recovered.postgres_admin_password = Some("verified-admin".to_string());
     encrypted
-        .upsert_recovered_protected_secrets(&recovered)
+        .upsert_recovered_secrets(&recovered)
         .await
         .unwrap();
 
@@ -118,7 +118,7 @@ async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_
     encrypted.load_for_daemon().await.unwrap();
 
     let repair = encrypted
-        .repair_ambiguous_protected_secret(
+        .repair_ambiguous_secret(
             "inst_affected",
             ProtectedSecretField::TenantPassword,
             &SecretString::from(ambiguous),
@@ -163,7 +163,7 @@ async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
     encrypted.load_for_daemon().await.unwrap();
 
     let error = encrypted
-        .repair_ambiguous_protected_secret(
+        .repair_ambiguous_secret(
             "inst_affected",
             ProtectedSecretField::TenantPassword,
             &SecretString::from("actual-password"),
@@ -213,7 +213,7 @@ async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() {
     );
 
     let first = encrypted
-        .repair_ambiguous_protected_secret(
+        .repair_ambiguous_secret(
             "inst_affected",
             ProtectedSecretField::TenantPassword,
             &SecretString::from("dbev1:tenant"),
@@ -227,7 +227,7 @@ async fn multiple_ambiguous_fields_remain_quarantined_until_each_is_repaired() {
     assert!(recovery_required(&pool, "inst_affected").await);
 
     let second = encrypted
-        .repair_ambiguous_protected_secret(
+        .repair_ambiguous_secret(
             "inst_affected",
             ProtectedSecretField::PostgresAdminPassword,
             &SecretString::from("dbev1:admin"),
@@ -305,7 +305,7 @@ async fn repair_rejects_already_valid_ciphertext_without_changing_state() {
     let before = raw_field(&pool, "inst_affected", "tenant_password").await;
 
     let error = repository
-        .repair_ambiguous_protected_secret(
+        .repair_ambiguous_secret(
             "inst_affected",
             ProtectedSecretField::TenantPassword,
             &SecretString::from("valid-password"),

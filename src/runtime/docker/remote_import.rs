@@ -138,7 +138,7 @@ impl RemoteImportHelperCleanupGuard {
     }
 
     async fn cleanup(&mut self) -> Result<(), DockerError> {
-        let result = force_remove_remote_import_helper(&self.docker, &self.name).await;
+        let result = remove_import_helper(&self.docker, &self.name).await;
         if result.is_ok() {
             self.armed = false;
         }
@@ -161,7 +161,7 @@ impl Drop for RemoteImportHelperCleanupGuard {
             return;
         };
         runtime.spawn(async move {
-            if let Err(error) = force_remove_remote_import_helper(&docker, &name).await {
+            if let Err(error) = remove_import_helper(&docker, &name).await {
                 tracing::error!(
                     helper = %name,
                     error = %error,
@@ -173,14 +173,14 @@ impl Drop for RemoteImportHelperCleanupGuard {
 }
 
 impl DockerRuntime {
-    pub async fn ensure_remote_import_image(&self, image: &str) -> Result<(), DockerError> {
+    pub async fn prepare_import_image(&self, image: &str) -> Result<(), DockerError> {
         if image.trim().is_empty() {
             return Err(invalid_helper_spec("image must not be empty"));
         }
         self.ensure_image_with_progress(image, None).await
     }
 
-    pub async fn run_remote_import_helper(
+    pub async fn run_import_helper(
         &self,
         spec: &RemoteImportHelperSpec,
     ) -> Result<CommandOutput, DockerError> {
@@ -192,11 +192,8 @@ impl DockerRuntime {
         let mut cancel_on_drop = CancelHelperOnDrop::new(cancellation.clone());
         let runtime = self.clone();
         let spec = spec.clone();
-        let supervisor = tokio::spawn(async move {
-            runtime
-                .run_remote_import_helper_supervised(spec, cancellation)
-                .await
-        });
+        let supervisor =
+            tokio::spawn(async move { runtime.run_import_worker(spec, cancellation).await });
         let joined = supervisor.await;
         cancel_on_drop.disarm();
         joined.map_err(|_| {
@@ -206,7 +203,7 @@ impl DockerRuntime {
         })?
     }
 
-    async fn run_remote_import_helper_supervised(
+    async fn run_import_worker(
         &self,
         spec: RemoteImportHelperSpec,
         cancellation: Arc<HelperCancellation>,
@@ -220,7 +217,7 @@ impl DockerRuntime {
             let owned_work_dir = work_dir.clone();
             run_unless_cancelled(&cancellation, async move {
                 tokio::task::spawn_blocking(move || {
-                    crate::shared::ownership::chown_directory_recursive(
+                    crate::shared::ownership::chown_recursive(
                         &owned_work_dir,
                         crate::shared::ownership::HostOwner { uid, gid },
                     )
@@ -249,14 +246,14 @@ impl DockerRuntime {
         // Resolve/pull the trusted caller-selected image before creating any
         // helper container. Remote-import API code writes secrets only after
         // it has selected this configured image.
-        run_unless_cancelled(&cancellation, self.ensure_remote_import_image(&spec.image)).await?;
+        run_unless_cancelled(&cancellation, self.prepare_import_image(&spec.image)).await?;
         if cancellation.is_cancelled() {
             return Err(DockerError::RemoteImportHelperCancelled);
         }
 
         let name = format!("{HELPER_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let mut cleanup = RemoteImportHelperCleanupGuard::new(self.docker.clone(), name.clone());
-        let body = remote_import_helper_body(
+        let body = import_helper_body(
             &spec,
             &work_dir,
             &self.security,
@@ -301,7 +298,7 @@ impl DockerRuntime {
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(DockerError::RemoteImportHelperCancelled),
-            result = self.run_created_remote_import_helper(&name, &spec, &work_dir) => result,
+            result = self.start_import_helper(&name, &spec, &work_dir) => result,
         };
         let cleanup_result = cleanup.cleanup().await;
         match (result, cleanup_result) {
@@ -324,7 +321,7 @@ impl DockerRuntime {
     /// Both the exact helper label and the generated name format must match.
     /// This prevents reconciliation from touching managed database containers
     /// or unrelated containers that happen to use a similar label or name.
-    pub async fn reconcile_remote_import_helpers(&self) -> Result<usize, DockerError> {
+    pub async fn reconcile_import_helpers(&self) -> Result<usize, DockerError> {
         let node_id = self
             .node_id
             .as_deref()
@@ -343,7 +340,7 @@ impl DockerRuntime {
         let mut removed = 0;
         let mut first_error = None;
         for container in containers {
-            if !is_owned_remote_import_helper(
+            if !is_owned_import_helper(
                 container.labels.as_ref(),
                 container.names.as_deref(),
                 node_id,
@@ -353,7 +350,7 @@ impl DockerRuntime {
             let Some(id) = container.id else {
                 continue;
             };
-            match force_remove_remote_import_helper(&self.docker, &id).await {
+            match remove_import_helper(&self.docker, &id).await {
                 Ok(()) => removed += 1,
                 Err(error) => {
                     tracing::error!(
@@ -375,7 +372,7 @@ impl DockerRuntime {
         }
     }
 
-    async fn run_created_remote_import_helper(
+    async fn start_import_helper(
         &self,
         name: &str,
         spec: &RemoteImportHelperSpec,
@@ -507,10 +504,7 @@ async fn run_unless_cancelled<T>(
     }
 }
 
-async fn force_remove_remote_import_helper(
-    docker: &Docker,
-    name_or_id: &str,
-) -> Result<(), DockerError> {
+async fn remove_import_helper(docker: &Docker, name_or_id: &str) -> Result<(), DockerError> {
     let remove = docker.remove_container(
         name_or_id,
         Some(RemoveContainerOptions {
@@ -535,7 +529,7 @@ async fn force_remove_remote_import_helper(
     }
 }
 
-fn is_owned_remote_import_helper(
+fn is_owned_import_helper(
     labels: Option<&HashMap<String, String>>,
     names: Option<&[String]>,
     expected_node_id: &str,
@@ -543,10 +537,10 @@ fn is_owned_remote_import_helper(
     labels.and_then(|labels| labels.get(HELPER_LABEL).map(String::as_str)) == Some("true")
         && labels.and_then(|labels| labels.get(NODE_LABEL).map(String::as_str))
             == Some(expected_node_id)
-        && names.is_some_and(|names| names.iter().any(|name| is_remote_import_helper_name(name)))
+        && names.is_some_and(|names| names.iter().any(|name| is_import_helper_name(name)))
 }
 
-fn is_remote_import_helper_name(name: &str) -> bool {
+fn is_import_helper_name(name: &str) -> bool {
     let normalized = name.strip_prefix('/').unwrap_or(name);
     let Some(suffix) = normalized.strip_prefix(HELPER_NAME_PREFIX) else {
         return false;
@@ -557,7 +551,7 @@ fn is_remote_import_helper_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn remote_import_helper_body(
+fn import_helper_body(
     spec: &RemoteImportHelperSpec,
     work_dir: &Path,
     security: &DockerSecurityPolicy,
@@ -760,7 +754,7 @@ fn is_rootless_podman_socket(path: &Path) -> bool {
 async fn measure_work_directory(path: &Path, stop_after: u64) -> Result<u64, DockerError> {
     let path = path.to_path_buf();
     let error_path = path.display().to_string();
-    tokio::task::spawn_blocking(move || measure_work_directory_blocking(&path, stop_after))
+    tokio::task::spawn_blocking(move || measure_work_dir_sync(&path, stop_after))
         .await
         .map_err(|error| DockerError::RemoteImportHelperTask(error.to_string()))?
         .map_err(|source| DockerError::RemoteImportHelperIo {
@@ -769,7 +763,7 @@ async fn measure_work_directory(path: &Path, stop_after: u64) -> Result<u64, Doc
         })
 }
 
-fn measure_work_directory_blocking(root: &Path, stop_after: u64) -> Result<u64, IoError> {
+fn measure_work_dir_sync(root: &Path, stop_after: u64) -> Result<u64, IoError> {
     let mut total = 0_u64;
     let mut entries = 0_usize;
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
@@ -860,7 +854,7 @@ mod tests {
             timeout: Duration::from_secs(900),
             max_output_bytes: 8 * 1024 * 1024 * 1024,
         };
-        let body = remote_import_helper_body(
+        let body = import_helper_body(
             &spec,
             &spec.work_dir,
             &DockerSecurityPolicy::default(),
@@ -953,7 +947,7 @@ mod tests {
             ..DockerSecurityPolicy::default()
         };
 
-        let body = remote_import_helper_body(&spec, &spec.work_dir, &security, true, "node-test");
+        let body = import_helper_body(&spec, &spec.work_dir, &security, true, "node-test");
 
         assert_eq!(
             body.host_config.unwrap().userns_mode.as_deref(),
@@ -969,17 +963,13 @@ mod tests {
         ]);
         let valid_names = vec!["/dbe-remote-import-0123456789abcdef0123456789abcdef".to_string()];
 
-        assert!(is_owned_remote_import_helper(
+        assert!(is_owned_import_helper(
             Some(&labels),
             Some(&valid_names),
             "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(
-            None,
-            Some(&valid_names),
-            "node-a"
-        ));
-        assert!(!is_owned_remote_import_helper(
+        assert!(!is_owned_import_helper(None, Some(&valid_names), "node-a"));
+        assert!(!is_owned_import_helper(
             Some(&HashMap::from([(
                 HELPER_LABEL.to_string(),
                 "false".to_string()
@@ -987,22 +977,22 @@ mod tests {
             Some(&valid_names),
             "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(
+        assert!(!is_owned_import_helper(
             Some(&labels),
             Some(&["/dbe-remote-import-not-a-uuid".to_string()]),
             "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(
+        assert!(!is_owned_import_helper(
             Some(&labels),
             Some(&["/dbe-remote-import-0123456789ABCDEF0123456789ABCDEF".to_string()]),
             "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(
+        assert!(!is_owned_import_helper(
             Some(&labels),
             Some(&["/unrelated-0123456789abcdef0123456789abcdef".to_string()]),
             "node-a",
         ));
-        assert!(!is_owned_remote_import_helper(
+        assert!(!is_owned_import_helper(
             Some(&labels),
             Some(&valid_names),
             "node-b",

@@ -172,11 +172,11 @@ pub mod import_export {
     }
 
     impl ImportExportJobs {
-        pub fn with_repository(repository: ImportExportJobRepository) -> Self {
+        pub fn with_repo(repository: ImportExportJobRepository) -> Self {
             Self::new(Some(repository), &crate::config::ArtifactConfig::default())
         }
 
-        pub fn with_repository_and_config(
+        pub fn with_repo_and_config(
             repository: ImportExportJobRepository,
             artifacts: &crate::config::ArtifactConfig,
         ) -> Self {
@@ -378,7 +378,7 @@ pub mod import_export {
         /// Active jobs are never evicted by `prune_job_cache`, so this avoids
         /// the public list endpoint's pagination limit when protecting
         /// one-use outputs from the expiry sweeper.
-        pub async fn active_export_artifact_paths(&self) -> Vec<String> {
+        pub async fn active_export_paths(&self) -> Vec<String> {
             self.inner
                 .read()
                 .await
@@ -504,12 +504,11 @@ pub mod import_export {
         }
     }
 
-    pub async fn create_data_archive(
+    pub async fn create_archive(
         data_dir: PathBuf,
         artifact_path: PathBuf,
     ) -> Result<(), ImportExportError> {
-        create_data_archive_with_policy(data_dir, artifact_path, DataArchiveSourcePolicy::Strict)
-            .await
+        create_archive_with_policy(data_dir, artifact_path, DataArchiveSourcePolicy::Strict).await
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,38 +523,33 @@ pub mod import_export {
         PreserveValidated,
     }
 
-    pub async fn create_data_archive_with_policy(
+    pub async fn create_archive_with_policy(
         data_dir: PathBuf,
         artifact_path: PathBuf,
         policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
-        create_data_archive_with_policy_bounded(data_dir, artifact_path, policy, u64::MAX).await
+        create_bounded_archive_with_policy(data_dir, artifact_path, policy, u64::MAX).await
     }
 
-    pub async fn create_data_archive_with_policy_bounded(
+    pub async fn create_bounded_archive_with_policy(
         data_dir: PathBuf,
         artifact_path: PathBuf,
         policy: DataArchiveSourcePolicy,
         max_output_bytes: u64,
     ) -> Result<(), ImportExportError> {
         tokio::task::spawn_blocking(move || {
-            create_data_archive_bounded_blocking(
-                &data_dir,
-                &artifact_path,
-                policy,
-                max_output_bytes,
-            )
+            create_bounded_archive_blocking(&data_dir, &artifact_path, policy, max_output_bytes)
         })
         .await
         .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
-    pub async fn create_data_archive_bounded(
+    pub async fn create_bounded_archive(
         data_dir: PathBuf,
         artifact_path: PathBuf,
         max_output_bytes: u64,
     ) -> Result<(), ImportExportError> {
-        create_data_archive_with_policy_bounded(
+        create_bounded_archive_with_policy(
             data_dir,
             artifact_path,
             DataArchiveSourcePolicy::Strict,
@@ -564,12 +558,12 @@ pub mod import_export {
         .await
     }
 
-    pub async fn extract_data_archive(
+    pub async fn extract_archive(
         artifact_path: PathBuf,
         data_parent: PathBuf,
         expected_root: String,
     ) -> Result<(), ImportExportError> {
-        extract_data_archive_bounded(
+        extract_bounded_archive(
             artifact_path,
             data_parent,
             expected_root,
@@ -579,7 +573,7 @@ pub mod import_export {
         .await
     }
 
-    pub async fn extract_data_archive_bounded(
+    pub async fn extract_bounded_archive(
         artifact_path: PathBuf,
         data_parent: PathBuf,
         expected_root: String,
@@ -587,7 +581,7 @@ pub mod import_export {
         symlink_policy: ArchiveSymlinkPolicy,
     ) -> Result<(), ImportExportError> {
         tokio::task::spawn_blocking(move || {
-            extract_data_archive_bounded_blocking(
+            extract_bounded_archive_blocking(
                 &artifact_path,
                 &data_parent,
                 &expected_root,
@@ -599,7 +593,7 @@ pub mod import_export {
         .map_err(|error| ImportExportError::Join(error.to_string()))?
     }
 
-    pub async fn validate_data_archive(
+    pub async fn validate_archive(
         artifact_path: PathBuf,
         expected_root: String,
     ) -> Result<(), ImportExportError> {
@@ -611,15 +605,15 @@ pub mod import_export {
     }
 
     #[cfg(test)]
-    fn create_data_archive_blocking(
+    fn create_archive_blocking(
         data_dir: &Path,
         artifact_path: &Path,
         policy: DataArchiveSourcePolicy,
     ) -> Result<(), ImportExportError> {
-        create_data_archive_bounded_blocking(data_dir, artifact_path, policy, u64::MAX)
+        create_bounded_archive_blocking(data_dir, artifact_path, policy, u64::MAX)
     }
 
-    fn create_data_archive_bounded_blocking(
+    fn create_bounded_archive_blocking(
         data_dir: &Path,
         artifact_path: &Path,
         policy: DataArchiveSourcePolicy,
@@ -684,12 +678,12 @@ pub mod import_export {
     }
 
     #[cfg(test)]
-    fn extract_data_archive_blocking(
+    fn extract_archive_blocking(
         artifact_path: &Path,
         data_parent: &Path,
         expected_root: &str,
     ) -> Result<(), ImportExportError> {
-        extract_data_archive_bounded_blocking(
+        extract_bounded_archive_blocking(
             artifact_path,
             data_parent,
             expected_root,
@@ -698,7 +692,7 @@ pub mod import_export {
         )
     }
 
-    fn extract_data_archive_bounded_blocking(
+    fn extract_bounded_archive_blocking(
         artifact_path: &Path,
         data_parent: &Path,
         expected_root: &str,
@@ -880,7 +874,7 @@ pub mod import_export {
         limits: ArchiveLimits,
         symlink_policy: ArchiveSymlinkPolicy,
     ) -> Result<(), ImportExportError> {
-        ensure_real_directory(data_parent)?;
+        require_real_dir(data_parent)?;
         let started = Instant::now();
         let mut entries = 0_usize;
         let mut bytes = 0_u64;
@@ -933,7 +927,7 @@ pub mod import_export {
         }
         for (target, link_name) in pending_symlinks {
             if let Some(parent) = target.parent() {
-                ensure_real_directory(parent)?;
+                require_real_dir(parent)?;
             }
             match std::fs::symlink_metadata(&target) {
                 Ok(_) => {
@@ -1223,7 +1217,7 @@ pub mod import_export {
             && left.modified().ok() == right.modified().ok()
     }
 
-    fn ensure_real_directory(path: &Path) -> Result<(), ImportExportError> {
+    fn require_real_dir(path: &Path) -> Result<(), ImportExportError> {
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ImportExportError::InvalidArchive(format!(
@@ -1236,7 +1230,7 @@ pub mod import_export {
 
     fn create_private_dir_all(path: &Path) -> Result<(), ImportExportError> {
         std::fs::create_dir_all(path)?;
-        ensure_real_directory(path)?;
+        require_real_dir(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

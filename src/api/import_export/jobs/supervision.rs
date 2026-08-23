@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn spawn_export_job_supervisor(
+pub(super) fn spawn_export_supervisor(
     state: AppState,
     job_id: String,
     instance_id: String,
@@ -19,7 +19,7 @@ pub(super) fn spawn_export_job_supervisor(
             metadata.protocol,
             Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
         ) && metadata.status == InstanceStatus::Running;
-        let execution_cost = estimate_export_execution_cost(&state, &metadata, &options).await;
+        let execution_cost = estimate_export_cost(&state, &metadata, &options).await;
         let execution = match state
             .import_export_jobs
             .acquire_execution(execution_cost)
@@ -32,14 +32,12 @@ pub(super) fn spawn_export_job_supervisor(
             }
             Err(SchedulerAcquireError::InsufficientCapacity) => {
                 let _ =
-                    update_job_result(&state, &job_id, Err(fixed_scheduler_capacity_error()), None)
-                        .await;
+                    update_job_result(&state, &job_id, Err(scheduler_capacity_error()), None).await;
                 return;
             }
         };
         let reservations =
-            match acquire_export_output_capacity(&state, &metadata, &artifact_path, &options).await
-            {
+            match reserve_export_capacity(&state, &metadata, &artifact_path, &options).await {
                 Ok(reservations) => reservations,
                 Err(error) => {
                     let _ = update_job_result(&state, &job_id, Err(error), None).await;
@@ -68,7 +66,7 @@ pub(super) fn spawn_export_job_supervisor(
             logical_output_capacity,
         ));
         if let Err(error) = worker.await {
-            handle_export_worker_failure(
+            recover_export_worker(
                 &failure_state,
                 &failure_job_id,
                 &failure_instance_id,
@@ -83,7 +81,7 @@ pub(super) fn spawn_export_job_supervisor(
     });
 }
 
-pub(super) fn spawn_import_job_supervisor(
+pub(super) fn spawn_import_supervisor(
     state: AppState,
     job_id: String,
     instance_id: String,
@@ -117,7 +115,7 @@ pub(super) fn spawn_import_job_supervisor(
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(error) => {
-                    handle_import_worker_failure(
+                    recover_import_worker(
                         &state,
                         &job_id,
                         &instance_id,
@@ -132,7 +130,7 @@ pub(super) fn spawn_import_job_supervisor(
         }
         let _operation = state.instance_locks.lock(&instance_id).await;
         let Some(metadata) = state.instances.get(&instance_id).await else {
-            finish_import_before_execution(
+            finish_import_setup(
                 &state,
                 &job_id,
                 &instance_id,
@@ -142,7 +140,7 @@ pub(super) fn spawn_import_job_supervisor(
             .await;
             return;
         };
-        let execution_cost = estimate_import_execution_cost(&state, &metadata, &options).await;
+        let execution_cost = estimate_import_cost(&state, &metadata, &options).await;
         let execution = match state
             .import_export_jobs
             .acquire_execution(execution_cost)
@@ -150,7 +148,7 @@ pub(super) fn spawn_import_job_supervisor(
         {
             Ok(execution) => execution,
             Err(SchedulerAcquireError::Closed) => {
-                finish_import_begin_outcome(
+                finish_import_start(
                     &state,
                     &job_id,
                     &instance_id,
@@ -161,12 +159,12 @@ pub(super) fn spawn_import_job_supervisor(
                 return;
             }
             Err(SchedulerAcquireError::InsufficientCapacity) => {
-                finish_import_before_execution(
+                finish_import_setup(
                     &state,
                     &job_id,
                     &instance_id,
                     upload_id.as_deref(),
-                    fixed_scheduler_capacity_error(),
+                    scheduler_capacity_error(),
                 )
                 .await;
                 return;
@@ -175,21 +173,14 @@ pub(super) fn spawn_import_job_supervisor(
         let staging = match acquire_upload_staging(&state, &instance_id, &options).await {
             Ok(staging) => staging,
             Err(error) => {
-                finish_import_before_execution(
-                    &state,
-                    &job_id,
-                    &instance_id,
-                    upload_id.as_deref(),
-                    error,
-                )
-                .await;
+                finish_import_setup(&state, &job_id, &instance_id, upload_id.as_deref(), error)
+                    .await;
                 return;
             }
         };
         let begin = begin_import_export_job(&state, &job_id).await;
         if begin != JobBeginOutcome::Running {
-            finish_import_begin_outcome(&state, &job_id, &instance_id, upload_id.as_deref(), begin)
-                .await;
+            finish_import_start(&state, &job_id, &instance_id, upload_id.as_deref(), begin).await;
             return;
         }
         phase.store(IMPORT_WORKER_RUNNING, Ordering::Release);
@@ -202,7 +193,7 @@ pub(super) fn spawn_import_job_supervisor(
             worker_phase.store(IMPORT_WORKER_FINISHED, Ordering::Release);
         });
         if let Err(error) = worker.await {
-            handle_import_worker_failure(
+            recover_import_worker(
                 &failure_state,
                 &failure_job_id,
                 &failure_instance_id,
@@ -217,7 +208,7 @@ pub(super) fn spawn_import_job_supervisor(
     });
 }
 
-async fn finish_import_before_execution(
+async fn finish_import_setup(
     state: &AppState,
     job_id: &str,
     instance_id: &str,
@@ -250,7 +241,7 @@ async fn finish_import_before_execution(
     }
 }
 
-async fn finish_import_begin_outcome(
+async fn finish_import_start(
     state: &AppState,
     job_id: &str,
     instance_id: &str,
@@ -286,7 +277,7 @@ async fn finish_import_begin_outcome(
     }
 }
 
-async fn handle_export_worker_failure(
+async fn recover_export_worker(
     state: &AppState,
     job_id: &str,
     instance_id: &str,
@@ -305,7 +296,7 @@ async fn handle_export_worker_failure(
         "worker_failure",
         "the export worker stopped unexpectedly; retry the export",
     );
-    let terminal_persisted = persist_terminal_job_status(
+    let terminal_persisted = save_terminal_job_status(
         state,
         job_id,
         ImportExportStatus::Failed,
@@ -332,16 +323,16 @@ async fn handle_export_worker_failure(
     }
     if restore_running
         && let Err(restart_error) =
-            lifecycle_instance_locked(state, instance_id, LifecycleAction::Start).await
+            change_instance_state_locked(state, instance_id, LifecycleAction::Start).await
     {
         tracing::error!(%job_id, %instance_id, %restart_error, "failed to restore a target after physical export worker failure");
-        if let Err(quarantine_error) = quarantine_after_uncertain_import(state, instance_id).await {
+        if let Err(quarantine_error) = quarantine_uncertain_import(state, instance_id).await {
             tracing::error!(%job_id, %instance_id, %quarantine_error, "failed to quarantine a target after physical export recovery failed");
         }
     }
 }
 
-async fn handle_import_worker_failure(
+async fn recover_import_worker(
     state: &AppState,
     job_id: &str,
     instance_id: &str,
@@ -369,7 +360,7 @@ async fn handle_import_worker_failure(
             "the import worker stopped before the import began; retry the import",
         )
     };
-    let terminal_persisted = persist_terminal_job_status(
+    let terminal_persisted = save_terminal_job_status(
         state,
         job_id,
         ImportExportStatus::Failed,
@@ -414,7 +405,7 @@ async fn handle_import_worker_failure(
         )
         .await;
     }
-    if let Err(quarantine_error) = quarantine_after_uncertain_import(state, instance_id).await {
+    if let Err(quarantine_error) = quarantine_uncertain_import(state, instance_id).await {
         tracing::error!(%job_id, %instance_id, %quarantine_error, "failed to fully quarantine a target after import worker failure");
     }
 }
@@ -428,8 +419,8 @@ pub(super) async fn block_uncertain_upload(
 ) {
     match state
         .import_uploads
-        .repository()
-        .reconcile_interrupted_importing(
+        .repo()
+        .reconcile_interrupted(
             instance_id,
             upload_id,
             job_id,
@@ -457,8 +448,8 @@ async fn claim_upload_for_job(
 ) -> bool {
     let claimed = match state
         .import_uploads
-        .repository()
-        .claim_ready_for_job(
+        .repo()
+        .claim_for_job(
             instance_id,
             upload_id,
             job_id,
@@ -477,8 +468,8 @@ async fn claim_upload_for_job(
             .await;
             if let Err(release_error) = state
                 .import_uploads
-                .repository()
-                .release_claim_after_failed_job(
+                .repo()
+                .release_failed_claim(
                     instance_id,
                     upload_id,
                     job_id,

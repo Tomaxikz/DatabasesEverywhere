@@ -92,12 +92,9 @@ pub async fn restore_artifact(
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let artifact_path = crate::api::artifacts::verified_artifact_path_for_instance(
-        &state,
-        &request.artifact_id,
-        &instance_id,
-    )
-    .await?;
+    let artifact_path =
+        crate::api::artifacts::verified_artifact_path(&state, &request.artifact_id, &instance_id)
+            .await?;
     queue_import_instance(
         &state,
         &instance_id,

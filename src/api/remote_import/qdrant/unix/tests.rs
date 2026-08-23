@@ -7,24 +7,24 @@ fn path_segments_are_encoded() {
 
 #[test]
 fn qdrant_snapshot_versions_follow_the_supported_upgrade_window() {
-    assert!(ensure_snapshot_compatible("1.12.0", "1.13.1").is_err());
-    assert!(ensure_snapshot_compatible("1.13.0", "1.13.1").is_ok());
-    assert!(ensure_snapshot_compatible("1.13.0", "1.12.9").is_err());
-    assert!(ensure_snapshot_compatible("1.16.0", "1.18.0").is_err());
-    assert!(ensure_snapshot_compatible("1.13.2", "1.13.1").is_err());
-    assert!(ensure_snapshot_compatible("2.0.0", "1.99.0").is_err());
+    assert!(check_snapshot_compatibility("1.12.0", "1.13.1").is_err());
+    assert!(check_snapshot_compatibility("1.13.0", "1.13.1").is_ok());
+    assert!(check_snapshot_compatibility("1.13.0", "1.12.9").is_err());
+    assert!(check_snapshot_compatibility("1.16.0", "1.18.0").is_err());
+    assert!(check_snapshot_compatibility("1.13.2", "1.13.1").is_err());
+    assert!(check_snapshot_compatibility("2.0.0", "1.99.0").is_err());
 }
 
 #[test]
 fn qdrant_topology_rejects_distributed_or_multi_peer_sources() {
     assert_eq!(
-        qdrant_topology_is_standalone(&json!({
+        topology_is_standalone(&json!({
             "result": { "status": "disabled" }
         })),
         Some(true)
     );
     assert_eq!(
-        qdrant_topology_is_standalone(&json!({
+        topology_is_standalone(&json!({
             "result": {
                 "status": "enabled",
                 "peers": { "1": { "uri": "http://node-1" } }
@@ -33,7 +33,7 @@ fn qdrant_topology_rejects_distributed_or_multi_peer_sources() {
         Some(false)
     );
     assert_eq!(
-        qdrant_topology_is_standalone(&json!({
+        topology_is_standalone(&json!({
             "result": {
                 "status": "disabled",
                 "peers": {
@@ -49,11 +49,11 @@ fn qdrant_topology_rejects_distributed_or_multi_peer_sources() {
 #[test]
 fn qdrant_version_errors_do_not_echo_remote_text() {
     let invalid = "secret-source-version";
-    let error = ensure_snapshot_compatible(invalid, "1.13.1").unwrap_err();
+    let error = check_snapshot_compatibility(invalid, "1.13.1").unwrap_err();
     assert!(!error.to_string().contains(invalid));
 
     let incompatible = "9.0-secret-source-version";
-    let error = ensure_snapshot_compatible(incompatible, "1.13.1").unwrap_err();
+    let error = check_snapshot_compatibility(incompatible, "1.13.1").unwrap_err();
     assert!(!error.to_string().contains(incompatible));
 }
 
@@ -69,8 +69,8 @@ fn qdrant_bridge_guard_owns_static_cleanup_state() {
 fn every_attempted_qdrant_mutation_requires_a_process_fence_before_rollback() {
     // A lost upload response can outlive the HTTP future inside Qdrant. Never optimize
     // this to an immediate rollback based only on the client-side error kind.
-    assert!(qdrant_rollback_requires_quiescence(true));
-    assert!(!qdrant_rollback_requires_quiescence(false));
+    assert!(qdrant_rollback_needs_stop(true));
+    assert!(!qdrant_rollback_needs_stop(false));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn qdrant_alias_selection_follows_collection_selection() {
 
 #[test]
 fn incoming_collection_cannot_resolve_through_a_target_alias() {
-    let error = ensure_no_qdrant_name_collisions(
+    let error = check_qdrant_names(
         &HashSet::from(["orders".to_string()]),
         &[],
         &["unrelated".to_string()],
@@ -152,7 +152,7 @@ fn incoming_collection_cannot_resolve_through_a_target_alias() {
 
 #[test]
 fn incoming_alias_cannot_shadow_a_target_collection() {
-    let error = ensure_no_qdrant_name_collisions(
+    let error = check_qdrant_names(
         &HashSet::from(["imported".to_string()]),
         &[qdrant_alias("orders", "imported")],
         &["orders".to_string()],

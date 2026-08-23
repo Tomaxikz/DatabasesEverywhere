@@ -20,7 +20,7 @@ use crate::{
     shared::protocol::Protocol,
 };
 
-use super::usage::{DirectoryUsage, ScanLimits, scan_directory_blocking_identified};
+use super::usage::{DirectoryUsage, ScanLimits, scan_directory_with_id};
 
 // Bound tenant-controlled incremental state; larger trees stream full scans.
 const DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET: usize = 4_096;
@@ -608,7 +608,7 @@ impl SoftDiskLimiter {
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let Some(cache) = cache else {
-                return scan_directory_blocking_identified(&scan_path, limits)
+                return scan_directory_with_id(&scan_path, limits)
                     .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
             };
             let mut state = cache
@@ -616,14 +616,12 @@ impl SoftDiskLimiter {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.streaming_only {
-                return scan_directory_blocking_identified(&scan_path, limits)
+                return scan_directory_with_id(&scan_path, limits)
                     .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
             }
             match request {
-                HybridScanRequest::StreamingFull => {
-                    scan_directory_blocking_identified(&scan_path, limits)
-                        .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
-                }
+                HybridScanRequest::StreamingFull => scan_directory_with_id(&scan_path, limits)
+                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity)),
                 HybridScanRequest::Full => scan_full_with_bounded_cache(
                     &cache,
                     &mut state,
@@ -954,7 +952,7 @@ fn scan_full_with_bounded_cache(
             slot.switch_to_streaming(state);
         }
     }
-    scan_directory_blocking_identified(scan_path, limits)
+    scan_directory_with_id(scan_path, limits)
         .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::api::import_export) async fn resolve_upload_source_database_catalog(
+pub(in crate::api::import_export) async fn resolve_upload_catalog(
     state: &AppState,
     instance_id: &str,
     source: &ImportSourceOptions,
@@ -11,7 +11,7 @@ pub(in crate::api::import_export) async fn resolve_upload_source_database_catalo
     };
     let upload = state
         .import_uploads
-        .repository()
+        .repo()
         .get(instance_id, upload_id)
         .await
         .map_err(upload_storage_error)?
@@ -33,10 +33,10 @@ pub(in crate::api::import_export) async fn resolve_upload_source_database_catalo
             "stored upload catalog protocol is invalid".to_string(),
         ));
     }
-    resolve_mongodb_source_database(catalog.as_ref(), source_database)
+    resolve_source_database(catalog.as_ref(), source_database)
 }
 
-fn resolve_mongodb_source_database(
+fn resolve_source_database(
     catalog: Option<&DumpInspection>,
     source_database: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
@@ -58,17 +58,17 @@ fn resolve_mongodb_source_database(
     }
 
     let Some(catalog) = catalog else {
-        return Err(manual_source_database_required(
+        return Err(manual_source_database_error(
             "inspect the upload or provide source.source_database",
         ));
     };
     if !catalog.catalog_complete || catalog.namespaces.is_empty() {
-        return Err(manual_source_database_required(
+        return Err(manual_source_database_error(
             "discovery was empty or incomplete; provide source.source_database",
         ));
     }
     if catalog.namespaces.len() != 1 {
-        return Err(manual_source_database_required(
+        return Err(manual_source_database_error(
             "multiple source databases were detected; choose one in source.source_database",
         ));
     }
@@ -84,7 +84,7 @@ fn resolve_mongodb_source_database(
     Ok(Some(database.clone()))
 }
 
-fn manual_source_database_required(reason: &str) -> ApiError {
+fn manual_source_database_error(reason: &str) -> ApiError {
     ApiError::Conflict(format!(
         "MongoDB upload imports need an unambiguous source database: {reason}"
     ))
@@ -117,11 +117,11 @@ mod tests {
     #[test]
     fn source_database_resolution_handles_inferred_explicit_and_inconclusive_catalogs() {
         assert_eq!(
-            resolve_mongodb_source_database(Some(&catalog(&["tenant"], true)), None).unwrap(),
+            resolve_source_database(Some(&catalog(&["tenant"], true)), None).unwrap(),
             Some("tenant".to_string())
         );
         assert!(matches!(
-            resolve_mongodb_source_database(Some(&catalog(&["alpha", "beta"], true)), None),
+            resolve_source_database(Some(&catalog(&["alpha", "beta"], true)), None),
             Err(ApiError::Conflict(_))
         ));
 
@@ -131,18 +131,18 @@ mod tests {
             None,
         ] {
             assert!(matches!(
-                resolve_mongodb_source_database(catalog.as_ref(), None),
+                resolve_source_database(catalog.as_ref(), None),
                 Err(ApiError::Conflict(_))
             ));
         }
 
         let authoritative_catalog = catalog(&["alpha", "beta"], true);
         assert_eq!(
-            resolve_mongodb_source_database(Some(&authoritative_catalog), Some("alpha")).unwrap(),
+            resolve_source_database(Some(&authoritative_catalog), Some("alpha")).unwrap(),
             Some("alpha".to_string())
         );
         assert!(matches!(
-            resolve_mongodb_source_database(Some(&authoritative_catalog), Some("gamma")),
+            resolve_source_database(Some(&authoritative_catalog), Some("gamma")),
             Err(ApiError::Conflict(_))
         ));
 
@@ -152,7 +152,7 @@ mod tests {
             None,
         ] {
             assert_eq!(
-                resolve_mongodb_source_database(catalog.as_ref(), Some("manual")).unwrap(),
+                resolve_source_database(catalog.as_ref(), Some("manual")).unwrap(),
                 Some("manual".to_string())
             );
         }

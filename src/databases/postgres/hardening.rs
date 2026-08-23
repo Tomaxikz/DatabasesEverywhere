@@ -52,7 +52,7 @@ pub async fn provision_tenant_role(
         shell_quote(&provision),
     );
     let output = docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             instance_id,
             &script,
@@ -99,7 +99,7 @@ pub async fn harden_instance_auth(
         SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()));
     let script = hardening_script(tenant_username);
     let output = docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             instance_id,
             &script,
@@ -128,13 +128,13 @@ pub async fn harden_instance_auth(
     }
 }
 
-pub(crate) async fn verify_internal_admin_password(
+pub(crate) async fn verify_admin_password(
     docker: &DockerRuntime,
     instance_id: &str,
     password: &SecretString,
 ) -> Result<(), DockerError> {
     let output = docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             instance_id,
             "set -eu\ntest \"$(cat /proc/1/comm)\" = postgres\nPGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atqc \"SELECT rolpassword FROM pg_authid WHERE rolname = current_user\"\n",
@@ -144,13 +144,12 @@ pub(crate) async fn verify_internal_admin_password(
         .await?;
     let verifier = output.stdout.trim().to_string();
     let password = password.expose_secret().to_string();
-    let verified =
-        tokio::task::spawn_blocking(move || verify_scram_sha256_password(&password, &verifier))
-            .await
-            .map_err(|error| DockerError::PostgresAuthHardeningFailed {
-                instance_id: instance_id.to_string(),
-                reason: format!("the PostgreSQL SCRAM verification task failed: {error}"),
-            })?;
+    let verified = tokio::task::spawn_blocking(move || verify_scram_password(&password, &verifier))
+        .await
+        .map_err(|error| DockerError::PostgresAuthHardeningFailed {
+            instance_id: instance_id.to_string(),
+            reason: format!("the PostgreSQL SCRAM verification task failed: {error}"),
+        })?;
     if !verified {
         return Err(DockerError::PostgresAuthHardeningFailed {
             instance_id: instance_id.to_string(),
@@ -161,7 +160,7 @@ pub(crate) async fn verify_internal_admin_password(
     Ok(())
 }
 
-async fn verify_tenant_password_against_scram(
+async fn verify_tenant_scram(
     docker: &DockerRuntime,
     instance_id: &str,
     tenant_username: &str,
@@ -172,7 +171,7 @@ async fn verify_tenant_password_against_scram(
         tenant_username,
     ));
     let output = docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             instance_id,
             &format!(
@@ -184,7 +183,7 @@ async fn verify_tenant_password_against_scram(
         .await?;
     let verifier = output.stdout.trim().to_string();
     let password = tenant_password.expose_secret().to_string();
-    tokio::task::spawn_blocking(move || verify_scram_sha256_password(&password, &verifier))
+    tokio::task::spawn_blocking(move || verify_scram_password(&password, &verifier))
         .await
         .map_err(|error| DockerError::PostgresAuthHardeningFailed {
             instance_id: instance_id.to_string(),
@@ -196,7 +195,7 @@ async fn verify_tenant_password_against_scram(
 /// legacy local authentication demonstrably accepts a deliberately invalid
 /// password. This is a controlled migration out of `trust`; it never changes
 /// a tenant credential and cannot bypass an already enforced password policy.
-async fn repair_internal_admin_password_under_bypassed_auth(
+async fn repair_admin_password(
     docker: &DockerRuntime,
     instance_id: &str,
     replacement: &SecretString,
@@ -219,7 +218,7 @@ printf 'rotated\n'
 "#
     );
     let output = docker
-        .exec_shell_with_secret_env_timeout(
+        .exec_shell_with_secrets_timeout(
             Protocol::Postgres,
             instance_id,
             &script,
@@ -232,7 +231,7 @@ printf 'rotated\n'
         .await?;
     match output.stdout.lines().last() {
         Some("rotated") => {
-            verify_internal_admin_password(docker, instance_id, replacement).await?;
+            verify_admin_password(docker, instance_id, replacement).await?;
             Ok(true)
         }
         Some("password_enforced") => Ok(false),
@@ -245,7 +244,7 @@ printf 'rotated\n'
     }
 }
 
-fn verify_scram_sha256_password(password: &str, verifier: &str) -> bool {
+fn verify_scram_password(password: &str, verifier: &str) -> bool {
     const MAX_VERIFIER_BYTES: usize = 4_096;
     const MAX_ITERATIONS: u32 = 100_000;
     const MAX_SALT_BYTES: usize = 1_024;
@@ -318,14 +317,14 @@ pub async fn harden_on_boot(
             .into_iter()
             .filter(|metadata| metadata.protocol == Protocol::Postgres),
     )
-    .map(|snapshot| harden_postgres_instance_on_boot(manager, docker, instance_locks, snapshot))
+    .map(|snapshot| harden_postgres(manager, docker, instance_locks, snapshot))
     .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    aggregate_postgres_hardening_summaries(outcomes)
+    merge_postgres_hardening(outcomes)
 }
 
-async fn harden_postgres_instance_on_boot(
+async fn harden_postgres(
     manager: &InstanceManager,
     docker: &DockerRuntime,
     instance_locks: &InstanceLocks,
@@ -359,7 +358,7 @@ async fn harden_postgres_instance_on_boot(
                 Some(check)
             }
             Err(error) => {
-                record_running_auth_failure(
+                record_auth_failure(
                     manager,
                     &metadata,
                     format!(
@@ -390,7 +389,7 @@ async fn harden_postgres_instance_on_boot(
             return summary;
         }
         Err(_) => {
-            record_running_auth_failure(
+            record_auth_failure(
                 manager,
                 &metadata,
                 "the managed PostgreSQL bootstrap credential could not be inspected safely"
@@ -416,7 +415,7 @@ async fn harden_postgres_instance_on_boot(
             );
             return summary;
         }
-        record_running_auth_failure(manager, &metadata, error.to_string(), &mut summary).await;
+        record_auth_failure(manager, &metadata, error.to_string(), &mut summary).await;
         return summary;
     }
     if metadata.status != InstanceStatus::Running {
@@ -428,29 +427,23 @@ async fn harden_postgres_instance_on_boot(
         .map(|password| SecretString::from(password.to_string()));
     let mut migrate_admin_password = false;
     let admin_password = if let Some(persisted) = persisted_admin {
-        if verify_internal_admin_password(docker, &metadata.instance_id, &persisted)
+        if verify_admin_password(docker, &metadata.instance_id, &persisted)
             .await
             .is_ok()
         {
             persisted
         } else if persisted.expose_secret() != bootstrap_password.expose_secret()
-            && verify_internal_admin_password(docker, &metadata.instance_id, &bootstrap_password)
+            && verify_admin_password(docker, &metadata.instance_id, &bootstrap_password)
                 .await
                 .is_ok()
         {
             migrate_admin_password = true;
             bootstrap_password
         } else {
-            match repair_internal_admin_password_under_bypassed_auth(
-                docker,
-                &metadata.instance_id,
-                &persisted,
-            )
-            .await
-            {
+            match repair_admin_password(docker, &metadata.instance_id, &persisted).await {
                 Ok(true) => persisted,
                 _ => {
-                    record_running_auth_failure(
+                    record_auth_failure(
                         manager,
                         &metadata,
                         "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
@@ -462,26 +455,20 @@ async fn harden_postgres_instance_on_boot(
                 }
             }
         }
-    } else if verify_internal_admin_password(docker, &metadata.instance_id, &bootstrap_password)
+    } else if verify_admin_password(docker, &metadata.instance_id, &bootstrap_password)
         .await
         .is_ok()
     {
         migrate_admin_password = true;
         bootstrap_password
     } else {
-        match repair_internal_admin_password_under_bypassed_auth(
-            docker,
-            &metadata.instance_id,
-            &bootstrap_password,
-        )
-        .await
-        {
+        match repair_admin_password(docker, &metadata.instance_id, &bootstrap_password).await {
             Ok(true) => {
                 migrate_admin_password = true;
                 bootstrap_password
             }
             _ => {
-                record_running_auth_failure(
+                record_auth_failure(
                     manager,
                     &metadata,
                     "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
@@ -493,11 +480,11 @@ async fn harden_postgres_instance_on_boot(
             }
         }
     };
-    if verify_internal_admin_password(docker, &metadata.instance_id, &admin_password)
+    if verify_admin_password(docker, &metadata.instance_id, &admin_password)
         .await
         .is_err()
     {
-        record_running_auth_failure(
+        record_auth_failure(
             manager,
             &metadata,
             "the existing PostgreSQL administrator credential could not be verified against the database SCRAM secret"
@@ -516,14 +503,14 @@ async fn harden_postgres_instance_on_boot(
         Some(password) if !password.is_empty() => SecretString::from(password.to_string()),
         _ => {
             let candidate = match docker
-                .postgres_legacy_tenant_credentials(&metadata.instance_id)
+                .postgres_legacy_credentials(&metadata.instance_id)
                 .await
             {
                 Ok(Some((username, password))) if username == metadata.database.username => {
                     password
                 }
                 Ok(Some(_)) => {
-                    record_running_auth_failure(
+                    record_auth_failure(
                         manager,
                         &metadata,
                         "the legacy PostgreSQL tenant username does not match protected instance metadata; refusing to adopt it"
@@ -534,7 +521,7 @@ async fn harden_postgres_instance_on_boot(
                     return summary;
                 }
                 Ok(None) | Err(_) => {
-                    record_running_auth_failure(
+                    record_auth_failure(
                         manager,
                         &metadata,
                         "the encrypted tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway"
@@ -545,7 +532,7 @@ async fn harden_postgres_instance_on_boot(
                     return summary;
                 }
             };
-            match verify_tenant_password_against_scram(
+            match verify_tenant_scram(
                 docker,
                 &metadata.instance_id,
                 &metadata.database.username,
@@ -559,7 +546,7 @@ async fn harden_postgres_instance_on_boot(
                     candidate
                 }
                 _ => {
-                    record_running_auth_failure(
+                    record_auth_failure(
                         manager,
                         &metadata,
                         "the legacy PostgreSQL tenant credential does not match the live database SCRAM verifier; reset this legacy instance before opening its gateway"
@@ -584,7 +571,7 @@ async fn harden_postgres_instance_on_boot(
     let changed = match hardening {
         Ok(changed) => changed,
         Err(_) => {
-            record_running_auth_failure(
+            record_auth_failure(
                 manager,
                 &metadata,
                 "PostgreSQL local authentication hardening could not be completed safely"
@@ -601,11 +588,8 @@ async fn harden_postgres_instance_on_boot(
     if migrate_admin_password || migrate_tenant_password {
         metadata.postgres_admin_password = Some(admin_password.expose_secret().to_string());
         metadata.tenant_password = Some(tenant_password.expose_secret().to_string());
-        if let Err(error) = manager
-            .upsert_recovered_protected_secrets(metadata.clone())
-            .await
-        {
-            record_running_auth_failure(
+        if let Err(error) = manager.upsert_recovered_secrets(metadata.clone()).await {
+            record_auth_failure(
                 manager,
                 &metadata,
                 format!(
@@ -645,7 +629,7 @@ async fn harden_postgres_instance_on_boot(
                 "PostgreSQL hardening succeeded, but its optimization attestation could not be persisted"
             );
         } else {
-            record_running_auth_failure(
+            record_auth_failure(
                 manager,
                 &metadata,
                 format!("PostgreSQL container generation changed during hardening: {error}"),
@@ -658,9 +642,7 @@ async fn harden_postgres_instance_on_boot(
     summary
 }
 
-fn aggregate_postgres_hardening_summaries(
-    outcomes: Vec<PostgresHardeningSummary>,
-) -> PostgresHardeningSummary {
+fn merge_postgres_hardening(outcomes: Vec<PostgresHardeningSummary>) -> PostgresHardeningSummary {
     let mut summary = PostgresHardeningSummary::default();
     for mut outcome in outcomes {
         summary.checked += outcome.checked;
@@ -678,7 +660,7 @@ fn aggregate_postgres_hardening_summaries(
     summary
 }
 
-async fn record_running_auth_failure(
+async fn record_auth_failure(
     manager: &InstanceManager,
     metadata: &InstanceMetadata,
     reason: String,
@@ -856,17 +838,14 @@ mod tests {
     fn bootstrap_admin_is_adopted_only_when_its_scram_secret_matches() {
         let verifier = "SCRAM-SHA-256$4096:MDEyMzQ1Njc4OWFiY2RlZg==$6/GDk4+gZMX4iv8Ibw6yXOdLYz3kM7F1as2BGy/hOKo=:Oa1MbaDa29ii1LLBMeTRyDGjXTn6G2q1ZT+GhsnFa2c=";
 
-        assert!(verify_scram_sha256_password("admin-password", verifier));
-        assert!(!verify_scram_sha256_password("wrong-password", verifier));
-        assert!(!verify_scram_sha256_password(
-            "admin-password",
-            "md5deadbeef"
-        ));
-        assert!(!verify_scram_sha256_password(
+        assert!(verify_scram_password("admin-password", verifier));
+        assert!(!verify_scram_password("wrong-password", verifier));
+        assert!(!verify_scram_password("admin-password", "md5deadbeef"));
+        assert!(!verify_scram_password(
             "admin-password",
             &verifier.replacen("4096", "100001", 1)
         ));
-        assert!(!verify_scram_sha256_password(
+        assert!(!verify_scram_password(
             "admin-password",
             &format!("SCRAM-SHA-256$4096:{}$AA==:AA==", "A".repeat(2_000))
         ));
@@ -913,7 +892,7 @@ mod tests {
 
     #[test]
     fn concurrent_outcomes_are_aggregated_deterministically() {
-        let summary = aggregate_postgres_hardening_summaries(vec![
+        let summary = merge_postgres_hardening(vec![
             PostgresHardeningSummary {
                 checked: 1,
                 hardened: 1,

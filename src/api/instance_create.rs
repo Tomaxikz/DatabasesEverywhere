@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use crate::{
     api::{
         api_response::ApiError,
-        images::{ensure_image_allowed, validate_image},
+        images::{check_image_allowed, validate_image},
         instance_requests::{CreateInstanceRequest, limits_from_request, validate_create_request},
         instances::docker_error,
         resources::{mib_to_bytes, read_host_cpu_cores, read_host_disk, read_host_memory},
@@ -32,9 +32,9 @@ use crate::{
 mod mysql_hardening;
 
 #[cfg(test)]
-use mysql_hardening::mysql_auth_failed_metadata;
+use mysql_hardening::failed_auth_metadata;
 pub(crate) use mysql_hardening::{
-    harden_mysql_accounts_on_boot, harden_mysql_tenant_auth, verify_mysql_root_auth,
+    harden_mysql_accounts, harden_mysql_tenant_auth, verify_mysql_root_auth,
 };
 
 pub async fn create_instance_from_request(
@@ -72,7 +72,7 @@ pub(crate) async fn prepare_instance_container_user(
         let (uid, gid) = docker
             .rootless_podman_host_owner()
             .ok_or(crate::instances::paths::InstancePathError::MissingRuntimeOwner)?;
-        paths.apply_rootless_podman_owner(uid, gid).await?;
+        paths.apply_rootless_owner(uid, gid).await?;
         Ok(user.to_string())
     } else {
         paths.apply_container_owner().await?;
@@ -173,7 +173,7 @@ pub(crate) async fn enforce_node_allocation_policy(
             allocated,
             previous_memory_bytes,
             requested_memory_bytes,
-            allocation.effective_memory_limit_bytes(host.total_bytes),
+            allocation.memory_allocation_cap_bytes(host.total_bytes),
             host.available_bytes,
             allocation.reserved_memory_bytes(),
         )?;
@@ -191,7 +191,7 @@ pub(crate) async fn enforce_node_allocation_policy(
             allocated,
             previous_disk_bytes,
             requested_disk_bytes,
-            allocation.effective_disk_limit_bytes(host.total_bytes),
+            allocation.disk_allocation_cap_bytes(host.total_bytes),
             host.available_bytes,
             allocation.reserved_disk_bytes(),
         )?;
@@ -243,7 +243,7 @@ fn enforce_resource_allocation(
         ));
     }
     if additional_bytes.saturating_add(reserved_bytes) > available_bytes {
-        return Err(available_capacity_unavailable(
+        return Err(capacity_unavailable(
             resource,
             additional_bytes,
             available_bytes,
@@ -262,7 +262,7 @@ fn allocation_unavailable(resource: &str, projected_bytes: u64, limit_bytes: u64
     ))
 }
 
-fn available_capacity_unavailable(
+fn capacity_unavailable(
     resource: &str,
     additional_bytes: u64,
     available_bytes: u64,
@@ -284,7 +284,7 @@ async fn create_instance_from_validated_request(
     state: &AppState,
     request: CreateInstanceRequest,
 ) -> Result<InstanceMetadata, ApiError> {
-    let image = requested_or_configured_image(state, &request)?;
+    let image = resolve_image(state, &request)?;
     state
         .install_progress
         .begin(&request.instance_id, request.protocol, &image);
@@ -646,8 +646,7 @@ async fn create_instance_from_validated_request(
         "socket",
         "registering private backend socket",
     );
-    let backend = match backend_endpoint_for_instance(state, request.protocol, &request.instance_id)
-    {
+    let backend = match backend_endpoint(state, request.protocol, &request.instance_id) {
         Ok(backend) => backend,
         Err(error) => {
             state.install_progress.fail_api_error(
@@ -882,7 +881,7 @@ pub(crate) async fn provision_mariadb_tenant_user(
     let root_password = SecretString::from(root_password.to_string());
     state
         .docker
-        .exec_shell_with_secret_env(
+        .exec_shell_with_secrets(
             Protocol::Mariadb,
             instance_id,
             &script,
@@ -902,7 +901,7 @@ pub(crate) async fn provision_mysql_tenant_user(
     root_password: &str,
 ) -> Result<(), ApiError> {
     let root_password_secret = SecretString::from(root_password.to_string());
-    mysql_hardening::verify_mysql_root_auth_with_timeout(
+    mysql_hardening::verify_mysql_root_auth(
         state,
         instance_id,
         &root_password_secret,
@@ -910,7 +909,7 @@ pub(crate) async fn provision_mysql_tenant_user(
     )
     .await?;
     let sql = databases::mysql::provision::tenant_user_sql(database, username);
-    mysql_hardening::execute_mysql_protected_sql(state, instance_id, &sql, password, root_password)
+    mysql_hardening::run_protected_mysql_sql(state, instance_id, &sql, password, root_password)
         .await
 }
 
@@ -1151,7 +1150,7 @@ fn image_for_protocol(state: &AppState, protocol: Protocol) -> &str {
     }
 }
 
-pub(crate) fn requested_or_configured_image(
+pub(crate) fn resolve_image(
     state: &AppState,
     request: &CreateInstanceRequest,
 ) -> Result<String, ApiError> {
@@ -1162,7 +1161,7 @@ pub(crate) fn requested_or_configured_image(
         .transpose()?
         .map(str::to_string)
         .unwrap_or_else(|| image_for_protocol(state, request.protocol).to_string());
-    ensure_image_allowed(state, request.protocol, &image)?;
+    check_image_allowed(state, request.protocol, &image)?;
     Ok(image)
 }
 
@@ -1471,7 +1470,7 @@ pub(crate) fn protocol_pids_limit(state: &AppState, protocol: Protocol) -> i64 {
     .unwrap_or(state.config.security.pids_limit)
 }
 
-pub(crate) fn backend_endpoint_for_instance(
+pub(crate) fn backend_endpoint(
     state: &AppState,
     protocol: Protocol,
     instance_id: &str,

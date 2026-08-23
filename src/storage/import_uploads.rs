@@ -237,7 +237,7 @@ impl ImportUploadRepository {
         }
     }
 
-    pub async fn insert_if_within_limits(
+    pub async fn insert_within_limits(
         &self,
         upload: NewImportUpload,
         max_per_instance: u64,
@@ -346,7 +346,7 @@ impl ImportUploadRepository {
         row.map(row_to_upload).transpose()
     }
 
-    pub async fn list_active_for_instance(
+    pub async fn list_active(
         &self,
         instance_id: &str,
         limit: u32,
@@ -454,7 +454,7 @@ impl ImportUploadRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn restore_ready_after_processing(
+    pub async fn restore_ready(
         &self,
         instance_id: &str,
         upload_id: &str,
@@ -517,7 +517,7 @@ impl ImportUploadRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn claim_ready_for_job(
+    pub async fn claim_for_job(
         &self,
         instance_id: &str,
         upload_id: &str,
@@ -545,7 +545,7 @@ impl ImportUploadRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn release_claim_after_failed_job(
+    pub async fn release_failed_claim(
         &self,
         instance_id: &str,
         upload_id: &str,
@@ -701,7 +701,7 @@ impl ImportUploadRepository {
         rows.into_iter().map(row_to_upload).collect()
     }
 
-    pub async fn list_terminal_cleanup_after(
+    pub async fn list_cleanup_after(
         &self,
         after_upload_id: Option<&str>,
         limit: u32,
@@ -726,7 +726,7 @@ impl ImportUploadRepository {
         rows.into_iter().map(row_to_upload).collect()
     }
 
-    pub async fn list_nonterminal_recovery_after(
+    pub async fn list_recovery_after(
         &self,
         after_upload_id: Option<&str>,
         now: &str,
@@ -805,7 +805,7 @@ impl ImportUploadRepository {
         })
     }
 
-    pub async fn reconcile_interrupted_importing(
+    pub async fn reconcile_interrupted(
         &self,
         instance_id: &str,
         upload_id: &str,
@@ -884,7 +884,7 @@ fn parse_protocol(value: &str) -> Result<Protocol, ImportUploadParseError> {
 fn validate_upload(upload: &ImportUpload) -> Result<(), ImportUploadValidationError> {
     validate_token("upload_id", &upload.upload_id)?;
     validate_token("instance_id", &upload.instance_id)?;
-    validate_original_filename(&upload.original_filename)?;
+    validate_filename(&upload.original_filename)?;
     validate_stored_filename(&upload.stored_filename)?;
     let created_at = validate_timestamp("created_at", &upload.created_at)?;
     let updated_at = validate_timestamp("updated_at", &upload.updated_at)?;
@@ -946,7 +946,7 @@ fn validate_token(field: &'static str, value: &str) -> Result<(), ImportUploadVa
     Ok(())
 }
 
-fn validate_original_filename(value: &str) -> Result<(), ImportUploadValidationError> {
+fn validate_filename(value: &str) -> Result<(), ImportUploadValidationError> {
     if value.is_empty()
         || value.len() > 255
         || matches!(value, "." | "..")

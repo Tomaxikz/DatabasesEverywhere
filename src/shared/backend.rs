@@ -58,7 +58,7 @@ pub fn clickhouse_http_socket_path(native_socket_path: &Path) -> Option<PathBuf>
         .map(|parent| parent.join(CLICKHOUSE_HTTP_SOCKET_FILENAME))
 }
 
-pub fn container_clickhouse_http_socket_path() -> String {
+pub fn clickhouse_http_socket() -> String {
     format!("{CONTAINER_SOCKET_DIRECTORY}/{CLICKHOUSE_HTTP_SOCKET_FILENAME}")
 }
 
@@ -68,7 +68,7 @@ pub fn qdrant_http_socket_path(grpc_socket_path: &Path) -> Option<PathBuf> {
         .map(|parent| parent.join(QDRANT_HTTP_SOCKET_FILENAME))
 }
 
-pub fn container_qdrant_http_socket_path() -> String {
+pub fn qdrant_http_socket() -> String {
     format!("{CONTAINER_SOCKET_DIRECTORY}/{QDRANT_HTTP_SOCKET_FILENAME}")
 }
 

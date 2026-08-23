@@ -66,7 +66,7 @@ impl InstanceRepository {
                 let metadata_json: String = row.try_get("metadata_json")?;
                 let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
                 self.load_desired_state(&mut metadata, &row)?;
-                self.load_disk_limit_blocked(&mut metadata, &row)?;
+                self.load_disk_block(&mut metadata, &row)?;
                 self.load_route_auth(&mut metadata, &row)?;
                 validate_metadata_schema(&metadata)?;
                 Ok(metadata)
@@ -109,36 +109,34 @@ impl InstanceRepository {
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
         self.load_desired_state(&mut metadata, &row)?;
-        self.load_disk_limit_blocked(&mut metadata, &row)?;
+        self.load_disk_block(&mut metadata, &row)?;
         self.load_route_auth(&mut metadata, &row)?;
         validate_metadata_schema(&metadata)?;
         Ok(Some(metadata))
     }
 
     pub async fn upsert(&self, metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
-        self.upsert_with_protected_secret_replacement(metadata, false)
-            .await
+        self.upsert_protected_secrets(metadata, false).await
     }
 
     /// Atomically replaces protected route authentication and clears an
     /// existing recovery marker. Callers must verify the replacement against
     /// the live database before using this path.
-    pub(crate) async fn upsert_recovered_protected_secrets(
+    pub(crate) async fn upsert_recovered_secrets(
         &self,
         metadata: &InstanceMetadata,
     ) -> Result<(), RepositoryError> {
-        self.upsert_with_protected_secret_replacement(metadata, true)
-            .await
+        self.upsert_protected_secrets(metadata, true).await
     }
 
-    async fn upsert_with_protected_secret_replacement(
+    async fn upsert_protected_secrets(
         &self,
         metadata: &InstanceMetadata,
         clear_protected_secret_recovery: bool,
     ) -> Result<(), RepositoryError> {
         validate_metadata_schema(metadata)?;
         if clear_protected_secret_recovery {
-            validate_complete_protected_secret_recovery(metadata)?;
+            validate_secret_recovery(metadata)?;
         }
         let backend = BackendColumns::from(&metadata.backend);
         let runtime_kind = metadata.runtime.kind.as_str();
@@ -345,7 +343,7 @@ impl InstanceRepository {
         Ok(())
     }
 
-    fn load_disk_limit_blocked(
+    fn load_disk_block(
         &self,
         metadata: &mut InstanceMetadata,
         row: &sqlx::sqlite::SqliteRow,
@@ -354,7 +352,7 @@ impl InstanceRepository {
         Ok(())
     }
 
-    pub async fn rewrite_protected_route_auth(
+    pub async fn rewrite_route_auth(
         &self,
         metadata: &[InstanceMetadata],
     ) -> Result<usize, RepositoryError> {
@@ -517,9 +515,7 @@ fn validate_metadata_schema(metadata: &InstanceMetadata) -> Result<(), Repositor
     }
 }
 
-fn validate_complete_protected_secret_recovery(
-    metadata: &InstanceMetadata,
-) -> Result<(), RepositoryError> {
+fn validate_secret_recovery(metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
     let mut missing = Vec::new();
     if metadata.status != InstanceStatus::Running {
         missing.push("running_status");
@@ -1062,7 +1058,7 @@ mod tests {
         let encrypted_repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
         let loaded = encrypted_repository.list().await.unwrap();
         let rewritten = encrypted_repository
-            .rewrite_protected_route_auth(&loaded)
+            .rewrite_route_auth(&loaded)
             .await
             .unwrap();
 
@@ -1089,7 +1085,7 @@ mod tests {
         repository.upsert(&metadata).await.unwrap();
 
         repository
-            .record_auth_hardening_attestation(
+            .record_hardening_attestation(
                 &metadata,
                 "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                 "2026-08-13T12:00:00Z",
@@ -1100,7 +1096,7 @@ mod tests {
 
         assert!(
             repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                     "2026-08-13T12:00:00Z",
@@ -1111,7 +1107,7 @@ mod tests {
         );
         assert!(
             !repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                     "2026-08-13T12:00:00Z",
@@ -1122,7 +1118,7 @@ mod tests {
         );
         assert!(
             !repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                     "2026-08-13T12:01:00Z",
@@ -1133,7 +1129,7 @@ mod tests {
         );
         assert!(
             !repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                     "2026-08-13T12:00:00Z",
@@ -1145,7 +1141,7 @@ mod tests {
         metadata.tenant_password = Some("rotated-tenant-secret".to_string());
         assert!(
             !repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                     "2026-08-13T12:00:00Z",
@@ -1166,7 +1162,7 @@ mod tests {
         .unwrap();
         assert!(
             !repository
-                .auth_hardening_attestation_is_current(
+                .hardening_is_current(
                     &metadata,
                     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                     "2026-08-13T12:01:00Z",
@@ -1198,7 +1194,7 @@ mod tests {
         metadata.postgres_admin_password = Some("admin-secret".to_string());
         repository.upsert(&metadata).await.unwrap();
         repository
-            .record_auth_hardening_attestation(
+            .record_hardening_attestation(
                 &metadata,
                 "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                 "2026-08-13T12:00:00Z",

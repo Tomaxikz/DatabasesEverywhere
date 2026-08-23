@@ -1,7 +1,7 @@
 //! Protocol-specific selection validation and native dump/restore scripts.
 
 use super::{files::*, *};
-use crate::instances::credentials::logical_import_environment;
+use crate::instances::credentials::logical_import_env;
 
 pub(super) async fn validate_import_source(
     _state: &AppState,
@@ -15,7 +15,7 @@ pub(super) async fn validate_import_source(
                     "artifact import requires source.artifact_id".to_string(),
                 ));
             }
-            validate_logical_artifact_selection(target_protocol, &options.selection)?;
+            validate_artifact_selection(target_protocol, &options.selection)?;
             if matches!(
                 target_protocol,
                 Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
@@ -33,7 +33,7 @@ pub(super) async fn validate_import_source(
                     "upload import requires source.upload_id".to_string(),
                 ));
             }
-            validate_logical_artifact_selection(target_protocol, &options.selection)?;
+            validate_artifact_selection(target_protocol, &options.selection)?;
             if options.archive_format.is_some() {
                 return Err(ApiError::BadRequest(
                     "upload imports detect their format from the uploaded file; omit archive_format"
@@ -52,7 +52,7 @@ pub(super) async fn validate_import_source(
     Ok(())
 }
 
-pub(super) fn validate_upload_source_database(
+pub(super) fn validate_source_database(
     target_protocol: Protocol,
     options: &ImportOptions,
 ) -> Result<(), ApiError> {
@@ -87,7 +87,7 @@ pub(super) async fn harden_import_options(
     mut options: ImportOptions,
 ) -> Result<ImportOptions, ApiError> {
     validate_import_source(state, target_protocol, &options).await?;
-    validate_upload_source_database(target_protocol, &options)?;
+    validate_source_database(target_protocol, &options)?;
     let source = std::mem::take(&mut options.source);
     options.source = match source {
         ImportSourceOptions::Artifact(path) => {
@@ -325,7 +325,7 @@ pub(super) fn postgres_dump_selection_args(
     Ok(args)
 }
 
-pub(super) fn mariadb_local_dump_selection_args(
+pub(super) fn mariadb_selection_args(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
     if selection.mode == SelectionMode::Full {
@@ -412,7 +412,7 @@ pub(super) fn clickhouse_table_source(
     ))
 }
 
-pub(super) fn validate_logical_artifact_selection(
+pub(super) fn validate_artifact_selection(
     protocol: Protocol,
     selection: &ImportExportSelection,
 ) -> Result<(), ApiError> {
@@ -423,7 +423,7 @@ pub(super) fn validate_logical_artifact_selection(
     }
 }
 
-pub(super) fn clickhouse_column_expr_function(
+pub(super) fn clickhouse_column_expr(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
     if selection.fields.is_empty() {
@@ -446,7 +446,7 @@ pub(super) fn clickhouse_column_expr_function(
     Ok(cases)
 }
 
-pub(super) fn ensure_mongodb_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+pub(super) fn mongodb_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.protocol == Protocol::Mongodb && metadata.mongodb_root_password.is_none() {
         return Err(ApiError::BadRequest(
             "mongodb internal root password is missing; this instance was created before DBE stored MongoDB maintenance credentials, so DBE cannot export/import protected internal collections such as time-series buckets. Recreate the instance or use a manual admin dump.".to_string(),
@@ -455,7 +455,7 @@ pub(super) fn ensure_mongodb_root_password(metadata: &InstanceMetadata) -> Resul
     Ok(())
 }
 
-pub(super) fn ensure_mysql_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
+pub(super) fn mysql_root_password(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.protocol == Protocol::Mysql && metadata.mysql_root_password.is_none() {
         return Err(ApiError::BadRequest(
             "mysql internal root password is missing; recreate or repair this instance before exporting or importing"
@@ -487,7 +487,7 @@ PGPASSWORD="$DBE_POSTGRES_PASSWORD" pg_dump \
             )
         }
         Protocol::Mariadb => {
-            let filters = mariadb_local_dump_selection_args(selection)?;
+            let filters = mariadb_selection_args(selection)?;
             let database_definition = if include_database_definition {
                 " --databases"
             } else {
@@ -507,7 +507,7 @@ mariadb-dump \
             )
         }
         Protocol::Mysql => {
-            ensure_mysql_root_password(metadata)?;
+            mysql_root_password(metadata)?;
             let filters = mysql_local_dump_selection_args(selection)?;
             let database_definition = if include_database_definition {
                 " --databases"
@@ -527,7 +527,7 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump \
             )
         }
         Protocol::Mongodb => {
-            ensure_mongodb_root_password(metadata)?;
+            mongodb_root_password(metadata)?;
             let filters = mongodb_dump_selection_args(selection)?;
             format!(
                 r#"set -eu
@@ -545,7 +545,7 @@ mongodump \
         }
         Protocol::Clickhouse => {
             let table_source = clickhouse_table_source(selection)?;
-            let column_expr = clickhouse_column_expr_function(selection)?;
+            let column_expr = clickhouse_column_expr(selection)?;
             let engine_parser = sh_quote(CLICKHOUSE_ENGINE_AWK_PROGRAM);
             format!(
                 r#"set -eu
@@ -667,7 +667,7 @@ mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock \
 "#
         .to_string(),
         Protocol::Mysql if database_definition_in_dump => {
-            ensure_mysql_root_password(metadata)?;
+            mysql_root_password(metadata)?;
             r#"set -eu
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
   --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u root \
@@ -676,7 +676,7 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             .to_string()
         }
         Protocol::Mysql => {
-            logical_import_environment(metadata, false)
+            logical_import_env(metadata, false)
                 .map_err(|error| ApiError::Conflict(error.to_string()))?;
             r#"set -eu
 settings=$(MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
@@ -705,7 +705,7 @@ MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
             .to_string()
         }
         Protocol::Mongodb => {
-            ensure_mongodb_root_password(metadata)?;
+            mongodb_root_password(metadata)?;
             r#"set -eu
 mongosh --quiet \
   --host 127.0.0.1 \
@@ -755,14 +755,14 @@ pub(super) async fn wipe_logical_target(
     database_definition_in_dump: bool,
 ) -> Result<(), ApiError> {
     let script = wipe_logical_script(metadata, database_definition_in_dump)?;
-    let credentials = logical_import_environment(metadata, database_definition_in_dump)
+    let credentials = logical_import_env(metadata, database_definition_in_dump)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let environment = credentials.references();
     let result = match exec_timeout {
         Some(timeout) => {
             state
                 .docker
-                .exec_shell_with_secret_env_timeout(
+                .exec_shell_with_secrets_timeout(
                     metadata.protocol,
                     &metadata.instance_id,
                     &script,
@@ -774,7 +774,7 @@ pub(super) async fn wipe_logical_target(
         None => {
             state
                 .docker
-                .exec_shell_with_secret_env(
+                .exec_shell_with_secrets(
                     metadata.protocol,
                     &metadata.instance_id,
                     &script,
@@ -792,7 +792,7 @@ pub(super) async fn wipe_logical_target(
     Ok(())
 }
 
-pub(super) fn mongodb_namespace_pattern(database: &str) -> String {
+pub(super) fn mongodb_database_pattern(database: &str) -> String {
     let mut pattern = String::with_capacity(database.len() + 2);
     for character in database.chars() {
         match character {
@@ -805,8 +805,8 @@ pub(super) fn mongodb_namespace_pattern(database: &str) -> String {
     pattern
 }
 
-fn mongodb_collection_namespace_pattern(database: &str, collection: &str) -> String {
-    let mut pattern = mongodb_namespace_pattern(database);
+fn mongodb_collection_pattern(database: &str, collection: &str) -> String {
+    let mut pattern = mongodb_database_pattern(database);
     pattern.pop();
     pattern.push_str(collection);
     pattern
@@ -824,29 +824,23 @@ pub(super) fn mongodb_restore_namespace_args(
             if selection.mode == SelectionMode::Full {
                 filters.push(format!(
                     "--nsInclude {}",
-                    sh_quote(&mongodb_namespace_pattern(source_database))
+                    sh_quote(&mongodb_database_pattern(source_database))
                 ));
             } else {
                 for collection in &selection.include {
                     filters.push(format!(
                         "--nsInclude {}",
-                        sh_quote(&mongodb_collection_namespace_pattern(
-                            source_database,
-                            collection
-                        ))
+                        sh_quote(&mongodb_collection_pattern(source_database, collection))
                     ));
                 }
                 for collection in &selection.exclude {
                     filters.push(format!(
                         "--nsExclude {}",
-                        sh_quote(&mongodb_collection_namespace_pattern(
-                            source_database,
-                            collection
-                        ))
+                        sh_quote(&mongodb_collection_pattern(source_database, collection))
                     ));
                 }
             }
-            let source_pattern = mongodb_namespace_pattern(source_database);
+            let source_pattern = mongodb_database_pattern(source_database);
             filters.push(format!("--nsFrom {}", sh_quote(&source_pattern)));
             filters.push("--nsTo \"$DBE_MONGO_DATABASE.*\"".to_string());
         }
@@ -955,7 +949,7 @@ mariadb \
 "#
         ),
         Protocol::Mysql if database_definition_in_dump => {
-            ensure_mysql_root_password(metadata)?;
+            mysql_root_password(metadata)?;
             format!(
                 r#"set -eu
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
@@ -968,7 +962,7 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
             )
         }
         Protocol::Mysql => {
-            logical_import_environment(metadata, false)
+            logical_import_env(metadata, false)
                 .map_err(|error| ApiError::Conflict(error.to_string()))?;
             format!(
                 r#"set -eu
@@ -983,7 +977,7 @@ MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
             )
         }
         Protocol::Mongodb => {
-            ensure_mongodb_root_password(metadata)?;
+            mongodb_root_password(metadata)?;
             let namespaces = mongodb_restore_namespace_args(selection, source_database)?;
             format!(
                 r#"set -eu

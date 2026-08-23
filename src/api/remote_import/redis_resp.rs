@@ -151,7 +151,7 @@ impl RespConnection {
         endpoint: &ResolvedRemoteEndpoint,
         connect_timeout: Duration,
     ) -> RedisRespResult<Self> {
-        Self::connect_source_with_options(
+        Self::connect_source_limited(
             endpoint,
             connect_timeout,
             DEFAULT_IO_TIMEOUT,
@@ -161,7 +161,7 @@ impl RespConnection {
         .await
     }
 
-    pub async fn connect_source_with_options(
+    pub async fn connect_source_limited(
         endpoint: &ResolvedRemoteEndpoint,
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -237,7 +237,7 @@ impl RespConnection {
     }
 
     pub async fn connect_unix(path: &Path, connect_timeout: Duration) -> RedisRespResult<Self> {
-        Self::connect_unix_with_options(
+        Self::connect_unix_limited(
             path,
             connect_timeout,
             DEFAULT_IO_TIMEOUT,
@@ -247,7 +247,7 @@ impl RespConnection {
         .await
     }
 
-    pub async fn connect_unix_with_options(
+    pub async fn connect_unix_limited(
         path: &Path,
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -361,7 +361,7 @@ impl RespConnection {
     /// Relays a binary DUMP response into RESTORE without buffering the serialized value.
     ///
     /// Returns `false` when the source key disappeared before DUMP produced a value.
-    pub async fn relay_dump_to_restore_replace(
+    pub async fn relay_restore_replace(
         &mut self,
         target: &mut RespConnection,
         key: &[u8],
@@ -407,7 +407,7 @@ impl RespConnection {
             b"ABSTTL".len(),
         ];
         target
-            .validate_streamed_restore_command_lengths(
+            .validate_restore_command_size(
                 &argument_lengths[..if use_absolute_ttl { 6 } else { 5 }],
                 serialized_length,
                 max_serialized_length,
@@ -588,7 +588,7 @@ impl RespConnection {
         Ok(())
     }
 
-    fn validate_streamed_restore_command_lengths(
+    fn validate_restore_command_size(
         &self,
         argument_lengths: &[usize],
         serialized_length: usize,
@@ -621,10 +621,8 @@ impl RespConnection {
                 limit: self.limits.max_bulk_len,
             });
         }
-        let encoded_size = command_encoded_size_from_lengths(
-            argument_lengths.len(),
-            argument_lengths.iter().copied(),
-        )?;
+        let encoded_size =
+            encoded_command_size(argument_lengths.len(), argument_lengths.iter().copied())?;
         let framing_bytes = encoded_size.checked_sub(serialized_length).ok_or_else(|| {
             RedisRespError::Protocol("streamed command length underflow".to_string())
         })?;
@@ -1087,10 +1085,10 @@ fn parse_u64(value: &[u8], kind: &'static str) -> RedisRespResult<u64> {
 }
 
 fn command_encoded_size(arguments: &[&[u8]]) -> RedisRespResult<usize> {
-    command_encoded_size_from_lengths(arguments.len(), arguments.iter().map(|value| value.len()))
+    encoded_command_size(arguments.len(), arguments.iter().map(|value| value.len()))
 }
 
-fn command_encoded_size_from_lengths(
+fn encoded_command_size(
     argument_count: usize,
     argument_lengths: impl IntoIterator<Item = usize>,
 ) -> RedisRespResult<usize> {

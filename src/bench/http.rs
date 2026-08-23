@@ -327,7 +327,7 @@ impl BenchClient {
         accumulator.finish("http_concurrent", started.elapsed(), active)
     }
 
-    pub async fn benchmark_concurrent_for_duration(
+    pub async fn benchmark_concurrency(
         &self,
         duration: Duration,
         concurrency: usize,
@@ -1087,7 +1087,7 @@ mod tests {
             BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false).unwrap();
 
         let run = client
-            .benchmark_concurrent_for_duration(
+            .benchmark_concurrency(
                 Duration::from_millis(50),
                 4,
                 vec![LoadTarget::instance_status("selected-db")],
@@ -1156,7 +1156,7 @@ mod tests {
             BenchClient::new(&format!("http://{address}"), None, "node-token", 4, false).unwrap();
 
         let run = client
-            .benchmark_concurrent_for_duration(
+            .benchmark_concurrency(
                 Duration::from_millis(50),
                 4,
                 vec![LoadTarget::heartbeat()],

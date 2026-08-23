@@ -25,12 +25,12 @@ pub(super) async fn allocate(
         .ok_or_else(|| registry_error(data_path, "instance data path has no parent"))?;
     let registry = parent.join(REGISTRY_DIRECTORY);
     let instance_id = instance_id.to_string();
-    tokio::task::spawn_blocking(move || allocate_blocking(&registry, &instance_id, base))
+    tokio::task::spawn_blocking(move || allocate_sync(&registry, &instance_id, base))
         .await
         .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
-fn allocate_blocking(registry: &Path, instance_id: &str, base: u32) -> Result<u32, DiskLimitError> {
+fn allocate_sync(registry: &Path, instance_id: &str, base: u32) -> Result<u32, DiskLimitError> {
     validate_instance_id(registry, instance_id)?;
     create_private_registry(registry)?;
     let _allocation_lock = lock_registry(registry)?;
@@ -250,8 +250,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let registry = temp.path().join(REGISTRY_DIRECTORY);
 
-        let first = allocate_blocking(&registry, "inst_one", 200_000).unwrap();
-        let second = allocate_blocking(&registry, "inst_one", 200_000).unwrap();
+        let first = allocate_sync(&registry, "inst_one", 200_000).unwrap();
+        let second = allocate_sync(&registry, "inst_one", 200_000).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
@@ -272,8 +272,8 @@ mod tests {
             .find(|name| initial_project_id(name, base, 2) == initial)
             .unwrap();
 
-        let first = allocate_blocking(&registry, first_name, base).unwrap();
-        let second = allocate_blocking(&registry, &second_name, base).unwrap();
+        let first = allocate_sync(&registry, first_name, base).unwrap();
+        let second = allocate_sync(&registry, &second_name, base).unwrap();
 
         assert_ne!(first, second);
     }
@@ -284,7 +284,7 @@ mod tests {
         let registry = temp.path().join(REGISTRY_DIRECTORY);
         let base = 200_000;
 
-        let id = allocate_blocking(&registry, "inst_one", base).unwrap();
+        let id = allocate_sync(&registry, "inst_one", base).unwrap();
 
         assert!(id >= base);
         assert!(u64::from(id) < u64::from(base) + PROJECT_ID_ALLOCATION_RANGE_SIZE);
@@ -305,7 +305,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    allocate_blocking(&registry, "inst_one", 200_000).unwrap()
+                    allocate_sync(&registry, "inst_one", 200_000).unwrap()
                 })
             })
             .collect::<Vec<_>>();
@@ -324,7 +324,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let registry = temp.path().join(REGISTRY_DIRECTORY);
-        let id = allocate_blocking(&registry, "inst_one", 200_000).unwrap();
+        let id = allocate_sync(&registry, "inst_one", 200_000).unwrap();
 
         assert_eq!(
             std::fs::metadata(&registry).unwrap().permissions().mode() & 0o777,

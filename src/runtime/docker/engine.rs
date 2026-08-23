@@ -23,7 +23,7 @@ impl DaemonEngineConnection {
     pub fn from_config(config: &DaemonConfig) -> Self {
         Self {
             engine: config.engine,
-            socket_path: configured_or_default_socket(config),
+            socket_path: engine_socket(config),
         }
     }
 
@@ -51,7 +51,7 @@ impl DaemonEngineConnection {
     }
 }
 
-pub fn rootless_podman_uid_from_socket_path(path: &str) -> Option<u32> {
+pub fn rootless_uid_from_socket(path: &str) -> Option<u32> {
     let components = Path::new(path).components().collect::<Vec<_>>();
     match components.as_slice() {
         [
@@ -117,7 +117,7 @@ pub fn podman_socket_owner(path: &str) -> std::io::Result<HostOwner> {
         uid: metadata.uid(),
         gid: metadata.gid(),
     };
-    if let Some(expected_uid) = rootless_podman_uid_from_socket_path(path)
+    if let Some(expected_uid) = rootless_uid_from_socket(path)
         && owner.uid != expected_uid
     {
         return Err(std::io::Error::new(
@@ -131,7 +131,7 @@ pub fn podman_socket_owner(path: &str) -> std::io::Result<HostOwner> {
     Ok(owner)
 }
 
-fn configured_or_default_socket(config: &DaemonConfig) -> Option<String> {
+fn engine_socket(config: &DaemonConfig) -> Option<String> {
     if let Some(socket_path) = config.configured_socket_path() {
         return Some(socket_path.to_string());
     }
@@ -178,21 +178,15 @@ mod tests {
     #[test]
     fn recognizes_only_the_standard_rootless_podman_socket_shape() {
         assert_eq!(
-            rootless_podman_uid_from_socket_path("/run/user/1001/podman/podman.sock"),
+            rootless_uid_from_socket("/run/user/1001/podman/podman.sock"),
             Some(1001)
         );
+        assert_eq!(rootless_uid_from_socket("/run/podman/podman.sock"), None);
         assert_eq!(
-            rootless_podman_uid_from_socket_path("/run/podman/podman.sock"),
+            rootless_uid_from_socket("/run/user/0/podman/podman.sock"),
             None
         );
-        assert_eq!(
-            rootless_podman_uid_from_socket_path("/run/user/0/podman/podman.sock"),
-            None
-        );
-        assert_eq!(
-            rootless_podman_uid_from_socket_path("/tmp/podman.sock"),
-            None
-        );
+        assert_eq!(rootless_uid_from_socket("/tmp/podman.sock"), None);
     }
 
     #[test]

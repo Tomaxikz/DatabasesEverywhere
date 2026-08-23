@@ -395,10 +395,7 @@ fn authenticate_request(
     let authorization = headers
         .get(crate::constants::AUTHORIZATION_HEADER)
         .and_then(|value| value.to_str().ok());
-    if let Some(accepted) = state
-        .api_token
-        .accepted_from_authorization_header(authorization)
-    {
+    if let Some(accepted) = state.api_token.from_auth_header(authorization) {
         return RequestAuthentication::Api(accepted);
     }
 
@@ -408,7 +405,7 @@ fn authenticate_request(
         return RequestAuthentication::WebSocket(Arc::new(claims));
     }
 
-    if let Some(token) = signed_download_query_token(uri)
+    if let Some(token) = download_query_token(uri)
         && let Ok(jti) = jwt::validated_token_jti(token, jwt_secret)
     {
         return RequestAuthentication::SignedJwt {
@@ -456,7 +453,7 @@ fn rate_limit_identity(
     }
 }
 
-fn signed_download_query_token(uri: &Uri) -> Option<&str> {
+fn download_query_token(uri: &Uri) -> Option<&str> {
     if !is_download_path(uri.path()) {
         return None;
     }
@@ -571,7 +568,7 @@ mod tests {
     #[test]
     fn valid_api_token_gets_a_stable_trusted_peer_bucket() {
         let accepted = crate::auth::api_token::ApiToken::new("secret")
-            .accepted_from_authorization_header(Some("Bearer secret"))
+            .from_auth_header(Some("Bearer secret"))
             .unwrap();
         let authentication = RequestAuthentication::Api(accepted);
         let identity =

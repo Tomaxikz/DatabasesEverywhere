@@ -15,7 +15,7 @@ fn disk_scan_counts_regular_files_without_following_symlinks() {
     symlink(&outside, data.join("outside-link")).unwrap();
 
     assert_eq!(
-        directory_size_blocking(&data, Duration::from_secs(1)).unwrap(),
+        directory_size_sync(&data, Duration::from_secs(1)).unwrap(),
         18
     );
 }
@@ -28,5 +28,5 @@ fn disk_scan_rejects_a_symlink_root() {
     fs::create_dir(&data).unwrap();
     symlink(&data, &linked).unwrap();
 
-    assert!(directory_size_blocking(&linked, Duration::from_secs(1)).is_err());
+    assert!(directory_size_sync(&linked, Duration::from_secs(1)).is_err());
 }

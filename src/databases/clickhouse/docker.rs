@@ -7,8 +7,8 @@ use crate::{
     runtime::socket_bridge::{SocketBridge, loopback_target},
     shared::{
         backend::{
-            CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH,
-            container_backend_socket_path, container_clickhouse_http_socket_path,
+            CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH, clickhouse_http_socket,
+            container_backend_socket_path,
         },
         files::atomic_write_private,
         protocol::Protocol,
@@ -70,7 +70,7 @@ pub fn instance_spec(
                 target: loopback_target(9000),
             },
             SocketBridge {
-                socket_path: container_clickhouse_http_socket_path(),
+                socket_path: clickhouse_http_socket(),
                 target: loopback_target(8123),
             },
         ],
@@ -106,12 +106,12 @@ pub fn instance_spec(
 
 pub async fn write_hosted_config(runtime_config_path: &Path) -> Result<PathBuf, std::io::Error> {
     let runtime_config_path = runtime_config_path.to_path_buf();
-    tokio::task::spawn_blocking(move || write_hosted_config_blocking(&runtime_config_path))
+    tokio::task::spawn_blocking(move || write_hosted_config_sync(&runtime_config_path))
         .await
         .map_err(std::io::Error::other)?
 }
 
-fn write_hosted_config_blocking(runtime_config_path: &Path) -> Result<PathBuf, std::io::Error> {
+fn write_hosted_config_sync(runtime_config_path: &Path) -> Result<PathBuf, std::io::Error> {
     std::fs::create_dir_all(runtime_config_path)?;
     let metadata = std::fs::symlink_metadata(runtime_config_path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {

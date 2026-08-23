@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::disk::usage::scan_directory_blocking;
+use crate::disk::usage::scan_directory_sync;
 
 use super::*;
 
@@ -38,10 +38,7 @@ fn reconcile(
 }
 
 fn assert_matches_full(cache: &UsageTreeCache, root: &Path) {
-    assert_eq!(
-        cache.usage(),
-        scan_directory_blocking(root, limits()).unwrap()
-    );
+    assert_eq!(cache.usage(), scan_directory_sync(root, limits()).unwrap());
 }
 
 #[test]

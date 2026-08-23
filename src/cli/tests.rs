@@ -135,7 +135,7 @@ async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal(
     })
     .await
     .unwrap();
-    assert!(jobs.running_import_instance_ids().await.unwrap().is_empty());
+    assert!(jobs.running_import_ids().await.unwrap().is_empty());
 
     let tmp_root = temp.path().join("tmp");
     let recovery_root = tmp_root.join("import-export");
@@ -157,7 +157,7 @@ async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal(
     .unwrap();
 
     assert_eq!(
-        quarantine_retained_import_recovery_manifests(&manager, &tmp_root)
+        quarantine_import_manifests(&manager, &tmp_root)
             .await
             .unwrap(),
         1
@@ -190,7 +190,7 @@ async fn retained_physical_restore_workspace_quarantines_target() {
     .unwrap();
 
     assert_eq!(
-        quarantine_retained_physical_restore_workspaces(&manager, &volumes)
+        quarantine_restore_workspaces(&manager, &volumes)
             .await
             .unwrap(),
         1
@@ -226,7 +226,7 @@ async fn physical_restore_recovery_scan_does_not_follow_workspace_symlinks() {
     .unwrap();
 
     assert_eq!(
-        quarantine_retained_physical_restore_workspaces(&manager, &volumes)
+        quarantine_restore_workspaces(&manager, &volumes)
             .await
             .unwrap(),
         0
@@ -298,27 +298,27 @@ async fn desired_stopped_instances_are_never_published_to_gateways() {
 
 #[test]
 fn recovery_scan_accepts_only_canonical_generated_names() {
-    assert!(is_generated_logical_recovery_manifest_name(
-        std::ffi::OsStr::new(".dbe-import-recovery-00000000-0000-4000-8000-000000000001.json")
-    ));
-    assert!(!is_generated_logical_recovery_manifest_name(
-        std::ffi::OsStr::new(".dbe-import-recovery-manual.json")
-    ));
-    assert!(is_canonical_uuid_file_name(std::ffi::OsStr::new(
+    assert!(is_recovery_manifest(std::ffi::OsStr::new(
+        ".dbe-import-recovery-00000000-0000-4000-8000-000000000001.json"
+    )));
+    assert!(!is_recovery_manifest(std::ffi::OsStr::new(
+        ".dbe-import-recovery-manual.json"
+    )));
+    assert!(is_uuid_filename(std::ffi::OsStr::new(
         "00000000-0000-4000-8000-000000000001"
     )));
-    assert!(!is_canonical_uuid_file_name(std::ffi::OsStr::new(
+    assert!(!is_uuid_filename(std::ffi::OsStr::new(
         "00000000000040008000000000000001"
     )));
     assert_eq!(
-        physical_restore_workspace_instance_id(std::ffi::OsStr::new(
+        workspace_instance_id(std::ffi::OsStr::new(
             ".dbe-restore-inst_recovery-00000000-0000-4000-8000-000000000001"
         ))
         .as_deref(),
         Some("inst_recovery")
     );
     assert!(
-        physical_restore_workspace_instance_id(std::ffi::OsStr::new(
+        workspace_instance_id(std::ffi::OsStr::new(
             ".dbe-restore-inst_recovery-not-a-uuid"
         ))
         .is_none()
@@ -327,15 +327,15 @@ fn recovery_scan_accepts_only_canonical_generated_names() {
 
 #[test]
 fn retained_valkey_recovery_manifests_are_protocol_bound() {
-    assert!(recovery_kind_matches_protocol(
+    assert!(recovery_matches_protocol(
         "valkey_remote_import",
         Protocol::Valkey
     ));
-    assert!(!recovery_kind_matches_protocol(
+    assert!(!recovery_matches_protocol(
         "valkey_remote_import",
         Protocol::Redis
     ));
-    assert!(!recovery_kind_matches_protocol(
+    assert!(!recovery_matches_protocol(
         "redis_remote_import",
         Protocol::Valkey
     ));
@@ -371,7 +371,7 @@ fn daemon_boot_preserves_running_containers() {
     );
     assert_eq!(
         managed_boot_action(
-            reconcile::classify_container_status(DockerContainerStatus::Created),
+            reconcile::classify_status(DockerContainerStatus::Created),
             DesiredInstanceState::Running,
         ),
         Some(ManagedBootAction::Start),
@@ -397,12 +397,12 @@ fn startup_resolves_qdrant_away_from_the_fuse_fallback() {
 fn stale_qdrant_fuse_mount_does_not_trigger_container_recreation() {
     let legacy = Path::new("/var/lib/dbev/fuse/instances/qdrant");
 
-    assert!(legacy_qdrant_container_uses_fuse(Some(legacy), legacy));
-    assert!(!legacy_qdrant_container_uses_fuse(
+    assert!(legacy_qdrant_uses_fuse(Some(legacy), legacy));
+    assert!(!legacy_qdrant_uses_fuse(
         Some(Path::new("/var/lib/dbev/volumes/qdrant")),
         legacy,
     ));
-    assert!(!legacy_qdrant_container_uses_fuse(None, legacy));
+    assert!(!legacy_qdrant_uses_fuse(None, legacy));
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn qdrant_fuse_migration_follows_durable_power_intent() {
     use crate::instances::metadata::DesiredInstanceState;
 
     assert_eq!(
-        qdrant_migration_runtime_actions(
+        qdrant_migration_actions(
             DockerContainerStatus::Stopped,
             DesiredInstanceState::Running,
         ),
@@ -418,7 +418,7 @@ fn qdrant_fuse_migration_follows_durable_power_intent() {
         "a desired-running instance must start its replacement even when the old container was stopped"
     );
     assert_eq!(
-        qdrant_migration_runtime_actions(
+        qdrant_migration_actions(
             DockerContainerStatus::Running,
             DesiredInstanceState::Stopped,
         ),
@@ -429,10 +429,10 @@ fn qdrant_fuse_migration_follows_durable_power_intent() {
 
 #[test]
 fn qdrant_fuse_migration_defers_native_quota_adoption_before_runtime_mutation() {
-    assert!(!qdrant_fuse_migration_target_is_safe(
+    assert!(!qdrant_migration_is_safe(
         crate::config::DiskLimitMode::ProjectQuota
     ));
-    assert!(qdrant_fuse_migration_target_is_safe(
+    assert!(qdrant_migration_is_safe(
         crate::config::DiskLimitMode::SoftScanner
     ));
 }
@@ -458,7 +458,7 @@ fn disk_mode_transition_failure_is_durably_stopped() {
     let mut metadata = recovery_test_metadata();
     metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Running;
 
-    isolate_disk_reconciliation_failure(&mut metadata, false);
+    isolate_disk_failure(&mut metadata, false);
 
     assert_eq!(
         metadata.desired_state,
@@ -472,7 +472,7 @@ fn disk_reconciliation_never_downgrades_an_existing_quarantine() {
     let mut metadata = recovery_test_metadata();
     metadata.status = InstanceStatus::Quarantined;
 
-    isolate_disk_reconciliation_failure(&mut metadata, false);
+    isolate_disk_failure(&mut metadata, false);
 
     assert_eq!(metadata.status, InstanceStatus::Quarantined);
     assert_eq!(
@@ -518,14 +518,14 @@ fn queued_soft_disk_decision_is_stale_after_a_limit_increase() {
         limit_bytes: 100 * 1024 * 1024,
         durable_blocked: false,
     };
-    assert!(soft_disk_target_is_current(
+    assert!(is_current_target(
         &metadata,
         &target,
         crate::config::DiskLimitMode::SoftScanner,
     ));
 
     metadata.limits.disk_mib = 200;
-    assert!(!soft_disk_target_is_current(
+    assert!(!is_current_target(
         &metadata,
         &target,
         crate::config::DiskLimitMode::SoftScanner,
@@ -539,7 +539,7 @@ fn hardens_existing_runtime_directory_permissions() {
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o777)).unwrap();
 
-    harden_runtime_directory(&runtime).unwrap();
+    harden_runtime_dir(&runtime).unwrap();
 
     let mode = fs::metadata(runtime).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
@@ -553,7 +553,7 @@ fn rejects_symlinked_runtime_directory() {
     fs::create_dir(&target).unwrap();
     symlink(&target, &runtime).unwrap();
 
-    let error = harden_runtime_directory(&runtime).unwrap_err();
+    let error = harden_runtime_dir(&runtime).unwrap_err();
 
     assert!(error.to_string().contains("not a symlink"));
 }
@@ -566,7 +566,7 @@ fn rejects_symlinked_runtime_path_ancestor() {
     fs::create_dir(&target).unwrap();
     symlink(&target, &linked_parent).unwrap();
 
-    let error = validate_runtime_path_ancestors(&linked_parent.join("runtime"), false).unwrap_err();
+    let error = validate_runtime_ancestors(&linked_parent.join("runtime"), false).unwrap_err();
 
     assert!(error.to_string().contains("must be a real directory"));
 }
@@ -576,7 +576,7 @@ fn securely_creates_nested_runtime_directories() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("nested").join("runtime");
 
-    create_runtime_directory_tree(&runtime).unwrap();
+    create_runtime_dirs(&runtime).unwrap();
 
     assert!(runtime.is_dir());
     assert_eq!(
@@ -593,7 +593,7 @@ fn secure_runtime_creation_rejects_symlinked_component() {
     fs::create_dir(&target).unwrap();
     symlink(&target, &linked_parent).unwrap();
 
-    let error = create_runtime_directory_tree(&linked_parent.join("runtime")).unwrap_err();
+    let error = create_runtime_dirs(&linked_parent.join("runtime")).unwrap_err();
 
     assert!(error.to_string().contains("not a symlink"));
     assert!(!target.join("runtime").exists());
@@ -606,14 +606,14 @@ fn rejects_runtime_path_ancestor_writable_by_other_users() {
     fs::create_dir(&parent).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
 
-    let error = validate_runtime_path_ancestors(&parent.join("runtime"), false).unwrap_err();
+    let error = validate_runtime_ancestors(&parent.join("runtime"), false).unwrap_err();
 
     assert!(error.to_string().contains("writable by group or others"));
 }
 
 #[test]
 fn rejects_runtime_directory_owned_by_another_uid() {
-    let error = require_runtime_directory_owner(Path::new("/runtime"), 1001, 1000).unwrap_err();
+    let error = require_runtime_owner(Path::new("/runtime"), 1001, 1000).unwrap_err();
 
     assert!(error.to_string().contains("owned by uid 1001"));
 }
@@ -638,7 +638,7 @@ fn setup_moves_legacy_logs_below_the_private_data_root_when_its_parent_is_unsafe
     config.paths.data = data.display().to_string();
     config.paths.logs = legacy_logs.display().to_string();
 
-    let (migrated, replacement, error) = build_legacy_logs_migration(&config, &legacy_logs)
+    let (migrated, replacement, error) = plan_legacy_logs_migration(&config, &legacy_logs)
         .unwrap()
         .unwrap();
 
@@ -656,16 +656,16 @@ fn default_logs_live_below_the_private_data_root() {
 
 #[test]
 fn setup_config_path_rejects_unit_file_metacharacters() {
-    assert!(validate_setup_config_path(Path::new("/etc/dbev/config.yml")).is_ok());
-    assert!(validate_setup_config_path(Path::new("relative.yml")).is_err());
-    assert!(validate_setup_config_path(Path::new("/etc/dbev/../config.yml")).is_err());
-    assert!(validate_setup_config_path(Path::new("/etc/dbev/config\nExecStart=evil")).is_err());
+    assert!(validate_setup_config(Path::new("/etc/dbev/config.yml")).is_ok());
+    assert!(validate_setup_config(Path::new("relative.yml")).is_err());
+    assert!(validate_setup_config(Path::new("/etc/dbev/../config.yml")).is_err());
+    assert!(validate_setup_config(Path::new("/etc/dbev/config\nExecStart=evil")).is_err());
 }
 
 #[test]
 fn managed_memory_sysctl_enables_overcommit_persistently() {
     assert_eq!(
-        memory_overcommit_sysctl_contents(),
+        memory_overcommit_sysctl(),
         "# Managed by DatabasesEverywhere --setup.\nvm.overcommit_memory = 1\n"
     );
 }
@@ -753,8 +753,8 @@ fn rootless_podman_custom_paths_require_traversable_ancestors() {
     fs::create_dir(&managed).unwrap();
     let metadata = fs::metadata(temp.path()).unwrap();
 
-    validate_rootless_podman_ancestor_traversal(&managed, metadata.uid(), metadata.gid()).unwrap();
-    let error = validate_rootless_podman_ancestor_traversal(
+    check_rootless_path_access(&managed, metadata.uid(), metadata.gid()).unwrap();
+    let error = check_rootless_path_access(
         &managed,
         metadata.uid().saturating_add(1),
         metadata.gid().saturating_add(1),
@@ -768,7 +768,7 @@ fn daemon_lock_is_private_and_exclusive() {
     let temp = tempfile::tempdir().unwrap();
     let locks = temp.path().join("locks");
     fs::create_dir(&locks).unwrap();
-    harden_runtime_directory(&locks).unwrap();
+    harden_runtime_dir(&locks).unwrap();
 
     let first = acquire_daemon_lock(&locks).unwrap();
     let lock_path = locks.join(DAEMON_LOCK_FILE);
@@ -804,7 +804,7 @@ fn process_umask_limits_new_files_to_owner_access() {
 #[test]
 #[ignore = "runs in an isolated child process from process_umask_limits_new_files_to_owner_access"]
 fn restrictive_umask_child() {
-    harden_process_file_creation();
+    set_safe_umask();
     let temp = tempfile::tempdir().unwrap();
     let file_path = temp.path().join("created");
     OpenOptions::new()

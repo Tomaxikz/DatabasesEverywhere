@@ -280,7 +280,7 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
         release_receiver.await.map_err(std::io::Error::other)?;
         Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"abc"))
     }));
-    let worker = spawn_owned_upload_worker(
+    let worker = spawn_upload_worker(
         recovery,
         guards,
         body,
@@ -380,7 +380,7 @@ async fn panicking_upload_worker_durably_cleans_files_and_row() {
         Ok::<_, std::io::Error>(bytes::Bytes::new())
     }));
 
-    let error = spawn_owned_upload_worker(
+    let error = spawn_upload_worker(
         recovery,
         guards,
         body,
@@ -526,7 +526,7 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
     let confirmed = confirmed_storage_archive_format(Protocol::Postgres, DumpArchiveFormat::Tar);
     assert!(
         repository
-            .restore_ready_after_processing(
+            .restore_ready(
                 "inst",
                 "upl",
                 confirmed,

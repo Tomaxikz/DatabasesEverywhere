@@ -14,7 +14,7 @@ pub fn is_secret_key(key: &str) -> bool {
 }
 
 pub fn redact_connection_url(value: &str) -> String {
-    redact_secret_assignments(&redact_url_credentials(value))
+    redact_secrets(&redact_url_credentials(value))
 }
 
 fn redact_url_credentials(value: &str) -> String {
@@ -50,7 +50,7 @@ fn redact_url_credentials(value: &str) -> String {
     redacted
 }
 
-fn redact_secret_assignments(value: &str) -> String {
+fn redact_secrets(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut replacements = Vec::new();
 

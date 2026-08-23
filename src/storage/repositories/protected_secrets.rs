@@ -137,9 +137,9 @@ impl InstanceRepository {
             let durable_instance_id: String = row.try_get("durable_instance_id")?;
             let metadata_json: String = row.try_get("metadata_json")?;
             let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-            validate_metadata_identity(&durable_instance_id, &metadata)?;
+            validate_identity(&durable_instance_id, &metadata)?;
             self.load_desired_state(&mut metadata, &row)?;
-            self.load_disk_limit_blocked(&mut metadata, &row)?;
+            self.load_disk_block(&mut metadata, &row)?;
             validate_metadata_schema(&metadata)?;
             let recovery_required: bool = row.try_get("protected_secret_recovery_required")?;
             let invalid_fields = self.load_route_auth_tolerant(&mut metadata, &row)?;
@@ -220,7 +220,7 @@ impl InstanceRepository {
         })
     }
 
-    pub async fn repair_ambiguous_protected_secret(
+    pub async fn repair_ambiguous_secret(
         &self,
         instance_id: &str,
         field: ProtectedSecretField,
@@ -320,7 +320,7 @@ impl InstanceRepository {
 
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-        validate_metadata_identity(instance_id, &metadata)?;
+        validate_identity(instance_id, &metadata)?;
         validate_metadata_schema(&metadata)?;
         metadata.status = if remaining_fields.is_empty() {
             InstanceStatus::Stopped
@@ -400,7 +400,7 @@ fn clear_route_auth(metadata: &mut InstanceMetadata) {
     }
 }
 
-fn validate_metadata_identity(
+fn validate_identity(
     durable_instance_id: &str,
     metadata: &InstanceMetadata,
 ) -> Result<(), RepositoryError> {

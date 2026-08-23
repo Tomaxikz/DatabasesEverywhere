@@ -28,7 +28,7 @@ use self::{
         BenchmarkOptionsReport, BenchmarkReport, EnvironmentReport, HttpPhaseReport, RequestSample,
         ResourceSample, TargetInstanceReport,
     },
-    recommendation::build_manual_active_jobs_recommendation,
+    recommendation::recommend_job_limit,
     report::{print_terminal_report, reserve_report_directory, write_reports},
     resources::{InstanceSampleTarget, ResourceSampler},
 };
@@ -305,9 +305,9 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         let system = client
             .required_json("/api/system", "system preflight")
             .await?;
-        populate_server_environment(&mut report.environment, &system);
+        populate_server_env(&mut report.environment, &system);
         if args.bench_time_minutes.is_some() && !args.bench_unthrottled {
-            report.options.timed_requests_per_minute = Some(timed_request_budget_for_limit(
+            report.options.timed_requests_per_minute = Some(request_budget(
                 &args,
                 report.environment.configured_api_rate_limit_per_minute,
             ));
@@ -447,7 +447,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         report.warnings.extend(sampler_warnings);
         sampler = Some(resource_sampler);
 
-        warn_about_rate_limit(&args, &config, &mut report.warnings);
+        warn_rate_limit(&args, &config, &mut report.warnings);
         set_sampler_phase(&sampler, "warmup", sample_interval).await;
         client
             .warm_up(args.bench_warmup_requests)
@@ -502,7 +502,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                 let target = selected_instances.first().ok_or_else(|| {
                     anyhow!("manual active-job recommendation requires a selected instance")
                 })?;
-                let recommendation = build_manual_active_jobs_recommendation(
+                let recommendation = recommend_job_limit(
                     &client,
                     &config,
                     &system,
@@ -610,7 +610,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                 },
             );
             client
-                .benchmark_concurrent_for_duration(
+                .benchmark_concurrency(
                     Duration::from_secs(minutes.saturating_mul(60)),
                     args.bench_concurrency,
                     load_targets,
@@ -726,10 +726,10 @@ fn benchmark_seed(benchmark_id: &str) -> u64 {
 }
 
 fn timed_request_budget(args: &BenchArgs, config: &Config) -> usize {
-    timed_request_budget_for_limit(args, config.security.api_rate_limit_per_minute)
+    request_budget(args, config.security.api_rate_limit_per_minute)
 }
 
-fn timed_request_budget_for_limit(args: &BenchArgs, limit_per_minute: u32) -> usize {
+fn request_budget(args: &BenchArgs, limit_per_minute: u32) -> usize {
     let percent = if args.bench_import_export {
         TIMED_LOAD_IMPORT_EXPORT_BUDGET_PERCENT
     } else {
@@ -863,7 +863,7 @@ fn report_directory(args: &BenchArgs, benchmark_id: &str, started_at: &str) -> P
     })
 }
 
-fn populate_server_environment(environment: &mut EnvironmentReport, system: &serde_json::Value) {
+fn populate_server_env(environment: &mut EnvironmentReport, system: &serde_json::Value) {
     environment.server_version = system["version"].as_str().map(str::to_string);
     environment.api_version = system["api_version"].as_str().map(str::to_string);
     environment.node_uuid = system["uuid"].as_str().map(str::to_string);
@@ -876,7 +876,7 @@ fn populate_server_environment(environment: &mut EnvironmentReport, system: &ser
     environment.api_rate_limit_scope = system["api_rate_limit_scope"].as_str().map(str::to_string);
 }
 
-fn warn_about_rate_limit(args: &BenchArgs, config: &Config, warnings: &mut Vec<String>) {
+fn warn_rate_limit(args: &BenchArgs, config: &Config, warnings: &mut Vec<String>) {
     if let Some(minutes) = args.bench_time_minutes {
         if args.bench_unthrottled {
             warnings.push(format!(

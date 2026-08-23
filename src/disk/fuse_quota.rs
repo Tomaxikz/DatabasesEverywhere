@@ -66,7 +66,7 @@ pub(super) async fn verify_startup(
     }
 
     if let Some(fuse_root) = fuse_root {
-        ensure_private_fuse_directories(fuse_root)?;
+        prepare_fuse_dirs(fuse_root)?;
     }
 
     let binary_path = resolve_binary(binary, binary_sha256, fuse_root).await?;
@@ -97,7 +97,7 @@ pub(super) async fn apply_with_root(
     rescan_interval_seconds: u64,
 ) -> Result<PathBuf, DiskLimitError> {
     let paths = fuse_paths_with_root(data_path, fuse_root)?;
-    ensure_private_fuse_directories(&paths.root_path)?;
+    prepare_fuse_dirs(&paths.root_path)?;
     tokio::fs::create_dir_all(data_path)
         .await
         .map_err(|source| DiskLimitError::PathIo {
@@ -135,7 +135,7 @@ pub(super) async fn apply_with_root(
     )
     .await
     {
-        ensure_helper_nofile_limit(response.peer_pid).await?;
+        set_helper_nofile_limit(response.peer_pid).await?;
         if mount_owner_matches(&paths.mount_path, expected_owner).await {
             return Ok(paths.mount_path);
         }
@@ -172,7 +172,7 @@ pub(super) async fn apply_with_root(
         .arg(uid.to_string())
         .arg("--gid")
         .arg(gid.to_string())
-        .args(database_safe_mount_args())
+        .args(mount_args())
         .arg("-o")
         .arg("allow_other")
         .arg(data_path)
@@ -242,7 +242,7 @@ pub(super) async fn quota_used_with_root(
 ) -> Result<u64, DiskLimitError> {
     let paths = fuse_paths_with_root(data_path, fuse_root)?;
     let response = send_command(&paths.socket_path, "get quota_used").await?;
-    parse_quota_used_response(&response)
+    parse_quota_usage(&response)
 }
 
 pub(super) async fn runtime_is_healthy(
@@ -269,7 +269,7 @@ pub(super) async fn runtime_is_healthy(
         Ok(response) => response,
         Err(_) => return Ok(false),
     };
-    if let Err(error) = ensure_helper_nofile_limit(response.peer_pid).await {
+    if let Err(error) = set_helper_nofile_limit(response.peer_pid).await {
         tracing::warn!(
             mount_path = %paths.mount_path.display(),
             helper_pid = response.peer_pid,
@@ -287,7 +287,7 @@ async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     while started.elapsed() < Duration::from_secs(10) {
         match send_command_detailed(socket_path, "get quota_used").await {
             Ok(response) => {
-                ensure_helper_nofile_limit(response.peer_pid).await?;
+                set_helper_nofile_limit(response.peer_pid).await?;
                 return Ok(());
             }
             Err(error) => {
@@ -426,7 +426,7 @@ async fn send_command_bounded(
     Ok(FuseControlResponse { lines, peer_pid })
 }
 
-async fn ensure_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
+async fn set_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
     let limits_path = PathBuf::from(format!("/proc/{peer_pid}/limits"));
     let contents = tokio::fs::read_to_string(&limits_path)
         .await
@@ -526,7 +526,7 @@ fn parse_nofile_value(value: &str) -> Result<Option<u64>, String> {
         .map_err(|error| format!("invalid open-file limit {value:?}: {error}"))
 }
 
-fn ensure_private_fuse_directories(fuse_root: &Path) -> Result<(), DiskLimitError> {
+fn prepare_fuse_dirs(fuse_root: &Path) -> Result<(), DiskLimitError> {
     for path in [
         fuse_root.to_path_buf(),
         fuse_root.join("instances"),
@@ -811,11 +811,11 @@ fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(1024).saturating_mul(1024)
 }
 
-fn database_safe_mount_args() -> [&'static str; 3] {
+fn mount_args() -> [&'static str; 3] {
     ["--nopassthrough", "--nosplice", "--clone-fd"]
 }
 
-fn parse_quota_used_response(lines: &[String]) -> Result<u64, DiskLimitError> {
+fn parse_quota_usage(lines: &[String]) -> Result<u64, DiskLimitError> {
     for line in lines {
         if let Some(value) = line.strip_prefix("quota_used =") {
             return value
@@ -907,7 +907,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
             "external fuse quota helper has no file name",
         )
     })?;
-    let directory = open_trusted_root_owned_directory(parent)?;
+    let directory = open_trusted_root_dir(parent)?;
     let binary = rustix::fs::openat(
         &directory,
         file_name,
@@ -916,7 +916,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
     )
     .map_err(Error::other)?;
     let stat = rustix::fs::fstat(&binary).map_err(Error::other)?;
-    validate_external_binary_metadata(
+    check_external_binary(
         FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
         stat.st_uid,
         link_count_u64(stat.st_nlink),
@@ -946,7 +946,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
     Ok(())
 }
 
-fn open_trusted_root_owned_directory(path: &Path) -> Result<rustix::fd::OwnedFd, Error> {
+fn open_trusted_root_dir(path: &Path) -> Result<rustix::fd::OwnedFd, Error> {
     use rustix::fs::{FileType, Mode, OFlags};
 
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -987,7 +987,7 @@ fn link_count_u64<T: Into<u64>>(link_count: T) -> u64 {
     link_count.into()
 }
 
-fn validate_external_binary_metadata(
+fn check_external_binary(
     is_regular_file: bool,
     uid: u32,
     link_count: u64,
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn fuse_quota_uses_database_safe_mount_args() {
-        let args = database_safe_mount_args();
+        let args = mount_args();
 
         assert!(args.contains(&"--nopassthrough"));
         assert!(args.contains(&"--nosplice"));
@@ -1028,18 +1028,18 @@ mod tests {
 
     #[test]
     fn external_helper_metadata_must_be_root_owned_and_immutable_to_unprivileged_users() {
-        assert!(validate_external_binary_metadata(true, 0, 1, 0o100755).is_ok());
-        assert!(validate_external_binary_metadata(true, 1000, 1, 0o100755).is_err());
-        assert!(validate_external_binary_metadata(true, 0, 2, 0o100755).is_err());
-        assert!(validate_external_binary_metadata(true, 0, 1, 0o100775).is_err());
-        assert!(validate_external_binary_metadata(true, 0, 1, 0o100644).is_err());
-        assert!(validate_external_binary_metadata(false, 0, 1, 0o100755).is_err());
+        assert!(check_external_binary(true, 0, 1, 0o100755).is_ok());
+        assert!(check_external_binary(true, 1000, 1, 0o100755).is_err());
+        assert!(check_external_binary(true, 0, 2, 0o100755).is_err());
+        assert!(check_external_binary(true, 0, 1, 0o100775).is_err());
+        assert!(check_external_binary(true, 0, 1, 0o100644).is_err());
+        assert!(check_external_binary(false, 0, 1, 0o100755).is_err());
     }
 
     #[test]
     fn parses_quota_used_response() {
         let lines = vec!["quota_used = 12345".to_string(), "OK".to_string()];
-        assert_eq!(parse_quota_used_response(&lines).unwrap(), 12345);
+        assert_eq!(parse_quota_usage(&lines).unwrap(), 12345);
     }
 
     #[test]
@@ -1109,7 +1109,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        ensure_private_fuse_directories(&root).unwrap();
+        prepare_fuse_dirs(&root).unwrap();
 
         for path in [root.clone(), root.join("instances"), root.join("mounts")] {
             let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
@@ -1126,7 +1126,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o710)).unwrap();
         }
 
-        ensure_private_fuse_directories(&root).unwrap();
+        prepare_fuse_dirs(&root).unwrap();
 
         for path in [root.clone(), root.join("instances"), root.join("mounts")] {
             let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
