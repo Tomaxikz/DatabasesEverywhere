@@ -40,7 +40,7 @@ impl PublicDiagnostic {
             ApiError::BadRequest(message) => Self::public("bad_request", message),
             ApiError::Unauthorized
             | ApiError::InvalidWebSocketJwt(_)
-            | ApiError::HostNotAllowed
+            | ApiError::BrowserOriginNotAllowed
             | ApiError::QueryTokenRejected => Self::public("unauthorized", "unauthorized"),
             ApiError::Forbidden(scope) => {
                 Self::public("forbidden", format!("missing required scope {scope}"))

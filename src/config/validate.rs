@@ -46,12 +46,6 @@ pub enum ConfigValidationError {
     #[error("api.host must be a host or IP address, not a URL/path: {value}")]
     InvalidApiHost { value: String },
     #[error(
-        "api.fqdn must be a fully qualified DNS hostname without a scheme, port, path, wildcard, or trailing dot: {value}"
-    )]
-    InvalidApiFqdn { value: String },
-    #[error("api.fqdn is required when api.host binds all interfaces")]
-    MissingApiFqdn,
-    #[error(
         "api.trusted_origins must contain only HTTP(S) origins without paths, queries, or credentials: {value}"
     )]
     InvalidApiOrigin { value: String },
@@ -1076,7 +1070,6 @@ mod tests {
     fn accepts_public_api_with_plain_http_or_native_tls() {
         let mut config = valid_config();
         config.api.host = "0.0.0.0".to_string();
-        config.api.fqdn = "db.example.com".to_string();
         validate_config(&config).unwrap();
 
         let directory = tempfile::tempdir().unwrap();
@@ -1308,21 +1301,14 @@ mod tests {
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443"]
         );
-        assert_eq!(config.request_allowed_hosts(), vec!["127.0.0.1"]);
     }
 
     #[test]
-    fn accepts_explicit_reverse_proxy_fqdn() {
+    fn ignores_legacy_api_fqdn() {
         let mut config = valid_config();
-        config.api.fqdn = "node.example.com".to_string();
+        config.api.fqdn = "not a validated public address".to_string();
 
         validate_config(&config).unwrap();
-
-        assert!(
-            config
-                .request_allowed_hosts()
-                .contains(&"node.example.com".to_string())
-        );
     }
 
     #[test]
@@ -1338,11 +1324,6 @@ mod tests {
         assert_eq!(
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443", "http://localhost:3000"]
-        );
-        assert!(
-            !config
-                .request_allowed_hosts()
-                .contains(&"localhost".to_string())
         );
     }
 

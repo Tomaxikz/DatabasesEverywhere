@@ -295,7 +295,7 @@ paths:
     }
 
     #[test]
-    fn loads_explicit_api_trusted_origins_without_breaking_legacy_defaults() {
+    fn loads_trusted_origins_and_ignores_legacy_fqdn() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");
         std::fs::write(
@@ -323,7 +323,8 @@ paths:
 
         let config = load_config(&path).unwrap();
 
-        assert_eq!(config.api.fqdn(), Some("db.example.com"));
+        assert_eq!(config.api.fqdn, "db.example.com");
+        assert!(!serde_yaml::to_string(&config).unwrap().contains("fqdn:"));
         assert_eq!(
             config.cors_allowed_origins(),
             vec!["https://panel.example.com:443", "http://localhost:3000"]

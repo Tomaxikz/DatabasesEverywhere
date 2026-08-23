@@ -10,30 +10,22 @@ use std::{collections::HashSet, sync::Arc};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
-    api::{
-        allowed_hosts, api_response::ApiError, routes::AppState, security::RequestAuthentication,
-    },
+    api::{api_response::ApiError, routes::AppState, security::RequestAuthentication},
     auth::{api_token::AcceptedApiToken, jwt},
     config::Config,
     constants,
 };
 
 #[derive(Debug, Clone)]
-pub struct HostPolicy {
-    request_hosts: Arc<HashSet<String>>,
+pub struct OriginPolicy {
     allowed_origins: Arc<HashSet<String>>,
 }
 
-impl HostPolicy {
+impl OriginPolicy {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            request_hosts: normalized_hosts(config.request_allowed_hosts()),
             allowed_origins: Arc::new(config.cors_allowed_origins().into_iter().collect()),
         }
-    }
-
-    fn allows_request_host(&self, host: &str) -> bool {
-        self.request_hosts.contains(host)
     }
 
     fn allows_origin(&self, origin: &str) -> bool {
@@ -43,24 +35,15 @@ impl HostPolicy {
     }
 
     fn is_complete(&self) -> bool {
-        !self.request_hosts.is_empty() && !self.allowed_origins.is_empty()
+        !self.allowed_origins.is_empty()
     }
-}
-
-fn normalized_hosts(hosts: Vec<String>) -> Arc<HashSet<String>> {
-    Arc::new(
-        hosts
-            .into_iter()
-            .map(|host| allowed_hosts::normalize_host(&host))
-            .collect(),
-    )
 }
 
 /// Authentication extracted before path, query, or body parsing.
 ///
 /// Handlers still name their required scope explicitly, but token and
 /// query-token policy is evaluated before path, query, or body deserialization.
-/// Host and Origin policy is enforced globally by `enforce_request_host_policy`.
+/// Browser Origin policy is enforced globally by `enforce_request_origin_policy`.
 #[derive(Debug, Clone)]
 pub struct ApiRequestContext {
     actor: AcceptedApiToken,
@@ -161,24 +144,16 @@ impl FromRequestParts<AppState> for ApiRequestContext {
     }
 }
 
-pub fn enforce_allowed_request_hosts(
-    state: &AppState,
-    headers: &HeaderMap,
-    uri: &Uri,
-) -> Result<(), ApiError> {
-    validate_allowed_request_hosts(headers, uri, state.host_policy())
-}
-
-pub async fn enforce_request_host_policy(
+pub async fn enforce_request_origin_policy(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    enforce_allowed_request_hosts(&state, request.headers(), request.uri())?;
+    validate_request_origin(request.headers(), state.origin_policy())?;
     Ok(next.run(request).await)
 }
 
-pub fn cors_layer(policy: HostPolicy) -> CorsLayer {
+pub fn cors_layer(policy: OriginPolicy) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(
             move |origin: &HeaderValue, _request_parts| {
@@ -204,24 +179,17 @@ pub fn cors_layer(policy: HostPolicy) -> CorsLayer {
         ])
 }
 
-fn validate_allowed_request_hosts(
-    headers: &HeaderMap,
-    uri: &Uri,
-    policy: &HostPolicy,
-) -> Result<(), ApiError> {
+fn validate_request_origin(headers: &HeaderMap, policy: &OriginPolicy) -> Result<(), ApiError> {
     if !policy.is_complete() {
-        return Err(ApiError::HostNotAllowed);
-    }
-
-    let request_host = allowed_hosts::request_host(headers, uri).ok_or(ApiError::HostNotAllowed)?;
-    if !policy.allows_request_host(&request_host) {
-        return Err(ApiError::HostNotAllowed);
+        return Err(ApiError::BrowserOriginNotAllowed);
     }
 
     if let Some(origin) = headers.get("origin") {
-        let origin = origin.to_str().map_err(|_| ApiError::HostNotAllowed)?;
+        let origin = origin
+            .to_str()
+            .map_err(|_| ApiError::BrowserOriginNotAllowed)?;
         if !policy.allows_origin(origin) {
-            return Err(ApiError::HostNotAllowed);
+            return Err(ApiError::BrowserOriginNotAllowed);
         }
     }
     Ok(())
@@ -367,28 +335,22 @@ mod tests {
     }
 
     #[test]
-    fn validates_host_and_origin_independently() {
-        let policy = HostPolicy {
-            request_hosts: normalized_hosts(vec!["panel.example.com".to_string()]),
+    fn server_requests_need_no_public_host_and_browser_origins_remain_restricted() {
+        let policy = OriginPolicy {
             allowed_origins: Arc::new(HashSet::from(["https://panel.example.com:443".to_string()])),
         };
-        let uri = "/api/system".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("host", "evil.example.com".parse().unwrap());
+
+        assert!(validate_request_origin(&headers, &policy).is_ok());
+
         headers.insert("origin", "https://panel.example.com".parse().unwrap());
-
-        assert!(matches!(
-            validate_allowed_request_hosts(&headers, &uri, &policy),
-            Err(ApiError::HostNotAllowed)
-        ));
-
-        headers.insert("host", "panel.example.com".parse().unwrap());
-        assert!(validate_allowed_request_hosts(&headers, &uri, &policy).is_ok());
+        assert!(validate_request_origin(&headers, &policy).is_ok());
 
         headers.insert("origin", "https://evil.example.com".parse().unwrap());
         assert!(matches!(
-            validate_allowed_request_hosts(&headers, &uri, &policy),
-            Err(ApiError::HostNotAllowed)
+            validate_request_origin(&headers, &policy),
+            Err(ApiError::BrowserOriginNotAllowed)
         ));
     }
 
@@ -399,7 +361,7 @@ mod tests {
             ..Config::default()
         };
         config.api.trusted_origins = vec!["http://localhost:3000/".to_string()];
-        let policy = HostPolicy::from_config(&config);
+        let policy = OriginPolicy::from_config(&config);
 
         assert!(policy.allows_origin("https://panel.example.com"));
         assert!(policy.allows_origin("https://PANEL.example.com:443"));
@@ -412,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn fqdn_and_cors_origin_are_independent_trust_boundaries() {
+    fn legacy_fqdn_does_not_change_browser_origin_policy() {
         let config = Config {
             remote: "https://panel.example.com".to_string(),
             api: crate::config::ApiConfig {
@@ -422,10 +384,8 @@ mod tests {
             },
             ..Config::default()
         };
-        let policy = HostPolicy::from_config(&config);
+        let policy = OriginPolicy::from_config(&config);
 
-        assert!(policy.allows_request_host("db.example.com"));
-        assert!(!policy.allows_request_host("panel.example.com"));
         assert!(policy.allows_origin("https://panel.example.com"));
         assert!(!policy.allows_origin("https://db.example.com"));
     }

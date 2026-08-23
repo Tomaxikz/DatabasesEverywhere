@@ -39,7 +39,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct AppState {
     inner: Arc<AppStateData>,
-    host_policy: Arc<security_policy::HostPolicy>,
+    origin_policy: Arc<security_policy::OriginPolicy>,
 }
 
 #[derive(Debug)]
@@ -67,15 +67,15 @@ pub struct AppStateData {
 
 impl AppState {
     pub fn new(data: AppStateData) -> Self {
-        let host_policy = Arc::new(security_policy::HostPolicy::from_config(&data.config));
+        let origin_policy = Arc::new(security_policy::OriginPolicy::from_config(&data.config));
         Self {
             inner: Arc::new(data),
-            host_policy,
+            origin_policy,
         }
     }
 
-    pub fn host_policy(&self) -> &security_policy::HostPolicy {
-        &self.host_policy
+    pub fn origin_policy(&self) -> &security_policy::OriginPolicy {
+        &self.origin_policy
     }
 }
 
@@ -183,7 +183,7 @@ fn release_mutation(active: &AtomicUsize, drain: &Notify) {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = security_policy::cors_layer(state.host_policy().clone());
+    let cors = security_policy::cors_layer(state.origin_policy().clone());
 
     Router::new()
         .merge(system_routes())
@@ -212,7 +212,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::api::security_policy::enforce_request_host_policy,
+            crate::api::security_policy::enforce_request_origin_policy,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -481,39 +481,35 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn host_and_browser_origin_policies_reject_each_invalid_boundary() {
-        for (name, host, origin) in [
-            (
-                "untrusted host with allowed origin",
-                "evil.example.com",
-                "https://panel.example.com",
-            ),
-            (
-                "trusted host with wrong origin scheme",
-                "panel.example.com",
-                "http://panel.example.com",
-            ),
-        ] {
-            let response = build_router(test_state().await)
-                .oneshot(
-                    Request::builder()
-                        .uri("/api/heartbeat")
-                        .header(header::HOST, host)
-                        .header(header::ORIGIN, origin)
-                        .header(header::AUTHORIZATION, "Bearer secret")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+    async fn public_host_is_panel_owned_while_browser_origin_remains_restricted() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/heartbeat")
+                    .header(header::HOST, "any-public-address.example.com")
+                    .header(header::ORIGIN, "https://panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
-            assert_eq!(
-                json_body(response).await["code"],
-                "host_not_allowed",
-                "{name}"
-            );
-        }
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/heartbeat")
+                    .header(header::HOST, "panel.example.com")
+                    .header(header::ORIGIN, "http://panel.example.com")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["code"], "host_not_allowed");
     }
 
     #[tokio::test]
@@ -742,10 +738,6 @@ mod tests {
             token_id: "test-token".to_string(),
             token: "secret".to_string(),
             jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
-            api: crate::config::ApiConfig {
-                fqdn: "panel.example.com".to_string(),
-                ..Default::default()
-            },
             ..Default::default()
         });
         AppState::new(AppStateData {
@@ -790,10 +782,6 @@ mod tests {
             token_id: "test-token".to_string(),
             token: "secret".to_string(),
             jwt_signing_key: "test-jwt-signing-key-at-least-32-bytes".to_string(),
-            api: crate::config::ApiConfig {
-                fqdn: "panel.example.com".to_string(),
-                ..Default::default()
-            },
             paths: crate::config::PathConfig {
                 data: root.join("data").display().to_string(),
                 sockets: root.join("sockets").display().to_string(),

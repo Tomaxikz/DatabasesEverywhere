@@ -70,8 +70,8 @@ pub enum ApiError {
     Unauthorized,
     #[error("forbidden: missing required scope {0}")]
     Forbidden(String),
-    #[error("request host is not allowed")]
-    HostNotAllowed,
+    #[error("request origin is not allowed")]
+    BrowserOriginNotAllowed,
     #[error("token in query string is not accepted")]
     QueryTokenRejected,
     #[error("websocket jwt is invalid: {0}")]
@@ -97,7 +97,7 @@ impl ApiError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized
-            | Self::HostNotAllowed
+            | Self::BrowserOriginNotAllowed
             | Self::QueryTokenRejected
             | Self::InvalidWebSocketJwt(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -116,7 +116,9 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::Unauthorized | Self::InvalidWebSocketJwt(_) => "unauthorized",
             Self::Forbidden(_) => "forbidden",
-            Self::HostNotAllowed => "host_not_allowed",
+            // Preserve the established wire code while older panels migrate
+            // from daemon Host validation to browser Origin validation.
+            Self::BrowserOriginNotAllowed => "host_not_allowed",
             Self::QueryTokenRejected => "query_token_rejected",
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",

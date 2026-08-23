@@ -113,11 +113,10 @@ jwt_signing_key: replace-with-a-different-32-byte-random-key
 api:
   host: 127.0.0.1
   port: 8090
-  fqdn: node-api.example.com # public DNS name; no scheme or port
   trusted_origins: [] # extra exact browser callers, if any
 ```
 
-Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and private Unix sockets. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Qdrant's one configured public listener auto-detects HTTP/2 gRPC and HTTP/1.1 REST, then uses distinct private gRPC/REST sockets and checks the API key on every request or stream. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0`, set `api.fqdn` to the hostname from the panel's node API URL, and configure `api.ssl` for that hostname. `api.host` controls the local bind while `api.fqdn` declares the canonical public request hostname, so clients must still include `api.port` when it is not the scheme default.
+Also tweak gateway ports, `daemon.engine`, or `daemon.socket_path` if your host needs it. Database container networking is not configurable: every instance uses `network_mode=none` and private Unix sockets. ClickHouse and Qdrant receive a hash-verified, statically linked bridge helper because those engines expose TCP listeners internally; the helper can connect only to non-zero loopback targets and creates sockets only directly under `/run/dbev`. Qdrant's one configured public listener auto-detects HTTP/2 gRPC and HTTP/1.1 REST, then uses distinct private gRPC/REST sockets and checks the API key on every request or stream. Keep `api.host` on loopback when using a local reverse proxy. Direct HTTP and HTTPS binds are both supported; use `api.host: 0.0.0.0` for a normal public listener and configure `api.ssl` when DBEV terminates TLS itself. The panel stores the public IP or DNS hostname and constructs the HTTP/WebSocket URLs. Legacy `api.fqdn` values are accepted on boot but ignored.
 
 `token` and `jwt_signing_key` are independent credentials and must each contain
 at least 32 random bytes. Generate them with a cryptographically secure secret
@@ -553,7 +552,7 @@ Authorization: Bearer <token>
 The config token has the `*` scope, so it can do everything. Things to know:
 
 - Putting a token in the query string (`?token=...`) gets you a `401` — headers only. The one exception is a temporary download URL returned by the download endpoint; it carries its own short-lived JWT.
-- The request `Host` must match `api.fqdn` or a concrete `api.host`; the panel's `remote` hostname is deliberately not treated as DBEV's own hostname. A wildcard bind (`0.0.0.0` or `::`) requires `api.fqdn`, which prevents a daemon from starting in a state that rejects its real public hostname. If an `Origin` header is present, it is checked independently against the exact browser-origin allow-list made from `remote` plus `api.trusted_origins`; scheme, hostname, and effective port must all match (for example, implicit HTTPS port 443 equals explicit `:443`). This strict origin list represents which browser hosts can use DBEV. Existing private/loopback configs remain valid because `fqdn` defaults to empty and `trusted_origins` defaults to an empty list.
+- The panel owns the daemon's public IP or hostname; `api.host` only controls the local listener. DBEV does not restrict authenticated server-to-server calls by their HTTP `Host` header. If an `Origin` header is present, it is checked against the exact browser-origin allow-list made from `remote` plus `api.trusted_origins`; scheme, hostname, and effective port must all match (for example, implicit HTTPS port 443 equals explicit `:443`). This keeps browser access restricted without duplicating the panel's public-address state inside the daemon.
 - Rate limit: 600 requests per minute per authenticated credential and
   transport-peer IP by default. IPv6 peers share a `/64`. Exceed it and you get
   `429`.
