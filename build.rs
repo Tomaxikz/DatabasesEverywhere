@@ -1,7 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-const FUSEQUOTA_VERSION: &str = "f939851";
 const FUSEQUOTA_X86_64_COMPRESSED_SHA256: &str =
     "2722e74f095f93e56b775e38f60364c878bf27515a52435123704535047113e3";
 const FUSEQUOTA_X86_64_EXECUTABLE_SHA256: &str =
@@ -10,7 +9,6 @@ const FUSEQUOTA_AARCH64_EXECUTABLE_SHA256: &str =
     "afd429f034458e0f3fe200cf74f91f82813a7395378174ba8985ce988492f740";
 const FUSEQUOTA_RISCV64_EXECUTABLE_SHA256: &str =
     "ab3b6c84dc905abf8b358f93e5b3eb9d2d8b8d3d0a542971cfa27414c5c34109";
-const SOCKET_BRIDGE_VERSION: &str = "5";
 // Pin the reviewed source and both artifact forms. Rust/LLD output is not
 // guaranteed to be byte-identical when the compiler host OS changes.
 const SOCKET_BRIDGE_SOURCE_SHA256: &str =
@@ -20,13 +18,23 @@ const SOCKET_BRIDGE_COMPRESSED_SHA256: &str =
 const SOCKET_BRIDGE_EXECUTABLE_SHA256: &str =
     "be614294f1b7d8e91217c0aaeb8503d4d969fb3868981b224e2d4f621ccc820f";
 
+const FUSEQUOTA_PAYLOAD: &str = "helpers/payloads/fusequota.zst";
+const FUSEQUOTA_VERSION_FILE: &str = "helpers/payloads/fusequota.version";
+const SOCKET_BRIDGE_PAYLOAD: &str = "helpers/payloads/socket-bridge.zst";
+const SOCKET_BRIDGE_SOURCE: &str = "helpers/socket_bridge.rs";
+const SOCKET_BRIDGE_VERSION_FILE: &str = "helpers/payloads/socket-bridge.version";
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=bins/fusequota");
-    println!("cargo:rerun-if-changed=bins/fusequota.version");
-    println!("cargo:rerun-if-changed=bins/socket-bridge");
-    println!("cargo:rerun-if-changed=bins/socket-bridge.version");
-    println!("cargo:rerun-if-changed=helpers/socket_bridge.rs");
+    for path in [
+        FUSEQUOTA_PAYLOAD,
+        FUSEQUOTA_VERSION_FILE,
+        SOCKET_BRIDGE_PAYLOAD,
+        SOCKET_BRIDGE_SOURCE,
+        SOCKET_BRIDGE_VERSION_FILE,
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
     println!("cargo:rerun-if-env-changed=DBEV_FUSEQUOTA_PAYLOAD");
     println!("cargo:rerun-if-env-changed=DBEV_SOCKET_BRIDGE_PAYLOAD");
 
@@ -75,18 +83,35 @@ fn configure_helpers(
     socket_bridge: &Path,
     socket_bridge_sha256: &str,
 ) {
+    let fusequota_version = read_helper_version(FUSEQUOTA_VERSION_FILE, "FuseQuota");
+    let socket_bridge_version = read_helper_version(SOCKET_BRIDGE_VERSION_FILE, "socket bridge");
     println!(
         "cargo:rustc-env=FUSEQUOTA_PAYLOAD_PATH={}",
         printable_path(fusequota)
     );
-    println!("cargo:rustc-env=FUSEQUOTA_VERSION={FUSEQUOTA_VERSION}");
+    println!("cargo:rustc-env=FUSEQUOTA_VERSION={fusequota_version}");
     println!("cargo:rustc-env=FUSEQUOTA_SHA256={fusequota_sha256}");
     println!(
         "cargo:rustc-env=SOCKET_BRIDGE_PAYLOAD_PATH={}",
         printable_path(socket_bridge)
     );
-    println!("cargo:rustc-env=SOCKET_BRIDGE_VERSION={SOCKET_BRIDGE_VERSION}");
+    println!("cargo:rustc-env=SOCKET_BRIDGE_VERSION={socket_bridge_version}");
     println!("cargo:rustc-env=SOCKET_BRIDGE_SHA256={socket_bridge_sha256}");
+}
+
+fn read_helper_version(path: &str, label: &str) -> String {
+    let contents = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("missing checked-in {path}: {error}"));
+    let version = contents.trim();
+    assert!(
+        !version.is_empty()
+            && version.len() <= 64
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+        "{label} version in {path} is invalid"
+    );
+    version.to_owned()
 }
 
 fn fusequota_sha256(target_arch: &str) -> &'static str {
@@ -145,25 +170,17 @@ fn canonical_payload_path(path: &Path, label: &str) -> PathBuf {
 }
 
 fn verify_socket_bridge_source() {
-    let source = std::fs::read("helpers/socket_bridge.rs")
-        .expect("missing checked-in helpers/socket_bridge.rs");
+    let source = std::fs::read(SOCKET_BRIDGE_SOURCE)
+        .unwrap_or_else(|error| panic!("missing checked-in {SOCKET_BRIDGE_SOURCE}: {error}"));
     assert_digest("socket bridge source", &source, SOCKET_BRIDGE_SOURCE_SHA256);
 }
 
 fn verify_checked_in_socket_bridge() -> PathBuf {
-    let version = std::fs::read_to_string("bins/socket-bridge.version")
-        .expect("missing checked-in bins/socket-bridge.version");
-    assert_eq!(
-        version.trim(),
-        SOCKET_BRIDGE_VERSION,
-        "checked-in socket bridge version does not match the pinned build version"
-    );
-
     verify_socket_bridge_source();
 
-    let path = canonical_payload_path(Path::new("bins/socket-bridge"), "socket bridge");
-    let compressed =
-        std::fs::read(&path).expect("missing checked-in compressed bins/socket-bridge");
+    let path = canonical_payload_path(Path::new(SOCKET_BRIDGE_PAYLOAD), "socket bridge");
+    let compressed = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("missing checked-in {SOCKET_BRIDGE_PAYLOAD}: {error}"));
     assert_digest(
         "compressed socket bridge",
         &compressed,
@@ -180,16 +197,9 @@ fn verify_checked_in_socket_bridge() -> PathBuf {
 }
 
 fn verify_checked_in_fusequota() -> PathBuf {
-    let version = std::fs::read_to_string("bins/fusequota.version")
-        .expect("missing checked-in bins/fusequota.version");
-    assert_eq!(
-        version.trim(),
-        FUSEQUOTA_VERSION,
-        "checked-in fusequota version does not match the pinned build version"
-    );
-
-    let path = canonical_payload_path(Path::new("bins/fusequota"), "FuseQuota");
-    let compressed = std::fs::read(&path).expect("missing checked-in compressed bins/fusequota");
+    let path = canonical_payload_path(Path::new(FUSEQUOTA_PAYLOAD), "FuseQuota");
+    let compressed = std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("missing checked-in {FUSEQUOTA_PAYLOAD}: {error}"));
     assert_digest(
         "compressed fusequota",
         &compressed,

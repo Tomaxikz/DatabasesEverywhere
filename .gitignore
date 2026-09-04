@@ -5,6 +5,7 @@
 /.venv-*/
 /scripts/
 /tests/*
+!/tests/openapi_contract.rs
 !/tests/real_drivers/
 !/tests/real_drivers/**
 /dbev-benchmarks/

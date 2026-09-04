@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag, for example v0.3.0"
+        description: "Release SemVer tag prefixed with v"
         required: true
         type: string
       create_github_release:
@@ -81,7 +81,7 @@ jobs:
             exit 1
           fi
           if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
-            echo "version must be a complete SemVer tag such as v0.3.0" >&2
+            echo "version must be a complete SemVer tag prefixed with v" >&2
             exit 1
           fi
 
@@ -332,7 +332,7 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: Dockerfile
+          file: deploy/docker/Dockerfile
           platforms: ${{ inputs.docker_platforms }}
           push: true
           tags: ${{ steps.docker_tags.outputs.tags }}

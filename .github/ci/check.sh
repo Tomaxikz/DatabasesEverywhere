@@ -25,20 +25,11 @@ lint() {
 
   section "Strict Clippy"
   cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  section "Static helper formatting"
-  cargo fmt --manifest-path tools/helper-packer/Cargo.toml -- --check
-
-  section "Static helper Clippy"
-  cargo clippy --manifest-path tools/helper-packer/Cargo.toml --all-targets --locked -- -D warnings
 }
 
 test_all() {
   section "Complete Linux test suite"
   cargo test --workspace --locked
-
-  section "Static helper tests"
-  cargo test --manifest-path tools/helper-packer/Cargo.toml --all-targets --locked
 }
 
 audit_dependencies() {
@@ -52,14 +43,8 @@ audit_dependencies() {
     exit 1
   fi
 
-  section "Root dependency audit"
+  section "Workspace dependency audit"
   cargo audit --no-yanked -D warnings
-
-  section "Static helper dependency audit"
-  (
-    cd tools/helper-packer
-    cargo audit --no-yanked -D warnings
-  )
 }
 
 case "${1:-pre-push}" in

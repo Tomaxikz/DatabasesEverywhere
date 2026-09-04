@@ -46,6 +46,12 @@ cd "$repository_root"
 artifact_dir="${DBEV_RELEASE_OUTPUT_DIR:-$repository_root/target/release-artifacts}"
 mkdir -p "$artifact_dir"
 
+fusequota_version="$(tr -d '\r\n' < "$repository_root/helpers/payloads/fusequota.version")"
+if [[ ! "$fusequota_version" =~ ^[0-9a-f]{7,40}$ ]]; then
+  echo "helpers/payloads/fusequota.version must contain a Git commit hash" >&2
+  exit 1
+fi
+
 if ! command -v zig >/dev/null 2>&1; then
   echo "Zig is required for pinned glibc-targeted release builds" >&2
   exit 1
@@ -78,7 +84,7 @@ if [ -n "$helper_target" ]; then
 
   curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
     --connect-timeout 10 --max-time 120 \
-    "https://github.com/calagopus/fusequota/releases/download/f939851/fusequota-${fusequota_arch}-linux" \
+    "https://github.com/calagopus/fusequota/releases/download/${fusequota_version}/fusequota-${fusequota_arch}-linux" \
     --output "$fusequota_executable"
   printf '%s  %s\n' "$fusequota_sha256" "$fusequota_executable" |
     sha256sum --check --strict
@@ -91,11 +97,11 @@ if [ -n "$helper_target" ]; then
     -o "$socket_bridge_executable"
 
   cargo run --quiet --locked \
-    --manifest-path "$repository_root/tools/helper-packer/Cargo.toml" \
+    --package dbev-helper-packer \
     --target-dir "$repository_root/target/helper-packer" \
     -- "$fusequota_executable" "$fusequota_payload"
   cargo run --quiet --locked \
-    --manifest-path "$repository_root/tools/helper-packer/Cargo.toml" \
+    --package dbev-helper-packer \
     --target-dir "$repository_root/target/helper-packer" \
     -- "$socket_bridge_executable" "$socket_bridge_payload"
 

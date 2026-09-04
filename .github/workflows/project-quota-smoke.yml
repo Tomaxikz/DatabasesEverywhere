@@ -1,0 +1,121 @@
+name: Native project-quota smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      filesystem:
+        description: Loopback filesystem to exercise
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - xfs
+          - ext4
+          - f2fs
+  schedule:
+    - cron: "41 4 * * 1"
+
+concurrency:
+  group: native-project-quota-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  quota:
+    name: ${{ github.event_name == 'schedule' && 'XFS + ext4 + optional F2FS' || inputs.filesystem }} project quotas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Install project-quota tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs f2fs-tools quota xfsprogs
+
+      - name: Verify privileged loopback support
+        run: |
+          sudo -n true
+          test -e /dev/loop-control || {
+            echo "GitHub runner is missing /dev/loop-control" >&2
+            exit 1
+          }
+
+      - name: Exercise native project quotas
+        env:
+          DBE_PROJECT_QUOTA_TEST_TIMEOUT: 6m
+          DBE_PROJECT_QUOTA_TEST_FS: ${{ github.event_name == 'schedule' && 'all' || inputs.filesystem }}
+        run: bash .github/ci/project-quota-smoke.sh "$DBE_PROJECT_QUOTA_TEST_FS"
+
+  engine:
+    name: ${{ matrix.protocol }} on real XFS + ext4 tenant quotas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        protocol:
+          - postgres
+          - mysql
+          - mariadb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Install project-quota tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs quota xfsprogs
+
+      - name: Verify privileged loopback and Docker support
+        run: |
+          sudo -n true
+          test -e /dev/loop-control || {
+            echo "GitHub runner is missing /dev/loop-control" >&2
+            exit 1
+          }
+          docker info >/dev/null
+
+      - name: Exercise real engine writes through both hard-quota backends
+        env:
+          DBE_PROJECT_QUOTA_TEST_TIMEOUT: 12m
+          DBE_PROJECT_QUOTA_BUILD_TIMEOUT: 15m
+          DBE_PROJECT_QUOTA_ENGINE_PROTOCOL: ${{ matrix.protocol }}
+        run: |
+          bash .github/ci/project-quota-smoke.sh xfs "$DBE_PROJECT_QUOTA_ENGINE_PROTOCOL"
+          bash .github/ci/project-quota-smoke.sh ext4 "$DBE_PROJECT_QUOTA_ENGINE_PROTOCOL"

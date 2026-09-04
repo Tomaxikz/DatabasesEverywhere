@@ -40,12 +40,12 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
+        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh .github/ci/shared-pool-isolation.sh .github/ci/project-quota-smoke.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
         with:
-          dockerfile: Dockerfile
+          dockerfile: deploy/docker/Dockerfile
           failure-threshold: warning
 
       - name: Install workflow security linter

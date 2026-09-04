@@ -1,0 +1,520 @@
+use std::path::{Path, PathBuf};
+
+use crate::{
+    config::PathConfig,
+    shared::{
+        ids::validate_instance_id,
+        ownership::{HostOwner, chown_recursive},
+    },
+};
+
+#[derive(Debug, Clone)]
+pub struct RuntimePathStatus {
+    pub entries: usize,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstancePaths {
+    pub instance_id: String,
+    pub data: PathBuf,
+    pub logs: PathBuf,
+    pub sockets: PathBuf,
+    pub artifacts: PathBuf,
+    /// Portable exports owned by this instance.
+    pub exports: PathBuf,
+    /// Operator-staged imports owned by this instance.
+    pub imports: PathBuf,
+    /// Physical backups are created lazily, but remain owned by the instance.
+    pub backups: PathBuf,
+    /// Daemon-owned configuration that must never be writable by a database container.
+    pub runtime_config: PathBuf,
+    /// Daemon executable copy used only by TCP-only engines as a local socket bridge.
+    pub socket_bridge_binary: PathBuf,
+}
+
+impl InstancePaths {
+    pub fn new(config: &PathConfig, instance_id: &str) -> Result<Self, InstancePathError> {
+        validate_instance_id(instance_id)?;
+        let volumes_root_value = config.volumes_root();
+        let data_root = root("paths.volumes", &volumes_root_value)?;
+        let logs_root = root("paths.logs", &config.logs)?;
+        let sockets_root = root("paths.sockets", &config.sockets)?;
+        let artifacts_root = root("paths.artifacts", &config.artifacts)?;
+        let exports_root = root("paths.exports", &config.exports_root())?;
+        let imports_root = root("paths.imports", &config.imports_root())?;
+        let backups_root = root("paths.backups", &config.backups_root())?;
+        let metadata_root = root("paths.metadata", &config.metadata_root())?;
+        let runtime_config_root = metadata_root.join("runtime-configs");
+
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            data: child_direct(&data_root, instance_id)?,
+            logs: child(&logs_root, instance_id)?,
+            sockets: child_direct(&sockets_root, instance_id)?,
+            artifacts: child(&artifacts_root, instance_id)?,
+            exports: child_direct(&exports_root, instance_id)?,
+            imports: child_direct(&imports_root, instance_id)?,
+            backups: child_direct(&backups_root, instance_id)?,
+            runtime_config: child_direct(&runtime_config_root, instance_id)?,
+            socket_bridge_binary: metadata_root
+                .join("runtime")
+                .join("bin")
+                .join(crate::bins::SOCKET_BRIDGE_FILENAME),
+        })
+    }
+
+    pub async fn create_dirs(&self) -> Result<(), InstancePathError> {
+        create_private_dir(&self.data).await?;
+        create_private_dir(&self.logs).await?;
+        create_private_dir(&self.sockets).await?;
+        create_private_dir(&self.artifacts).await?;
+        create_private_dir(&self.runtime_config).await?;
+        Ok(())
+    }
+
+    pub async fn clear_socket_dir(&self) -> Result<(), InstancePathError> {
+        let sockets = self.sockets.clone();
+        tokio::task::spawn_blocking(move || clear_dir_contents(&sockets))
+            .await
+            .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    pub async fn socket_dir_status(&self) -> Result<RuntimePathStatus, InstancePathError> {
+        let sockets = self.sockets.clone();
+        tokio::task::spawn_blocking(move || dir_status(&sockets))
+            .await
+            .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    pub async fn apply_container_owner(&self) -> Result<(), InstancePathError> {
+        let Some(owner) = self.desired_container_owner().await? else {
+            return Ok(());
+        };
+        let paths = vec![
+            self.data.clone(),
+            self.logs.clone(),
+            self.sockets.clone(),
+            self.artifacts.clone(),
+        ];
+        tokio::task::spawn_blocking(move || {
+            for path in paths {
+                chown_recursive(&path, owner).map_err(|source| InstancePathError::Chown {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    /// Makes only the paths mounted into rootless Podman containers belong to
+    /// the host account that owns the Podman service. Daemon-owned artifacts,
+    /// imports, exports, and backups remain root-private.
+    pub async fn apply_rootless_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
+        if uid == 0 {
+            return Err(InstancePathError::InvalidRuntimeOwner);
+        }
+        let paths = vec![
+            self.data.clone(),
+            self.logs.clone(),
+            self.sockets.clone(),
+            self.runtime_config.clone(),
+        ];
+        let owner = HostOwner { uid, gid };
+        tokio::task::spawn_blocking(move || {
+            for path in paths {
+                chown_recursive(&path, owner).map_err(|source| InstancePathError::Chown {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    /// Reapply the persistent data directory's existing owner after a
+    /// physical restore has created replacement entries as the daemon user.
+    pub async fn restore_data_owner(&self) -> Result<(), InstancePathError> {
+        let owner = self.data_owner().await?;
+        let data = self.data.clone();
+        tokio::task::spawn_blocking(move || {
+            chown_recursive(&data, owner).map_err(|source| InstancePathError::Chown {
+                path: data.display().to_string(),
+                source,
+            })
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    pub async fn set_rootless_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
+        if uid == 0 {
+            return Err(InstancePathError::InvalidRuntimeOwner);
+        }
+        let data = self.data.clone();
+        tokio::task::spawn_blocking(move || {
+            chown_recursive(&data, HostOwner { uid, gid }).map_err(|source| {
+                InstancePathError::Chown {
+                    path: data.display().to_string(),
+                    source,
+                }
+            })
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    pub async fn apply_socket_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
+        let sockets = self.sockets.clone();
+        let owner = HostOwner { uid, gid };
+        tokio::task::spawn_blocking(move || {
+            chown_recursive(&sockets, owner).map_err(|source| InstancePathError::Chown {
+                path: sockets.display().to_string(),
+                source,
+            })
+        })
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+    }
+
+    async fn desired_container_owner(&self) -> Result<Option<HostOwner>, InstancePathError> {
+        if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
+            return Ok(Some(owner));
+        }
+
+        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
+            InstancePathError::ReadMetadata {
+                path: self.data.display().to_string(),
+                source,
+            }
+        })?;
+
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(default_owner_for(metadata.uid(), metadata.gid()))
+    }
+
+    async fn data_owner(&self) -> Result<HostOwner, InstancePathError> {
+        if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
+            return Ok(owner);
+        }
+
+        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
+            InstancePathError::ReadMetadata {
+                path: self.data.display().to_string(),
+                source,
+            }
+        })?;
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(existing_owner_for(metadata.uid(), metadata.gid()))
+    }
+
+    pub async fn container_user(&self) -> Result<String, InstancePathError> {
+        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
+            InstancePathError::ReadMetadata {
+                path: self.data.display().to_string(),
+                source,
+            }
+        })?;
+
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(format!("{}:{}", metadata.uid(), metadata.gid()))
+    }
+}
+
+fn root(field: &'static str, value: &str) -> Result<PathBuf, InstancePathError> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(InstancePathError::RelativeRoot {
+            field,
+            path: value.to_string(),
+        })
+    }
+}
+
+fn child(root: &Path, instance_id: &str) -> Result<PathBuf, InstancePathError> {
+    let path = root.join("instances").join(instance_id);
+    if path.starts_with(root) {
+        Ok(path)
+    } else {
+        Err(InstancePathError::EscapesRoot {
+            path: path.display().to_string(),
+            root: root.display().to_string(),
+        })
+    }
+}
+
+fn child_direct(root: &Path, instance_id: &str) -> Result<PathBuf, InstancePathError> {
+    let path = root.join(instance_id);
+    if path.starts_with(root) {
+        Ok(path)
+    } else {
+        Err(InstancePathError::EscapesRoot {
+            path: path.display().to_string(),
+            root: root.display().to_string(),
+        })
+    }
+}
+
+async fn create_private_dir(path: &Path) -> Result<(), InstancePathError> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(|source| InstancePathError::CreateDir {
+            path: path.display().to_string(),
+            source,
+        })?;
+    require_real_dir(path)?;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|source| InstancePathError::CreateDir {
+            path: path.display().to_string(),
+            source,
+        })?;
+
+    Ok(())
+}
+
+fn require_real_dir(path: &Path) -> Result<(), InstancePathError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| InstancePathError::ReadMetadata {
+            path: path.display().to_string(),
+            source,
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(InstancePathError::InvalidDirectory {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn clear_dir_contents(path: &Path) -> Result<(), InstancePathError> {
+    require_real_dir(path)?;
+
+    for entry in std::fs::read_dir(path).map_err(|source| InstancePathError::ReadDir {
+        path: path.display().to_string(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| InstancePathError::ReadDir {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let entry_path = entry.path();
+        let metadata = std::fs::symlink_metadata(&entry_path).map_err(|source| {
+            InstancePathError::ReadMetadata {
+                path: entry_path.display().to_string(),
+                source,
+            }
+        })?;
+
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(&entry_path).map_err(|source| {
+                InstancePathError::RemovePath {
+                    path: entry_path.display().to_string(),
+                    source,
+                }
+            })?;
+        } else {
+            std::fs::remove_file(&entry_path).map_err(|source| InstancePathError::RemovePath {
+                path: entry_path.display().to_string(),
+                source,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dir_status(path: &Path) -> Result<RuntimePathStatus, InstancePathError> {
+    require_real_dir(path)?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| InstancePathError::ReadMetadata {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let entries = std::fs::read_dir(path)
+        .map_err(|source| InstancePathError::ReadDir {
+            path: path.display().to_string(),
+            source,
+        })?
+        .count();
+
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    Ok(RuntimePathStatus {
+        entries,
+        uid: Some(metadata.uid()),
+        gid: Some(metadata.gid()),
+        mode: Some(metadata.permissions().mode() & 0o777),
+    })
+}
+
+const DEFAULT_CONTAINER_UID: u32 = 1000;
+const DEFAULT_CONTAINER_GID: u32 = 1000;
+
+fn owner_from_env(uid_key: &str, gid_key: &str) -> Option<HostOwner> {
+    let uid = std::env::var(uid_key).ok()?.parse::<u32>().ok()?;
+    let gid = std::env::var(gid_key).ok()?.parse::<u32>().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    Some(HostOwner { uid, gid })
+}
+
+fn default_owner_for(uid: u32, _gid: u32) -> Option<HostOwner> {
+    if uid == 0 {
+        Some(HostOwner {
+            uid: DEFAULT_CONTAINER_UID,
+            gid: DEFAULT_CONTAINER_GID,
+        })
+    } else {
+        None
+    }
+}
+
+fn existing_owner_for(uid: u32, gid: u32) -> HostOwner {
+    default_owner_for(uid, gid).unwrap_or(HostOwner { uid, gid })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstancePathError {
+    #[error(transparent)]
+    InvalidId(#[from] crate::shared::ids::IdError),
+    #[error("{field} must be absolute: {path}")]
+    RelativeRoot { field: &'static str, path: String },
+    #[error("path {path} escapes root {root}")]
+    EscapesRoot { path: String, root: String },
+    #[error("path {path} is not a real directory")]
+    InvalidDirectory { path: String },
+    #[error("failed to create directory {path}: {source}")]
+    CreateDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read metadata for {path}: {source}")]
+    ReadMetadata {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read directory {path}: {source}")]
+    ReadDir {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to set container owner on {path}: {source}")]
+    Chown {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to remove runtime path {path}: {source}")]
+    RemovePath {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("instance path task failed: {0}")]
+    Task(String),
+    #[error("rootless container runtime owner must not be uid 0")]
+    InvalidRuntimeOwner,
+    #[error("rootless Podman host uid/gid was not initialized")]
+    MissingRuntimeOwner,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_instance_ids() {
+        let config = PathConfig::default();
+
+        let error = InstancePaths::new(&config, "../bad").unwrap_err();
+
+        assert!(matches!(error, InstancePathError::InvalidId(_)));
+    }
+
+    #[test]
+    fn builds_paths_under_configured_roots() {
+        let config = PathConfig::default();
+
+        let paths = InstancePaths::new(&config, "inst_abc").unwrap();
+
+        assert!(paths.data.starts_with(&config.data));
+        assert!(paths.logs.starts_with(&config.logs));
+        assert!(paths.exports.starts_with(config.exports_root()));
+        assert!(paths.imports.starts_with(config.imports_root()));
+        assert!(paths.backups.starts_with(config.backups_root()));
+        assert!(paths.runtime_config.starts_with(config.metadata_root()));
+    }
+
+    #[test]
+    fn default_owner_changes_only_root_owned_paths() {
+        assert_eq!(
+            default_owner_for(0, 0),
+            Some(HostOwner {
+                uid: DEFAULT_CONTAINER_UID,
+                gid: DEFAULT_CONTAINER_GID
+            })
+        );
+        assert_eq!(default_owner_for(1001, 1002), None);
+    }
+
+    #[test]
+    fn physical_restore_reapplies_the_data_roots_existing_owner() {
+        assert_eq!(
+            existing_owner_for(1001, 1002),
+            HostOwner {
+                uid: 1001,
+                gid: 1002
+            }
+        );
+    }
+
+    #[test]
+    fn container_owner_repair_does_not_follow_symlinks() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("must-not-be-traversed"), b"outside").unwrap();
+        symlink(&outside, managed.join("outside-link")).unwrap();
+        let owner = HostOwner {
+            uid: std::fs::metadata(&managed).unwrap().uid(),
+            gid: std::fs::metadata(&managed).unwrap().gid(),
+        };
+
+        chown_recursive(&managed, owner).unwrap();
+
+        assert_eq!(
+            std::fs::read(outside.join("must-not-be-traversed")).unwrap(),
+            b"outside"
+        );
+        assert!(
+            std::fs::symlink_metadata(managed.join("outside-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}

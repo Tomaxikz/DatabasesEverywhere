@@ -1,0 +1,87 @@
+name: Shared-pool tenant isolation
+
+on:
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: Database engine to exercise
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - postgres
+          - mysql
+          - mariadb
+          - mongodb
+          - clickhouse
+  schedule:
+    - cron: "17 3 * * 1"
+
+concurrency:
+  # The cleanup script removes protocol-scoped integration containers, so all
+  # refs must share one lock to keep concurrent manual runs from racing.
+  group: shared-pool-isolation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  engine:
+    name: ${{ matrix.protocol }} tenant isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        protocol:
+          - postgres
+          - mysql
+          - mariadb
+          - mongodb
+          - clickhouse
+    steps:
+      - name: Checkout
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust builds
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Verify hosted Docker
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        run: |
+          command -v docker >/dev/null || {
+            echo "GitHub runner is missing Docker" >&2
+            exit 1
+          }
+          docker info >/dev/null
+
+      - name: Compile the shared-pool integration tests
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        run: cargo test --locked --lib --no-run
+
+      - name: Exercise one real shared database engine
+        if: ${{ github.event_name == 'schedule' || inputs.protocol == 'all' || inputs.protocol == matrix.protocol }}
+        env:
+          DBE_SHARED_POOL_TEST_TIMEOUT: 12m
+          DBE_SHARED_POOL_PROTOCOL: ${{ matrix.protocol }}
+        run: bash .github/ci/shared-pool-isolation.sh "$DBE_SHARED_POOL_PROTOCOL"

@@ -1,0 +1,2887 @@
+# Canonical DatabasesEverywhere panel integration contract.
+openapi: 3.1.0
+info:
+  title: DatabasesEverywhere API
+  version: 0.14.0
+  description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
+servers:
+  - url: http://127.0.0.1:8090
+    description: Local daemon API
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: panel token
+  schemas:
+    Protocol:
+      type: string
+      enum: [postgres, redis, valkey, mariadb, mysql, mongodb, clickhouse, qdrant]
+    DeploymentMode:
+      type: string
+      enum: [dedicated, shared]
+      description: Dedicated owns one engine runtime; shared is an isolated logical tenant in a managed engine pool. Shared is available only for PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse. Shared ClickHouse deliberately excludes whole-table DROP/DETACH, FREEZE, partition move/fetch, and table-settings privileges so tenant files cannot escape catalog disk accounting; DBEV retains those operations for its administrator-scoped restore and deletion paths.
+    DeploymentCapability:
+      type: object
+      additionalProperties: false
+      required: [protocol, enabled, modes]
+      properties:
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        enabled:
+          type: boolean
+          description: Whether the protocol listener and provisioning path are enabled on this node.
+        modes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/DeploymentMode"
+    LimitsRequest:
+      type: object
+      additionalProperties: false
+      required: [cpu_cores, memory_mib, disk_mib]
+      properties:
+        cpu_cores:
+          type: number
+          minimum: 0.01
+          maximum: 1024
+          example: 0.5
+        memory_mib:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          example: 512
+        disk_mib:
+          type: integer
+          minimum: 1
+          example: 1024
+    InstanceLimits:
+      type: object
+      additionalProperties: false
+      required: [cpu_cores, memory_mib, disk_mib, disk_enforced, disk_enforcement_method]
+      properties:
+        cpu_cores:
+          type: number
+          minimum: 0.01
+          maximum: 1024
+          example: 0.5
+        memory_mib:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          example: 512
+        disk_mib:
+          type: integer
+          minimum: 1
+          example: 1024
+        disk_enforced:
+          type: boolean
+        disk_enforcement_method:
+          type: string
+          example: host_filesystem_quota
+    CreateInstanceRequest:
+      type: object
+      additionalProperties: false
+      required: [instance_id, protocol, database, username, password, public_host]
+      properties:
+        instance_id:
+          type: string
+          example: inst_server_123_pg
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        deployment_mode:
+          allOf:
+            - $ref: "#/components/schemas/DeploymentMode"
+          default: dedicated
+          description: Omit to preserve the existing one-container-per-database dedicated behavior. Shared is rejected for Redis, Valkey, and Qdrant.
+        database:
+          type: string
+          example: server_123
+        username:
+          type: string
+          example: app_server_123
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\u0000\r\n]+$'
+          description: Tenant database password or, for Qdrant, API key. DBE rejects NUL and line-break characters; Qdrant keys must also be valid HTTP header values.
+        public_host:
+          type: string
+          example: db.example.com
+        public_port:
+          type: [integer, "null"]
+          example: 5434
+        image:
+          type: [string, "null"]
+          example: postgres:18.4
+          description: Optional desired engine image. Dedicated mode pins it to this instance; shared mode selects or creates a compatible pool using it. The image must be the configured default or listed in images.allowed.<protocol>; omit this field to use the node default.
+        project_id:
+          type: [string, "null"]
+          example: server-123
+        limits:
+          $ref: "#/components/schemas/LimitsRequest"
+        purge_stale_resources:
+          type: boolean
+          default: false
+          description: Irreversibly remove an orphaned container and persistent paths for this instance_id before retrying creation. Requires purge_stale_resources_confirmation.
+        purge_stale_resources_confirmation:
+          oneOf:
+            - $ref: "#/components/schemas/DestructiveActionConfirmation"
+            - type: "null"
+    Instance:
+      type: object
+      additionalProperties: false
+      required: [schema_version, instance_id, deployment_mode, runtime_id, protocol, status, public, backend, runtime, database, limits, created_at, updated_at]
+      properties:
+        schema_version:
+          type: integer
+        instance_id:
+          type: string
+        deployment_mode:
+          $ref: "#/components/schemas/DeploymentMode"
+        runtime_id:
+          type: string
+          description: Physical engine runtime serving this database. Equal to instance_id for dedicated instances and shared by multiple tenants in shared mode.
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        status:
+          type: string
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+          description: Live runtime classification for durably running instances; pre-ready, failed, quarantined, deleting, desired-stopped, and temporarily route-fenced maintenance states are never promoted to running merely because a container process exists.
+        public:
+          type: object
+          required: [host, port]
+          properties:
+            host:
+              type: string
+            port:
+              type: integer
+        backend:
+          description: >-
+            Active instances use unix_socket. docker_tcp is returned only for
+            legacy records quarantined during migration and is never connected.
+          oneOf:
+            - type: object
+              required: [kind, socket_path]
+              properties:
+                kind:
+                  type: string
+                  const: unix_socket
+                socket_path:
+                  type: string
+            - type: object
+              required: [kind, host, port]
+              properties:
+                kind:
+                  type: string
+                  const: docker_tcp
+                host:
+                  type: string
+                port:
+                  type: integer
+        runtime:
+          type: object
+          required: [kind, container_name, network_mode]
+          properties:
+            kind:
+              type: string
+              example: docker
+            container_name:
+              type: string
+            network_mode:
+              type: string
+              const: none
+        database:
+          type: object
+          required: [name, username]
+          properties:
+            name:
+              type: string
+            username:
+              type: string
+        route_key_sha256:
+          type: string
+          description: Optional daemon-keyed HMAC-SHA256 fingerprint used as the Qdrant gateway route index; it cannot be used for offline API-key guessing without the daemon secret.
+        limits:
+          $ref: "#/components/schemas/InstanceLimits"
+        image:
+          type: object
+          required: [current, configured, update_available]
+          properties:
+            current:
+              type: [string, "null"]
+            configured:
+              type: string
+            update_available:
+              type: boolean
+        database_version:
+          type: object
+          description: Durable engine-version compatibility attestation for the exact managed container and immutable image. Instance read endpoints never execute a version command. The proof is refreshed on creation, reconstruction, image update/migration, or password reset and reused across ordinary daemon/container restarts.
+          required: [current, error]
+          properties:
+            current:
+              type: [string, "null"]
+              description: Normalized vendor engine version, or null when no current attestation exists.
+            error:
+              description: Non-fatal missing-probe diagnostic or unsupported-version reason; null for a compatible attestation.
+              oneOf:
+                - $ref: "#/components/schemas/PublicDiagnostic"
+                - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    StartDeploymentMigrationRequest:
+      type: object
+      additionalProperties: false
+      required: [target_mode]
+      properties:
+        target_mode:
+          $ref: "#/components/schemas/DeploymentMode"
+    DeploymentMigrationStage:
+      type: string
+      enum:
+        - requested
+        - preflight
+        - target_preparing
+        - target_prepared
+        - source_fencing
+        - source_fenced
+        - exporting
+        - exported
+        - importing
+        - imported
+        - validating
+        - cutover_pending
+        - cutover_committed
+        - verifying_cutover
+        - cleaning_source
+        - rolling_back
+        - cleanup_pending
+        - manual_intervention
+        - completed
+        - failed
+        - cancelled
+    DeploymentMigration:
+      type: object
+      additionalProperties: false
+      required: [migration_id, instance_id, protocol, source_mode, target_mode, source_runtime_id, stage, revision, source_fenced, cutover_committed, created_at, updated_at]
+      properties:
+        migration_id: {type: string, format: uuid}
+        instance_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        source_mode: {$ref: "#/components/schemas/DeploymentMode"}
+        target_mode: {$ref: "#/components/schemas/DeploymentMode"}
+        source_runtime_id: {type: string}
+        target_runtime_id: {type: string}
+        stage: {$ref: "#/components/schemas/DeploymentMigrationStage"}
+        revision: {type: integer, minimum: 0}
+        source_fenced: {type: boolean}
+        cutover_committed: {type: boolean}
+        failure_code:
+          type: string
+          enum: [preflight_failed, pre_cutover_failure, structural_validation_timed_out, post_cutover_failure, rolled_back_before_cutover, target_verification_failed, daemon_restarted_before_mutation, daemon_restarted_before_cutover, daemon_restarted_after_cutover]
+          description: Stable sanitized machine-readable failure code. The daemon never copies container, database-client, or command output into this field.
+        failure_message:
+          type: string
+          description: Stable sanitized operator guidance selected by failure_code. Raw Docker errors, database-client stderr, secrets, paths, and debug output are logged under daemon audit events and never returned here.
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    SystemResponse:
+      type: object
+      additionalProperties: false
+      required: [service, version, api_version, api_readiness, uuid, token_id, remote, api_host, api_port, api_bind, api_ssl_enabled, api_rate_limit_per_minute, api_rate_limit_scope, daemon_engine, daemon_socket, database_container_network_mode, database_backend_transport, daemon_disk_limits_enforced, disk_mode, prevent_cpu_overallocation, prevent_memory_overallocation, prevent_disk_overallocation, remote_import_enabled, postgres_enabled, redis_enabled, valkey_enabled, mariadb_enabled, mysql_enabled, mongodb_enabled, clickhouse_enabled, clickhouse_http_enabled, clickhouse_http_bind, clickhouse_http_port, qdrant_enabled, deployment_capabilities, gateways]
+      properties:
+        service: {type: string, const: databases-everywhere}
+        version: {type: string}
+        api_version: {type: string, example: 0.14.0}
+        api_readiness:
+          type: string
+          const: ready
+          description: Readiness of the management API itself. Database listener readiness is reported separately under gateways.
+        uuid: {type: string}
+        token_id: {type: string}
+        remote: {type: string, format: uri}
+        api_host: {type: string}
+        api_port: {type: integer}
+        api_bind: {type: string}
+        api_ssl_enabled: {type: boolean}
+        api_rate_limit_per_minute:
+          type: integer
+          minimum: 1
+          description: Fixed-window request allowance for each authenticated credential and transport-peer IP.
+        api_rate_limit_scope:
+          type: string
+          const: credential_and_peer_ip
+        daemon_engine: {type: string, enum: [docker, podman]}
+        daemon_socket: {type: string}
+        database_container_network_mode: {type: string, const: none}
+        database_backend_transport: {type: string, const: unix_socket}
+        daemon_disk_limits_enforced: {type: boolean}
+        disk_mode: {type: string}
+        prevent_cpu_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission prevents configured CPU reservations from exceeding detected host cores.
+        prevent_memory_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission enforces the configured memory pool and reserve.
+        prevent_disk_overallocation:
+          type: boolean
+          description: Whether create and limit-increase admission enforces the configured disk pool and reserve.
+        remote_import_enabled:
+          type: boolean
+          description: Whether this node accepts credential-based remote import sources.
+        postgres_enabled: {type: boolean}
+        redis_enabled: {type: boolean}
+        valkey_enabled: {type: boolean}
+        mariadb_enabled: {type: boolean}
+        mysql_enabled: {type: boolean}
+        mongodb_enabled: {type: boolean}
+        clickhouse_enabled: {type: boolean}
+        clickhouse_http_enabled: {type: boolean}
+        clickhouse_http_bind: {type: string}
+        clickhouse_http_port: {type: integer}
+        qdrant_enabled: {type: boolean}
+        deployment_capabilities:
+          type: array
+          description: Per-protocol deployment modes understood by this daemon. Panels choose the mode on create; DBEV validates and provisions it.
+          items:
+            $ref: "#/components/schemas/DeploymentCapability"
+        gateways:
+          $ref: "#/components/schemas/GatewayReadiness"
+    HeartbeatResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, const: ok}
+    ImportExportJobResourceCost:
+      type: object
+      additionalProperties: false
+      required: [input_size_bytes, memory_mib, io_mib, cpu_units]
+      properties:
+        input_size_bytes: {type: integer, minimum: 1}
+        memory_mib: {type: integer, minimum: 1}
+        io_mib: {type: integer, minimum: 1}
+        cpu_units: {type: integer, minimum: 1}
+    ImportExportSchedulerCapacity:
+      type: object
+      additionalProperties: false
+      required: [mode, max_active_jobs, memory_budget_mib, io_budget_mib, cpu_units]
+      properties:
+        mode: {type: string, enum: [dynamic, manual]}
+        max_active_jobs: {type: integer, minimum: 1}
+        memory_budget_mib: {type: integer, minimum: 1}
+        io_budget_mib: {type: integer, minimum: 1}
+        cpu_units: {type: integer, minimum: 1}
+    ImportExportSchedulerSnapshot:
+      type: object
+      additionalProperties: false
+      required: [capacity, active_jobs, waiting_jobs, active_memory_mib, active_io_mib, active_cpu_units, accepting]
+      properties:
+        capacity:
+          $ref: "#/components/schemas/ImportExportSchedulerCapacity"
+        active_jobs: {type: integer, minimum: 0}
+        waiting_jobs: {type: integer, minimum: 0}
+        active_memory_mib: {type: integer, minimum: 0}
+        active_io_mib: {type: integer, minimum: 0}
+        active_cpu_units: {type: integer, minimum: 0}
+        accepting: {type: boolean}
+    ImportExportSchedulerRecommendation:
+      type: object
+      additionalProperties: false
+      required: [scheduler, estimate, recommended_active_jobs, admitted_jobs, max_queued_jobs, max_queued_jobs_per_instance]
+      properties:
+        scheduler:
+          $ref: "#/components/schemas/ImportExportSchedulerSnapshot"
+        estimate:
+          $ref: "#/components/schemas/ImportExportJobResourceCost"
+        recommended_active_jobs:
+          type: integer
+          minimum: 0
+          description: >-
+            Mode-independent resource-model concurrency for jobs with the
+            requested characteristics, bounded by dynamic_max_active_jobs.
+            Zero is a valid safety result when the live memory budget cannot
+            fit one modelled job; clients must not clamp it to one. CPU and
+            I/O are concurrency weights, so a memory-safe job that exceeds
+            either whole weight budget is recommended as one isolated job. In manual mode, compare it with
+            scheduler.capacity.max_active_jobs, which is the actual fixed
+            ceiling.
+        admitted_jobs:
+          type: integer
+          minimum: 0
+          description: Current node-wide durable jobs and synchronous data operations holding queue admission, including work still waiting for an instance lock.
+        max_queued_jobs: {type: integer, minimum: 1}
+        max_queued_jobs_per_instance: {type: integer, minimum: 1}
+    GatewayReadiness:
+      type: object
+      additionalProperties: false
+      required: [status, expected_listeners, ready_listeners]
+      properties:
+        status: {type: string, enum: [starting, ready, failed, stopping]}
+        expected_listeners: {type: integer, minimum: 0}
+        ready_listeners: {type: integer, minimum: 0}
+        failure: {type: string}
+    InstanceStatusResponse:
+      type: object
+      required: [instance_id, status]
+      properties:
+        instance_id: {type: string}
+        status:
+          type: string
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+        progress:
+          $ref: "#/components/schemas/InstallProgress"
+    CreateInstanceAcceptedResponse:
+      type: object
+      additionalProperties: false
+      required: [instance_id, status, status_url]
+      properties:
+        instance_id: {type: string}
+        status:
+          type: string
+          const: creating
+        status_url:
+          type: string
+          description: Origin-relative URL for polling creation status and progress.
+    InstallProgress:
+      type: object
+      additionalProperties: false
+      required: [instance_id, protocol, action, status, stage, message, image, layer, current, total, percent, updated_at]
+      properties:
+        instance_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        action: {type: string, enum: [create, image_update, major_upgrade]}
+        status: {type: string, enum: [running, completed, failed]}
+        stage: {type: string}
+        message: {type: string}
+        image: {type: [string, "null"]}
+        layer: {type: [string, "null"]}
+        current: {type: [integer, "null"]}
+        total: {type: [integer, "null"]}
+        percent: {type: [number, "null"]}
+        diagnostic:
+          $ref: "#/components/schemas/PublicDiagnostic"
+        updated_at: {type: string, format: date-time}
+    DeleteInstanceResponse:
+      type: object
+      required: [instance_id, deleted, purged]
+      properties:
+        instance_id: {type: string}
+        deleted: {type: boolean}
+        purged: {type: boolean}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error, code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+        error_id:
+          type: string
+          format: uuid
+          description: Opaque support identifier included only for server-side failures.
+    PublicDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string, maxLength: 512}
+        error_id:
+          type: string
+          format: uuid
+          description: Opaque identifier for correlating an internal asynchronous failure with daemon logs.
+    ImportRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source:
+          oneOf:
+            - $ref: "#/components/schemas/ArtifactImportSource"
+            - $ref: "#/components/schemas/RemoteImportSource"
+            - $ref: "#/components/schemas/UploadImportSource"
+          discriminator:
+            propertyName: type
+            mapping:
+              artifact: "#/components/schemas/ArtifactImportSource"
+              remote: "#/components/schemas/RemoteImportSource"
+              upload: "#/components/schemas/UploadImportSource"
+        mode:
+          type: string
+          enum: [merge, wipe]
+          default: merge
+          description: >-
+            For nonphysical imports, merge replaces source-named
+            objects/keys/collections while preserving target-only data; wipe
+            clears the target database first. Redis, Valkey, and Qdrant artifact imports
+            and uploads always replace the complete physical database, so mode
+            does not change their behavior.
+        selection:
+          $ref: "#/components/schemas/ImportExportSelection"
+    ExportRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        archive_format:
+          type: [string, "null"]
+          enum: [plain, gzip, bzip2, null]
+          description: >-
+            Optional outer wrapper. MongoDB plain output is already a native
+            gzip archive, so gzip is normalized to plain instead of creating a
+            double-gzip artifact. Redis, Valkey, and Qdrant accept only plain.
+        selection:
+          $ref: "#/components/schemas/ImportExportSelection"
+    ArtifactImportSource:
+      type: object
+      additionalProperties: false
+      required: [type, artifact_id]
+      properties:
+        type:
+          type: string
+          const: artifact
+        artifact_id:
+          type: string
+          description: ID returned by this instance's artifacts endpoint, or the filename of an operator-staged file under paths.imports/<instance_id>/.
+        archive_format:
+          type: [string, "null"]
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
+          description: Archive wrapper to remove before import. Omit for an unwrapped dump and for Redis/Valkey/Qdrant physical archives.
+    UploadImportSource:
+      type: object
+      additionalProperties: false
+      required: [type, upload_id]
+      description: >-
+        A temporary dump received through the octet-stream form of this
+        instance's import endpoint. The daemon uses the persisted, inspected
+        archive format; clients cannot override it. A successful import
+        consumes and deletes the upload. A failed import releases it for retry
+        until it is cancelled or expires. MongoDB uploads use source_database
+        so one archive namespace can be selected and remapped without restoring
+        other databases; DBEV may infer it from an inspected, complete,
+        single-candidate catalog.
+      properties:
+        type:
+          type: string
+          const: upload
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+          description: Opaque ID returned by a successful temporary dump upload.
+        source_database:
+          type: string
+          minLength: 1
+          maxLength: 63
+          description: >-
+            Original database namespace in a MongoDB archive. Rejected for
+            every other protocol. It may be omitted only when the persisted
+            inspection catalog is complete and has exactly one candidate;
+            multiple or inconclusive candidates require an explicit value.
+            DBEV restores only this namespace and remaps it to the target. The
+            value must occupy 1-63 UTF-8 bytes and cannot contain NUL,
+            slash, backslash, dot, space, double quote, or dollar sign.
+          example: legacy_tenant
+    RemoteImportSource:
+      type: object
+      additionalProperties: false
+      required: [type, host]
+      description: Protocol-specific remote credentials. Qdrant imports also migrate aliases attached to selected source collections; source aliases win same-name conflicts.
+      properties:
+        type:
+          type: string
+          const: remote
+        host:
+          type: string
+          minLength: 1
+          maxLength: 253
+          description: DNS name or literal IP only after surrounding whitespace is removed; URLs, paths, userinfo, and embedded ports are rejected.
+          example: source-db.example.com
+        port:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 65535
+          description: Optional protocol port. A TLS-aware protocol default is used when omitted.
+        tls:
+          type: boolean
+          default: true
+          description: Verified TLS is the default. Plaintext also requires security.remote_import.allow_plaintext on the node.
+        database:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Required for PostgreSQL, MariaDB, MySQL, MongoDB, and ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Omit for Redis, Valkey, and Qdrant. MariaDB/MySQL additionally allow at most 64 characters. MongoDB applies a 63-byte limit and rejects slash, backslash, dot, space, double quote, and dollar sign. ClickHouse additionally requires at most 128 ASCII letters, digits, underscores, or dashes.
+        username:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Required for SQL/ClickHouse. The trimmed value must occupy 1-256 UTF-8 bytes and contain no control characters. Optional with password for MongoDB, Redis, and Valkey ACL authentication.
+        password:
+          type: [string, "null"]
+          format: password
+          maxLength: 4096
+          writeOnly: true
+          description: Source credentials are limited to 4096 UTF-8 bytes and are not stored in durable job records or metadata. SQL, MongoDB, and ClickHouse acquisition may place this value in a mode-0600 job-private temporary file that is removed immediately after the helper exits; Redis and Valkey keep it in process memory. SQL passwords cannot contain NUL, CR, or LF.
+        authentication_database:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          description: Optional MongoDB authentication database. It follows MongoDB's 63-byte database-name restrictions or may be exactly $external. Defaults to database and is accepted only when username and password are both supplied.
+        database_index:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 4294967295
+          description: Redis or Valkey logical database index. Defaults to 0.
+        api_key:
+          type: [string, "null"]
+          format: password
+          maxLength: 4096
+          writeOnly: true
+          description: Optional Qdrant API key limited to 4096 UTF-8 bytes, kept in process memory, and not stored in a credential file, durable job record, or job metadata. It must be a syntactically valid HTTP header value and permit cluster-topology, collection, and alias reads plus snapshot creation, download, and cleanup.
+    ImportExportSelection:
+      type: object
+      additionalProperties: false
+      properties:
+        mode:
+          type: string
+          enum: [full, selective]
+          default: full
+        include:
+          type: array
+          maxItems: 512
+          description: Required and non-empty when mode is selective. MongoDB credential imports accept multiple collection names; MongoDB exports accept exactly one.
+          items:
+            type: string
+            maxLength: 257
+        exclude:
+          type: array
+          maxItems: 512
+          items:
+            type: string
+            maxLength: 257
+        fields:
+          type: object
+          maxProperties: 512
+          description: The complete replayable job options document is limited to 65536 encoded bytes.
+          additionalProperties:
+            type: array
+            maxItems: 512
+            items:
+              type: string
+              maxLength: 128
+    ImportUpload:
+      type: object
+      additionalProperties: false
+      required: [upload_id, instance_id, original_filename, protocol, archive_format, state, size_bytes, sha256, created_at, updated_at, expires_at]
+      properties:
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+        instance_id:
+          type: string
+        original_filename:
+          type: string
+          maxLength: 180
+          description: Display-only flat filename supplied in X-DBEV-Filename; never a host path.
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        archive_format:
+          type: [string, "null"]
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip, null]
+          description: Persisted wrapper selection. Catalog inspection verifies and may refine this value.
+        state:
+          type: string
+          enum: [uploading, uploaded, processing, ready, failed, importing, consumed, deleting]
+        size_bytes:
+          type: integer
+          minimum: 1
+        sha256:
+          type: [string, "null"]
+          pattern: '^[0-9a-f]{64}$'
+          description: Daemon-computed digest; null only while reception has not committed.
+        catalog:
+          $ref: "#/components/schemas/DumpInspection"
+        error:
+          type: string
+          description: Safe diagnostic for the most recent upload or inspection failure.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+    DumpInspection:
+      type: object
+      additionalProperties: false
+      required: [protocol, sha256, source_size_bytes, detected_archive_format, selection_kind, selective_supported, catalog_complete, namespaces, objects, unselectable_object_count]
+      properties:
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        source_size_bytes:
+          type: integer
+          minimum: 1
+        detected_archive_format:
+          type: string
+          enum: [plain, gzip, bzip2, tar, tar.gz, zip]
+        selection_kind:
+          type: string
+          enum: [tables, collections, full_only]
+        selective_supported:
+          type: boolean
+          description: The only authoritative switch for enabling selective-import controls.
+        catalog_complete:
+          type: boolean
+          description: False when the bounded inspector could not enumerate every relevant catalog item.
+        namespaces:
+          type: array
+          maxItems: 512
+          description: For MongoDB uploads, sorted source database candidates discovered from the bounded native archive prelude; otherwise protocol-specific namespace hints or an empty list. Treat this list as authoritative only when catalog_complete is true; an incomplete list may contain partial hints.
+          items:
+            type: string
+        objects:
+          type: array
+          maxItems: 512
+          items:
+            $ref: "#/components/schemas/DumpSelectableObject"
+        unselectable_object_count:
+          type: integer
+          minimum: 0
+        selective_unavailable_reason:
+          type: string
+          description: Human-readable reason selective import is unavailable.
+    DumpSelectableObject:
+      type: object
+      additionalProperties: false
+      required: [kind, name, selection_key]
+      properties:
+        kind:
+          type: string
+          enum: [table, collection]
+        name:
+          type: string
+        namespace:
+          type: string
+        selection_key:
+          type: string
+          description: Exact opaque value to send in selection.include or selection.exclude if selective_supported is true.
+    ImportUploadDeleteResponse:
+      type: object
+      additionalProperties: false
+      required: [upload_id, deleted]
+      properties:
+        upload_id:
+          type: string
+          pattern: '^upl_[0-9a-f]{32}$'
+        deleted:
+          type: boolean
+    ImportExportJob:
+      type: object
+      required: [job_id, instance_id, action, status, artifact_id, artifact_size_bytes, error, created_at, updated_at]
+      properties:
+        job_id:
+          type: string
+        instance_id:
+          type: string
+        action:
+          type: string
+          enum: [export, import]
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        artifact_id:
+          type: [string, "null"]
+          description: Retained artifact ID, or a one-use download ID when stream-only export policy is enabled.
+        artifact_size_bytes:
+          type: [integer, "null"]
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/PublicDiagnostic"
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    StoredArtifact:
+      type: object
+      required: [id, instance_id, size_bytes, modified_at, sha256]
+      properties:
+        id:
+          type: string
+        instance_id:
+          type: string
+        size_bytes:
+          type: integer
+        modified_at:
+          type: string
+          format: date-time
+        sha256:
+          type: string
+    BackupLayout:
+      type: string
+      enum: [physical, logical]
+    BackupInfo:
+      type: object
+      additionalProperties: false
+      required: [id, instance_id, protocol, layout, size_bytes, modified_at, sha256]
+      properties:
+        id: {type: string}
+        instance_id: {type: string}
+        protocol:
+          $ref: "#/components/schemas/Protocol"
+        layout:
+          $ref: "#/components/schemas/BackupLayout"
+        size_bytes: {type: integer}
+        modified_at: {type: string, format: date-time}
+        sha256: {type: string}
+    CreateDownloadRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expires_in_seconds:
+          type: integer
+          minimum: 1
+          maximum: 900
+          default: 120
+        single_use:
+          type: boolean
+          default: true
+    DownloadUrlResponse:
+      type: object
+      additionalProperties: false
+      required: [url, expires_at_unix, single_use]
+      properties:
+        url:
+          type: string
+          description: Origin-relative temporary download URL containing the short-lived capability.
+        expires_at_unix: {type: integer}
+        single_use: {type: boolean}
+    DeleteArtifactResponse:
+      type: object
+      required: [id, deleted]
+      properties:
+        id: {type: string}
+        deleted: {type: boolean}
+    RetentionResponse:
+      type: object
+      required: [deleted]
+      properties:
+        deleted:
+          type: array
+          items: {type: string}
+    BackupStatusResponse:
+      type: object
+      additionalProperties: false
+      required: [enabled, interval_minutes, run_on_startup, retention_keep_latest_per_instance, retention_max_age_days, redis_excluded, storage_driver, browsing_enabled]
+      properties:
+        enabled: {type: boolean}
+        interval_minutes: {type: integer}
+        run_on_startup: {type: boolean}
+        retention_keep_latest_per_instance: {type: integer}
+        retention_max_age_days: {type: integer}
+        redis_excluded: {type: boolean}
+        storage_driver:
+          type: string
+          enum: [local, s3, kopia]
+        browsing_enabled: {type: boolean}
+    BackupCatalogColumn:
+      type: object
+      additionalProperties: false
+      required: [name, data_type, nullable, ordinal]
+      properties:
+        name: {type: string}
+        data_type: {type: string}
+        "nullable": {type: boolean}
+        ordinal: {type: integer, minimum: 1}
+    BackupObjectSummary:
+      type: object
+      additionalProperties: false
+      required: [id, namespace, name, kind, estimated_rows, columns, captured_preview_rows, preview_truncated]
+      properties:
+        id: {type: string}
+        namespace: {type: string}
+        name: {type: string}
+        kind: {type: string}
+        estimated_rows: {type: [integer, "null"]}
+        columns:
+          type: array
+          items: {$ref: "#/components/schemas/BackupCatalogColumn"}
+        captured_preview_rows: {type: integer, minimum: 0}
+        preview_truncated: {type: boolean}
+    BackupObjectSelection:
+      type: object
+      additionalProperties: false
+      required: [object_id, offset, limit, returned, total_captured, rows, truncated]
+      properties:
+        object_id: {type: string}
+        offset: {type: integer, minimum: 0}
+        limit: {type: integer, minimum: 1, maximum: 100}
+        returned: {type: integer, minimum: 0}
+        total_captured: {type: integer, minimum: 0}
+        rows:
+          type: array
+          items: {}
+        truncated: {type: boolean}
+    BackupContentsResponse:
+      type: object
+      additionalProperties: false
+      required: [backup_id, instance_id, protocol, database_name, captured_at, consistency, catalog_available, truncated, warnings, objects, selection]
+      properties:
+        backup_id: {type: string}
+        instance_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        database_name: {type: string}
+        captured_at: {type: [string, "null"], format: date-time}
+        consistency: {type: [string, "null"]}
+        catalog_available: {type: boolean}
+        truncated: {type: boolean}
+        warnings:
+          type: array
+          items: {type: string}
+        objects:
+          type: array
+          items: {$ref: "#/components/schemas/BackupObjectSummary"}
+        selection:
+          oneOf:
+            - $ref: "#/components/schemas/BackupObjectSelection"
+            - type: "null"
+    SkippedBackup:
+      type: object
+      required: [instance_id, protocol, reason]
+      properties:
+        instance_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        reason: {$ref: "#/components/schemas/PublicDiagnostic"}
+    RunBackupsResponse:
+      type: object
+      additionalProperties: false
+      required: [backups, skipped]
+      properties:
+        backups:
+          type: array
+          items: {$ref: "#/components/schemas/BackupInfo"}
+        skipped:
+          type: array
+          items: {$ref: "#/components/schemas/SkippedBackup"}
+    RestoreBackupResponse:
+      type: object
+      additionalProperties: false
+      required: [instance_id, backup_id, restored]
+      properties:
+        instance_id: {type: string}
+        backup_id: {type: string}
+        restored: {type: boolean}
+    DestructiveActionConfirmation:
+      type: object
+      additionalProperties: false
+      required: [confirm, reason]
+      properties:
+        confirm:
+          type: boolean
+          const: true
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+    WsTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [subject, scopes]
+      properties:
+        subject:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [monitor:read, logs:read, import-export:read]
+          example: [monitor:read]
+        instances:
+          type: array
+          items:
+            type: string
+          default: []
+          maxItems: 256
+          description: Explicit instance allow-list. Each ID is bound inside the opaque JWT to the current immutable instance generation, so deletion/recreation never transfers access to a replacement. Must be non-empty unless all_instances is true.
+        all_instances:
+          type: boolean
+          default: false
+          description: Explicitly grants node-wide instance access and cannot be combined with a non-empty instances list.
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 900
+    WsTokenResponse:
+      type: object
+      required: [token_type, token, expires_at_unix]
+      properties:
+        token_type: {type: string, const: Bearer}
+        token: {type: string}
+        expires_at_unix: {type: integer}
+    PowerRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [start, stop, restart, kill]
+    PowerResponse:
+      type: object
+      required: [action, instance]
+      properties:
+        action:
+          type: string
+          enum: [start, stop, restart, kill]
+        instance:
+          $ref: "#/components/schemas/Instance"
+    ResetInstancePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\u0000\r\n]+$'
+          description: New tenant database password or, for Qdrant, API key. It is never returned; DBE stores it only in its encrypted private credential repository for rollback and future managed recreation.
+    ResetInstancePasswordResponse:
+      type: object
+      additionalProperties: false
+      required: [instance, restarted]
+      properties:
+        instance:
+          $ref: "#/components/schemas/Instance"
+        restarted:
+          type: boolean
+          description: True only when a dedicated engine's immutable startup credentials require owned-runtime recreation (ClickHouse, Qdrant, and one-time migration of legacy Redis/Valkey instances without a stored encrypted credential). Shared tenant rotation never restarts the pool and always returns false.
+    UpdateInstanceImageRequest:
+      type: object
+      additionalProperties: false
+      required: [image]
+      properties:
+        image:
+          type: string
+          example: mongo:8.3.4
+          description: Pinned target image. Must be the configured default image or listed in images.allowed.<protocol>. Bare images and latest tags are rejected.
+        password:
+          type: [string, "null"]
+          format: password
+          writeOnly: true
+          description: Current tenant database password. Used only as a compatibility fallback for legacy instances that predate encrypted tenant credential storage; current instances use their protected stored credential.
+        major_upgrade:
+          type: boolean
+          default: false
+          description: Set true only after an explicit admin confirmation when the image changes database major version. DBE then runs its export/import migration workflow instead of a same-volume recreate.
+    ImageUpdateStrategy:
+      type: string
+      enum: [in_place_recreate, major_upgrade_migration]
+    UpdateInstanceImageResponse:
+      type: object
+      properties:
+        instance:
+          $ref: "#/components/schemas/Instance"
+        image:
+          type: string
+          description: Target image applied to the instance.
+        recreated:
+          type: boolean
+        strategy:
+          $ref: "#/components/schemas/ImageUpdateStrategy"
+        warnings:
+          type: array
+          items:
+            type: string
+          description: Provider-style warnings the panel should show after a successful upgrade.
+        export_artifact_id:
+          type: [string, "null"]
+          description: Logical export artifact kept after a major upgrade for rollback/audit.
+        old_volume_backup_retained:
+          type: boolean
+          description: Whether the old volume was retained on the node for manual rollback.
+    ConfigPatchResponse:
+      type: object
+      required: [applied, restart_required, config_path]
+      properties:
+        applied:
+          type: boolean
+        restart_required:
+          type: boolean
+        config_path:
+          type: string
+    LogsResponse:
+      type: object
+      required: [instance_id, stdout, stderr]
+      properties:
+        instance_id: {type: string}
+        stdout: {type: string}
+        stderr: {type: string}
+    ResourceReport:
+      type: object
+      required: [instance_id, runtime_id, deployment_mode, scope, protocol, status, cpu, memory, disk, network]
+      properties:
+        instance_id: {type: string}
+        runtime_id:
+          type: string
+          description: Physical engine runtime supplying this logical database. Equal to instance_id for dedicated instances.
+        deployment_mode:
+          $ref: "#/components/schemas/DeploymentMode"
+        scope:
+          type: string
+          enum: [dedicated_instance, shared_tenant]
+          description: Scope of the configured limits and directly attributable usage fields.
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        status: {type: string}
+        cpu:
+          type: object
+          required: [configured_cores, usage_percent]
+          properties:
+            configured_cores:
+              type: number
+              description: Dedicated cgroup limit, or a shared tenant's reservation against aggregate pool capacity. A shared value is not a per-tenant cgroup measurement or CPU ceiling.
+            usage_percent:
+              type: [number, "null"]
+              description: Docker-compatible CPU usage in percentage points; 11.0 means 11%, not 0.11.
+        memory:
+          type: object
+          required: [configured_mib, usage_bytes, limit_bytes]
+          properties:
+            configured_mib:
+              type: integer
+              description: Dedicated cgroup limit, or a shared tenant's reservation against aggregate pool capacity. A shared value is not a per-tenant cgroup measurement or memory ceiling.
+            usage_bytes:
+              type: [integer, "null"]
+              description: Docker-compatible memory working set in bytes (on Linux, raw cgroup usage minus inactive file cache).
+            limit_bytes: {type: [integer, "null"]}
+        disk:
+          type: object
+          required: [configured_mib, limit_bytes, used_bytes, enforced, enforcement_method, enforcement_strength]
+          properties:
+            configured_mib:
+              type: integer
+              description: Dedicated filesystem allocation or a shared tenant boundary. Shared PostgreSQL/MySQL/MariaDB tenants use a hard native project quota when a supported project-quota filesystem is active; other layouts use the catalog guard.
+            limit_bytes:
+              type: integer
+              description: Configured tenant boundary in bytes. The enforced and enforcement_method fields state whether this individual boundary is hard or catalog-guarded.
+            used_bytes:
+              type: integer
+              description: Latest sampled tenant usage in bytes. Hard shared tenants use the authoritative kernel project-quota counter; soft shared tenants use engine-catalog measurement.
+            enforced: {type: boolean}
+            enforcement_method: {type: string}
+            enforcement_strength:
+              type: string
+              enum: [hard, soft, none]
+              description: Hard means writes are bounded at the filesystem layer, by a native quota for shared tenants or by the dedicated FuseQuota mount. Soft means engine-catalog measurement and route fencing. Shared tenants report the mechanism actually persisted for that tenant.
+            scanner_logical_bytes: {type: integer}
+            scanner_physical_bytes: {type: integer}
+            scanner_growth_bytes_per_second: {type: number}
+            scanner_peak_growth_bytes_per_second: {type: number}
+            scanner_predicted_seconds_to_limit: {type: integer}
+            scanner_stop_threshold_bytes: {type: integer}
+            scanner_recovery_threshold_bytes: {type: integer}
+            scanner_restart_blocked: {type: boolean}
+            scanner_sample_age_seconds: {type: integer}
+        network:
+          type: object
+          required: [rx_bytes, tx_bytes]
+          properties:
+            rx_bytes: {type: [integer, "null"]}
+            tx_bytes: {type: [integer, "null"]}
+        pool:
+          type: object
+          required: [runtime_id, cpu_limit_cores, cpu_usage_percent, memory_limit_bytes, memory_usage_bytes]
+          description: Physical shared-engine usage. Returned only by administrator resource endpoints and never by tenant-scoped REST or WebSocket views.
+          properties:
+            runtime_id: {type: string}
+            cpu_limit_cores:
+              type: number
+              description: Cgroup CPU capacity configured for the complete shared engine, not a limit attributed to this tenant.
+            cpu_usage_percent:
+              type: [number, "null"]
+              description: CPU usage for the complete shared engine, never usage attributed to this tenant.
+            memory_limit_bytes:
+              type: integer
+              minimum: 0
+              description: Cgroup memory capacity configured for the complete shared engine, not a limit attributed to this tenant.
+            memory_usage_bytes:
+              type: [integer, "null"]
+              description: Working-set memory for the complete shared engine, never usage attributed to this tenant.
+    OperationCounts:
+      type: object
+      additionalProperties: false
+      required: [read, write, ddl, other]
+      properties:
+        read: {type: integer, minimum: 0}
+        write: {type: integer, minimum: 0}
+        ddl: {type: integer, minimum: 0}
+        other: {type: integer, minimum: 0}
+    TenantActivity:
+      type: object
+      additionalProperties: false
+      required: [instance_id, stats_epoch, sampled_at_unix, accepted, rejected, active_connections, opened_connections, rx_bytes, tx_bytes, cpu_time_micros, peak_query_memory_bytes, sources]
+      properties:
+        instance_id: {type: string}
+        stats_epoch:
+          type: string
+          description: Changes when a cumulative counter discontinuity is detected; panels must not connect chart lines across epochs or gap buckets.
+        sampled_at_unix: {type: integer}
+        accepted:
+          allOf: [{$ref: "#/components/schemas/OperationCounts"}]
+          description: For gateway-sourced protocols, operations accepted by DBEV and forwarded to the backend; this does not prove backend execution succeeded. Engine-query-log sources count their documented completed entries.
+        rejected:
+          allOf: [{$ref: "#/components/schemas/OperationCounts"}]
+          description: Operations rejected by DBEV before reaching the backend, not backend query failures.
+        active_connections:
+          type: integer
+          minimum: 0
+          description: Current authenticated gateway sessions where the protocol permits exact post-authentication accounting.
+        opened_connections: {type: integer, minimum: 0}
+        rx_bytes: {type: integer, minimum: 0}
+        tx_bytes: {type: integer, minimum: 0}
+        cpu_time_micros:
+          type: [integer, "null"]
+          minimum: 0
+          description: Engine-observed query CPU time, never estimated tenant cgroup CPU. Null means the engine cannot measure this safely.
+        peak_query_memory_bytes:
+          type: [integer, "null"]
+          minimum: 0
+          description: Highest supported engine-observed query-memory value newly seen during DBEV tracking, never tenant RSS. MySQL baselines its cumulative per-user high-water mark, so pre-monitoring work is excluded and queries below an existing maximum are not observable. ClickHouse supplies interval observations. Null means the engine cannot measure this safely.
+        sources:
+          type: object
+          additionalProperties: false
+          required: [connections, network, operations, cpu_time, peak_query_memory]
+          properties:
+            connections: {type: string, enum: [gateway_authenticated_exact, unavailable]}
+            network: {type: string, enum: [gateway_route_exact]}
+            operations: {type: string, enum: [gateway_protocol_observed, engine_query_log_observed, unavailable]}
+            cpu_time: {type: string, enum: [engine_query_observed, unavailable]}
+            peak_query_memory: {type: string, enum: [engine_query_observed, unavailable]}
+    ActivityBucket:
+      type: object
+      additionalProperties: false
+      required: [instance_id, bucket_start_unix, duration_seconds, stats_epoch, gap, operations_observed, accepted, rejected, active_connections, opened_connections, rx_bytes, tx_bytes, cpu_time_micros, peak_query_memory_bytes]
+      properties:
+        instance_id: {type: string}
+        bucket_start_unix: {type: integer}
+        duration_seconds:
+          type: integer
+          minimum: 60
+          description: Authoritative elapsed interval covered by this aggregate. Normally 60; it can be longer when sampling is delayed.
+        stats_epoch: {type: string}
+        gap:
+          type: boolean
+          description: True when counters reset or continuity could not be proven; delta fields are zero/null and chart lines must break.
+        operations_observed:
+          type: boolean
+          description: True when the bucket's operation counters came from a supported observer. False distinguishes unavailable operation telemetry from a measured all-zero interval.
+        accepted:
+          allOf: [{$ref: "#/components/schemas/OperationCounts"}]
+          description: Bucket delta of the source-specific accepted counter. Gateway acceptance means forwarded, not successfully executed.
+        rejected:
+          allOf: [{$ref: "#/components/schemas/OperationCounts"}]
+          description: Bucket delta of operations DBEV rejected before forwarding; it excludes backend failures.
+        active_connections: {type: integer, minimum: 0}
+        opened_connections: {type: integer, minimum: 0}
+        rx_bytes: {type: integer, minimum: 0}
+        tx_bytes: {type: integer, minimum: 0}
+        cpu_time_micros: {type: [integer, "null"], minimum: 0}
+        peak_query_memory_bytes: {type: [integer, "null"], minimum: 0}
+    ActivityHistory:
+      type: object
+      additionalProperties: false
+      required: [instance_id, bucket_seconds, max_buckets, buckets]
+      properties:
+        instance_id: {type: string}
+        bucket_seconds:
+          type: integer
+          enum: [60]
+          description: Target sampling cadence. Consumers must use each bucket's duration_seconds as its authoritative width.
+        max_buckets: {type: integer, enum: [1440]}
+        buckets:
+          type: array
+          maxItems: 1440
+          items: {$ref: "#/components/schemas/ActivityBucket"}
+    PoolMetricSample:
+      type: object
+      additionalProperties: false
+      required: [source, state, sampled_at_unix, sample_age_seconds, fresh]
+      properties:
+        source:
+          type: string
+          enum: [container_cpu, container_memory_working_set, filesystem_quota, fuse_quota, resource_disk_sampler]
+          description: Physical measurement source. The resource disk sampler is the bounded cached quota-or-directory sampler used by soft pool storage.
+        state:
+          type: string
+          enum: [fresh, warming, stale, stopped, failed]
+          description: Why the metric is present or null. Consumers must not draw a null value as zero.
+        sampled_at_unix:
+          type: [integer, "null"]
+          description: Approximate Unix timestamp of the physical sample; null when no sample exists.
+        sample_age_seconds:
+          type: [integer, "null"]
+          minimum: 0
+          description: Whole seconds between the physical sample and this report; null when no sample exists.
+        fresh:
+          type: boolean
+          description: True only when state is fresh and the usage value is safe to display.
+        diagnostic:
+          $ref: "#/components/schemas/PublicDiagnostic"
+    SharedPoolReport:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, protocol, status, image, database_version, tenant_count, max_tenants, cpu, memory, disk]
+      properties:
+        runtime_id: {type: string}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        status:
+          type: string
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+        image: {type: string}
+        database_version: {type: [string, "null"]}
+        tenant_count: {type: integer, minimum: 0}
+        max_tenants: {type: integer, minimum: 1}
+        cpu:
+          type: object
+          additionalProperties: false
+          required: [limit_cores, reserved_cores, usage_percent, sample]
+          properties:
+            limit_cores: {type: number, minimum: 0}
+            reserved_cores: {type: number, minimum: 0}
+            usage_percent: {type: [number, "null"], minimum: 0}
+            sample: {$ref: "#/components/schemas/PoolMetricSample"}
+        memory:
+          type: object
+          additionalProperties: false
+          required: [limit_bytes, reserved_bytes, usage_bytes, sample]
+          properties:
+            limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            usage_bytes: {type: [integer, "null"], minimum: 0}
+            sample: {$ref: "#/components/schemas/PoolMetricSample"}
+        disk:
+          type: object
+          additionalProperties: false
+          required: [limit_bytes, reserved_bytes, usage_bytes, enforced, enforcement_method, sample]
+          properties:
+            limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            usage_bytes: {type: [integer, "null"], minimum: 0}
+            enforced: {type: boolean}
+            enforcement_method: {type: string}
+            sample: {$ref: "#/components/schemas/PoolMetricSample"}
+    SharedPoolTenant:
+      type: object
+      additionalProperties: false
+      required: [instance_id, database, username, status, limits, resources]
+      properties:
+        instance_id: {type: string}
+        database: {type: string}
+        username: {type: string}
+        status:
+          type: string
+          enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+        limits: {$ref: "#/components/schemas/InstanceLimits"}
+        resources: {$ref: "#/components/schemas/ResourceReport"}
+    NodeResourceSummary:
+      type: object
+      additionalProperties: false
+      required: [node_uuid, sampled_at, cpu, memory, disk, instances]
+      properties:
+        node_uuid: {type: string}
+        sampled_at: {type: string, format: date-time}
+        cpu:
+          type: object
+          additionalProperties: false
+          required: [total_cores, allocated_cores, host_usage_percent, managed_usage_cores]
+          properties:
+            total_cores: {type: integer, minimum: 1}
+            allocated_cores: {type: number, minimum: 0}
+            host_usage_percent: {type: number, minimum: 0, maximum: 100}
+            managed_usage_cores: {type: [number, "null"], minimum: 0}
+        memory:
+          type: object
+          additionalProperties: false
+          required: [total_bytes, allocation_limit_bytes, reserved_bytes, allocated_bytes, host_used_bytes, managed_used_bytes, available_bytes]
+          properties:
+            total_bytes: {type: integer, minimum: 0}
+            allocation_limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            allocated_bytes: {type: integer, minimum: 0}
+            host_used_bytes: {type: integer, minimum: 0}
+            managed_used_bytes: {type: [integer, "null"], minimum: 0}
+            available_bytes: {type: integer, minimum: 0}
+        disk:
+          type: object
+          additionalProperties: false
+          required: [total_bytes, allocation_limit_bytes, reserved_bytes, allocated_bytes, host_used_bytes, managed_used_bytes, available_bytes]
+          properties:
+            total_bytes: {type: integer, minimum: 0}
+            allocation_limit_bytes: {type: integer, minimum: 0}
+            reserved_bytes: {type: integer, minimum: 0}
+            allocated_bytes: {type: integer, minimum: 0}
+            host_used_bytes: {type: integer, minimum: 0}
+            managed_used_bytes: {type: [integer, "null"], minimum: 0}
+            available_bytes: {type: integer, minimum: 0}
+        instances:
+          type: object
+          additionalProperties: false
+          required: [total, creating, booting, running, stopped, failed, quarantined, deleting]
+          properties:
+            total: {type: integer, minimum: 0}
+            creating: {type: integer, minimum: 0}
+            booting: {type: integer, minimum: 0}
+            running: {type: integer, minimum: 0}
+            stopped: {type: integer, minimum: 0}
+            failed: {type: integer, minimum: 0}
+            quarantined: {type: integer, minimum: 0}
+            deleting: {type: integer, minimum: 0}
+    PullImageResponse:
+      type: object
+      required: [protocol, image, pulled]
+      properties:
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        image: {type: string}
+        pulled: {type: boolean}
+  responses:
+    ApiError:
+      description: Request rejection or server-side failure. Internal details are logged under error_id and are never returned to clients.
+      headers:
+        X-Error-Id:
+          description: Opaque support identifier included for server-side failures.
+          schema: {type: string, format: uuid}
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing, invalid, or insufficient bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+paths:
+  /api/system:
+    get:
+      summary: Get daemon runtime/configuration summary.
+      x-required-scope: system:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: System status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/system/import-export-scheduler/recommendation:
+    get:
+      summary: Inspect live import/export scheduling capacity and estimate representative concurrency.
+      description: The recommendation is a conservative resource model, not a measured throughput guarantee. A result of zero means the live memory budget cannot safely fit one modelled job and must not be coerced to one. CPU and I/O are concurrency weights; a memory-safe job that exceeds either whole weight budget may run only as one isolated job. A compressed logical import is charged at the configured prepared-data ceiling because its expansion ratio is not trusted before bounded extraction; compressed Redis, Valkey, and Qdrant physical imports are charged at the target disk allocation, capped by the physical archive limit. MongoDB, Redis, Valkey, and Qdrant are always modelled as natively compressed. action=export with mode=wipe is invalid.
+      x-required-scope: system:read
+      parameters:
+        - in: query
+          name: protocol
+          description: Defaults to postgres when omitted.
+          schema: {$ref: "#/components/schemas/Protocol"}
+        - in: query
+          name: action
+          schema: {type: string, enum: [import, export], default: import}
+        - in: query
+          name: size_bytes
+          description: Plain or prepared input size. Defaults to the configured maximum upload size.
+          schema: {type: integer, minimum: 1, maximum: 68719476736}
+        - in: query
+          name: target_disk_mib
+          description: Defaults to size_bytes rounded up to MiB.
+          schema: {type: integer, minimum: 1}
+        - in: query
+          name: mode
+          schema: {type: string, enum: [merge, wipe], default: merge}
+        - in: query
+          name: compressed
+          description: Compression hint. Native-compression protocols are treated as compressed even when false.
+          schema: {type: boolean, default: false}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Live scheduler snapshot and model-based recommendation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportSchedulerRecommendation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/system/config:
+    patch:
+      summary: Merge a validated config patch into the daemon config file.
+      description: Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, and Fuse helper edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.
+      x-required-scope: config:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Config patch applied.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigPatchResponse"
+  /api/heartbeat:
+    get:
+      summary: Lightweight authenticated API liveness check.
+      description: Returns success when the authenticated management API is reachable, independently of database instance and gateway readiness.
+      x-required-scope: system:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Heartbeat response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatResponse"
+  /metrics:
+    get:
+      summary: Get Prometheus metrics for the daemon.
+      x-required-scope: metrics:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /api/instances:
+    get:
+      summary: List database instances with route-safe live status classification.
+      x-required-scope: instances:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Instance list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Instance"
+    post:
+      summary: Create a database instance.
+      x-required-scope: instances:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInstanceRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Instance creation accepted and continuing in the background.
+          headers:
+            Location:
+              description: Origin-relative instance creation status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateInstanceAcceptedResponse"
+        "400":
+          description: Invalid create request, including a disabled protocol or a shared deployment requested for Redis, Valkey, or Qdrant.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Request JSON does not match the create schema, for example an unknown deployment_mode value or a missing required field.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Instance ID already exists.
+        "503":
+          description: Creation admission is closed or the bounded creation queue is full.
+  /api/instances/{instance_id}:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get one instance with route-safe live status classification.
+      x-required-scope: instances:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Instance metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      summary: Irreversibly delete one instance, its jobs, artifacts, backups, recovery data, and database contents.
+      description: Dedicated deletion removes the owned engine runtime. Shared deletion removes only the logical tenant and removes the pool runtime only when its final tenant is gone.
+      x-required-scope: instances:write
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be true because instance deletion always purges managed data.
+          schema:
+            type: boolean
+            const: true
+        - name: reason
+          in: query
+          required: true
+          description: Audit reason for irreversible instance deletion; at most 512 characters.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Delete result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteInstanceResponse"
+  /api/instances/{instance_id}/status:
+    get:
+      summary: Get instance status.
+      x-required-scope: instances:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Status response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStatusResponse"
+  /api/instances/{instance_id}/limits:
+    patch:
+      summary: Update CPU, memory, and disk limits for an instance.
+      description: Dedicated limits apply to the owned runtime. Shared limits update this tenant's reservation and enforcement policy, then resize aggregate pool capacity without assigning whole-pool CPU or memory usage to the tenant. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LimitsRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Updated instance metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Instance"
+        "409":
+          description: A shared tenant disk decrease is below its current physical usage, or the tenant could not be fenced and drained safely for the shrink check. The existing limit remains unchanged.
+        "503":
+          description: An enabled CPU, memory, or disk allocation guard rejected a limit increase. Capacity guards do not reject decreases; shared disk decreases can separately return 409 when current data does not fit.
+  /api/instances/{instance_id}/password:
+    patch:
+      summary: Reset an instance tenant password or API key.
+      description: Atomically rotates and validates the tenant credential and attempts to restore the previous credential if any step fails. Shared mode changes only the selected tenant and never recreates or restarts the pool. Dedicated mode normally rotates in place but may recreate its owned runtime when the engine stores immutable startup credentials. The instance must be running and experiences a brief connection interruption.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetInstancePasswordRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Credential reset result. The password is never included.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResetInstancePasswordResponse"
+  /api/instances/{instance_id}/deployment-migrations:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      summary: List durable deployment-migration attempts for an instance.
+      x-required-scope: instances:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Migration history, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/DeploymentMigration"}
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Start a crash-recoverable deployment migration.
+      description: Migrations in both directions, dedicated-to-shared and shared-to-dedicated, run asynchronously through a tenant-scoped logical export/import, target validation, atomic placement cutover, and source cleanup. A successful start returns 202 immediately; poll the returned Location for durable progress. The source remains authoritative until cutover, and crash recovery records a safe rollback, cleanup, or manual-intervention stage.
+      x-required-scope: instances:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartDeploymentMigrationRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Migration accepted and durably queued.
+          headers:
+            Location:
+              description: Origin-relative migration status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMigration"
+        "400":
+          description: A valid shared target was requested for an unsupported protocol.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Source is not ready, already uses the target mode, lacks a current encrypted tenant credential, has active data work, or already has an active migration.
+        "422":
+          description: Request JSON does not match the migration schema, for example target_mode is missing or is not dedicated/shared.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: The import/export scheduler has no global capacity for the migration.
+        "503":
+          description: Daemon shutdown or mutation draining has started; no migration was accepted.
+  /api/instances/{instance_id}/deployment-migrations/{migration_id}:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: {type: string}
+      - name: migration_id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      summary: Get one durable deployment-migration attempt.
+      x-required-scope: instances:read
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Migration state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentMigration"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/instances/{instance_id}/reconcile:
+    post:
+      summary: Reconcile stored instance status with its engine runtime.
+      description: Dedicated mode inspects its owned runtime. Shared mode also verifies the pool placement while preserving tenant-only route and lifecycle state.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Reconciled instance status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstanceStatusResponse"
+  /api/instances/{instance_id}/power:
+    post:
+      summary: Unified power API for start, stop, restart, and kill.
+      description: Dedicated actions control the owned engine runtime. Shared actions fence or restore only this tenant's login, routes, and sessions; they never stop or kill the shared pool for another tenant.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PowerRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Power action result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PowerResponse"
+  /api/instances/{instance_id}/image:
+    patch:
+      summary: Pull and switch an instance to a new database image.
+      description: Dedicated instances only. Same-major updates recreate the owned runtime on its existing volume. Major version changes require major_upgrade=true and run the safer export/import migration workflow where supported. Shared tenants return 409 because pool images are selected through placement and deployment migration.
+      x-required-scope: instances:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateInstanceImageRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Image update result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateInstanceImageResponse"
+  /api/admin/resources:
+    get:
+      summary: List resource usage for all instances.
+      x-required-scope: resources:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Resource reports.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ResourceReport"
+  /api/admin/resources/summary:
+    get:
+      summary: Get node capacity, allocation, and whole-host resource pressure.
+      description: Allocation includes all managed instances, including stopped instances that may be restarted. Host usage covers the entire Linux node. Managed usage is null when any running or booting instance could not be sampled. Disk totals describe the filesystem backing paths.volumes.
+      x-required-scope: resources:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Node-wide resource summary for scheduling and capacity decisions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeResourceSummary"
+  /api/admin/shared-pools:
+    get:
+      summary: List physical shared database pools and their aggregate capacity.
+      description: Pool CPU and memory are physical cgroup metrics and are intentionally available only through this administrator-scoped endpoint. Every usage field includes its source, physical sample time, age, freshness, and a bounded public diagnostic when stopped, warming, stale, or failed. Null is never an implied zero.
+      x-required-scope: resources:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Shared pool inventory.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/SharedPoolReport"}
+  /api/admin/shared-pools/{runtime_id}:
+    get:
+      summary: Get one physical shared database pool.
+      description: Returns the same administrator-only physical metrics and sample diagnostics as the pool inventory endpoint.
+      x-required-scope: resources:admin
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Shared pool capacity and current physical usage.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SharedPoolReport"}
+  /api/admin/shared-pools/{runtime_id}/instances:
+    get:
+      summary: List logical tenants assigned to one shared pool.
+      description: Each nested resource report remains tenant-scoped and therefore omits the pool's physical CPU and memory.
+      x-required-scope: resources:admin
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Shared-pool tenant inventory.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/SharedPoolTenant"}
+  /api/instances/{instance_id}/resources:
+    get:
+      summary: Get resource usage for one instance.
+      x-required-scope: resources:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Resource report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceReport"
+  /api/instances/{instance_id}/activity:
+    get:
+      summary: Get current tenant-attributed gateway and query activity.
+      description: Returns cumulative gateway counters plus explicitly source-labelled engine observations. For gateway sources, accepted means forwarded by DBEV rather than successfully executed, and rejected includes only DBEV pre-backend rejections. It never returns SQL text, bind values, client addresses, errors, or whole-pool CPU/RAM as tenant usage.
+      x-required-scope: resources:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Current tenant activity.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TenantActivity"}
+  /api/instances/{instance_id}/activity/history:
+    get:
+      summary: Get rolling tenant activity history.
+      description: Returns at most 1440 aggregate buckets in chronological order on a target 60-second cadence. If sampling is delayed, one bucket covers the complete elapsed interval and duration_seconds is authoritative. before is an exclusive Unix timestamp for backwards pagination. DBEV persists only aggregate counters in SQLite and never exposes SQL text, bind values, client addresses, or engine errors through this API. Shared ClickHouse pools temporarily retain a protected, size-bounded system.query_log so the daemon can derive aggregates. It has a two-hour asynchronous TTL target and a finite per-tenant query quota; tenant roles cannot read it or alter the required logging settings.
+      x-required-scope: resources:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: before
+          in: query
+          required: false
+          schema: {type: integer}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1440, default: 240}
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Rolling activity history.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ActivityHistory"}
+  /api/instances/{instance_id}/logs:
+    get:
+      summary: Get recent logs for one instance.
+      description: Available only for dedicated instances. Shared-engine logs are pool-wide and are rejected with 409 because they can contain activity from other tenants.
+      x-required-scope: logs:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 200
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Log output.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogsResponse"
+        "409":
+          description: Shared-engine logs are pool-wide and cannot be exposed through a tenant-scoped route.
+  /api/instances/{instance_id}/export:
+    post:
+      summary: Export one instance to a protocol-native dump artifact.
+      description: >-
+        Queues an export using the node artifact policy. Retained mode stores the
+        result in the instance artifact inventory. Stream-only mode exposes the
+        same job artifact_id through a forced single-use download and deletes
+        its private spool when streaming finishes, disconnects, or expires.
+        Shared tenants always use a tenant-scoped logical dump and never expose
+        the pool filesystem or another tenant's data.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExportRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Queued export job.
+          headers:
+            Location:
+              description: Origin-relative job status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/import:
+    post:
+      summary: Upload a temporary dump or queue an import into one instance.
+      description: >-
+        application/octet-stream stores, hashes, and returns a temporary upload
+        without starting an import. application/json queues an import from an
+        artifact, typed remote source, or ready temporary upload. Temporary
+        uploads are separate from generated artifacts. Shared tenants accept
+        only tenant-scoped logical imports; physical restores and database-level
+        statements that could affect the pool or another tenant are rejected.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Content-Length
+          in: header
+          required: false
+          description: Required for application/octet-stream and must exactly equal the bytes sent.
+          schema:
+            type: integer
+            minimum: 1
+        - name: X-DBEV-Filename
+          in: header
+          required: false
+          description: >-
+            Required for application/octet-stream. Percent-encoded UTF-8 flat
+            filename, at most 180 decoded bytes, with a supported native dump
+            extension. Paths and traversal components are rejected.
+          schema:
+            type: string
+        - name: X-DBEV-SHA256
+          in: header
+          required: false
+          description: Optional expected digest for application/octet-stream; exactly 64 lowercase hexadecimal characters.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportRequest"
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: >-
+                Raw, unencoded dump bytes. Content-Encoding must be absent or
+                identity. The configured default limit is 8 GiB; the daemon
+                also enforces per-instance count, node-wide byte, concurrency,
+                free-space, total-duration, and idle-duration limits.
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "201":
+          description: Temporary upload committed, hashed, and ready for inspection or full import; no import job was started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
+        "202":
+          description: Queued import job.
+          headers:
+            Location:
+              description: Origin-relative job status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/import/uploads:
+    get:
+      summary: List active temporary import uploads for one instance.
+      description: Returns at most 100 instance-owned records. Temporary uploads never appear in the artifact inventory.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary upload list.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items:
+                  $ref: "#/components/schemas/ImportUpload"
+  /api/instances/{instance_id}/import/uploads/{upload_id}:
+    get:
+      summary: Get one temporary import upload belonging to an instance.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary upload state and optional cached inspection catalog.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
+    delete:
+      summary: Cancel and durably delete one temporary import upload.
+      description: Importing uploads return a conflict. Deletion never removes a DBEV-generated artifact or operator-staged import file.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Upload deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUploadDeleteResponse"
+  /api/instances/{instance_id}/import/uploads/{upload_id}/catalog:
+    post:
+      summary: Inspect a ready temporary dump and cache its bounded catalog.
+      description: >-
+        Validates the archive wrapper and extracts a bounded metadata-only
+        catalog without executing dump content. Inspection is lazy and
+        idempotent once cached. The selective_supported response field is the
+        authoritative capability; formats that report it as false are
+        full-import only. A
+        concurrency rejection or bounded inspection limit leaves the upload
+        ready, so a full import remains available.
+      x-required-scope: import-export:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^upl_[0-9a-f]{32}$'
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Upload with cached dump inspection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportUpload"
+  /api/instances/{instance_id}/import-export/jobs:
+    get:
+      summary: List import/export jobs for one instance.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Job list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/import-export/jobs/{job_id}:
+    get:
+      summary: Get one import/export job belonging to an instance.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/backups:
+    get:
+      summary: List backups belonging to one instance.
+      x-required-scope: backups:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Backup artifact list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BackupInfo"
+    post:
+      summary: Run a backup for one instance.
+      description: Dedicated instances use their protocol's physical backup layout where supported. Shared tenants always use tenant-scoped logical backups and never capture the pool filesystem or another tenant's data.
+      x-required-scope: backups:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Completed backup artifact.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupInfo"
+  /api/admin/backups/status:
+    get:
+      summary: Get automatic backup configuration status.
+      x-required-scope: backups:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Backup status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupStatusResponse"
+  /api/admin/backups/run:
+    post:
+      summary: Run backups for all eligible instances.
+      x-required-scope: backups:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Completed backups and skipped instances.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunBackupsResponse"
+  /api/instances/{instance_id}/backups/{backup_id}:
+    delete:
+      summary: Delete one backup belonging to an instance.
+      x-required-scope: backups:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: backup_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Delete result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteArtifactResponse"
+  /api/instances/{instance_id}/backups/{backup_id}/contents:
+    get:
+      summary: Browse the bounded schema catalog and captured row previews stored with a backup.
+      description: Existing backups created before catalog capture return catalog_available=false. The endpoint never starts a restored database or executes queries against backup files.
+      x-required-scope: backups:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: backup_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: object
+          in: query
+          required: false
+          description: Exact object id returned by the objects list, such as public.users.
+          schema:
+            type: string
+            maxLength: 1024
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Backup catalog, with an optional bounded preview selection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupContentsResponse"
+  /api/instances/{instance_id}/backups/{backup_id}/download:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: backup_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Download a backup using its temporary URL.
+      description: The stream is admitted under node-wide and transport-peer concurrency caps. A 429 response does not consume a single-use ticket.
+      security: []
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Backup file stream.
+    post:
+      summary: Create a temporary download URL for one instance backup.
+      x-required-scope: backups:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDownloadRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary download URL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadUrlResponse"
+  /api/instances/{instance_id}/backups/{backup_id}/restore:
+    post:
+      summary: Restore one backup into the same instance that owns it.
+      description: A backup is bound to the deployment layout that created it. After a dedicated/shared migration, older backups remain downloadable but restore returns 409 until the instance uses the matching physical or logical layout again.
+      x-required-scope: recovery:admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: backup_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DestructiveActionConfirmation"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Completed restore result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestoreBackupResponse"
+        "409":
+          description: The backup protocol or physical/logical layout does not match the instance's current protocol and deployment mode, or another data operation blocks restore.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/instances/{instance_id}/artifacts:
+    get:
+      summary: List retained export artifacts belonging to one instance.
+      description: One-use stream-only export spools never appear in this inventory.
+      x-required-scope: artifacts:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Artifact list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/StoredArtifact"
+  /api/instances/{instance_id}/artifacts/{artifact_id}:
+    delete:
+      summary: Delete one retained artifact or pending one-use export belonging to an instance.
+      x-required-scope: artifacts:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: artifact_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Delete result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteArtifactResponse"
+  /api/instances/{instance_id}/artifacts/{artifact_id}/download:
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: artifact_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Download an artifact using its temporary URL.
+      description: >-
+        The stream is admitted under node-wide and transport-peer concurrency
+        caps. A 429 response does not consume a single-use ticket. A stream-only
+        export is deleted when this response finishes or disconnects.
+      security: []
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Artifact file stream.
+    post:
+      summary: Create a temporary download URL for one instance artifact.
+      x-required-scope: artifacts:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDownloadRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Temporary download URL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadUrlResponse"
+  /api/instances/{instance_id}/artifacts/retention:
+    post:
+      summary: Apply artifact retention for one instance.
+      x-required-scope: artifacts:write
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Deleted artifact IDs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionResponse"
+  /api/admin/recovery/failed-jobs:
+    get:
+      summary: List failed import/export jobs across the node.
+      x-required-scope: recovery:admin
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Failed job list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/recovery/jobs/{job_id}/retry:
+    post:
+      summary: Retry a failed export or artifact import from its sanitized replay options. Credential imports and legacy jobs must be resubmitted.
+      x-required-scope: recovery:admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Replacement job.
+          headers:
+            Location:
+              description: Origin-relative replacement job status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/instances/{instance_id}/recovery/restore:
+    post:
+      summary: Restore an export artifact belonging to the same instance.
+      x-required-scope: recovery:admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [artifact_id, confirm, reason]
+              properties:
+                artifact_id:
+                  type: string
+                confirm:
+                  type: boolean
+                reason:
+                  type: string
+                  minLength: 1
+                  maxLength: 512
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "202":
+          description: Queued restore job.
+          headers:
+            Location:
+              description: Origin-relative restore job status URL.
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportExportJob"
+  /api/ws-token:
+    post:
+      summary: Issue short-lived WebSocket JWT for monitoring/log streams.
+      x-required-scope: ws-tokens:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WsTokenRequest"
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: WebSocket token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WsTokenResponse"
+  /api/admin/images/pull:
+    post:
+      summary: Pull an image for a protocol.
+      x-required-scope: images:admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [protocol]
+              properties:
+                protocol:
+                  $ref: "#/components/schemas/Protocol"
+                image:
+                  type: [string, "null"]
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Pull result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PullImageResponse"
+  /ws/monitoring:
+    get:
+      summary: WebSocket stream of instance resource snapshots.
+      description: >-
+        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Selected-instance tokens are bound to the current tenant generations, so deletion and recreation under the same ID requires a new token. Messages and frames are limited to 16 KiB. One complete authorized snapshot is produced every second and split into bounded stats messages carrying sequence, sampled_at_unix, zero-based batch_index, and batch_count. Clients must buffer every batch for a sequence and atomically replace state only after indexes 0 through batch_count-1 arrive; a single batch is never a deletion signal. Instances and install_progress may occupy separate batches. Each instance identifies its logical and physical placement with instance_id, runtime_id, deployment_mode, and resource_scope. The canonical live resource shape is the nested resources object matching GET /api/instances/{instance_id}/resources; removed flat compatibility fields are not emitted. The activity object matches GET /api/instances/{instance_id}/activity and includes dynamic sources labels on every sample. CPU is reported in percentage points (11.0 means 11%). DBEV obtains one non-streaming Docker counter snapshot per physical runtime per second and calculates CPU from container CPU-time delta divided by real wall-clock delta. Dedicated resources expose that runtime sample. Shared tenants leave resources.cpu.usage_percent, resources.memory.usage_bytes, and resources.memory.limit_bytes null because reservations are not per-tenant cgroup measurements or ceilings. Tenant messages never expose whole-pool CPU or memory; panels obtain those only from resources:admin shared-pool endpoints. Tenant activity exposes authenticated gateway sessions, source-specific operation categories, exact bytes after route selection, and nullable engine-observed query CPU/peak memory; it never exposes SQL text or bind values. Gateway accepted means DBEV forwarded an operation, not that backend execution succeeded; gateway rejected means DBEV blocked it before forwarding. Sampling is independent of WebSocket delivery and missed ticks are skipped rather than sent as catch-up bursts. Linux memory usage follows Docker's working-set calculation.
+      x-required-scope: monitor:read
+      x-websocket: true
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "101":
+          description: WebSocket upgrade.
+  /ws/instances/{instance_id}/logs:
+    get:
+      summary: WebSocket stream of container logs for one instance.
+      description: >-
+        Requires a short-lived WebSocket JWT with logs:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages and frames are limited to 16 KiB. Available only for dedicated instances; shared-engine logs are pool-wide and the upgrade is rejected with 409 to prevent cross-tenant disclosure.
+      x-required-scope: logs:read
+      x-websocket: true
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "101":
+          description: WebSocket upgrade.
+        "409":
+          description: Shared-engine logs are pool-wide and cannot be exposed through a tenant-scoped WebSocket.
+  /ws/instances/{instance_id}/import-export:
+    get:
+      summary: WebSocket stream of import/export jobs for one instance.
+      description: Requires a short-lived WebSocket JWT with import-export:read and access to the instance in the path. Messages and frames are limited to 16 KiB.
+      x-required-scope: import-export:read
+      x-websocket: true
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "101":
+          description: WebSocket upgrade.

@@ -53,7 +53,7 @@ DatabasesEverywhere is a database hosting daemon built to sit behind a panel. Ea
 - Automatic disk enforcement selects native quotas when available and otherwise
   uses FuseQuota; Qdrant uses predictive soft scanning instead of unsafe FUSE storage.
 - Explicit project-quota, FuseQuota, and soft-scanner modes for unusual hosts.
-  See [disk-limit setup](docs/disk-limits.md).
+  See [disk-limit setup](docs/operations/disk-limits.md).
 - Native logical dumps for SQL/document stores and physical archive exports for Redis/Valkey/Qdrant.
 - Physical backups and restores.
 - Signed artifact downloads.
@@ -152,9 +152,6 @@ Runtime data lives in:
 On daemon boot these runtime directories and their subdirectories are created
 automatically if missing. Compose installs still need
 `/etc/databases-everywhere/config.yml` in place before startup.
-During `--setup`, an old `/var/log/dbev` setting is moved to
-`/var/lib/dbev/logs` if the shared `/var/log` parent does not satisfy the
-runtime path safety policy. Existing legacy log files are left untouched.
 Every existing ancestor of a configured runtime path must be a real,
 non-symlink directory that is not writable by untrusted users. This prevents a
 local account from redirecting daemon-owned data while the service starts.
@@ -173,13 +170,15 @@ latest 14 files.
 
 ## Docs
 
-Everything else lives in [docs.md](docs.md): node setup, config fields, paths, and a full integration guide for panel developers — every REST endpoint, WebSocket event, auth flow, and temporary download URL.
+Everything else lives in the [documentation guide](docs/README.md): node setup, config fields, paths, and a full integration guide for panel developers — every REST endpoint, WebSocket event, auth flow, and temporary download URL.
 
 ## Security
 
 Found a vulnerability? Don't post it publicly — report it via GitHub Security Advisories or a private ticket on our [Discord](https://discord.com/invite/FJGQAbtyWN), and make sure it reproduces on the latest release first. Details in [SECURITY.md](SECURITY.md).
 
 ## Hacking on it
+
+See the [repository layout and development guide](docs/development.md) for module ownership and checks.
 
 ```bash
 cargo test --all-targets

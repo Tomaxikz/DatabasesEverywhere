@@ -1,5 +1,7 @@
 /.gitattributes text eol=lf
-helpers/socket_bridge.rs text eol=lf
+/helpers/socket_bridge.rs text eol=lf
+/helpers/payloads/*.version text eol=lf
+/helpers/payloads/*.zst binary
 *.sh text eol=lf
 .githooks/* text eol=lf
 .github/workflows/*.yml text eol=lf

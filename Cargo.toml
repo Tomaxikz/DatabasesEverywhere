@@ -1,7 +1,14 @@
 [package]
 name = "databases-everywhere"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
+
+[workspace]
+members = ["tools/helper-packer", "tools/release-builder"]
+resolver = "3"
+
+[lib]
+path = "src/app/mod.rs"
 
 [[bin]]
 name = "dbev"
@@ -10,22 +17,23 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.103"
 aws-lc-rs = "1.17.1"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 bzip2 = { version = "0.4", features = ["static"] }
-bollard = "0.21.0"
+bollard = { version = "0.21.0", default-features = false, features = ["pipe"] }
 bson = "2.13"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 h2 = "0.4"
-hdrhistogram = "7.5"
+hdrhistogram = { version = "7.5", default-features = false }
 http = "1.1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2"
 notify = { version = "8.2.0", default-features = false }
 secrecy = { version = "0.10", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
@@ -40,29 +48,31 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 subtle = "2.6"
 flate2 = "1.0"
-tar = "0.4"
+tar = { version = "0.4", default-features = false }
 thiserror = "2.0"
-time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1.38", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["serde", "v4"] }
+uuid = { version = "1.10", features = ["v4"] }
 webpki-roots = "1.0"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
-zstd = "0.13"
+zip = { version = "2.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+zstd = { version = "0.13", default-features = false }
 
 [build-dependencies]
 sha2 = "0.10"
-zstd = "0.13"
+zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1.38", features = ["test-util"] }
 tempfile = "3.10"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "symbols"

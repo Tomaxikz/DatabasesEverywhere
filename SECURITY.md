@@ -2,12 +2,8 @@
 
 ## Supported Versions
 
-Security fixes only land in the latest release — there's no backporting to older builds.
-
-| Version | Supported              |
-|---------|------------------------|
-| 0.2.x   | :white_check_mark: Yes |
-| < 0.2.0 | :x: No                 |
+Only the latest published version is supported. Security fixes are not
+backported to older builds.
 
 > Before reporting, make sure your finding reproduces on the latest release. If it only exists in an older build, the fix is updating — though if something old is nasty enough, we may still put out an advisory so people know to move.
 
