@@ -80,6 +80,8 @@ run_case() (
   project_lock_backup="$workspace/project-quota-lock.backup"
   mkdir -p "$mount_dir"
 
+  # Invoked by the EXIT trap below; ShellCheck cannot follow this nested callback.
+  # shellcheck disable=SC2317
   cleanup_case() {
     local status="$1"
     local cleanup_failed=0
