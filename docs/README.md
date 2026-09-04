@@ -1,37 +1,27 @@
-# DatabasesEverywhere documentation
+# Documentation
 
-## Running a node
+## Run a node
 
-- [Setup and configuration](operations/setup.md): install, upgrade compatibility, config fields, and startup.
-- [Disk limits](operations/disk-limits.md): quota backends, prerequisites, and verification.
-- [Benchmarking](operations/benchmarking.md): measure a running node and interpret the reports.
-- [Docker deployment](../deploy/docker/README.md): Compose setup and image build layout.
-- [Complete example configuration](../config/example.yml).
+- [Setup](operations/setup.md): installation, configuration, upgrades, and logs.
+- [Disk limits](operations/disk-limits.md): enforcement choices and host preparation.
+- [Docker deployment](../deploy/docker/README.md): Compose requirements.
+- [Benchmarking](operations/benchmarking.md): safe checks and opt-in load tests.
+- [Example configuration](../config/example.yml): complete settings and defaults.
 
-## Integrating with the daemon
+## Build a panel integration
 
-- [Authentication and API basics](api/auth.md): tokens, scopes, errors, and contract versioning.
-- [Instances](api/instances.md): dedicated/shared creation, migrations, limits, and images.
-- [Monitoring](api/monitoring.md): resource reports, tenant activity, and history.
-- [Exports, imports, and backups](api/transfers.md): uploads, jobs, recovery, and download URLs.
-- [WebSockets](api/websockets.md): tokens, connections, endpoints, and events.
-- [Panel WebSocket handoff](api/panel-websocket-ai-handoff.md): detailed panel integration behavior.
-- [System endpoints](api/system.md): node settings, readiness, and administration.
-- [OpenAPI contract](api/openapi.yml): machine-readable request and response schemas.
+Start with authentication and capability discovery. Keep node credentials on
+the panel backend; authorize each tenant before calling its instance endpoints.
 
-## Integration checklist
+- [Authentication](api/auth.md): credentials, scopes, errors, and version checks.
+- [Instances](api/instances.md): placement, creation, lifecycle, limits, and migrations.
+- [Monitoring](api/monitoring.md): resource metrics, tenant activity, and history.
+- [Transfers](api/transfers.md): uploads, import/export jobs, backups, and downloads.
+- [WebSockets](api/websockets.md): event handling, reconnection, and restart state.
+- [System](api/system.md): readiness, configuration changes, and recovery states.
+- [OpenAPI](api/openapi.yml): canonical endpoint and schema reference.
 
-Rough order for wiring up a panel:
+## Develop and report issues
 
-1. Generate `uuid`, `token_id`, a random API `token`, and a different random `jwt_signing_key`; both secrets must be at least 32 bytes. Render the node's `config.yml`; admin runs setup.
-2. Call `GET /api/system` to verify connectivity and see what the node supports.
-3. Create/manage instances via `/api/instances`; store `instance_id` ↔ your customer records on the panel side (the daemon doesn't know about your users).
-4. Poll `GET /api/heartbeat` for node health.
-5. For live dashboards, mint per-user JWTs with `/api/ws-token` and connect to `/ws/monitoring` and `/ws/instances/{instance_id}/logs`.
-6. For "download my data", queue an export, watch `/ws/instances/{instance_id}/import-export`, and surface the `download` URL it hands you.
-7. Point Prometheus at `/metrics` if you run one.
-
-## Contributing
-
-See the [repository layout and development guide](development.md).
-Report vulnerabilities privately as described in [SECURITY.md](../SECURITY.md).
+- [Repository layout and checks](development.md)
+- [Security policy](../SECURITY.md)

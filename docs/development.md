@@ -1,6 +1,6 @@
-# Repository layout and development
+# Development
 
-## Where code belongs
+## Repository layout
 
 ```text
 src/
@@ -57,29 +57,28 @@ Other directories:
 `target/`, `dist/`, `.local/`, local virtual environments, and scratch
 scripts are generated or local-only content, not application source.
 
-## Keeping the layout coherent
+## Contributing
 
-Put changes in the module that already owns the behavior. Keep helpers and
-focused unit tests beside that module; use `tests.rs` or child modules when
-a file becomes hard to navigate. Real-driver fixtures stay in
-`tests/real_drivers/`. Do not add forwarding modules just to preserve an old
-internal path. HTTP routes and schemas remain defined in the router and
-OpenAPI contract, respectively.
+Change the module that owns the behavior. Keep focused tests beside it and
+real-driver fixtures in `tests/real_drivers/`. Avoid forwarding modules and
+duplicate implementations. Routes and schemas belong in the router and
+[OpenAPI contract](api/openapi.yml).
 
-## Checks
+When moving files, update compile-time inclusions, CI/Docker paths, and links.
+Rust source files are limited to 1,500 lines.
 
-Run from the repository root on Linux (or WSL):
+## Checks and builds
+
+Run from the repository root on Linux or WSL:
 
 ```bash
-cargo fmt --all --check
-bash .github/ci/check.sh lint
-cargo test --workspace --locked
+bash .github/ci/check.sh pre-push
 ```
 
-Lint includes the 1,500-line Rust source limit and Clippy. Unit and API
-contract tests do not require a running database. Ignored runtime/driver
-integration tests need their external services and are run through the CI
-scripts; see [CI checks](../.github/ci/README.md).
+This runs formatting, strict Clippy, source-size checks, and workspace tests.
+Unit and API contract tests need no running database; ignored integration
+tests need external services. See [CI checks](../.github/ci/README.md) for
+individual checks and real-driver runners.
 
 A release build is separate from validation:
 
@@ -87,5 +86,6 @@ A release build is separate from validation:
 cargo build --release --locked
 ```
 
-Source layout changes must also update compile-time file inclusions, CI paths,
-Docker build paths, and documentation links.
+The `cargo b` alias runs the workspace's
+[release builder](../tools/release-builder/src/main.rs) for cross-release
+packaging. It is not a substitute for Linux tests.

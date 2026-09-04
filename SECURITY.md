@@ -1,30 +1,15 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
-
-Only the latest published version is supported. Security fixes are not
+Only the latest published release receives security fixes; fixes are not
 backported to older builds.
 
-> Before reporting, make sure your finding reproduces on the latest release. If it only exists in an older build, the fix is updating — though if something old is nasty enough, we may still put out an advisory so people know to move.
+Report vulnerabilities privately through
+[GitHub Security Advisories](https://github.com/Tomaxikz/DatabasesEverywhere/security/advisories/new)
+or a private ticket on [Discord](https://discord.com/invite/FJGQAbtyWN).
+Do not post vulnerability details in public issues or channels.
 
-## Reporting a Vulnerability
+Include the tested version, affected component, reproduction steps, and
+potential impact. Check the latest release when possible.
 
-We take the security of this project seriously. If you believe you have found a security vulnerability, **do not** report it through a public GitHub issue or in public Discord channels.
-
-### How to Report
-
-Please report vulnerabilities using one of the following methods:
-- **GitHub Private Vulnerability Reporting**: Use the [Security Advisories](../../security/advisories/new) tab in this repository.
-- **Discord ticket**: Join our [Discord](https://discord.com/invite/FJGQAbtyWN) and open a private ticket.
-
-Please include as much of the following information as possible to help us understand and reproduce the issue:
-- Type of vulnerability
-- The version you tested (reproduce on the latest release first)
-- Step-by-step instructions to reproduce the issue
-- Proof-of-concept (if available)
-- Your views on potential impact
-
-We kindly ask that you:
-- Give us a reasonable amount of time to address the issue before public disclosure.
-- Avoid accessing or modifying data that does not belong to you.
-- Act in good faith and avoid actions that could harm the project or its users.
+Allow time for a fix before public disclosure. Test only systems you are
+authorized to assess, and do not access or modify other users' data.

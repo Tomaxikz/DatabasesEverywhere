@@ -1,128 +1,84 @@
 # Disk limits
 
-DBEV separates **hard filesystem enforcement** from **soft scanner
-enforcement**. Hard limits reject an allocation at the filesystem boundary.
-The scanner measures usage, predicts near-term growth, and intentionally stops
-an instance before it can consume the node, but it cannot provide the same
-guarantee as a kernel quota.
+Hard quotas reject writes at the filesystem boundary. Soft guards measure
+usage and stop or fence a database near its limit; they can overshoot between
+samples. Panels must distinguish these guarantees.
 
 ## Mode selection
 
-```yaml
-disk:
-  mode: auto
-  project_id_base: 200000
-  fuse_quota_binary: embedded
-  fuse_quota_binary_sha256: ""
-  fuse_quota_rescan_interval_seconds: 150
-  soft_scanner:
-    scan_interval_seconds: 15
-    use_inotify: true
-    full_scan_interval_seconds: 90
-    inotify_debounce_milliseconds: 500
-    max_dirty_paths_per_instance: 512
-    max_concurrent_scans: 2
-    max_entries_per_scan: 1000000
-    scan_timeout_seconds: 30
-    max_consecutive_scan_failures: 3
-    safety_reserve_mib: 64
-    recovery_percent: 85
-    shutdown_grace_seconds: 30
-```
+Set `disk.mode`; all tuning fields and defaults are in the
+[example config](../../config/example.yml).
 
-The soft scanner uses the same hybrid model as Wings: one recursive inotify
-watcher coalesces changed paths, bounded partial scans replace only affected
-subtrees in the cached usage tree, and periodic full scans reconcile anything
-notifications cannot observe. DBEV additionally treats queue overflow, watcher
-errors, cache/root replacement, and dirty-path saturation as mandatory full
-reconciliation. A watcher failure never disables enforcement; that instance
-falls back to periodic full scans. Qdrant always receives a full scan at
-`scan_interval_seconds` because mmap-backed writes may not emit inotify events.
-
-The configured target interval for authoritative full scans is the greater of
-`full_scan_interval_seconds` and `scan_interval_seconds`, and both are bounded
-to one hour. Completion can be later when the active scanner fleet generates
-more work than `max_concurrent_scans` can process. Size concurrency for the
-number and size of instances, and monitor scanner completion latency; this is
-one reason soft enforcement is intentionally not described as a hard quota.
-This preserves older configurations that used a longer base interval.
-`max_dirty_paths_per_instance` bounds memory during event storms; exceeding it
-deliberately collapses the hints into one full scan. Incremental usage trees are
-additionally capped at 4,096 directories per instance and 32,768 directories
-process-wide. A target that exceeds either cache cap drops its tree and safely
-uses the original bounded-memory streaming full scan. Inotify is an
-accelerator, not a quota boundary: only native project quotas or FuseQuota
-provide hard write-time enforcement.
-
-`disk.mode` accepts:
-
-| Value | Behaviour |
+| Mode | Behavior |
 | --- | --- |
-| `auto` | Prefer a supported native quota. Otherwise use FuseQuota, except that Qdrant uses the soft scanner. |
-| `project_quota` | Require native filesystem quota support. Startup fails closed when the selected volumes filesystem is not ready. |
-| `fuse_quota` | Use FuseQuota for compatible databases. Qdrant still uses the soft scanner because Qdrant does not consider FUSE safe for persistent vector storage. |
-| `soft_scanner` | Use scanner enforcement for every database. The legacy spelling `none` is accepted as an alias, but limits are still actively monitored. |
+| `auto` | Prefer native quotas; otherwise FuseQuota, or the soft scanner for Qdrant |
+| `project_quota` | Require supported native quotas; fail closed if the filesystem is not ready |
+| `fuse_quota` | FuseQuota for compatible engines; Qdrant still uses the scanner |
+| `soft_scanner` | Scanner enforcement; the alias `none` does **not** disable limits |
 
-The effective method is reported per instance. `disk_enforced: true` means a
-hard write-time limit. Scanner-enforced instances deliberately report
-`disk_enforced: false` and `disk_enforcement_method: soft_scanner` so a panel
-does not mistake prediction and shutdown for a kernel quota.
+Reports set `disk_enforced: true` only for hard write-time limits.
+Soft enforcement reports `false` and its enforcement method.
 
-## Shared-tenant boundaries
-
-On XFS, ext4, or F2FS with project quotas enabled, each new shared PostgreSQL,
-MySQL, or MariaDB tenant gets an independent project ID and hard `disk_mib`
-limit. PostgreSQL uses a managed per-tenant tablespace; MySQL and MariaDB use
-the encoded schema directory. The shared engine root retains a separate quota
-for engine overhead and tenants that still require soft enforcement, so child
-limits are not counted twice. It also reserves `ceil(5%)` of aggregate tenant
-disk reservations, capped at 8 GiB per pool, for tenant-induced engine-global
-files such as WAL, redo/undo logs, and shared journals. This spill reserve is
-included in node admission as well as the root quota; provisional reservations
-count until durable tenant metadata resolves them.
-
-Hard usage metrics query the kernel's project-quota counter and do not scan the
-tenant tree. Claims are activated only after path adoption and limit setup;
-released project IDs are permanently tombstoned. MongoDB, ClickHouse, legacy
-PostgreSQL databases outside managed tablespaces, and hosts without these
-native facilities use the engine-catalog soft guard instead.
-
-When a legacy shared pool is adopted from the soft guard into native project
-quotas, DBEV first stops its engine and then performs an FD-relative, no-follow
-tree adoption. Symlinks, special files, foreign nested project IDs, or an
-ambiguous interrupted adoption fail closed: the pool remains stopped and its
-old data is not partially relabelled. Use tenant-scoped export/import into a new
-pool for layouts that cannot be adopted safely.
-
-Shared ClickHouse tenants do not receive whole-table `DROP`/`DETACH`, snapshot
-`FREEZE`, partition move/fetch, or table-settings privileges because those
-operations can leave files outside live-table catalog accounting. DBEV's
-administrator restore/delete paths still perform required cleanup, and the
-soft usage query includes detached partition bytes.
-
-Major-version image upgrades use a rollback-safe directory cutover. DBEV
-currently rejects that operation during preflight for native project-quota
-instances because project IDs, qgroups, and mounted datasets require a
-backend-specific transactional transfer. Use export, create a fresh target,
-then import for those instances; the rejection happens before the source is
-stopped or modified.
-
-For soft-limited instances the existing resource-report disk object also
-includes optional `scanner_logical_bytes`, `scanner_physical_bytes`, current
-and peak `scanner_growth_bytes_per_second`,
-`scanner_predicted_seconds_to_limit`, stop/recovery thresholds,
-`scanner_restart_blocked`, and sample age. Hard-limited instances omit these
-scanner fields unless a compatibility safety monitor is active.
-
-Start by identifying the filesystem that actually backs the volume root:
+Identify the filesystem backing the volume root, then validate it:
 
 ```bash
 findmnt -T /var/lib/dbev/volumes -o TARGET,SOURCE,FSTYPE,OPTIONS
 sudo dbev --setup
 ```
 
-Run `--setup` again after changing a mount or its quota options. DBEV validates
-the detected facility before starting the daemon.
+Rerun setup after changing mounts or quota options. Reserve the project-ID
+range exclusively for DBEV: up to one million IDs starting at
+`disk.project_id_base` (default 200000), bounded by the 32-bit ID space.
+Coordinate with other quota managers.
+
+## Shared-tenant boundaries
+
+| Tenant / filesystem | Enforcement |
+| --- | --- |
+| New PostgreSQL, MySQL, MariaDB tenants on project-quota-enabled XFS/ext4/F2FS | Independent hard project quota |
+| MongoDB, ClickHouse, or legacy PostgreSQL in `pg_default` | Engine-catalog soft guard |
+| Shared tenants on FuseQuota, Btrfs, ZFS, or other filesystems | Engine-catalog soft guard, even if the pool has a hard aggregate quota |
+
+PostgreSQL uses a managed tenant tablespace. MySQL/MariaDB use the encoded
+schema directory with file-per-table enabled; gateway policy rejects database
+recreation and storage clauses that escape it. PostgreSQL tenants cannot
+create explicit temporary tables or use global/default tablespaces.
+
+Hard tenant limits cover persistent tables, indexes, and relations—not
+engine-global WAL, redo/undo, journals, or server temporary files. The pool
+root covers overhead and soft/unattached/recovery reservations without
+double-counting durable child quotas. It also reserves 5% of total tenant
+disk reservations, rounded up and capped at 8 GiB per pool, for engine-global
+growth. Node admission charges this reserve too. PostgreSQL pools reserve
+2 GiB of base overhead for WAL/checkpoint headroom.
+
+Hard usage comes from kernel quota counters. Limits are restored before
+routes reopen; the catalog sampler does not stop hard-quota tenants. A full
+quota returns the engine's normal quota error while reads and deletion remain
+possible. Disk shrinking uses a fenced physical check. Logical imports drain
+sessions, verify usage after restore, and roll back oversized data before
+reopening the route.
+
+Adopting an existing soft pool into project quotas stops the engine first.
+Unsafe or ambiguous layouts—including symlinks, special files, and foreign
+project IDs—leave it stopped and quarantined. Released IDs are not reused.
+Use tenant export/import into a new pool when safe adoption is impossible.
+
+Shared ClickHouse denies whole-table `DROP`/`DETACH`, `FREEZE`,
+partition move/fetch, and table-settings changes that could evade catalog
+accounting. Administrator restore/delete still performs cleanup; detached
+partition bytes count toward soft usage.
+
+Choose dedicated placement when you need an independent CPU/memory boundary
+or hard disk enforcement unavailable for your shared engine/filesystem.
+
+## Image upgrades
+
+Major-version upgrades require a rollback-safe directory cutover. Native
+project-quota instances currently reject this during preflight, before
+stopping or changing the source: project IDs, qgroups, and mounted datasets
+need backend-specific transfer support. Export, create a fresh target, and
+import instead. See [instance operations](../api/instances.md).
 
 ## ext4 project quotas
 
@@ -251,10 +207,10 @@ Reference: [OpenZFS quotas and reservations](https://openzfs.github.io/openzfs-d
 
 ## FuseQuota fallback
 
-FuseQuota works over filesystems without a supported native quota facility.
-It is a hard user-space limit, but it adds filesystem overhead and compatibility
-risk. The host needs `/dev/fuse`, permission to create FUSE mounts, and
-`user_allow_other` in `/etc/fuse.conf`:
+FuseQuota provides a hard user-space limit on other filesystems, with extra
+filesystem overhead and compatibility constraints. The host needs
+`/dev/fuse`, permission to create FUSE mounts, and `user_allow_other`
+in `/etc/fuse.conf`:
 
 ```bash
 test -c /dev/fuse
@@ -262,33 +218,40 @@ grep -Eq '^[[:space:]]*user_allow_other([[:space:]]|$)' /etc/fuse.conf
 sudo dbev --setup
 ```
 
-The bundled helper is hash-verified before execution. An external helper must
-be configured with its expected SHA-256. Qdrant is never mounted through this
-driver; it uses native storage plus the scanner when no native quota is active.
-Legacy Qdrant instances that predate this rule are migrated from FUSE to raw
-scanner-managed storage on startup. If native project quota is selected, DBEV
-defers that legacy migration before touching the container because adopting a
-non-empty database into every native backend is not transactionally portable.
-Temporarily select `soft_scanner` to perform the safe FUSE-to-raw migration, or
-use a backup/create/import migration.
+The bundled helper is hash-verified. External helpers require an expected
+SHA-256 and a trusted, root-owned executable path; the API cannot change this
+setting. See [helper maintenance](../../helpers/README.md).
+
+Qdrant never uses FUSE. Legacy FUSE-backed Qdrant data is migrated to raw
+scanner-managed storage on startup. Selecting native quota mode defers this
+migration before touching the container; use `soft_scanner` for the
+FUSE-to-raw migration, or backup/create/import.
 
 ## Predictive soft scanner
 
-The scanner performs bounded, symlink-safe walks of each instance data root.
-It records both apparent file length and allocated blocks, tracks recent and
-peak growth, estimates time to the configured limit, and reserves space for
-writes that can occur during detection and database shutdown.
+Bounded, symlink-safe scans measure apparent and allocated bytes, recent
+growth, and time to the limit. A reserve allows for writes during detection
+and shutdown. Near the safe threshold, DBEV records an intentional disk stop
+and requests graceful shutdown, then kills the still-running container after
+the configured grace period. Restart is blocked until usage falls below the
+recovery threshold or the limit increases.
 
-When the safe threshold is crossed, DBEV records an intentional disk-limit
-stop, requests a graceful database shutdown, and sends `SIGKILL` only if the
-container is still running after `shutdown_grace_seconds` (30 seconds by
-default). Automatic restart remains blocked until usage falls below
-`recovery_percent` or the configured limit is increased. Scan concurrency,
-entry count, and runtime are bounded node-wide/per instance.
+Inotify accelerates partial rescans; periodic full scans reconcile changes.
+Overflow, watcher errors, root replacement, and saturated caches force full
+reconciliation. Watcher failure falls back to scanning, not disabled
+enforcement. Qdrant gets full scans at the base interval because mmap writes
+may not generate notifications.
 
-This remains soft enforcement. A process can allocate between scans, mmap
-writes are not guaranteed to generate useful filesystem notifications, and
-open-but-deleted files are not visible in a directory walk. Use native quotas
-for hostile multi-tenant workloads whenever possible. For Qdrant on a host
-without native quotas, the scanner is deliberately preferred over exposing
-Qdrant data to a FUSE filesystem it considers unsafe.
+Scan concurrency, work, runtime, and caches are bounded. Full-scan targets
+use the greater of the base and full-scan intervals; a busy scanner fleet can
+finish later. Monitor sample age rather than assuming the interval is a
+deadline.
+
+Resource reports expose nullable scanner sizes, growth, predicted time to
+limit, stop/recovery thresholds, and restart-blocked state. Hard-limited
+instances normally omit these fields.
+
+Soft scans cannot guarantee write-time limits: writes can happen between
+samples, mmap notifications are incomplete, and open-but-deleted files are
+invisible to directory walks. Prefer native quotas for hostile multi-tenant
+workloads.

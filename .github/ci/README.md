@@ -1,131 +1,82 @@
-# Local CI
+# CI and local checks
 
-DBEV is Linux-only, so the complete test suite must execute under Linux rather
-than only being cross-compiled from Windows.
-
-From a WSL2/Linux checkout, run:
+DBEV is Linux-only. Run tests on Linux/WSL, not just a Windows cross-build.
 
 ```bash
 bash .github/ci/check.sh pre-push
 ```
 
-To make that check automatic for this clone:
+This runs formatting, strict Clippy, the Rust source-size check, and workspace
+tests. To enable it as this clone's pre-push hook:
 
 ```bash
 chmod +x .githooks/pre-push
 git config core.hooksPath .githooks
 ```
 
-The hook runs formatting, strict Clippy, and the complete test suite for the
-daemon and both tool crates in one locked Cargo workspace. A failed check stops
-the push. Git's `--no-verify` option remains available for an intentional
-emergency bypass.
+## GitHub Actions
 
-GitHub Actions uses `Global lint` as its fast fail gate. After it passes,
-dependency auditing, Linux tests, the real MySQL driver matrix, rootless Podman,
-documentation, CodeQL, and all three release-architecture builds run in
-parallel. The final `CI gate` requires every branch to succeed. The binary
-builds have one canonical reusable workflow and use Zig/cargo-zigbuild with a
-glibc 2.35 floor, so CI never downloads cross-compilers through Ubuntu mirrors.
+Global lint gates the parallel audit, unit/contract tests, driver tests,
+Podman, documentation, CodeQL, and release-architecture builds.
+Require the final `CI gate` status in branch rules.
 
-The driver matrix runs each official MySQL
-8.4/9.7/26.7 and MariaDB 10.11/11.4/11.8/12.3 image/connector combination in
-an isolated parallel job. It exercises MariaDB CLI, Connector/J 8.4/9.2/9.7,
-MariaDB Connector/J, HikariCP, database-qualified and deferred-catalog
-connections, and standard CLIENT_SSL. Each case is compiled before its own
-12-minute runtime deadline begins and has a 20-minute total job deadline, so a
-stuck external client cannot consume the former one-hour serial matrix timeout.
-Configure the `main` branch ruleset to require the single `CI gate` status.
+[Release publication](../workflows/release.yml) independently validates the
+version, repeats required checks/builds, and publishes only after success.
+Release runs are serialized. Configure the `production-release` environment
+with reviewers and protected main/version-tag deployment refs.
 
-The release workflow independently repeats locked lint/tests, dependency
-auditing, real-driver coverage, and binary builds after validating its version.
-Those independent jobs run in parallel, but neither GitHub releases nor Docker
-images can publish until every validation and build succeeds. Release runs are
-serialized so two production publications cannot overlap.
+Binary builds use the reusable [Linux build workflow](../workflows/build-binaries.yml).
+Consult the workflows for current matrices, tool versions, and deadlines rather
+than duplicating those values here.
 
-To run one driver case on a Linux host with Docker, Maven, JDK 21, and OpenSSL
-installed:
+## Real database tests
+
+Prerequisites: Linux, Docker, Maven, JDK 21, and OpenSSL.
 
 ```bash
 bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 9.7.0
 ```
 
-The MariaDB CLI runs from an official MariaDB container with host networking:
-the tested image for MariaDB cases and `mariadb:11.4` for MySQL cases. CI
-therefore does not depend on Ubuntu package mirrors or mutate each ephemeral
-runner with `apt-get`.
+The canonical image/connector cases are in
+[mysql-driver-matrix.yml](../workflows/mysql-driver-matrix.yml), shared by CI
+and release. They test CLI/JDBC/Hikari, explicit/deferred catalogs, and TLS.
+Compilation and bounded runtime execution are separate steps.
 
-The complete case list has one canonical definition in
-`.github/workflows/mysql-driver-matrix.yml`; CI and release both call that
-reusable workflow.
+## Shared-pool isolation
 
-## Shared-pool isolation tests
-
-The real two-tenant isolation suite is intentionally separate from ordinary
-push, pull-request, lint, release-build, and release-publication jobs. A weekly
-`Shared-pool tenant isolation` workflow runs PostgreSQL, MySQL, MariaDB,
-MongoDB, and ClickHouse in independent bounded jobs. The same workflow can be
-started manually for all engines or one selected engine.
-
-Run one case on a Linux/WSL2 host with Docker available:
+The weekly/manual [shared isolation workflow](../workflows/shared-pool-isolation.yml)
+tests PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse independently.
+It is not part of ordinary push/release gating.
 
 ```bash
 bash .github/ci/shared-pool-isolation.sh postgres
-```
-
-Run all five sequentially, avoiding five database engines competing for local
-memory at once:
-
-```bash
 bash .github/ci/shared-pool-isolation.sh all
 ```
 
-Each case uses the production container specification and canonical tenant
-lifecycle functions, pulls its version-tagged engine image through DBEV, has a
-12-minute execution deadline, and removes only DBEV-managed test containers
-whose instance label starts with `shared_it_<protocol>_`.
+Local `all` runs sequentially. Cleanup is restricted to managed test containers.
 
-## Native project-quota smoke tests
+## Native project quotas
 
-Native per-tenant disk enforcement has its own weekly and manually dispatchable
-`Native project-quota smoke` workflow. It is intentionally separate from normal
-lint, unit, pull-request, release-build, and publication jobs because it needs
-root and disposable loopback mounts. XFS and ext4 are required cases. F2FS runs
-when both the hosted kernel and installed tools support a project-quota mount;
-an unsupported F2FS runner is reported as a notice rather than weakening the
-required XFS/ext4 result.
-
-The smoke test calls DBEV's canonical `DiskLimiter` path-quota methods rather
-than invoking quota tools as a substitute for application coverage. For each
-filesystem it verifies adoption of pre-existing data, independent project IDs
-for two tenants, a real `EDQUOT` at tenant A's boundary, kernel-accounted usage,
-an in-place limit increase, tenant A clear and permanent ID tombstone, and that
-tenant B's writes, limit, accounting, and claim survive tenant A exhaustion and
-cleanup. Each filesystem case has a six-minute deadline and the workflow has a
-25-minute deadline.
-
-Run it on a disposable Linux host with passwordless `sudo`, loop-device and
-mount privileges, Rust 1.95.0, `xfsprogs`, `e2fsprogs`, and `quota` installed:
+Run only on a disposable Linux host with passwordless sudo, loop/mount
+privileges, the pinned Rust toolchain, `xfsprogs`, `e2fsprogs`, and `quota`:
 
 ```bash
 bash .github/ci/project-quota-smoke.sh xfs
 bash .github/ci/project-quota-smoke.sh ext4
 ```
 
-Install `f2fs-tools` and use `f2fs` or `all` to request the optional F2FS case.
-The runner temporarily backs up and restores `/etc/projects` and `/etc/projid`
-for XFS and mounts only images created in a private temporary directory.
+The [weekly/manual workflow](../workflows/project-quota-smoke.yml) verifies
+real DBEV quota adoption, isolation, accounting, exhaustion, resize, and cleanup.
+It temporarily backs up/restores XFS project files. F2FS is optional and also
+needs kernel support and `f2fs-tools`; request `f2fs` or `all`.
 
 ## Release notes
 
-GitHub generates release notes automatically when the optional `release_notes`
-input is empty. GitHub's web form renders workflow string inputs on one line;
-to provide a complete multiline Markdown body without committing a notes file,
-use the GitHub CLI:
+An empty `release_notes` input uses generated notes. For a local multiline file:
 
 ```bash
 gh workflow run release.yml --ref main -f version=vX.Y.Z \
   -F release_notes=@CHANGELOG.md
 ```
 
-`CHANGELOG.md` may be any local file and does not need to be committed.
+The notes file need not be committed.
