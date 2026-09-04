@@ -20,36 +20,9 @@ sudo systemctl enable --now docker
 
 ## Install
 
-Choose a reviewed release and the matching architecture. Pin the version in
-automated deployments rather than following `latest`.
-
-```bash
-DBEV_VERSION=v0.8.0 # replace with the reviewed release
-case "$(uname -m)" in
-  x86_64|amd64) DBEV_ARCH=x86_64 ;;
-  aarch64|arm64) DBEV_ARCH=arm64 ;;
-  riscv64) DBEV_ARCH=riscv64 ;;
-  *) echo "Unsupported architecture" >&2; exit 1 ;;
-esac
-DBEV_DOWNLOAD="$(mktemp)"
-curl --fail --location \
-  "https://github.com/Tomaxikz/DatabasesEverywhere/releases/download/${DBEV_VERSION}/dbev-${DBEV_ARCH}-linux" \
-  -o "$DBEV_DOWNLOAD"
-```
-
-Before installing, verify the release checksum or, with the GitHub CLI, its
-signed build attestation:
-
-```bash
-gh attestation verify "$DBEV_DOWNLOAD" --repo Tomaxikz/DatabasesEverywhere
-```
-
-After successful verification:
-
-```bash
-sudo install -m 0755 "$DBEV_DOWNLOAD" /usr/local/bin/dbev
-rm -- "$DBEV_DOWNLOAD"
-```
+Use the README's [download and install commands](../../README.md#download-and-install).
+They select the host architecture and verify the binary's build attestation.
+Pin a reviewed release in automated deployments rather than following `latest`.
 
 For container deployment, use the [Compose guide](../../deploy/docker/README.md).
 For source builds, use the [development guide](../development.md).
