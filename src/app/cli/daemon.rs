@@ -6,7 +6,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .await
         .context("failed to create runtime directories")?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     warn_memory_overcommit();
     log_disk_mode(&mut config)?;
     let config = Arc::new(config);

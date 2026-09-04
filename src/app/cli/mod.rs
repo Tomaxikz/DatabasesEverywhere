@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command as StdCommand,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -30,7 +30,6 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     api::{
@@ -42,7 +41,7 @@ use crate::{
     },
     auth::api_token::ApiToken,
     config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
-    constants::{self, MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
+    constants::{MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
     disk::DiskLimiter,
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
@@ -72,6 +71,7 @@ mod boot_recovery;
 mod container_events;
 mod daemon;
 mod import_temp_cleanup;
+mod logging;
 mod maintenance;
 mod orphan_reservations;
 mod runtime_paths;
@@ -86,6 +86,7 @@ use boot_recovery::*;
 use container_events::*;
 use daemon::*;
 use import_temp_cleanup::*;
+use logging::*;
 use maintenance::*;
 use orphan_reservations::*;
 use runtime_paths::*;
@@ -349,7 +350,6 @@ pub async fn run() -> anyhow::Result<()> {
         return setup_system(cli.config).await;
     }
     if cli.move_new_config {
-        init_stdout_logging();
         return migrate_paths(cli.config, false, false).await;
     }
     match cli.command.unwrap_or(Command::Daemon) {

@@ -684,46 +684,6 @@ pub(super) async fn wait_for_shutdown() -> &'static str {
     }
 }
 
-pub(super) static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    OnceLock::new();
-
-pub(super) fn init_stdout_logging() {
-    let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
-        .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .try_init();
-}
-
-pub(super) fn init_logging(config: &Config) -> anyhow::Result<()> {
-    fs::create_dir_all(&config.paths.logs)
-        .with_context(|| format!("failed to create log directory {}", config.paths.logs))?;
-    harden_runtime_dir(Path::new(&config.paths.logs))?;
-
-    let filter = EnvFilter::try_from_env(constants::RUST_LOG_ENV)
-        .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"));
-    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("dbev.log")
-        .max_log_files(14)
-        .build(&config.paths.logs)
-        .with_context(|| format!("failed to initialize log file in {}", config.paths.logs))?;
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-    let _ = LOG_GUARD.set(guard);
-
-    let result = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
-        .with(fmt::layer().with_ansi(false).with_writer(file_writer))
-        .try_init();
-
-    if result.is_err() {
-        tracing::debug!("logging was already initialized");
-    }
-    Ok(())
-}
-
 pub(super) fn startup_banner() -> String {
     format!(
         r#"     ____    ____    ______  _    __

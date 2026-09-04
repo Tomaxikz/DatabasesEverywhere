@@ -5,7 +5,7 @@ const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
 pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     let pool = sqlite::connect(std::path::Path::new(&config.paths.metadata_root()))
         .await
         .context("failed to initialize sqlite storage")?;
@@ -17,7 +17,7 @@ pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()>
 pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?
         .with_node_id(config.uuid.clone());
@@ -36,7 +36,7 @@ pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
 pub(super) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     let metadata_root = config.paths.metadata_root();
     let data_root = std::path::Path::new(&metadata_root);
     let mut removed = 0;
@@ -70,7 +70,7 @@ pub(super) async fn repair_protected_secret(
     validate_instance_id(&instance_id)?;
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     let known_plaintext = read_secret_from_stdin()?;
     let metadata_root = config.paths.metadata_root();
     let pool = sqlite::connect(Path::new(&metadata_root))
@@ -139,7 +139,7 @@ pub(super) async fn migrate_paths(
 ) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     let plan = PathMigrationPlan::new(&config);
     let actions = plan.actions();
 
@@ -516,7 +516,7 @@ pub(super) async fn disk_test(
         .await
         .context("failed to create runtime directories")?;
     let _daemon_lock = lock_daemon(&config).await?;
-    init_logging(&config)?;
+    let _log_guard = init_logging(&config)?;
     log_disk_mode(&mut config)?;
     validate_runtime_support(&config).await?;
 

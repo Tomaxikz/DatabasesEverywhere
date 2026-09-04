@@ -540,4 +540,35 @@ Files end up here:
 /run/dbev
 ```
 
+### Daemon logs
+
+Normal API polling and successful WebSocket upgrades are logged at DEBUG, not
+INFO. Startup, lifecycle and audit events, warnings, and request failures remain
+visible at the default level. To trace requests temporarily, set
+`RUST_LOG=databases_everywhere=info,databases_everywhere::api::http::trace=debug`
+in the service environment and restart it; remove the override after diagnosis.
+
+The daemon writes to stdout (so `journalctl -u databases-everywhere -f` still
+works) and to `paths.logs/dbev.log`. File output rotates at 10 MiB, retaining
+four archives (`dbev.log.1` is newest, through `dbev.log.4`): at most 50 MiB for
+these five files, regardless of request volume or debug logging. Normal log
+records stay together; records larger than a whole file are split to respect
+the cap. Rotation runs on the logging worker, and normal shutdown flushes the
+queue. No configuration fields or container recreation are required.
+
+Older `dbev.log.YYYY-MM-DD` files are not automatically deleted or counted in
+this cap. Inspect and archive/remove those separately if disk space is already
+low. Files under `paths.logs/instances`, Docker/Podman container logs, and the
+systemd journal have separate storage and retention; the daemon's file cap
+does not limit those. DBEV does not change global journal settings.
+
+Read-only checks for the default paths:
+
+```bash
+sudo du -h --max-depth=2 /var/lib/dbev/logs | sort -h
+sudo journalctl --disk-usage
+```
+
+`journalctl --disk-usage` reports the journal for all services, not just DBEV.
+
 ---

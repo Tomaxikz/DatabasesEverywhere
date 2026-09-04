@@ -165,8 +165,11 @@ bind to non-loopback addresses with or without TLS and continue to enforce each
 database protocol's native credentials. Cleartext public gateways emit a startup
 warning because credentials, queries, and results are not protected from network
 interception. Remote imports use temporary acquisition workers; target database
-containers stay network-isolated. Daemon file logs rotate daily and retain the
-latest 14 files.
+containers stay network-isolated. Daemon file logs rotate at 10 MiB and retain
+four archives (50 MiB total including the active file). Routine API requests
+are DEBUG-only; failures and audit events remain visible by default. Old dated
+logs, the system journal, and container logs are separate; see the
+[logging guide](docs/operations/setup.md#daemon-logs).
 
 ## Docs
 

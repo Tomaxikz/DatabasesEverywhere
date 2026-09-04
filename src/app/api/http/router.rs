@@ -216,10 +216,7 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             crate::api::http::policy::check_request_origin,
         ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::api::http::trace::trace_request,
-        ))
+        .layer(middleware::from_fn(crate::api::http::trace::trace_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::api::http::limits::rate_limit,
