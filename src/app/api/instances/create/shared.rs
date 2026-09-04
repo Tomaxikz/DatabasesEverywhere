@@ -1099,37 +1099,27 @@ mod tests {
     use super::*;
 
     fn initial_runtime() -> EngineRuntime {
-        EngineRuntime {
-            schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-            runtime_id: "pool_postgres_initial".to_string(),
-            protocol: Protocol::Postgres,
-            deployment_mode: DeploymentMode::Shared,
-            status: EngineRuntimeStatus::Creating,
-            backend: crate::shared::backend::BackendEndpoint::UnixSocket {
-                socket_path: "/run/dbe/pool_postgres_initial/.s.PGSQL.5432".to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "dbe-postgres-pool_postgres_initial".to_string(),
-                network_mode: "none".to_string(),
-            },
-            limits: InstanceLimits {
-                cpu_cores: 1.25,
-                memory_mib: 1280,
-                disk_mib: 8192,
-                disk_enforced: true,
-                disk_enforcement_method: "fuse_quota".to_string(),
-            },
-            image: "postgres:18.4".to_string(),
-            database_version: None,
-            compatibility: None,
-            compatibility_key: "postgres:postgres:18.4".to_string(),
-            max_tenants: policy::max_tenants(Protocol::Postgres).unwrap(),
-            reserved: RuntimeReservation::default(),
-            admin_secret: Some("pool-admin-secret".to_string()),
-            created_at: "2026-09-08T00:00:00Z".to_string(),
-            updated_at: "2026-09-08T00:00:00Z".to_string(),
-        }
+        let mut runtime = crate::placement::test_support::runtime(
+            "pool_postgres_initial",
+            Protocol::Postgres,
+            "postgres:18.4",
+        );
+        runtime.status = EngineRuntimeStatus::Creating;
+        runtime.backend = crate::shared::backend::BackendEndpoint::UnixSocket {
+            socket_path: "/run/dbe/pool_postgres_initial/.s.PGSQL.5432".to_string(),
+        };
+        runtime.limits = InstanceLimits {
+            cpu_cores: 1.25,
+            memory_mib: 1280,
+            disk_mib: 8192,
+            disk_enforced: true,
+            disk_enforcement_method: "fuse_quota".to_string(),
+        };
+        runtime.max_tenants = policy::max_tenants(Protocol::Postgres).unwrap();
+        runtime.admin_secret = Some("pool-admin-secret".to_string());
+        runtime.created_at = "2026-09-08T00:00:00Z".to_string();
+        runtime.updated_at = runtime.created_at.clone();
+        runtime
     }
 
     #[test]

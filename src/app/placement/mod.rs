@@ -4,6 +4,8 @@ pub(crate) mod policy;
 mod repository;
 pub(crate) mod runtime;
 pub(crate) mod tenant;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use migration::{
     DeploymentMigration, DeploymentMigrationError, DeploymentMigrationRepository, MigrationFailure,

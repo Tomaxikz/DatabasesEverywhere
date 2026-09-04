@@ -372,45 +372,15 @@ fn sample_metadata(
     database: &str,
     username: &str,
 ) -> InstanceMetadata {
-    InstanceMetadata {
-        schema_version: SCHEMA_VERSION,
-        instance_id: instance_id.to_string(),
-        deployment_mode: crate::placement::DeploymentMode::Dedicated,
-        runtime_id: String::new(),
-        protocol,
-        status: InstanceStatus::Running,
-        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
-        disk_limit_blocked: false,
-        public: PublicEndpoint {
-            host: "127.0.0.1".to_string(),
-            port: 5432,
-        },
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: format!("dbe-{}-{instance_id}", protocol.as_str()),
-            network_mode: "none".to_string(),
-        },
-        database: DatabaseIdentity {
-            name: database.to_string(),
-            username: username.to_string(),
-        },
-        route_key_sha256: None,
-        mariadb_native_password_sha1_stage2: None,
-        mariadb_root_password: None,
-        mysql_native_password_sha1_stage2: None,
-        mysql_root_password: None,
-        mongodb_root_password: None,
-        postgres_admin_password: None,
-        tenant_password: None,
-        limits: crate::shared::limits::InstanceLimits::default(),
-        image: None,
-        database_version: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    let mut metadata = crate::instances::test_support::metadata(instance_id, protocol);
+    metadata.public.host = "127.0.0.1".to_string();
+    metadata.public.port = 5432;
+    metadata.backend = BackendEndpoint::UnixSocket {
+        socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),
+    };
+    metadata.database.name = database.to_string();
+    metadata.database.username = username.to_string();
+    metadata
 }
 
 pub(super) async fn test_state(config: Config) -> (AppState, tempfile::TempDir) {

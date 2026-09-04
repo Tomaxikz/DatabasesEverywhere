@@ -1035,42 +1035,17 @@ mod tests {
     }
 
     fn test_runtime(protocol: Protocol) -> EngineRuntime {
-        use crate::{
-            instances::metadata::{RuntimeKind, RuntimeMetadata},
-            placement::{ENGINE_RUNTIME_SCHEMA_VERSION, RuntimeReservation},
-            shared::{backend::BackendEndpoint, limits::InstanceLimits},
+        let mut runtime = crate::placement::test_support::runtime("pool_test", protocol, "test");
+        runtime.status = EngineRuntimeStatus::Stopped;
+        runtime.backend = crate::shared::backend::BackendEndpoint::UnixSocket {
+            socket_path: "/tmp/test.sock".to_string(),
         };
-
-        EngineRuntime {
-            schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-            runtime_id: "pool_test".to_string(),
-            protocol,
-            deployment_mode: DeploymentMode::Shared,
-            status: EngineRuntimeStatus::Stopped,
-            backend: BackendEndpoint::UnixSocket {
-                socket_path: "/tmp/test.sock".to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "pool_test".to_string(),
-                network_mode: "none".to_string(),
-            },
-            limits: InstanceLimits {
-                cpu_cores: 1.0,
-                memory_mib: 1024,
-                disk_mib: 1024,
-                disk_enforced: false,
-                disk_enforcement_method: "test".to_string(),
-            },
-            image: "test".to_string(),
-            database_version: None,
-            compatibility: None,
-            compatibility_key: "test".to_string(),
-            max_tenants: 8,
-            reserved: RuntimeReservation::default(),
-            admin_secret: Some("test".to_string()),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
+        runtime.runtime.container_name = "pool_test".to_string();
+        runtime.limits.disk_mib = 1024;
+        runtime.limits.disk_enforcement_method = "test".to_string();
+        runtime.compatibility_key = "test".to_string();
+        runtime.max_tenants = 8;
+        runtime.admin_secret = Some("test".to_string());
+        runtime
     }
 }

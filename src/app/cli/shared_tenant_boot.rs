@@ -618,28 +618,7 @@ fn isolation_confirmed(route_fenced: bool, engine_fenced: bool, quarantined: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{disk::DiskEnforcement, shared::limits::InstanceLimits};
-
-    fn shared_metadata() -> InstanceMetadata {
-        let mut metadata: InstanceMetadata = serde_json::from_value(serde_json::json!({
-            "schema_version": 1,
-            "instance_id": "tenant-a",
-            "deployment_mode": "shared",
-            "runtime_id": "pool-a",
-            "protocol": "mysql",
-            "status": "running",
-            "public": {"host": "db.example.com", "port": 3306},
-            "backend": {"kind": "unix_socket", "socket_path": "/run/mysql.sock"},
-            "runtime": {"kind": "docker", "container_name": "pool-a", "network_mode": "none"},
-            "database": {"name": "app_a", "username": "tenant_a"},
-            "limits": InstanceLimits::default(),
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap();
-        metadata.desired_state = DesiredInstanceState::Running;
-        metadata
-    }
+    use crate::{disk::DiskEnforcement, instances::test_support::shared_metadata};
 
     #[test]
     fn running_state_replays_password_and_quota_before_opening() {

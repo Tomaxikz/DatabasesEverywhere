@@ -165,41 +165,23 @@ async fn quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        instances::metadata::{RuntimeKind, RuntimeMetadata},
-        placement::{DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, RuntimeReservation},
-        shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
-    };
+    use crate::shared::{backend::BackendEndpoint, protocol::Protocol};
 
     fn runtime(status: EngineRuntimeStatus, tenants: u32) -> EngineRuntime {
-        EngineRuntime {
-            schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-            runtime_id: "pool_postgres_boot_claim".to_string(),
-            protocol: Protocol::Postgres,
-            deployment_mode: DeploymentMode::Shared,
-            status,
-            backend: BackendEndpoint::UnixSocket {
-                socket_path: "/run/dbev/pool.sock".to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "dbe-postgres-pool".to_string(),
-                network_mode: "none".to_string(),
-            },
-            limits: InstanceLimits::default(),
-            image: "postgres:18.4".to_string(),
-            database_version: None,
-            compatibility: None,
-            compatibility_key: "postgres:postgres:18.4".to_string(),
-            max_tenants: 64,
-            reserved: RuntimeReservation {
-                tenants,
-                ..RuntimeReservation::default()
-            },
-            admin_secret: Some("admin".to_string()),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
+        let mut runtime = crate::placement::test_support::runtime(
+            "pool_postgres_boot_claim",
+            Protocol::Postgres,
+            "postgres:18.4",
+        );
+        runtime.status = status;
+        runtime.backend = BackendEndpoint::UnixSocket {
+            socket_path: "/run/dbev/pool.sock".to_string(),
+        };
+        runtime.runtime.container_name = "dbe-postgres-pool".to_string();
+        runtime.max_tenants = 64;
+        runtime.reserved.tenants = tenants;
+        runtime.admin_secret = Some("admin".to_string());
+        runtime
     }
 
     #[test]

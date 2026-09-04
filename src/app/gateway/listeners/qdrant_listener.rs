@@ -423,15 +423,8 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
 mod tests {
     use super::*;
     use crate::{
-        api::monitoring::resources::ResourceCache,
-        instances::{
-            metadata::{
-                DatabaseIdentity, DesiredInstanceState, InstanceStatus, PublicEndpoint,
-                RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
-            },
-            state::InstanceStore,
-        },
-        shared::{limits::InstanceLimits, protocol::Protocol},
+        api::monitoring::resources::ResourceCache, instances::state::InstanceStore,
+        shared::protocol::Protocol,
     };
 
     #[test]
@@ -595,45 +588,20 @@ mod tests {
     fn qdrant_metadata(
         grpc_socket: &std::path::Path,
     ) -> crate::instances::metadata::InstanceMetadata {
-        crate::instances::metadata::InstanceMetadata {
-            schema_version: SCHEMA_VERSION,
-            instance_id: "inst_qdrant_rest".to_string(),
-            deployment_mode: crate::placement::DeploymentMode::Dedicated,
-            runtime_id: String::new(),
-            protocol: Protocol::Qdrant,
-            status: InstanceStatus::Running,
-            desired_state: DesiredInstanceState::Running,
-            disk_limit_blocked: false,
-            public: PublicEndpoint {
-                host: "db.example.test".to_string(),
-                port: 6334,
-            },
-            backend: BackendEndpoint::UnixSocket {
-                socket_path: grpc_socket.display().to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "dbe-qdrant-inst_qdrant_rest".to_string(),
-                network_mode: "none".to_string(),
-            },
-            database: DatabaseIdentity {
-                name: "qdrant".to_string(),
-                username: "tenant".to_string(),
-            },
-            route_key_sha256: Some(test_qdrant_route_key().fingerprint("secret")),
-            mariadb_native_password_sha1_stage2: None,
-            mariadb_root_password: None,
-            mysql_native_password_sha1_stage2: None,
-            mysql_root_password: None,
-            mongodb_root_password: None,
-            postgres_admin_password: None,
-            tenant_password: Some("secret".to_string()),
-            limits: InstanceLimits::default(),
-            image: None,
-            database_version: None,
-            created_at: "2026-08-19T00:00:00Z".to_string(),
-            updated_at: "2026-08-19T00:00:00Z".to_string(),
-        }
+        let mut metadata =
+            crate::instances::test_support::metadata("inst_qdrant_rest", Protocol::Qdrant);
+        metadata.public.host = "db.example.test".to_string();
+        metadata.public.port = 6334;
+        metadata.backend = BackendEndpoint::UnixSocket {
+            socket_path: grpc_socket.display().to_string(),
+        };
+        metadata.database.name = "qdrant".to_string();
+        metadata.database.username = "tenant".to_string();
+        metadata.route_key_sha256 = Some(test_qdrant_route_key().fingerprint("secret"));
+        metadata.tenant_password = Some("secret".to_string());
+        metadata.created_at = "2026-08-19T00:00:00Z".to_string();
+        metadata.updated_at = metadata.created_at.clone();
+        metadata
     }
 
     fn test_qdrant_route_key() -> qdrant::QdrantRouteKey {

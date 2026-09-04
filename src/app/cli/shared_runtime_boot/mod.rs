@@ -1122,15 +1122,8 @@ mod tests {
     use super::*;
     use crate::{
         compatibility::COMPATIBILITY_PROBE_REVISION,
-        instances::{
-            manager::InstanceManager,
-            metadata::{RuntimeKind, RuntimeMetadata},
-            state::InstanceStore,
-        },
-        placement::{
-            ENGINE_RUNTIME_SCHEMA_VERSION, ReserveTenant, RuntimeCompatibility, RuntimeReservation,
-            TenantReservationState,
-        },
+        instances::{manager::InstanceManager, state::InstanceStore},
+        placement::{ReserveTenant, RuntimeCompatibility, TenantReservationState},
         shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
         storage::{repositories::InstanceRepository, sqlite},
     };
@@ -1315,34 +1308,24 @@ mod tests {
     }
 
     fn runtime() -> EngineRuntime {
-        EngineRuntime {
-            schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-            runtime_id: "pool-postgres".to_string(),
-            protocol: Protocol::Postgres,
-            deployment_mode: DeploymentMode::Shared,
-            status: EngineRuntimeStatus::Running,
-            backend: BackendEndpoint::UnixSocket {
-                socket_path: "/run/dbev/pool-postgres/postgres.sock".to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "dbe-postgres-pool-postgres".to_string(),
-                network_mode: "none".to_string(),
-            },
-            limits: InstanceLimits::default(),
-            image: "postgres:18".to_string(),
-            database_version: Some("18.4".to_string()),
-            compatibility: Some(RuntimeCompatibility {
-                container_id: "container-id".to_string(),
-                image_id: "sha256:image-id".to_string(),
-                probe_revision: COMPATIBILITY_PROBE_REVISION,
-            }),
-            compatibility_key: "postgres:18:default".to_string(),
-            max_tenants: 32,
-            reserved: RuntimeReservation::default(),
-            admin_secret: None,
-            created_at: "2026-08-27T00:00:00Z".to_string(),
-            updated_at: "2026-08-27T00:00:00Z".to_string(),
-        }
+        let mut runtime = crate::placement::test_support::runtime(
+            "pool-postgres",
+            Protocol::Postgres,
+            "postgres:18",
+        );
+        runtime.backend = BackendEndpoint::UnixSocket {
+            socket_path: "/run/dbev/pool-postgres/postgres.sock".to_string(),
+        };
+        runtime.database_version = Some("18.4".to_string());
+        runtime.compatibility = Some(RuntimeCompatibility {
+            container_id: "container-id".to_string(),
+            image_id: "sha256:image-id".to_string(),
+            probe_revision: COMPATIBILITY_PROBE_REVISION,
+        });
+        runtime.compatibility_key = "postgres:18:default".to_string();
+        runtime.max_tenants = 32;
+        runtime.created_at = "2026-08-27T00:00:00Z".to_string();
+        runtime.updated_at = runtime.created_at.clone();
+        runtime
     }
 }

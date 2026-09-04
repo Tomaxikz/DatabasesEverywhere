@@ -912,58 +912,29 @@ pub enum DeploymentMigrationError {
 mod tests {
     use super::*;
     use crate::{
-        instances::metadata::{
-            DatabaseIdentity, DesiredInstanceState, InstanceStatus, PublicEndpoint, RuntimeKind,
-            RuntimeMetadata, SCHEMA_VERSION,
-        },
+        instances::metadata::{RuntimeKind, RuntimeMetadata},
         placement::{
             ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus, PlacementRepository,
             ReserveTenant, RuntimeReservation,
         },
-        shared::{backend::BackendEndpoint, limits::InstanceLimits},
+        shared::backend::BackendEndpoint,
         storage::{repositories::InstanceRepository, sqlite},
     };
 
     fn metadata(instance_id: &str) -> InstanceMetadata {
-        InstanceMetadata {
-            schema_version: SCHEMA_VERSION,
-            instance_id: instance_id.to_string(),
-            deployment_mode: DeploymentMode::Dedicated,
-            runtime_id: instance_id.to_string(),
-            protocol: Protocol::Postgres,
-            status: InstanceStatus::Running,
-            desired_state: DesiredInstanceState::Running,
-            disk_limit_blocked: false,
-            public: PublicEndpoint {
-                host: "db.example.test".to_string(),
-                port: 5432,
-            },
-            backend: BackendEndpoint::UnixSocket {
-                socket_path: "/tmp/postgres.sock".to_string(),
-            },
-            runtime: RuntimeMetadata {
-                kind: RuntimeKind::Docker,
-                container_name: "postgres".to_string(),
-                network_mode: "none".to_string(),
-            },
-            database: DatabaseIdentity {
-                name: "app".to_string(),
-                username: "app".to_string(),
-            },
-            route_key_sha256: None,
-            mariadb_native_password_sha1_stage2: None,
-            mariadb_root_password: None,
-            mysql_native_password_sha1_stage2: None,
-            mysql_root_password: None,
-            mongodb_root_password: None,
-            postgres_admin_password: Some("admin".to_string()),
-            tenant_password: Some("tenant".to_string()),
-            limits: InstanceLimits::default(),
-            image: None,
-            database_version: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
+        let mut metadata =
+            crate::instances::test_support::metadata(instance_id, Protocol::Postgres);
+        metadata.runtime_id = instance_id.to_string();
+        metadata.public.host = "db.example.test".to_string();
+        metadata.backend = BackendEndpoint::UnixSocket {
+            socket_path: "/tmp/postgres.sock".to_string(),
+        };
+        metadata.runtime.container_name = "postgres".to_string();
+        metadata.database.name = "app".to_string();
+        metadata.database.username = "app".to_string();
+        metadata.postgres_admin_password = Some("admin".to_string());
+        metadata.tenant_password = Some("tenant".to_string());
+        metadata
     }
 
     fn metadata_in_mode(instance_id: &str, mode: DeploymentMode) -> InstanceMetadata {

@@ -517,54 +517,20 @@ fn mongodb_namespace_pattern_escapes_literal_database_wildcards() {
 
 #[test]
 fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
-    use crate::{
-        instances::metadata::{
-            DatabaseIdentity, PublicEndpoint, RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
-        },
-        shared::{backend::BackendEndpoint, limits::InstanceLimits},
-    };
+    use crate::shared::backend::BackendEndpoint;
 
-    let metadata = InstanceMetadata {
-        schema_version: SCHEMA_VERSION,
-        instance_id: "inst_mysql_1".to_string(),
-        deployment_mode: crate::placement::DeploymentMode::Dedicated,
-        runtime_id: String::new(),
-        protocol: Protocol::Mysql,
-        status: InstanceStatus::Running,
-        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
-        disk_limit_blocked: false,
-        public: PublicEndpoint {
-            host: "db.example.com".to_string(),
-            port: 3308,
-        },
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: "/run/dbev/sockets/inst_mysql_1/mysqld.sock".to_string(),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: "dbe-mysql-inst-mysql-1".to_string(),
-            network_mode: "none".to_string(),
-        },
-        database: DatabaseIdentity {
-            name: "mysql_1".to_string(),
-            username: "app_mysql_1".to_string(),
-        },
-        route_key_sha256: None,
-        mariadb_native_password_sha1_stage2: None,
-        mariadb_root_password: None,
-        mysql_native_password_sha1_stage2: Some(
-            "0123456789abcdef0123456789abcdef01234567".to_string(),
-        ),
-        mysql_root_password: Some("internal-root-password".to_string()),
-        mongodb_root_password: None,
-        postgres_admin_password: None,
-        tenant_password: Some("internal-tenant-password".to_string()),
-        limits: InstanceLimits::default(),
-        image: None,
-        database_version: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    let mut metadata = crate::instances::test_support::metadata("inst_mysql_1", Protocol::Mysql);
+    metadata.public.port = 3308;
+    metadata.backend = BackendEndpoint::UnixSocket {
+        socket_path: "/run/dbev/sockets/inst_mysql_1/mysqld.sock".to_string(),
     };
+    metadata.runtime.container_name = "dbe-mysql-inst-mysql-1".to_string();
+    metadata.database.name = "mysql_1".to_string();
+    metadata.database.username = "app_mysql_1".to_string();
+    metadata.mysql_native_password_sha1_stage2 =
+        Some("0123456789abcdef0123456789abcdef01234567".to_string());
+    metadata.mysql_root_password = Some("internal-root-password".to_string());
+    metadata.tenant_password = Some("internal-tenant-password".to_string());
 
     let export = export_script(
         &metadata,

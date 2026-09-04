@@ -1,25 +1,6 @@
 use super::*;
 
-fn shared_metadata() -> InstanceMetadata {
-    let mut metadata: InstanceMetadata = serde_json::from_value(serde_json::json!({
-        "schema_version": 1,
-        "instance_id": "tenant-a",
-        "deployment_mode": "shared",
-        "runtime_id": "pool-a",
-        "protocol": "mysql",
-        "status": "running",
-        "public": {"host": "db.example.com", "port": 3306},
-        "backend": {"kind": "unix_socket", "socket_path": "/run/mysql.sock"},
-        "runtime": {"kind": "docker", "container_name": "pool-a", "network_mode": "none"},
-        "database": {"name": "app_a", "username": "tenant_a"},
-        "limits": InstanceLimits::default(),
-        "created_at": "2026-01-01T00:00:00Z",
-        "updated_at": "2026-01-01T00:00:00Z"
-    }))
-    .unwrap();
-    metadata.desired_state = DesiredInstanceState::Running;
-    metadata
-}
+use crate::instances::test_support::shared_metadata;
 
 #[test]
 fn destructive_shared_states_cannot_be_cleared_by_power_actions() {

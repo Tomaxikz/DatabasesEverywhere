@@ -1,9 +1,6 @@
 use super::{PlacementRepository, PlacementRepositoryError, reservations::claim_matches};
 use crate::{
-    instances::metadata::{
-        DatabaseIdentity, DesiredInstanceState, InstanceMetadata, InstanceStatus, PublicEndpoint,
-        RuntimeKind, RuntimeMetadata,
-    },
+    instances::metadata::InstanceMetadata,
     placement::{
         DeploymentMode, EngineRuntime, EngineRuntimeStatus, PlacementError, ReserveTenant,
         RuntimeCompatibility, RuntimeReservation, TenantReservation, TenantReservationState,
@@ -1065,83 +1062,42 @@ async fn shared_placement_fills_existing_pools_before_spreading() {
 }
 
 fn shared_runtime(runtime_id: &str, max_tenants: u32) -> EngineRuntime {
-    EngineRuntime {
-        schema_version: crate::placement::model::ENGINE_RUNTIME_SCHEMA_VERSION,
-        runtime_id: runtime_id.to_string(),
-        protocol: Protocol::Postgres,
-        deployment_mode: DeploymentMode::Shared,
-        status: EngineRuntimeStatus::Running,
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: format!("/run/dbev/{runtime_id}/postgres.sock"),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: format!("dbe-pool-{runtime_id}"),
-            network_mode: "none".to_string(),
-        },
-        limits: InstanceLimits {
-            cpu_cores: 4.0,
-            memory_mib: 8192,
-            disk_mib: 32768,
-            disk_enforced: true,
-            disk_enforcement_method: "fusequota".to_string(),
-        },
-        image: "postgres:18".to_string(),
-        database_version: Some("18.4".to_string()),
-        compatibility: Some(RuntimeCompatibility {
-            container_id: format!("container-{runtime_id}"),
-            image_id: "sha256:postgres18".to_string(),
-            probe_revision: 1,
-        }),
-        compatibility_key: "postgres:18:default".to_string(),
-        max_tenants,
-        reserved: RuntimeReservation::default(),
-        admin_secret: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    let mut runtime =
+        crate::placement::test_support::runtime(runtime_id, Protocol::Postgres, "postgres:18");
+    runtime.backend = BackendEndpoint::UnixSocket {
+        socket_path: format!("/run/dbev/{runtime_id}/postgres.sock"),
+    };
+    runtime.runtime.container_name = format!("dbe-pool-{runtime_id}");
+    runtime.limits = InstanceLimits {
+        cpu_cores: 4.0,
+        memory_mib: 8192,
+        disk_mib: 32768,
+        disk_enforced: true,
+        disk_enforcement_method: "fusequota".to_string(),
+    };
+    runtime.database_version = Some("18.4".to_string());
+    runtime.compatibility = Some(RuntimeCompatibility {
+        container_id: format!("container-{runtime_id}"),
+        image_id: "sha256:postgres18".to_string(),
+        probe_revision: 1,
+    });
+    runtime.compatibility_key = "postgres:18:default".to_string();
+    runtime.max_tenants = max_tenants;
+    runtime
 }
 
 fn dedicated_instance(instance_id: &str) -> InstanceMetadata {
-    InstanceMetadata {
-        schema_version: crate::instances::metadata::SCHEMA_VERSION,
-        instance_id: instance_id.to_string(),
-        deployment_mode: DeploymentMode::Dedicated,
-        runtime_id: String::new(),
-        protocol: Protocol::Postgres,
-        status: InstanceStatus::Running,
-        desired_state: DesiredInstanceState::Running,
-        disk_limit_blocked: false,
-        public: PublicEndpoint {
-            host: "db.example.test".to_string(),
-            port: 15432,
-        },
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: format!("/run/dbev/{instance_id}/postgres.sock"),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: format!("dbe-{instance_id}"),
-            network_mode: "none".to_string(),
-        },
-        database: DatabaseIdentity {
-            name: format!("db_{instance_id}"),
-            username: format!("user_{instance_id}"),
-        },
-        route_key_sha256: None,
-        mariadb_native_password_sha1_stage2: None,
-        mariadb_root_password: None,
-        mysql_native_password_sha1_stage2: None,
-        mysql_root_password: None,
-        mongodb_root_password: None,
-        postgres_admin_password: None,
-        tenant_password: None,
-        limits: tenant_limits(),
-        image: None,
-        database_version: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    let mut metadata = crate::instances::test_support::metadata(instance_id, Protocol::Postgres);
+    metadata.public.host = "db.example.test".to_string();
+    metadata.public.port = 15432;
+    metadata.backend = BackendEndpoint::UnixSocket {
+        socket_path: format!("/run/dbev/{instance_id}/postgres.sock"),
+    };
+    metadata.runtime.container_name = format!("dbe-{instance_id}");
+    metadata.database.name = format!("db_{instance_id}");
+    metadata.database.username = format!("user_{instance_id}");
+    metadata.limits = tenant_limits();
+    metadata
 }
 
 fn shared_instance(

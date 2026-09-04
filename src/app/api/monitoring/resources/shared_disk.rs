@@ -595,24 +595,14 @@ mod tests {
     use super::*;
 
     fn hard_tenant() -> InstanceMetadata {
-        let mut metadata: InstanceMetadata = serde_json::from_value(serde_json::json!({
-            "schema_version": 1,
-            "instance_id": "tenant-a",
-            "deployment_mode": "shared",
-            "runtime_id": "pool-a",
-            "protocol": "mysql",
-            "status": "running",
-            "public": {"host": "db.example.com", "port": 3306},
-            "backend": {"kind": "unix_socket", "socket_path": "/run/mysql.sock"},
-            "runtime": {"kind": "docker", "container_name": "pool-a", "network_mode": "none"},
-            "database": {"name": "app_a", "username": "tenant_a"},
-            "limits": {"cpu_cores": 1.0, "memory_mib": 256, "disk_mib": 1024,
-                "disk_enforced": true, "disk_enforcement_method": "host_linux_project_quota"},
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap();
-        metadata.desired_state = DesiredInstanceState::Running;
+        let mut metadata = crate::instances::test_support::shared_metadata();
+        metadata.limits = crate::shared::limits::InstanceLimits {
+            cpu_cores: 1.0,
+            memory_mib: 256,
+            disk_mib: 1024,
+            disk_enforced: true,
+            disk_enforcement_method: "host_linux_project_quota".to_string(),
+        };
         metadata
     }
 

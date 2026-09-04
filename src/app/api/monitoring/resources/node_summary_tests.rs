@@ -4,12 +4,7 @@ use super::{
     sampler::{host_cpu_percent_between, parse_host_cpu, parse_host_memory},
     shared_disk::reported_disk_used_bytes,
 };
-use crate::{
-    instances::metadata::{
-        DatabaseIdentity, PublicEndpoint, RuntimeKind, RuntimeMetadata, SCHEMA_VERSION,
-    },
-    shared::{backend::BackendEndpoint, limits::InstanceLimits},
-};
+use crate::shared::{backend::BackendEndpoint, limits::InstanceLimits};
 use bollard::models::{
     ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerStatsResponse,
 };
@@ -526,36 +521,13 @@ fn running_shared_pool_is_sampled_when_all_tenants_are_stopped() {
 }
 
 fn shared_runtime(runtime_id: &str, protocol: Protocol) -> crate::placement::EngineRuntime {
-    use crate::placement::{
-        DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus,
-        RuntimeReservation,
+    let mut runtime = crate::placement::test_support::runtime(runtime_id, protocol, "test:latest");
+    runtime.backend = BackendEndpoint::UnixSocket {
+        socket_path: format!("/run/{runtime_id}.sock"),
     };
-
-    EngineRuntime {
-        schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-        runtime_id: runtime_id.to_string(),
-        protocol,
-        deployment_mode: DeploymentMode::Shared,
-        status: EngineRuntimeStatus::Running,
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: format!("/run/{runtime_id}.sock"),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: runtime_id.to_string(),
-            network_mode: "none".to_string(),
-        },
-        limits: InstanceLimits::default(),
-        image: "test:latest".to_string(),
-        database_version: None,
-        compatibility: None,
-        compatibility_key: "test".to_string(),
-        max_tenants: 10,
-        reserved: RuntimeReservation::default(),
-        admin_secret: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    runtime.runtime.container_name = runtime_id.to_string();
+    runtime.compatibility_key = "test".to_string();
+    runtime
 }
 
 #[test]
@@ -754,43 +726,15 @@ fn metadata_with_limits(
     status: InstanceStatus,
     limits: InstanceLimits,
 ) -> InstanceMetadata {
-    InstanceMetadata {
-        schema_version: SCHEMA_VERSION,
-        instance_id: instance_id.to_string(),
-        deployment_mode: crate::placement::DeploymentMode::Dedicated,
-        runtime_id: String::new(),
-        protocol: Protocol::Mysql,
-        status,
-        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
-        disk_limit_blocked: false,
-        public: PublicEndpoint {
-            host: "127.0.0.1".to_string(),
-            port: 3308,
-        },
-        backend: BackendEndpoint::UnixSocket {
-            socket_path: format!("/run/dbev/sockets/{instance_id}/mysqld.sock"),
-        },
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::Docker,
-            container_name: format!("dbe-mysql-{instance_id}"),
-            network_mode: "none".to_string(),
-        },
-        database: DatabaseIdentity {
-            name: format!("db_{instance_id}"),
-            username: format!("user_{instance_id}"),
-        },
-        route_key_sha256: None,
-        mariadb_native_password_sha1_stage2: None,
-        mariadb_root_password: None,
-        mysql_native_password_sha1_stage2: None,
-        mysql_root_password: None,
-        mongodb_root_password: None,
-        postgres_admin_password: None,
-        tenant_password: None,
-        limits,
-        image: None,
-        database_version: None,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    }
+    let mut metadata = crate::instances::test_support::metadata(instance_id, Protocol::Mysql);
+    metadata.status = status;
+    metadata.limits = limits;
+    metadata.public.host = "127.0.0.1".to_string();
+    metadata.public.port = 3308;
+    metadata.backend = BackendEndpoint::UnixSocket {
+        socket_path: format!("/run/dbev/sockets/{instance_id}/mysqld.sock"),
+    };
+    metadata.database.name = format!("db_{instance_id}");
+    metadata.database.username = format!("user_{instance_id}");
+    metadata
 }

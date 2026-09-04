@@ -55,3 +55,17 @@ pub(crate) fn metadata(instance_id: &str, protocol: Protocol) -> InstanceMetadat
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     }
 }
+
+/// Shared MySQL tenant used by lifecycle, job-lock, and quota tests.
+pub(crate) fn shared_metadata() -> InstanceMetadata {
+    let mut metadata = metadata("tenant-a", Protocol::Mysql);
+    metadata.deployment_mode = DeploymentMode::Shared;
+    metadata.runtime_id = "pool-a".to_string();
+    metadata.backend = BackendEndpoint::UnixSocket {
+        socket_path: "/run/mysql.sock".to_string(),
+    };
+    metadata.runtime.container_name = "pool-a".to_string();
+    metadata.database.name = "app_a".to_string();
+    metadata.database.username = "tenant_a".to_string();
+    metadata
+}

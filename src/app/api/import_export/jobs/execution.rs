@@ -399,31 +399,14 @@ fn estimate_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
 mod lock_tests {
     use super::*;
 
-    fn shared_job_metadata() -> InstanceMetadata {
-        serde_json::from_value(serde_json::json!({
-            "schema_version": 1,
-            "instance_id": "tenant-a",
-            "deployment_mode": "shared",
-            "runtime_id": "pool-a",
-            "protocol": "mysql",
-            "status": "running",
-            "public": {"host": "db.example.com", "port": 3306},
-            "backend": {"kind": "unix_socket", "socket_path": "/run/mysql.sock"},
-            "runtime": {"kind": "docker", "container_name": "pool-a", "network_mode": "none"},
-            "database": {"name": "app_a", "username": "tenant_a"},
-            "limits": crate::shared::limits::InstanceLimits::default(),
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z"
-        }))
-        .unwrap()
-    }
+    use crate::instances::test_support::shared_metadata;
 
     #[tokio::test]
     async fn shared_job_locks_runtime_only_after_reconcile_releases_it() {
         let locks = crate::instances::locks::InstanceLocks::default();
         let _tenant_operation = locks.lock("tenant-a").await;
         let reconcile_locks = locks.clone();
-        let metadata = shared_job_metadata();
+        let metadata = shared_metadata();
 
         let (_, runtime_operation) = tokio::time::timeout(
             Duration::from_secs(1),
@@ -442,7 +425,7 @@ mod lock_tests {
 
     #[test]
     fn job_target_identity_rejects_pool_or_tenant_replacement() {
-        let snapshot = shared_job_metadata();
+        let snapshot = shared_metadata();
         let mut current = snapshot.clone();
         assert!(same_job_target(&snapshot, &current));
         current.runtime_id = "pool-b".to_string();

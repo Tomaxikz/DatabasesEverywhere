@@ -278,6 +278,16 @@ mod tests {
     const EXAMPLE_CONFIG_YAML: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config/example.yml"));
 
+    #[track_caller]
+    fn strings(value: &Value) -> Vec<&str> {
+        value
+            .as_sequence()
+            .expect("schema array")
+            .iter()
+            .map(|value| value.as_str().expect("schema string"))
+            .collect()
+    }
+
     #[test]
     fn openapi_advertises_remote_import_capability_and_discriminator() {
         let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
@@ -285,37 +295,29 @@ mod tests {
 
         let schemas = &document["components"]["schemas"];
         let system = &schemas["SystemResponse"];
-        assert!(system["properties"]["remote_import_enabled"].is_mapping());
-        assert!(system["properties"]["valkey_enabled"].is_mapping());
-        assert!(system["properties"]["deployment_capabilities"].is_mapping());
         for field in [
+            "remote_import_enabled",
+            "valkey_enabled",
+            "deployment_capabilities",
             "prevent_cpu_overallocation",
             "prevent_memory_overallocation",
             "prevent_disk_overallocation",
         ] {
-            assert!(system["properties"][field].is_mapping());
+            assert!(system["properties"][field].is_mapping(), "missing {field}");
+        }
+        let required = strings(&system["required"]);
+        for field in [
+            "remote_import_enabled",
+            "deployment_capabilities",
+            "prevent_cpu_overallocation",
+            "prevent_memory_overallocation",
+            "prevent_disk_overallocation",
+        ] {
             assert!(
-                system["required"]
-                    .as_sequence()
-                    .expect("SystemResponse required array")
-                    .iter()
-                    .any(|required| required.as_str() == Some(field))
+                required.contains(&field),
+                "SystemResponse must require {field}"
             );
         }
-        assert!(
-            system["required"]
-                .as_sequence()
-                .expect("SystemResponse required array")
-                .iter()
-                .any(|field| field.as_str() == Some("remote_import_enabled"))
-        );
-        assert!(
-            system["required"]
-                .as_sequence()
-                .expect("SystemResponse required array")
-                .iter()
-                .any(|field| field.as_str() == Some("deployment_capabilities"))
-        );
 
         let discriminator = &schemas["ImportRequest"]["properties"]["source"]["discriminator"];
         assert_eq!(discriminator["propertyName"].as_str(), Some("type"));
@@ -350,12 +352,7 @@ mod tests {
         let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let schemas = &document["components"]["schemas"];
 
-        let protocols = schemas["Protocol"]["enum"]
-            .as_sequence()
-            .expect("Protocol enum")
-            .iter()
-            .map(|value| value.as_str().expect("protocol string"))
-            .collect::<Vec<_>>();
+        let protocols = strings(&schemas["Protocol"]["enum"]);
         assert_eq!(
             protocols,
             Protocol::ALL
@@ -363,12 +360,7 @@ mod tests {
                 .map(|protocol| protocol.as_str())
                 .collect::<Vec<_>>()
         );
-        let modes = schemas["DeploymentMode"]["enum"]
-            .as_sequence()
-            .expect("DeploymentMode enum")
-            .iter()
-            .map(|value| value.as_str().expect("deployment mode string"))
-            .collect::<Vec<_>>();
+        let modes = strings(&schemas["DeploymentMode"]["enum"]);
         assert_eq!(modes, ["dedicated", "shared"]);
 
         let create = &schemas["CreateInstanceRequest"];
@@ -376,24 +368,12 @@ mod tests {
             create["properties"]["deployment_mode"]["default"].as_str(),
             Some("dedicated")
         );
-        assert!(
-            !create["required"]
-                .as_sequence()
-                .expect("CreateInstanceRequest required array")
-                .iter()
-                .any(|field| field.as_str() == Some("deployment_mode"))
-        );
+        assert!(!strings(&create["required"]).contains(&"deployment_mode"));
 
         let instance = &schemas["Instance"];
         assert_eq!(instance["additionalProperties"].as_bool(), Some(false));
         for field in ["deployment_mode", "runtime_id"] {
-            assert!(
-                instance["required"]
-                    .as_sequence()
-                    .expect("Instance required array")
-                    .iter()
-                    .any(|required| required.as_str() == Some(field))
-            );
+            assert!(strings(&instance["required"]).contains(&field));
         }
 
         // Limits returned by the daemon add two enforcement fields to the
@@ -405,12 +385,7 @@ mod tests {
             instance_limits["additionalProperties"].as_bool(),
             Some(false)
         );
-        let limit_fields = instance_limits["required"]
-            .as_sequence()
-            .expect("InstanceLimits required array")
-            .iter()
-            .map(|field| field.as_str().expect("limit field name"))
-            .collect::<Vec<_>>();
+        let limit_fields = strings(&instance_limits["required"]);
         assert_eq!(
             limit_fields,
             [
@@ -438,12 +413,7 @@ mod tests {
         );
 
         let pool = &schemas["ResourceReport"]["properties"]["pool"];
-        let required = pool["required"]
-            .as_sequence()
-            .expect("ResourceReport pool required array")
-            .iter()
-            .map(|field| field.as_str().expect("pool field name"))
-            .collect::<Vec<_>>();
+        let required = strings(&pool["required"]);
         assert_eq!(
             required,
             [
@@ -488,12 +458,7 @@ mod tests {
         let migration = &schemas["DeploymentMigration"];
 
         assert_eq!(migration["additionalProperties"].as_bool(), Some(false));
-        let required = migration["required"]
-            .as_sequence()
-            .expect("DeploymentMigration required array")
-            .iter()
-            .map(|field| field.as_str().expect("migration field name"))
-            .collect::<Vec<_>>();
+        let required = strings(&migration["required"]);
         assert_eq!(
             required,
             [
@@ -512,12 +477,7 @@ mod tests {
             ]
         );
 
-        let stages = schemas["DeploymentMigrationStage"]["enum"]
-            .as_sequence()
-            .expect("DeploymentMigrationStage enum")
-            .iter()
-            .map(|stage| stage.as_str().expect("migration stage"))
-            .collect::<Vec<_>>();
+        let stages = strings(&schemas["DeploymentMigrationStage"]["enum"]);
         let expected_stages = [
             crate::placement::MigrationStage::Requested,
             crate::placement::MigrationStage::Preflight,
@@ -557,12 +517,7 @@ mod tests {
             assert!(description.contains("stable"));
             assert!(description.contains("sanitized"));
         }
-        let failure_codes = migration["properties"]["failure_code"]["enum"]
-            .as_sequence()
-            .expect("stable migration failure codes")
-            .iter()
-            .map(|code| code.as_str().expect("failure code"))
-            .collect::<Vec<_>>();
+        let failure_codes = strings(&migration["properties"]["failure_code"]["enum"]);
         assert_eq!(
             failure_codes,
             [
@@ -659,14 +614,10 @@ mod tests {
     fn openapi_advertises_backup_storage_and_catalog_browsing() {
         let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let info = &document["components"]["schemas"]["BackupInfo"];
-        let info_required = info["required"]
-            .as_sequence()
-            .expect("BackupInfo required array");
+        let info_required = strings(&info["required"]);
         for field in ["protocol", "layout"] {
             assert!(
-                info_required
-                    .iter()
-                    .any(|required| required.as_str() == Some(field)),
+                info_required.contains(&field),
                 "BackupInfo omits restore-compatibility field {field}"
             );
         }
