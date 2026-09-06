@@ -15,6 +15,7 @@ the panel backend; authorize each tenant before calling its instance endpoints.
 
 - [Authentication](api/auth.md): credentials, scopes, errors, and version checks.
 - [Instances](api/instances.md): placement, creation, lifecycle, limits, and migrations.
+- [Pools](api/pools.md): server-owned engines, child databases, power and logs.
 - [Monitoring](api/monitoring.md): resource metrics, tenant activity, and history.
 - [Transfers](api/transfers.md): uploads, import/export jobs, backups, and downloads.
 - [WebSockets](api/websockets.md): event handling, reconnection, and restart state.

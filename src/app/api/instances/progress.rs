@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -22,6 +22,7 @@ const MAX_ADMITTED_CREATIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct InstallProgressStore {
+    revision: Arc<AtomicU64>,
     inner: Arc<RwLock<HashMap<String, InstallProgress>>>,
     accepting: Arc<AtomicBool>,
     active_creations: Arc<AtomicUsize>,
@@ -44,6 +45,7 @@ pub struct CreationPermit {
 impl Default for InstallProgressStore {
     fn default() -> Self {
         Self {
+            revision: Arc::new(AtomicU64::new(1)),
             inner: Arc::default(),
             accepting: Arc::new(AtomicBool::new(true)),
             active_creations: Arc::default(),
@@ -61,7 +63,11 @@ impl InstallProgressStore {
         }) {
             return;
         }
-        let _ = set_progress(&mut entries, progress);
+        let _ = set_progress(
+            &mut entries,
+            progress,
+            self.revision.fetch_add(1, Ordering::Relaxed),
+        );
     }
 
     pub fn try_begin_creation(
@@ -89,6 +95,7 @@ impl InstallProgressStore {
         if !set_progress(
             &mut entries,
             creation_progress(instance_id, protocol, image),
+            self.revision.fetch_add(1, Ordering::Relaxed),
         ) {
             return Err(BeginCreationError::Capacity);
         }
@@ -168,6 +175,7 @@ impl InstallProgressStore {
 
     pub fn begin_image_update(&self, instance_id: &str, protocol: Protocol, image: &str) {
         self.set(InstallProgress {
+            revision: 0,
             instance_id: instance_id.to_string(),
             protocol: protocol.to_string(),
             action: "image_update".to_string(),
@@ -186,6 +194,7 @@ impl InstallProgressStore {
 
     pub fn begin_major_upgrade(&self, instance_id: &str, protocol: Protocol, image: &str) {
         self.set(InstallProgress {
+            revision: 0,
             instance_id: instance_id.to_string(),
             protocol: protocol.to_string(),
             action: "major_upgrade".to_string(),
@@ -286,13 +295,21 @@ impl InstallProgressStore {
 
     fn set(&self, progress: InstallProgress) {
         let mut entries = self.inner.write().expect("install progress lock poisoned");
-        let _ = set_progress(&mut entries, progress);
+        let _ = set_progress(
+            &mut entries,
+            progress,
+            self.revision.fetch_add(1, Ordering::Relaxed),
+        );
     }
 
     fn update(&self, instance_id: &str, update: impl FnOnce(&mut InstallProgress)) {
         let mut progress = self.inner.write().expect("install progress lock poisoned");
         if let Some(progress) = progress.get_mut(instance_id) {
+            let before = progress.clone();
             update(progress);
+            if *progress != before {
+                progress.revision = self.revision.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -305,8 +322,10 @@ impl Drop for CreationPermit {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InstallProgress {
+    #[serde(skip)]
+    pub(crate) revision: u64,
     pub instance_id: String,
     pub protocol: String,
     pub action: String,
@@ -333,6 +352,7 @@ pub enum InstallProgressStatus {
 
 fn creation_progress(instance_id: &str, protocol: Protocol, image: &str) -> InstallProgress {
     InstallProgress {
+        revision: 0,
         instance_id: instance_id.to_string(),
         protocol: protocol.to_string(),
         action: "create".to_string(),
@@ -349,7 +369,11 @@ fn creation_progress(instance_id: &str, protocol: Protocol, image: &str) -> Inst
     }
 }
 
-fn set_progress(entries: &mut HashMap<String, InstallProgress>, progress: InstallProgress) -> bool {
+fn set_progress(
+    entries: &mut HashMap<String, InstallProgress>,
+    mut progress: InstallProgress,
+    revision: u64,
+) -> bool {
     if entries.len() >= MAX_INSTALL_PROGRESS_ENTRIES && !entries.contains_key(&progress.instance_id)
     {
         let candidate = entries
@@ -362,6 +386,7 @@ fn set_progress(entries: &mut HashMap<String, InstallProgress>, progress: Instal
         };
         entries.remove(&instance_id);
     }
+    progress.revision = revision;
     entries.insert(progress.instance_id.clone(), progress);
     true
 }
@@ -393,6 +418,29 @@ fn apply_failure(progress: &mut InstallProgress, diagnostic: PublicDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn progress_revisions_survive_reuse_but_are_not_public() {
+        let store = InstallProgressStore::default();
+        store.begin("tenant", Protocol::Mysql, "mysql:8.4");
+        store.complete("tenant", "done");
+        let before = store.get("tenant").unwrap();
+        store.fail_if_running_api_error(
+            "tenant",
+            "creation",
+            &ApiError::Conflict("ignored".into()),
+        );
+        assert_eq!(store.get("tenant").unwrap().revision, before.revision);
+        assert!(
+            serde_json::to_value(&before)
+                .unwrap()
+                .get("revision")
+                .is_none()
+        );
+        store.remove("tenant");
+        store.begin("tenant", Protocol::Mysql, "mysql:8.4");
+        assert!(store.get("tenant").unwrap().revision > before.revision);
+    }
+
     use super::*;
 
     #[test]

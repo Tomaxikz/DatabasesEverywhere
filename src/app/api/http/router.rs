@@ -352,19 +352,52 @@ fn instance_routes() -> Router<AppState> {
 
 fn resource_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/pools/{runtime_id}/image",
+            patch(crate::api::pools::image::update),
+        )
+        .route(
+            "/api/pools/{runtime_id}/logs",
+            get(crate::api::pools::streams::logs),
+        )
+        .route(
+            "/api/pools/{runtime_id}/backups",
+            get(crate::api::pools::streams::backups),
+        )
+        .route(
+            "/ws/pools/{runtime_id}/logs",
+            get(crate::api::pools::streams::log_socket),
+        )
+        .route(
+            "/ws/pools/{runtime_id}/monitoring",
+            get(crate::api::pools::streams::monitoring),
+        )
+        .route(
+            "/api/pools/{runtime_id}/status",
+            get(crate::api::pools::status),
+        )
+        .route(
+            "/api/pools/{runtime_id}/power",
+            post(crate::api::pools::power),
+        )
         .route("/api/admin/resources", get(resources::list_resources))
         .route(
             "/api/admin/resources/summary",
             get(resources::node_resource_summary),
         )
-        .route("/api/admin/shared-pools", get(resources::list_shared_pools))
         .route(
-            "/api/admin/shared-pools/{runtime_id}",
-            get(resources::get_shared_pool),
+            "/api/pools",
+            get(resources::list_shared_pools).post(crate::api::pools::create),
         )
         .route(
-            "/api/admin/shared-pools/{runtime_id}/instances",
-            get(resources::list_pool_tenants),
+            "/api/pools/{runtime_id}",
+            get(resources::get_shared_pool)
+                .patch(crate::api::pools::resize_pool)
+                .delete(crate::api::pools::delete),
+        )
+        .route(
+            "/api/pools/{runtime_id}/instances",
+            get(resources::list_pool_tenants).post(crate::api::pools::create_database),
         )
         .route(
             "/api/instances/{instance_id}/resources",
@@ -404,7 +437,7 @@ fn import_export_routes() -> Router<AppState> {
         )
         .route(
             "/api/instances/{instance_id}/import/uploads/{upload_id}/catalog",
-            post(import_export::inspect_import_upload),
+            get(import_export::get_import_catalog).post(import_export::inspect_import_upload),
         )
         .route(
             "/api/instances/{instance_id}/import-export/jobs",

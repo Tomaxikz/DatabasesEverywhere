@@ -13,6 +13,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InstanceMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::placement::PoolOwner>,
     pub schema_version: u32,
     pub instance_id: String,
     #[serde(default)]

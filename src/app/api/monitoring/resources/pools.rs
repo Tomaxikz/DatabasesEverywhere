@@ -21,10 +21,13 @@ use crate::{
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SharedPoolReport {
+    pub owner: Option<crate::placement::PoolOwner>,
     pub runtime_id: String,
     pub protocol: Protocol,
     pub status: EngineRuntimeStatus,
+    pub desired_state: &'static str,
     pub image: String,
+    pub pending_image: Option<String>,
     pub database_version: Option<String>,
     pub tenant_count: u32,
     pub max_tenants: u32,
@@ -36,7 +39,6 @@ pub(crate) struct SharedPoolReport {
 #[derive(Debug, Serialize)]
 pub(crate) struct PoolCpu {
     pub limit_cores: f64,
-    pub reserved_cores: f64,
     pub usage_percent: Option<f64>,
     pub sample: PoolMetricSample,
 }
@@ -44,7 +46,6 @@ pub(crate) struct PoolCpu {
 #[derive(Debug, Serialize)]
 pub(crate) struct PoolMemory {
     pub limit_bytes: u64,
-    pub reserved_bytes: u64,
     pub usage_bytes: Option<u64>,
     pub sample: PoolMetricSample,
 }
@@ -188,7 +189,7 @@ pub(crate) async fn list_shared_pools(
     State(state): State<AppState>,
     auth: ApiRequestContext,
 ) -> ApiResult<Vec<SharedPoolReport>> {
-    auth.require_scope(scopes::RESOURCES_ADMIN)?;
+    auth.require_scope(scopes::POOLS_READ)?;
     let runtimes = shared_runtimes(&state).await?;
     let reports = pool_reports(&state, &runtimes).await?;
     Ok(ApiResponse::ok(reports))
@@ -199,7 +200,7 @@ pub(crate) async fn get_shared_pool(
     auth: ApiRequestContext,
     ApiPath(runtime_id): ApiPath<String>,
 ) -> ApiResult<SharedPoolReport> {
-    auth.require_scope(scopes::RESOURCES_ADMIN)?;
+    auth.require_scope(scopes::POOLS_READ)?;
     let runtime = state
         .placements
         .get(&runtime_id)
@@ -221,7 +222,7 @@ pub(crate) async fn list_pool_tenants(
     auth: ApiRequestContext,
     ApiPath(runtime_id): ApiPath<String>,
 ) -> ApiResult<Vec<SharedPoolTenant>> {
-    auth.require_scope(scopes::RESOURCES_ADMIN)?;
+    auth.require_scope(scopes::POOLS_READ)?;
     let runtime = state
         .placements
         .get(&runtime_id)
@@ -245,6 +246,7 @@ pub(crate) async fn list_pool_tenants(
         if metadata.deployment_mode != DeploymentMode::Shared
             || metadata.runtime_id() != runtime.runtime_id
             || metadata.protocol != runtime.protocol
+            || metadata.owner != runtime.owner
         {
             return Err(ApiError::Runtime(format!(
                 "shared pool {} has inconsistent tenant metadata",
@@ -278,7 +280,7 @@ async fn shared_runtimes(state: &AppState) -> Result<Vec<EngineRuntime>, ApiErro
         })
 }
 
-async fn pool_reports(
+pub(crate) async fn pool_reports(
     state: &AppState,
     runtimes: &[EngineRuntime],
 ) -> Result<Vec<SharedPoolReport>, ApiError> {
@@ -314,22 +316,23 @@ async fn pool_reports(
             clock,
         );
         reports.push(SharedPoolReport {
+            owner: runtime.owner.clone(),
             runtime_id: runtime.runtime_id.clone(),
             protocol: runtime.protocol,
             status: runtime.status,
+            desired_state: runtime.desired_state.as_str(),
             image: runtime.image.clone(),
+            pending_image: runtime.pending_image.clone(),
             database_version: runtime.database_version.clone(),
             tenant_count: runtime.reserved.tenants,
             max_tenants: runtime.max_tenants,
             cpu: PoolCpu {
                 limit_cores: runtime.limits.cpu_cores,
-                reserved_cores: runtime.reserved.cpu_cores,
                 usage_percent: cpu_usage_percent,
                 sample: cpu_sample,
             },
             memory: PoolMemory {
                 limit_bytes: mib_to_bytes(runtime.limits.memory_mib),
-                reserved_bytes: mib_to_bytes(runtime.reserved.memory_mib),
                 usage_bytes: memory_usage_bytes,
                 sample: memory_sample,
             },

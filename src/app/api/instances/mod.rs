@@ -40,9 +40,9 @@ pub(crate) use deployment::{
 use major_upgrade::*;
 #[cfg(test)]
 use normal_image_update::quarantine_image_metadata;
+pub(crate) use normal_image_update::spawn_owned_mutation_task;
 use normal_image_update::{
     image_quarantine_summary, image_update_spec, quarantine_image_update, run_image_update,
-    spawn_owned_mutation_task,
 };
 pub(crate) use password::verify_resp_credential;
 pub use password::{
@@ -367,7 +367,9 @@ pub async fn update_instance_limits(
     ApiJson(request): ApiJson<LimitsRequest>,
 ) -> ApiResult<InstanceMetadata> {
     auth.require_scope(scopes::INSTANCES_WRITE)?;
-    validate_limits(&request)?;
+    if request.disk_mib == 0 || request.disk_mib > u64::MAX / (1024 * 1024) {
+        return Err(ApiError::BadRequest("disk_mib must be positive".into()));
+    }
     let mutation = state
         .daemon_shutdown
         .try_admit_background_mutation()
@@ -407,7 +409,10 @@ async fn resize_instance(
         .await
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(state, instance_id).await?;
-    validate_protocol_limits(metadata.protocol, &request)?;
+    if metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated {
+        validate_limits(&request)?;
+        validate_protocol_limits(metadata.protocol, &request)?;
+    }
     let limits = limits_from_request(&request);
     let previous_limits = metadata.limits.clone();
     if metadata.deployment_mode == crate::placement::DeploymentMode::Shared {
@@ -659,7 +664,7 @@ pub(crate) fn check_logs_available(metadata: &InstanceMetadata) -> Result<(), Ap
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
     Start,

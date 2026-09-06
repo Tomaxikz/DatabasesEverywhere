@@ -10,7 +10,10 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Claims {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PoolGrant>,
     pub iss: String,
     pub aud: String,
     pub sub: String,
@@ -31,8 +34,35 @@ impl Claims {
     /// Node-wide access is explicit. An empty allow-list never silently
     /// broadens a token to every tenant.
     pub fn allows_instance(&self, instance_id: &str) -> bool {
-        self.all_instances || self.instances.iter().any(|allowed| allowed == instance_id)
+        self.pools.is_empty()
+            && (self.all_instances || self.instances.iter().any(|allowed| allowed == instance_id))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolGrant {
+    pub runtime_id: String,
+    pub owner: crate::placement::PoolOwner,
+    pub created_at: String,
+}
+
+impl PoolGrant {
+    pub(crate) fn matches(&self, pool: &crate::placement::EngineRuntime) -> bool {
+        pool.deployment_mode == crate::placement::DeploymentMode::Shared
+            && pool.runtime_id == self.runtime_id
+            && pool.created_at == self.created_at
+            && pool.owner.as_ref() == Some(&self.owner)
+    }
+}
+
+pub(crate) enum WsTargets {
+    Instances {
+        instances: Vec<String>,
+        all_instances: bool,
+        generation: Option<String>,
+    },
+    Pools(Vec<PoolGrant>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,18 +84,25 @@ pub enum JwtAuthError {
     MissingInstance { instance_id: String },
 }
 
-pub fn issue_ws_token(
+pub(crate) fn issue_ws_token(
     secret: &[u8],
     subject: &str,
     scopes: Vec<String>,
-    instances: Vec<String>,
-    all_instances: bool,
-    instance_generation_digest: Option<String>,
+    targets: WsTargets,
     ttl_seconds: i64,
 ) -> Result<(String, i64), JwtAuthError> {
     let now = now_unix();
     let exp = now + ttl_seconds;
+    let (instances, all_instances, instance_generation_digest, pools) = match targets {
+        WsTargets::Instances {
+            instances,
+            all_instances,
+            generation,
+        } => (instances, all_instances, generation, Vec::new()),
+        WsTargets::Pools(pools) => (Vec::new(), false, None, pools),
+    };
     let claims = Claims {
+        pools,
         iss: ISSUER.to_string(),
         aud: AUDIENCE.to_string(),
         sub: subject.to_string(),
@@ -270,12 +307,14 @@ mod tests {
             secret,
             "panel",
             vec![scopes::MONITOR_READ.to_string()],
-            vec!["inst_abc".to_string()],
-            false,
-            Some(instance_generation_digest(&[(
-                "inst_abc".to_string(),
-                "generation-a".to_string(),
-            )])),
+            WsTargets::Instances {
+                instances: vec!["inst_abc".into()],
+                all_instances: false,
+                generation: Some(instance_generation_digest(&[(
+                    "inst_abc".into(),
+                    "generation-a".into(),
+                )])),
+            },
             60,
         )
         .unwrap();
@@ -290,6 +329,7 @@ mod tests {
     fn claims(scope: &str, instance_id: &str, ttl_seconds: i64) -> Claims {
         let now = now_unix();
         Claims {
+            pools: Vec::new(),
             iss: ISSUER.to_string(),
             aud: AUDIENCE.to_string(),
             sub: "admin".to_string(),

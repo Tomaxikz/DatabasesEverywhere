@@ -82,4 +82,6 @@ pub enum PlacementRepositoryError {
 }
 
 #[cfg(test)]
+mod owner_tests;
+#[cfg(test)]
 mod tests;

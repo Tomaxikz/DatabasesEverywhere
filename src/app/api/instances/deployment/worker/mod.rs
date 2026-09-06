@@ -14,8 +14,8 @@ use crate::{
         instances::{
             create::{
                 attest_dedicated_target, build_dedicated_target, build_shared_metadata,
-                claim_shared_runtime, destroy_empty_shared_runtime, enforce_node_allocation_policy,
-                launch_dedicated_target, resolve_image,
+                claim_shared_runtime, enforce_node_allocation_policy, launch_dedicated_target,
+                resolve_image,
             },
             requests::{CreateInstanceRequest, LimitsRequest},
         },

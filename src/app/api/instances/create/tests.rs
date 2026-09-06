@@ -1,10 +1,8 @@
 use super::*;
 use crate::{
-    api::test_support,
-    auth::api_token::ApiToken,
+    api::test_support::database as test_state,
     config::{Config, ImageAllowlistConfig, ImageConfig},
-    instances::{manager::InstanceManager, state::InstanceStore},
-    storage::{repositories::InstanceRepository, sqlite},
+    instances::state::InstanceStore,
 };
 
 #[tokio::test]
@@ -150,9 +148,20 @@ async fn create_never_adopts_or_purges_an_existing_runtime_id() {
 
 #[tokio::test]
 async fn shared_create_waits_for_boot_recovery() {
-    let (state, _directory) = test_state(Config::default()).await;
+    let (state, _directory) = test_state(Config {
+        token_id: "test-panel".into(),
+        ..Default::default()
+    })
+    .await;
     let mut request = create_request(Protocol::Postgres);
     request.deployment_mode = crate::placement::DeploymentMode::Shared;
+    request.server_id = Some("server-a".into());
+    request.pool_id = Some("existing-pool".into());
+    request.limits = Some(crate::api::instances::requests::LimitsRequest {
+        cpu_cores: 0.0,
+        memory_mib: 0,
+        disk_mib: 1024,
+    });
 
     let error = create_instance_from_request(&state, request)
         .await
@@ -188,25 +197,19 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
         image.clone(),
     );
     runtime.deployment_mode = crate::placement::DeploymentMode::Shared;
-    runtime.max_tenants = crate::placement::policy::max_tenants(Protocol::Postgres).unwrap();
-    runtime.limits = crate::placement::policy::pool_limits(Protocol::Postgres, &limits).unwrap();
-    runtime.compatibility_key =
-        crate::placement::policy::compatibility_key(Protocol::Postgres, &image);
+    runtime.max_tenants = 64;
+    runtime.limits = crate::shared::limits::InstanceLimits::default();
+    runtime.owner = Some(crate::placement::test_support::owner("handoff-server"));
+    request.server_id = Some("handoff-server".into());
+    request.pool_id = Some(runtime.runtime_id.clone());
+    request.owner = runtime.owner.clone();
+
     state.placements.save(&runtime).await.unwrap();
 
-    let mut creation = Some(state.instance_locks.lock_creation().await);
-    let (claimed, created_pool, operation) = super::shared::claim_runtime(
-        &state,
-        &request,
-        &image,
-        limits.clone(),
-        &limits,
-        &mut creation,
-    )
-    .await
-    .unwrap();
-    assert!(!created_pool);
-    assert!(creation.is_none());
+    let (claimed, operation) =
+        super::shared::claim_runtime(&state, &request, &image, &mut limits.clone())
+            .await
+            .unwrap();
     assert_eq!(
         state
             .placements
@@ -350,6 +353,9 @@ fn cpu_allocation_guard_allows_decreases_while_overcommitted() {
 
 fn create_request(protocol: Protocol) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        server_id: None,
+        pool_id: None,
+        owner: None,
         instance_id: "inst_test_pg".to_string(),
         protocol,
         deployment_mode: crate::placement::DeploymentMode::Dedicated,
@@ -383,18 +389,92 @@ fn sample_metadata(
     metadata
 }
 
-pub(super) async fn test_state(config: Config) -> (AppState, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let store = InstanceStore::default();
-    let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
-    let state = test_support::state(
-        config,
-        dir.path().join("config.yml"),
-        ApiToken::new("secret"),
-        store,
-        manager,
-        pool,
-    );
-    (state, dir)
+#[tokio::test]
+async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool() {
+    for protocol in Protocol::ALL
+        .into_iter()
+        .filter(|protocol| crate::placement::DeploymentMode::Shared.supports(*protocol))
+    {
+        for problem in ["stopped", "full", "image", "owner", "disk"] {
+            let (state, _dir) = test_state(Config::default()).await;
+            let mut pool = crate::placement::test_support::runtime(
+                "existing-pool",
+                protocol,
+                "existing-image",
+            );
+            pool.owner = Some(crate::placement::test_support::owner("server-a"));
+            pool.max_tenants = 1;
+            pool.limits.disk_mib = 4096;
+            if problem == "stopped" {
+                pool.status = crate::placement::EngineRuntimeStatus::Stopped;
+            }
+            state.placements.save(&pool).await.unwrap();
+            let mut limits = crate::shared::limits::InstanceLimits {
+                disk_mib: 128,
+                ..Default::default()
+            };
+            if problem == "full" {
+                state
+                    .placements
+                    .reserve(crate::placement::ReserveTenant {
+                        owner: pool.owner.clone().unwrap(),
+                        instance_id: "existing-tenant",
+                        runtime_id: &pool.runtime_id,
+                        database: "existing_db",
+                        username: "existing_user",
+                        limits: &limits,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut request = create_request(protocol);
+            request.server_id = Some("server-a".into());
+            request.pool_id = Some("existing-pool".into());
+            request.owner = pool.owner.clone();
+            request.deployment_mode = crate::placement::DeploymentMode::Shared;
+            request.image = (problem == "image").then(|| "different-image".into());
+            if problem == "owner" {
+                request.owner = Some(crate::placement::test_support::owner("another-server"));
+            }
+            if problem == "disk" {
+                limits.disk_mib = pool.limits.disk_mib + 1;
+            }
+            let image = request.image.as_deref().unwrap_or("existing-image");
+            let error = super::shared::claim_runtime(&state, &request, image, &mut limits)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.status(),
+                http::StatusCode::CONFLICT,
+                "{protocol}/{problem}: {error}"
+            );
+            assert_eq!(state.placements.list().await.unwrap().len(), 1);
+            assert!(
+                state
+                    .placements
+                    .get_reservation(&request.instance_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if problem == "full" {
+                request.limits = Some(crate::api::instances::requests::LimitsRequest {
+                    cpu_cores: 0.0,
+                    memory_mib: 0,
+                    disk_mib: 128,
+                });
+                let instance_id = request.instance_id.clone();
+                let error = super::shared::create(&state, request).await.unwrap_err();
+                assert_eq!(error.status(), http::StatusCode::CONFLICT);
+                let diagnostic = state
+                    .install_progress
+                    .get(&instance_id)
+                    .unwrap()
+                    .diagnostic
+                    .unwrap();
+                assert_eq!(diagnostic.code, "conflict");
+                assert!(diagnostic.message.contains("shared_pool_full"));
+            }
+        }
+    }
 }

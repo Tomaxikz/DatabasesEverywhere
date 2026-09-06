@@ -8,12 +8,9 @@ use super::{
     purge_runtime_paths, purge_shared_tenant_paths, route_fence,
 };
 use crate::{
-    api::{
-        http::{
-            response::{ApiError, ApiResponse, ApiResult},
-            router::AppState,
-        },
-        instances::create::enforce_node_allocation_policy,
+    api::http::{
+        response::{ApiError, ApiResponse, ApiResult},
+        router::AppState,
     },
     disk::DiskEnforcement,
     instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
@@ -462,23 +459,27 @@ pub(super) async fn resize(
     }
     let previous_limits = metadata.limits.clone();
     let previous_runtime = load_runtime(state, &metadata).await?;
-    let mut admission = requested.clone();
-    if requested.disk_mib > previous_limits.disk_mib {
-        let added = requested.disk_mib - previous_limits.disk_mib;
-        let growth = crate::placement::policy::pool_disk_growth_mib(
-            metadata.protocol,
-            previous_runtime.reserved.disk_mib,
-            added,
-        )
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "{} cannot use shared deployment",
-                metadata.protocol
-            ))
-        })?;
-        admission.disk_mib = previous_limits.disk_mib.saturating_add(growth);
+    if requested.cpu_cores != 0.0 || requested.memory_mib != 0 {
+        return Err(ApiError::BadRequest(
+            "shared tenant resize accepts disk_mib only; resize pool CPU/RAM separately".into(),
+        ));
     }
-    enforce_node_allocation_policy(state, &admission, Some(&previous_limits)).await?;
+    requested.cpu_cores = previous_limits.cpu_cores;
+    requested.memory_mib = previous_limits.memory_mib;
+    let next_disk = previous_runtime
+        .reserved
+        .disk_mib
+        .checked_sub(previous_limits.disk_mib)
+        .and_then(|value| value.checked_add(requested.disk_mib))
+        .ok_or_else(|| ApiError::Conflict("shared_pool_full: disk reservation overflow".into()))?;
+    if crate::placement::policy::pool_disk_mib(metadata.protocol, next_disk)
+        .is_none_or(|disk| disk > previous_runtime.limits.disk_mib)
+    {
+        return Err(ApiError::Conflict(
+            "shared_pool_full: resize the pool before increasing this tenant's disk allowance"
+                .into(),
+        ));
+    }
     if previous_runtime.status != EngineRuntimeStatus::Running {
         return Err(ApiError::Conflict(
             "the shared database runtime is not available".to_string(),
@@ -949,6 +950,8 @@ async fn load_runtime(
     if runtime.deployment_mode != DeploymentMode::Shared
         || runtime.protocol != metadata.protocol
         || runtime.runtime_id != runtime_id
+        || metadata.owner.is_none()
+        || runtime.owner != metadata.owner
     {
         return Err(ApiError::Conflict(
             "tenant placement does not match its shared runtime".to_string(),

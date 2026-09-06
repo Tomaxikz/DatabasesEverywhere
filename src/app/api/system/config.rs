@@ -91,7 +91,7 @@ fn apply_config_patch(path: &Path, patch: Value) -> Result<(), ApiError> {
     let config: Config = serde_json::from_value(document)
         .map_err(|error| ApiError::BadRequest(format!("invalid config patch: {error}")))?;
     validate_config(&config).map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let yaml = serde_yaml::to_string(&config)
+    let yaml = yaml_serde::to_string(&config)
         .map_err(|error| ApiError::Runtime(format!("failed to encode config: {error}")))?;
     atomic_replace_private(path, yaml.as_bytes())
         .map_err(|error| ApiError::Runtime(format!("failed to write config: {error}")))

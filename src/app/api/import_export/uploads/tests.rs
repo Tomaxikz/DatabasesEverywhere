@@ -526,3 +526,146 @@ async fn retryable_inspection_retains_detected_wrapper_for_hardening() {
         None
     );
 }
+
+#[test]
+fn upload_summaries_never_decode_or_serialize_the_catalog() {
+    let upload = crate::storage::import_uploads::ImportUpload {
+        upload_id: "upl_test".into(),
+        instance_id: "tenant".into(),
+        original_filename: "dump.sql".into(),
+        stored_filename: "private.dump".into(),
+        protocol: Protocol::Mysql,
+        archive_format: Some(ImportUploadArchiveFormat::Plain),
+        state: ImportUploadState::Ready,
+        size_bytes: 1024,
+        sha256: Some("a".repeat(64)),
+        catalog_json: Some("deliberately invalid and large catalog".repeat(10_000)),
+        last_error: None,
+        claimed_job_id: None,
+        created_at: "now".into(),
+        updated_at: "now".into(),
+        expires_at: "later".into(),
+    };
+    assert!(upload_catalog(&upload).is_err());
+    let summary = serde_json::to_value(public_upload(upload.clone())).unwrap();
+    assert_eq!(summary["catalog_available"], true);
+    assert!(summary.get("catalog").is_none());
+    assert!(summary.get("stored_filename").is_none());
+    assert!(serde_json::to_vec(&summary).unwrap().len() < 1024);
+    let mut missing = upload;
+    missing.catalog_json = None;
+    assert_eq!(
+        upload_catalog(&missing).unwrap_err().status(),
+        http::StatusCode::CONFLICT
+    );
+    assert!(!public_upload(missing).catalog_available);
+}
+
+#[tokio::test]
+async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrapper() {
+    use crate::{
+        api::http::router::build_router,
+        auth::api_token::ApiToken,
+        instances::{manager::InstanceManager, state::InstanceStore},
+        storage::repositories::InstanceRepository,
+    };
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let db = crate::storage::sqlite::connect(directory.path())
+        .await
+        .unwrap();
+    let instances = InstanceStore::default();
+    for id in ["owner", "other"] {
+        let mut metadata = crate::instances::test_support::metadata(id, Protocol::Mysql);
+        metadata.database.username = format!("user_{id}");
+        InstanceRepository::new(db.clone())
+            .upsert(&metadata)
+            .await
+            .unwrap();
+        instances.upsert(metadata).await;
+    }
+    let manager = InstanceManager::new(instances.clone(), InstanceRepository::new(db.clone()));
+    let state = crate::api::test_support::state(
+        crate::config::Config {
+            remote: "https://panel.example.test".into(),
+            ..Default::default()
+        },
+        directory.path().join("config.yml"),
+        ApiToken::new("test-token"),
+        instances,
+        manager,
+        db,
+    );
+    let id = format!("upl_{}", "a".repeat(32));
+    let catalog = serde_json::json!({
+        "protocol":"mysql","sha256":"a".repeat(64),"source_size_bytes":1024,
+        "detected_archive_format":"plain","selection_kind":"tables",
+        "selective_supported":true,"catalog_complete":true,"namespaces":[],
+        "objects":[{"kind":"table","name":"users","selection_key":"users"}],
+        "unselectable_object_count":0
+    });
+    state
+        .import_uploads
+        .repo()
+        .insert(&ImportUpload {
+            upload_id: id.clone(),
+            instance_id: "owner".into(),
+            original_filename: "dump.sql".into(),
+            stored_filename: "dump.sql".into(),
+            protocol: Protocol::Mysql,
+            archive_format: Some(ImportUploadArchiveFormat::Plain),
+            state: ImportUploadState::Ready,
+            size_bytes: 1024,
+            sha256: Some("a".repeat(64)),
+            catalog_json: Some(catalog.to_string()),
+            last_error: None,
+            claimed_job_id: None,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            updated_at: "2026-09-01T00:00:00Z".into(),
+            expires_at: "2099-09-01T00:00:00Z".into(),
+        })
+        .await
+        .unwrap();
+    let app = build_router(state);
+    for method in ["GET", "POST"] {
+        for (instance, token, expected) in [
+            ("owner", "test-token", StatusCode::OK),
+            ("other", "test-token", StatusCode::NOT_FOUND),
+            ("owner", "wrong-token", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!(
+                            "/api/instances/{instance}/import/uploads/{id}/catalog"
+                        ))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "{method}/{instance}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            if expected == StatusCode::OK {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    catalog
+                );
+            }
+        }
+    }
+}

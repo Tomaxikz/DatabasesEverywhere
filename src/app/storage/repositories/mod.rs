@@ -488,13 +488,15 @@ impl InstanceRepository {
                 backend_kind, backend_socket_path, backend_host, backend_port,
                 runtime_kind, container_name, network, limits_json,
                 limit_cpu_cores, limit_memory_mib, limit_disk_mib,
-                image, database_version, compatibility_key, max_tenants, created_at, updated_at
+                image, database_version, max_tenants, created_at, updated_at, owner_panel, owner_server
             ) VALUES (
                 ?1, 1, ?2, 'dedicated', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, 1, ?18, ?19
+                ?11, ?12, ?13, ?14, ?15, ?16, 1, ?17, ?18, ?19, ?20
             )
             ON CONFLICT(runtime_id) DO UPDATE SET
                 status = excluded.status,
+                owner_panel = excluded.owner_panel,
+                owner_server = excluded.owner_server,
                 backend_kind = excluded.backend_kind,
                 backend_socket_path = excluded.backend_socket_path,
                 backend_host = excluded.backend_host,
@@ -533,12 +535,10 @@ impl InstanceRepository {
         )
         .bind(image)
         .bind(database_version)
-        .bind(format!(
-            "dedicated:{}:{}",
-            metadata.protocol, metadata.instance_id
-        ))
         .bind(&metadata.created_at)
         .bind(&metadata.updated_at)
+        .bind(metadata.owner.as_ref().map(|owner| owner.panel_id.as_str()))
+        .bind(metadata.owner.as_ref().map(|owner| owner.server_id.as_str()))
         .execute(&mut **transaction)
         .await?;
         Ok(())

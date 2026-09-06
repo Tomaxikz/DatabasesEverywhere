@@ -2,13 +2,15 @@
 
 [Documentation index](../README.md) · [OpenAPI](openapi.yml)
 
-DBEV has three management streams. Database clients use the protocol gateways,
+DBEV has instance and pool management streams. Database clients use the protocol gateways,
 not WebSockets; there is no raw SQL, table-change, or general CRUD event stream.
 
 | Endpoint | JWT scope | Delivery |
 | --- | --- | --- |
-| `/ws/monitoring` | `monitor:read` | Complete authorized snapshots, normally once per second |
-| `/ws/instances/{id}/logs?tail=100` | `logs:read` | Dedicated-container log snapshots |
+| `/ws/pools/{id}/monitoring` | `pools:monitor` | Whole-engine snapshots and pool progress |
+| `/ws/pools/{id}/logs?tail=100` | `pools:logs` | Reset and whole-engine log appends |
+| `/ws/monitoring` | `monitor:read` | Full instance snapshots + progress changes, normally once per second |
+| `/ws/instances/{id}/logs?tail=100` | `logs:read` | Reset, then dedicated-container log appends |
 | `/ws/instances/{id}/import-export?job_id=...` | `import-export:read` | Initial job snapshot, then updates; job filter optional |
 
 ## Authenticate and connect
@@ -26,7 +28,7 @@ The panel backend needs `ws-tokens:write` to call `POST /api/ws-token`:
 
 The response contains `token_type`, `token`, and `expires_at_unix`.
 
-- Subject and scopes must be non-empty. Only the three scopes above are accepted.
+- Subject and scopes must be non-empty. Instance scopes and pool scopes must not be mixed.
 - TTL defaults to 900 seconds; range 1–3,600.
 - Use an explicit allow-list of at most 256 existing instance IDs. Tokens bind
   to their current generations and cannot access a deleted/recreated replacement.
@@ -54,6 +56,13 @@ Sockets close at JWT expiry. Incoming messages/frames are limited to 16 KiB;
 write buffering is bounded and slow clients can be disconnected. Send no
 application commands; let the client library answer WebSocket Ping frames.
 
+## Pool streams
+
+[Pool integration](pools.md) describes owner-bound JWTs and the `pool_stats`
+event. Pool logs use the same reset/append/end protocol below, but identify
+`runtime_id` instead of `instance_id`. Mint a fresh token for each socket;
+a database-only subuser must not receive pool log access.
+
 ## Monitoring
 
 A `stats` message contains:
@@ -66,20 +75,30 @@ A `stats` message contains:
   "batch_index": 0,
   "batch_count": 1,
   "instances": [],
-  "install_progress": []
+  "progress_reset": false,
+  "install_progress": [],
+  "install_progress_removed": []
 }
 ```
 
 Instance entries identify `instance_id`, `runtime_id`, `deployment_mode`,
 `resource_scope`, protocol, status, runtime, activity, resources, and
-`resource_error`. See [monitoring](monitoring.md) for field meanings.
+`resource_error`. In API 0.16, `resources` contains only `cpu`, `memory`,
+and `disk`. Read identity/status from the outer item, and RX/TX only from
+`activity.rx_bytes`/`activity.tx_bytes`. Activity has no repeated instance ID.
+REST resource/activity responses remain self-contained.
+See [monitoring](monitoring.md) for metric meanings.
 
 Client state rules:
 
 1. Collect indexes `0..batch_count-1` for the same sequence.
-2. Replace the authorized instance/progress state only when the whole sequence
-   is present. A single batch is not a deletion or a delta.
-3. Discard an incomplete sequence when a newer one starts.
+2. Replace the authorized instance list only when the whole sequence is present.
+   For progress, first clear its cache if `progress_reset` is true, remove
+   `install_progress_removed` IDs (default empty), then upsert `install_progress`
+   by instance ID. Apply all of this atomically, never per batch.
+3. If a sequence is missing or incomplete when a newer one starts, discard the
+   partial batch and reconnect with a fresh JWT. Progress is now change-only;
+   skipping a sequence and continuing could permanently lose an update.
 4. Reset sequence tracking on reconnect; sequences are not replay cursors.
 5. Keep instances with `resources: null` and show their diagnostic. Missing
    telemetry does not mean deletion, zero usage, or a stopped database.
@@ -93,6 +112,10 @@ changes; never turn a counter reset into a spike.
 `install_progress` is in-memory progress for `create`, `image_update`, and
 `major_upgrade`, with `running`, `completed`, or `failed` status. Render
 stage/message and optional byte/percent progress without inventing steps.
+The first complete sequence after connect has `progress_reset: true` and
+includes all retained progress. Later sequences include only changed records;
+an empty array does not clear pending progress. Missing progress never means
+a database is installing: use its actual instance status.
 The `healthcheck` stage is a startup-readiness check, not a permanent probe.
 After a daemon restart, use REST instance state; progress history is not replayed.
 
@@ -102,25 +125,33 @@ After a daemon restart, use REST instance state; progress history is not replaye
 read physical pool logs through their instance endpoint.
 
 ```json
-{
-  "type": "logs",
-  "instance_id": "cust-42-db",
-  "sequence": 7,
-  "stdout": "...",
-  "stderr": "...",
-  "error": null
-}
+{"type":"logs","instance_id":"cust-42-db","sequence":0,"event":"reset"}
 ```
 
-- Messages arrive on output and on a 30-second snapshot heartbeat.
-- Replace each non-null stdout/stderr buffer; they are cumulative rolling
-  snapshots, **not deltas**. Each buffer retains at most 128 KiB.
-- Sequence numbers apply only to this connection and reset on reconnect.
-- Errors are public diagnostics; recognized secrets/URLs are redacted.
-- `stream_ended` means the followed container stream ended. Refresh instance
-  state, then reconnect if appropriate, particularly after image replacement.
-- Reconnecting recovers only the requested recent tail, not lossless history.
-  Open log sockets only while someone is viewing them.
+```json
+{"type":"logs","instance_id":"cust-42-db","sequence":1,"event":"append","stream":"stdout","data":"database ready\n"}
+```
+
+```json
+{"type":"logs","instance_id":"cust-42-db","sequence":2,"event":"end"}
+```
+
+- Clear the console on `reset`; append only `data` to the named stream on
+  `append`. The old cumulative `stdout`/`stderr` fields are gone.
+- A single Docker follow request delivers the requested history and then live
+  output. There is no separate history/live switch that can lose intervening logs.
+- Each append is UTF-8 safe and below 16 KiB. Keep a bounded client history.
+- Sequence numbers are local to the connection; reset them on reconnect and
+  ignore duplicate/stale events. Refresh/reconnect after a detected gap.
+- Heartbeats are Ping/Pong every 30 seconds, not repeated log text. Browsers
+  handle control Pong automatically; other clients must answer it.
+- Redaction buffers incomplete records across runtime chunks. An incomplete
+  final secret assignment is omitted. A record exceeding 128 KiB ends the
+  stream with `error.code: "log_record_limit"`; do not tightly retry the same tail.
+- `end` optionally includes a public `error`. Refresh instance state and reconnect
+  when appropriate. Reconnect clears the old console and recovers only the
+  requested recent tail, not guaranteed lossless history.
+- Open log sockets only while someone is viewing them.
 
 ## Import/export jobs
 
@@ -174,7 +205,6 @@ After restart:
 ## Panel checks
 
 Test fresh-token reconnects, expiry and restart closes, bounded backoff,
-complete batch replacement, null metrics, counter resets, log-buffer
-replacement, job upserts/lag recovery, expired downloads, and cleanup on logout.
+atomic instance snapshots/progress merges, null metrics, counter resets, log reset/append, job upserts/lag recovery, expired downloads, and cleanup on logout.
 REST command responses remain authoritative; a socket is not confirmation that
 a mutation succeeded.

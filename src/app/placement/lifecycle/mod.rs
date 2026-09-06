@@ -7,7 +7,7 @@ use futures::StreamExt;
 mod compatibility;
 
 use compatibility::attest_runtime_locked;
-pub(super) use compatibility::sync_shared_compatibility;
+pub(crate) use compatibility::sync_shared_compatibility;
 
 use crate::{
     api::http::router::AppState,
@@ -31,7 +31,7 @@ use crate::{
 const POOL_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct SharedReconcileSummary {
+pub(crate) struct SharedReconcileSummary {
     pub checked: usize,
     pub booting: usize,
     pub running: usize,
@@ -43,7 +43,7 @@ pub(super) struct SharedReconcileSummary {
 /// Restores hard limits for physical shared pools. Tenant ids never reach a
 /// container or filesystem-limit API here: each placement row is visited once
 /// and all physical work is keyed by `runtime_id`.
-pub(super) async fn restore_shared_limits(
+pub(crate) async fn restore_shared_limits(
     state: &AppState,
     disk_limiter: &DiskLimiter,
 ) -> anyhow::Result<()> {
@@ -106,7 +106,7 @@ pub(super) async fn restore_shared_limits(
 /// Finishes deletion of pools that have no durable tenant reservations. This
 /// runs after migration recovery and before limits, reconciliation, or route
 /// publication, so an interrupted cleanup cannot revive an orphaned engine.
-pub(super) async fn cleanup_empty_shared_runtimes(state: &AppState) -> usize {
+pub(crate) async fn recover_pool_deletions(state: &AppState) -> usize {
     let runtimes = match shared_runtimes(&state.placements).await {
         Ok(runtimes) => runtimes,
         Err(error) => {
@@ -116,6 +116,11 @@ pub(super) async fn cleanup_empty_shared_runtimes(state: &AppState) -> usize {
     };
     let outcomes = futures::stream::iter(runtimes)
         .map(|snapshot| async move {
+            // Unowned pools are quarantined for operator handling, not
+            // guessed empty or automatically adopted/deleted during upgrade.
+            if snapshot.owner.is_none() || snapshot.status != EngineRuntimeStatus::Deleting {
+                return false;
+            }
             let runtime_id = snapshot.runtime_id.clone();
             let _operation = state.instance_locks.lock(&runtime_id).await;
             match state.placements.tenant_count(&runtime_id).await {
@@ -243,7 +248,7 @@ fn needs_pool_adoption(current: DiskLimitMode, persisted_method: &str) -> bool {
             != Some(DiskLimitMode::ProjectQuota)
 }
 
-pub(super) async fn reconcile_shared_runtimes(
+pub(crate) async fn reconcile_shared_runtimes(
     state: &AppState,
 ) -> anyhow::Result<SharedReconcileSummary> {
     let runtimes = shared_runtimes(&state.placements).await?;
@@ -277,7 +282,7 @@ pub(super) async fn reconcile_shared_runtimes(
     Ok(summary)
 }
 
-async fn reconcile_one_runtime(
+pub(crate) async fn reconcile_one_runtime(
     state: &AppState,
     mut runtime: EngineRuntime,
 ) -> anyhow::Result<EngineRuntime> {
@@ -298,6 +303,9 @@ async fn reconcile_one_runtime(
                 containment.summary()
             );
         }
+        return Ok(runtime);
+    }
+    if honor_stop(state, &mut runtime).await? {
         return Ok(runtime);
     }
     match state
@@ -361,11 +369,144 @@ async fn reconcile_one_runtime(
     Ok(runtime)
 }
 
-pub(super) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()> {
+/// Caller holds the pool lock. Both boot and API power use this path.
+pub(crate) async fn activate_locked(
+    state: &AppState,
+    runtime: &mut EngineRuntime,
+    restart: bool,
+) -> anyhow::Result<()> {
+    if runtime.owner.is_none()
+        || matches!(
+            runtime.status,
+            EngineRuntimeStatus::Quarantined | EngineRuntimeStatus::Deleting
+        )
+    {
+        anyhow::bail!("pool is not eligible for activation");
+    }
+    if runtime.pending_image.is_none() {
+        runtime.desired_state = DesiredInstanceState::Running;
+    }
+    runtime.status = EngineRuntimeStatus::Booting;
+    runtime.updated_at = now_rfc3339();
+    fence_runtime(state, &runtime.runtime_id).await;
+    save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
+    let result = async {
+        check_shared_start_disk(state, runtime)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        crate::placement::runtime::apply_limits(
+            &state.docker,
+            &state.config,
+            &state.placements,
+            runtime,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        if restart {
+            state
+                .docker
+                .restart(runtime.protocol, &runtime.runtime_id)
+                .await?;
+        } else {
+            state
+                .docker
+                .start(runtime.protocol, &runtime.runtime_id)
+                .await?;
+        }
+        state
+            .docker
+            .wait_until_ready(runtime.protocol, &runtime.runtime_id, POOL_READY_TIMEOUT)
+            .await?;
+        attest_runtime_locked(state, runtime)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let inspection = state
+            .docker
+            .inspect_instance(runtime.protocol, &runtime.runtime_id)
+            .await?;
+        if inspection.network_mode.as_deref() != Some("none") {
+            anyhow::bail!("pool network isolation changed");
+        }
+        runtime.status = EngineRuntimeStatus::Running;
+        runtime.updated_at = now_rfc3339();
+        save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
+        if runtime.pending_image.is_none() {
+            let recovery = crate::placement::tenant::recovery::reconcile_runtime_tenants_locked(
+                state, runtime,
+            )
+            .await?;
+            anyhow::ensure!(recovery.pools_contained == 0, "pool failed tenant recovery");
+        }
+        state
+            .docker
+            .enforce_cpu_burst_policy(runtime.protocol, &runtime.runtime_id)
+            .await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = &result {
+        let containment = crate::api::instances::containment::contain_locked(
+            state,
+            runtime,
+            "pool activation failed",
+        )
+        .await;
+        tracing::error!(runtime_id = %runtime.runtime_id, %error, containment = %containment.summary());
+    }
+    clear_runtime_caches(state, &runtime.runtime_id).await;
+    result
+}
+
+pub(crate) async fn honor_stop(
+    state: &AppState,
+    runtime: &mut EngineRuntime,
+) -> anyhow::Result<bool> {
+    if runtime.pending_image.is_some() {
+        let report = crate::api::instances::containment::contain_locked(
+            state,
+            runtime,
+            "interrupted pool image update",
+        )
+        .await;
+        if !report.contained() {
+            anyhow::bail!(
+                "pool image recovery containment failed: {}",
+                report.summary()
+            );
+        }
+        runtime.status = EngineRuntimeStatus::Quarantined;
+        return Ok(true);
+    }
+    if runtime.desired_state != DesiredInstanceState::Stopped
+        || matches!(
+            runtime.status,
+            EngineRuntimeStatus::Quarantined | EngineRuntimeStatus::Deleting
+        )
+    {
+        return Ok(false);
+    }
+    fence_runtime(state, &runtime.runtime_id).await;
+    if let Err(error) = state
+        .docker
+        .stop(runtime.protocol, &runtime.runtime_id)
+        .await
+        && !error.is_not_found()
+        && !error.is_not_running()
+    {
+        return Err(error.into());
+    }
+    runtime.status = EngineRuntimeStatus::Stopped;
+    runtime.updated_at = now_rfc3339();
+    save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
+    clear_runtime_caches(state, &runtime.runtime_id).await;
+    Ok(true)
+}
+
+pub(crate) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()> {
     let runtimes = shared_runtimes(&state.placements).await?;
     let outcomes = futures::stream::iter(runtimes)
         .map(|snapshot| async move {
-            if shared_boot_action(snapshot.status).is_none() {
+            if shared_boot_action(snapshot.status, snapshot.desired_state).is_none() {
                 return Ok::<_, anyhow::Error>(None);
             }
             let runtime_id = snapshot.runtime_id.clone();
@@ -373,65 +514,17 @@ pub(super) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()
             let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
                 return Ok(None);
             };
-            let Some(action) = shared_boot_action(runtime.status) else {
+            if honor_stop(state, &mut runtime).await? {
+                return Ok(None);
+            }
+            let Some(action) = shared_boot_action(runtime.status, runtime.desired_state) else {
                 return Ok(None);
             };
-            if let Err(error) = check_shared_start_disk(state, &runtime).await {
-                runtime.status = EngineRuntimeStatus::Failed;
-                runtime.updated_at = now_rfc3339();
-                save_runtime(&state.placements, &state.manager, runtime).await?;
-                tracing::error!(
-                    event = "audit shared_runtime_disk_start_blocked",
-                    runtime_id,
-                    %error,
-                    "refused to activate a shared pool whose aggregate disk limit could not be verified"
-                );
+            let restart = matches!(action, SharedBootAction::Restart);
+            if let Err(error) = activate_locked(state, &mut runtime, restart).await {
+                tracing::error!(runtime_id, %error, "shared pool boot activation failed");
                 return Ok(Some(EngineRuntimeStatus::Failed));
             }
-            let activation = match action {
-                SharedBootAction::Start => state.docker.start(runtime.protocol, &runtime_id).await,
-                SharedBootAction::Restart => {
-                    state.docker.restart(runtime.protocol, &runtime_id).await
-                }
-            };
-            let result = match activation {
-                Ok(_) => state
-                    .docker
-                    .wait_until_ready(runtime.protocol, &runtime_id, POOL_READY_TIMEOUT)
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = result {
-                if let Err(stop) = state.docker.stop(runtime.protocol, &runtime_id).await
-                    && !stop.is_not_found()
-                    && !stop.is_not_running()
-                {
-                    tracing::error!(
-                        event = "audit shared_runtime_boot_cleanup_failed",
-                        runtime_id,
-                        %stop,
-                        "failed to stop a shared pool after boot activation failed"
-                    );
-                }
-                runtime.status = EngineRuntimeStatus::Failed;
-                runtime.updated_at = now_rfc3339();
-                save_runtime(&state.placements, &state.manager, runtime).await?;
-                tracing::error!(
-                    event = "audit shared_runtime_boot_failed",
-                    runtime_id,
-                    %error,
-                    "shared pool activation failed; all of its tenant routes remain isolated"
-                );
-                return Ok(Some(EngineRuntimeStatus::Failed));
-            }
-            runtime.status = EngineRuntimeStatus::Running;
-            runtime.updated_at = now_rfc3339();
-            save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
-            state
-                .docker
-                .enforce_cpu_burst_policy(runtime.protocol, &runtime_id)
-                .await;
             Ok(Some(EngineRuntimeStatus::Running))
         })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
@@ -462,7 +555,7 @@ pub(super) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()
     Ok(())
 }
 
-pub(super) async fn sync_shared_cpu_burst(
+pub(crate) async fn sync_shared_cpu_burst(
     placements: &PlacementRepository,
     docker: &DockerRuntime,
     locks: &InstanceLocks,
@@ -496,7 +589,7 @@ pub(super) async fn sync_shared_cpu_burst(
     Ok(())
 }
 
-pub(super) async fn reconcile_shared_event(
+pub(crate) async fn reconcile_shared_event(
     state: &AppState,
     event: ManagedContainerEvent,
 ) -> anyhow::Result<()> {
@@ -577,6 +670,9 @@ pub(super) async fn reconcile_shared_event(
         return Ok(());
     }
 
+    if honor_stop(state, &mut runtime).await? {
+        return Ok(());
+    }
     let previous = runtime.status;
     let activation = event.action.activates_container();
     let mut activation_error = None;
@@ -663,7 +759,8 @@ pub(super) async fn reconcile_shared_event(
     runtime.updated_at = now_rfc3339();
     save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
     if activation && runtime.status == EngineRuntimeStatus::Running {
-        super::shared_tenant_boot::reconcile_runtime_tenants_locked(state, &runtime).await?;
+        crate::placement::tenant::recovery::reconcile_runtime_tenants_locked(state, &runtime)
+            .await?;
     }
     clear_runtime_caches(state, &runtime_id).await;
     tracing::info!(
@@ -680,7 +777,7 @@ pub(super) async fn reconcile_shared_event(
     Ok(())
 }
 
-pub(super) async fn reconcile_shared_snapshot(state: &AppState) {
+pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
     let runtimes = match shared_runtimes(&state.placements).await {
         Ok(runtimes) => runtimes,
         Err(error) => {
@@ -695,6 +792,7 @@ pub(super) async fn reconcile_shared_snapshot(state: &AppState) {
             let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
                 return Ok::<_, anyhow::Error>(());
             };
+            if honor_stop(state, &mut runtime).await? { return Ok(()); }
             let previous = runtime.status;
             if runtime.status == EngineRuntimeStatus::Deleting {
                 return Ok(());
@@ -804,7 +902,7 @@ pub(super) async fn reconcile_shared_snapshot(state: &AppState) {
             runtime.updated_at = now_rfc3339();
             save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
             if replay_running && runtime.status == EngineRuntimeStatus::Running {
-                super::shared_tenant_boot::reconcile_runtime_tenants_locked(state, &runtime)
+                crate::placement::tenant::recovery::reconcile_runtime_tenants_locked(state, &runtime)
                     .await?;
             }
             clear_runtime_caches(state, &runtime_id).await;
@@ -826,7 +924,10 @@ pub(super) async fn reconcile_shared_snapshot(state: &AppState) {
     }
 }
 
-async fn check_shared_start_disk(state: &AppState, runtime: &EngineRuntime) -> Result<(), String> {
+pub(crate) async fn check_shared_start_disk(
+    state: &AppState,
+    runtime: &EngineRuntime,
+) -> Result<(), String> {
     let paths = InstancePaths::new(&state.config.paths, &runtime.runtime_id)
         .map_err(|error| error.to_string())?;
     let limiter =
@@ -862,7 +963,7 @@ async fn check_shared_start_disk(state: &AppState, runtime: &EngineRuntime) -> R
     Ok(())
 }
 
-pub(super) async fn isolate_runtime(
+pub(crate) async fn isolate_runtime(
     state: &AppState,
     runtime: EngineRuntime,
     reason: &str,
@@ -872,7 +973,7 @@ pub(super) async fn isolate_runtime(
         .contained()
 }
 
-pub(super) async fn mark_shared_disk_blocked(
+pub(crate) async fn mark_shared_disk_blocked(
     state: &AppState,
     target: &SoftDiskTarget,
 ) -> Result<bool, String> {
@@ -909,7 +1010,7 @@ fn shared_disk_target_is_current(runtime: &EngineRuntime, target: &SoftDiskTarge
         && mib_to_bytes(runtime.limits.disk_mib) == target.limit_bytes
 }
 
-async fn save_runtime(
+pub(crate) async fn save_runtime(
     placements: &PlacementRepository,
     manager: &InstanceManager,
     runtime: EngineRuntime,
@@ -924,6 +1025,7 @@ async fn save_runtime(
         if metadata.deployment_mode != DeploymentMode::Shared
             || metadata.runtime_id() != runtime.runtime_id
             || metadata.protocol != runtime.protocol
+            || metadata.owner != runtime.owner
         {
             tracing::error!(
                 event = "audit shared_runtime_tenant_mismatch",
@@ -943,6 +1045,9 @@ async fn save_runtime(
             database_version.current = Some(version.clone());
             database_version.error = None;
         }
+        if let Some(image) = &mut metadata.image {
+            image.current = Some(runtime.image.clone());
+        }
         metadata.updated_at = now_rfc3339();
         manager.upsert_preserving_fence(metadata).await?;
     }
@@ -958,7 +1063,7 @@ async fn shared_runtimes(placements: &PlacementRepository) -> anyhow::Result<Vec
         .collect())
 }
 
-async fn fence_runtime(state: &AppState, runtime_id: &str) -> bool {
+pub(crate) async fn fence_runtime(state: &AppState, runtime_id: &str) -> bool {
     let mut all_fenced = true;
     for instance_id in store_tenants(&state.manager, runtime_id).await {
         all_fenced &= crate::instances::sessions::fence(
@@ -971,7 +1076,7 @@ async fn fence_runtime(state: &AppState, runtime_id: &str) -> bool {
     all_fenced
 }
 
-async fn clear_runtime_caches(state: &AppState, runtime_id: &str) {
+pub(crate) async fn clear_runtime_caches(state: &AppState, runtime_id: &str) {
     let tenant_ids = store_tenants(&state.manager, runtime_id).await;
     state.instance_runtime_cache.remove(runtime_id).await;
     state.resource_cache.invalidate_runtime(runtime_id).await;
@@ -1087,7 +1192,13 @@ enum SharedBootAction {
     Restart,
 }
 
-fn shared_boot_action(status: EngineRuntimeStatus) -> Option<SharedBootAction> {
+fn shared_boot_action(
+    status: EngineRuntimeStatus,
+    desired: DesiredInstanceState,
+) -> Option<SharedBootAction> {
+    if desired == DesiredInstanceState::Stopped {
+        return None;
+    }
     match status {
         EngineRuntimeStatus::Stopped => Some(SharedBootAction::Start),
         EngineRuntimeStatus::Failed => Some(SharedBootAction::Restart),
@@ -1147,6 +1258,7 @@ mod tests {
         };
         placements
             .reserve(ReserveTenant {
+                owner: runtime.owner.clone().unwrap(),
                 instance_id: "tenant-in-progress",
                 runtime_id: &runtime.runtime_id,
                 database: "tenant_db",
@@ -1193,7 +1305,14 @@ mod tests {
             (EngineRuntimeStatus::Quarantined, None),
             (EngineRuntimeStatus::Deleting, None),
         ] {
-            assert_eq!(shared_boot_action(status), action);
+            assert_eq!(
+                shared_boot_action(status, DesiredInstanceState::Running),
+                action
+            );
+            assert_eq!(
+                shared_boot_action(status, DesiredInstanceState::Stopped),
+                None
+            );
         }
     }
 
@@ -1322,7 +1441,7 @@ mod tests {
             image_id: "sha256:image-id".to_string(),
             probe_revision: COMPATIBILITY_PROBE_REVISION,
         });
-        runtime.compatibility_key = "postgres:18:default".to_string();
+
         runtime.max_tenants = 32;
         runtime.created_at = "2026-08-27T00:00:00Z".to_string();
         runtime.updated_at = runtime.created_at.clone();

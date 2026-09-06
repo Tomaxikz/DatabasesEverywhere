@@ -28,6 +28,7 @@ pub(super) fn same_shared_identity(
     current: &InstanceMetadata,
 ) -> bool {
     current.created_at == snapshot.created_at
+        && current.owner == snapshot.owner
         && current.deployment_mode == DeploymentMode::Shared
         && current.runtime_id() == snapshot.runtime_id()
         && current.protocol == snapshot.protocol

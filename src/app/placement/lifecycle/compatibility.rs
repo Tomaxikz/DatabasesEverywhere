@@ -14,16 +14,14 @@ use crate::{
 use super::{isolate_runtime, save_runtime, shared_runtimes};
 
 #[derive(Debug, Clone, Default)]
-pub(in crate::cli) struct SharedCompatibilitySummary {
-    pub(in crate::cli) checked: usize,
-    pub(in crate::cli) reused: usize,
-    pub(in crate::cli) probed: usize,
-    pub(in crate::cli) failed: usize,
+pub(crate) struct SharedCompatibilitySummary {
+    pub(crate) checked: usize,
+    pub(crate) reused: usize,
+    pub(crate) probed: usize,
+    pub(crate) failed: usize,
 }
 
-pub(in crate::cli) async fn sync_shared_compatibility(
-    state: &AppState,
-) -> SharedCompatibilitySummary {
+pub(crate) async fn sync_shared_compatibility(state: &AppState) -> SharedCompatibilitySummary {
     let runtimes = match shared_runtimes(&state.placements).await {
         Ok(runtimes) => runtimes
             .into_iter()
@@ -88,7 +86,7 @@ async fn attest_runtime(state: &AppState, snapshot: EngineRuntime) -> AttestOutc
     }
 }
 
-pub(super) async fn attest_runtime_locked(
+pub(crate) async fn attest_runtime_locked(
     state: &AppState,
     runtime: &mut EngineRuntime,
 ) -> Result<(), String> {
@@ -114,7 +112,7 @@ async fn attest_locked(state: &AppState, runtime: &mut EngineRuntime) -> Result<
     Ok(true)
 }
 
-pub(super) fn attestation_matches(
+pub(crate) fn attestation_matches(
     runtime: &EngineRuntime,
     container_id: &str,
     image_id: &str,

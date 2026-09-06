@@ -39,12 +39,17 @@ The response includes `upload_id`, state, format, size, computed hash, and expir
 | --- | --- | --- |
 | GET | `/import/uploads` | `import-export:read` |
 | GET | `/import/uploads/{upload_id}` | `import-export:read` |
+| GET | `/import/uploads/{upload_id}/catalog` | `import-export:read` |
 | POST | `/import/uploads/{upload_id}/catalog` | `import-export:write` |
 | DELETE | `/import/uploads/{upload_id}` | `import-export:write` |
 
 Prefix these paths with `/api/instances/{id}`.
 
-Catalog inspection is optional for full imports and never executes the dump.
+Upload list/detail responses contain `catalog_available`, not an embedded
+`catalog`. When opened, GET the upload's `/catalog`; if unavailable (409),
+POST that endpoint to inspect. Both catalog methods return `DumpInspection`
+directly at the JSON root. Catalog inspection is optional for full imports
+and never executes the dump.
 Enable selective controls only when `selective_supported` is true; submit the
 returned object `selection_key` values. A preview catalog alone does not imply
 selective import support. Catalog admission can return `429`; bounded resource/
@@ -254,6 +259,10 @@ S3 configure encryption and cleanup of incomplete multipart uploads.
 Automatic retention is per instance and removes the oldest owned backups after
 successful backup creation until count and age limits are satisfied.
 Catalog browsing reads a bounded stored schema/row preview, not a running clone.
+With no `object` query, backup contents returns `objects` summaries with
+`column_count`, not full columns. Selecting `object` returns `selection.columns`
+and paged `selection.rows`, and omits `objects`; retain the cached object list.
+The existing offset/limit bounds and stored backup files are unchanged.
 Missing catalogs report `catalog_available: false`. Row previews are sensitive;
 set `preview_rows_per_object: 0` for schema-only browsing.
 

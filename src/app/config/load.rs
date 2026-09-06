@@ -14,7 +14,7 @@ pub enum ConfigLoadError {
     Parse {
         path: String,
         #[source]
-        source: serde_yaml::Error,
+        source: yaml_serde::Error,
     },
     #[error(transparent)]
     Validate(#[from] validate::ConfigValidationError),
@@ -32,7 +32,7 @@ pub(crate) fn parse_config_file(path: impl AsRef<Path>) -> Result<Config, Config
         path: path.display().to_string(),
         source,
     })?;
-    serde_yaml::from_str::<Config>(&content).map_err(|source| ConfigLoadError::Parse {
+    yaml_serde::from_str::<Config>(&content).map_err(|source| ConfigLoadError::Parse {
         path: path.display().to_string(),
         source,
     })
@@ -87,6 +87,30 @@ paths:
             0
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn yaml_roundtrip_preserves_strings_and_rejects_duplicate_settings() {
+        // These are strings, even when they resemble YAML booleans/numbers.
+        for token in ["on", "false", "null", "001", "1e3", "test: # $ @ 'value'"] {
+            let config = Config {
+                token: token.into(),
+                ..Config::default()
+            };
+            let encoded = yaml_serde::to_string(&config).unwrap();
+            let decoded: Config = yaml_serde::from_str(&encoded).unwrap();
+            assert_eq!(decoded.token, token);
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                serde_json::to_value(&config).unwrap()
+            );
+        }
+        for document in [
+            "token: first\ntoken: second\n",
+            "api:\n  port: 8090\n  port: 8091\n",
+        ] {
+            assert!(yaml_serde::from_str::<Config>(document).is_err());
+        }
     }
 
     #[test]
@@ -239,7 +263,7 @@ paths:
 
         assert_eq!(config.api.fqdn, "db.example.com");
         assert_eq!(config.api.trusted_hosts, ["panel.example.com"]);
-        let serialized = serde_yaml::to_string(&config).unwrap();
+        let serialized = yaml_serde::to_string(&config).unwrap();
         assert!(!serialized.contains("fqdn:"));
         assert!(!serialized.contains("trusted_hosts:"));
         assert_eq!(

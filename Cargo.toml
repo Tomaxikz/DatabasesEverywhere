@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
-aws-lc-rs = "1.17.1"
+aws-lc-rs = "1.18.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
@@ -26,7 +26,7 @@ bson = "2.13"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
-h2 = "0.4"
+h2 = "0.4.19"
 hdrhistogram = { version = "7.5", default-features = false }
 http = "1.1"
 http-body-util = "0.1"
@@ -41,7 +41,7 @@ rustls-pki-types = { version = "1.14", features = ["std"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
+yaml_serde = "0.10.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "multipart", "stream"] }
 sha1 = "0.10"
 sha2 = "0.10"

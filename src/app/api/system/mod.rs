@@ -19,13 +19,15 @@ use crate::{
 };
 
 // API compatibility is versioned independently from the daemon binary release.
-pub const API_VERSION: &str = "0.14.0";
+pub const API_VERSION: &str = "0.17.0";
 
 #[derive(Debug, Serialize)]
 pub struct DeploymentCapability {
     pub protocol: Protocol,
     pub enabled: bool,
     pub modes: Vec<DeploymentMode>,
+    pub shared_pool_scope: Option<&'static str>,
+    pub server_private_pools: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +127,10 @@ fn deployment_capabilities(config: &crate::config::Config) -> Vec<DeploymentCapa
                 protocol,
                 enabled: config.protocol_enabled(protocol),
                 modes,
+                shared_pool_scope: DeploymentMode::Shared
+                    .supports(protocol)
+                    .then_some("server"),
+                server_private_pools: DeploymentMode::Shared.supports(protocol),
             }
         })
         .collect()
@@ -271,7 +277,7 @@ pub async fn scheduler_recommendation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::Value;
+    use yaml_serde::Value;
 
     const OPENAPI_YAML: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/api/openapi.yml"));
@@ -290,7 +296,7 @@ mod tests {
 
     #[test]
     fn openapi_advertises_remote_import_capability_and_discriminator() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         assert_eq!(document["info"]["version"].as_str(), Some(API_VERSION));
 
         let schemas = &document["components"]["schemas"];
@@ -339,6 +345,16 @@ mod tests {
         for (capability, protocol) in capabilities.into_iter().zip(Protocol::ALL) {
             assert_eq!(capability.protocol, protocol);
             assert_eq!(capability.enabled, config.protocol_enabled(protocol));
+            assert_eq!(
+                capability.server_private_pools,
+                DeploymentMode::Shared.supports(protocol)
+            );
+            assert_eq!(
+                capability.shared_pool_scope,
+                DeploymentMode::Shared
+                    .supports(protocol)
+                    .then_some("server")
+            );
             assert_eq!(capability.modes.first(), Some(&DeploymentMode::Dedicated));
             assert_eq!(
                 capability.modes.contains(&DeploymentMode::Shared),
@@ -349,7 +365,7 @@ mod tests {
 
     #[test]
     fn openapi_shared_deployment_contract_matches_wire_policy() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let schemas = &document["components"]["schemas"];
 
         let protocols = strings(&schemas["Protocol"]["enum"]);
@@ -453,7 +469,7 @@ mod tests {
 
     #[test]
     fn openapi_deployment_migration_contract_matches_wire_types() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let schemas = &document["components"]["schemas"];
         let migration = &schemas["DeploymentMigration"];
 
@@ -578,7 +594,7 @@ mod tests {
 
     #[test]
     fn openapi_remote_source_constraints_match_request_validation() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let properties = &document["components"]["schemas"]["RemoteImportSource"]["properties"];
 
         assert_eq!(properties["host"]["minLength"].as_i64(), Some(1));
@@ -612,7 +628,7 @@ mod tests {
 
     #[test]
     fn openapi_advertises_backup_storage_and_catalog_browsing() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let info = &document["components"]["schemas"]["BackupInfo"];
         let info_required = strings(&info["required"]);
         for field in ["protocol", "layout"] {
@@ -656,7 +672,7 @@ mod tests {
 
     #[test]
     fn openapi_advertises_password_reset_without_response_credentials() {
-        let document: Value = serde_yaml::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
+        let document: Value = yaml_serde::from_str(OPENAPI_YAML).expect("valid OpenAPI YAML");
         let operation = &document["paths"]["/api/instances/{instance_id}/password"]["patch"];
         assert_eq!(
             operation["x-required-scope"].as_str(),
@@ -680,7 +696,7 @@ mod tests {
     #[test]
     fn example_config_includes_valid_backup_driver_settings() {
         let config: crate::config::Config =
-            serde_yaml::from_str(EXAMPLE_CONFIG_YAML).expect("valid example config YAML");
+            yaml_serde::from_str(EXAMPLE_CONFIG_YAML).expect("valid example config YAML");
         assert_eq!(
             config.backups.storage.driver,
             crate::config::BackupStorageDriver::Local

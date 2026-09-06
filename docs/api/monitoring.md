@@ -8,7 +8,7 @@
 | `GET /api/instances/{id}/activity` | `resources:read` | Live attributed activity |
 | `GET /api/instances/{id}/activity/history` | `resources:read` | Durable activity buckets |
 | `GET /api/admin/resources` | `resources:admin` | Node-wide resource reports |
-| `GET /api/admin/shared-pools` | `resources:admin` | Physical pool capacity and health |
+| `GET /api/pools` | `pools:read` | Physical pool capacity and health |
 | `GET /api/admin/resources/summary` | `resources:admin` | Node placement/admission view |
 
 Use [WebSockets](websockets.md) for live dashboards rather than polling each DB.
@@ -19,7 +19,7 @@ Use [WebSockets](websockets.md) for live dashboards rather than polling each DB.
 | --- | --- | --- |
 | Scope | `dedicated_instance` | `shared_tenant` |
 | CPU/RAM usage | Container measurement, or null if unavailable | Null; not individually attributable |
-| Configured CPU/RAM | Runtime limits | Reservations against shared pool capacity, not tenant cgroup ceilings |
+| Configured CPU/RAM | Runtime limits | Engine-operation budgets, not additive reservations or tenant cgroup ceilings |
 | Disk | Instance boundary | Tenant boundary; inspect reported enforcement strength |
 | RX/TX | Routed gateway bytes | Routed gateway bytes for this tenant |
 
@@ -42,6 +42,11 @@ Example dedicated report:
   "network": { "rx_bytes": 1234, "tx_bytes": 5678 }
 }
 ```
+
+In API 0.16 WebSocket items, identity/status is on the outer instance.
+Their `resources` includes only `cpu`, `memory`, and `disk`; read network
+totals from `activity.rx_bytes`/`activity.tx_bytes`. REST reports retain the
+self-contained shape above.
 
 ### Rendering rules
 

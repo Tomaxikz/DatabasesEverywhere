@@ -4,6 +4,7 @@ pub mod http;
 pub mod import_export;
 pub mod instances;
 pub mod monitoring;
+pub(crate) mod pools;
 pub mod system;
 
 #[cfg(test)]

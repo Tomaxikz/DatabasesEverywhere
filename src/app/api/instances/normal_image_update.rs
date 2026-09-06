@@ -394,7 +394,7 @@ pub(super) async fn run_image_update(
     }
 }
 
-pub(super) fn spawn_owned_mutation_task<F, T>(future: F) -> tokio::task::JoinHandle<T>
+pub(crate) fn spawn_owned_mutation_task<F, T>(future: F) -> tokio::task::JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,

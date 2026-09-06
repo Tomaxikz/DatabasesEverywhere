@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use databases_everywhere::{api::system::API_VERSION, auth::scopes};
-use serde_yaml::Value;
+use yaml_serde::Value;
 
 const INSTANCE_PATHS: &[&str] = &[
     "/api/instances/{instance_id}/activity",
@@ -28,12 +28,22 @@ const ADMIN_PATHS: &[&str] = &[
     "/api/admin/recovery/failed-jobs",
     "/api/admin/resources",
     "/api/admin/resources/summary",
-    "/api/admin/shared-pools",
-    "/api/admin/shared-pools/{runtime_id}",
-    "/api/admin/shared-pools/{runtime_id}/instances",
+    "/api/pools",
+    "/api/pools/{runtime_id}",
+    "/api/pools/{runtime_id}/instances",
+    "/api/pools/{runtime_id}/status",
+    "/api/pools/{runtime_id}/power",
+    "/api/pools/{runtime_id}/image",
+    "/api/pools/{runtime_id}/logs",
+    "/api/pools/{runtime_id}/backups",
+    "/ws/pools/{runtime_id}/logs",
+    "/ws/pools/{runtime_id}/monitoring",
 ];
 
 const RETIRED_PATHS: &[&str] = &[
+    "/api/admin/shared-pools",
+    "/api/admin/shared-pools/{runtime_id}",
+    "/api/admin/shared-pools/{runtime_id}/instances",
     "/api/artifacts",
     "/api/backups",
     "/api/import-export/jobs",
@@ -118,7 +128,7 @@ fn property_names(schema: &Value) -> HashSet<&str> {
 #[test]
 fn openapi_and_router_use_only_the_scoped_contract() {
     let source = include_str!("../docs/api/openapi.yml");
-    let document: Value = serde_yaml::from_str(source).expect("openapi.yml must be valid YAML");
+    let document: Value = yaml_serde::from_str(source).expect("openapi.yml must be valid YAML");
     let paths = document["paths"]
         .as_mapping()
         .expect("OpenAPI document must contain a paths mapping");
@@ -232,7 +242,7 @@ fn openapi_and_router_use_only_the_scoped_contract() {
 #[test]
 fn openapi_describes_the_current_response_contract() {
     let source = include_str!("../docs/api/openapi.yml");
-    let document: Value = serde_yaml::from_str(source).expect("openapi.yml must be valid YAML");
+    let document: Value = yaml_serde::from_str(source).expect("openapi.yml must be valid YAML");
     let schemas = &document["components"]["schemas"];
 
     assert_eq!(document["info"]["version"].as_str(), Some(API_VERSION));
@@ -439,6 +449,50 @@ fn openapi_describes_the_current_response_contract() {
         .collect();
     assert_eq!(
         ws_scope_values,
-        HashSet::from(["monitor:read", "logs:read", "import-export:read"])
+        HashSet::from([
+            "monitor:read",
+            "logs:read",
+            "import-export:read",
+            "pools:monitor",
+            "pools:logs"
+        ])
     );
+}
+
+#[test]
+fn lean_stream_and_catalog_schemas_match_the_current_payloads() {
+    let document: Value = yaml_serde::from_str(include_str!("../docs/api/openapi.yml")).unwrap();
+    let schemas = &document["components"]["schemas"];
+    assert_eq!(
+        property_names(&schemas["MonitoringResources"]),
+        HashSet::from(["cpu", "memory", "disk"])
+    );
+    assert!(!property_names(&schemas["MonitoringActivity"]).contains("instance_id"));
+    assert!(property_names(&schemas["MonitoringBatch"]).contains("progress_reset"));
+    assert!(property_names(&schemas["MonitoringBatch"]).contains("install_progress_removed"));
+    let logs = property_names(&schemas["LogEvent"]);
+    assert!(logs.contains("event") && logs.contains("stream") && logs.contains("data"));
+    assert!(!logs.contains("stdout") && !logs.contains("stderr"));
+    let summary = property_names(&schemas["ImportUpload"]);
+    assert!(summary.contains("catalog_available") && !summary.contains("catalog"));
+    let path =
+        &document["paths"]["/api/instances/{instance_id}/import/uploads/{upload_id}/catalog"];
+    for method in ["get", "post"] {
+        assert_eq!(
+            path[method]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                .as_str(),
+            Some("#/components/schemas/DumpInspection")
+        );
+    }
+    assert_eq!(
+        path["get"]["x-required-scope"].as_str(),
+        Some("import-export:read")
+    );
+    assert_eq!(
+        path["post"]["x-required-scope"].as_str(),
+        Some("import-export:write")
+    );
+    assert!(property_names(&schemas["BackupObjectSummary"]).contains("column_count"));
+    assert!(!property_names(&schemas["BackupObjectSummary"]).contains("columns"));
+    assert!(property_names(&schemas["BackupObjectSelection"]).contains("columns"));
 }

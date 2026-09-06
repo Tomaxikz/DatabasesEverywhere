@@ -2,7 +2,7 @@
 openapi: 3.1.0
 info:
   title: DatabasesEverywhere API
-  version: 0.14.0
+  version: 0.17.0
   description: API used by panels/addons to create, manage, monitor, back up, and restore hosted database instances.
 servers:
   - url: http://127.0.0.1:8090
@@ -26,7 +26,7 @@ components:
     DeploymentCapability:
       type: object
       additionalProperties: false
-      required: [protocol, enabled, modes]
+      required: [protocol, enabled, modes, shared_pool_scope, server_private_pools]
       properties:
         protocol:
           $ref: "#/components/schemas/Protocol"
@@ -39,19 +39,135 @@ components:
           uniqueItems: true
           items:
             $ref: "#/components/schemas/DeploymentMode"
+        shared_pool_scope: {type: [string, "null"], enum: [server, null]}
+        server_private_pools: {type: boolean}
+    PoolOwner:
+      type: object
+      additionalProperties: false
+      required: [panel_id, server_id]
+      properties:
+        panel_id: {type: string, description: Namespace derived from the authenticated daemon token_id; keep that identifier stable when rotating its secret.}
+        server_id: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_.-]+$'}
+    PoolLimits:
+      type: object
+      additionalProperties: false
+      required: [cpu_cores, memory_mib, disk_mib, max_tenants]
+      properties:
+        cpu_cores: {type: number, minimum: 0.01, maximum: 1024}
+        memory_mib: {type: integer, minimum: 1, maximum: 1048576}
+        disk_mib: {type: integer, minimum: 1, description: Fixed physical capacity including tenant allowances and engine-global overhead/spill.}
+        max_tenants: {type: integer, minimum: 1, maximum: 1024}
+    CreatePoolRequest:
+      type: object
+      additionalProperties: false
+      required: [server_id, protocol, limits]
+      properties:
+        server_id: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_.-]+$'}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        image: {type: [string, "null"]}
+        limits: {$ref: "#/components/schemas/PoolLimits"}
+    PoolAccepted:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, status, status_url]
+      properties:
+        runtime_id: {type: string}
+        status: {type: string, enum: [creating, updating]}
+        status_url: {type: string}
+    PoolStatus:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, status]
+      properties:
+        runtime_id: {type: string}
+        status: {type: string, enum: [creating, booting, running, stopped, failed, quarantined, deleting]}
+        progress: {$ref: "#/components/schemas/InstallProgress"}
+    CreatePoolDatabaseRequest:
+      type: object
+      additionalProperties: false
+      required: [instance_id, database, username, password, public_host, disk_mib]
+      properties:
+        instance_id: {type: string}
+        database: {type: string}
+        username: {type: string}
+        password: {type: string, format: password, writeOnly: true}
+        public_host: {type: string}
+        public_port: {type: [integer, "null"]}
+        disk_mib: {type: integer, minimum: 1}
+    PoolImageRequest:
+      type: object
+      additionalProperties: false
+      required: [image, confirm, reason]
+      properties:
+        image: {type: string}
+        confirm: {type: boolean, const: true}
+        reason: {type: string, minLength: 1}
+    PoolStats:
+      type: object
+      additionalProperties: false
+      required: [type, sequence, sampled_at_unix, pool, progress_reset, install_progress]
+      properties:
+        type: {type: string, const: pool_stats}
+        sequence: {type: integer, minimum: 1}
+        sampled_at_unix: {type: integer}
+        pool: {$ref: "#/components/schemas/SharedPoolReport"}
+        progress_reset: {type: boolean}
+        install_progress:
+          type: array
+          items: {$ref: "#/components/schemas/InstallProgress"}
+          description: Changes only. In this pool stream, progress.instance_id contains the parent runtime_id, never a child database ID.
+        install_progress_removed:
+          type: array
+          items: {type: string}
+    PoolLogEvent:
+      type: object
+      additionalProperties: false
+      required: [type, runtime_id, sequence, event]
+      properties:
+        type: {type: string, const: logs}
+        runtime_id: {type: string}
+        sequence: {type: integer, minimum: 0}
+        event: {type: string, enum: [reset, append, end]}
+        stream: {type: string, enum: [stdout, stderr]}
+        data: {type: string}
+        error: {$ref: "#/components/schemas/PublicDiagnostic"}
+    PoolLogs:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, stdout, stderr]
+      properties:
+        runtime_id: {type: string}
+        stdout: {type: string}
+        stderr: {type: string}
+    DeletePoolResponse:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, deleted]
+      properties:
+        runtime_id: {type: string}
+        deleted: {type: boolean}
+    PoolConfig:
+      type: object
+      additionalProperties: false
+      required: [runtime_id, owner, limits]
+      properties:
+        runtime_id: {type: string}
+        owner: {$ref: "#/components/schemas/PoolOwner"}
+        limits: {$ref: "#/components/schemas/PoolLimits"}
     LimitsRequest:
       type: object
       additionalProperties: false
-      required: [cpu_cores, memory_mib, disk_mib]
+      required: [disk_mib]
+      description: Dedicated requests require positive CPU and memory. Shared create/resize accepts disk_mib only; CPU and memory are configured on the parent pool.
       properties:
         cpu_cores:
           type: number
-          minimum: 0.01
+          minimum: 0
           maximum: 1024
           example: 0.5
         memory_mib:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 1048576
           example: 512
         disk_mib:
@@ -87,6 +203,15 @@ components:
       additionalProperties: false
       required: [instance_id, protocol, database, username, password, public_host]
       properties:
+        server_id:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_.-]+$'
+          description: Required for shared placement. Stable game-server identity supplied by the trusted panel backend, not an unchecked browser field. project_id is not an ownership key.
+        pool_id:
+          type: [string, "null"]
+          description: Required for shared placement. Create the parent pool first; the owner and engine must match.
         instance_id:
           type: string
           example: inst_server_123_pg
@@ -120,7 +245,7 @@ components:
         image:
           type: [string, "null"]
           example: postgres:18.4
-          description: Optional desired engine image. Dedicated mode pins it to this instance; shared mode selects or creates a compatible pool using it. The image must be the configured default or listed in images.allowed.<protocol>; omit this field to use the node default.
+          description: Optional allowed engine image. Shared mode reuses the server's existing pool; an explicit incompatible image returns 409, never a second pool. Omission reuses the existing pool image and never creates a pool.
         project_id:
           type: [string, "null"]
           example: server-123
@@ -139,6 +264,8 @@ components:
       additionalProperties: false
       required: [schema_version, instance_id, deployment_mode, runtime_id, protocol, status, public, backend, runtime, database, limits, created_at, updated_at]
       properties:
+        owner:
+          $ref: "#/components/schemas/PoolOwner"
         schema_version:
           type: integer
         instance_id:
@@ -244,6 +371,11 @@ components:
       additionalProperties: false
       required: [target_mode]
       properties:
+        server_id: {type: string, description: Required when assigning a previously dedicated instance to its first server-owned pool. Existing ownership cannot change.}
+        pool_id: {type: string, description: Required for a shared target; the pool must already exist and match the owner and engine.}
+        limits:
+          $ref: "#/components/schemas/LimitsRequest"
+          description: Optional positive resource limits for a dedicated target. Shared targets retain the source tenant disk allowance.
         target_mode:
           $ref: "#/components/schemas/DeploymentMode"
     DeploymentMigrationStage:
@@ -275,6 +407,8 @@ components:
       additionalProperties: false
       required: [migration_id, instance_id, protocol, source_mode, target_mode, source_runtime_id, stage, revision, source_fenced, cutover_committed, created_at, updated_at]
       properties:
+        target_pool_id: {type: string}
+        target_limits: {$ref: "#/components/schemas/InstanceLimits"}
         migration_id: {type: string, format: uuid}
         instance_id: {type: string}
         protocol: {$ref: "#/components/schemas/Protocol"}
@@ -302,7 +436,7 @@ components:
       properties:
         service: {type: string, const: databases-everywhere}
         version: {type: string}
-        api_version: {type: string, example: 0.14.0}
+        api_version: {type: string, example: 0.17.0}
         api_readiness:
           type: string
           const: ready
@@ -686,7 +820,7 @@ components:
     ImportUpload:
       type: object
       additionalProperties: false
-      required: [upload_id, instance_id, original_filename, protocol, archive_format, state, size_bytes, sha256, created_at, updated_at, expires_at]
+      required: [upload_id, instance_id, original_filename, protocol, archive_format, state, size_bytes, sha256, catalog_available, created_at, updated_at, expires_at]
       properties:
         upload_id:
           type: string
@@ -713,8 +847,9 @@ components:
           type: [string, "null"]
           pattern: '^[0-9a-f]{64}$'
           description: Daemon-computed digest; null only while reception has not committed.
-        catalog:
-          $ref: "#/components/schemas/DumpInspection"
+        catalog_available:
+          type: boolean
+          description: Catalog contents are fetched separately from the upload's /catalog endpoint.
         error:
           type: string
           description: Safe diagnostic for the most recent upload or inspection failure.
@@ -917,24 +1052,25 @@ components:
     BackupObjectSummary:
       type: object
       additionalProperties: false
-      required: [id, namespace, name, kind, estimated_rows, columns, captured_preview_rows, preview_truncated]
+      required: [id, namespace, name, kind, estimated_rows, column_count, captured_preview_rows, preview_truncated]
       properties:
         id: {type: string}
         namespace: {type: string}
         name: {type: string}
         kind: {type: string}
         estimated_rows: {type: [integer, "null"]}
-        columns:
-          type: array
-          items: {$ref: "#/components/schemas/BackupCatalogColumn"}
+        column_count: {type: integer, minimum: 0}
         captured_preview_rows: {type: integer, minimum: 0}
         preview_truncated: {type: boolean}
     BackupObjectSelection:
       type: object
       additionalProperties: false
-      required: [object_id, offset, limit, returned, total_captured, rows, truncated]
+      required: [object_id, columns, offset, limit, returned, total_captured, rows, truncated]
       properties:
         object_id: {type: string}
+        columns:
+          type: array
+          items: {$ref: "#/components/schemas/BackupCatalogColumn"}
         offset: {type: integer, minimum: 0}
         limit: {type: integer, minimum: 1, maximum: 100}
         returned: {type: integer, minimum: 0}
@@ -946,7 +1082,7 @@ components:
     BackupContentsResponse:
       type: object
       additionalProperties: false
-      required: [backup_id, instance_id, protocol, database_name, captured_at, consistency, catalog_available, truncated, warnings, objects, selection]
+      required: [backup_id, instance_id, protocol, database_name, captured_at, consistency, catalog_available, truncated, warnings, selection]
       properties:
         backup_id: {type: string}
         instance_id: {type: string}
@@ -961,6 +1097,7 @@ components:
           items: {type: string}
         objects:
           type: array
+          description: Present only when no object was selected. Omitted on row pages; do not clear a cached object list when absent.
           items: {$ref: "#/components/schemas/BackupObjectSummary"}
         selection:
           oneOf:
@@ -1008,14 +1145,22 @@ components:
       type: object
       additionalProperties: false
       required: [subject, scopes]
+      description: Use either instance targets with instance scopes, or pools plus server_id with pool scopes. Mixing target types or scopes is rejected. The panel must authorize access to every database in a pool before granting pool logs or metrics.
       properties:
+        server_id: {type: string, description: Required for pool targets; derived from the authorized game-server record.}
+        pools:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items: {type: string}
+          description: Explicit pool IDs, bound to their current owner and generation. No all-pools grant exists.
         subject:
           type: string
         scopes:
           type: array
           items:
             type: string
-            enum: [monitor:read, logs:read, import-export:read]
+            enum: [monitor:read, logs:read, import-export:read, pools:monitor, pools:logs]
           example: [monitor:read]
         instances:
           type: array
@@ -1141,6 +1286,86 @@ components:
         instance_id: {type: string}
         stdout: {type: string}
         stderr: {type: string}
+    MonitoringResources:
+      type: object
+      additionalProperties: false
+      required: [cpu, memory, disk]
+      properties:
+        cpu: {$ref: "#/components/schemas/ResourceReport/properties/cpu"}
+        memory: {$ref: "#/components/schemas/ResourceReport/properties/memory"}
+        disk: {$ref: "#/components/schemas/ResourceReport/properties/disk"}
+    MonitoringActivity:
+      type: object
+      additionalProperties: false
+      required: [stats_epoch, sampled_at_unix, accepted, rejected, active_connections, opened_connections, rx_bytes, tx_bytes, cpu_time_micros, peak_query_memory_bytes, sources]
+      properties:
+        stats_epoch: {$ref: "#/components/schemas/TenantActivity/properties/stats_epoch"}
+        sampled_at_unix: {$ref: "#/components/schemas/TenantActivity/properties/sampled_at_unix"}
+        accepted: {$ref: "#/components/schemas/TenantActivity/properties/accepted"}
+        rejected: {$ref: "#/components/schemas/TenantActivity/properties/rejected"}
+        active_connections: {$ref: "#/components/schemas/TenantActivity/properties/active_connections"}
+        opened_connections: {$ref: "#/components/schemas/TenantActivity/properties/opened_connections"}
+        rx_bytes: {$ref: "#/components/schemas/TenantActivity/properties/rx_bytes"}
+        tx_bytes: {$ref: "#/components/schemas/TenantActivity/properties/tx_bytes"}
+        cpu_time_micros: {$ref: "#/components/schemas/TenantActivity/properties/cpu_time_micros"}
+        peak_query_memory_bytes: {$ref: "#/components/schemas/TenantActivity/properties/peak_query_memory_bytes"}
+        sources: {$ref: "#/components/schemas/TenantActivity/properties/sources"}
+    MonitoringInstance:
+      type: object
+      additionalProperties: false
+      required: [instance_id, runtime_id, deployment_mode, resource_scope, protocol, status, runtime, activity, resources, resource_error]
+      properties:
+        instance_id: {type: string}
+        runtime_id: {type: string}
+        deployment_mode: {$ref: "#/components/schemas/DeploymentMode"}
+        resource_scope: {type: string, enum: [dedicated_instance, shared_tenant]}
+        protocol: {$ref: "#/components/schemas/Protocol"}
+        status: {$ref: "#/components/schemas/Instance/properties/status"}
+        runtime: {type: string, enum: [docker, podman]}
+        activity: {$ref: "#/components/schemas/MonitoringActivity"}
+        resources:
+          oneOf:
+            - {$ref: "#/components/schemas/MonitoringResources"}
+            - {type: "null"}
+        resource_error:
+          oneOf:
+            - {$ref: "#/components/schemas/PublicDiagnostic"}
+            - {type: "null"}
+    MonitoringBatch:
+      type: object
+      additionalProperties: false
+      required: [type, sequence, sampled_at_unix, batch_index, batch_count, instances, install_progress, progress_reset]
+      properties:
+        type: {type: string, const: stats}
+        sequence: {type: integer, minimum: 1}
+        sampled_at_unix: {type: integer}
+        batch_index: {type: integer, minimum: 0}
+        batch_count: {type: integer, minimum: 1}
+        progress_reset: {type: boolean}
+        instances:
+          type: array
+          items: {$ref: "#/components/schemas/MonitoringInstance"}
+        install_progress:
+          type: array
+          items: {$ref: "#/components/schemas/InstallProgress"}
+        install_progress_removed:
+          type: array
+          items: {type: string}
+    LogEvent:
+      type: object
+      additionalProperties: false
+      required: [type, instance_id, sequence, event]
+      properties:
+        type: {type: string, const: logs}
+        instance_id: {type: string}
+        sequence: {type: integer, minimum: 0}
+        event: {type: string, enum: [reset, append, end]}
+        stream: {type: string, enum: [stdout, stderr]}
+        data: {type: string, maxLength: 1536}
+        error: {$ref: "#/components/schemas/PublicDiagnostic"}
+      allOf:
+        - if: {properties: {event: {const: append}}}
+          then: {required: [stream, data]}
     ResourceReport:
       type: object
       required: [instance_id, runtime_id, deployment_mode, scope, protocol, status, cpu, memory, disk, network]
@@ -1163,7 +1388,7 @@ components:
           properties:
             configured_cores:
               type: number
-              description: Dedicated cgroup limit, or a shared tenant's reservation against aggregate pool capacity. A shared value is not a per-tenant cgroup measurement or CPU ceiling.
+              description: Dedicated cgroup limit, or the shared tenant's engine-operation budget. A shared value is not an additive CPU reservation or per-tenant cgroup ceiling.
             usage_percent:
               type: [number, "null"]
               description: Docker-compatible CPU usage in percentage points; 11.0 means 11%, not 0.11.
@@ -1173,7 +1398,7 @@ components:
           properties:
             configured_mib:
               type: integer
-              description: Dedicated cgroup limit, or a shared tenant's reservation against aggregate pool capacity. A shared value is not a per-tenant cgroup measurement or memory ceiling.
+              description: Dedicated cgroup limit, or the shared tenant's engine-operation budget. A shared value is not an additive memory reservation or per-tenant cgroup ceiling.
             usage_bytes:
               type: [integer, "null"]
               description: Docker-compatible memory working set in bytes (on Linux, raw cgroup usage minus inactive file cache).
@@ -1354,13 +1579,19 @@ components:
     SharedPoolReport:
       type: object
       additionalProperties: false
-      required: [runtime_id, protocol, status, image, database_version, tenant_count, max_tenants, cpu, memory, disk]
+      required: [owner, runtime_id, protocol, status, desired_state, pending_image, image, database_version, tenant_count, max_tenants, cpu, memory, disk]
       properties:
+        owner:
+          oneOf:
+            - {$ref: "#/components/schemas/PoolOwner"}
+            - {type: "null"}
         runtime_id: {type: string}
         protocol: {$ref: "#/components/schemas/Protocol"}
         status:
           type: string
           enum: [creating, booting, running, stopped, failed, quarantined, deleting]
+        desired_state: {type: string, enum: [running, stopped]}
+        pending_image: {type: [string, "null"], description: Immutable image ID of an unfinished update; do not offer ordinary power actions while present.}
         image: {type: string}
         database_version: {type: [string, "null"]}
         tenant_count: {type: integer, minimum: 0}
@@ -1368,19 +1599,17 @@ components:
         cpu:
           type: object
           additionalProperties: false
-          required: [limit_cores, reserved_cores, usage_percent, sample]
+          required: [limit_cores, usage_percent, sample]
           properties:
             limit_cores: {type: number, minimum: 0}
-            reserved_cores: {type: number, minimum: 0}
             usage_percent: {type: [number, "null"], minimum: 0}
             sample: {$ref: "#/components/schemas/PoolMetricSample"}
         memory:
           type: object
           additionalProperties: false
-          required: [limit_bytes, reserved_bytes, usage_bytes, sample]
+          required: [limit_bytes, usage_bytes, sample]
           properties:
             limit_bytes: {type: integer, minimum: 0}
-            reserved_bytes: {type: integer, minimum: 0}
             usage_bytes: {type: [integer, "null"], minimum: 0}
             sample: {$ref: "#/components/schemas/PoolMetricSample"}
         disk:
@@ -1718,7 +1947,7 @@ paths:
   /api/instances/{instance_id}/limits:
     patch:
       summary: Update CPU, memory, and disk limits for an instance.
-      description: Dedicated limits apply to the owned runtime. Shared limits update this tenant's reservation and enforcement policy, then resize aggregate pool capacity without assigning whole-pool CPU or memory usage to the tenant. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.
+      description: Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. They never resize pool CPU/RAM/disk. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.
       x-required-scope: instances:write
       parameters:
         - name: instance_id
@@ -1956,59 +2185,289 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeResourceSummary"
-  /api/admin/shared-pools:
+  /api/pools:
     get:
-      summary: List physical shared database pools and their aggregate capacity.
-      description: Pool CPU and memory are physical cgroup metrics and are intentionally available only through this administrator-scoped endpoint. Every usage field includes its source, physical sample time, age, freshness, and a bounded public diagnostic when stopped, warming, stale, or failed. Null is never an implied zero.
-      x-required-scope: resources:admin
+      summary: List server-owned pools.
+      description: Pool CPU and memory are whole-engine cgroup measurements, not individual tenant usage. Null means unavailable, not zero. Panel backends must filter inventory to the authorized server before exposing it.
+      x-required-scope: pools:read
       responses:
-        default:
-          $ref: "#/components/responses/ApiError"
+        default: {$ref: "#/components/responses/ApiError"}
         "200":
-          description: Shared pool inventory.
+          description: Operation result.
           content:
             application/json:
               schema:
                 type: array
                 items: {$ref: "#/components/schemas/SharedPoolReport"}
-  /api/admin/shared-pools/{runtime_id}:
-    get:
-      summary: Get one physical shared database pool.
-      description: Returns the same administrator-only physical metrics and sample diagnostics as the pool inventory endpoint.
-      x-required-scope: resources:admin
-      parameters:
-        - name: runtime_id
-          in: path
-          required: true
-          schema: {type: string}
+
+    post:
+      summary: Create a persistent engine pool.
+      description: Creates an empty, persistent server-owned pool. Only PostgreSQL, MySQL, MariaDB, MongoDB and ClickHouse. One per authenticated panel namespace, server_id and engine; duplicates fail asynchronously. Poll status_url after 202.
+      x-required-scope: pools:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreatePoolRequest"}
       responses:
-        default:
-          $ref: "#/components/responses/ApiError"
-        "200":
-          description: Shared pool capacity and current physical usage.
+        default: {$ref: "#/components/responses/ApiError"}
+        "202":
+          description: Operation result.
           content:
             application/json:
-              schema: {$ref: "#/components/schemas/SharedPoolReport"}
-  /api/admin/shared-pools/{runtime_id}/instances:
+              schema:
+                $ref: "#/components/schemas/PoolAccepted"
+
+  /api/pools/{runtime_id}:
     get:
-      summary: List logical tenants assigned to one shared pool.
-      description: Each nested resource report remains tenant-scoped and therefore omits the pool's physical CPU and memory.
-      x-required-scope: resources:admin
+      summary: Get pool metrics and configuration.
+      description: Pool CPU and memory are whole-engine cgroup measurements, not individual tenant usage. Null means unavailable, not zero. Panel backends must filter inventory to the authorized server before exposing it.
+      x-required-scope: pools:read
       parameters:
         - name: runtime_id
           in: path
           required: true
           schema: {type: string}
       responses:
-        default:
-          $ref: "#/components/responses/ApiError"
+        default: {$ref: "#/components/responses/ApiError"}
         "200":
-          description: Shared-pool tenant inventory.
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SharedPoolReport"
+
+    patch:
+      summary: Resize fixed pool capacity.
+      description: Requires pools:write. Fixed capacity; memory and disk may grow but cannot shrink online. max_tenants cannot fall below reservations. No automatic growth or overflow pool.
+      x-required-scope: pools:write
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PoolLimits"}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolConfig"
+
+    delete:
+      summary: Delete an empty pool.
+      description: Requires confirm=true and a nonempty reason. Only an empty pool without active work can be deleted. Deleting its last child never deletes the pool automatically.
+      x-required-scope: pools:write
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+        - {name: confirm, in: query, required: true, schema: {type: boolean, const: true}}
+        - {name: reason, in: query, required: true, schema: {type: string, minLength: 1}}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletePoolResponse"
+
+  /api/pools/{runtime_id}/instances:
+    get:
+      summary: List child databases.
+      description: List child databases.
+      x-required-scope: pools:read
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
           content:
             application/json:
               schema:
                 type: array
                 items: {$ref: "#/components/schemas/SharedPoolTenant"}
+
+    post:
+      summary: Create a child database.
+      description: Creates a child in this explicit pool using the existing instance provisioning path. Protocol, owner and image come from the pool. Returns the child instance_id/status_url, not another pool.
+      x-required-scope: instances:write
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreatePoolDatabaseRequest"}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "202":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateInstanceAcceptedResponse"
+
+  /api/pools/{runtime_id}/status:
+    get:
+      summary: Get pool state and retained operation progress.
+      description: Get pool state and retained operation progress.
+      x-required-scope: pools:read
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolStatus"
+
+  /api/pools/{runtime_id}/power:
+    post:
+      summary: Change whole-pool power state.
+      description: Start, stop, restart or kill the physical engine, affecting all its databases. Active data jobs/migrations and pending image recovery reject the action. Stop intent survives daemon restart.
+      x-required-scope: pools:write
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PowerRequest"}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolStatus"
+
+  /api/pools/{runtime_id}/image:
+    patch:
+      summary: Update a pool image within its release line.
+      description: Requires pools:write and images:admin, confirm=true and a reason. Take backups first. Uses a disposable no-data-mount version probe, then preserves volumes and verifies the replacement before routing. Rejects downgrades and different release lines. Interrupted updates are quarantined; retry only the same immutable image.
+      x-required-scope: pools:write
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PoolImageRequest"}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "202":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolAccepted"
+
+  /api/pools/{runtime_id}/logs:
+    get:
+      summary: Read recent redacted pool logs.
+      description: Read recent redacted pool logs.
+      x-required-scope: pools:logs
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: tail
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 2000, default: 100}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PoolLogs"
+
+  /api/pools/{runtime_id}/backups:
+    get:
+      summary: List backups of the pool's databases.
+      description: Lists existing per-database backups for this pool. Requires pools:read and backups:read. These remain independent backups, not a simultaneous whole-engine snapshot.
+      x-required-scope: pools:read
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Operation result.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/BackupInfo"}
+
+  /ws/pools/{runtime_id}/monitoring:
+    get:
+      summary: Stream whole-pool metrics.
+      description: Requires an owner-and-generation-bound pools:monitor JWT minted with pools plus server_id. No instance token grants this access. Sends one unbatched pool_stats snapshot per second; progress is change-only. Merge reset/removals/updates and reconnect with a fresh one-use JWT after a sequence gap. Values are already percentage points/bytes; keep null and sample freshness.
+      x-required-scope: pools:monitor
+      x-websocket: true
+      x-websocket-message: {$ref: "#/components/schemas/PoolStats"}
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "101":
+          description: WebSocket upgrade.
+
+  /ws/pools/{runtime_id}/logs:
+    get:
+      summary: Stream whole-pool logs.
+      description: Requires an owner-and-generation-bound pools:logs JWT, not logs:read. Pool-wide logs can contain data from every child database. Same reset/append/end protocol as dedicated logs, with runtime_id instead of instance_id. Reconnect with a fresh one-use JWT. No query-token authentication.
+      x-required-scope: pools:logs
+      x-websocket: true
+      x-websocket-message: {$ref: "#/components/schemas/PoolLogEvent"}
+      parameters:
+        - name: runtime_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: tail
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 2000, default: 100}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "101":
+          description: WebSocket upgrade.
   /api/instances/{instance_id}/resources:
     get:
       summary: Get resource usage for one instance.
@@ -2255,7 +2714,7 @@ paths:
         default:
           $ref: "#/components/responses/ApiError"
         "200":
-          description: Temporary upload state and optional cached inspection catalog.
+          description: Temporary upload summary including catalog_available, without catalog contents.
           content:
             application/json:
               schema:
@@ -2286,6 +2745,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ImportUploadDeleteResponse"
   /api/instances/{instance_id}/import/uploads/{upload_id}/catalog:
+    get:
+      summary: Read a cached upload catalog without running inspection.
+      description: Returns DumpInspection at the JSON root. Returns 409 when no catalog is cached; POST to this endpoint performs bounded inspection.
+      x-required-scope: import-export:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: upload_id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^upl_[0-9a-f]{32}$'}
+      responses:
+        default: {$ref: "#/components/responses/ApiError"}
+        "200":
+          description: Cached catalog.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DumpInspection"}
     post:
       summary: Inspect a ready temporary dump and cache its bounded catalog.
       description: >-
@@ -2313,11 +2792,11 @@ paths:
         default:
           $ref: "#/components/responses/ApiError"
         "200":
-          description: Upload with cached dump inspection.
+          description: DumpInspection at the JSON root, not wrapped in an upload summary.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ImportUpload"
+                $ref: "#/components/schemas/DumpInspection"
   /api/instances/{instance_id}/import-export/jobs:
     get:
       summary: List import/export jobs for one instance.
@@ -2835,7 +3314,14 @@ paths:
     get:
       summary: WebSocket stream of instance resource snapshots.
       description: >-
-        Requires a short-lived WebSocket JWT with monitor:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Selected-instance tokens are bound to the current tenant generations, so deletion and recreation under the same ID requires a new token. Messages and frames are limited to 16 KiB. One complete authorized snapshot is produced every second and split into bounded stats messages carrying sequence, sampled_at_unix, zero-based batch_index, and batch_count. Clients must buffer every batch for a sequence and atomically replace state only after indexes 0 through batch_count-1 arrive; a single batch is never a deletion signal. Instances and install_progress may occupy separate batches. Each instance identifies its logical and physical placement with instance_id, runtime_id, deployment_mode, and resource_scope. The canonical live resource shape is the nested resources object matching GET /api/instances/{instance_id}/resources; removed flat compatibility fields are not emitted. The activity object matches GET /api/instances/{instance_id}/activity and includes dynamic sources labels on every sample. CPU is reported in percentage points (11.0 means 11%). DBEV obtains one non-streaming Docker counter snapshot per physical runtime per second and calculates CPU from container CPU-time delta divided by real wall-clock delta. Dedicated resources expose that runtime sample. Shared tenants leave resources.cpu.usage_percent, resources.memory.usage_bytes, and resources.memory.limit_bytes null because reservations are not per-tenant cgroup measurements or ceilings. Tenant messages never expose whole-pool CPU or memory; panels obtain those only from resources:admin shared-pool endpoints. Tenant activity exposes authenticated gateway sessions, source-specific operation categories, exact bytes after route selection, and nullable engine-observed query CPU/peak memory; it never exposes SQL text or bind values. Gateway accepted means DBEV forwarded an operation, not that backend execution succeeded; gateway rejected means DBEV blocked it before forwarding. Sampling is independent of WebSocket delivery and missed ticks are skipped rather than sent as catch-up bursts. Linux memory usage follows Docker's working-set calculation.
+        Requires monitor:read on a short-lived generation-bound WebSocket JWT. Browser authentication uses Sec-WebSocket-Protocol ["dbe.jwt", "<jwt>"]; query tokens are rejected.
+        One full authorized instance snapshot is produced per second, split into bounded messages with sequence, sampled_at_unix, batch_index and batch_count. Assemble every batch before applying a sequence. Reconnect with a fresh JWT on a missing/incomplete sequence; skipping progress deltas loses updates.
+        API 0.16 instance identity lives only on the outer item: instance_id, runtime_id, deployment_mode, resource_scope, protocol, status, runtime.
+        resources contains only cpu, memory and disk (or null with resource_error); REST resource responses remain self-contained. activity omits instance_id and is the only WebSocket location for rx_bytes and tx_bytes.
+        install_progress contains changed records only. After assembling a sequence, clear the progress cache if progress_reset is true, remove install_progress_removed IDs, and upsert install_progress by instance_id. Missing progress is not deletion or a creating state.
+        New connections receive a complete retained progress snapshot with progress_reset=true. Reset sequence/batch state on reconnect; keep explicit null values, source labels, timestamps and stats_epoch discontinuities.
+        CPU remains percentage points (11.0 means 11%). Shared tenant CPU/RAM remains null, never whole-pool consumption. Sampling, generation checks, authorization and 16-KiB batch limits are unchanged.
+      x-websocket-message: {$ref: "#/components/schemas/MonitoringBatch"}
       x-required-scope: monitor:read
       x-websocket: true
       responses:
@@ -2847,7 +3333,12 @@ paths:
     get:
       summary: WebSocket stream of container logs for one instance.
       description: >-
-        Requires a short-lived WebSocket JWT with logs:read. Non-browser clients may send Authorization: Bearer <jwt>. Browser clients should use Sec-WebSocket-Protocol with ["dbe.jwt", "<jwt>"]. Query-string tokens are rejected. Messages and frames are limited to 16 KiB. Available only for dedicated instances; shared-engine logs are pool-wide and the upgrade is rejected with 409 to prevent cross-tenant disclosure.
+        Requires logs:read on a generation-bound WebSocket JWT. Dedicated instances only; shared logs return 409.
+        API 0.16 sends type=logs with event=reset and sequence=0, then event=append with stream=stdout|stderr and data containing new text only. One Docker follow request delivers the requested tail followed by live output.
+        Append to a bounded client buffer; never replace it for append events. event=end terminates the stream, optionally with a public error. Sequence numbers are per connection. Reconnect clears local sequence state and receives a new reset/tail, not guaranteed lossless history.
+        Complete records are redacted across runtime chunks, then split into UTF-8-safe messages below 16 KiB. An incomplete final secret value is omitted. Records exceeding the 128-KiB redaction budget end the stream with log_record_limit; do not retry that error in a tight loop.
+        Heartbeats use Ping/Pong every 30 seconds and never resend log text. Expiry, shutdown and generation fencing remain enforced.
+      x-websocket-message: {$ref: "#/components/schemas/LogEvent"}
       x-required-scope: logs:read
       x-websocket: true
       parameters:

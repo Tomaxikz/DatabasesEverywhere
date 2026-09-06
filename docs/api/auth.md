@@ -56,8 +56,9 @@ Do not expect raw paths, container output, or database errors in public response
 Call `GET /api/system` before enabling node actions. Check `api_version`
 independently of the daemon's binary `version`, and use
 `deployment_capabilities` to discover enabled protocols and placement modes.
-The current contract is `0.14.0`; [OpenAPI](openapi.yml) defines request,
-response, and scope requirements.
+The current contract is `0.17.0`; [OpenAPI](openapi.yml) defines request,
+response, and scope requirements. Successful JSON is the raw response body,
+not a `{data: ...}` envelope.
 
 The panel owns customer authorization and the mapping to DBEV instance IDs.
 A successful heartbeat proves management liveness, not database readiness;
@@ -66,6 +67,8 @@ check instance status and gateway readiness separately.
 ## Scopes
 
 Endpoint scopes are listed in OpenAPI and the relevant guides. Browser JWTs
-accept only `monitor:read`, `logs:read`, and `import-export:read`.
+accept instance scopes `monitor:read`, `logs:read`, and `import-export:read`,
+or pool scopes `pools:monitor` and `pools:logs`. Never mix the two target types.
+Pool tokens require explicit pool IDs plus an authorized `server_id`.
 Mint them through `POST /api/ws-token` using a credential with
 `ws-tokens:write`; never send the node token to a browser.

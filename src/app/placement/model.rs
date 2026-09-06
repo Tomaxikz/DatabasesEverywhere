@@ -85,8 +85,6 @@ impl EngineRuntimeStatus {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeReservation {
     pub tenants: u32,
-    pub cpu_cores: f64,
-    pub memory_mib: u64,
     pub disk_mib: u64,
 }
 
@@ -123,8 +121,9 @@ pub struct TenantReservation {
     pub limits: InstanceLimits,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReserveTenant<'a> {
+    pub owner: super::PoolOwner,
     pub instance_id: &'a str,
     pub runtime_id: &'a str,
     pub database: &'a str,
@@ -141,6 +140,12 @@ pub struct RuntimeCompatibility {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EngineRuntime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_image: Option<String>,
+    #[serde(default, skip)]
+    pub(crate) desired_state: crate::instances::metadata::DesiredInstanceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<super::PoolOwner>,
     pub schema_version: u32,
     pub runtime_id: String,
     pub protocol: Protocol,
@@ -156,7 +161,6 @@ pub struct EngineRuntime {
     pub database_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<RuntimeCompatibility>,
-    pub compatibility_key: String,
     pub max_tenants: u32,
     pub reserved: RuntimeReservation,
     #[serde(default, skip_serializing)]
@@ -180,7 +184,6 @@ impl fmt::Debug for EngineRuntime {
             .field("image", &self.image)
             .field("database_version", &self.database_version)
             .field("compatibility", &self.compatibility)
-            .field("compatibility_key", &self.compatibility_key)
             .field("max_tenants", &self.max_tenants)
             .field("reserved", &self.reserved)
             .field(
@@ -202,6 +205,18 @@ impl EngineRuntime {
             return Err(PlacementError::EmptyRuntimeId);
         }
         self.deployment_mode.check(self.protocol)?;
+        if let Some(owner) = &self.owner {
+            owner.check().map_err(PlacementError::InvalidLimits)?;
+        } else if self.deployment_mode == DeploymentMode::Shared
+            && !matches!(
+                self.status,
+                EngineRuntimeStatus::Quarantined | EngineRuntimeStatus::Deleting
+            )
+        {
+            return Err(PlacementError::InvalidLimits(
+                "shared pool ownership is missing".into(),
+            ));
+        }
         crate::shared::limits::validate_runtime_limits(
             self.limits.cpu_cores,
             self.limits.memory_mib,
@@ -237,12 +252,7 @@ impl EngineRuntime {
         {
             return Err(PlacementError::IncompleteSharedCompatibility);
         }
-        if !self.reserved.cpu_cores.is_finite()
-            || self.reserved.cpu_cores < 0.0
-            || self.reserved.tenants > self.max_tenants
-            || self.reserved.cpu_cores > self.limits.cpu_cores
-            || self.reserved.memory_mib > self.limits.memory_mib
-            || self.reserved.disk_mib > self.limits.disk_mib
+        if self.reserved.tenants > self.max_tenants || self.reserved.disk_mib > self.limits.disk_mib
         {
             return Err(PlacementError::ReservationExceedsLimits);
         }
@@ -257,8 +267,11 @@ impl EngineRuntime {
         let runtime_id = instance.instance_id.clone();
         let protocol = instance.protocol;
         Self {
+            pending_image: None,
+            desired_state: instance.desired_state,
+            owner: instance.owner.clone(),
             schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-            compatibility_key: format!("dedicated:{protocol}:{runtime_id}"),
+
             runtime_id,
             protocol,
             deployment_mode: DeploymentMode::Dedicated,
@@ -362,6 +375,9 @@ mod tests {
     #[test]
     fn runtime_debug_redacts_the_admin_secret() {
         let mut runtime = EngineRuntime {
+            pending_image: None,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            owner: None,
             schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
             runtime_id: "runtime-1".to_string(),
             protocol: Protocol::Postgres,
@@ -379,7 +395,7 @@ mod tests {
             image: "postgres:18".to_string(),
             database_version: None,
             compatibility: None,
-            compatibility_key: "dedicated:postgres:runtime-1".to_string(),
+
             max_tenants: 1,
             reserved: RuntimeReservation::default(),
             admin_secret: None,

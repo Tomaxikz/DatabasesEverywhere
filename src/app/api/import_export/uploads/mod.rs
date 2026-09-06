@@ -191,8 +191,7 @@ pub(crate) struct ImportUploadResponse {
     pub state: &'static str,
     pub size_bytes: u64,
     pub sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub catalog: Option<DumpInspection>,
+    pub catalog_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub created_at: String,
@@ -254,11 +253,9 @@ pub(crate) async fn list_import_uploads(
         .list_active(&instance_id, MAX_LISTED_UPLOADS)
         .await
         .map_err(upload_storage_error)?;
-    uploads
-        .into_iter()
-        .map(public_upload)
-        .collect::<Result<Vec<_>, _>>()
-        .map(ApiResponse::ok)
+    Ok(ApiResponse::ok(
+        uploads.into_iter().map(public_upload).collect(),
+    ))
 }
 
 pub(crate) async fn get_import_upload(
@@ -269,14 +266,14 @@ pub(crate) async fn get_import_upload(
     auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
     require_instance(&state, &instance_id).await?;
     let upload = load_upload(&state, &instance_id, &upload_id).await?;
-    Ok(ApiResponse::ok(public_upload(upload)?))
+    Ok(ApiResponse::ok(public_upload(upload)))
 }
 
 pub(crate) async fn inspect_import_upload(
     State(state): State<AppState>,
     auth: ApiRequestContext,
     ApiPath((instance_id, upload_id)): ApiPath<(String, String)>,
-) -> ApiResult<ImportUploadResponse> {
+) -> ApiResult<DumpInspection> {
     auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
     let instance_operation = state.instance_locks.lock(&instance_id).await;
     let metadata = state
@@ -291,7 +288,7 @@ pub(crate) async fn inspect_import_upload(
         ));
     }
     if upload.state == ImportUploadState::Ready && upload.catalog_json.is_some() {
-        return Ok(ApiResponse::ok(public_upload(upload)?));
+        return Ok(ApiResponse::ok(upload_catalog(&upload)?));
     }
     if upload.state != ImportUploadState::Ready {
         return Err(ApiError::Conflict(format!(
@@ -352,7 +349,7 @@ pub(crate) async fn inspect_import_upload(
             )));
         }
     };
-    Ok(ApiResponse::ok(public_upload(upload)?))
+    Ok(ApiResponse::ok(upload_catalog(&upload)?))
 }
 
 fn spawn_owned_inspection<T>(
@@ -642,7 +639,7 @@ async fn upload_dump(
     let committed = committed?;
     Ok(ApiResponse::with_status(
         StatusCode::CREATED,
-        public_upload(committed)?,
+        public_upload(committed),
     ))
 }
 
@@ -832,14 +829,8 @@ fn percent_decode_utf8(value: &str) -> Result<String, ApiError> {
         .map_err(|_| ApiError::BadRequest("x-dbev-filename is not valid UTF-8".to_string()))
 }
 
-fn public_upload(upload: ImportUpload) -> Result<ImportUploadResponse, ApiError> {
-    let catalog = upload
-        .catalog_json
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|error| ApiError::Runtime(format!("stored upload catalog is invalid: {error}")))?;
-    Ok(ImportUploadResponse {
+fn public_upload(upload: ImportUpload) -> ImportUploadResponse {
+    ImportUploadResponse {
         upload_id: upload.upload_id,
         instance_id: upload.instance_id,
         original_filename: upload.original_filename,
@@ -848,12 +839,31 @@ fn public_upload(upload: ImportUpload) -> Result<ImportUploadResponse, ApiError>
         state: upload.state.as_str(),
         size_bytes: upload.size_bytes,
         sha256: upload.sha256,
-        catalog,
+        catalog_available: upload.catalog_json.is_some(),
         error: upload.last_error,
         created_at: upload.created_at,
         updated_at: upload.updated_at,
         expires_at: upload.expires_at,
-    })
+    }
+}
+
+fn upload_catalog(upload: &ImportUpload) -> Result<DumpInspection, ApiError> {
+    let catalog = upload.catalog_json.as_deref().ok_or_else(|| {
+        ApiError::Conflict("upload catalog is unavailable; inspect this upload first".into())
+    })?;
+    serde_json::from_str(catalog)
+        .map_err(|error| ApiError::Runtime(format!("stored upload catalog is invalid: {error}")))
+}
+
+pub(crate) async fn get_import_catalog(
+    State(state): State<AppState>,
+    auth: ApiRequestContext,
+    ApiPath((instance_id, upload_id)): ApiPath<(String, String)>,
+) -> ApiResult<DumpInspection> {
+    auth.require_scope(scopes::IMPORT_EXPORT_READ)?;
+    require_instance(&state, &instance_id).await?;
+    let upload = load_upload(&state, &instance_id, &upload_id).await?;
+    Ok(ApiResponse::ok(upload_catalog(&upload)?))
 }
 
 async fn load_upload(

@@ -82,9 +82,6 @@ pub(super) async fn maintain_pool_after_delete(state: &AppState, deleted_from: E
     // Only the empty path persists `Deleting`; doing so for a live pool would
     // let a crash strand its remaining tenants before limits were reapplied.
     let result = match state.placements.tenant_count(&runtime.runtime_id).await {
-        Ok(0) => delete_empty_pool(state, &runtime.runtime_id)
-            .await
-            .map(|_| ()),
         Ok(_) => {
             shared_runtime::apply_limits(&state.docker, &state.config, &state.placements, &runtime)
                 .await

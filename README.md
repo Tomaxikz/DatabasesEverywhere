@@ -3,7 +3,7 @@
 A Linux daemon for hosting databases behind a control panel.
 
 Run each database in a **dedicated container** or place multiple tenants in a
-**shared engine pool**. The panel chooses placement; DBEV handles provisioning,
+**server-owned engine pool**. The panel chooses placement; DBEV handles provisioning,
 credentials, gateway routing, limits, and recovery.
 
 ## Features
@@ -74,5 +74,6 @@ upgrades, and logs, or [Docker deployment](deploy/docker/README.md) for Compose.
 
 - [Documentation index](docs/README.md)
 - [API contract](docs/api/openapi.yml) and [panel authentication](docs/api/auth.md)
+- [Pool management](docs/api/pools.md): engines, child databases, metrics, and logs
 - [Development and checks](docs/development.md)
 - [Private security reporting](SECURITY.md)

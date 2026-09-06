@@ -1,5 +1,7 @@
+pub(crate) mod lifecycle;
 mod migration;
 mod model;
+mod owner;
 pub(crate) mod policy;
 mod repository;
 pub(crate) mod runtime;
@@ -16,4 +18,6 @@ pub use model::{
     PlacementError, ReserveTenant, RuntimeCompatibility, RuntimeReservation, TenantReservation,
     TenantReservationState,
 };
+pub(crate) use owner::PoolSpec;
+pub use owner::{PoolLimits, PoolOwner};
 pub use repository::{PlacementRepository, PlacementRepositoryError};

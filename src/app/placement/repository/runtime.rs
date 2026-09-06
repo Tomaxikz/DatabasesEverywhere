@@ -3,14 +3,13 @@ use std::path::Path;
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use super::{
-    PlacementRepository, PlacementRepositoryError, capacity::check_reservation, i64_to_u64,
-    parse_protocol, u64_to_i64,
+    PlacementRepository, PlacementRepositoryError, i64_to_u64, parse_protocol, u64_to_i64,
 };
 use crate::{
     instances::metadata::RuntimeMetadata,
     placement::model::{
-        DeploymentMode, EngineRuntime, PlacementError, RuntimeCompatibility, RuntimeReservation,
-        parse_mode, parse_runtime_kind, parse_status,
+        EngineRuntime, RuntimeCompatibility, RuntimeReservation, parse_mode, parse_runtime_kind,
+        parse_status,
     },
     shared::{backend::BackendEndpoint, limits::InstanceLimits, protocol::Protocol},
     storage::secrets::SecretStore,
@@ -61,14 +60,7 @@ impl PlacementRepository {
     pub async fn save(&self, runtime: &EngineRuntime) -> Result<(), PlacementRepositoryError> {
         runtime.check()?;
         let backend = BackendColumns::from(&runtime.backend);
-        let mut limits = runtime.limits.clone();
-        if runtime.deployment_mode == DeploymentMode::Shared {
-            limits.disk_mib = crate::placement::policy::pool_disk_mib(
-                runtime.protocol,
-                runtime.reserved.disk_mib,
-            )
-            .ok_or(PlacementError::UnsupportedSharedProtocol(runtime.protocol))?;
-        }
+        let limits = &runtime.limits;
         let limits_json = serde_json::to_string(&limits)?;
         let protected_admin = runtime
             .admin_secret
@@ -86,18 +78,24 @@ impl PlacementRepository {
                 limit_cpu_cores, limit_memory_mib, limit_disk_mib,
                 image, database_version, compatibility_container_id,
                 compatibility_image_id, compatibility_probe_revision,
-                compatibility_key, max_tenants, tenant_count,
-                reserved_cpu_cores, reserved_memory_mib, reserved_disk_mib,
-                created_at, updated_at
+                max_tenants, tenant_count,
+                reserved_disk_mib,
+                created_at, updated_at, owner_panel, owner_server, desired_state, pending_image
             )
             VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29
+                ?26, ?27, ?28, ?29, ?30
             )
             ON CONFLICT(runtime_id) DO UPDATE SET
                 schema_version = excluded.schema_version,
+                owner_panel = excluded.owner_panel,
+                owner_server = excluded.owner_server,
+                protocol = excluded.protocol,
+                deployment_mode = excluded.deployment_mode,
                 status = excluded.status,
+                desired_state = excluded.desired_state,
+                pending_image = excluded.pending_image,
                 backend_kind = excluded.backend_kind,
                 backend_socket_path = excluded.backend_socket_path,
                 backend_host = excluded.backend_host,
@@ -107,32 +105,24 @@ impl PlacementRepository {
                 network = excluded.network,
                 limits_json = CASE
                     WHEN engine_runtimes.tenant_count = excluded.tenant_count
-                     AND engine_runtimes.reserved_cpu_cores = excluded.reserved_cpu_cores
-                     AND engine_runtimes.reserved_memory_mib = excluded.reserved_memory_mib
                      AND engine_runtimes.reserved_disk_mib = excluded.reserved_disk_mib
                     THEN excluded.limits_json
                     ELSE engine_runtimes.limits_json
                 END,
                 limit_cpu_cores = CASE
                     WHEN engine_runtimes.tenant_count = excluded.tenant_count
-                     AND engine_runtimes.reserved_cpu_cores = excluded.reserved_cpu_cores
-                     AND engine_runtimes.reserved_memory_mib = excluded.reserved_memory_mib
                      AND engine_runtimes.reserved_disk_mib = excluded.reserved_disk_mib
                     THEN excluded.limit_cpu_cores
                     ELSE engine_runtimes.limit_cpu_cores
                 END,
                 limit_memory_mib = CASE
                     WHEN engine_runtimes.tenant_count = excluded.tenant_count
-                     AND engine_runtimes.reserved_cpu_cores = excluded.reserved_cpu_cores
-                     AND engine_runtimes.reserved_memory_mib = excluded.reserved_memory_mib
                      AND engine_runtimes.reserved_disk_mib = excluded.reserved_disk_mib
                     THEN excluded.limit_memory_mib
                     ELSE engine_runtimes.limit_memory_mib
                 END,
                 limit_disk_mib = CASE
                     WHEN engine_runtimes.tenant_count = excluded.tenant_count
-                     AND engine_runtimes.reserved_cpu_cores = excluded.reserved_cpu_cores
-                     AND engine_runtimes.reserved_memory_mib = excluded.reserved_memory_mib
                      AND engine_runtimes.reserved_disk_mib = excluded.reserved_disk_mib
                     THEN excluded.limit_disk_mib
                     ELSE engine_runtimes.limit_disk_mib
@@ -142,7 +132,6 @@ impl PlacementRepository {
                 compatibility_container_id = excluded.compatibility_container_id,
                 compatibility_image_id = excluded.compatibility_image_id,
                 compatibility_probe_revision = excluded.compatibility_probe_revision,
-                compatibility_key = excluded.compatibility_key,
                 max_tenants = excluded.max_tenants,
                 updated_at = excluded.updated_at
             "#,
@@ -183,17 +172,15 @@ impl PlacementRepository {
                 .as_ref()
                 .map(|compatibility| i64::from(compatibility.probe_revision)),
         )
-        .bind(&runtime.compatibility_key)
         .bind(i64::from(runtime.max_tenants))
         .bind(i64::from(runtime.reserved.tenants))
-        .bind(runtime.reserved.cpu_cores)
-        .bind(u64_to_i64(
-            runtime.reserved.memory_mib,
-            "reserved_memory_mib",
-        )?)
         .bind(u64_to_i64(runtime.reserved.disk_mib, "reserved_disk_mib")?)
         .bind(&runtime.created_at)
         .bind(&runtime.updated_at)
+        .bind(runtime.owner.as_ref().map(|owner| owner.panel_id.as_str()))
+        .bind(runtime.owner.as_ref().map(|owner| owner.server_id.as_str()))
+        .bind(runtime.desired_state.as_str())
+        .bind(&runtime.pending_image)
         .execute(&mut *transaction)
         .await?;
 
@@ -218,44 +205,23 @@ impl PlacementRepository {
         Ok(())
     }
 
-    pub async fn find_shared(
+    pub async fn server_pool(
         &self,
         protocol: Protocol,
-        image: &str,
-        requested: &InstanceLimits,
-    ) -> Result<Vec<EngineRuntime>, PlacementRepositoryError> {
-        DeploymentMode::Shared.check(protocol)?;
-        check_reservation(requested)?;
-        let overhead = crate::placement::policy::runtime_overhead(protocol)
-            .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let requested_memory = u64_to_i64(requested.memory_mib, "memory_mib")?;
-        let overhead_memory = u64_to_i64(overhead.memory_mib, "overhead_memory_mib")?;
-        let rows = sqlx::query(&runtime_select(
-            r#"
-            WHERE runtime.deployment_mode = 'shared'
-              AND runtime.protocol = ?1
-              AND runtime.image = ?2
-              AND runtime.status = 'running'
-              AND runtime.tenant_count < runtime.max_tenants
-              AND runtime.reserved_cpu_cores + ?3 + ?5 <= ?7
-              AND runtime.reserved_memory_mib + ?4 + ?6 <= ?8
-            ORDER BY runtime.tenant_count DESC, runtime.runtime_id
-            "#,
+        owner: &crate::placement::PoolOwner,
+    ) -> Result<Option<EngineRuntime>, PlacementRepositoryError> {
+        owner
+            .check()
+            .map_err(PlacementRepositoryError::InvalidReservation)?;
+        let row = sqlx::query(&runtime_select(
+            "WHERE runtime.deployment_mode = 'shared' AND runtime.protocol = ?1 AND runtime.owner_panel = ?2 AND runtime.owner_server = ?3",
         ))
         .bind(protocol.as_str())
-        .bind(image)
-        .bind(requested.cpu_cores)
-        .bind(requested_memory)
-        .bind(overhead.cpu_cores)
-        .bind(overhead_memory)
-        .bind(crate::shared::limits::MAX_CPU_CORES)
-        .bind(u64_to_i64(
-            crate::shared::limits::MAX_MEMORY_MIB,
-            "max_memory_mib",
-        )?)
-        .fetch_all(&self.pool)
+        .bind(&owner.panel_id)
+        .bind(&owner.server_id)
+        .fetch_optional(&self.pool)
         .await?;
-        rows.iter().map(|row| self.read_runtime(row)).collect()
+        row.as_ref().map(|row| self.read_runtime(row)).transpose()
     }
 
     pub async fn delete(&self, runtime_id: &str) -> Result<bool, PlacementRepositoryError> {
@@ -295,18 +261,35 @@ impl PlacementRepository {
             .transpose()?;
         let backend = read_backend(row)?;
         let tenant_count: i64 = row.try_get("tenant_count")?;
-        let reserved_memory_mib: i64 = row.try_get("reserved_memory_mib")?;
         let reserved_disk_mib: i64 = row.try_get("reserved_disk_mib")?;
         let schema_version: i64 = row.try_get("schema_version")?;
         let max_tenants: i64 = row.try_get("max_tenants")?;
 
         let reserved_disk_mib = i64_to_u64(reserved_disk_mib, "reserved_disk_mib")?;
-        let mut limits: InstanceLimits = serde_json::from_str(&limits_json)?;
-        if deployment_mode == DeploymentMode::Shared {
-            limits.disk_mib = crate::placement::policy::pool_disk_mib(protocol, reserved_disk_mib)
-                .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        }
+        let limits: InstanceLimits = serde_json::from_str(&limits_json)?;
         let runtime = EngineRuntime {
+            pending_image: row.try_get("pending_image")?,
+            desired_state: crate::instances::metadata::DesiredInstanceState::parse(
+                &row.try_get::<String, _>("desired_state")?,
+            )
+            .ok_or_else(|| {
+                PlacementRepositoryError::InvalidReservation("invalid pool desired state".into())
+            })?,
+            owner: match (
+                row.try_get::<Option<String>, _>("owner_panel")?,
+                row.try_get::<Option<String>, _>("owner_server")?,
+            ) {
+                (Some(panel_id), Some(server_id)) => Some(crate::placement::PoolOwner {
+                    panel_id,
+                    server_id,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(PlacementRepositoryError::InvalidReservation(
+                        "incomplete pool owner".into(),
+                    ));
+                }
+            },
             schema_version: u32::try_from(schema_version).map_err(|_| {
                 PlacementRepositoryError::InvalidInteger {
                     field: "schema_version",
@@ -327,7 +310,6 @@ impl PlacementRepository {
             image: row.try_get("image")?,
             database_version: row.try_get("database_version")?,
             compatibility: read_compatibility(row)?,
-            compatibility_key: row.try_get("compatibility_key")?,
             max_tenants: u32::try_from(max_tenants).map_err(|_| {
                 PlacementRepositoryError::InvalidInteger {
                     field: "max_tenants",
@@ -341,8 +323,6 @@ impl PlacementRepository {
                         value: tenant_count,
                     }
                 })?,
-                cpu_cores: row.try_get("reserved_cpu_cores")?,
-                memory_mib: i64_to_u64(reserved_memory_mib, "reserved_memory_mib")?,
                 disk_mib: reserved_disk_mib,
             },
             admin_secret,

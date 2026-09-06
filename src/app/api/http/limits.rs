@@ -594,12 +594,14 @@ mod tests {
             secret,
             "browser-user",
             vec![crate::auth::scopes::MONITOR_READ.to_string()],
-            vec!["inst_allowed".to_string()],
-            false,
-            Some(jwt::instance_generation_digest(&[(
-                "inst_allowed".to_string(),
-                "generation-a".to_string(),
-            )])),
+            jwt::WsTargets::Instances {
+                instances: vec!["inst_allowed".into()],
+                all_instances: false,
+                generation: Some(jwt::instance_generation_digest(&[(
+                    "inst_allowed".into(),
+                    "generation-a".into(),
+                )])),
+            },
             60,
         )
         .unwrap();

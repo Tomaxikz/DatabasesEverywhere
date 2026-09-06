@@ -20,6 +20,9 @@ mod worker;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartDeploymentMigrationRequest {
+    pub server_id: Option<String>,
+    pub pool_id: Option<String>,
+    pub limits: Option<crate::api::instances::requests::LimitsRequest>,
     pub target_mode: DeploymentMode,
 }
 
@@ -48,12 +51,81 @@ pub async fn start_deployment_migration(
         .map_err(|error| migration_admission_error(&instance_id, error))?;
     let creation = state.instance_locks.lock_creation().await;
     let operation = state.instance_locks.lock(&instance_id).await;
-    let metadata = state
+    let mut metadata = state
         .instances
         .get(&instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
     validate_source(&state, &metadata, request.target_mode).await?;
+    let previous_owner = metadata.owner.clone();
+    if let Some(server_id) = &request.server_id {
+        let owner = crate::placement::PoolOwner {
+            panel_id: state.config.token_id.clone(),
+            server_id: server_id.clone(),
+        };
+        owner.check().map_err(ApiError::BadRequest)?;
+        if metadata
+            .owner
+            .as_ref()
+            .is_some_and(|current| current != &owner)
+        {
+            return Err(ApiError::Conflict(
+                "instance owner cannot be changed during migration".into(),
+            ));
+        }
+        if metadata.owner.is_none() {
+            metadata.owner = Some(owner);
+        }
+    }
+    if request.target_mode == DeploymentMode::Shared && metadata.owner.is_none() {
+        return Err(ApiError::BadRequest(
+            "dedicated-to-shared migration requires server_id".into(),
+        ));
+    }
+    let mut target_pool_guard = None;
+    if request.target_mode == DeploymentMode::Shared {
+        let id = request.pool_id.as_deref().ok_or_else(|| {
+            ApiError::BadRequest("shared target requires pool_id; create the pool first".into())
+        })?;
+        target_pool_guard = Some(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.instance_locks.lock(id),
+            )
+            .await
+            .map_err(|_| ApiError::Conflict("target pool is busy; retry the migration".into()))?,
+        );
+        let pool = crate::api::pools::load(&state, id).await?;
+        if pool.owner != metadata.owner
+            || pool.protocol != metadata.protocol
+            || pool.status != EngineRuntimeStatus::Running
+            || pool.pending_image.is_some()
+            || pool.desired_state != DesiredInstanceState::Running
+        {
+            return Err(ApiError::Conflict(
+                "target pool ownership, engine or state does not match".into(),
+            ));
+        }
+    } else if request.pool_id.is_some() {
+        return Err(ApiError::BadRequest(
+            "dedicated target cannot select a pool".into(),
+        ));
+    }
+    let target_limits = request
+        .limits
+        .as_ref()
+        .map(|limits| {
+            if request.target_mode != DeploymentMode::Dedicated {
+                return Err(ApiError::BadRequest(
+                    "limits is only valid for a dedicated migration target".into(),
+                ));
+            }
+            crate::api::instances::requests::validate_limits(limits)?;
+            crate::api::instances::requests::validate_protocol_limits(metadata.protocol, limits)?;
+            Ok(crate::api::instances::requests::limits_from_request(limits))
+        })
+        .transpose()?;
+
     let mutation = state
         .daemon_shutdown
         .try_admit_background_mutation()
@@ -62,16 +134,29 @@ pub async fn start_deployment_migration(
                 "daemon shutdown has started; deployment migrations are not accepted".to_string(),
             )
         })?;
+    if metadata.owner != previous_owner {
+        state
+            .manager
+            .upsert(metadata.clone())
+            .await
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    }
     let migration = state
         .placements
         .migrations()
-        .start(&metadata, request.target_mode)
+        .start(
+            &metadata,
+            request.target_mode,
+            request.pool_id.as_deref(),
+            target_limits.as_ref(),
+        )
         .await
         .map_err(migration_error)?;
     let location = format!(
         "/api/instances/{instance_id}/deployment-migrations/{}",
         migration.migration_id
     );
+    drop(target_pool_guard);
     worker::spawn(
         state,
         metadata,
@@ -161,7 +246,9 @@ async fn validate_source(
                 "source placement runtime is missing; reconcile it first".to_string(),
             )
         })?;
-    if runtime.protocol != metadata.protocol
+    if (metadata.deployment_mode == DeploymentMode::Shared
+        && (metadata.owner.is_none() || runtime.owner != metadata.owner))
+        || runtime.protocol != metadata.protocol
         || runtime.deployment_mode != metadata.deployment_mode
         || !matches!(
             runtime.status,

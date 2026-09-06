@@ -37,20 +37,15 @@ pub(super) async fn run_dedicated_to_shared(
     .await?;
     let temp_id = temp_instance_id(&migration.migration_id)?;
     let temp_password = temporary_password();
-    let request = target_request(&source, &source_runtime, &temp_id, &temp_password);
+    let mut request = target_request(&source, &source_runtime, &temp_id, &temp_password);
+    request.pool_id = migration.target_pool_id.clone();
     let image = resolve_image(state, &request)?;
     let mut tenant_limits = source.limits.clone();
     tenant_limits.disk_enforced = false;
     tenant_limits.disk_enforcement_method = "shared_pool_reservation".to_string();
-    let (target_runtime, created_pool, _target_runtime_operation) = claim_shared_runtime(
-        state,
-        &request,
-        &image,
-        source.limits.clone(),
-        &tenant_limits,
-        &mut creation,
-    )
-    .await?;
+    drop(creation.take());
+    let (target_runtime, _target_runtime_operation) =
+        claim_shared_runtime(state, &request, &image, &mut tenant_limits).await?;
     tenant::verify_password(
         &state.docker,
         &source_runtime,
@@ -68,9 +63,7 @@ pub(super) async fn run_dedicated_to_shared(
     .await
     {
         let _ = state.placements.release(&temp_id).await;
-        if created_pool {
-            destroy_empty_shared_runtime(state, &target_runtime).await;
-        } else if let Ok(Some(current)) = state.placements.get(&target_runtime.runtime_id).await {
+        if let Ok(Some(current)) = state.placements.get(&target_runtime.runtime_id).await {
             let _ = runtime_ops::apply_limits(
                 &state.docker,
                 &state.config,
@@ -322,7 +315,12 @@ pub(super) async fn run_shared_to_dedicated(
     // The provisional dedicated engine exists at the same time as the source
     // pool, so admit its full temporary footprint rather than treating this as
     // an in-place resize.
-    enforce_node_allocation_policy(state, &source.limits, None).await?;
+    enforce_node_allocation_policy(
+        state,
+        migration.target_limits.as_ref().unwrap_or(&source.limits),
+        None,
+    )
+    .await?;
 
     migration = advance(
         state,
@@ -334,7 +332,14 @@ pub(super) async fn run_shared_to_dedicated(
     // This private engine has no gateway route until cutover. Bootstrap with
     // the durable credential: changing it later would reapply shared grants
     // and cannot work for ClickHouse's XML-managed dedicated account.
-    let request = dedicated_target_request(&source, &source_runtime)?;
+    let mut request = dedicated_target_request(&source, &source_runtime)?;
+    if let Some(limits) = &migration.target_limits {
+        request.limits = Some(LimitsRequest {
+            cpu_cores: limits.cpu_cores,
+            memory_mib: limits.memory_mib,
+            disk_mib: limits.disk_mib,
+        });
+    }
     let target = build_dedicated_target(state, request, false).await?;
 
     // Persist maintenance credentials before the first container process is

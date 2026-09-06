@@ -450,8 +450,8 @@ pub(crate) use physical::{
 pub(crate) use upload_recovery::{reconcile_import_uploads, run_upload_sweeper};
 pub(crate) use uploads::{DiskCapacityReservation, ImportUploadService};
 pub(crate) use uploads::{
-    delete_import_upload, get_import_upload, import_entry, inspect_import_upload,
-    list_import_uploads,
+    delete_import_upload, get_import_catalog, get_import_upload, import_entry,
+    inspect_import_upload, list_import_uploads,
 };
 
 #[cfg(test)]

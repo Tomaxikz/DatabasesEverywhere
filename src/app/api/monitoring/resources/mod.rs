@@ -61,7 +61,9 @@ use sampler::{SharedRuntimeUsage, aggregate_managed_usage, summarize_allocations
 pub(crate) use sampler::{read_host_cpu_cores, read_host_disk, read_host_memory};
 
 pub(crate) use network::NetworkCounter;
-pub(crate) use pools::{get_shared_pool, list_pool_tenants, list_shared_pools};
+pub(crate) use pools::{
+    SharedPoolReport, get_shared_pool, list_pool_tenants, list_shared_pools, pool_reports,
+};
 
 const RUNTIME_STATS_STALE_AFTER: Duration = Duration::from_secs(3);
 const RUNTIME_STATS_POLL_INTERVAL: Duration = Duration::from_secs(1);

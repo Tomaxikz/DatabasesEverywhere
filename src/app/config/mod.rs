@@ -881,7 +881,7 @@ mod allocation_config_tests {
         assert!(allocation.prevent_memory_overallocation);
         assert!(allocation.prevent_disk_overallocation);
 
-        let allocation: AllocationConfig = serde_yaml::from_str(
+        let allocation: AllocationConfig = yaml_serde::from_str(
             r#"
 max_memory_mib: null
 max_disk_mib: null
@@ -960,7 +960,7 @@ mod disk_config_tests {
             ..DiskConfig::default()
         };
 
-        let yaml = serde_yaml::to_string(&disk).unwrap();
+        let yaml = yaml_serde::to_string(&disk).unwrap();
 
         assert!(yaml.contains("mode: auto"));
         assert!(!yaml.contains("host_filesystem_quota"));
@@ -969,7 +969,7 @@ mod disk_config_tests {
 
     #[test]
     fn legacy_soft_scanner_config_receives_safe_hybrid_defaults() {
-        let scanner: SoftDiskScannerConfig = serde_yaml::from_str(
+        let scanner: SoftDiskScannerConfig = yaml_serde::from_str(
             r#"
 scan_interval_seconds: 20
 max_concurrent_scans: 3

@@ -156,7 +156,7 @@ fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
     };
     let batches = snapshot
         .filtered(&InstanceAuthorization::All)
-        .batches(42, 1_788_220_800)
+        .batches(42, 1_788_220_800, &mut wire::ProgressCursor::default())
         .unwrap();
 
     assert!(batches.len() > 1);
@@ -276,6 +276,7 @@ fn claims_for_instances(instances: Vec<&str>) -> Claims {
         )
     });
     Claims {
+        pools: Vec::new(),
         iss: crate::constants::jwt::ISSUER.to_string(),
         aud: crate::constants::jwt::AUDIENCE.to_string(),
         sub: "test-user".to_string(),
@@ -412,4 +413,157 @@ fn sample_job(job_id: &str, instance_id: &str) -> ImportExportJob {
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn compact_monitoring_preserves_every_metric_without_duplicate_identity() {
+    let instance = monitoring_instance(
+        "tenant",
+        crate::placement::DeploymentMode::Dedicated,
+        Some(11.0),
+    );
+    let mut expected_resources = serde_json::to_value(&instance.resources).unwrap();
+    for field in [
+        "instance_id",
+        "runtime_id",
+        "deployment_mode",
+        "scope",
+        "protocol",
+        "status",
+        "network",
+        "pool",
+    ] {
+        expected_resources.as_object_mut().unwrap().remove(field);
+    }
+    let mut expected_activity = serde_json::to_value(&instance.activity).unwrap();
+    expected_activity
+        .as_object_mut()
+        .unwrap()
+        .remove("instance_id");
+    let json = serde_json::to_value(&instance).unwrap();
+    assert_eq!(json["resources"], expected_resources);
+    assert_eq!(json["activity"], expected_activity);
+    assert_eq!(json["instance_id"], "tenant");
+    let mut old = json.clone();
+    old["resources"] = serde_json::to_value(&instance.resources).unwrap();
+    old["activity"] = serde_json::to_value(&instance.activity).unwrap();
+    assert!(serde_json::to_vec(&json).unwrap().len() < serde_json::to_vec(&old).unwrap().len());
+}
+
+#[test]
+fn progress_changes_reset_reconnect_and_remove_evicted_records() {
+    let store = crate::api::instances::progress::InstallProgressStore::default();
+    store.begin(
+        "tenant",
+        crate::shared::protocol::Protocol::Mysql,
+        "mysql:8.4",
+    );
+    store.complete("tenant", "finished");
+    let first = store.get("tenant").unwrap();
+    let mut cursor = wire::ProgressCursor::default();
+    let delta = cursor.select(&[&first]);
+    assert!(delta.reset);
+    assert_eq!(delta.updates.len(), 1);
+    let delta = cursor.select(&[&first]);
+    assert!(!delta.reset);
+    assert!(delta.updates.is_empty());
+    store.stage("tenant", "retry", "retrying");
+    let mut changed = store.get("tenant").unwrap();
+    changed.updated_at = first.updated_at.clone(); // Revision still detects changes.
+    assert_eq!(cursor.select(&[&changed]).updates.len(), 1);
+    assert_eq!(
+        wire::ProgressCursor::default()
+            .select(&[&changed])
+            .updates
+            .len(),
+        1
+    );
+    let removed = cursor.select(&[]);
+    assert_eq!(removed.removed, ["tenant"]);
+    assert!(cursor.select(&[]).removed.is_empty());
+    assert_eq!(cursor.select(&[&first]).updates.len(), 1);
+}
+
+#[test]
+fn progress_delta_batches_are_bounded_and_authorized() {
+    let store = crate::api::instances::progress::InstallProgressStore::default();
+    let mut instances = Vec::new();
+    for index in 0..300 {
+        let id = format!("tenant-{index:04}");
+        store.begin(&id, crate::shared::protocol::Protocol::Mysql, "mysql:8.4");
+        store.complete(&id, "finished");
+        instances.push(monitoring_instance(
+            id,
+            crate::placement::DeploymentMode::Shared,
+            None,
+        ));
+    }
+    let mut snapshot = MonitoringSnapshotData {
+        instances,
+        install_progress: store.list(),
+    };
+    let mut cursor = wire::ProgressCursor::default();
+    let first = snapshot
+        .filtered(&InstanceAuthorization::All)
+        .batches(1, 1, &mut cursor)
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|batch| batch.install_progress.len())
+            .sum::<usize>(),
+        300
+    );
+    assert!(first.iter().all(|batch| batch.progress_reset));
+    for batch in &first {
+        assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+    }
+    let unchanged = snapshot
+        .filtered(&InstanceAuthorization::All)
+        .batches(2, 2, &mut cursor)
+        .unwrap();
+    assert!(
+        unchanged
+            .iter()
+            .all(|batch| !batch.progress_reset && batch.install_progress.is_empty())
+    );
+    assert_eq!(
+        unchanged
+            .iter()
+            .map(|batch| batch.instances.len())
+            .sum::<usize>(),
+        300
+    );
+    snapshot.install_progress.clear();
+    let removed = snapshot
+        .filtered(&InstanceAuthorization::All)
+        .batches(3, 3, &mut cursor)
+        .unwrap();
+    assert_eq!(
+        removed
+            .iter()
+            .map(|batch| batch.install_progress_removed.len())
+            .sum::<usize>(),
+        300
+    );
+    for (index, batch) in removed.iter().enumerate() {
+        assert_eq!(batch.batch_index, index as u32);
+        assert_eq!(batch.batch_count, removed.len() as u32);
+        assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+    }
+    snapshot.install_progress = store.list();
+    let authorization = InstanceAuthorization::Selected(HashMap::from([(
+        "tenant-0000".into(),
+        "generation-a".into(),
+    )]));
+    let own = snapshot
+        .filtered(&authorization)
+        .batches(1, 1, &mut wire::ProgressCursor::default())
+        .unwrap();
+    let ids = own
+        .iter()
+        .flat_map(|batch| &batch.install_progress)
+        .map(|progress| progress.instance_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["tenant-0000"]);
 }

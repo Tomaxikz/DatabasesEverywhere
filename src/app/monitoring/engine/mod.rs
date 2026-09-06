@@ -1043,7 +1043,7 @@ mod tests {
         runtime.runtime.container_name = "pool_test".to_string();
         runtime.limits.disk_mib = 1024;
         runtime.limits.disk_enforcement_method = "test".to_string();
-        runtime.compatibility_key = "test".to_string();
+
         runtime.max_tenants = 8;
         runtime.admin_secret = Some("test".to_string());
         runtime

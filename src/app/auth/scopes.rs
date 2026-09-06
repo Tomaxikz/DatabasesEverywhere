@@ -20,6 +20,10 @@ pub const CONFIG_ADMIN: &str = "config:admin";
 pub const WS_TOKENS_WRITE: &str = "ws-tokens:write";
 
 pub const MONITOR_READ: &str = "monitor:read";
+pub const POOLS_READ: &str = "pools:read";
+pub const POOLS_WRITE: &str = "pools:write";
+pub const POOLS_LOGS: &str = "pools:logs";
+pub const POOLS_MONITOR: &str = "pools:monitor";
 
 pub const KNOWN: &[&str] = &[
     ALL,
@@ -42,6 +46,10 @@ pub const KNOWN: &[&str] = &[
     CONFIG_ADMIN,
     WS_TOKENS_WRITE,
     MONITOR_READ,
+    POOLS_READ,
+    POOLS_WRITE,
+    POOLS_LOGS,
+    POOLS_MONITOR,
 ];
 
 pub fn is_known(scope: &str) -> bool {

@@ -1,3 +1,7 @@
+pub(crate) mod log_stream;
+pub(crate) mod wire;
+use log_stream::stream_logs;
+
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -41,7 +45,7 @@ use crate::{
     },
     instances::metadata::InstanceMetadata,
     jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
-    shared::{redaction, time::now_unix},
+    shared::time::now_unix,
 };
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +67,7 @@ const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const MONITORING_BATCH_TARGET_BYTES: usize = 12 * 1024;
 const MONITORING_SNAPSHOT_TTL: Duration = Duration::from_millis(400);
 
-fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
+pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket
         .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
         .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES)
@@ -104,6 +108,7 @@ async fn stream_monitoring(
     let expiration = sleep_until(expiration_deadline);
     tokio::pin!(expiration);
     let mut sequence = 0_u64;
+    let mut progress_cursor = wire::ProgressCursor::default();
     loop {
         tokio::select! {
             _ = wait_for_daemon_shutdown(&mut shutdown) => {
@@ -133,7 +138,7 @@ async fn stream_monitoring(
                 sequence = sequence.saturating_add(1);
                 let batches = match message
                     .filtered(&authorization)
-                    .batches(sequence, now_unix())
+                    .batches(sequence, now_unix(), &mut progress_cursor)
                 {
                     Ok(batches) => batches,
                     Err(error) => {
@@ -360,15 +365,24 @@ impl<'a> AuthorizedMonitoring<'a> {
         self,
         sequence: u64,
         sampled_at_unix: i64,
+        cursor: &mut wire::ProgressCursor,
     ) -> Result<Vec<MonitoringBatch<'a>>, serde_json::Error> {
         let instance_batches = chunk_serialized(self.instances)?;
-        let progress_batches = chunk_serialized(self.install_progress)?;
-        let batch_count = (instance_batches.len() + progress_batches.len()).max(1) as u32;
+        let progress = cursor.select(&self.install_progress);
+        let progress_batches = chunk_serialized(progress.updates)?;
+        let removed_batches = chunk_serialized(progress.removed.iter().collect())?
+            .into_iter()
+            .map(|batch| batch.into_iter().cloned().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let batch_count =
+            (instance_batches.len() + progress_batches.len() + removed_batches.len()).max(1) as u32;
         let mut batches = Vec::with_capacity(batch_count as usize);
 
         for instances in instance_batches {
             batches.push(MonitoringBatch {
                 r#type: "stats",
+                progress_reset: progress.reset,
+                install_progress_removed: Vec::new(),
                 sequence,
                 sampled_at_unix,
                 batch_index: batches.len() as u32,
@@ -380,6 +394,8 @@ impl<'a> AuthorizedMonitoring<'a> {
         for install_progress in progress_batches {
             batches.push(MonitoringBatch {
                 r#type: "stats",
+                progress_reset: progress.reset,
+                install_progress_removed: Vec::new(),
                 sequence,
                 sampled_at_unix,
                 batch_index: batches.len() as u32,
@@ -388,9 +404,24 @@ impl<'a> AuthorizedMonitoring<'a> {
                 install_progress,
             });
         }
+        for removed in removed_batches {
+            batches.push(MonitoringBatch {
+                r#type: "stats",
+                sequence,
+                sampled_at_unix,
+                batch_index: batches.len() as u32,
+                batch_count,
+                instances: Vec::new(),
+                install_progress: Vec::new(),
+                progress_reset: progress.reset,
+                install_progress_removed: removed,
+            });
+        }
         if batches.is_empty() {
             batches.push(MonitoringBatch {
                 r#type: "stats",
+                progress_reset: progress.reset,
+                install_progress_removed: Vec::new(),
                 sequence,
                 sampled_at_unix,
                 batch_index: 0,
@@ -512,6 +543,9 @@ async fn resolve_instance_authorization(
 
 #[derive(Debug, Serialize)]
 struct MonitoringBatch<'a> {
+    progress_reset: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    install_progress_removed: Vec<String>,
     r#type: &'static str,
     sequence: u64,
     sampled_at_unix: i64,
@@ -532,7 +566,9 @@ struct MonitoringInstance {
     protocol: String,
     status: String,
     runtime: &'static str,
+    #[serde(serialize_with = "wire::activity")]
     activity: TenantActivity,
+    #[serde(serialize_with = "wire::resources")]
     resources: Option<ResourceReport>,
     resource_error: Option<PublicDiagnostic>,
 }
@@ -559,7 +595,18 @@ pub async fn logs(
     Ok(upgrade_websocket(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
-            stream_logs(socket, state, metadata, query.tail, claims.exp, connection)
+            stream_logs(
+                socket,
+                state,
+                log_stream::LogTarget::Instance {
+                    instance_id: metadata.instance_id,
+                    created_at: metadata.created_at,
+                    protocol: metadata.protocol,
+                },
+                query.tail,
+                claims.exp,
+                connection,
+            )
         }))
 }
 
@@ -597,7 +644,7 @@ pub async fn import_export(
         }))
 }
 
-async fn admit_websocket(
+pub(crate) async fn admit_websocket(
     state: &AppState,
     claims: &Claims,
 ) -> Result<WebSocketConnectionPermit, ApiError> {
@@ -623,152 +670,6 @@ async fn admit_websocket(
             Err(ApiError::RateLimited)
         }
     }
-}
-
-async fn stream_logs(
-    mut socket: WebSocket,
-    state: AppState,
-    metadata: InstanceMetadata,
-    tail: Option<usize>,
-    jwt_exp: i64,
-    _connection: WebSocketConnectionPermit,
-) {
-    let mut shutdown = state.daemon_shutdown.subscribe();
-    let expiration_deadline = jwt_expiration_deadline(jwt_exp);
-    if !instance_generation_is_current(&state, &metadata.instance_id, &metadata.created_at).await {
-        close_replaced_socket(&mut socket).await;
-        return;
-    }
-    let follow_logs = state
-        .docker
-        .follow_logs(metadata.protocol, &metadata.instance_id, tail);
-    let logs_result = tokio::select! {
-        _ = wait_for_daemon_shutdown(&mut shutdown) => {
-            close_shutdown_socket(&mut socket).await;
-            return;
-        }
-        result = follow_logs => result,
-    };
-    let mut logs = match logs_result {
-        Ok(logs) => logs,
-        Err(error) => {
-            let message = LogSnapshot {
-                r#type: "logs",
-                instance_id: metadata.instance_id,
-                sequence: 1,
-                stdout: None,
-                stderr: None,
-                error: Some(PublicDiagnostic::internal("container log stream", error)),
-            };
-            let _ = send_json_before(&mut socket, &message, expiration_deadline).await;
-            return;
-        }
-    };
-    let mut heartbeat = interval(Duration::from_secs(30));
-    let mut sequence = 0_u64;
-    let mut stdout_buffer = String::new();
-    let mut stderr_buffer = String::new();
-    let expiration = sleep_until(expiration_deadline);
-    tokio::pin!(expiration);
-    loop {
-        let message = tokio::select! {
-            _ = wait_for_daemon_shutdown(&mut shutdown) => {
-                close_shutdown_socket(&mut socket).await;
-                break;
-            }
-            _ = &mut expiration => {
-                close_expired_socket(&mut socket).await;
-                break;
-            }
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => continue,
-                }
-            }
-            output = logs.recv() => {
-                sequence += 1;
-                match output {
-                    Some(Ok(output)) => {
-                        append_log_buffer(&mut stdout_buffer, &output.stdout);
-                        append_log_buffer(&mut stderr_buffer, &output.stderr);
-                        LogSnapshot {
-                            r#type: "logs",
-                            instance_id: metadata.instance_id.clone(),
-                            sequence,
-                            stdout: non_empty_redacted(&stdout_buffer),
-                            stderr: non_empty_redacted(&stderr_buffer),
-                            error: None,
-                        }
-                    }
-                    Some(Err(error)) => LogSnapshot {
-                        r#type: "logs",
-                        instance_id: metadata.instance_id.clone(),
-                        sequence,
-                        stdout: None,
-                        stderr: None,
-                        error: Some(PublicDiagnostic::internal("container log stream", error)),
-                    },
-                    None => LogSnapshot {
-                        r#type: "logs",
-                        instance_id: metadata.instance_id.clone(),
-                        sequence,
-                        stdout: None,
-                        stderr: None,
-                        error: Some(PublicDiagnostic::public(
-                            "stream_ended",
-                            "container log stream ended",
-                        )),
-                    },
-                }
-            }
-            _ = heartbeat.tick() => {
-                sequence += 1;
-                LogSnapshot {
-                    r#type: "logs",
-                    instance_id: metadata.instance_id.clone(),
-                    sequence,
-                    stdout: non_empty_redacted(&stdout_buffer),
-                    stderr: non_empty_redacted(&stderr_buffer),
-                    error: None,
-                }
-            }
-        };
-
-        if !instance_generation_is_current(&state, &metadata.instance_id, &metadata.created_at)
-            .await
-        {
-            close_replaced_socket(&mut socket).await;
-            break;
-        }
-        if send_json_before(&mut socket, &message, expiration_deadline)
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-const LOG_STREAM_BUFFER_LIMIT: usize = 128 * 1024;
-
-fn append_log_buffer(buffer: &mut String, chunk: &str) {
-    if chunk.is_empty() {
-        return;
-    }
-    buffer.push_str(chunk);
-    if buffer.len() <= LOG_STREAM_BUFFER_LIMIT {
-        return;
-    }
-    let mut start = buffer.len().saturating_sub(LOG_STREAM_BUFFER_LIMIT);
-    while start < buffer.len() && !buffer.is_char_boundary(start) {
-        start += 1;
-    }
-    buffer.replace_range(..start, "");
-}
-
-fn non_empty_redacted(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| redaction::redact_connection_url(value))
 }
 
 async fn stream_import_export(
@@ -1037,7 +938,7 @@ async fn download_ticket_for_job(
     }
 }
 
-fn jwt_expiration_deadline(exp: i64) -> Instant {
+pub(crate) fn jwt_expiration_deadline(exp: i64) -> Instant {
     let now_since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -1057,7 +958,7 @@ async fn instance_generation_is_current(
         .is_some_and(|metadata| metadata.created_at == instance_generation)
 }
 
-async fn close_expired_socket(socket: &mut WebSocket) {
+pub(crate) async fn close_expired_socket(socket: &mut WebSocket) {
     close_socket(socket, "JWT expired").await;
 }
 
@@ -1065,11 +966,11 @@ async fn close_unresponsive_socket(socket: &mut WebSocket) {
     close_socket(socket, "heartbeat timeout").await;
 }
 
-async fn close_replaced_socket(socket: &mut WebSocket) {
+pub(crate) async fn close_replaced_socket(socket: &mut WebSocket) {
     close_socket(socket, "instance identity changed").await;
 }
 
-async fn close_shutdown_socket(socket: &mut WebSocket) {
+pub(crate) async fn close_shutdown_socket(socket: &mut WebSocket) {
     close_socket_with_code(socket, close_code::RESTART, "server restarting").await;
 }
 
@@ -1090,7 +991,7 @@ async fn close_socket_with_code(socket: &mut WebSocket, code: u16, reason: &'sta
     .await;
 }
 
-async fn wait_for_daemon_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn wait_for_daemon_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
             return;
@@ -1098,7 +999,7 @@ async fn wait_for_daemon_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bo
     }
 }
 
-async fn send_json_before<T: Serialize>(
+pub(crate) async fn send_json_before<T: Serialize>(
     socket: &mut WebSocket,
     value: &T,
     deadline: Instant,
@@ -1130,7 +1031,7 @@ async fn send_monitoring_batch(
     send_message_before(socket, Message::Text(payload.into()), deadline).await
 }
 
-async fn send_message_before(
+pub(crate) async fn send_message_before(
     socket: &mut WebSocket,
     message: Message,
     deadline: Instant,
@@ -1146,7 +1047,7 @@ async fn send_message_before(
         .map_err(|_| ())
 }
 
-async fn complete_before<F>(deadline: Instant, future: F) -> Result<F::Output, ()>
+pub(crate) async fn complete_before<F>(deadline: Instant, future: F) -> Result<F::Output, ()>
 where
     F: Future,
 {
@@ -1181,16 +1082,6 @@ struct ImportExportJobUpdate {
 struct ImportExportLaggedEvent {
     r#type: &'static str,
     skipped: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct LogSnapshot {
-    r#type: &'static str,
-    instance_id: String,
-    sequence: u64,
-    stdout: Option<String>,
-    stderr: Option<String>,
-    error: Option<PublicDiagnostic>,
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 [Documentation index](../README.md) · [OpenAPI](openapi.yml)
 
 An instance is one logical database tenant. `dedicated` owns an engine
-container; `shared` runs inside a managed pool with other tenants.
+container; `shared` runs inside a pool private to one game server. Different servers never share a pool.
 
 ## Placement and lifecycle
 
@@ -15,8 +15,7 @@ Discover enabled protocols and modes through `GET /api/system` →
 | Dedicated | All eight | Own runtime, CPU/RAM/disk limits |
 | Shared | PostgreSQL, MySQL, MariaDB, MongoDB, ClickHouse | Tenant credentials/routes/data; pool CPU/RAM and tenant disk enforcement |
 
-Shared mode is rejected for Redis, Valkey, and Qdrant. Shared CPU/RAM
-reservations are not per-tenant cgroup limits; see [monitoring](monitoring.md)
+Shared mode is rejected for Redis, Valkey, and Qdrant. CPU/RAM are fixed pool limits, not per-tenant reservations; see [monitoring](monitoring.md)
 and [disk boundaries](../operations/disk-limits.md#shared-tenant-boundaries).
 
 Statuses are `creating`, `booting`, `running`, `stopped`, `failed`,
@@ -85,18 +84,20 @@ Key validation:
 - MongoDB and ClickHouse require at least 1,024 MiB memory and disk.
 - Disabled protocols and unsupported placement modes fail before provisioning.
 
-Node capacity checks are authoritative. Do not automatically retry with
+Node capacity checks are authoritative. Shared-pool admission runs in the background worker: an accepted HTTP 202 can become a failed creation with a public conflict diagnostic; acceptance never means the pool was usable. Do not automatically retry with
 `purge_stale_resources`; it explicitly deletes orphaned data.
 
 ## Updating limits
 
-`PATCH /api/instances/{id}/limits` requires all three fields:
+`PATCH /api/instances/{id}/limits` requires all three fields for dedicated instances:
 
 ```json
 { "cpu_cores": 2.0, "memory_mib": 4096, "disk_mib": 20480 }
 ```
 
-Creation floors still apply. A shared disk shrink fences/drains the tenant and
+Shared tenants instead send only `{ "disk_mib": 20480 }`. Their disk allowances must fit inside the fixed pool budget, including engine overhead and spill; CPU/RAM are not resized by tenant requests.
+
+Creation floors still apply to dedicated instances. A shared disk shrink fences/drains the tenant and
 measures its physical data; `409` preserves the old limit if the data does not
 fit. Hard-quota resizes retain the tenant's existing project identity.
 
@@ -109,10 +110,10 @@ blocking startup; there is no additional API/config field.
 `POST /api/instances/{id}/deployment-migrations`:
 
 ```json
-{ "target_mode": "shared" }
+{ "target_mode": "shared", "server_id": "game-server-uuid", "pool_id": "pool_postgres_..." }
 ```
 
-Use `dedicated` for the reverse direction. `202` returns a durable migration
+Use `dedicated` for the reverse direction; optional `limits` sets the new dedicated engine budget. Create the target [pool](pools.md) first. Ownership cannot change during migration. `202` returns a durable migration
 record and a status `Location`. GET the collection to list attempts, or
 `/deployment-migrations/{migration_id}` to read one.
 
@@ -193,3 +194,13 @@ compatibility listeners are outside this model.
 official MySQL/MariaDB images with CLI, Connector/J, MariaDB Connector/J,
 HikariCP, deferred catalog selection, and native TLS negotiation. Keep that
 matrix distinct from the broader version admission policy.
+
+## Server-owned pools (API 0.17)
+
+[Create the pool first](pools.md), then add databases to it. The pool owns
+physical CPU, RAM, disk capacity, power, image and logs. Each child retains its
+database account, disk allowance, gateway route, backups and import/export.
+
+The generic create endpoint also accepts shared requests with explicit
+`server_id`, `pool_id` and `limits: {"disk_mib":1024}`. It never creates a pool
+implicitly. Redis, Valkey and Qdrant remain dedicated-only.

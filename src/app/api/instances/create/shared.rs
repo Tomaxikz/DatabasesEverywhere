@@ -1,41 +1,27 @@
-use secrecy::SecretString;
 use tokio::sync::OwnedMutexGuard;
 
-use super::{
-    backend_endpoint, docker_error, launch_container_from_spec, prepare_instance_container_user,
-    protocol_pids_limit, resolve_image,
-};
+use super::resolve_image;
 use crate::{
     api::{
         http::{response::ApiError, router::AppState},
         instances::requests::CreateInstanceRequest,
     },
-    databases,
-    disk::DiskLimiter,
-    instances::{
-        metadata::{
-            DatabaseIdentity, DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus,
-            InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind, RuntimeMetadata,
-            SCHEMA_VERSION,
-        },
-        paths::InstancePaths,
+    instances::metadata::{
+        DatabaseIdentity, DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus,
+        InstanceMetadata, InstanceStatus, PublicEndpoint, SCHEMA_VERSION,
     },
     placement::{
-        DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus,
-        PlacementRepositoryError, ReserveTenant, RuntimeReservation, policy,
-        runtime as shared_runtime,
+        DeploymentMode, EngineRuntime, EngineRuntimeStatus, PlacementRepositoryError,
+        ReserveTenant, runtime as shared_runtime,
         tenant::{self, TenantTarget},
     },
-    runtime::docker::DockerInstanceSpec,
     shared::{limits::InstanceLimits, protocol::Protocol, time::now_rfc3339},
 };
 
 pub(super) async fn create(
     state: &AppState,
     request: CreateInstanceRequest,
-    creation: OwnedMutexGuard<()>,
 ) -> Result<InstanceMetadata, ApiError> {
-    let mut creation = Some(creation);
     let image = resolve_image(state, &request)?;
     state
         .install_progress
@@ -43,32 +29,29 @@ pub(super) async fn create(
     state.install_progress.stage(
         &request.instance_id,
         "select_pool",
-        "selecting a compatible shared database runtime",
+        "using the requested server-owned pool",
     );
 
-    let mut tenant_limits = request
-        .limits
-        .as_ref()
-        .map(super::limits_from_request)
-        .unwrap_or_default();
-    tenant_limits.disk_enforced = false;
-    tenant_limits.disk_enforcement_method = "shared_pool_reservation".to_string();
-
-    let requested_pool_limits = request
-        .limits
-        .as_ref()
-        .map(super::limits_from_request)
-        .unwrap_or_default();
-    let (claimed_runtime, created_pool, _runtime_operation) = claim_runtime(
-        state,
-        &request,
-        &image,
-        requested_pool_limits,
-        &tenant_limits,
-        &mut creation,
-    )
-    .await
-    .map_err(|error| fail(state, &request.instance_id, error))?;
+    let mut tenant_limits = crate::shared::limits::InstanceLimits {
+        disk_mib: request
+            .limits
+            .as_ref()
+            .expect("validated tenant disk")
+            .disk_mib,
+        disk_enforced: false,
+        disk_enforcement_method: "shared_pool_reservation".into(),
+        ..Default::default()
+    };
+    let (claimed_runtime, _runtime_operation) =
+        claim_runtime(state, &request, &image, &mut tenant_limits)
+            .await
+            .inspect_err(|error| {
+                state.install_progress.fail_api_error(
+                    &request.instance_id,
+                    "shared instance creation",
+                    error,
+                )
+            })?;
     let runtime = state
         .placements
         .get(&claimed_runtime.runtime_id)
@@ -89,7 +72,6 @@ pub(super) async fn create(
             &request.instance_id,
             &request.database,
             &request.username,
-            created_pool,
         )
         .await;
         return Err(fail(
@@ -103,7 +85,7 @@ pub(super) async fn create(
         shared_runtime::apply_limits(&state.docker, &state.config, &state.placements, &runtime)
             .await
     {
-        release_claim(state, &runtime, &request.instance_id, created_pool).await;
+        release_claim(state, &runtime, &request.instance_id).await;
         return Err(fail(state, &request.instance_id, error));
     }
 
@@ -131,7 +113,6 @@ pub(super) async fn create(
             &request.instance_id,
             &request.database,
             &request.username,
-            created_pool,
         )
         .await;
         return Err(fail(
@@ -155,7 +136,6 @@ pub(super) async fn create(
             &request.instance_id,
             &request.database,
             &request.username,
-            created_pool,
         )
         .await;
         return Err(fail(state, &request.instance_id, error));
@@ -177,7 +157,6 @@ pub(super) async fn create(
                 &request.instance_id,
                 &request.database,
                 &request.username,
-                created_pool,
             )
             .await;
             return Err(fail(
@@ -200,7 +179,6 @@ pub(super) async fn create(
             &request.instance_id,
             &request.database,
             &request.username,
-            created_pool,
         )
         .await;
         return Err(fail(
@@ -210,7 +188,7 @@ pub(super) async fn create(
         ));
     }
 
-    let metadata = build_shared_metadata(state, &request, &runtime, tenant_limits, &image);
+    let metadata = build_shared_metadata(state, &request, &runtime, tenant_limits, &runtime.image);
     if let Err(error) = state.manager.upsert_fenced(metadata.clone()).await {
         match state.manager.get_persisted(&metadata.instance_id).await {
             Ok(Some(persisted)) if same_created_tenant(&persisted, &metadata) => {
@@ -230,7 +208,6 @@ pub(super) async fn create(
                     &metadata.instance_id,
                     &metadata.database.name,
                     &metadata.database.username,
-                    created_pool,
                 )
                 .await;
                 return Err(fail(
@@ -324,7 +301,6 @@ pub(super) async fn create(
         protocol = %metadata.protocol,
         database = %metadata.database.name,
         username = %metadata.database.username,
-        created_pool,
     );
     Ok(metadata)
 }
@@ -333,51 +309,51 @@ pub(crate) async fn claim_runtime(
     state: &AppState,
     request: &CreateInstanceRequest,
     image: &str,
-    limits: InstanceLimits,
-    tenant_limits: &InstanceLimits,
-    creation: &mut Option<OwnedMutexGuard<()>>,
-) -> Result<(EngineRuntime, bool, OwnedMutexGuard<()>), ApiError> {
-    let protocol = request.protocol;
-    for candidate in state
+    tenant_limits: &mut InstanceLimits,
+) -> Result<(EngineRuntime, OwnedMutexGuard<()>), ApiError> {
+    let owner = request.owner.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("shared_pool_owner_required: server_id is required".into())
+    })?;
+    owner.check().map_err(ApiError::BadRequest)?;
+    let pool_id = request
+        .pool_id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("shared deployment requires pool_id".into()))?;
+    if let Some(candidate) = state
         .placements
-        .find_shared(protocol, image, &limits)
+        .get(pool_id)
         .await
         .map_err(placement_error)?
     {
-        let candidate_operation = state.instance_locks.lock(&candidate.runtime_id).await;
-        let Some(runtime) = state
-            .placements
-            .get(&candidate.runtime_id)
-            .await
-            .map_err(placement_error)?
-        else {
-            continue;
-        };
-        if runtime.status != EngineRuntimeStatus::Running {
-            continue;
+        let operation = state.instance_locks.lock(&candidate.runtime_id).await;
+        let runtime = state.placements.get(&candidate.runtime_id).await.map_err(placement_error)?
+            .ok_or_else(|| ApiError::Conflict("shared_pool_unavailable: the server pool disappeared; retry after reconciliation".into()))?;
+        if runtime.owner.as_ref() != Some(owner) || runtime.protocol != request.protocol {
+            return Err(ApiError::Conflict(
+                "shared_pool_owner_mismatch: pool ownership does not match".into(),
+            ));
         }
-        match state
+        if runtime.deployment_mode != DeploymentMode::Shared
+            || runtime.pending_image.is_some()
+            || runtime.desired_state != DesiredInstanceState::Running
+            || runtime.status != EngineRuntimeStatus::Running
+        {
+            return Err(ApiError::Conflict("shared_pool_unavailable: the server pool is not running; repair or start it before adding databases".into()));
+        }
+        if request.image.is_some() && runtime.image != image {
+            return Err(ApiError::Conflict("shared_pool_image_mismatch: use the existing pool image or migrate/upgrade it explicitly".into()));
+        }
+        tenant_limits.cpu_cores = runtime.limits.cpu_cores;
+        tenant_limits.memory_mib = runtime.limits.memory_mib;
+        state
             .placements
             .check_tenant_identity(&runtime.runtime_id, &request.database, &request.username)
             .await
-        {
-            Ok(()) => {}
-            Err(
-                PlacementRepositoryError::DatabaseInUse { .. }
-                | PlacementRepositoryError::UsernameInUse { .. },
-            ) => continue,
-            Err(error) => return Err(placement_error(error)),
-        }
-        let mut admission = limits.clone();
-        admission.disk_mib =
-            policy::pool_disk_growth_mib(protocol, runtime.reserved.disk_mib, limits.disk_mib)
-                .ok_or_else(|| {
-                    ApiError::BadRequest(format!("{protocol} cannot use shared deployment"))
-                })?;
-        super::enforce_node_allocation_policy(state, &admission, None).await?;
-        match state
+            .map_err(placement_error)?;
+        let runtime = state
             .placements
             .reserve(ReserveTenant {
+                owner: owner.clone(),
                 instance_id: &request.instance_id,
                 runtime_id: &runtime.runtime_id,
                 database: &request.database,
@@ -385,433 +361,12 @@ pub(crate) async fn claim_runtime(
                 limits: tenant_limits,
             })
             .await
-        {
-            Ok(runtime) => {
-                // The durable reservation is the node-capacity commit. Release
-                // global admission before any Docker or tenant-engine work.
-                drop(creation.take());
-                return Ok((runtime, false, candidate_operation));
-            }
-            Err(PlacementRepositoryError::CapacityUnavailable(_)) => continue,
-            Err(error) => return Err(placement_error(error)),
-        }
+            .map_err(placement_error)?;
+        return Ok((runtime, operation));
     }
-
-    let pool_limits = policy::pool_limits(protocol, &limits)
-        .ok_or_else(|| ApiError::BadRequest(format!("{protocol} cannot use shared deployment")))?;
-    crate::shared::limits::validate_runtime_limits(pool_limits.cpu_cores, pool_limits.memory_mib)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    super::enforce_node_allocation_policy(state, &pool_limits, None).await?;
-    let (runtime, runtime_operation) =
-        create_runtime(state, request, image, pool_limits, tenant_limits, creation).await?;
-    Ok((runtime, true, runtime_operation))
-}
-
-async fn create_runtime(
-    state: &AppState,
-    request: &CreateInstanceRequest,
-    image: &str,
-    mut limits: InstanceLimits,
-    tenant_limits: &InstanceLimits,
-    creation: &mut Option<OwnedMutexGuard<()>>,
-) -> Result<(EngineRuntime, OwnedMutexGuard<()>), ApiError> {
-    let protocol = request.protocol;
-    let runtime_id = policy::runtime_id(protocol);
-    // Container events use this same lock before reading and persisting pool
-    // state. Holding it across the first durable row, bootstrap, and any
-    // cleanup prevents an early event from reviving a failed pool from a stale
-    // snapshot.
-    let runtime_operation = state.instance_locks.lock(&runtime_id).await;
-    let admin_password = format!(
-        "dbe-pool-{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
-    let paths = InstancePaths::new(&state.config.paths, &runtime_id)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    // Resolve every fallible identity value before creating the pool's
-    // filesystem namespace. From create_dirs onward there is no durable row
-    // for boot recovery until the initial placement save succeeds.
-    let backend = backend_endpoint(state, protocol, &runtime_id)?;
-    let container_name = state
-        .docker
-        .container_name(protocol, &runtime_id)
-        .map_err(docker_error)?;
-    let max_tenants = policy::max_tenants(protocol)
-        .ok_or_else(|| ApiError::BadRequest(format!("{protocol} cannot use shared deployment")))?;
-    let disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .for_protocol(protocol);
-    let effective_disk_method = disk_limiter.mode().method().to_string();
-    if let Err(error) = paths.create_dirs().await {
-        return Err(cleanup_unpersisted_runtime(
-            state,
-            &paths,
-            protocol,
-            &effective_disk_method,
-            ApiError::Runtime(error.to_string()),
-        )
-        .await);
-    }
-    let user = match prepare_instance_container_user(&state.docker, &paths, protocol).await {
-        Ok(user) => user,
-        Err(error) => {
-            return Err(cleanup_unpersisted_runtime(
-                state,
-                &paths,
-                protocol,
-                &effective_disk_method,
-                ApiError::Runtime(error.to_string()),
-            )
-            .await);
-        }
-    };
-    let disk = match disk_limiter
-        .apply_instance_limit(&runtime_id, &paths.data, limits.disk_mib)
-        .await
-    {
-        Ok(disk) => disk,
-        Err(error) => {
-            return Err(cleanup_unpersisted_runtime(
-                state,
-                &paths,
-                protocol,
-                &effective_disk_method,
-                ApiError::Runtime(error.to_string()),
-            )
-            .await);
-        }
-    };
-    limits.disk_enforced = disk.enforced;
-    limits.disk_enforcement_method = disk.method.clone();
-    let data_path = disk.container_data_path.unwrap_or(paths.data.clone());
-    let mut spec = match shared_spec(
-        protocol,
-        &runtime_id,
-        image,
-        &admin_password,
-        &paths,
-        data_path,
-    )
-    .await
-    {
-        Ok(spec) => spec,
-        Err(error) => {
-            return Err(cleanup_unpersisted_runtime(
-                state,
-                &paths,
-                protocol,
-                &limits.disk_enforcement_method,
-                error,
-            )
-            .await);
-        }
-    };
-    spec.user = Some(user);
-    spec.cpu_cores = limits.cpu_cores;
-    spec.memory_mib = limits.memory_mib;
-    spec.disk_mib = limits.disk_mib;
-    spec.pids_limit = Some(protocol_pids_limit(state, protocol));
-
-    let now = now_rfc3339();
-    let mut runtime = EngineRuntime {
-        schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
-        runtime_id: runtime_id.clone(),
-        protocol,
-        deployment_mode: DeploymentMode::Shared,
-        status: EngineRuntimeStatus::Creating,
-        backend,
-        runtime: RuntimeMetadata {
-            kind: RuntimeKind::from(state.config.daemon.engine),
-            container_name,
-            network_mode: "none".to_string(),
-        },
-        limits,
-        image: image.to_string(),
-        database_version: None,
-        compatibility: None,
-        compatibility_key: policy::compatibility_key(protocol, image),
-        max_tenants,
-        reserved: RuntimeReservation::default(),
-        admin_secret: Some(admin_password.clone()),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    if let Err(error) = state.placements.save(&runtime).await {
-        let save_error = placement_error(error);
-        match state.placements.get(&runtime_id).await {
-            Ok(Some(persisted)) if same_initial_runtime(&persisted, &runtime) => {
-                tracing::warn!(
-                    event = "audit shared_runtime_create_commit_ack_lost",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    "initial shared runtime placement was committed despite a lost SQLite acknowledgement"
-                );
-            }
-            Ok(None) => {
-                return Err(cleanup_unpersisted_runtime(
-                    state,
-                    &paths,
-                    protocol,
-                    &runtime.limits.disk_enforcement_method,
-                    save_error,
-                )
-                .await);
-            }
-            Ok(Some(_)) => {
-                tracing::error!(
-                    event = "audit shared_runtime_create_commit_ambiguous",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    durable_state = "mismatched",
-                    "retained provisional shared runtime paths because placement persistence became ambiguous"
-                );
-                return Err(ApiError::Runtime(format!(
-                    "initial shared runtime placement returned {save_error}, but runtime {runtime_id} contains different durable state; retained its physical state for boot recovery"
-                )));
-            }
-            Err(read_error) => {
-                tracing::error!(
-                    event = "audit shared_runtime_create_commit_ambiguous",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    durable_state = "unreadable",
-                    durable_read_error = %read_error,
-                    "retained provisional shared runtime paths because placement persistence became ambiguous"
-                );
-                return Err(ApiError::Runtime(format!(
-                    "initial shared runtime placement returned {save_error}, and durable state for runtime {runtime_id} could not be read ({read_error}); retained its physical state for boot recovery"
-                )));
-            }
-        }
-    }
-    runtime = match state
-        .placements
-        .reserve_starting(ReserveTenant {
-            instance_id: &request.instance_id,
-            runtime_id: &runtime.runtime_id,
-            database: &request.database,
-            username: &request.username,
-            limits: tenant_limits,
-        })
-        .await
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            destroy_empty_runtime(state, &runtime).await;
-            return Err(placement_error(error));
-        }
-    };
-    // The creating runtime and its first tenant reservation are one durable
-    // physical-capacity commit. Other admissions count it while Docker work
-    // runs, but find_shared excludes it until launch succeeds.
-    drop(creation.take());
-
-    state.install_progress.stage(
-        &request.instance_id,
-        "create_pool",
-        "starting a new shared database runtime",
-    );
-    let progress = state.install_progress.clone();
-    let progress_id = request.instance_id.clone();
-    let pull_progress = move |event| progress.docker_pull(&progress_id, event);
-    let launch = launch_container_from_spec(
-        state,
-        &spec,
-        protocol,
-        &runtime_id,
-        &pull_progress,
-        false,
-        || async {
-            if protocol == Protocol::Mongodb {
-                super::bootstrap_mongodb_root(state, &runtime_id, &admin_password).await?;
-            }
-            Ok(())
-        },
-    )
-    .await;
-    if let Err(error) = launch {
-        cleanup_starting_runtime(state, &runtime, &request.instance_id).await;
-        return Err(error.into_api_error());
-    }
-
-    if let Err(error) = tenant::secure_pool(&state.docker, &runtime).await {
-        cleanup_starting_runtime(state, &runtime, &request.instance_id).await;
-        return Err(ApiError::Conflict(format!(
-            "shared runtime isolation bootstrap failed: {error}"
-        )));
-    }
-
-    let probe = match shared_runtime::probe_compatibility(&state.docker, &runtime).await {
-        Ok(probe) => probe,
-        Err(error) => {
-            cleanup_starting_runtime(state, &runtime, &request.instance_id).await;
-            return Err(ApiError::Conflict(error));
-        }
-    };
-    runtime.database_version = Some(probe.version.clone());
-    runtime.compatibility = Some(probe.compatibility);
-    runtime.status = EngineRuntimeStatus::Running;
-    runtime.updated_at = now_rfc3339();
-    if let Err(error) = state
-        .placements
-        .save(&runtime)
-        .await
-        .map_err(placement_error)
-    {
-        cleanup_starting_runtime(state, &runtime, &request.instance_id).await;
-        return Err(error);
-    }
-    tracing::info!(
-        event = "audit shared_runtime_created",
-        runtime_id = %runtime.runtime_id,
-        %protocol,
-        image,
-        version = %probe.version,
-        max_tenants = runtime.max_tenants,
-    );
-    Ok((runtime, runtime_operation))
-}
-
-async fn cleanup_unpersisted_runtime(
-    state: &AppState,
-    paths: &InstancePaths,
-    protocol: Protocol,
-    disk_enforcement_method: &str,
-    error: ApiError,
-) -> ApiError {
-    let physical_cleanup = crate::api::instances::purge_provisional_runtime_paths(
-        state,
-        &paths.instance_id,
-        protocol,
-        Some(disk_enforcement_method),
-    )
-    .await;
-    // purge_provisional_runtime_paths deliberately preserves logical instance
-    // artifacts for deployment rollback. A brand-new pool has no logical
-    // owner, so remove the artifacts directory created by create_dirs too.
-    let artifact_cleanup =
-        crate::api::instances::major_upgrade::remove_path_if_exists(&paths.artifacts).await;
-    let cleanup_error = match (physical_cleanup, artifact_cleanup) {
-        (Ok(()), Ok(())) => None,
-        (Err(physical), Ok(())) => Some(physical.to_string()),
-        (Ok(()), Err(artifacts)) => Some(artifacts.to_string()),
-        (Err(physical), Err(artifacts)) => Some(format!(
-            "physical cleanup failed: {physical}; artifact cleanup failed: {artifacts}"
-        )),
-    };
-    match cleanup_error {
-        None => {
-            tracing::info!(
-                event = "audit shared_runtime_create_failed_cleaned",
-                runtime_id = %paths.instance_id,
-                %protocol,
-                disk_enforcement_method,
-                error = %error,
-                "removed an unpersisted shared runtime after creation failed"
-            );
-            error
-        }
-        Some(cleanup_error) => {
-            tracing::error!(
-                event = "audit shared_runtime_create_cleanup_incomplete",
-                runtime_id = %paths.instance_id,
-                %protocol,
-                disk_enforcement_method,
-                error = %error,
-                %cleanup_error,
-                "an unpersisted shared runtime could not be cleaned completely"
-            );
-            ApiError::Runtime(format!(
-                "{error}; cleanup of unpersisted shared runtime {} using disk method {disk_enforcement_method} also failed: {cleanup_error}",
-                paths.instance_id
-            ))
-        }
-    }
-}
-
-async fn cleanup_starting_runtime(state: &AppState, runtime: &EngineRuntime, instance_id: &str) {
-    if let Err(error) = state.placements.release(instance_id).await {
-        tracing::error!(
-            event = "audit shared_runtime_initial_reservation_cleanup_failed",
-            %instance_id,
-            runtime_id = %runtime.runtime_id,
-            %error,
-            "could not release a failed new pool's initial reservation"
-        );
-        return;
-    }
-    destroy_empty_runtime(state, runtime).await;
-}
-
-async fn shared_spec(
-    protocol: Protocol,
-    runtime_id: &str,
-    image: &str,
-    admin_password: &str,
-    paths: &InstancePaths,
-    data_path: std::path::PathBuf,
-) -> Result<DockerInstanceSpec, ApiError> {
-    let password = || SecretString::from(admin_password.to_string());
-    let spec = match protocol {
-        Protocol::Postgres => databases::postgres::docker::shared_spec(
-            runtime_id,
-            image,
-            password(),
-            data_path,
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mysql => databases::mysql::docker::shared_spec(
-            runtime_id,
-            image,
-            password(),
-            data_path,
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mariadb => databases::mariadb::docker::shared_spec(
-            runtime_id,
-            image,
-            password(),
-            data_path,
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Mongodb => databases::mongodb::docker::shared_spec(
-            runtime_id,
-            image,
-            password(),
-            data_path,
-            paths.logs.clone(),
-            paths.sockets.clone(),
-        ),
-        Protocol::Clickhouse => {
-            let config =
-                databases::clickhouse::docker::write_shared_hosted_config(&paths.runtime_config)
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-            databases::clickhouse::docker::shared_spec(
-                runtime_id,
-                image,
-                password(),
-                data_path,
-                paths.logs.clone(),
-                config,
-                paths.sockets.clone(),
-                paths.socket_bridge_binary.clone(),
-            )
-        }
-        protocol => {
-            return Err(ApiError::BadRequest(format!(
-                "{protocol} cannot use shared deployment"
-            )));
-        }
-    };
-    Ok(spec)
+    Err(ApiError::Conflict(
+        "shared_pool_missing: create the selected pool before adding databases".into(),
+    ))
 }
 
 pub(crate) fn build_shared_metadata(
@@ -823,6 +378,7 @@ pub(crate) fn build_shared_metadata(
 ) -> InstanceMetadata {
     let now = now_rfc3339();
     InstanceMetadata {
+        owner: runtime.owner.clone(),
         schema_version: SCHEMA_VERSION,
         instance_id: request.instance_id.clone(),
         deployment_mode: DeploymentMode::Shared,
@@ -874,7 +430,6 @@ async fn cleanup_failed_tenant(
     instance_id: &str,
     database: &str,
     username: &str,
-    created_pool: bool,
 ) {
     let target = TenantTarget { database, username };
     if let Err(error) = tenant::disk::prepare_drop(&state.config, runtime, target).await {
@@ -930,15 +485,10 @@ async fn cleanup_failed_tenant(
         );
         return;
     }
-    release_claim(state, runtime, instance_id, created_pool).await;
+    release_claim(state, runtime, instance_id).await;
 }
 
-async fn release_claim(
-    state: &AppState,
-    runtime: &EngineRuntime,
-    instance_id: &str,
-    created_pool: bool,
-) {
+async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &str) {
     if let Err(error) = state.placements.release(instance_id).await {
         let containment = crate::api::instances::containment::contain_locked(
             state,
@@ -955,10 +505,6 @@ async fn release_claim(
             contained = containment.contained(),
             "failed to release a tenant claim; contained the runtime around the uncertain reservation"
         );
-        return;
-    }
-    if created_pool {
-        destroy_empty_runtime(state, runtime).await;
         return;
     }
     match state.placements.get(&runtime.runtime_id).await {
@@ -1024,27 +570,12 @@ async fn release_claim(
     }
 }
 
-pub(crate) async fn destroy_empty_runtime(state: &AppState, runtime: &EngineRuntime) {
-    if let Err(error) = crate::api::instances::delete_empty_pool(state, &runtime.runtime_id).await {
-        let containment = crate::api::instances::containment::contain_locked(
-            state,
-            runtime,
-            "empty shared runtime cleanup failed",
-        )
-        .await;
-        tracing::error!(
-            event = "audit empty_shared_runtime_cleanup_failed",
-            runtime_id = %runtime.runtime_id,
-            %error,
-            containment = %containment.summary(),
-            contained = containment.contained(),
-            "retained the empty runtime after physical cleanup failed"
-        );
+pub(crate) fn placement_error(error: PlacementRepositoryError) -> ApiError {
+    match error {
+        PlacementRepositoryError::CapacityUnavailable(_) => ApiError::Conflict("shared_pool_full: the server pool has reached its disk or database-count limit; resize it explicitly".into()),
+        PlacementRepositoryError::DatabaseInUse { .. } | PlacementRepositoryError::UsernameInUse { .. } | PlacementRepositoryError::AlreadyReserved(_) => ApiError::Conflict(error.to_string()),
+        _ => ApiError::Runtime(format!("shared runtime storage failed: {error}")),
     }
-}
-
-fn placement_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError::Runtime(format!("shared runtime storage failed: {error}"))
 }
 
 fn same_created_tenant(stored: &InstanceMetadata, expected: &InstanceMetadata) -> bool {
@@ -1065,27 +596,6 @@ fn same_created_tenant(stored: &InstanceMetadata, expected: &InstanceMetadata) -
         && stored.tenant_password == expected.tenant_password
 }
 
-fn same_initial_runtime(stored: &EngineRuntime, expected: &EngineRuntime) -> bool {
-    let Some(persisted_disk_mib) =
-        policy::pool_disk_mib(expected.protocol, expected.reserved.disk_mib)
-    else {
-        return false;
-    };
-    // PlacementRepository::save persists a shared runtime's disk limit from
-    // its durable reservation total. Before reserve_starting, that total is
-    // zero even though the effective quota was prepared for the first tenant.
-    let mut normalized_expected = expected.clone();
-    normalized_expected.limits.disk_mib = persisted_disk_mib;
-    let same_public = match (
-        serde_json::to_value(stored),
-        serde_json::to_value(&normalized_expected),
-    ) {
-        (Ok(stored), Ok(expected)) => stored == expected,
-        _ => false,
-    };
-    same_public && stored.admin_secret == normalized_expected.admin_secret
-}
-
 fn fail(state: &AppState, instance_id: &str, error: impl std::fmt::Display) -> ApiError {
     let error = ApiError::Runtime(error.to_string());
     state
@@ -1097,104 +607,6 @@ fn fail(state: &AppState, instance_id: &str, error: impl std::fmt::Display) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn initial_runtime() -> EngineRuntime {
-        let mut runtime = crate::placement::test_support::runtime(
-            "pool_postgres_initial",
-            Protocol::Postgres,
-            "postgres:18.4",
-        );
-        runtime.status = EngineRuntimeStatus::Creating;
-        runtime.backend = crate::shared::backend::BackendEndpoint::UnixSocket {
-            socket_path: "/run/dbe/pool_postgres_initial/.s.PGSQL.5432".to_string(),
-        };
-        runtime.limits = InstanceLimits {
-            cpu_cores: 1.25,
-            memory_mib: 1280,
-            disk_mib: 8192,
-            disk_enforced: true,
-            disk_enforcement_method: "fuse_quota".to_string(),
-        };
-        runtime.max_tenants = policy::max_tenants(Protocol::Postgres).unwrap();
-        runtime.admin_secret = Some("pool-admin-secret".to_string());
-        runtime.created_at = "2026-09-08T00:00:00Z".to_string();
-        runtime.updated_at = runtime.created_at.clone();
-        runtime
-    }
-
-    #[test]
-    fn lost_initial_save_ack_only_adopts_exact_creating_runtime() {
-        let expected = initial_runtime();
-        let mut persisted = expected.clone();
-        persisted.limits.disk_mib = policy::pool_disk_mib(Protocol::Postgres, 0).unwrap();
-        assert!(same_initial_runtime(&persisted, &expected));
-
-        persisted.admin_secret = Some("different-secret".to_string());
-        assert!(!same_initial_runtime(&persisted, &expected));
-        persisted = expected.clone();
-        persisted.limits.disk_mib = policy::pool_disk_mib(Protocol::Postgres, 0).unwrap();
-        persisted.runtime.container_name.push_str("-different");
-        assert!(!same_initial_runtime(&persisted, &expected));
-    }
-
-    #[tokio::test]
-    async fn unpersisted_runtime_cleanup_removes_every_created_pool_path() {
-        let namespace = tempfile::tempdir().unwrap();
-        let root = namespace.path();
-        let path = |name: &str| root.join(name).display().to_string();
-        let mut config = crate::config::Config::default();
-        config.disk.mode = crate::config::DiskLimitMode::SoftScanner;
-        config.paths.data = path("data");
-        config.paths.metadata = path("metadata");
-        config.paths.volumes = path("volumes");
-        config.paths.backups = path("backups");
-        config.paths.sockets = path("sockets");
-        config.paths.locks = path("locks");
-        config.paths.logs = path("logs");
-        config.paths.artifacts = path("artifacts");
-        config.paths.exports = path("exports");
-        config.paths.imports = path("imports");
-        config.paths.fuse = path("fuse");
-        config.paths.tmp = path("tmp");
-        let (state, _database) = super::super::tests::test_state(config).await;
-        let paths = InstancePaths::new(&state.config.paths, "pool_postgres_unpersisted").unwrap();
-        paths.create_dirs().await.unwrap();
-        for path in [
-            &paths.data,
-            &paths.logs,
-            &paths.sockets,
-            &paths.artifacts,
-            &paths.runtime_config,
-        ] {
-            tokio::fs::write(path.join("partial-create"), b"orphan")
-                .await
-                .unwrap();
-        }
-
-        let error = cleanup_unpersisted_runtime(
-            &state,
-            &paths,
-            Protocol::Postgres,
-            "soft_scanner",
-            ApiError::Runtime("injected pre-durable failure".to_string()),
-        )
-        .await;
-
-        assert!(error.to_string().contains("injected pre-durable failure"));
-        for path in [
-            &paths.data,
-            &paths.logs,
-            &paths.sockets,
-            &paths.artifacts,
-            &paths.runtime_config,
-        ] {
-            assert!(
-                tokio::fs::symlink_metadata(path).await.is_err(),
-                "{} survived cleanup",
-                path.display()
-            );
-        }
-    }
 
     #[test]
     fn lost_create_ack_only_adopts_exact_metadata_and_secrets() {

@@ -46,3 +46,22 @@ pub(crate) fn state(
         daemon_shutdown: DaemonShutdown::default(),
     })
 }
+
+pub(crate) async fn database(config: Config) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = crate::storage::sqlite::connect(dir.path()).await.unwrap();
+    let store = InstanceStore::default();
+    let manager = InstanceManager::new(
+        store.clone(),
+        crate::storage::repositories::InstanceRepository::new(pool.clone()),
+    );
+    let state = state(
+        config,
+        dir.path().join("config.yml"),
+        ApiToken::new("secret"),
+        store,
+        manager,
+        pool,
+    );
+    (state, dir)
+}

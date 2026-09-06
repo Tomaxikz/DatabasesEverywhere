@@ -315,7 +315,6 @@ async fn rollback_shared_target(
             runtime_ops::apply_limits(&state.docker, &state.config, &state.placements, &updated)
                 .await
                 .map_err(ApiError::Runtime)?;
-            destroy_empty_shared_runtime(state, &updated).await;
         }
     }
     crate::api::instances::purge_shared_tenant_paths(state, &temp_id).await
@@ -523,7 +522,6 @@ pub(super) async fn retire_shared_source(
         runtime_ops::apply_limits(&state.docker, &state.config, &state.placements, &updated)
             .await
             .map_err(ApiError::Runtime)?;
-        destroy_empty_shared_runtime(state, &updated).await;
     }
     Ok(())
 }

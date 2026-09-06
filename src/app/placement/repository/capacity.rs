@@ -10,7 +10,7 @@ use crate::{
     placement::model::{
         EngineRuntime, PlacementError, ReserveTenant, TenantReservation, TenantReservationState,
     },
-    shared::{limits::InstanceLimits, protocol::Protocol, time::now_rfc3339},
+    shared::{limits::InstanceLimits, time::now_rfc3339},
 };
 
 const SQLITE_WRITE_ATTEMPTS: u32 = 5;
@@ -20,26 +20,8 @@ impl PlacementRepository {
         &self,
         request: ReserveTenant<'_>,
     ) -> Result<EngineRuntime, PlacementRepositoryError> {
-        self.reserve_inner(request, false).await
-    }
-
-    /// Reserves the first tenant in a newly persisted runtime before its
-    /// container is launched. The creating runtime plus this reservation form
-    /// one durable node-capacity commit, while normal placement remains
-    /// restricted to running runtimes.
-    pub async fn reserve_starting(
-        &self,
-        request: ReserveTenant<'_>,
-    ) -> Result<EngineRuntime, PlacementRepositoryError> {
-        self.reserve_inner(request, true).await
-    }
-
-    async fn reserve_inner(
-        &self,
-        request: ReserveTenant<'_>,
-        starting_runtime: bool,
-    ) -> Result<EngineRuntime, PlacementRepositoryError> {
         let ReserveTenant {
+            owner,
             instance_id,
             runtime_id,
             database,
@@ -47,6 +29,9 @@ impl PlacementRepository {
             limits: requested,
         } = request;
         check_reservation(requested)?;
+        owner
+            .check()
+            .map_err(PlacementRepositoryError::InvalidReservation)?;
         check_identity(database, "database_name")?;
         check_identity(username, "database_username")?;
         let now = now_rfc3339();
@@ -76,10 +61,6 @@ impl PlacementRepository {
             crate::placement::policy::pool_disk_mib(protocol, next_reserved_disk_mib)
                 .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         let limit_disk_mib = u64_to_i64(limit_disk_mib, "limit_disk_mib")?;
-        let overhead = crate::placement::policy::runtime_overhead(protocol)
-            .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let overhead_memory = u64_to_i64(overhead.memory_mib, "overhead_memory_mib")?;
-
         let already_reserved = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM engine_runtime_reservations WHERE instance_id = ?1)",
         )
@@ -134,44 +115,21 @@ impl PlacementRepository {
             r#"
             UPDATE engine_runtimes
             SET tenant_count = tenant_count + 1,
-                reserved_cpu_cores = reserved_cpu_cores + ?1,
-                reserved_memory_mib = reserved_memory_mib + ?2,
-                reserved_disk_mib = reserved_disk_mib + ?3,
-                limit_cpu_cores = reserved_cpu_cores + ?1 + ?6,
-                limit_memory_mib = reserved_memory_mib + ?2 + ?7,
-                limit_disk_mib = ?8,
-                limits_json = json_set(
-                    limits_json,
-                    '$.cpu_cores', reserved_cpu_cores + ?1 + ?6,
-                    '$.memory_mib', reserved_memory_mib + ?2 + ?7,
-                    '$.disk_mib', ?8
-                ),
-                updated_at = ?4
-            WHERE runtime_id = ?5
-              AND deployment_mode = 'shared'
-              AND (
-                    (status = 'running' AND ?11 = 0)
-                 OR (status = 'creating' AND tenant_count = 0 AND ?11 = 1)
-               )
+                reserved_disk_mib = reserved_disk_mib + ?1,
+                updated_at = ?2
+            WHERE runtime_id = ?3 AND deployment_mode = 'shared'
+              AND owner_panel = ?4 AND owner_server = ?5
+              AND status = 'running' AND desired_state = 'running'
               AND tenant_count < max_tenants
-              AND reserved_cpu_cores + ?1 + ?6 <= ?9
-              AND reserved_memory_mib + ?2 + ?7 <= ?10
+              AND ?6 <= limit_disk_mib
             "#,
         )
-        .bind(requested.cpu_cores)
-        .bind(memory_mib)
         .bind(disk_mib)
         .bind(&now)
         .bind(runtime_id)
-        .bind(overhead.cpu_cores)
-        .bind(overhead_memory)
+        .bind(&owner.panel_id)
+        .bind(&owner.server_id)
         .bind(limit_disk_mib)
-        .bind(crate::shared::limits::MAX_CPU_CORES)
-        .bind(u64_to_i64(
-            crate::shared::limits::MAX_MEMORY_MIB,
-            "max_memory_mib",
-        )?)
-        .bind(i64::from(starting_runtime))
         .execute(&mut *transaction)
         .await?;
         if update.rows_affected() != 1 {
@@ -184,8 +142,8 @@ impl PlacementRepository {
             r#"
             INSERT INTO engine_runtime_reservations (
                 instance_id, runtime_id, database_name, database_username, state,
-                cpu_cores, memory_mib, disk_mib, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7, ?8, ?8)
+                cpu_cores, memory_mib, disk_mib, created_at, updated_at, owner_panel, owner_server
+            ) VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7, ?8, ?8, ?9, ?10)
             "#,
         )
         .bind(instance_id)
@@ -196,18 +154,12 @@ impl PlacementRepository {
         .bind(memory_mib)
         .bind(disk_mib)
         .bind(&now)
+        .bind(&owner.panel_id)
+        .bind(&owner.server_id)
         .execute(&mut *transaction)
         .await?;
 
-        sync_runtime_capacity(
-            &mut transaction,
-            runtime_id,
-            protocol,
-            overhead,
-            overhead_memory,
-            &now,
-        )
-        .await?;
+        sync_runtime_capacity(&mut transaction, runtime_id, &now).await?;
 
         if let Err(error) = transaction.commit().await {
             let committed = self
@@ -321,25 +273,13 @@ impl PlacementRepository {
             return Ok(false);
         };
         let runtime_id: String = reservation.try_get("runtime_id")?;
-        let protocol = parse_protocol(reservation.try_get("protocol")?)?;
-        let overhead = crate::placement::policy::runtime_overhead(protocol)
-            .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let overhead_memory = u64_to_i64(overhead.memory_mib, "overhead_memory_mib")?;
 
         sqlx::query("DELETE FROM engine_runtime_reservations WHERE instance_id = ?1")
             .bind(instance_id)
             .execute(&mut *transaction)
             .await?;
         let now = now_rfc3339();
-        sync_runtime_capacity(
-            &mut transaction,
-            &runtime_id,
-            protocol,
-            overhead,
-            overhead_memory,
-            &now,
-        )
-        .await?;
+        sync_runtime_capacity(&mut transaction, &runtime_id, &now).await?;
         if let Err(error) = transaction.commit().await {
             match self.get_reservation(instance_id).await {
                 Ok(None) => {
@@ -399,8 +339,6 @@ impl PlacementRepository {
         .await?
         .ok_or_else(|| PlacementRepositoryError::ReservationNotFound(instance_id.to_string()))?;
         let runtime_id: String = current.try_get("runtime_id")?;
-        let old_cpu: f64 = current.try_get("cpu_cores")?;
-        let old_memory: i64 = current.try_get("memory_mib")?;
         let old_disk: i64 = current.try_get("disk_mib")?;
         let protocol = parse_protocol(current.try_get("protocol")?)?;
         let runtime_disk_mib =
@@ -418,54 +356,22 @@ impl PlacementRepository {
             crate::placement::policy::pool_disk_mib(protocol, next_reserved_disk_mib)
                 .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         let limit_disk_mib = u64_to_i64(limit_disk_mib, "limit_disk_mib")?;
-        let overhead = crate::placement::policy::runtime_overhead(protocol)
-            .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let overhead_memory = u64_to_i64(overhead.memory_mib, "overhead_memory_mib")?;
         let now = now_rfc3339();
 
         let update = sqlx::query(
             r#"
             UPDATE engine_runtimes
-            SET reserved_cpu_cores = reserved_cpu_cores - ?1 + ?2,
-                reserved_memory_mib = reserved_memory_mib - ?3 + ?4,
-                reserved_disk_mib = reserved_disk_mib - ?5 + ?6,
-                limit_cpu_cores = reserved_cpu_cores - ?1 + ?2 + ?9,
-                limit_memory_mib = reserved_memory_mib - ?3 + ?4 + ?10,
-                limit_disk_mib = ?11,
-                limits_json = json_set(
-                    limits_json,
-                    '$.cpu_cores', reserved_cpu_cores - ?1 + ?2 + ?9,
-                    '$.memory_mib', reserved_memory_mib - ?3 + ?4 + ?10,
-                    '$.disk_mib', ?11
-                ),
-                updated_at = ?7
-            WHERE runtime_id = ?8
-              AND deployment_mode = 'shared'
-              AND status = 'running'
-              AND tenant_count > 0
-              AND reserved_cpu_cores >= ?1
-              AND reserved_memory_mib >= ?3
-              AND reserved_disk_mib >= ?5
-              AND reserved_cpu_cores - ?1 + ?2 + ?9 <= ?12
-              AND reserved_memory_mib - ?3 + ?4 + ?10 <= ?13
+            SET reserved_disk_mib = reserved_disk_mib - ?1 + ?2, updated_at = ?3
+            WHERE runtime_id = ?4 AND deployment_mode = 'shared'
+              AND status = 'running' AND tenant_count > 0
+              AND reserved_disk_mib >= ?1 AND ?5 <= limit_disk_mib
             "#,
         )
-        .bind(old_cpu)
-        .bind(requested.cpu_cores)
-        .bind(old_memory)
-        .bind(new_memory)
         .bind(old_disk)
         .bind(new_disk)
         .bind(&now)
         .bind(&runtime_id)
-        .bind(overhead.cpu_cores)
-        .bind(overhead_memory)
         .bind(limit_disk_mib)
-        .bind(crate::shared::limits::MAX_CPU_CORES)
-        .bind(u64_to_i64(
-            crate::shared::limits::MAX_MEMORY_MIB,
-            "max_memory_mib",
-        )?)
         .execute(&mut *transaction)
         .await?;
         if update.rows_affected() != 1 {
@@ -515,15 +421,7 @@ impl PlacementRepository {
                 instance_id.to_string(),
             ));
         }
-        sync_runtime_capacity(
-            &mut transaction,
-            &runtime_id,
-            protocol,
-            overhead,
-            overhead_memory,
-            &now,
-        )
-        .await?;
+        sync_runtime_capacity(&mut transaction, &runtime_id, &now).await?;
         transaction.commit().await?;
 
         self.get(&runtime_id)
@@ -549,75 +447,18 @@ fn sqlite_write_contention(error: &sqlx::Error) -> bool {
 async fn sync_runtime_capacity(
     transaction: &mut Transaction<'_, Sqlite>,
     runtime_id: &str,
-    protocol: Protocol,
-    overhead: crate::placement::policy::RuntimeOverhead,
-    overhead_memory: i64,
     now: &str,
 ) -> Result<(), PlacementRepositoryError> {
-    let reserved_disk_mib: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(SUM(disk_mib), 0)
-        FROM engine_runtime_reservations
-        WHERE runtime_id = ?1
-        "#,
-    )
-    .bind(runtime_id)
-    .fetch_one(&mut **transaction)
-    .await?;
-    let limit_disk_mib = crate::placement::policy::pool_disk_mib(
-        protocol,
-        i64_to_u64(reserved_disk_mib, "reserved_disk_mib")?,
-    )
-    .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-    let limit_disk_mib = u64_to_i64(limit_disk_mib, "limit_disk_mib")?;
     let update = sqlx::query(
         r#"
-        UPDATE engine_runtimes
-        SET tenant_count = (
-                SELECT COUNT(*) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ),
-            reserved_cpu_cores = COALESCE((
-                SELECT SUM(cpu_cores) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ), 0.0),
-            reserved_memory_mib = COALESCE((
-                SELECT SUM(memory_mib) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ), 0),
-            reserved_disk_mib = COALESCE((
-                SELECT SUM(disk_mib) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ), 0),
-            limit_cpu_cores = ?2 + COALESCE((
-                SELECT SUM(cpu_cores) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ), 0.0),
-            limit_memory_mib = ?3 + COALESCE((
-                SELECT SUM(memory_mib) FROM engine_runtime_reservations
-                WHERE runtime_id = ?1
-            ), 0),
-            limit_disk_mib = ?4,
-            limits_json = json_set(
-                limits_json,
-                '$.cpu_cores', ?2 + COALESCE((
-                    SELECT SUM(cpu_cores) FROM engine_runtime_reservations
-                    WHERE runtime_id = ?1
-                ), 0.0),
-                '$.memory_mib', ?3 + COALESCE((
-                    SELECT SUM(memory_mib) FROM engine_runtime_reservations
-                    WHERE runtime_id = ?1
-                ), 0),
-                '$.disk_mib', ?4
-            ),
-            updated_at = ?5
+        UPDATE engine_runtimes SET
+            tenant_count = (SELECT COUNT(*) FROM engine_runtime_reservations WHERE runtime_id = ?1),
+            reserved_disk_mib = COALESCE((SELECT SUM(disk_mib) FROM engine_runtime_reservations WHERE runtime_id = ?1), 0),
+            updated_at = ?2
         WHERE runtime_id = ?1 AND deployment_mode = 'shared'
         "#,
     )
     .bind(runtime_id)
-    .bind(overhead.cpu_cores)
-    .bind(overhead_memory)
-    .bind(limit_disk_mib)
     .bind(now)
     .execute(&mut **transaction)
     .await?;

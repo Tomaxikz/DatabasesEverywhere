@@ -15,6 +15,7 @@ use crate::{
 pub(crate) fn metadata(instance_id: &str, protocol: Protocol) -> InstanceMetadata {
     let port = protocol.default_container_port();
     InstanceMetadata {
+        owner: None,
         schema_version: SCHEMA_VERSION,
         instance_id: instance_id.to_string(),
         deployment_mode: DeploymentMode::Dedicated,

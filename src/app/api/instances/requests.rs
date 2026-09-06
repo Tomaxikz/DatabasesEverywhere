@@ -20,6 +20,10 @@ pub(crate) const MAX_PASSWORD_CHARACTERS: usize = 4 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateInstanceRequest {
+    pub server_id: Option<String>,
+    pub pool_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) owner: Option<crate::placement::PoolOwner>,
     pub instance_id: String,
     pub protocol: Protocol,
     #[serde(default)]
@@ -40,7 +44,9 @@ pub struct CreateInstanceRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsRequest {
+    #[serde(default)]
     pub cpu_cores: f64,
+    #[serde(default)]
     pub memory_mib: u64,
     pub disk_mib: u64,
 }
@@ -67,7 +73,39 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
             "public_host must not be empty".to_string(),
         ));
     }
-    if let Some(limits) = &request.limits {
+    if request.deployment_mode == DeploymentMode::Shared {
+        let server_id = request
+            .server_id
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("shared deployment requires server_id".into()))?;
+        crate::placement::PoolOwner {
+            panel_id: "panel".into(),
+            server_id: server_id.into(),
+        }
+        .check()
+        .map_err(ApiError::BadRequest)?;
+        let limits = request.limits.as_ref().ok_or_else(|| {
+            ApiError::BadRequest("shared deployment requires limits.disk_mib".into())
+        })?;
+        if limits.disk_mib == 0
+            || limits.disk_mib > u64::MAX / (1024 * 1024)
+            || limits.cpu_cores != 0.0
+            || limits.memory_mib != 0
+        {
+            return Err(ApiError::BadRequest(
+                "shared limits accept only a positive disk_mib; CPU and memory belong to the pool"
+                    .into(),
+            ));
+        }
+        let pool_id = request.pool_id.as_deref().ok_or_else(|| {
+            ApiError::BadRequest("shared deployment requires pool_id; create the pool first".into())
+        })?;
+        validate_instance_id(pool_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    } else if request.pool_id.is_some() {
+        return Err(ApiError::BadRequest(
+            "pool_id is only valid for shared deployment".into(),
+        ));
+    } else if let Some(limits) = &request.limits {
         validate_limits(limits)?;
         validate_protocol_limits(request.protocol, limits)?;
     }
@@ -250,6 +288,33 @@ pub fn limits_from_request(request: &LimitsRequest) -> InstanceLimits {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_creation_requires_explicit_owner_and_disk_only_limits() {
+        let valid = serde_json::json!({
+            "instance_id":"tenant-a", "protocol":"mysql", "deployment_mode":"shared", "pool_id":"pool_test",
+            "database":"tenant_db", "username":"tenant_user", "password":"secret",
+            "public_host":"db.example.test", "server_id":"server-a", "limits":{"disk_mib":1024}
+        });
+        validate_create_request(&serde_json::from_value(valid.clone()).unwrap()).unwrap();
+        for field in ["server_id", "pool_id", "limits"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate_create_request(&serde_json::from_value(missing).unwrap()).is_err());
+        }
+        let mut spoofed = valid.clone();
+        spoofed["owner"] = serde_json::json!({"panel_id":"another-panel","server_id":"server-b"});
+        assert!(serde_json::from_value::<CreateInstanceRequest>(spoofed).is_err());
+        for limits in [
+            serde_json::json!({"disk_mib":0}),
+            serde_json::json!({"disk_mib":1024,"cpu_cores":1}),
+            serde_json::json!({"disk_mib":1024,"memory_mib":512}),
+        ] {
+            let mut bad = valid.clone();
+            bad["limits"] = limits;
+            assert!(validate_create_request(&serde_json::from_value(bad).unwrap()).is_err());
+        }
+    }
+
     use super::*;
 
     fn limits(memory_mib: u64, disk_mib: u64) -> LimitsRequest {
@@ -376,6 +441,9 @@ mod tests {
                 "instance_id": "inst_test_cache",
                 "protocol": protocol,
                 "deployment_mode": "shared",
+                "pool_id": "pool_test",
+                "server_id": "server-1",
+                "limits": {"disk_mib": 1024},
                 "database": "test_db",
                 "username": "test_user",
                 "password": "secret",
@@ -463,6 +531,9 @@ mod tests {
                 "instance_id": "inst_test_shared",
                 "protocol": protocol,
                 "deployment_mode": "shared",
+                "pool_id": "pool_test",
+                "server_id": "server-a",
+                "limits": {"disk_mib": 1024},
                 "database": "test_db",
                 "username": "test_user",
                 "password": "secret",
@@ -492,6 +563,9 @@ mod tests {
                 "instance_id": "inst_test_control_name",
                 "protocol": protocol,
                 "deployment_mode": deployment_mode,
+                "pool_id": if deployment_mode == DeploymentMode::Shared { Some("pool_test") } else { None },
+                "server_id": "server-a",
+                "limits": if deployment_mode == DeploymentMode::Shared { Some(serde_json::json!({"disk_mib":1024})) } else { None },
                 "database": "dbe_control",
                 "username": "test_user",
                 "password": "secret",
@@ -513,6 +587,9 @@ mod tests {
                 "instance_id": "inst_test_system_name",
                 "protocol": protocol,
                 "deployment_mode": "shared",
+                "pool_id": "pool_test",
+                "server_id": "server-a",
+                "limits": {"disk_mib": 1024},
                 "database": database,
                 "username": "test_user",
                 "password": "secret",
@@ -525,6 +602,8 @@ mod tests {
                 "{protocol}:{database}"
             );
             request.deployment_mode = DeploymentMode::Dedicated;
+            request.pool_id = None;
+            request.limits = None;
             assert!(
                 validate_create_request(&request).is_ok(),
                 "{protocol}:{database}"

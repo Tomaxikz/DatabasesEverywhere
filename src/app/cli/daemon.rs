@@ -223,6 +223,11 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     reconcile::validate_runtime(&manager, &docker)
         .await
         .context("configured container engine is incompatible with stored instances")?;
+    match docker.cleanup_version_probes().await {
+        Ok(count) if count > 0 => tracing::info!(count, "removed interrupted image version probes"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "image version probe cleanup incomplete"),
+    }
     let remote_import_helper_reconciliation = docker.reconcile_import_helpers().await;
     match &remote_import_helper_reconciliation {
         Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
@@ -369,7 +374,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "finished interrupted shared tenant deletion recovery"
         );
     }
-    let removed_empty_shared_runtimes = cleanup_empty_shared_runtimes(&state).await;
+    let removed_empty_shared_runtimes = recover_pool_deletions(&state).await;
     if removed_empty_shared_runtimes > 0 {
         tracing::info!(
             removed_empty_shared_runtimes,

@@ -16,7 +16,7 @@ use crate::{
 const SOFT_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct SharedTenantBootSummary {
+pub(crate) struct SharedTenantBootSummary {
     pub checked: usize,
     pub opened: usize,
     pub fenced: usize,
@@ -40,7 +40,7 @@ impl SharedTenantBootSummary {
 /// and SQLite in separate steps. A daemon exit between those steps can leave
 /// the engine ahead of durable metadata. Gateway listeners stay closed until
 /// this pass has made the durable row authoritative again.
-pub(super) async fn reconcile_shared_tenants(
+pub(crate) async fn reconcile_shared_tenants(
     state: &AppState,
 ) -> anyhow::Result<SharedTenantBootSummary> {
     let runtimes = state
@@ -75,6 +75,8 @@ async fn reconcile_pool(
         || runtime.protocol != snapshot.protocol
         || runtime.created_at != snapshot.created_at
         || runtime.status != EngineRuntimeStatus::Running
+        || runtime.desired_state != DesiredInstanceState::Running
+        || runtime.pending_image.is_some()
     {
         return Ok(SharedTenantBootSummary::default());
     }
@@ -86,12 +88,14 @@ async fn reconcile_pool(
 ///
 /// Pool activation uses the same path as daemon boot so a restarted or
 /// reconstructed engine cannot publish routes after only a health check.
-pub(super) async fn reconcile_runtime_tenants_locked(
+pub(crate) async fn reconcile_runtime_tenants_locked(
     state: &AppState,
     runtime: &EngineRuntime,
 ) -> anyhow::Result<SharedTenantBootSummary> {
     if runtime.deployment_mode != DeploymentMode::Shared
         || runtime.status != EngineRuntimeStatus::Running
+        || runtime.desired_state != DesiredInstanceState::Running
+        || runtime.pending_image.is_some()
     {
         return Ok(SharedTenantBootSummary::default());
     }
@@ -526,7 +530,7 @@ async fn contain_pool(
 ) -> anyhow::Result<()> {
     summary.pools_contained += 1;
     let contained =
-        super::shared_runtime_boot::isolate_runtime(state, runtime.clone(), reason).await;
+        crate::placement::lifecycle::isolate_runtime(state, runtime.clone(), reason).await;
     anyhow::ensure!(
         contained,
         "shared pool {} could not be contained during boot reconciliation",
@@ -545,6 +549,8 @@ fn same_tenant(
         && current.deployment_mode == DeploymentMode::Shared
         && current.runtime_id() == runtime.runtime_id
         && current.protocol == runtime.protocol
+        && current.owner == runtime.owner
+        && snapshot.owner == current.owner
         && snapshot.database.name == current.database.name
         && snapshot.database.username == current.database.username
 }

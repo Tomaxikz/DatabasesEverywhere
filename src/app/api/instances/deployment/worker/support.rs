@@ -7,6 +7,9 @@ pub(super) fn target_request(
     password: &str,
 ) -> CreateInstanceRequest {
     CreateInstanceRequest {
+        server_id: source.owner.as_ref().map(|owner| owner.server_id.clone()),
+        pool_id: None,
+        owner: source.owner.clone(),
         instance_id: temp_id.to_string(),
         protocol: source.protocol,
         deployment_mode: DeploymentMode::Shared,
@@ -18,8 +21,8 @@ pub(super) fn target_request(
         project_id: None,
         image: Some(source_runtime.image.clone()),
         limits: Some(LimitsRequest {
-            cpu_cores: source.limits.cpu_cores,
-            memory_mib: source.limits.memory_mib,
+            cpu_cores: 0.0,
+            memory_mib: 0,
             disk_mib: source.limits.disk_mib,
         }),
         purge_stale_resources: false,
@@ -36,6 +39,9 @@ pub(super) fn dedicated_target_request(
         .clone()
         .ok_or_else(|| ApiError::Conflict("source tenant credential disappeared".to_string()))?;
     Ok(CreateInstanceRequest {
+        server_id: source.owner.as_ref().map(|owner| owner.server_id.clone()),
+        pool_id: None,
+        owner: source.owner.clone(),
         instance_id: source.instance_id.clone(),
         protocol: source.protocol,
         deployment_mode: DeploymentMode::Dedicated,

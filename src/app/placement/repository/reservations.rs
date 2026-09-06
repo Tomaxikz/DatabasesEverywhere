@@ -151,12 +151,11 @@ impl PlacementRepository {
             "root_charged_disk_mib",
         )?;
         let all_tenant_disk = i64_to_u64(row.try_get("tenant_disk_mib")?, "tenant_disk_mib")?;
-        let overhead = crate::placement::policy::runtime_overhead(protocol)
+        let overhead = crate::placement::policy::engine_disk_overhead(protocol)
             .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         let spill = crate::placement::policy::root_spill_mib(protocol, all_tenant_disk)
             .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         overhead
-            .disk_mib
             .checked_add(tenant_disk)
             .and_then(|disk| disk.checked_add(spill))
             .ok_or_else(|| {

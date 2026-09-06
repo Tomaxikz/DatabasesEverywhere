@@ -95,7 +95,8 @@ pub struct BackupContentsResponse {
     pub catalog_available: bool,
     pub truncated: bool,
     pub warnings: Vec<String>,
-    pub objects: Vec<BackupObjectSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objects: Option<Vec<BackupObjectSummary>>,
     pub selection: Option<BackupObjectSelection>,
 }
 
@@ -106,13 +107,14 @@ pub struct BackupObjectSummary {
     pub name: String,
     pub kind: String,
     pub estimated_rows: Option<u64>,
-    pub columns: Vec<BackupCatalogColumn>,
+    pub column_count: usize,
     pub captured_preview_rows: usize,
     pub preview_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BackupObjectSelection {
+    pub columns: Vec<BackupCatalogColumn>,
     pub object_id: String,
     pub offset: usize,
     pub limit: usize,
@@ -210,7 +212,7 @@ pub async fn browse_instance_backup(
                 "this backup predates catalog capture or browsing was disabled when it was created"
                     .to_string(),
             ],
-            objects: Vec::new(),
+            objects: query.object.is_none().then(Vec::new),
             selection: None,
         }));
     };
@@ -229,20 +231,7 @@ pub async fn browse_instance_backup(
         )));
     }
     let selection = select_catalog_object(&catalog, query.object.as_deref(), query.offset, limit)?;
-    let objects = catalog
-        .objects
-        .iter()
-        .map(|object| BackupObjectSummary {
-            id: object.id.clone(),
-            namespace: object.namespace.clone(),
-            name: object.name.clone(),
-            kind: object.kind.clone(),
-            estimated_rows: object.estimated_rows,
-            columns: object.columns.clone(),
-            captured_preview_rows: object.preview_rows.len(),
-            preview_truncated: object.preview_truncated,
-        })
-        .collect();
+    let objects = backup_objects(&catalog, query.object.is_none());
     Ok(ApiResponse::ok(BackupContentsResponse {
         backup_id,
         instance_id,
@@ -854,6 +843,25 @@ async fn prune_instance_backups(
     Ok(())
 }
 
+fn backup_objects(catalog: &BackupCatalog, include: bool) -> Option<Vec<BackupObjectSummary>> {
+    include.then(|| {
+        catalog
+            .objects
+            .iter()
+            .map(|object| BackupObjectSummary {
+                id: object.id.clone(),
+                namespace: object.namespace.clone(),
+                name: object.name.clone(),
+                kind: object.kind.clone(),
+                estimated_rows: object.estimated_rows,
+                column_count: object.columns.len(),
+                captured_preview_rows: object.preview_rows.len(),
+                preview_truncated: object.preview_truncated,
+            })
+            .collect()
+    })
+}
+
 fn select_catalog_object(
     catalog: &BackupCatalog,
     object_id: Option<&str>,
@@ -881,6 +889,7 @@ fn select_catalog_object(
         .cloned()
         .collect::<Vec<_>>();
     Ok(Some(BackupObjectSelection {
+        columns: object.columns.clone(),
         object_id: object.id.clone(),
         offset,
         limit,
@@ -1047,7 +1056,12 @@ mod tests {
                 name: "users".to_string(),
                 kind: "table".to_string(),
                 estimated_rows: Some(3),
-                columns: Vec::new(),
+                columns: vec![BackupCatalogColumn {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    nullable: false,
+                    ordinal: 1,
+                }],
                 preview_rows: vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
                 preview_truncated: true,
             }],
@@ -1059,6 +1073,13 @@ mod tests {
         assert_eq!(selection.returned, 1);
         assert_eq!(selection.rows[0]["id"], 2);
         assert!(selection.truncated);
+        assert_eq!(selection.columns[0].name, "id");
+        let objects = backup_objects(&catalog, true).unwrap();
+        let json = serde_json::to_value(&objects).unwrap();
+        assert_eq!(json[0]["column_count"], 1);
+        assert!(json[0].get("columns").is_none());
+        assert!(backup_objects(&catalog, false).is_none());
+        assert!(select_catalog_object(&catalog, Some("foreign.table"), 0, 1).is_err());
     }
 
     #[test]

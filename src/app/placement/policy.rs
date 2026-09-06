@@ -25,50 +25,17 @@ pub(crate) fn sum_runtime_limits<'a>(
         })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RuntimeOverhead {
-    pub cpu_cores: f64,
-    pub memory_mib: u64,
-    pub disk_mib: u64,
-}
-
 const ROOT_SPILL_DIVISOR: u64 = 20;
 const ROOT_SPILL_CAP_MIB: u64 = 8 * 1024;
 const SHARED_CLICKHOUSE_QUERIES_PER_HOUR: u64 = 20_000;
 
-/// Capacity reserved once per physical engine, separate from logical tenant
-/// reservations. Without this headroom, the first tenant would unknowingly pay
-/// for catalogs, journals, background workers, and engine metadata.
-pub(crate) const fn runtime_overhead(protocol: Protocol) -> Option<RuntimeOverhead> {
+/// Engine-global disk overhead, separate from tenant data allowances.
+/// PostgreSQL needs WAL/checkpoint headroom; ClickHouse includes bounded query history.
+pub(crate) const fn engine_disk_overhead(protocol: Protocol) -> Option<u64> {
     match protocol {
-        Protocol::Postgres => Some(RuntimeOverhead {
-            cpu_cores: 0.25,
-            memory_mib: 256,
-            // WAL and other engine-global files are charged to the pool root,
-            // not a tenant tablespace. Keep this above PostgreSQL's default
-            // max_wal_size so a healthy checkpoint cycle cannot exhaust the
-            // root before tenant storage reaches its own limit.
-            disk_mib: 2048,
-        }),
-        Protocol::Mysql | Protocol::Mariadb => Some(RuntimeOverhead {
-            cpu_cores: 0.25,
-            memory_mib: 384,
-            disk_mib: 512,
-        }),
-        Protocol::Mongodb => Some(RuntimeOverhead {
-            cpu_cores: 0.25,
-            memory_mib: 512,
-            disk_mib: 512,
-        }),
-        Protocol::Clickhouse => Some(RuntimeOverhead {
-            cpu_cores: 0.5,
-            memory_mib: 768,
-            // Includes the pool-root system.query_log used for tenant
-            // accounting. Its query length, row rate, and retention window
-            // are bounded separately; the pool root quota/monitor is the
-            // final fail-closed boundary.
-            disk_mib: 1024,
-        }),
+        Protocol::Postgres => Some(2048),
+        Protocol::Mysql | Protocol::Mariadb | Protocol::Mongodb => Some(512),
+        Protocol::Clickhouse => Some(1024),
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => None,
     }
 }
@@ -78,7 +45,7 @@ pub(crate) const fn runtime_overhead(protocol: Protocol) -> Option<RuntimeOverhe
 /// WAL, redo/undo logs, and shared journals. The reserve is pooled because
 /// those files cannot be attributed reliably to one tenant.
 pub(crate) const fn root_spill_mib(protocol: Protocol, tenant_disk_mib: u64) -> Option<u64> {
-    if runtime_overhead(protocol).is_none() {
+    if engine_disk_overhead(protocol).is_none() {
         return None;
     }
     let rounded = tenant_disk_mib / ROOT_SPILL_DIVISOR
@@ -96,50 +63,13 @@ pub(crate) const fn root_spill_mib(protocol: Protocol, tenant_disk_mib: u64) -> 
 
 /// Returns the physical disk capacity committed by one shared runtime.
 pub(crate) fn pool_disk_mib(protocol: Protocol, tenant_disk_mib: u64) -> Option<u64> {
-    let overhead = runtime_overhead(protocol)?;
+    let overhead = engine_disk_overhead(protocol)?;
     let spill = root_spill_mib(protocol, tenant_disk_mib)?;
     Some(
         tenant_disk_mib
-            .saturating_add(overhead.disk_mib)
+            .saturating_add(overhead)
             .saturating_add(spill),
     )
-}
-
-/// Returns the extra physical capacity needed when a reservation is added to
-/// an existing pool. The spill cap makes this intentionally non-linear.
-pub(crate) fn pool_disk_growth_mib(
-    protocol: Protocol,
-    current_tenant_disk_mib: u64,
-    added_tenant_disk_mib: u64,
-) -> Option<u64> {
-    let current = pool_disk_mib(protocol, current_tenant_disk_mib)?;
-    let grown = pool_disk_mib(
-        protocol,
-        current_tenant_disk_mib.saturating_add(added_tenant_disk_mib),
-    )?;
-    Some(grown.saturating_sub(current))
-}
-
-pub(crate) fn pool_limits(protocol: Protocol, tenants: &InstanceLimits) -> Option<InstanceLimits> {
-    let overhead = runtime_overhead(protocol)?;
-    Some(InstanceLimits {
-        cpu_cores: tenants.cpu_cores + overhead.cpu_cores,
-        memory_mib: tenants.memory_mib.saturating_add(overhead.memory_mib),
-        disk_mib: pool_disk_mib(protocol, tenants.disk_mib)?,
-        disk_enforced: tenants.disk_enforced,
-        disk_enforcement_method: tenants.disk_enforcement_method.clone(),
-    })
-}
-
-/// Shared runtimes deliberately stay small enough that one engine failure or
-/// maintenance operation has a bounded tenant blast radius. A busy node grows
-/// horizontally by creating another compatible runtime.
-pub(crate) const fn max_tenants(protocol: Protocol) -> Option<u32> {
-    match protocol {
-        Protocol::Postgres | Protocol::Mysql | Protocol::Mariadb => Some(64),
-        Protocol::Mongodb | Protocol::Clickhouse => Some(32),
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => None,
-    }
 }
 
 pub(crate) fn runtime_id(protocol: Protocol) -> String {
@@ -148,10 +78,6 @@ pub(crate) fn runtime_id(protocol: Protocol) -> String {
         protocol.as_str(),
         uuid::Uuid::new_v4().simple()
     )
-}
-
-pub(crate) fn compatibility_key(protocol: Protocol, image: &str) -> String {
-    format!("{}:{}", protocol.as_str(), image.trim())
 }
 
 pub(crate) fn max_connections(limits: &InstanceLimits) -> u32 {
@@ -222,7 +148,7 @@ mod tests {
     fn only_tenant_safe_engines_have_shared_capacity() {
         for protocol in Protocol::ALL {
             assert_eq!(
-                max_tenants(protocol).is_some(),
+                engine_disk_overhead(protocol).is_some(),
                 crate::placement::DeploymentMode::Shared.supports(protocol)
             );
         }
@@ -254,19 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn pool_limits_charge_engine_overhead_once() {
-        let tenants = InstanceLimits {
-            cpu_cores: 4.0,
-            memory_mib: 4096,
-            disk_mib: 20_000,
-            ..InstanceLimits::default()
-        };
-        let limits = pool_limits(Protocol::Postgres, &tenants).unwrap();
-
-        assert_eq!(limits.cpu_cores, 4.25);
-        assert_eq!(limits.memory_mib, 4352);
-        assert_eq!(limits.disk_mib, 23_048);
-        assert!(runtime_overhead(Protocol::Redis).is_none());
+    fn pool_disk_budget_includes_global_overhead_and_spill() {
+        assert_eq!(pool_disk_mib(Protocol::Postgres, 20_000), Some(23_048));
+        assert!(pool_disk_mib(Protocol::Redis, 1024).is_none());
     }
 
     #[test]
@@ -287,19 +203,6 @@ mod tests {
             );
         }
         assert_eq!(root_spill_mib(Protocol::Redis, 1024), None);
-    }
-
-    #[test]
-    fn pool_growth_includes_only_marginal_spill() {
-        assert_eq!(
-            pool_disk_growth_mib(Protocol::Mysql, 1000, 1000),
-            Some(1050)
-        );
-        assert_eq!(
-            pool_disk_growth_mib(Protocol::Mysql, 163_840, 1000),
-            Some(1000)
-        );
-        assert_eq!(pool_disk_growth_mib(Protocol::Redis, 1000, 1000), None);
     }
 
     #[test]

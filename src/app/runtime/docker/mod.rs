@@ -3,6 +3,7 @@ mod container_config;
 mod cpu_burst;
 mod engine;
 mod events;
+mod image_probe;
 mod inspection;
 mod podman_api;
 mod remote_import;

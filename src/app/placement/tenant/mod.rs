@@ -18,6 +18,7 @@ const TENANT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TELEMETRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 mod manifest;
+pub(crate) mod recovery;
 pub(crate) use manifest::{ManifestChallenge, TenantManifest, measure_manifest};
 pub(crate) mod disk;
 
@@ -1094,7 +1095,7 @@ mod tests {
     #[test]
     fn unsupported_engines_are_explicit() {
         for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
-            assert!(policy::max_tenants(protocol).is_none());
+            assert!(policy::engine_disk_overhead(protocol).is_none());
         }
     }
 

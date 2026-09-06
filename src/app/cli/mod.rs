@@ -77,11 +77,11 @@ mod orphan_reservations;
 mod runtime_paths;
 mod server;
 mod setup;
-mod shared_runtime_boot;
-mod shared_tenant_boot;
 mod soft_disk_limiter;
 mod startup;
 
+use crate::placement::lifecycle::*;
+use crate::placement::tenant::recovery::*;
 use boot_recovery::*;
 use container_events::*;
 use daemon::*;
@@ -92,8 +92,6 @@ use orphan_reservations::*;
 use runtime_paths::*;
 use server::*;
 use setup::*;
-use shared_runtime_boot::*;
-use shared_tenant_boot::*;
 use soft_disk_limiter::*;
 use startup::*;
 

@@ -40,16 +40,13 @@ use crate::{
 pub(crate) mod dedicated;
 mod mongodb;
 mod mysql_hardening;
-mod shared;
+pub(crate) mod shared;
 
 pub(crate) use dedicated::{
     attest as attest_dedicated_target, build as build_dedicated_target,
     launch as launch_dedicated_target,
 };
-pub(crate) use shared::{
-    build_shared_metadata, claim_runtime as claim_shared_runtime,
-    destroy_empty_runtime as destroy_empty_shared_runtime,
-};
+pub(crate) use shared::{build_shared_metadata, claim_runtime as claim_shared_runtime};
 
 pub(crate) use mongodb::bootstrap_root as bootstrap_mongodb_root;
 pub(crate) use mongodb::provision_tenant as provision_mongodb_tenant_user;
@@ -62,8 +59,18 @@ pub(crate) use mysql_hardening::{
 
 pub async fn create_instance_from_request(
     state: &AppState,
-    request: CreateInstanceRequest,
+    mut request: CreateInstanceRequest,
 ) -> Result<InstanceMetadata, ApiError> {
+    request.owner = request
+        .server_id
+        .as_ref()
+        .map(|server_id| crate::placement::PoolOwner {
+            panel_id: state.config.token_id.clone(),
+            server_id: server_id.clone(),
+        });
+    if let Some(owner) = &request.owner {
+        owner.check().map_err(ApiError::BadRequest)?;
+    }
     validate_create_request(&request)?;
     validate_create_config(&state.config, &request)?;
     if request.deployment_mode == crate::placement::DeploymentMode::Shared
@@ -74,7 +81,11 @@ pub async fn create_instance_from_request(
                 .to_string(),
         ));
     }
-    let creation = state.instance_locks.lock_creation().await;
+    let _creation = if request.deployment_mode == crate::placement::DeploymentMode::Dedicated {
+        Some(state.instance_locks.lock_creation().await)
+    } else {
+        None
+    };
     let _operation = state.instance_locks.lock(&request.instance_id).await;
     reject_duplicate_instance(state, &request).await?;
     handle_stale_instance_resources(state, &request).await?;
@@ -84,7 +95,7 @@ pub async fn create_instance_from_request(
         .map(limits_from_request)
         .unwrap_or_default();
     if request.deployment_mode == crate::placement::DeploymentMode::Shared {
-        return shared::create(state, request, creation).await;
+        return shared::create(state, request).await;
     }
     enforce_node_allocation_policy(state, &requested_limits, None).await?;
 

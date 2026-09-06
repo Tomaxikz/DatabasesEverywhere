@@ -18,6 +18,9 @@ const MAX_TTL_SECONDS: i64 = 3600;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssueWsTokenRequest {
+    #[serde(default)]
+    pub pools: Vec<String>,
+    pub server_id: Option<String>,
     pub subject: String,
     pub scopes: Vec<String>,
     #[serde(default)]
@@ -42,7 +45,7 @@ pub async fn issue_ws_token(
     auth.require_scope(scopes::WS_TOKENS_WRITE)?;
     validate_request(&request)?;
     let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
-    let generation_digest = if request.all_instances {
+    let generation_digest = if request.all_instances || !request.pools.is_empty() {
         None
     } else {
         let mut generations = Vec::with_capacity(request.instances.len());
@@ -56,13 +59,40 @@ pub async fn issue_ws_token(
         }
         Some(jwt::instance_generation_digest(&generations))
     };
+    let targets = if request.pools.is_empty() {
+        jwt::WsTargets::Instances {
+            instances: request.instances.clone(),
+            all_instances: request.all_instances,
+            generation: generation_digest,
+        }
+    } else {
+        let owner = crate::placement::PoolOwner {
+            panel_id: state.config.token_id.clone(),
+            server_id: request
+                .server_id
+                .clone()
+                .ok_or_else(|| ApiError::BadRequest("pool tokens require server_id".into()))?,
+        };
+        owner.check().map_err(ApiError::BadRequest)?;
+        let mut grants = Vec::new();
+        for id in &request.pools {
+            let pool = crate::api::pools::load(&state, id).await?;
+            if pool.owner.as_ref() != Some(&owner) {
+                return Err(ApiError::Forbidden("pool ownership".into()));
+            }
+            grants.push(jwt::PoolGrant {
+                runtime_id: pool.runtime_id,
+                owner: owner.clone(),
+                created_at: pool.created_at,
+            });
+        }
+        jwt::WsTargets::Pools(grants)
+    };
     let (token, expires_at_unix) = jwt::issue_ws_token(
         state.config.websocket_jwt_secret(),
         request.subject.trim(),
         request.scopes.clone(),
-        request.instances.clone(),
-        request.all_instances,
-        generation_digest,
+        targets,
         ttl_seconds,
     )
     .map_err(|error| ApiError::Runtime(error.to_string()))?;
@@ -97,7 +127,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
             "all_instances=true may not be combined with an instance allow-list".to_string(),
         ));
     }
-    if !request.all_instances && request.instances.is_empty() {
+    if !request.all_instances && request.instances.is_empty() && request.pools.is_empty() {
         return Err(ApiError::BadRequest(
             "provide at least one instance or explicitly set all_instances=true".to_string(),
         ));
@@ -117,8 +147,34 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
             ));
         }
     }
+    if !request.pools.is_empty() {
+        if request.pools.len() > 256
+            || request.all_instances
+            || !request.instances.is_empty()
+            || request.server_id.is_none()
+        {
+            return Err(ApiError::BadRequest("pool tokens require an explicit pool allow-list and server_id, without instance targets".into()));
+        }
+        let mut seen = HashSet::new();
+        for id in &request.pools {
+            crate::shared::ids::validate_instance_id(id)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            if !seen.insert(id) {
+                return Err(ApiError::BadRequest("duplicate pool target".into()));
+            }
+        }
+    } else if request.server_id.is_some() {
+        return Err(ApiError::BadRequest(
+            "server_id applies only to pool tokens".into(),
+        ));
+    }
     for scope in &request.scopes {
-        if !known_scope(scope) {
+        let allowed = if request.pools.is_empty() {
+            known_scope(scope)
+        } else {
+            matches!(scope.as_str(), scopes::POOLS_LOGS | scopes::POOLS_MONITOR)
+        };
+        if !allowed {
             return Err(ApiError::BadRequest(format!("unsupported scope {scope}")));
         }
     }
@@ -144,6 +200,8 @@ mod tests {
 
     fn request(instances: Vec<&str>, all_instances: bool) -> IssueWsTokenRequest {
         IssueWsTokenRequest {
+            pools: Vec::new(),
+            server_id: None,
             subject: "panel-user".to_string(),
             scopes: vec![scopes::MONITOR_READ.to_string()],
             instances: instances.into_iter().map(str::to_string).collect(),

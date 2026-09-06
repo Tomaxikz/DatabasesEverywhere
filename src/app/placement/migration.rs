@@ -153,6 +153,10 @@ impl MigrationStage {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeploymentMigration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_pool_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_limits: Option<crate::shared::limits::InstanceLimits>,
     pub migration_id: String,
     pub instance_id: String,
     pub protocol: Protocol,
@@ -275,6 +279,8 @@ impl DeploymentMigrationRepository {
         &self,
         metadata: &InstanceMetadata,
         target_mode: DeploymentMode,
+        target_pool_id: Option<&str>,
+        target_limits: Option<&crate::shared::limits::InstanceLimits>,
     ) -> Result<DeploymentMigration, DeploymentMigrationError> {
         target_mode.check(metadata.protocol)?;
         if metadata.deployment_mode == target_mode {
@@ -286,8 +292,8 @@ impl DeploymentMigrationRepository {
             r#"
             INSERT INTO deployment_migrations (
                 migration_id, instance_id, protocol, source_mode, target_mode,
-                source_runtime_id, stage, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'requested', ?7, ?7)
+                source_runtime_id, stage, created_at, updated_at, target_pool_id, target_limits_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'requested', ?7, ?7, ?8, ?9)
             "#,
         )
         .bind(&migration_id)
@@ -297,6 +303,8 @@ impl DeploymentMigrationRepository {
         .bind(target_mode.as_str())
         .bind(metadata.runtime_id())
         .bind(&now)
+        .bind(target_pool_id)
+        .bind(target_limits.map(serde_json::to_string).transpose()?)
         .execute(&self.pool)
         .await;
         if let Err(error) = result {
@@ -836,6 +844,11 @@ fn read_migration(row: &SqliteRow) -> Result<DeploymentMigration, DeploymentMigr
         .ok_or_else(|| DeploymentMigrationError::InvalidValue("stage", stage_value.clone()))?;
     let revision: i64 = row.try_get("revision")?;
     Ok(DeploymentMigration {
+        target_pool_id: row.try_get("target_pool_id")?,
+        target_limits: row
+            .try_get::<Option<String>, _>("target_limits_json")?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
         migration_id: row.try_get("migration_id")?,
         instance_id: row.try_get("instance_id")?,
         protocol,
@@ -930,6 +943,7 @@ mod tests {
             socket_path: "/tmp/postgres.sock".to_string(),
         };
         metadata.runtime.container_name = "postgres".to_string();
+        metadata.owner = Some(crate::placement::test_support::owner("game-server"));
         metadata.database.name = "app".to_string();
         metadata.database.username = "app".to_string();
         metadata.postgres_admin_password = Some("admin".to_string());
@@ -957,12 +971,12 @@ mod tests {
     async fn active_workflow_is_unique_and_terminal_history_allows_retry() {
         let (repository, _directory) = repository().await;
         let first = repository
-            .start(&metadata("inst-a"), DeploymentMode::Shared)
+            .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
             .await
             .unwrap();
         assert!(matches!(
             repository
-                .start(&metadata("inst-a"), DeploymentMode::Shared)
+                .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
                 .await,
             Err(DeploymentMigrationError::ActiveMigration(_))
         ));
@@ -979,7 +993,7 @@ mod tests {
             .await
             .unwrap();
         repository
-            .start(&metadata("inst-a"), DeploymentMode::Shared)
+            .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
             .await
             .unwrap();
     }
@@ -988,7 +1002,7 @@ mod tests {
     async fn transition_compare_and_swap_rejects_stale_and_invalid_writers() {
         let (repository, _directory) = repository().await;
         let migration = repository
-            .start(&metadata("inst-a"), DeploymentMode::Shared)
+            .start(&metadata("inst-a"), DeploymentMode::Shared, None, None)
             .await
             .unwrap();
         let preflight = repository
@@ -1062,7 +1076,10 @@ mod tests {
             for (index, (crash_stage, recovery_stage)) in cases.iter().copied().enumerate() {
                 let mode = source_mode.as_str();
                 let source = metadata_in_mode(&format!("{mode}-{index}"), source_mode);
-                let mut migration = repository.start(&source, target_mode).await.unwrap();
+                let mut migration = repository
+                    .start(&source, target_mode, None, None)
+                    .await
+                    .unwrap();
                 if crash_stage != MigrationStage::Requested {
                     migration = advance_to(&repository, migration, crash_stage).await;
                 }
@@ -1100,6 +1117,9 @@ mod tests {
             .await
             .unwrap();
         let shared_runtime = EngineRuntime {
+            pending_image: None,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            owner: source.owner.clone(),
             schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
             runtime_id: "runtime-target".to_string(),
             protocol: source.protocol,
@@ -1113,11 +1133,14 @@ mod tests {
                 container_name: "shared-postgres".to_string(),
                 network_mode: "none".to_string(),
             },
-            limits: source.limits.clone(),
+            limits: crate::shared::limits::InstanceLimits {
+                disk_mib: 32768,
+                ..source.limits.clone()
+            },
             image: "postgres:18".to_string(),
             database_version: None,
             compatibility: None,
-            compatibility_key: "postgres:18".to_string(),
+
             max_tenants: 10,
             reserved: RuntimeReservation::default(),
             admin_secret: Some("pool-admin".to_string()),
@@ -1127,6 +1150,7 @@ mod tests {
         placements.save(&shared_runtime).await.unwrap();
         placements
             .reserve(ReserveTenant {
+                owner: shared_runtime.owner.clone().unwrap(),
                 instance_id: "migration-temp",
                 runtime_id: &shared_runtime.runtime_id,
                 database: &source.database.name,
@@ -1139,7 +1163,7 @@ mod tests {
         let pending = advance_to(
             &repository,
             repository
-                .start(&source, DeploymentMode::Shared)
+                .start(&source, DeploymentMode::Shared, None, None)
                 .await
                 .unwrap(),
             MigrationStage::CutoverPending,
@@ -1205,6 +1229,9 @@ mod tests {
         source.limits.disk_enforced = true;
         source.limits.disk_enforcement_method = "host_linux_project_quota".to_string();
         let source_runtime = EngineRuntime {
+            pending_image: None,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            owner: source.owner.clone(),
             schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
             runtime_id: source.runtime_id.clone(),
             protocol: source.protocol,
@@ -1212,11 +1239,14 @@ mod tests {
             status: EngineRuntimeStatus::Running,
             backend: source.backend.clone(),
             runtime: source.runtime.clone(),
-            limits: source.limits.clone(),
+            limits: crate::shared::limits::InstanceLimits {
+                disk_mib: 32768,
+                ..source.limits.clone()
+            },
             image: "postgres:18".to_string(),
             database_version: None,
             compatibility: None,
-            compatibility_key: "postgres:18".to_string(),
+
             max_tenants: 10,
             reserved: RuntimeReservation::default(),
             admin_secret: Some("pool-admin".to_string()),
@@ -1226,6 +1256,7 @@ mod tests {
         placements.save(&source_runtime).await.unwrap();
         placements
             .reserve(ReserveTenant {
+                owner: source_runtime.owner.clone().unwrap(),
                 instance_id: &source.instance_id,
                 runtime_id: &source_runtime.runtime_id,
                 database: &source.database.name,
@@ -1270,7 +1301,7 @@ mod tests {
         let pending = advance_to(
             &repository,
             repository
-                .start(&source, DeploymentMode::Dedicated)
+                .start(&source, DeploymentMode::Dedicated, None, None)
                 .await
                 .unwrap(),
             MigrationStage::CutoverPending,

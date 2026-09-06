@@ -21,7 +21,7 @@ use crate::{
     },
     placement::{
         DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus,
-        RuntimeReservation, policy,
+        RuntimeReservation,
     },
     runtime::docker::{CommandOutput, DockerError, DockerInstanceSpec, DockerRuntime},
     shared::{
@@ -1100,6 +1100,9 @@ fn runtime(
     paths: &InstancePaths,
 ) -> EngineRuntime {
     EngineRuntime {
+        pending_image: None,
+        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        owner: Some(crate::placement::test_support::owner(runtime_id)),
         schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
         runtime_id: runtime_id.to_string(),
         protocol,
@@ -1119,8 +1122,8 @@ fn runtime(
         image: image.to_string(),
         database_version: None,
         compatibility: None,
-        compatibility_key: policy::compatibility_key(protocol, image),
-        max_tenants: policy::max_tenants(protocol).expect("shared protocol has a tenant limit"),
+
+        max_tenants: 16,
         reserved: RuntimeReservation::default(),
         admin_secret: Some(ADMIN_PASSWORD.to_string()),
         created_at: "2026-01-01T00:00:00Z".to_string(),

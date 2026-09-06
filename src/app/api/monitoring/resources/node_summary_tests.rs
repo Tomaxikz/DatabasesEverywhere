@@ -526,7 +526,7 @@ fn shared_runtime(runtime_id: &str, protocol: Protocol) -> crate::placement::Eng
         socket_path: format!("/run/{runtime_id}.sock"),
     };
     runtime.runtime.container_name = runtime_id.to_string();
-    runtime.compatibility_key = "test".to_string();
+
     runtime
 }
 

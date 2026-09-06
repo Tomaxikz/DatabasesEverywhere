@@ -8,6 +8,9 @@ use crate::{instances::test_support::metadata, shared::protocol::Protocol};
 pub(crate) fn runtime(runtime_id: &str, protocol: Protocol, image: &str) -> EngineRuntime {
     let instance = metadata(runtime_id, protocol);
     EngineRuntime {
+        pending_image: None,
+        desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+        owner: Some(owner(runtime_id)),
         schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
         runtime_id: runtime_id.to_string(),
         protocol,
@@ -19,11 +22,18 @@ pub(crate) fn runtime(runtime_id: &str, protocol: Protocol, image: &str) -> Engi
         image: image.to_string(),
         database_version: None,
         compatibility: None,
-        compatibility_key: format!("{}:{image}", protocol.as_str()),
+
         max_tenants: 10,
         reserved: RuntimeReservation::default(),
         admin_secret: None,
         created_at: instance.created_at,
         updated_at: instance.updated_at,
+    }
+}
+
+pub(crate) fn owner(server_id: &str) -> super::PoolOwner {
+    super::PoolOwner {
+        panel_id: "test-panel".into(),
+        server_id: server_id.into(),
     }
 }

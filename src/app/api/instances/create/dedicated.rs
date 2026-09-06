@@ -16,6 +16,9 @@ pub(crate) struct DedicatedTarget {
 impl DedicatedTarget {
     pub(crate) fn runtime(&self) -> crate::placement::EngineRuntime {
         crate::placement::EngineRuntime {
+            pending_image: None,
+            desired_state: crate::instances::metadata::DesiredInstanceState::Running,
+            owner: self.metadata.owner.clone(),
             schema_version: crate::placement::ENGINE_RUNTIME_SCHEMA_VERSION,
             runtime_id: self.metadata.instance_id.clone(),
             protocol: self.metadata.protocol,
@@ -27,10 +30,7 @@ impl DedicatedTarget {
             image: self.image.clone(),
             database_version: None,
             compatibility: None,
-            compatibility_key: format!(
-                "dedicated:{}:{}",
-                self.metadata.protocol, self.metadata.instance_id
-            ),
+
             max_tenants: 1,
             reserved: crate::placement::RuntimeReservation::default(),
             admin_secret: maintenance_secret(&self.metadata).map(str::to_string),
@@ -199,6 +199,7 @@ pub(crate) async fn build(
     let backend = backend_endpoint(state, request.protocol, &request.instance_id)?;
     let now = now_rfc3339();
     let metadata = InstanceMetadata {
+        owner: request.owner.clone(),
         schema_version: SCHEMA_VERSION,
         instance_id: request.instance_id.clone(),
         deployment_mode: crate::placement::DeploymentMode::Dedicated,

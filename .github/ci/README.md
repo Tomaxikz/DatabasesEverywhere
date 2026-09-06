@@ -34,7 +34,7 @@ than duplicating those values here.
 Prerequisites: Linux, Docker, Maven, JDK 21, and OpenSSL.
 
 ```bash
-bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 9.7.0
+bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 26.7.0
 ```
 
 The canonical image/connector cases are in

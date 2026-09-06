@@ -345,7 +345,7 @@ async fn prepare_mongodb(
         ),
         password: source.password.as_ref().map(ExposeSecret::expose_secret),
     };
-    let config = serde_yaml::to_string(&config).map_err(|error| {
+    let config = yaml_serde::to_string(&config).map_err(|error| {
         ApiError::Runtime(format!("failed to encode mongodb credentials: {error}"))
     })?;
     write_private_file(&work_dir.join("mongodump.yml"), config.as_bytes()).await?;

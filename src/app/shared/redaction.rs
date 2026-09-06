@@ -17,6 +17,20 @@ pub fn redact_connection_url(value: &str) -> String {
     redact_secrets(&redact_url_credentials(value))
 }
 
+/// A log record can span runtime chunks (and quoted secrets can span lines).
+/// Do not publish a recognized secret assignment until its value is complete.
+pub(crate) fn redact_log_record(value: &str) -> Option<String> {
+    for (separator, byte) in value.bytes().enumerate() {
+        if matches!(byte, b'=' | b':')
+            && assignment_key(value, separator).is_some_and(is_secret_key)
+            && assignment_value_range(value, separator + 1, byte).is_none()
+        {
+            return None;
+        }
+    }
+    Some(redact_connection_url(value))
+}
+
 /// Redacts exact short-lived secret values as well as recognizable connection
 /// credentials. Longer values are replaced first so overlapping secrets cannot
 /// leave a suffix behind.
