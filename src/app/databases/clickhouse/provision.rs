@@ -14,7 +14,7 @@ pub fn create_tenant_sql(database: &str, username: &str) -> String {
     let grants = shared_grant_sql_quoted(&database, &role);
     format!(
         r#"CREATE DATABASE IF NOT EXISTS {database} ENGINE = Atomic;
-CREATE OR REPLACE ROLE {role};
+CREATE ROLE OR REPLACE {role};
 {grants}
 GRANT TABLE ENGINE ON MergeTree TO {role};
 GRANT TABLE ENGINE ON ReplacingMergeTree TO {role};
@@ -110,7 +110,7 @@ pub fn tenant_quota_sql(username: &str, quota: TenantQuota) -> String {
     let profile = tenant_profile_ident(username);
     let quota_name = tenant_quota_ident(username);
     format!(
-        r#"CREATE OR REPLACE SETTINGS PROFILE {profile} SETTINGS
+        r#"CREATE SETTINGS PROFILE OR REPLACE {profile} SETTINGS
     max_memory_usage = {} CONST,
     max_threads = {} CONST,
     max_execution_time = {} CONST,
@@ -131,7 +131,7 @@ pub fn tenant_quota_sql(username: &str, quota: TenantQuota) -> String {
     log_query_views = 0 CONST,
     log_processors_profiles = 0 CONST
 TO {role};
-CREATE OR REPLACE QUOTA {quota_name} KEYED BY user_name
+CREATE QUOTA OR REPLACE {quota_name} KEYED BY user_name
     FOR INTERVAL 1 hour MAX queries = {}, read_bytes = {}, written_bytes = {}
 TO {role};"#,
         quota.max_memory_bytes,
@@ -193,6 +193,11 @@ mod tests {
         for (database, username) in [("tenant_a", "user_a"), ("db`quoted", "user`quoted")] {
             let sql = create_tenant_sql(database, username);
 
+            assert!(sql.contains(&format!(
+                "CREATE ROLE OR REPLACE {};",
+                tenant_role_ident(username)
+            )));
+            assert!(!sql.contains("CREATE OR REPLACE ROLE"));
             assert_eq!(sql.matches(PASSWORD_SQL_PLACEHOLDER).count(), 1);
             assert!(sql.contains("HOST LOCAL"));
             assert!(sql.contains("DEFAULT DATABASE"));
@@ -307,6 +312,15 @@ mod tests {
             },
         );
 
+        assert!(
+            sql.starts_with(
+                "CREATE SETTINGS PROFILE OR REPLACE `dbev_profile_tenant_user` SETTINGS"
+            )
+        );
+        assert!(
+            sql.contains("CREATE QUOTA OR REPLACE `dbev_quota_tenant_user` KEYED BY user_name")
+        );
+        assert!(!sql.contains("CREATE OR REPLACE"));
         assert!(sql.contains("max_memory_usage = 536870912 CONST"));
         assert!(sql.contains("max_threads = 2 CONST"));
         assert!(sql.contains("allow_introspection_functions = 0 CONST"));

@@ -55,6 +55,20 @@ bash .github/ci/shared-pool-isolation.sh all
 
 Local `all` runs sequentially. Cleanup is restricted to managed test containers.
 
+Without Docker, an official ClickHouse 26.4+ binary can execute the shared
+provisioning SQL in an isolated `clickhouse local` process (no listeners or live data):
+
+```bash
+DBE_CLICKHOUSE_BINARY=/path/to/clickhouse cargo test --locked --lib \
+  databases::clickhouse::integration_tests::shared_sql_executes_and_reapplies_on_clickhouse_local \
+  -- --exact --ignored
+```
+
+This checks creation, role/profile/quota reapplication, preserved table data and
+access-entity cleanup. It does not replace Docker/gateway authentication tests.
+For older binaries without local access storage, run `shared_sql_parses_on_clickhouse`
+instead with the same test-module prefix. That checks syntax only.
+
 ## Native project quotas
 
 Run only on a disposable Linux host with passwordless sudo, loop/mount

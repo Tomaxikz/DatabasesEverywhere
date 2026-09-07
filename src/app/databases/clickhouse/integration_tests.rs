@@ -1,5 +1,6 @@
 use std::{
-    process::{Command, Output},
+    io::Write,
+    process::{Command, Output, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -12,6 +13,114 @@ const REPLACEMENT_PASSWORD: &str = "integration-replacement-password";
 const SHARED_DATABASE: &str = "shared_integration_db";
 const SHARED_TENANT: &str = "shared_integration_user";
 const SHARED_PASSWORD: &str = "shared-integration-password";
+
+fn shared_sql_scenario() -> String {
+    use super::provision::{self, TenantQuota};
+    let create = provision::create_tenant_sql(SHARED_DATABASE, SHARED_TENANT).replace(
+        provision::PASSWORD_SQL_PLACEHOLDER,
+        &provision::password_literal(SHARED_PASSWORD),
+    );
+    let quota = TenantQuota {
+        max_memory_bytes: 128 * 1024 * 1024,
+        max_threads: 2,
+        max_execution_time_seconds: 30,
+        max_result_bytes: 16 * 1024 * 1024,
+        max_temp_bytes: 64 * 1024 * 1024,
+        max_queries_per_hour: 10_000,
+        max_read_bytes_per_hour: 1024 * 1024 * 1024,
+        max_written_bytes_per_hour: 1024 * 1024 * 1024,
+    };
+    let initial_quota = provision::tenant_quota_sql(SHARED_TENANT, quota);
+    let changed_quota = provision::tenant_quota_sql(
+        SHARED_TENANT,
+        TenantQuota {
+            max_threads: 3,
+            max_queries_per_hour: 20_000,
+            ..quota
+        },
+    );
+    let drop = provision::drop_tenant_sql(SHARED_DATABASE, SHARED_TENANT);
+    format!(
+        r#"
+{create}
+{initial_quota}
+CREATE TABLE {SHARED_DATABASE}.rows (id UInt64) ENGINE = MergeTree ORDER BY id;
+INSERT INTO {SHARED_DATABASE}.rows VALUES (1), (2);
+{create}
+{changed_quota}
+SELECT sum(id) FROM {SHARED_DATABASE}.rows;
+SELECT count() FROM system.roles WHERE name = 'dbev_role_{SHARED_TENANT}';
+SELECT count() FROM system.role_grants WHERE user_name = '{SHARED_TENANT}'
+    AND granted_role_name = 'dbev_role_{SHARED_TENANT}'
+    AND granted_role_is_default = 1 AND with_admin_option = 0;
+SELECT value FROM system.settings_profile_elements
+    WHERE profile_name = 'dbev_profile_{SHARED_TENANT}' AND setting_name = 'max_threads';
+SELECT max_queries FROM system.quota_limits WHERE quota_name = 'dbev_quota_{SHARED_TENANT}';
+{drop}
+SELECT count() FROM system.roles WHERE name = 'dbev_role_{SHARED_TENANT}';
+SELECT count() FROM system.settings_profiles WHERE name = 'dbev_profile_{SHARED_TENANT}';
+SELECT count() FROM system.quotas WHERE name = 'dbev_quota_{SHARED_TENANT}';
+SELECT count() FROM system.databases WHERE name = '{SHARED_DATABASE}';
+"#
+    )
+}
+
+fn run_local_tool(arguments: &[&str], path: Option<&std::path::Path>) -> Output {
+    let binary = std::env::var_os("DBE_CLICKHOUSE_BINARY")
+        .expect("set DBE_CLICKHOUSE_BINARY to the ClickHouse executable");
+    let mut command = Command::new(binary);
+    command.args(arguments);
+    if let Some(path) = path {
+        command.arg("--path").arg(path);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start isolated ClickHouse tool");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(shared_sql_scenario().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+#[ignore = "requires DBE_CLICKHOUSE_BINARY; uses the real SQL parser without executing queries"]
+fn shared_sql_parses_on_clickhouse() {
+    let output = run_local_tool(&["format", "--multiquery"], None);
+    assert_success(
+        &output,
+        "parse generated shared provisioning SQL with ClickHouse",
+    );
+}
+
+#[test]
+#[ignore = "requires DBE_CLICKHOUSE_BINARY with ClickHouse 26.4+ local access storage; no Docker or network listeners"]
+fn shared_sql_executes_and_reapplies_on_clickhouse_local() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run_local_tool(
+        &[
+            "local",
+            "--multiquery",
+            "--max_threads=2",
+            "--max_memory_usage=268435456",
+        ],
+        Some(directory.path()),
+    );
+    assert_success(
+        &output,
+        "execute shared SQL with the real ClickHouse engine",
+    );
+    let rows = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        ["3", "1", "1", "3", "20000", "0", "0", "0", "0"]
+    );
+}
 
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned ClickHouse image"]
