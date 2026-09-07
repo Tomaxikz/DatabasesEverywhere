@@ -230,29 +230,9 @@ pub(crate) async fn list_pool_tenants(
         .map_err(|error| ApiError::Runtime(format!("failed to load shared pool: {error}")))?
         .filter(|runtime| runtime.deployment_mode == DeploymentMode::Shared)
         .ok_or(ApiError::NotFound)?;
-    let tenant_ids = state
-        .placements
-        .tenants(&runtime.runtime_id)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load pool tenants: {error}")))?;
-    let mut tenants = Vec::with_capacity(tenant_ids.len());
-    for instance_id in tenant_ids {
-        let metadata = state.instances.get(&instance_id).await.ok_or_else(|| {
-            ApiError::Runtime(format!(
-                "shared pool {} references missing tenant {instance_id}",
-                runtime.runtime_id
-            ))
-        })?;
-        if metadata.deployment_mode != DeploymentMode::Shared
-            || metadata.runtime_id() != runtime.runtime_id
-            || metadata.protocol != runtime.protocol
-            || metadata.owner != runtime.owner
-        {
-            return Err(ApiError::Runtime(format!(
-                "shared pool {} has inconsistent tenant metadata",
-                runtime.runtime_id
-            )));
-        }
+    let members = crate::api::pools::tenants(&state, &runtime).await?;
+    let mut tenants = Vec::with_capacity(members.len());
+    for metadata in members {
         let resources = resource_report(&state, &metadata, ResourceView::Tenant).await?;
         tenants.push(SharedPoolTenant {
             instance_id: metadata.instance_id,
@@ -616,6 +596,227 @@ mod tests {
 
     use super::*;
     use crate::api::monitoring::resources::CachedRuntimeStats;
+
+    async fn get_pool_route(
+        state: &AppState,
+        suffix: &str,
+    ) -> (http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = http::Request::builder()
+            .uri(format!("/api/pools/pool_read/{suffix}"))
+            .header(http::header::AUTHORIZATION, "Bearer secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::api::http::router::build_router(state.clone()).oneshot(request),
+        )
+        .await
+        .expect("pool reads must not wait for creation to release its lock")
+        .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn reserve_child(state: &AppState, pool: &EngineRuntime, id: &str) -> InstanceMetadata {
+        let mut metadata = crate::instances::test_support::metadata(id, pool.protocol);
+        metadata.deployment_mode = DeploymentMode::Shared;
+        metadata.runtime_id = pool.runtime_id.clone();
+        metadata.owner = pool.owner.clone();
+        metadata.database.name = format!("db_{id}");
+        metadata.database.username = format!("user_{id}");
+        metadata.limits.disk_mib = 128;
+        state
+            .placements
+            .reserve(crate::placement::ReserveTenant {
+                owner: pool.owner.clone().unwrap(),
+                instance_id: id,
+                runtime_id: &pool.runtime_id,
+                database: &metadata.database.name,
+                username: &metadata.database.username,
+                limits: &metadata.limits,
+            })
+            .await
+            .unwrap();
+        state
+            .resource_cache
+            .store_disk_usage(
+                id.into(),
+                super::super::CachedDiskUsage {
+                    used_bytes: 42,
+                    sampled_at: Instant::now(),
+                },
+            )
+            .await;
+        metadata
+    }
+
+    #[tokio::test]
+    async fn pool_reads_remain_available_at_each_creation_stage() {
+        for protocol in Protocol::ALL
+            .into_iter()
+            .filter(|protocol| DeploymentMode::Shared.supports(*protocol))
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config {
+                remote: "https://panel.example.test".into(),
+                ..Default::default()
+            };
+            config.paths.backups = directory.path().join("backups").display().to_string();
+            let (state, _db) = crate::api::test_support::database(config).await;
+            let mut pool =
+                crate::placement::test_support::runtime("pool_read", protocol, "test-image");
+            pool.limits.disk_mib = 8192;
+            state.placements.save(&pool).await.unwrap();
+            let old = reserve_child(&state, &pool, "old").await;
+            state.placements.mark_provisioned("old").await.unwrap();
+            state.manager.upsert(old).await.unwrap();
+
+            // Hold the real worker permit and runtime lock while pausing at
+            // the production reserve -> provision -> publish boundaries.
+            let permit = state
+                .install_progress
+                .try_begin_creation("new", protocol, "test-image")
+                .unwrap();
+            let operation = state.instance_locks.lock(&pool.runtime_id).await;
+            let new = reserve_child(&state, &pool, "new").await;
+            for stage in 0..3 {
+                if stage == 1 {
+                    state.placements.mark_provisioned("new").await.unwrap();
+                }
+                if stage == 2 {
+                    state.manager.upsert_fenced(new.clone()).await.unwrap();
+                }
+                let (status, body) = get_pool_route(&state, "instances").await;
+                assert_eq!(status, http::StatusCode::OK, "{protocol}/{stage}: {body}");
+                assert_eq!(body.as_array().unwrap().len(), 1);
+                assert_eq!(body[0]["instance_id"], "old");
+                let (status, body) = get_pool_route(&state, "backups").await;
+                assert_eq!(status, http::StatusCode::OK, "{protocol}/{stage}: {body}");
+            }
+            state.instances.upsert(new).await;
+            state.install_progress.complete("new", "ready");
+            drop(permit);
+            drop(operation);
+            let (status, body) = get_pool_route(&state, "instances").await;
+            assert_eq!(status, http::StatusCode::OK, "{protocol}: {body}");
+            let ids = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["instance_id"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, ["new", "old"]);
+            state.manager.delete("new").await.unwrap();
+            let (status, body) = get_pool_route(&state, "instances").await;
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(body.as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_mismatched_tenants_are_not_hidden_by_stale_progress() {
+        let (state, _db) = crate::api::test_support::database(crate::config::Config {
+            remote: "https://panel.example.test".into(),
+            ..Default::default()
+        })
+        .await;
+        let mut pool =
+            crate::placement::test_support::runtime("pool_read", Protocol::Postgres, "test-image");
+        pool.limits.disk_mib = 8192;
+        state.placements.save(&pool).await.unwrap();
+        let mut child = reserve_child(&state, &pool, "lost").await;
+        state
+            .install_progress
+            .begin("lost", pool.protocol, "test-image");
+        let unrelated = state
+            .install_progress
+            .try_begin_creation("another", pool.protocol, "test-image")
+            .unwrap();
+        for provisioned in [false, true] {
+            if provisioned {
+                state.placements.mark_provisioned("lost").await.unwrap();
+            }
+            let error = crate::api::pools::tenants(&state, &pool).await.unwrap_err();
+            assert!(error.to_string().contains("missing tenant lost"));
+            assert_eq!(
+                get_pool_route(&state, "instances").await.0,
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        state.manager.upsert(child.clone()).await.unwrap();
+        state.instances.remove("lost").await;
+        assert!(crate::api::pools::tenants(&state, &pool).await.is_err());
+        state.instances.upsert(child.clone()).await;
+        for mismatch in ["owner", "protocol", "database", "username"] {
+            let mut bad = child.clone();
+            match mismatch {
+                "owner" => bad.owner.as_mut().unwrap().server_id = "another-server".into(),
+                "protocol" => bad.protocol = Protocol::Mysql,
+                "database" => bad.database.name = "another_db".into(),
+                _ => bad.database.username = "another_user".into(),
+            }
+            state.instances.upsert(bad).await;
+            assert!(
+                crate::api::pools::tenants(&state, &pool).await.is_err(),
+                "{mismatch}"
+            );
+        }
+        child.status = InstanceStatus::Quarantined;
+        state.manager.upsert(child).await.unwrap();
+        let tenants = crate::api::pools::tenants(&state, &pool).await.unwrap();
+        assert_eq!(tenants[0].status, InstanceStatus::Quarantined);
+        drop(unrelated);
+    }
+
+    #[tokio::test]
+    async fn provisional_migration_targets_are_not_public_pool_members() {
+        let (state, _db) = crate::api::test_support::database(crate::config::Config {
+            remote: "https://panel.example.test".into(),
+            ..Default::default()
+        })
+        .await;
+        let mut pool =
+            crate::placement::test_support::runtime("pool_read", Protocol::Postgres, "test-image");
+        pool.limits.disk_mib = 8192;
+        state.placements.save(&pool).await.unwrap();
+        let mut source = crate::instances::test_support::metadata("source", pool.protocol);
+        source.owner = pool.owner.clone();
+        state.manager.upsert(source.clone()).await.unwrap();
+        let migration = state
+            .placements
+            .migrations()
+            .start(
+                &source,
+                DeploymentMode::Shared,
+                Some(&pool.runtime_id),
+                None,
+            )
+            .await
+            .unwrap();
+        let temporary_id = format!("migration_{}", migration.migration_id.replace('-', ""));
+        reserve_child(&state, &pool, &temporary_id).await;
+        state
+            .placements
+            .mark_provisioned(&temporary_id)
+            .await
+            .unwrap();
+        let (status, body) = get_pool_route(&state, "instances").await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!([]));
+        assert!(state.instances.get("source").await.is_some());
+        assert!(
+            state
+                .placements
+                .get_reservation(&temporary_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn clock() -> ReportClock {
         ReportClock {

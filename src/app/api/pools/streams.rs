@@ -162,26 +162,14 @@ pub(crate) async fn backups(
     auth.require_scope(scopes::POOLS_READ)?;
     auth.require_scope(scopes::BACKUPS_READ)?;
     let pool = super::load(&state, &id).await?;
-    let ids = state
-        .placements
-        .tenants(&id)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let tenants = super::tenants(&state, &pool).await?;
     let mut records = Vec::new();
-    for instance_id in ids {
-        let instance = state
-            .instances
-            .get(&instance_id)
-            .await
-            .ok_or(ApiError::NotFound)?;
-        if instance.owner != pool.owner {
-            return Err(ApiError::Conflict("pool tenant ownership mismatch".into()));
-        }
+    for instance in tenants {
         records.extend(
             crate::api::backups::list_instance_backups(
                 State(state.clone()),
                 auth.clone(),
-                ApiPath(instance_id),
+                ApiPath(instance.instance_id),
             )
             .await?
             .into_body(),

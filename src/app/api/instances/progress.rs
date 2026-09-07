@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -25,7 +25,7 @@ pub struct InstallProgressStore {
     revision: Arc<AtomicU64>,
     inner: Arc<RwLock<HashMap<String, InstallProgress>>>,
     accepting: Arc<AtomicBool>,
-    active_creations: Arc<AtomicUsize>,
+    active_creations: Arc<RwLock<HashSet<String>>>,
     drain_notify: Arc<Notify>,
 }
 
@@ -38,7 +38,8 @@ pub enum BeginCreationError {
 
 #[derive(Debug)]
 pub struct CreationPermit {
-    active_creations: Arc<AtomicUsize>,
+    instance_id: String,
+    active_creations: Arc<RwLock<HashSet<String>>>,
     drain_notify: Arc<Notify>,
 }
 
@@ -83,13 +84,18 @@ impl InstallProgressStore {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(BeginCreationError::ShuttingDown);
         }
+        let mut active = self
+            .active_creations
+            .write()
+            .expect("creation lock poisoned");
         if entries
             .get(instance_id)
             .is_some_and(|progress| progress.status == InstallProgressStatus::Running)
+            || active.contains(instance_id)
         {
             return Err(BeginCreationError::AlreadyRunning);
         }
-        if self.active_creations.load(Ordering::Acquire) >= MAX_ADMITTED_CREATIONS {
+        if active.len() >= MAX_ADMITTED_CREATIONS {
             return Err(BeginCreationError::Capacity);
         }
         if !set_progress(
@@ -99,8 +105,9 @@ impl InstallProgressStore {
         ) {
             return Err(BeginCreationError::Capacity);
         }
-        self.active_creations.fetch_add(1, Ordering::AcqRel);
+        active.insert(instance_id.to_string());
         Ok(CreationPermit {
+            instance_id: instance_id.to_string(),
             active_creations: Arc::clone(&self.active_creations),
             drain_notify: Arc::clone(&self.drain_notify),
         })
@@ -127,14 +134,25 @@ impl InstallProgressStore {
     }
 
     pub fn active_creation_count(&self) -> usize {
-        self.active_creations.load(Ordering::Acquire)
+        self.active_creations
+            .read()
+            .expect("creation lock poisoned")
+            .len()
+    }
+
+    /// Worker lifetime, not a retained progress message that may outlive it.
+    pub(crate) fn is_creating(&self, instance_id: &str) -> bool {
+        self.active_creations
+            .read()
+            .expect("creation lock poisoned")
+            .contains(instance_id)
     }
 
     pub async fn wait_for_creation_drain(&self, deadline: Duration) -> bool {
         let drained = async {
             loop {
                 let notified = self.drain_notify.notified();
-                if self.active_creations.load(Ordering::Acquire) == 0 {
+                if self.active_creation_count() == 0 {
                     return;
                 }
                 notified.await;
@@ -316,7 +334,15 @@ impl InstallProgressStore {
 
 impl Drop for CreationPermit {
     fn drop(&mut self) {
-        if self.active_creations.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let empty = {
+            let mut active = self
+                .active_creations
+                .write()
+                .expect("creation lock poisoned");
+            active.remove(&self.instance_id);
+            active.is_empty()
+        };
+        if empty {
             self.drain_notify.notify_one();
         }
     }
@@ -535,5 +561,29 @@ mod tests {
             BeginCreationError::Capacity
         );
         drop(permits);
+    }
+
+    #[test]
+    fn creation_lifetime_is_independent_of_retained_progress() {
+        let store = InstallProgressStore::default();
+        let permit = store
+            .try_begin_creation("tenant", Protocol::Postgres, "postgres:test")
+            .unwrap();
+        assert!(store.is_creating("tenant"));
+        store.complete("tenant", "ready");
+        store.remove("tenant");
+        assert!(store.is_creating("tenant"));
+        assert_eq!(store.active_creation_count(), 1);
+        assert_eq!(
+            store
+                .try_begin_creation("tenant", Protocol::Postgres, "postgres:test")
+                .unwrap_err(),
+            BeginCreationError::AlreadyRunning
+        );
+        drop(permit);
+        assert!(!store.is_creating("tenant"));
+        assert_eq!(store.active_creation_count(), 0);
+        store.begin("tenant", Protocol::Postgres, "postgres:test");
+        assert!(!store.is_creating("tenant"));
     }
 }

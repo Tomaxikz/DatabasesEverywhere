@@ -2283,7 +2283,7 @@ paths:
   /api/pools/{runtime_id}/instances:
     get:
       summary: List child databases.
-      description: List child databases.
+      description: Lists published child databases. In-flight creations and provisional migration targets are omitted until published; use the creation status_url for progress. Unexplained orphan reservations and ownership mismatches still fail rather than being silently adopted.
       x-required-scope: pools:read
       parameters:
         - name: runtime_id

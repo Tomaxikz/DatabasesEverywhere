@@ -68,6 +68,12 @@ inherited. The generic `POST /api/instances` shared request also works, but
 requires explicit `server_id`, `pool_id` and disk-only `limits`.
 The old implicit `pool_limits` request field is removed.
 
+Pool instance/backup lists omit children while their creation worker is active
+and omit provisional migration targets. Track new children through their returned
+`status_url`; generic instance GET can return 404 before publication. Pool
+`tenant_count` includes capacity reservations, so it can temporarily exceed the
+published child count. Unexplained orphan metadata remains an error.
+
 CPU/RAM and the engine's physical disk budget belong to the pool. Each child
 still has its own disk allowance and restricted database account. This is not
 per-child hard CPU/RAM isolation. Dedicated databases remain the option for
