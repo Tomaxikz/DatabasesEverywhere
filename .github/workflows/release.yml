@@ -338,5 +338,6 @@ jobs:
           tags: ${{ steps.docker_tags.outputs.tags }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Re-fetch security indexes and upgrade packages on every release.
+          # This image copies prebuilt Rust binaries; no compiler cache is lost.
+          no-cache: true

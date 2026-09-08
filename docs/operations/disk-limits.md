@@ -35,13 +35,20 @@ Coordinate with other quota managers.
 
 Each FUSE-mounted engine has a helper process. New helpers use at most two
 I/O workers instead of libfuse's default ten; each worker retains a receive
-buffer, so this bounds per-mount overhead without disabling quota checks or
-filesystem caching. Very busy mounts trade some peak I/O parallelism for the
+buffer, so this bounds per-mount overhead without disabling quota checks.
+Very busy mounts trade some peak I/O parallelism for the
 smaller footprint. It is not a hard process-memory limit.
 
-Healthy helpers survive daemon restarts to keep database mounts usable. Their
-worker settings change only when the mount is safely recreated, not merely
-when DBEV restarts. Do not kill helpers or force-unmount active databases to
+Helpers use `--nocache` to disable the pinned helper's unsafe FUSE writeback and
+attribute caching; the backing filesystem still uses Linux page caching. This
+prevents `EBADF` on newly created write-only append files after cache eviction,
+including Redis AOF workloads. Persistence and disk quotas remain enabled.
+
+Boot recovery stops affected containers before replacing older cached mounts,
+then resumes only desired-running instances. Safe helpers are reused. This is
+a one-time database restart during upgrade: preserve Redis data before deploying
+when persistence is already failing. Live limit updates never remount underneath
+open database files. Do not kill helpers or force-unmount active databases to
 reclaim memory. Native project quotas avoid these userspace helpers entirely,
 but changing enforcement needs a planned storage migration.
 

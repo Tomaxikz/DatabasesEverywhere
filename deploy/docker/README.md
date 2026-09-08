@@ -37,7 +37,10 @@ The [Dockerfile](Dockerfile) packages prebuilt binaries, not Rust source.
 After staging binaries, build with the repository root as context:
 
 ```bash
-docker build -f deploy/docker/Dockerfile .
+docker build --no-cache -f deploy/docker/Dockerfile .
 ```
 
 Keep `.dockerignore` aligned with the Dockerfile and staging paths.
+The fresh build upgrades installed Debian packages from signed repositories.
+Rebuild and rescan the new image digest to verify fixes; an existing published
+tag is not patched merely by changing this Dockerfile.

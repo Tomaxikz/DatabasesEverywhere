@@ -539,7 +539,7 @@ async fn import_logical_batch(
     if primary.helper_uncertain() {
         let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
         return Err(ApiError::Runtime(format!(
-            "{} import failed after helper cleanup became uncertain: {primary}; rollback was not attempted because it could race the previous helper; target was failed closed{}; rollback dump retained at {} with recovery manifest {}",
+            "{} import failed after restore-command cleanup became uncertain: {primary}; rollback was not attempted because it could race the previous command; target was failed closed{}; rollback dump retained at {} with recovery manifest {}",
             metadata.protocol.as_str(),
             quarantine_suffix(&quarantine),
             rollback_path.display(),

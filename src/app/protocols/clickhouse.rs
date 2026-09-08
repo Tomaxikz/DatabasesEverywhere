@@ -14,6 +14,18 @@ pub struct ClickhouseHttpRoute {
     pub database: String,
 }
 
+/// Native Server::Exception, with no tenant names, credentials or stack trace.
+pub(crate) fn auth_error_packet() -> Vec<u8> {
+    let mut packet = vec![2];
+    packet.extend_from_slice(&516_i32.to_le_bytes());
+    for value in ["DB::Exception", "Authentication failed.", ""] {
+        write_uvarint(&mut packet, value.len() as u64);
+        packet.extend_from_slice(value.as_bytes());
+    }
+    packet.push(0); // no nested exception
+    packet
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClickhouseParseError {
     #[error("clickhouse native hello is missing username")]
@@ -102,10 +114,17 @@ pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, Cli
     }
 
     let mut username = None;
-    let mut database = query_value(target, "database");
-
-    if let Some(value) = query_value(target, "user") {
-        username = Some(value);
+    let mut database = None;
+    if let Some((_, query)) = target.split_once('?') {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = percent_decode(key);
+            if key.eq_ignore_ascii_case("user") {
+                merge_route_field(&mut username, percent_decode(value))?;
+            } else if key.eq_ignore_ascii_case("database") {
+                merge_route_field(&mut database, percent_decode(value))?;
+            }
+        }
     }
 
     for line in lines {
@@ -115,14 +134,13 @@ pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, Cli
         let name = name.trim();
         let value = value.trim();
         if name.eq_ignore_ascii_case("x-clickhouse-user") {
-            username = Some(value.to_string());
+            merge_route_field(&mut username, value.to_string())?;
         } else if name.eq_ignore_ascii_case("x-clickhouse-database") {
-            database = Some(value.to_string());
-        } else if name.eq_ignore_ascii_case("authorization")
-            && username.is_none()
-            && let Some(encoded) = basic_authorization_payload(value)?
-        {
-            username = Some(basic_auth_username(encoded)?);
+            merge_route_field(&mut database, value.to_string())?;
+        } else if name.eq_ignore_ascii_case("authorization") {
+            let encoded = basic_authorization_payload(value)?
+                .ok_or(ClickhouseParseError::InvalidHttpBasicAuth)?;
+            merge_route_field(&mut username, basic_auth_username(encoded)?)?;
         }
     }
 
@@ -249,15 +267,15 @@ fn basic_authorization_payload(value: &str) -> Result<Option<&str>, ClickhousePa
     Ok(value.get(6..))
 }
 
-fn query_value(target: &str, key: &str) -> Option<String> {
-    let query = target.split_once('?')?.1;
-    for pair in query.split('&') {
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if percent_decode(name).eq_ignore_ascii_case(key) {
-            return Some(percent_decode(value));
-        }
+fn merge_route_field(
+    current: &mut Option<String>,
+    value: String,
+) -> Result<(), ClickhouseParseError> {
+    if current.as_ref().is_some_and(|current| current != &value) {
+        return Err(ClickhouseParseError::InvalidHttpRequest);
     }
-    None
+    *current = Some(value);
+    Ok(())
 }
 
 fn percent_decode(value: &str) -> String {

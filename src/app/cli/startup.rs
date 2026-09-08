@@ -299,9 +299,10 @@ pub(super) async fn restore_disk_limits(
         manager.store().list().await.into_iter().filter(|metadata| {
             metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
         });
-    let outcomes = futures::stream::iter(instances)
-        .map(|metadata| async move {
-            let outcome = async {
+    let outcomes =
+        futures::stream::iter(instances)
+            .map(|metadata| async move {
+                let outcome = async {
                 let paths = InstancePaths::new(&config.paths, &metadata.instance_id).with_context(
                     || format!("failed to build paths for {}", metadata.instance_id),
                 )?;
@@ -363,6 +364,7 @@ pub(super) async fn restore_disk_limits(
                             });
                         }
                     }
+                    effective_limiter.teardown_instance_mount(&paths.data).await?;
                 }
                 let enforcement = effective_limiter
                     .apply_instance_limit(
@@ -380,11 +382,11 @@ pub(super) async fn restore_disk_limits(
                 ))
             }
             .await;
-            (metadata, outcome)
-        })
-        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+                (metadata, outcome)
+            })
+            .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
     let mut failed = 0_usize;
     for (mut metadata, outcome) in outcomes {
         if let Ok((_effective_mode, enforcement)) = outcome.as_ref() {
@@ -478,6 +480,13 @@ async fn migrate_qdrant_storage(
     metadata: &crate::instances::metadata::InstanceMetadata,
     paths: &InstancePaths,
 ) -> anyhow::Result<bool> {
+    if metadata.desired_state == crate::instances::metadata::DesiredInstanceState::Running
+        && let Err(error) = docker.check_autostart(&metadata.instance_id).await
+    {
+        tracing::warn!(instance_id = %metadata.instance_id, %error,
+            "deferred automatic storage migration while startup is blocked");
+        return Ok(false);
+    }
     let legacy_mount = disk_limiter.legacy_fuse_container_path(&paths.data)?;
     let legacy_mount_present = disk_limiter.has_legacy_fuse_mount(&paths.data)?;
     let bound_source = match docker
@@ -627,6 +636,7 @@ async fn migrate_qdrant_storage(
                 Err(error) if error.is_not_found() => {}
                 Err(error) => return Err(anyhow::Error::from(error)),
             }
+            disk_limiter.unmount_legacy_fuse(&paths.data).await?;
             disk_limiter
                 .set_legacy_fuse_limit(&paths.data, metadata.limits.disk_mib)
                 .await?;
@@ -868,6 +878,19 @@ pub(super) async fn start_known_instance(
     let Some(action) = managed_boot_action(metadata.status, metadata.desired_state) else {
         return Ok(None);
     };
+    if let Err(error) = docker.check_autostart(&metadata.instance_id).await {
+        tracing::warn!(event = "audit container_autostart_blocked", instance_id = %metadata.instance_id, %error);
+        metadata.status = InstanceStatus::Failed;
+        manager.upsert_fenced(metadata.clone()).await?;
+        if let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
+            && !error.is_not_found()
+            && !error.is_not_running()
+        {
+            tracing::error!(instance_id = %metadata.instance_id, %error,
+                "could not stop a startup-blocked container; its routes remain fenced");
+        }
+        return Ok(Some(InstanceStatus::Failed));
+    }
     if action != snapshot_action {
         tracing::debug!(
             instance_id = %metadata.instance_id,
@@ -1081,10 +1104,9 @@ pub(super) fn managed_boot_action(
         return None;
     }
     match status {
-        InstanceStatus::Stopped => Some(ManagedBootAction::Start),
+        InstanceStatus::Stopped | InstanceStatus::Booting => Some(ManagedBootAction::Start),
         InstanceStatus::Failed => Some(ManagedBootAction::Restart),
         InstanceStatus::Creating
-        | InstanceStatus::Booting
         | InstanceStatus::Running
         | InstanceStatus::Quarantined
         | InstanceStatus::Deleting => None,

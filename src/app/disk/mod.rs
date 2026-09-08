@@ -857,6 +857,8 @@ fn should_apply_native_path(mode: DiskLimitMode, existing_native: bool) -> bool 
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskLimitError {
+    #[error("FuseQuota mount {} requires an offline recovery or cache-policy update; stop the database before remounting (daemon boot performs this safely)", .0.display())]
+    FuseRequiresRestart(PathBuf),
     #[error(
         "disk enforcement cannot transition in place from {from} to {to}: the existing hard quota must be removed through a safe recreation or migration before metadata can change"
     )]

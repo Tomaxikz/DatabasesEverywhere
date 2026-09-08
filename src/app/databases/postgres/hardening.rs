@@ -204,7 +204,7 @@ async fn run_hardening_command(
                 )
                 .await
         }
-        ExecRecovery::CallerFencesTenant => {
+        ExecRecovery::CallerHandles => {
             docker
                 .exec_tenant_shell(
                     Protocol::Postgres,

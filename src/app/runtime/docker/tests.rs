@@ -36,6 +36,7 @@ fn every_database_uses_one_bounded_console_history_without_log_binds() {
             spec.protocol = protocol;
             let body = runtime.create_body(&spec).unwrap();
             let host = body.host_config.unwrap();
+            assert_eq!(host.restart_policy, Some(startup::no_restarts()));
             let logs = host.log_config.unwrap();
             assert_eq!(
                 logs.typ.as_deref(),

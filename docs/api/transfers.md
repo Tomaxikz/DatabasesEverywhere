@@ -197,6 +197,12 @@ managed tenant where supported. Unsupported source objects are rejected before
 mutation; destructive restores also require a complete rollback snapshot.
 Choose dedicated placement when these engine features are required.
 
+Restore full ClickHouse SQL dumps with `wipe`. DBEV clears only the verified
+tenant database through its internal administrator connection, then replays the
+inspected dump as the restricted tenant. Tenant grants are not widened; `merge`
+does not permit replacing existing tables with `DROP TABLE`. An uncertain
+administrator wipe stops and quarantines the pool instead of racing rollback.
+
 ## Scheduler and retention
 
 The [example config](../../config/example.yml) defines upload size, total

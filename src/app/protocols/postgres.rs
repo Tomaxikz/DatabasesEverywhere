@@ -1,5 +1,14 @@
 use std::collections::HashMap;
 
+/// A routing rejection is an authorization failure, not a broken transport.
+pub(crate) fn auth_error_packet() -> Vec<u8> {
+    let fields = b"SFATAL\0VFATAL\0C28000\0MAccess denied for requested database\0\0";
+    let mut packet = vec![b'E'];
+    packet.extend_from_slice(&(fields.len() as u32 + 4).to_be_bytes());
+    packet.extend_from_slice(fields);
+    packet
+}
+
 pub const SSL_REQUEST_CODE: i32 = 80877103;
 pub const GSSENC_REQUEST_CODE: i32 = 80877104;
 pub const CANCEL_REQUEST_CODE: i32 = 80877102;

@@ -231,6 +231,7 @@ impl DockerRuntime {
                     .await
                     {
                         Ok(Ok(_)) => {
+                            self.startup_ready(instance_id).await?;
                             tracing::debug!(
                                 instance_id,
                                 %protocol,
@@ -242,9 +243,16 @@ impl DockerRuntime {
                             last_readiness_error = Some(error.to_string());
                         }
                         Err(_) => {
-                            last_readiness_error = Some(format!(
-                                "readiness attempt exceeded {} seconds",
-                                attempt_timeout.as_secs()
+                            // Cancelling an exec HTTP request does not prove its
+                            // process exited. Do not pile up hung probes: let the
+                            // startup owner stop the container and report failure.
+                            return Err(not_ready_error(
+                                instance_id,
+                                last,
+                                Some(format!(
+                                    "readiness attempt exceeded {} seconds",
+                                    attempt_timeout.as_secs()
+                                )),
                             ));
                         }
                     }

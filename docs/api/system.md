@@ -22,6 +22,19 @@ Desired-running instances start in a bounded background phase; gateway
 publication waits for startup and required hardening. A broken instance is
 isolated rather than blocking every management endpoint.
 
+Existing dedicated containers and shared pools whose desired state is running
+auto-start on node/daemon boot. Intentional stops, quarantine and pending
+destructive recovery remain authoritative; missing containers are not recreated.
+Two consecutive unconfirmed starts block further automatic activation, including
+command-timeout recovery. The runtime-owned count survives daemon restarts and
+is cleared only by successful startup readiness. After repairing the cause, use
+the existing instance/pool `power` endpoint with `start` or `restart` to retry.
+Readiness polls do not consume attempts or restart containers themselves.
+
+Docker/Podman restart policies are disabled for managed containers, including
+existing ones at boot. DBEV owns activation so quotas and stop intent are checked
+first; there is no second unbounded container-engine restart loop.
+
 Daemon restart normally leaves containers and healthy quota mounts running.
 Shutdown closes mutation admission and uses bounded drains for mutations/jobs,
 API connections, WebSockets, and gateway sessions. WebSockets receive close

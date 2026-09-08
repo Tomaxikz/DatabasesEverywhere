@@ -241,7 +241,7 @@ pub(crate) async fn create(
                 target.username,
                 &SecretString::from(password.to_string()),
                 &admin,
-                ExecRecovery::CallerFencesTenant,
+                ExecRecovery::CallerHandles,
             )
             .await?;
             postgres_sql(

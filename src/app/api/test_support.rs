@@ -29,7 +29,8 @@ pub(crate) fn state(
         manager,
         placements: crate::placement::PlacementRepository::new(pool.clone()),
         instance_locks: crate::instances::locks::InstanceLocks::default(),
-        docker: DockerRuntime::offline_for_tests(&Default::default(), false),
+        docker: DockerRuntime::offline_for_tests(&Default::default(), false)
+            .with_startup_history(pool.clone()),
         import_export_jobs: ImportExportJobs::default(),
         import_uploads: crate::api::import_export::ImportUploadService::new(
             crate::storage::import_uploads::ImportUploadRepository::new(pool),

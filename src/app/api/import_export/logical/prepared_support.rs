@@ -234,14 +234,21 @@ pub(super) async fn apply_prepared_logical_imports(
         .ok_or_else(|| ApiError::BadRequest("prepared import size overflowed".to_string()))?;
     super::super::shared_security::admit_import(state, metadata, prepared_bytes, mode).await?;
     let runtime_id = metadata.runtime_id();
-    if mode == ImportMode::Wipe {
-        wipe_logical_target(
+    if mode == ImportMode::Wipe
+        && let Err(error) = wipe_logical_target(
             state,
             metadata,
             first.exec_timeout,
             first.database_definition_in_dump,
         )
-        .await?;
+        .await
+    {
+        let uncertain = error.helper_uncertain();
+        return Err(if uncertain {
+            LogicalApplyError::helper(error.into_api_error())
+        } else {
+            error.into_api_error().into()
+        });
     }
     let credentials = logical_import_env(metadata, first.database_definition_in_dump)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;

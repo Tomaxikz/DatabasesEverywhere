@@ -46,6 +46,7 @@ const MINIMUM_FUSEQUOTA_NOFILE: u64 = 65_536;
 const TARGET_FUSEQUOTA_NOFILE: u64 = 1_048_576;
 const UNMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HELPER_CMDLINE_BYTES: usize = 16 * 1024;
 
 pub(super) async fn verify_startup(
     binary: &str,
@@ -131,32 +132,25 @@ pub(super) async fn apply_with_root(
 
     let expected_owner = path_owner(data_path).await?;
 
-    if let Ok(response) = send_command_detailed(
-        &paths.socket_path,
-        &format!("set quota = {}", mib_to_bytes(disk_mib)),
-    )
-    .await
-    {
-        set_helper_nofile_limit(response.peer_pid).await?;
-        if mount_owner_matches(&paths.mount_path, expected_owner).await {
-            return Ok(paths.mount_path);
+    if let Ok(response) = send_command_detailed(&paths.socket_path, "get quota_used", None).await {
+        if !mounts::is_mountpoint(&paths.mount_path)?
+            || !helper_cache_is_safe(response.peer_pid).await
+            || !mount_owner_matches(&paths.mount_path, expected_owner).await
+        {
+            return Err(DiskLimitError::FuseRequiresRestart(paths.mount_path));
         }
-
-        tracing::warn!(
-            data_path = %data_path.display(),
-            mount_path = %paths.mount_path.display(),
-            uid = expected_owner.0,
-            gid = expected_owner.1,
-            "fuse quota mount owner does not match data path owner; restarting mount"
-        );
-        destroy_with_root(data_path, fuse_root).await?;
+        set_helper_nofile_limit(response.peer_pid).await?;
+        send_command_detailed(
+            &paths.socket_path,
+            &format!("set quota = {}", mib_to_bytes(disk_mib)),
+            Some(response.peer_pid),
+        )
+        .await?;
+        return Ok(paths.mount_path);
     } else if mounts::is_mountpoint(&paths.mount_path)? {
-        tracing::warn!(
-            data_path = %data_path.display(),
-            mount_path = %paths.mount_path.display(),
-            "stale fuse quota mount has no responsive control socket; tearing it down before restart"
-        );
-        destroy_with_root(data_path, fuse_root).await?;
+        // Live resize, password and image preflights also use this function.
+        // Only the lifecycle owner may stop the database and then detach it.
+        return Err(DiskLimitError::FuseRequiresRestart(paths.mount_path));
     }
 
     remove_control_socket(&paths.socket_path).await?;
@@ -264,13 +258,15 @@ pub(super) async fn runtime_is_healthy(
         }
         Err(error) => return Err(error),
     };
-    if !mount_owner_matches(&paths.mount_path, expected_owner).await {
-        return Ok(false);
-    }
-    let response = match send_command_detailed(&paths.socket_path, "get quota_used").await {
+    let response = match send_command_detailed(&paths.socket_path, "get quota_used", None).await {
         Ok(response) => response,
         Err(_) => return Ok(false),
     };
+    if !helper_cache_is_safe(response.peer_pid).await
+        || !mount_owner_matches(&paths.mount_path, expected_owner).await
+    {
+        return Ok(false);
+    }
     if let Err(error) = set_helper_nofile_limit(response.peer_pid).await {
         tracing::warn!(
             mount_path = %paths.mount_path.display(),
@@ -287,7 +283,7 @@ async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     let started = Instant::now();
     let mut last_error = String::new();
     while started.elapsed() < Duration::from_secs(10) {
-        match send_command_detailed(socket_path, "get quota_used").await {
+        match send_command_detailed(socket_path, "get quota_used", None).await {
             Ok(response) => {
                 set_helper_nofile_limit(response.peer_pid).await?;
                 return Ok(());
@@ -305,7 +301,7 @@ async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
 }
 
 async fn send_command(socket_path: &Path, command: &str) -> Result<Vec<String>, DiskLimitError> {
-    send_command_detailed(socket_path, command)
+    send_command_detailed(socket_path, command, None)
         .await
         .map(|response| response.lines)
 }
@@ -313,6 +309,7 @@ async fn send_command(socket_path: &Path, command: &str) -> Result<Vec<String>, 
 async fn send_command_detailed(
     socket_path: &Path,
     command: &str,
+    expected_pid: Option<i32>,
 ) -> Result<FuseControlResponse, DiskLimitError> {
     if command.len() > MAX_CONTROL_COMMAND_BYTES || command.contains(['\r', '\n']) {
         return Err(DiskLimitError::FuseSocket(
@@ -323,7 +320,7 @@ async fn send_command_detailed(
 
     timeout(
         CONTROL_IO_TIMEOUT,
-        send_command_bounded(socket_path, command),
+        send_command_bounded(socket_path, command, expected_pid),
     )
     .await
     .map_err(|_| {
@@ -337,6 +334,7 @@ async fn send_command_detailed(
 async fn send_command_bounded(
     socket_path: &Path,
     command: &str,
+    expected_pid: Option<i32>,
 ) -> Result<FuseControlResponse, DiskLimitError> {
     let mut stream =
         UnixStream::connect(socket_path)
@@ -365,6 +363,11 @@ async fn send_command_bounded(
             socket_path.display()
         ))
     })?;
+    if expected_pid.is_some_and(|expected| peer_pid != expected) {
+        return Err(DiskLimitError::FuseRequiresRestart(
+            socket_path.to_path_buf(),
+        ));
+    }
 
     stream
         .write_all(format!("{command}\n").as_bytes())
@@ -783,11 +786,37 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
     output
 }
 
-fn mount_args() -> [&'static str; 5] {
+async fn helper_cache_is_safe(pid: i32) -> bool {
+    let Ok(file) = tokio::fs::File::open(format!("/proc/{pid}/cmdline")).await else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    file.take((MAX_HELPER_CMDLINE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .is_ok()
+        && bytes.len() <= MAX_HELPER_CMDLINE_BYTES
+        && has_nocache_arg(&bytes)
+}
+
+fn has_nocache_arg(cmdline: &[u8]) -> bool {
+    cmdline.ends_with(&[0])
+        && cmdline
+            .split(|byte| *byte == 0)
+            .skip(1)
+            .take_while(|arg| *arg != b"--")
+            .any(|arg| arg == b"--nocache")
+}
+
+fn mount_args() -> [&'static str; 6] {
     // Each libfuse worker retains its receive buffer (up to 4 MiB plus header).
     // The helper defaults to ten persistent workers per mount. Two keep I/O
     // concurrent without multiplying that idle footprint across every engine.
     [
+        // The pinned helper's create path leaves O_WRONLY descriptors unable
+        // to serve kernel writeback-cache reads after a partial-page append.
+        // Keep backing-filesystem caching, but disable unsafe FUSE writeback.
+        "--nocache",
         "--nopassthrough",
         "--nosplice",
         "--clone-fd",
@@ -1006,7 +1035,17 @@ mod tests {
         assert!(args.contains(&"--clone-fd"));
         assert!(args.windows(2).any(|pair| pair == ["--num-threads", "2"]));
         assert!(!args.contains(&"--single"));
-        assert!(!args.contains(&"--nocache"));
+        assert!(args.contains(&"--nocache"));
+        for (cmdline, expected) in [
+            (b"fusequota\0--nocache\0/data\0/mount\0".as_slice(), true),
+            (b"fusequota\0/data/--nocache\0/mount\0".as_slice(), false),
+            (b"fusequota\0--nocache=false\0".as_slice(), false),
+            (b"fusequota\0--nocache".as_slice(), false),
+            (b"fusequota\0--\0--nocache\0".as_slice(), false),
+            (b"".as_slice(), false),
+        ] {
+            assert_eq!(has_nocache_arg(cmdline), expected);
+        }
     }
 
     #[test]
@@ -1027,17 +1066,100 @@ mod tests {
         let data = temp.path().join("data");
         let root = temp.path().join("fuse");
         let result = timeout(Duration::from_secs(30), async {
-            let mount = apply_with_root(&data, Some(&root), 64, "embedded", "", 150).await?;
+            // Model a cached helper left by an older daemon. A live quota
+            // change must reject it without remounting or changing its quota.
             let paths = fuse_paths_with_root(&data, Some(&root))?;
-            let peer = send_command_detailed(&paths.socket_path, "get quota_used")
+            prepare_fuse_dirs(&root)?;
+            tokio::fs::create_dir_all(&data).await?;
+            tokio::fs::create_dir_all(&paths.mount_path).await?;
+            let binary = resolve_binary("embedded", "", Some(&root)).await?;
+            let mut legacy = Command::new(binary)
+                .args([
+                    "--foreground",
+                    "--quota",
+                    "67108864",
+                    "--uid",
+                    "0",
+                    "--gid",
+                    "0",
+                ])
+                .arg("--communication-socket-path")
+                .arg(&paths.socket_path)
+                .args(mount_args().into_iter().filter(|arg| *arg != "--nocache"))
+                .arg(&data)
+                .arg(&paths.mount_path)
+                .kill_on_drop(true)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            wait_for_socket(&paths.socket_path).await?;
+            let old_pid = send_command_detailed(&paths.socket_path, "get quota_used", None)
+                .await?
+                .peer_pid;
+            anyhow::ensure!(!runtime_is_healthy(&data, Some(&root)).await?);
+            let mut held = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(paths.mount_path.join("held-open"))
+                .await?;
+            held.write_all(b"before").await?;
+            held.sync_all().await?;
+            anyhow::ensure!(matches!(
+                apply_with_root(&data, Some(&root), 1, "embedded", "", 150).await,
+                Err(DiskLimitError::FuseRequiresRestart(_))
+            ));
+            held.write_all(b" after").await?;
+            held.sync_all().await?;
+            anyhow::ensure!(
+                send_command_detailed(&paths.socket_path, "get quota_used", None)
+                    .await?
+                    .peer_pid
+                    == old_pid
+            );
+            let stats = rustix::fs::statvfs(&paths.mount_path)?;
+            anyhow::ensure!(
+                stats.f_blocks * stats.f_frsize == mib_to_bytes(64),
+                "rejected update changed quota"
+            );
+            drop(held); // lifecycle must close database files before detaching
+            destroy_with_root(&data, Some(&root)).await?;
+            legacy.wait().await?;
+            let mount = apply_with_root(&data, Some(&root), 64, "embedded", "", 150).await?;
+            let peer = send_command_detailed(&paths.socket_path, "get quota_used", None)
                 .await?
                 .peer_pid;
             let command = tokio::fs::read(format!("/proc/{peer}/cmdline")).await?;
+            anyhow::ensure!(has_nocache_arg(&command));
+            anyhow::ensure!(runtime_is_healthy(&data, Some(&root)).await?);
+            anyhow::ensure!(tokio::fs::read(mount.join("held-open")).await? == b"before after");
             anyhow::ensure!(
                 command
                     .windows(b"--num-threads\x002\0".len())
                     .any(|w| w == b"--num-threads\x002\0")
             );
+
+            // Redis AOF pattern: a newly created O_WRONLY append handle,
+            // partial pages, sync, cache eviction, then another append.
+            use std::os::fd::AsRawFd;
+            let mut aof = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(mount.join("appendonly.aof"))
+                .await?;
+            let mut expected = vec![b'x'; 8192 + 123];
+            aof.write_all(&expected).await?;
+            aof.sync_all().await?;
+            for _ in 0..8 {
+                let error = unsafe {
+                    libc::posix_fadvise(aof.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+                };
+                anyhow::ensure!(error == 0, "cache eviction failed: {error}");
+                aof.write_all(b"append\n").await?;
+                aof.sync_data().await?;
+                expected.extend_from_slice(b"append\n");
+            }
+            anyhow::ensure!(tokio::fs::read(mount.join("appendonly.aof")).await? == expected);
 
             let writes = (0..8).map(|index| {
                 let path = mount.join(format!("data-{index}"));
@@ -1059,17 +1181,23 @@ mod tests {
             for write in futures::future::join_all(writes).await {
                 write?;
             }
-            let response = send_command_detailed(&paths.socket_path, "get quota_used").await?;
+            let response =
+                send_command_detailed(&paths.socket_path, "get quota_used", None).await?;
             anyhow::ensure!(parse_quota_usage(&response.lines)? >= mib_to_bytes(32));
             let reused = apply_with_root(&data, Some(&root), 48, "embedded", "", 150).await?;
             anyhow::ensure!(reused == mount);
             anyhow::ensure!(
-                send_command_detailed(&paths.socket_path, "get quota_used")
+                send_command_detailed(&paths.socket_path, "get quota_used", None)
                     .await?
                     .peer_pid
                     == peer,
                 "healthy helper was restarted"
             );
+            aof.write_all(b"after quota update\n").await?;
+            aof.sync_all().await?;
+            expected.extend_from_slice(b"after quota update\n");
+            drop(aof);
+            anyhow::ensure!(tokio::fs::read(mount.join("appendonly.aof")).await? == expected);
             let mut file = tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -1251,6 +1379,25 @@ mod tests {
         server.await.unwrap();
 
         assert!(error.to_string().contains("response exceeded"));
+    }
+
+    #[tokio::test]
+    async fn quota_mutation_rejects_a_replacement_peer_before_sending_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = Vec::new();
+            stream.read_to_end(&mut command).await.unwrap();
+            command
+        });
+        let error = send_command_detailed(&socket, "set quota = 123", Some(-1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DiskLimitError::FuseRequiresRestart(_)));
+        assert!(server.await.unwrap().is_empty());
     }
 
     #[tokio::test]

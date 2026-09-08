@@ -44,6 +44,7 @@ pub struct AppState {
     origin_policy: Arc<security_policy::OriginPolicy>,
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub struct AppStateData {
     pub config: Arc<Config>,
     pub config_path: PathBuf,

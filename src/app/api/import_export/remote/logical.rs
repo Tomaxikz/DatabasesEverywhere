@@ -428,9 +428,11 @@ client='clickhouse-client --config-file=/work/clickhouse-client.xml'
 database={database_shell}
 $client --query 'SELECT version()' >/work/source-version
 printf '%s\n' '-- DatabasesEverywhere ClickHouse logical dump' > /work/source.clickhouse.sql
-{table_source} | while IFS= read -r table; do
+{{ {table_source} || printf '\n!DBEV_TABLE_LIST_FAILED\n'; }} | while IFS= read -r table; do
   [ -n "$table" ] || continue
-  case "$table" in *[!A-Za-z0-9_-]*)
+  case "$table" in
+    '!DBEV_TABLE_LIST_FAILED') echo 'failed to list ClickHouse tables' >&2; exit 44 ;;
+    *[!A-Za-z0-9_-]*)
     echo 'remote clickhouse contains a non-portable table name' >&2
     exit 40
   ;; esac
@@ -1319,6 +1321,7 @@ mod tests {
         assert!(client_config.contains("<verificationMode>strict</verificationMode>"));
         assert!(client_config.contains("<name>RejectCertificateHandler</name>"));
         assert!(client_config.contains("<connect_timeout>37</connect_timeout>"));
+        crate::api::import_export::tests::assert_failed_clickhouse_listing(&script);
     }
 
     #[test]

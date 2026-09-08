@@ -1,4 +1,4 @@
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -29,8 +29,14 @@ pub(super) async fn handle_clickhouse_client(
             .await;
         let (database, target) = match resolution {
             DatabaseRouteResolution::Found { database, target } => (database, target),
-            DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+            DatabaseRouteResolution::NotFound => {
+                client.write_all(&clickhouse::auth_error_packet()).await?;
+                client.shutdown().await?;
+                return Err(ListenerError::RouteNotFound);
+            }
             DatabaseRouteResolution::Ambiguous => {
+                client.write_all(&clickhouse::auth_error_packet()).await?;
+                client.shutdown().await?;
                 return Err(ListenerError::AmbiguousDatabaseRoute {
                     protocol: "clickhouse",
                 });
@@ -70,7 +76,13 @@ pub(super) async fn handle_clickhouse_http(
         client_handshake("clickhouse_http", async move {
             let mut client = accept_direct_tls(client, tls).await?;
             let initial = read_http_headers(&mut client).await?;
-            let route = clickhouse::parse_http_initial_route(&initial)?;
+            let route = match clickhouse::parse_http_initial_route(&initial) {
+                Ok(route) => route,
+                Err(error) => {
+                    reject_http(&mut client).await?;
+                    return Err(error.into());
+                }
+            };
             let resolution = resolver
                 .resolve_clickhouse(
                     &route.username,
@@ -79,8 +91,12 @@ pub(super) async fn handle_clickhouse_http(
                 .await;
             let (database, target) = match resolution {
                 DatabaseRouteResolution::Found { database, target } => (database, target),
-                DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+                DatabaseRouteResolution::NotFound => {
+                    reject_http(&mut client).await?;
+                    return Err(ListenerError::RouteNotFound);
+                }
                 DatabaseRouteResolution::Ambiguous => {
+                    reject_http(&mut client).await?;
                     return Err(ListenerError::AmbiguousDatabaseRoute {
                         protocol: "clickhouse_http",
                     });
@@ -122,3 +138,11 @@ fn clickhouse_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint
         BackendEndpoint::DockerTcp { .. } => Err(ListenerError::InvalidClickhouseBackend),
     }
 }
+
+async fn reject_http(client: &mut super::GatewayStream) -> Result<(), std::io::Error> {
+    client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nAccess denied.\n").await?;
+    client.shutdown().await
+}
+
+#[cfg(test)]
+mod tests;

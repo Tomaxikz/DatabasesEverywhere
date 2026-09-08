@@ -57,7 +57,7 @@ const LOGICAL_STREAM_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub(super) fn logical_exec_recovery(metadata: &InstanceMetadata) -> ExecRecovery {
     match metadata.deployment_mode {
         DeploymentMode::Dedicated => ExecRecovery::RestartRuntime,
-        DeploymentMode::Shared => ExecRecovery::CallerFencesTenant,
+        DeploymentMode::Shared => ExecRecovery::CallerHandles,
     }
 }
 pub(crate) const CLICKHOUSE_ENGINE_AWK_PROGRAM: &str = r#"
@@ -454,5 +454,7 @@ pub(crate) use uploads::{
     inspect_import_upload, list_import_uploads,
 };
 
+#[cfg(test)]
+pub(crate) mod roundtrip_tests;
 #[cfg(test)]
 mod tests;

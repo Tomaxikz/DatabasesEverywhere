@@ -12,7 +12,7 @@ use crate::{api::monitoring::resources::NetworkCounter, shared::backend::Backend
 
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
-const BACKEND_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const FIRST_REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // Two buffers are retained for the lifetime of every idle tunnel. Stream
 // larger transfers in 16 KiB chunks instead of reserving 128 KiB per client.
 const TUNNEL_BUFFER_SIZE: usize = 16 * 1024;
@@ -29,7 +29,9 @@ pub enum TunnelError {
     ReplayTimeout { endpoint: String, timeout_secs: u64 },
     #[error("backend first response failed: {0}")]
     FirstResponse(std::io::Error),
-    #[error("backend first response timed out after {timeout_secs}s from {endpoint}")]
+    #[error(
+        "backend first response stalled for {timeout_secs}s without upload progress: {endpoint}"
+    )]
     FirstResponseTimeout { endpoint: String, timeout_secs: u64 },
     #[error("tunnel io failed: {0}")]
     Tunnel(std::io::Error),
@@ -237,11 +239,11 @@ where
             timeout_secs: BACKEND_REPLAY_TIMEOUT.as_secs(),
         })?
         .map_err(TunnelError::Replay)?;
-    tunnel_after_backend_reply(&mut client, &mut backend, endpoint_description).await?;
+    tunnel_streams(&mut client, &mut backend, endpoint_description).await?;
     Ok(())
 }
 
-async fn tunnel_after_backend_reply<C, B>(
+async fn tunnel_streams<C, B>(
     client: &mut C,
     backend: &mut B,
     endpoint: String,
@@ -250,24 +252,69 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut first = [0_u8; 1];
-    timeout(
-        BACKEND_FIRST_RESPONSE_TIMEOUT,
-        backend.read_exact(&mut first),
-    )
-    .await
-    .map_err(|_| TunnelError::FirstResponseTimeout {
-        endpoint,
-        timeout_secs: BACKEND_FIRST_RESPONSE_TIMEOUT.as_secs(),
-    })?
-    .map_err(TunnelError::FirstResponse)?;
-    client
-        .write_all(&first)
-        .await
-        .map_err(TunnelError::Tunnel)?;
-    io::copy_bidirectional_with_sizes(client, backend, TUNNEL_BUFFER_SIZE, TUNNEL_BUFFER_SIZE)
-        .await
-        .map_err(TunnelError::Tunnel)?;
+    let (mut client_read, mut client_write) = io::split(client);
+    let (mut backend_read, mut backend_write) = io::split(backend);
+    let (progress, mut uploaded) = tokio::sync::watch::channel(());
+    let upstream = async {
+        let mut buffer = vec![0_u8; TUNNEL_BUFFER_SIZE];
+        loop {
+            let count = client_read.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            // HTTP may not reply until it receives the complete body. Forward
+            // it immediately, and count actual upload progress as activity.
+            // The receiver is dropped after the first backend byte.
+            let mut pending = &buffer[..count];
+            while !pending.is_empty() {
+                let written = backend_write.write(pending).await?;
+                if written == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                }
+                pending = &pending[written..];
+                let _ = progress.send(());
+            }
+        }
+        drop(progress);
+        backend_write.shutdown().await
+    };
+    let downstream = async {
+        let mut first = [0_u8; 1];
+        let mut uploading = true;
+        loop {
+            tokio::select! {
+                result = backend_read.read_exact(&mut first) => {
+                    result.map_err(TunnelError::FirstResponse)?;
+                    break;
+                }
+                changed = uploaded.changed(), if uploading => {
+                    uploading = changed.is_ok();
+                }
+                _ = tokio::time::sleep(FIRST_REPLY_IDLE_TIMEOUT) => {
+                    return Err(TunnelError::FirstResponseTimeout {
+                        endpoint,
+                        timeout_secs: FIRST_REPLY_IDLE_TIMEOUT.as_secs(),
+                    });
+                }
+            }
+        }
+        drop(uploaded);
+        client_write
+            .write_all(&first)
+            .await
+            .map_err(TunnelError::Tunnel)?;
+        let mut reader = io::BufReader::with_capacity(TUNNEL_BUFFER_SIZE, backend_read);
+        io::copy_buf(&mut reader, &mut client_write)
+            .await
+            .map_err(TunnelError::Tunnel)?;
+        client_write.shutdown().await.map_err(TunnelError::Tunnel)
+    };
+    // A failure in either direction cancels the other; a clean half-close
+    // still lets its peer finish. Tenant-session cancellation remains metered.
+    tokio::try_join!(
+        async { upstream.await.map_err(TunnelError::Tunnel) },
+        downstream
+    )?;
     Ok(())
 }
 
@@ -298,17 +345,17 @@ mod tests {
         let database_exchange = async {
             let (mut read, mut write) = io::split(database);
             let mut received = Vec::new();
-            let send = async {
-                write.write_all(b"!").await?;
-                write.write_all(&response).await?;
-                write.shutdown().await
-            };
-            tokio::try_join!(send, read.read_to_end(&mut received)).unwrap();
+            // HTTP servers may need the entire POST body before producing
+            // even their first response byte. The gateway must not hold it.
+            read.read_to_end(&mut received).await.unwrap();
+            write.write_all(b"!").await.unwrap();
+            write.write_all(&response).await.unwrap();
+            write.shutdown().await.unwrap();
             received
         };
         let (forwarded, reply, query) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                tunnel_after_backend_reply(&mut client_proxy, &mut backend, "test".into()),
+                tunnel_streams(&mut client_proxy, &mut backend, "test".into()),
                 client_exchange,
                 database_exchange,
             )
@@ -335,6 +382,47 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, TunnelError::LegacyDockerTcp));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_reply_timeout_tracks_upload_progress_not_total_request_time() {
+        let (mut client, mut client_proxy) = io::duplex(64);
+        let (mut backend, mut database) = io::duplex(1);
+        let forward = tunnel_streams(&mut client_proxy, &mut backend, "test".into());
+        let upload = async {
+            client.write_all(b"bodybodybodybody").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, b"OK");
+        };
+        let response = async {
+            let mut body = Vec::new();
+            for _ in 0..16 {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                body.push(database.read_u8().await.unwrap());
+            }
+            assert_eq!(body, b"bodybodybodybody");
+            database.write_all(b"OK").await.unwrap();
+            database.shutdown().await.unwrap();
+        };
+        let (result, (), ()) = tokio::join!(forward, upload, response);
+        result.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_backends_still_time_out_with_and_without_a_client_half_close() {
+        for half_close in [false, true] {
+            let (mut client, mut client_proxy) = io::duplex(64);
+            let (mut backend, _database) = io::duplex(64);
+            if half_close {
+                client.shutdown().await.unwrap();
+            }
+            assert!(matches!(
+                tunnel_streams(&mut client_proxy, &mut backend, "test".into()).await,
+                Err(TunnelError::FirstResponseTimeout { .. })
+            ));
+        }
     }
 
     #[tokio::test]

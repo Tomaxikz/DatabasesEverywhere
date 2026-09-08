@@ -7,7 +7,8 @@ LABEL org.opencontainers.image.source="https://github.com/Tomaxikz/DatabasesEver
 # The base image is digest-pinned; package versions intentionally follow its
 # Debian security repository instead of freezing vulnerable package revisions.
 # hadolint ignore=DL3008
-RUN apt-get update \
+RUN apt-get update --error-on=any \
+    && apt-get upgrade -y --with-new-pkgs --no-install-recommends \
     && apt-get install -y --no-install-recommends ca-certificates fuse3 \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 /etc/databases-everywhere /var/lib/dbev/logs /var/log/dbev /run/dbev

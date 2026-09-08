@@ -142,7 +142,7 @@ mongodump --quiet \
             sh_quote(collection),
         );
         let recovery = if self.runtime.deployment_mode == DeploymentMode::Shared {
-            ExecRecovery::CallerFencesTenant
+            ExecRecovery::CallerHandles
         } else {
             ExecRecovery::RestartRuntime
         };

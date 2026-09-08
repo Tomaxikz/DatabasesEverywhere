@@ -9,6 +9,7 @@ mod podman_api;
 mod remote_import;
 mod security;
 mod spec;
+mod startup;
 mod stream_exec;
 mod transfer;
 
@@ -119,6 +120,7 @@ pub struct DockerRuntime {
     engine_api_version: Option<String>,
     cgroup_version: Option<String>,
     node_id: Option<String>,
+    startup_history: Option<sqlx::SqlitePool>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +194,7 @@ impl DockerRuntime {
             engine_api_version: None,
             cgroup_version: None,
             node_id: None,
+            startup_history: None,
         }
     }
 
@@ -354,6 +357,7 @@ impl DockerRuntime {
         }
 
         let mut host_config = HostConfig {
+            restart_policy: Some(startup::no_restarts()),
             log_config: Some(container_config::log_config(self.engine)),
             network_mode: Some("none".to_string()),
             nano_cpus: Some(nano_cpus),
@@ -624,6 +628,17 @@ impl DockerRuntime {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
+        self.disable_restarts(protocol, instance_id).await?;
+        if self
+            .docker
+            .inspect_container(&name, None)
+            .await?
+            .state
+            .is_some_and(|state| state.running == Some(true))
+        {
+            return Ok(CommandOutput::empty());
+        }
+        self.note_start(instance_id, false).await?;
         self.docker
             .start_container(&name, None::<StartContainerOptions>)
             .await?;
@@ -675,6 +690,8 @@ impl DockerRuntime {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
+        self.disable_restarts(protocol, instance_id).await?;
+        self.note_start(instance_id, false).await?;
         self.docker.restart_container(&name, None).await?;
         self.enforce_cpu_burst_policy(protocol, instance_id).await;
         Ok(CommandOutput::empty())
@@ -870,6 +887,14 @@ fn verify_managed_instance_labels(
 
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
+    #[error("startup history could not be persisted: {0}")]
+    StartupHistory(#[from] sqlx::Error),
+    #[error(
+        "automatic startup blocked for {0} after two unconfirmed startups; repair the cause, then explicitly start the instance or pool"
+    )]
+    AutostartBlocked(String),
+    #[error("container engine did not confirm disabled automatic restarts for {0}")]
+    RestartPolicyNotDisabled(String),
     #[error(transparent)]
     InvalidId(#[from] crate::shared::ids::IdError),
     #[error("docker api error: {0}")]

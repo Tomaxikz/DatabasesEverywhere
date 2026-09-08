@@ -209,7 +209,8 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
 
     let mut docker = DockerRuntime::new(&config.daemon, false)
         .context("failed to connect to container engine API")?
-        .with_node_id(config.uuid.clone());
+        .with_node_id(config.uuid.clone())
+        .with_startup_history(pool.clone());
     docker
         .refresh_engine_info()
         .await
@@ -341,6 +342,7 @@ pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         gateway_supervisor: GatewaySupervisor::new(),
         daemon_shutdown: crate::api::http::router::DaemonShutdown::default(),
     });
+    disable_runtime_restarts(&state).await?;
     // Interrupted migration recovery may start its authoritative source or
     // target in order to verify credentials and finish cleanup. Re-establish
     // the recorded data bind and disk boundary before any such activation;

@@ -334,7 +334,7 @@ fn daemon_boot_preserves_running_containers() {
     );
     assert_eq!(
         managed_boot_action(InstanceStatus::Booting, DesiredInstanceState::Running),
-        None
+        Some(ManagedBootAction::Start)
     );
     assert_eq!(
         managed_boot_action(
@@ -343,6 +343,76 @@ fn daemon_boot_preserves_running_containers() {
         ),
         Some(ManagedBootAction::Start),
         "a crash after create-before-start must be recovered on the next boot"
+    );
+}
+
+#[tokio::test]
+async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
+    use crate::instances::metadata::DesiredInstanceState;
+    use crate::placement::{EngineRuntimeStatus, test_support as pools};
+
+    let (state, dir) = crate::api::test_support::database(Config::default()).await;
+    let mut metadata = test_support::metadata("blocked_boot", Protocol::Postgres);
+    metadata.status = InstanceStatus::Failed;
+    state.manager.upsert(metadata.clone()).await.unwrap();
+    let mut pool = pools::runtime("pool_boot", Protocol::Mysql, "mysql:8.4");
+    pool.status = EngineRuntimeStatus::Stopped;
+    state.placements.save(&pool).await.unwrap();
+    let sqlite = sqlite::connect(dir.path()).await.unwrap();
+    sqlx::query("UPDATE engine_runtimes SET startup_attempts = 2")
+        .execute(&sqlite)
+        .await
+        .unwrap();
+
+    // The offline runtime cannot perform a start. Admission must stop before
+    // mount preparation or activation and leave both kinds visibly failed.
+    assert_eq!(
+        start_known_instance(
+            &state.config,
+            &state.manager,
+            &state.docker,
+            &state.instance_locks,
+            metadata.clone()
+        )
+        .await
+        .unwrap(),
+        Some(InstanceStatus::Failed)
+    );
+    start_shared_runtimes(&state).await.unwrap();
+    assert_eq!(
+        state
+            .placements
+            .get("pool_boot")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        EngineRuntimeStatus::Failed
+    );
+    assert!(state.docker.check_autostart("blocked_boot").await.is_err());
+    assert!(state.docker.check_autostart("pool_boot").await.is_err());
+    assert!(matches!(
+        state
+            .instances
+            .resolve_postgres(&metadata.database.username, Some(&metadata.database.name))
+            .await,
+        crate::instances::state::DatabaseRouteResolution::NotFound
+    ));
+
+    metadata.status = InstanceStatus::Stopped;
+    metadata.desired_state = DesiredInstanceState::Stopped;
+    state.manager.upsert(metadata.clone()).await.unwrap();
+    assert_eq!(
+        start_known_instance(
+            &state.config,
+            &state.manager,
+            &state.docker,
+            &state.instance_locks,
+            metadata
+        )
+        .await
+        .unwrap(),
+        None
     );
 }
 

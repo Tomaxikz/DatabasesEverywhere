@@ -204,6 +204,9 @@ async fn restore_one_limit(
             Err(error) => return Err(error.into()),
         }
     }
+    if !limiter_healthy {
+        limiter.teardown_instance_mount(&paths.data).await?;
+    }
     if adopting_pool {
         // Pools persisted under the legacy soft guard have no native root
         // project. Adopt that root once, before tenant quotas are replayed.
@@ -520,6 +523,20 @@ pub(crate) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()
             let Some(action) = shared_boot_action(runtime.status, runtime.desired_state) else {
                 return Ok(None);
             };
+            if let Err(error) = state.docker.check_autostart(&runtime_id).await {
+                tracing::warn!(event = "audit container_autostart_blocked", runtime_id, %error);
+                fence_runtime(state, &runtime_id).await;
+                runtime.status = EngineRuntimeStatus::Failed;
+                if let Err(error) = state.docker.stop(runtime.protocol, &runtime_id).await
+                    && !error.is_not_found()
+                    && !error.is_not_running()
+                {
+                    tracing::error!(runtime_id, %error,
+                        "could not stop a startup-blocked pool; its routes remain fenced");
+                }
+                save_runtime(&state.placements, &state.manager, runtime).await?;
+                return Ok(Some(EngineRuntimeStatus::Failed));
+            }
             let restart = matches!(action, SharedBootAction::Restart);
             if let Err(error) = activate_locked(state, &mut runtime, restart).await {
                 tracing::error!(runtime_id, %error, "shared pool boot activation failed");
@@ -1200,10 +1217,11 @@ fn shared_boot_action(
         return None;
     }
     match status {
-        EngineRuntimeStatus::Stopped => Some(SharedBootAction::Start),
+        EngineRuntimeStatus::Stopped | EngineRuntimeStatus::Booting => {
+            Some(SharedBootAction::Start)
+        }
         EngineRuntimeStatus::Failed => Some(SharedBootAction::Restart),
         EngineRuntimeStatus::Creating
-        | EngineRuntimeStatus::Booting
         | EngineRuntimeStatus::Running
         | EngineRuntimeStatus::Quarantined
         | EngineRuntimeStatus::Deleting => None,
@@ -1300,6 +1318,9 @@ mod tests {
     #[test]
     fn shared_boot_actions_never_activate_quarantined_or_deleting_pools() {
         for (status, action) in [
+            (EngineRuntimeStatus::Booting, Some(SharedBootAction::Start)),
+            (EngineRuntimeStatus::Running, None),
+            (EngineRuntimeStatus::Creating, None),
             (EngineRuntimeStatus::Stopped, Some(SharedBootAction::Start)),
             (EngineRuntimeStatus::Failed, Some(SharedBootAction::Restart)),
             (EngineRuntimeStatus::Quarantined, None),

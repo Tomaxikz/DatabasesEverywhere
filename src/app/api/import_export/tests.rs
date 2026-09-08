@@ -9,6 +9,53 @@ use crate::{
     storage::{repositories::InstanceRepository, sqlite},
 };
 
+pub(super) fn assert_failed_clickhouse_listing(script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let client = directory.path().join("clickhouse-client");
+    std::fs::write(&client, b"#!/bin/sh\ncase \"$*\" in *'SELECT version()'*) echo 26.4; exit 0 ;; esac\necho 'simulated catalog failure' >&2\nexit 7\n").unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The remote helper normally uses /work. Keep every test write private.
+    let script = script.replace("/work/", &format!("{}/", directory.path().display()));
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(directory.path())
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", directory.path().display()),
+        )
+        .env("CLICKHOUSE_DB", "tenant")
+        .env("CLICKHOUSE_USER", "user")
+        .env("CLICKHOUSE_PASSWORD", "test-only")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(44),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to list ClickHouse tables"));
+}
+
+#[test]
+fn clickhouse_export_and_wipe_cannot_hide_a_catalog_failure() {
+    let mut metadata = crate::instances::test_support::shared_metadata();
+    metadata.protocol = Protocol::Clickhouse;
+    assert_failed_clickhouse_listing(
+        &export_script(
+            &metadata,
+            "/dev/stdout",
+            &ImportExportSelection::default(),
+            false,
+        )
+        .unwrap(),
+    );
+    assert_failed_clickhouse_listing(&wipe_logical_script(&metadata, false).unwrap());
+}
+
 #[tokio::test]
 async fn public_job_response_never_exposes_a_host_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -702,7 +749,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     );
     assert_eq!(
         logical_exec_recovery(&shared_mysql),
-        crate::runtime::docker::ExecRecovery::CallerFencesTenant
+        crate::runtime::docker::ExecRecovery::CallerHandles
     );
     let shared_export = export_script(
         &shared_mysql,

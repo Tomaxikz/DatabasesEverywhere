@@ -28,13 +28,13 @@ struct ExecPolicy {
 
 /// Defines who owns recovery when Docker cannot prove an exec process stopped.
 ///
-/// Restarting is appropriate for a dedicated database because the container is
-/// the tenant's failure boundary. A shared engine must instead return control
-/// to the caller, which can fence and terminate only the affected tenant.
+/// Dedicated data operations may need bounded container recovery. Shared
+/// operations and readiness probes return control to their lifecycle owner;
+/// probing a recovering container must never initiate another restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecRecovery {
     RestartRuntime,
-    CallerFencesTenant,
+    CallerHandles,
 }
 
 impl ExecRecovery {
@@ -120,7 +120,7 @@ impl DockerRuntime {
                 log_failure: false,
                 timeout: DOCKER_EXEC_TIMEOUT,
                 recovery_readiness_timeout: DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT,
-                recovery: ExecRecovery::RestartRuntime,
+                recovery: ExecRecovery::CallerHandles,
             },
         )
         .await
@@ -143,7 +143,7 @@ impl DockerRuntime {
                 log_failure: false,
                 timeout,
                 recovery_readiness_timeout: DOCKER_EXEC_SHORT_RECOVERY_READINESS_TIMEOUT,
-                recovery: ExecRecovery::RestartRuntime,
+                recovery: ExecRecovery::CallerHandles,
             },
         )
         .await
@@ -218,7 +218,7 @@ impl DockerRuntime {
                 log_failure: true,
                 timeout,
                 recovery_readiness_timeout: DOCKER_EXEC_SHORT_RECOVERY_READINESS_TIMEOUT,
-                recovery: ExecRecovery::CallerFencesTenant,
+                recovery: ExecRecovery::CallerHandles,
             },
         )
         .await
@@ -244,7 +244,7 @@ impl DockerRuntime {
                 log_failure: false,
                 timeout,
                 recovery_readiness_timeout: DOCKER_EXEC_SHORT_RECOVERY_READINESS_TIMEOUT,
-                recovery: ExecRecovery::CallerFencesTenant,
+                recovery: ExecRecovery::CallerHandles,
             },
         )
         .await
@@ -368,7 +368,10 @@ impl DockerRuntime {
         }
 
         let inspect = self.docker.inspect_exec(&exec.id).await?;
-        let exit_code = inspect.exit_code.unwrap_or_default();
+        let exit_code = inspect
+            .exit_code
+            .filter(|_| inspect.running != Some(true))
+            .ok_or(DockerError::ExecExitStatusUnavailable)?;
         let output = CommandOutput {
             stdout: redaction::redact_exact_secrets(&stdout.into_string(), &secret_values),
             stderr: redaction::redact_exact_secrets(&stderr.into_string(), &secret_values),
@@ -414,7 +417,7 @@ impl DockerRuntime {
                     %container,
                     %operation,
                     timeout_seconds = policy.timeout.as_secs(),
-                    "shared-runtime exec timed out; returning recovery to the tenant fence without restarting the pool"
+                    "exec timed out; the caller owns cleanup, no automatic container restart"
                 );
             }
             return Ok(());
@@ -486,6 +489,7 @@ impl DockerRuntime {
         operation: &str,
         readiness_timeout: Duration,
     ) -> Result<(), DockerError> {
+        self.disable_restarts(protocol, instance_id).await?;
         match tokio::time::timeout(
             DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
             self.docker.kill_container(
@@ -513,6 +517,9 @@ impl DockerRuntime {
             }
         }
 
+        // Kill the hung command even when restart admission is exhausted.
+        // Charge recovery before starting, and never reset it on daemon boot.
+        self.note_start(instance_id, true).await?;
         match tokio::time::timeout(
             DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
             self.docker
@@ -596,7 +603,7 @@ mod recovery_tests {
 
     #[test]
     fn tenant_timeout_recovery_cannot_select_a_pool_restart() {
-        assert!(!ExecRecovery::CallerFencesTenant.restarts_runtime());
+        assert!(!ExecRecovery::CallerHandles.restarts_runtime());
         assert!(ExecRecovery::RestartRuntime.restarts_runtime());
     }
 }

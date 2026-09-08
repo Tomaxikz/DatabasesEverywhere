@@ -24,6 +24,138 @@ use crate::{
 
 const SHARED_HELPER_WORK_MARGIN_BYTES: u64 = 1024 * 1024;
 
+/// Only this daemon-generated wipe uses the pool administrator. The dump is
+/// still inspected, pinned and replayed as the restricted tenant by `run`.
+pub(super) async fn wipe_clickhouse(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    timeout: Duration,
+) -> Result<(), RestoreError> {
+    let runtime = state
+        .placements
+        .get(metadata.runtime_id())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .ok_or_else(|| ApiError::Conflict("shared wipe runtime is missing".into()))?;
+    let reservation = state
+        .placements
+        .get_reservation(&metadata.instance_id)
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    if !wipe_target_matches(metadata, &runtime, reservation.as_ref())
+        || !state.instances.routes_fenced(&metadata.instance_id).await
+        || state
+            .gateway_supervisor
+            .tenant_sessions()
+            .active(&metadata.instance_id)
+            != 0
+    {
+        return Err(ApiError::Conflict("shared ClickHouse wipe requires a fenced, drained tenant with matching ownership and reservation".into()).into());
+    }
+    let identity = state
+        .docker
+        .verified_compatibility_identity(Protocol::Clickhouse, metadata.runtime_id())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    if !identity
+        .as_ref()
+        .zip(runtime.compatibility.as_ref())
+        .is_some_and(|(live, attested)| {
+            live.id == attested.container_id && live.image_id == attested.image_id
+        })
+    {
+        return Err(ApiError::Conflict(
+            "shared wipe container no longer matches its attested identity".into(),
+        )
+        .into());
+    }
+    let admin = SecretString::from(
+        runtime
+            .admin_secret
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| {
+                ApiError::Conflict("shared wipe administrator credential is missing".into())
+            })?
+            .to_string(),
+    );
+    let username = SecretString::from(
+        crate::databases::clickhouse::docker::INTERNAL_ADMIN_USERNAME.to_string(),
+    );
+    let database = SecretString::from(metadata.database.name.clone());
+    let script = super::protocol::wipe_logical_script(metadata, false)?;
+    if let Err(error) = state
+        .docker
+        .exec_tenant_shell(
+            Protocol::Clickhouse,
+            metadata.runtime_id(),
+            &script,
+            &[
+                ("CLICKHOUSE_USER", &username),
+                ("CLICKHOUSE_PASSWORD", &admin),
+                ("CLICKHOUSE_DB", &database),
+            ],
+            timeout,
+        )
+        .await
+    {
+        if matches!(
+            error,
+            crate::runtime::docker::DockerError::ExecFailed { .. }
+        ) {
+            // A confirmed nonzero exit cannot race rollback. Preserve the
+            // normal tenant-local recovery path and leave other tenants online.
+            return Err(RestoreError::Failed(ApiError::Runtime(format!(
+                "shared ClickHouse wipe failed: {error}"
+            ))));
+        }
+        // A disconnected/timed-out administrator exec may still be dropping
+        // tables. Fencing just the tenant cannot stop that administrator: stop
+        // the pool and forbid automatic rollback from racing the old command.
+        let containment = crate::api::instances::containment::contain_locked(
+            state,
+            &runtime,
+            "shared ClickHouse wipe did not finish successfully",
+        )
+        .await;
+        return Err(RestoreError::HelperUncertain(ApiError::Runtime(format!(
+            "shared ClickHouse wipe failed: {error}; containment: {}",
+            containment.summary()
+        ))));
+    }
+    Ok(())
+}
+
+fn wipe_target_matches(
+    metadata: &InstanceMetadata,
+    runtime: &crate::placement::EngineRuntime,
+    reservation: Option<&crate::placement::TenantReservation>,
+) -> bool {
+    metadata.deployment_mode == DeploymentMode::Shared
+        && !matches!(
+            metadata.status,
+            crate::instances::metadata::InstanceStatus::Deleting
+                | crate::instances::metadata::InstanceStatus::Quarantined
+        )
+        && metadata.protocol == Protocol::Clickhouse
+        && runtime.deployment_mode == DeploymentMode::Shared
+        && runtime.protocol == metadata.protocol
+        && runtime.status == EngineRuntimeStatus::Running
+        && runtime.runtime_id == metadata.runtime_id()
+        && metadata.owner.is_some()
+        && metadata.owner == runtime.owner
+        && !["system", "information_schema", "dbe_control"]
+            .iter()
+            .any(|name| metadata.database.name.eq_ignore_ascii_case(name))
+        && reservation.is_some_and(|reservation| {
+            reservation.state == crate::placement::TenantReservationState::Provisioned
+                && reservation.instance_id == metadata.instance_id
+                && reservation.runtime_id == runtime.runtime_id
+                && reservation.database == metadata.database.name
+                && reservation.username == metadata.database.username
+        })
+}
+
 #[derive(Debug)]
 pub(super) enum RestoreError {
     Failed(ApiError),
@@ -421,5 +553,54 @@ mod tests {
         })
         .await
         .expect("dropped sandbox pin must be cleaned up");
+    }
+    #[test]
+    fn privileged_wipe_requires_exact_tenant_reservation_and_pool_ownership() {
+        use crate::placement::{TenantReservation, TenantReservationState, test_support};
+        let mut metadata = crate::instances::test_support::shared_metadata();
+        metadata.protocol = Protocol::Clickhouse;
+        let runtime = test_support::runtime(
+            metadata.runtime_id(),
+            Protocol::Clickhouse,
+            "clickhouse:26.4",
+        );
+        metadata.owner = runtime.owner.clone();
+        let reservation = TenantReservation {
+            instance_id: metadata.instance_id.clone(),
+            runtime_id: runtime.runtime_id.clone(),
+            database: metadata.database.name.clone(),
+            username: metadata.database.username.clone(),
+            state: TenantReservationState::Provisioned,
+            limits: metadata.limits.clone(),
+        };
+        assert!(wipe_target_matches(&metadata, &runtime, Some(&reservation)));
+        assert!(!wipe_target_matches(&metadata, &runtime, None));
+        for field in ["instance", "runtime", "database", "username", "state"] {
+            let mut wrong = reservation.clone();
+            match field {
+                "instance" => wrong.instance_id.push('x'),
+                "runtime" => wrong.runtime_id.push('x'),
+                "database" => wrong.database.push('x'),
+                "username" => wrong.username.push('x'),
+                "state" => wrong.state = TenantReservationState::Reserved,
+                _ => unreachable!(),
+            }
+            assert!(
+                !wipe_target_matches(&metadata, &runtime, Some(&wrong)),
+                "{field}"
+            );
+        }
+        let mut wrong = runtime.clone();
+        wrong.owner = Some(test_support::owner("another-server"));
+        assert!(!wipe_target_matches(&metadata, &wrong, Some(&reservation)));
+        wrong = runtime.clone();
+        wrong.status = EngineRuntimeStatus::Quarantined;
+        assert!(!wipe_target_matches(&metadata, &wrong, Some(&reservation)));
+        metadata.owner = None;
+        assert!(!wipe_target_matches(
+            &metadata,
+            &runtime,
+            Some(&reservation)
+        ));
     }
 }

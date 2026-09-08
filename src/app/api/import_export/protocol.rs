@@ -592,9 +592,11 @@ mongodump \
                 r#"set -eu
 out={output_path}
 printf '%s\n' '-- DatabasesEverywhere ClickHouse logical dump' > "$out"
-{table_source} | while IFS= read -r table; do
+{{ {table_source} || printf '\n!DBEV_TABLE_LIST_FAILED\n'; }} | while IFS= read -r table; do
     [ -n "$table" ] || continue
-    case "$table" in *[!A-Za-z0-9_-]*)
+    case "$table" in
+      '!DBEV_TABLE_LIST_FAILED') echo 'failed to list ClickHouse tables' >&2; exit 44 ;;
+      *[!A-Za-z0-9_-]*)
       echo 'target clickhouse contains a non-portable table name' >&2
       exit 42
     ;; esac
@@ -883,14 +885,18 @@ mongosh --quiet \
             .to_string()
         }
         Protocol::Clickhouse => r#"set -eu
+{
 clickhouse-client \
   --host 127.0.0.1 \
   --user "$CLICKHOUSE_USER" \
   --password "$CLICKHOUSE_PASSWORD" \
   --database "$CLICKHOUSE_DB" \
-  --query "SELECT name FROM system.tables WHERE database = currentDatabase() ORDER BY engine != 'View', name FORMAT TSVRaw" | while IFS= read -r table; do
+  --query "SELECT name FROM system.tables WHERE database = currentDatabase() ORDER BY engine != 'View', name FORMAT TSVRaw" || printf '\n!DBEV_TABLE_LIST_FAILED\n'
+} | while IFS= read -r table; do
   [ -n "$table" ] || continue
-  case "$table" in *[!A-Za-z0-9_-]*)
+  case "$table" in
+    '!DBEV_TABLE_LIST_FAILED') echo 'failed to list ClickHouse tables' >&2; exit 44 ;;
+    *[!A-Za-z0-9_-]*)
     echo 'target clickhouse contains a non-portable table name' >&2
     exit 42
   ;; esac
@@ -932,12 +938,17 @@ pub(super) async fn wipe_logical_target(
     metadata: &InstanceMetadata,
     exec_timeout: Option<Duration>,
     database_definition_in_dump: bool,
-) -> Result<(), ApiError> {
+) -> Result<(), super::shared_restore::RestoreError> {
+    let timeout = exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT);
     let script = wipe_logical_script(metadata, database_definition_in_dump)?;
+    if metadata.deployment_mode == DeploymentMode::Shared
+        && metadata.protocol == Protocol::Clickhouse
+    {
+        return super::shared_restore::wipe_clickhouse(state, metadata, timeout).await;
+    }
     let credentials = logical_import_env(metadata, database_definition_in_dump)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let environment = credentials.references();
-    let timeout = exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT);
     let result = match logical_exec_recovery(metadata) {
         ExecRecovery::RestartRuntime => {
             state
@@ -951,7 +962,7 @@ pub(super) async fn wipe_logical_target(
                 )
                 .await
         }
-        ExecRecovery::CallerFencesTenant => {
+        ExecRecovery::CallerHandles => {
             state
                 .docker
                 .exec_tenant_shell(

@@ -278,6 +278,39 @@ async fn exercise_started_pool(pool: SharedPool) {
     );
     assert_tenant_b_works(&pool, tenant_b).await;
 
+    crate::api::import_export::roundtrip_tests::shared_roundtrip(
+        &pool.config,
+        &pool.docker,
+        &pool.runtime,
+        &limits,
+        [
+            (DATABASE_A, USER_A, PASSWORD_A),
+            (DATABASE_B, USER_B, PASSWORD_B),
+        ],
+        async {
+            let change = if protocol == Protocol::Mongodb {
+                "db.probe.updateMany({}, {$set: {value: 'changed'}});"
+            } else {
+                "TRUNCATE TABLE probe; INSERT INTO probe VALUES (1, 'changed');"
+            };
+            assert_ok(
+                run_as(&pool, tenant_a, PASSWORD_A, DATABASE_A, change).await,
+                "change tenant A after the backup",
+            );
+        },
+    )
+    .await;
+    assert_eq!(
+        assert_ok(
+            run_as(&pool, tenant_a, PASSWORD_A, DATABASE_A, read_sql(protocol)).await,
+            "read restored tenant A"
+        )
+        .stdout
+        .trim(),
+        "a"
+    );
+    assert_tenant_b_works(&pool, tenant_b).await;
+
     if protocol == Protocol::Clickhouse {
         assert_clickhouse_activity_window(&pool, tenant_a).await;
     }
@@ -932,7 +965,8 @@ impl SharedPool {
         temp_root: Option<tempfile::TempDir>,
     ) -> Self {
         let docker = DockerRuntime::new(&DaemonConfig::default(), false)
-            .expect("connect to the local Docker daemon");
+            .expect("connect to the local Docker daemon")
+            .with_node_id("dbev-shared-isolation-tests");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let runtime_id = format!("shared_it_{}_{}", protocol.as_str(), &suffix[..12]);
         let (paths, path_config) = test_paths(&root, &runtime_id).await;
@@ -973,6 +1007,13 @@ impl SharedPool {
             .wait_until_ready(protocol, &runtime_id, STARTUP_TIMEOUT)
             .await
             .expect("wait for the production shared-runtime readiness probe");
+        assert!(
+            pool.docker
+                .log_policy_is_current(protocol, &runtime_id)
+                .await
+                .unwrap(),
+            "the real runtime must retain only the configured bounded console history"
+        );
         secure_pool(&pool.docker, &pool.runtime)
             .await
             .expect("reconcile production shared-pool isolation");

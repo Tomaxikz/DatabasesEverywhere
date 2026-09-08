@@ -79,8 +79,14 @@ pub(super) async fn handle_postgres_client(
             .await;
         let (database, target) = match resolution {
             DatabaseRouteResolution::Found { database, target } => (database, target),
-            DatabaseRouteResolution::NotFound => return Err(ListenerError::RouteNotFound),
+            DatabaseRouteResolution::NotFound => {
+                client.write_all(&postgres::auth_error_packet()).await?;
+                client.shutdown().await?;
+                return Err(ListenerError::RouteNotFound);
+            }
             DatabaseRouteResolution::Ambiguous => {
+                client.write_all(&postgres::auth_error_packet()).await?;
+                client.shutdown().await?;
                 return Err(ListenerError::AmbiguousDatabaseRoute {
                     protocol: "postgres",
                 });

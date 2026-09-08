@@ -1,5 +1,49 @@
 use super::*;
 
+pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result<()> {
+    let runtimes = state.placements.list().await?;
+    futures::stream::iter(runtimes)
+        .map(|runtime| async move {
+            let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
+            if let Err(error) = state
+                .docker
+                .disable_restarts(runtime.protocol, &runtime.runtime_id)
+                .await
+            {
+                tracing::error!(runtime_id = %runtime.runtime_id, %error,
+                    "could not disable engine restarts; stopping this container before boot recovery");
+                if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
+                    crate::api::instances::containment::contain_locked(
+                        state, &runtime, "engine restart policy could not be repaired",
+                    ).await;
+                    return;
+                }
+                if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
+                    crate::instances::sessions::fence(
+                        &state.instances, &state.gateway_supervisor.tenant_sessions(),
+                        &metadata.instance_id,
+                    ).await;
+                    metadata.status = InstanceStatus::Failed;
+                    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+                    if let Err(error) = state.manager.upsert_fenced(metadata).await {
+                        tracing::error!(runtime_id = %runtime.runtime_id, %error,
+                            "could not persist stopped intent after restart-policy repair failed");
+                    }
+                }
+                if let Err(error) = state.docker.stop(runtime.protocol, &runtime.runtime_id).await
+                    && !error.is_not_found() && !error.is_not_running()
+                {
+                    tracing::error!(runtime_id = %runtime.runtime_id, %error,
+                        "could not stop container after restart-policy repair failed");
+                }
+            }
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    Ok(())
+}
+
 async fn cleanup_old_console_logs(state: &AppState) {
     let runtimes = match state.placements.list().await {
         Ok(runtimes) => runtimes,

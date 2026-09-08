@@ -44,6 +44,15 @@ Compilation and bounded runtime execution are separate steps.
 
 ## Shared-pool isolation
 
+Docker-free gateway tests exercise split/chunked HTTP uploads, backpressure,
+half-closes, timeouts, tenant-route rejection, and native authentication errors:
+
+```bash
+cargo test --locked --lib gateway::
+```
+
+These transport checks do not replace the real-engine lifecycle tests below.
+
 The weekly/manual [shared isolation workflow](../workflows/shared-pool-isolation.yml)
 tests PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse independently.
 It is not part of ordinary push/release gating.
@@ -54,6 +63,8 @@ bash .github/ci/shared-pool-isolation.sh all
 ```
 
 Local `all` runs sequentially. Cleanup is restricted to managed test containers.
+Each engine case also exports a tenant backup, changes its data, restores it,
+and verifies the second tenant remains intact, using the production transfer paths.
 
 Without Docker, an official ClickHouse 26.4+ binary can execute the shared
 provisioning SQL in an isolated `clickhouse local` process (no listeners or live data):

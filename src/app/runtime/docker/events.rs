@@ -233,9 +233,17 @@ mod tests {
 
     #[test]
     fn ignores_health_and_unmanaged_events() {
-        assert!(
-            ManagedContainerEvent::from_message(event("health_status: healthy"), None).is_none()
-        );
+        // Readiness and log-policy repair must never trigger their own
+        // activation reconciliation, or a successful probe could feed a loop.
+        for action in [
+            "health_status: healthy",
+            "exec_create",
+            "exec_start",
+            "exec_die",
+            "update",
+        ] {
+            assert!(ManagedContainerEvent::from_message(event(action), None).is_none());
+        }
 
         let mut unmanaged = event("start");
         unmanaged
