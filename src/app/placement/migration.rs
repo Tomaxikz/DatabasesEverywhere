@@ -667,7 +667,7 @@ impl DeploymentMigrationRepository {
             .checked_add(1)
             .ok_or(DeploymentMigrationError::RevisionOverflow)?;
         let now = now_rfc3339();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let reservation = sqlx::query(
             r#"
             SELECT reservation.runtime_id

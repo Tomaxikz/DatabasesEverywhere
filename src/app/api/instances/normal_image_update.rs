@@ -6,7 +6,7 @@ use crate::api::instances::create::provision_mariadb_tenant_user;
 
 const IMAGE_UPDATE_FAIL_CLOSED_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn update_instance_image_normal(
+pub(super) async fn update_instance_image_normal(
     state: AppState,
     mut metadata: InstanceMetadata,
     current_image: String,
@@ -136,6 +136,20 @@ async fn update_instance_image_normal(
         "delete_container",
         "removing old container",
     );
+    route_fence::fence(&state, &metadata.instance_id).await;
+    if let Err(error) = state
+        .docker
+        .stop(metadata.protocol, &metadata.instance_id)
+        .await
+        && !error.is_not_running()
+        && !error.is_not_found()
+    {
+        return Err(fail_image_update_api(
+            &state,
+            &metadata.instance_id,
+            docker_error(error),
+        ));
+    }
     match state
         .docker
         .delete(metadata.protocol, &metadata.instance_id)
@@ -151,7 +165,6 @@ async fn update_instance_image_normal(
             ));
         }
     }
-    route_fence::fence(&state, &metadata.instance_id).await;
     let replacement_result: Result<(), ApiError> = async {
         launch_container_from_spec(
             &state,
@@ -324,7 +337,7 @@ async fn update_instance_image_normal(
     })
 }
 
-pub(super) async fn run_image_update(
+pub(crate) async fn run_image_update(
     state: AppState,
     operation: tokio::sync::OwnedMutexGuard<()>,
     metadata: InstanceMetadata,
@@ -658,7 +671,6 @@ pub(super) async fn image_update_spec(
                 )
             })?),
             container_data_path.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Redis | Protocol::Valkey => databases::resp::instance_spec(
@@ -666,7 +678,6 @@ pub(super) async fn image_update_spec(
             &metadata.instance_id,
             image,
             container_data_path.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::instance_spec(
@@ -681,7 +692,6 @@ pub(super) async fn image_update_spec(
                 )
             })?),
             container_data_path.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mysql => databases::mysql::docker::instance_spec(
@@ -694,7 +704,6 @@ pub(super) async fn image_update_spec(
                 )
             })?),
             container_data_path.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mongodb => databases::mongodb::docker::instance_spec(
@@ -713,7 +722,6 @@ pub(super) async fn image_update_spec(
                 ),
             },
             container_data_path.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
@@ -728,7 +736,6 @@ pub(super) async fn image_update_spec(
                 &metadata.database.username,
                 password,
                 container_data_path,
-                paths.logs.clone(),
                 hosted_config_path,
                 paths.sockets.clone(),
                 paths.socket_bridge_binary.clone(),
@@ -739,7 +746,6 @@ pub(super) async fn image_update_spec(
             image,
             password,
             container_data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
             paths.socket_bridge_binary.clone(),
         ),

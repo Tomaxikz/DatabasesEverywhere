@@ -357,7 +357,6 @@ pub(crate) async fn shared_spec(
             image,
             password(),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mysql => databases::mysql::docker::shared_spec(
@@ -365,7 +364,6 @@ pub(crate) async fn shared_spec(
             image,
             password(),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::shared_spec(
@@ -373,7 +371,6 @@ pub(crate) async fn shared_spec(
             image,
             password(),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mongodb => databases::mongodb::docker::shared_spec(
@@ -381,7 +378,6 @@ pub(crate) async fn shared_spec(
             image,
             password(),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
@@ -394,7 +390,6 @@ pub(crate) async fn shared_spec(
                 image,
                 password(),
                 data_path,
-                paths.logs.clone(),
                 config,
                 paths.sockets.clone(),
                 paths.socket_bridge_binary.clone(),
@@ -483,6 +478,8 @@ mod tests {
         let (state, _database) = crate::api::test_support::database(config).await;
         let paths = InstancePaths::new(&state.config.paths, "pool_postgres_unpersisted").unwrap();
         paths.create_dirs().await.unwrap();
+        // Old installations may still have a log directory to purge.
+        tokio::fs::create_dir_all(&paths.logs).await.unwrap();
         for path in [
             &paths.data,
             &paths.logs,

@@ -338,6 +338,10 @@ impl DockerRuntime {
                 memory_mib: spec.memory_mib,
             })?;
         let mut labels = HashMap::from([
+            (
+                container_config::LOG_POLICY_LABEL.to_string(),
+                container_config::LOG_POLICY_VERSION.to_string(),
+            ),
             (MANAGED_LABEL.to_string(), "true".to_string()),
             (INSTANCE_LABEL.to_string(), spec.instance_id.clone()),
             (PROTOCOL_LABEL.to_string(), spec.protocol.to_string()),
@@ -350,6 +354,7 @@ impl DockerRuntime {
         }
 
         let mut host_config = HostConfig {
+            log_config: Some(container_config::log_config(self.engine)),
             network_mode: Some("none".to_string()),
             nano_cpus: Some(nano_cpus),
             memory: Some(memory_bytes),
@@ -964,6 +969,8 @@ pub enum DockerError {
     ManagedContainerStartedAtUnavailable { container: String },
     #[error("DBE node ownership identity is unavailable for this container operation")]
     RuntimeNodeIdUnavailable,
+    #[error("container log history exceeded its 10-second deadline")]
+    LogsTimedOut,
     #[error("file transfer failed for {path}: {source}")]
     FileTransferIo {
         path: String,

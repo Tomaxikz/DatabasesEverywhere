@@ -1,11 +1,11 @@
 use super::*;
-use crate::shared::redaction;
+use crate::shared::logs::LogRedactor;
+#[cfg(test)]
+use crate::shared::logs::{INCOMPLETE_RECORD, LOG_RECORD_LIMIT, TRUNCATED_RECORD};
+use futures::StreamExt;
 
-const LOG_RECORD_LIMIT: usize = 128 * 1024;
 // A JSON control character expands to six bytes; leave room for the envelope.
 const LOG_CHUNK_BYTES: usize = 1536;
-const TRUNCATED_RECORD: &str = "[oversized log record omitted]\n";
-const INCOMPLETE_RECORD: &str = "[incomplete secret-bearing log record omitted]\n";
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -195,7 +195,7 @@ pub(crate) async fn stream_logs(
                 awaiting_pong = true;
                 continue;
             }
-            output = logs.recv() => output,
+            output = logs.next() => output,
         };
         if !target.is_current(&state).await {
             close_replaced_socket(&mut socket).await;
@@ -326,41 +326,6 @@ fn text_chunks(mut text: &str) -> impl Iterator<Item = &str> {
         text = tail;
         Some(head)
     })
-}
-
-#[derive(Default)]
-struct LogRedactor {
-    pending: String,
-    failed: bool,
-}
-
-impl LogRedactor {
-    fn push(&mut self, text: &str) -> String {
-        let mut output = String::new();
-        for part in text.split_inclusive(['\n', '\r']) {
-            let complete = part.ends_with(['\n', '\r']);
-            if self.failed {
-                break;
-            }
-            if self.pending.len().saturating_add(part.len()) > LOG_RECORD_LIMIT {
-                self.pending.clear();
-                self.failed = true;
-                output.push_str(TRUNCATED_RECORD);
-                break;
-            }
-            self.pending.push_str(part);
-            if complete && let Some(safe) = redaction::redact_log_record(&self.pending) {
-                output.push_str(&safe);
-                self.pending.clear();
-            }
-        }
-        output
-    }
-
-    fn finish(&mut self) -> String {
-        let pending = std::mem::take(&mut self.pending);
-        redaction::redact_log_record(&pending).unwrap_or_else(|| INCOMPLETE_RECORD.into())
-    }
 }
 
 #[cfg(test)]

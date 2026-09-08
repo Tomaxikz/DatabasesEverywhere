@@ -783,8 +783,17 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
     output
 }
 
-fn mount_args() -> [&'static str; 3] {
-    ["--nopassthrough", "--nosplice", "--clone-fd"]
+fn mount_args() -> [&'static str; 5] {
+    // Each libfuse worker retains its receive buffer (up to 4 MiB plus header).
+    // The helper defaults to ten persistent workers per mount. Two keep I/O
+    // concurrent without multiplying that idle footprint across every engine.
+    [
+        "--nopassthrough",
+        "--nosplice",
+        "--clone-fd",
+        "--num-threads",
+        "2",
+    ]
 }
 
 fn parse_quota_usage(lines: &[String]) -> Result<u64, DiskLimitError> {
@@ -995,6 +1004,8 @@ mod tests {
         assert!(args.contains(&"--nopassthrough"));
         assert!(args.contains(&"--nosplice"));
         assert!(args.contains(&"--clone-fd"));
+        assert!(args.windows(2).any(|pair| pair == ["--num-threads", "2"]));
+        assert!(!args.contains(&"--single"));
         assert!(!args.contains(&"--nocache"));
     }
 
@@ -1006,6 +1017,115 @@ mod tests {
         assert!(check_external_binary(true, 0, 1, 0o100775).is_err());
         assert!(check_external_binary(true, 0, 1, 0o100644).is_err());
         assert!(check_external_binary(false, 0, 1, 0o100755).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root, /dev/fuse and fusermount3 on a disposable Linux host"]
+    async fn mounted_helper_enforces_quota_and_reuses_process() {
+        assert!(rustix::process::geteuid().is_root(), "run as root");
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("fuse");
+        let result = timeout(Duration::from_secs(30), async {
+            let mount = apply_with_root(&data, Some(&root), 64, "embedded", "", 150).await?;
+            let paths = fuse_paths_with_root(&data, Some(&root))?;
+            let peer = send_command_detailed(&paths.socket_path, "get quota_used")
+                .await?
+                .peer_pid;
+            let command = tokio::fs::read(format!("/proc/{peer}/cmdline")).await?;
+            anyhow::ensure!(
+                command
+                    .windows(b"--num-threads\x002\0".len())
+                    .any(|w| w == b"--num-threads\x002\0")
+            );
+
+            let writes = (0..8).map(|index| {
+                let path = mount.join(format!("data-{index}"));
+                async move {
+                    let block = vec![index as u8; 1024 * 1024];
+                    let mut file = tokio::fs::File::create(&path).await?;
+                    for _ in 0..4 {
+                        file.write_all(&block).await?;
+                    }
+                    file.sync_all().await?;
+                    drop(file);
+                    anyhow::ensure!(
+                        tokio::fs::read(&path).await? == block.repeat(4),
+                        "data changed"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+            });
+            for write in futures::future::join_all(writes).await {
+                write?;
+            }
+            let response = send_command_detailed(&paths.socket_path, "get quota_used").await?;
+            anyhow::ensure!(parse_quota_usage(&response.lines)? >= mib_to_bytes(32));
+            let reused = apply_with_root(&data, Some(&root), 48, "embedded", "", 150).await?;
+            anyhow::ensure!(reused == mount);
+            anyhow::ensure!(
+                send_command_detailed(&paths.socket_path, "get quota_used")
+                    .await?
+                    .peer_pid
+                    == peer,
+                "healthy helper was restarted"
+            );
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .custom_flags(libc::O_SYNC)
+                .open(mount.join("overflow"))
+                .await?;
+            // Tokio may acknowledge its write buffer before the underlying
+            // syscall completes. Fill remaining quota (including the helper's
+            // already-reserved headroom) and observe completed writes/fsync.
+            let overflow = async {
+                let block = vec![9; 1024 * 1024];
+                for _ in 0..32 {
+                    file.write_all(&block).await?;
+                    file.sync_all().await?;
+                }
+                Ok::<_, std::io::Error>(())
+            }
+            .await;
+            anyhow::ensure!(
+                matches!(
+                    overflow.as_ref().err().map(std::io::Error::kind),
+                    Some(ErrorKind::StorageFull | ErrorKind::QuotaExceeded)
+                ),
+                "over-quota write was not rejected: {overflow:?}"
+            );
+            drop(file);
+            anyhow::ensure!(
+                tokio::fs::read(mount.join("data-1")).await? == vec![1; 4 * 1024 * 1024],
+                "quota exhaustion damaged existing data"
+            );
+            for index in 0..8 {
+                tokio::fs::remove_file(mount.join(format!("data-{index}"))).await?;
+            }
+            tokio::fs::remove_file(mount.join("overflow")).await?;
+            let mut file = tokio::fs::File::create(mount.join("after-delete")).await?;
+            file.write_all(b"quota capacity recovered").await?;
+            file.sync_all().await?;
+            drop(file);
+            anyhow::ensure!(
+                tokio::fs::read(mount.join("after-delete")).await? == b"quota capacity recovered"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        // Never recursively remove a temporary directory while it is mounted.
+        if let Err(error) = destroy_with_root(&data, Some(&root)).await {
+            panic!(
+                "test mount cleanup failed; preserved {}: {error}",
+                temp.keep().display()
+            );
+        }
+        result.unwrap().unwrap();
+        assert_eq!(
+            tokio::fs::read(data.join("after-delete")).await.unwrap(),
+            b"quota capacity recovered"
+        );
     }
 
     #[test]

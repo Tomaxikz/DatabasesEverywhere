@@ -6,13 +6,20 @@ use std::{
 };
 
 use anyhow::Context;
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{config::Config, constants};
 
 const LOG_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_ARCHIVES: usize = 4;
+const LOG_QUEUE_LINES: usize = 2048;
+
+fn log_queue() -> NonBlockingBuilder {
+    // The library's 128,000 slots are excessive for a daemon, even when idle.
+    // Keep its non-blocking/lossy behavior; stdout still goes to the journal.
+    NonBlockingBuilder::default().buffered_lines_limit(LOG_QUEUE_LINES)
+}
 
 fn log_filter() -> EnvFilter {
     EnvFilter::try_from_env(constants::RUST_LOG_ENV)
@@ -34,7 +41,7 @@ pub(super) fn init_logging(config: &Config) -> anyhow::Result<WorkerGuard> {
     super::harden_runtime_dir(directory)?;
     let writer = RollingLog::new(directory, LOG_BYTES)
         .with_context(|| format!("failed to initialize log file in {}", directory.display()))?;
-    let (file_writer, guard) = tracing_appender::non_blocking(writer);
+    let (file_writer, guard) = log_queue().finish(writer);
 
     tracing_subscriber::registry()
         .with(log_filter())
@@ -177,6 +184,53 @@ impl Write for RollingLog {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_queue_stays_bounded_when_disk_writes_stall() {
+        use std::sync::{Arc, Mutex, mpsc};
+        struct StalledWriter {
+            started: Option<mpsc::SyncSender<()>>,
+            resume: mpsc::Receiver<()>,
+            output: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for StalledWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).map_err(io::Error::other)?;
+                    self.resume.recv().map_err(io::Error::other)?;
+                }
+                self.output.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (started, waiting) = mpsc::sync_channel(1);
+        let (resume, paused) = mpsc::sync_channel(1);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (mut writer, guard) = log_queue().finish(StalledWriter {
+            started: Some(started),
+            resume: paused,
+            output: output.clone(),
+        });
+        writer.write_all(b"first\n").unwrap();
+        let ready = waiting.recv_timeout(std::time::Duration::from_secs(3));
+        if ready.is_ok() {
+            for _ in 0..=LOG_QUEUE_LINES {
+                writer.write_all(b"line\n").unwrap();
+            }
+        }
+        let dropped = writer.error_counter().dropped_lines();
+        resume.send(()).unwrap();
+        drop(guard);
+        ready.unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            output.lock().unwrap().len(),
+            b"first\n".len() + LOG_QUEUE_LINES * b"line\n".len()
+        );
+    }
+
     fn contents(directory: &Path, max_bytes: u64) -> String {
         (0..=LOG_ARCHIVES)
             .rev()
@@ -203,7 +257,7 @@ mod tests {
         fs::create_dir(directory.path().join("instances")).unwrap();
         for batch in 0..3 {
             let (mut writer, guard) =
-                tracing_appender::non_blocking(RollingLog::new(directory.path(), 10).unwrap());
+                log_queue().finish(RollingLog::new(directory.path(), 10).unwrap());
             for record in batch * 4..batch * 4 + 4 {
                 writer
                     .write_all(format!("line-{record:02}\n").as_bytes())

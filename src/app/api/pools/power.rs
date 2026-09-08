@@ -147,9 +147,12 @@ pub(super) async fn change(
                 {
                     return Ok(());
                 }
+                pool.desired_state = DesiredInstanceState::Running;
+                if !super::image::refresh_logging_locked(&state, &mut pool).await? {
                 lifecycle::activate_locked(&state, &mut pool, action == LifecycleAction::Restart)
                     .await
                     .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                }
             }
             LifecycleAction::Stop | LifecycleAction::Kill => {
                 pool.desired_state = DesiredInstanceState::Stopped;

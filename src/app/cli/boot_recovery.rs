@@ -1,5 +1,48 @@
 use super::*;
 
+async fn cleanup_old_console_logs(state: &AppState) {
+    let runtimes = match state.placements.list().await {
+        Ok(runtimes) => runtimes,
+        Err(error) => {
+            tracing::warn!(%error, "could not list runtimes for legacy console-log cleanup");
+            return;
+        }
+    };
+    for runtime in runtimes
+        .into_iter()
+        .filter(|runtime| runtime.protocol == Protocol::Clickhouse)
+    {
+        let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
+        let Ok(Some(current)) = state.placements.get(&runtime.runtime_id).await else {
+            continue;
+        };
+        if current.status != crate::placement::EngineRuntimeStatus::Running
+            || !matches!(
+                state
+                    .docker
+                    .log_policy_is_current(current.protocol, &current.runtime_id)
+                    .await,
+                Ok(true)
+            )
+        {
+            continue;
+        }
+        let Ok(paths) = InstancePaths::new(&state.config.paths, &current.runtime_id) else {
+            continue;
+        };
+        match crate::databases::clickhouse::docker::remove_legacy_logs(&paths.logs).await {
+            Ok((0, _)) => {}
+            Ok((files, bytes)) => {
+                tracing::info!(event = "audit legacy_clickhouse_logs_removed", runtime_id = %current.runtime_id, files, bytes,
+                "removed obsolete ClickHouse file logs after console-policy upgrade; database data and backups were not removed")
+            }
+            Err(error) => {
+                tracing::warn!(runtime_id = %current.runtime_id, %error, "legacy ClickHouse log cleanup was incomplete; it will be retried on boot")
+            }
+        }
+    }
+}
+
 pub(super) async fn finish_runtime_boot(state: AppState) {
     let Some(_mutation) = state.daemon_shutdown.try_admit_background_mutation() else {
         return;
@@ -40,6 +83,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
 
     let compatibility = crate::compatibility::sync_compatibility(&state).await;
     let shared_compatibility = sync_shared_compatibility(&state).await;
+    cleanup_old_console_logs(&state).await;
     if compatibility.failed == 0 && shared_compatibility.failed == 0 {
         tracing::info!(
             checked = compatibility.checked,

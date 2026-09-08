@@ -40,10 +40,8 @@ pub(crate) use deployment::{
 use major_upgrade::*;
 #[cfg(test)]
 use normal_image_update::quarantine_image_metadata;
-pub(crate) use normal_image_update::spawn_owned_mutation_task;
-use normal_image_update::{
-    image_quarantine_summary, image_update_spec, quarantine_image_update, run_image_update,
-};
+use normal_image_update::{image_quarantine_summary, image_update_spec, quarantine_image_update};
+pub(crate) use normal_image_update::{run_image_update, spawn_owned_mutation_task};
 pub(crate) use password::verify_resp_credential;
 pub use password::{
     ResetInstancePasswordRequest, ResetInstancePasswordResponse, reset_instance_password,
@@ -982,7 +980,13 @@ pub(crate) async fn change_instance_state_locked(
                     .await
                     .map_err(|error| ApiError::Runtime(error.to_string()))?;
             }
-            match action {
+            let refresh_console = matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
+                && !state.docker.log_policy_is_current(metadata.protocol, &metadata.instance_id).await.map_err(docker_error)?;
+            if refresh_console {
+                let image = state.docker.container_recreation_image(metadata.protocol, &metadata.instance_id).await.map_err(docker_error)?
+                    .ok_or_else(|| ApiError::Conflict("console-policy repair cannot preserve the installed image; update the image explicitly first".into()))?;
+                metadata = normal_image_update::update_instance_image_normal(state.clone(), metadata.clone(), image.clone(), image, None).await?.instance;
+            } else { match action {
                 LifecycleAction::Start => {
                     state
                         .docker
@@ -1008,7 +1012,7 @@ pub(crate) async fn change_instance_state_locked(
                         .await
                 }
             }
-            .map_err(docker_error)?;
+            .map_err(docker_error)?; }
         }
 
         if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {

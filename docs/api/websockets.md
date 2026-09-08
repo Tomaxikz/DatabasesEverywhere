@@ -63,6 +63,13 @@ event. Pool logs use the same reset/append/end protocol below, but identify
 `runtime_id` instead of `instance_id`. Mint a fresh token for each socket;
 a database-only subuser must not receive pool log access.
 
+Console history is limited to the runtime's roughly 5 MiB rolling buffer per
+physical container. It is not a complete log since creation. Reconnection reads
+the requested recent tail and then follows live output; DBEV keeps no second
+log archive or per-viewer producer queue. REST log reads are capped at 1 MiB per
+output channel and may include a truncation marker. Authorization and event
+schemas are unchanged. See [log retention](../operations/setup.md#daemon-logs).
+
 ## Monitoring
 
 A `stats` message contains:

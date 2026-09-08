@@ -114,22 +114,45 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
         }
     };
 
-    let runtime_spec_upgrade = runtime_spec_upgrade_required(&metadata).await;
-    if current_image != configured_image || runtime_spec_upgrade {
-        if runtime_spec_upgrade && current_image == configured_image {
+    let logging_upgrade = match state
+        .docker
+        .log_policy_is_current(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(current) => !current,
+        Err(error) => {
+            tracing::warn!(instance_id = %metadata.instance_id, %error, "could not inspect container console policy; retaining the current container");
+            return attest_without_upgrade(state, metadata, false, Some(operation)).await;
+        }
+    };
+    // Retention repair must keep a panel-selected image, even when the node
+    // default points at a different database version.
+    let target_image = boot_image(&current_image, &configured_image, logging_upgrade).to_string();
+    let runtime_spec_upgrade = runtime_spec_upgrade_required(&metadata).await || logging_upgrade;
+    if logging_upgrade
+        && !matches!(
+            state
+                .docker
+                .container_recreation_image(metadata.protocol, &metadata.instance_id)
+                .await,
+            Ok(Some(_))
+        )
+    {
+        tracing::warn!(event = "audit console_policy_upgrade_deferred", instance_id = %metadata.instance_id,
+            "console-policy repair cannot preserve the installed image reference; update the image explicitly first");
+        return attest_without_upgrade(state, metadata, false, Some(operation)).await;
+    }
+    if current_image != target_image || runtime_spec_upgrade {
+        if runtime_spec_upgrade && current_image == target_image {
             tracing::info!(
                 event = "audit boot_runtime_spec_upgrade_started",
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
-                image = %configured_image,
-                "reconstructing a managed container once to install newly required private runtime sockets"
+                image = %target_image,
+                "reconstructing a managed container once to apply private runtime sockets and bounded console logging"
             );
         }
-        let change = match classify_image_update(
-            metadata.protocol,
-            &current_image,
-            &configured_image,
-        ) {
+        let change = match classify_image_update(metadata.protocol, &current_image, &target_image) {
             Ok(change) => change,
             Err(error) => {
                 tracing::error!(
@@ -137,7 +160,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
                     instance_id = %metadata.instance_id,
                     protocol = %metadata.protocol,
                     from_image = %current_image,
-                    to_image = %configured_image,
+                    to_image = %target_image,
                     %error,
                     "configured boot image upgrade could not be classified; retaining the current container"
                 );
@@ -154,7 +177,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
                 from_image = %current_image,
-                to_image = %configured_image,
+                to_image = %target_image,
                 "configured image crosses a major version that DBEV cannot migrate automatically; retaining the current compatible image"
             );
             let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
@@ -162,17 +185,31 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
             return outcome;
         }
         let instance_id = metadata.instance_id.clone();
-        match update_instance_image_locked(
-            state.clone(),
-            operation,
-            metadata,
-            current_image,
-            configured_image,
-            major_upgrade,
-            None,
-        )
-        .await
-        {
+        let result = if logging_upgrade {
+            // The reference was read and verified from this managed container;
+            // this is not a request to deploy a newly selected image.
+            crate::api::instances::run_image_update(
+                state.clone(),
+                operation,
+                metadata,
+                current_image,
+                target_image,
+                None,
+            )
+            .await
+        } else {
+            update_instance_image_locked(
+                state.clone(),
+                operation,
+                metadata,
+                current_image,
+                target_image,
+                major_upgrade,
+                None,
+            )
+            .await
+        };
+        match result {
             Ok(_) => {
                 // Both image-update strategies force a compatibility probe
                 // before committing and republishing the replacement. Do not
@@ -210,6 +247,10 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
     } else {
         attest_without_upgrade(state, metadata, false, Some(operation)).await
     }
+}
+
+fn boot_image<'a>(current: &'a str, configured: &'a str, console_repair: bool) -> &'a str {
+    if console_repair { current } else { configured }
 }
 
 async fn runtime_spec_upgrade_required(metadata: &InstanceMetadata) -> bool {
@@ -312,6 +353,21 @@ mod tests {
         instances::test_support,
         shared::{backend::BackendEndpoint, protocol::Protocol},
     };
+
+    #[test]
+    fn console_repair_keeps_selected_and_digest_pinned_images() {
+        for (current, configured) in [
+            ("mysql:9.7", "mysql:8.4"),
+            (
+                "clickhouse/clickhouse-server:25.8",
+                "clickhouse/clickhouse-server:26.4",
+            ),
+            ("sha256:installed", "postgres:18.4"),
+        ] {
+            assert_eq!(boot_image(current, configured, true), current);
+            assert_eq!(boot_image(current, configured, false), configured);
+        }
+    }
 
     #[tokio::test]
     async fn qdrant_runtime_spec_upgrade_is_required_only_until_rest_socket_is_live() {

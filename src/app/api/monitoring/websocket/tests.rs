@@ -4,6 +4,63 @@ use crate::api::monitoring::{
     resources::{CpuReport, DiskReport, MemoryReport, NetworkReport},
 };
 
+#[tokio::test]
+async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/ws",
+        axum::routing::get(|ws: WebSocketUpgrade| async {
+            upgrade_websocket(ws).on_upgrade(|mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    if socket.send(message).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(client.read_u8().await.unwrap());
+            assert!(headers.len() < 4096);
+        }
+        assert!(headers.starts_with(b"HTTP/1.1 101"));
+        for length in [WEBSOCKET_READ_BUFFER_BYTES + 37, WEBSOCKET_MAX_MESSAGE_BYTES, WEBSOCKET_MAX_MESSAGE_BYTES + 1] {
+            let payload = (0..length).map(|index| index as u8).collect::<Vec<_>>();
+            let mask = [1, 2, 3, 4];
+            let mut frame = vec![0x82, 0xfe];
+            frame.extend_from_slice(&(length as u16).to_be_bytes());
+            frame.extend_from_slice(&mask);
+            frame.extend(payload.iter().enumerate().map(|(index, byte)| byte ^ mask[index % 4]));
+            client.write_all(&frame).await.unwrap();
+            if length > WEBSOCKET_MAX_MESSAGE_BYTES {
+                let mut byte = [0];
+                assert!(matches!(client.read(&mut byte).await, Ok(0) | Err(_)), "oversized frame was accepted");
+                break;
+            }
+            assert_eq!(client.read_u8().await.unwrap(), 0x82);
+            assert_eq!(client.read_u8().await.unwrap(), 126);
+            assert_eq!(client.read_u16().await.unwrap() as usize, length);
+            let mut echoed = vec![0; length];
+            client.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(echoed, payload);
+        }
+    }).await;
+    server.abort();
+    result.unwrap();
+}
+
 fn activity(instance_id: &str) -> TenantActivity {
     TenantActivity {
         current: crate::monitoring::ActivityCurrent {

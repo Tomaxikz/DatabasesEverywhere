@@ -31,17 +31,21 @@ async fn rootless_podman_compatibility_smoke() -> anyhow::Result<()> {
     let temporary = tempfile::tempdir()?;
     let instance_id = format!("inst_podman_smoke_{}", uuid::Uuid::new_v4().simple());
     let data_path = temporary.path().join("data");
-    let logs_path = temporary.path().join("logs");
     let upload_path = temporary.path().join("upload.txt");
     let download_path = temporary.path().join("download.txt");
     let payload = b"dbev-podman-file-transfer\n";
     tokio::fs::write(&upload_path, payload).await?;
 
-    let spec = smoke_spec(&instance_id, &image, data_path, logs_path);
+    let spec = smoke_spec(&instance_id, &image, data_path);
     let mut created = false;
     let operation = async {
         runtime.create(&spec).await?;
         created = true;
+        ensure!(
+            runtime
+                .log_policy_is_current(Protocol::Redis, &instance_id)
+                .await?
+        );
         ensure!(
             runtime
                 .verified_managed_container_name(Protocol::Redis, &instance_id)
@@ -146,12 +150,7 @@ async fn rootless_podman_compatibility_smoke() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn smoke_spec(
-    instance_id: &str,
-    image: &str,
-    data_path: PathBuf,
-    logs_path: PathBuf,
-) -> DockerInstanceSpec {
+fn smoke_spec(instance_id: &str, image: &str, data_path: PathBuf) -> DockerInstanceSpec {
     DockerInstanceSpec {
         instance_id: instance_id.to_string(),
         protocol: Protocol::Redis,
@@ -166,8 +165,6 @@ fn smoke_spec(
         pids_limit: Some(64),
         data_path,
         data_target: "/data".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: Vec::new(),
         socket_bridges: Vec::new(),
         env: vec![DockerEnv {

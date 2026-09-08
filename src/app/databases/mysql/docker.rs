@@ -14,7 +14,6 @@ pub fn instance_spec(
     database: &str,
     root_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -23,7 +22,6 @@ pub fn instance_spec(
         Some(database),
         root_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -33,7 +31,6 @@ pub fn shared_spec(
     image: &str,
     root_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -42,7 +39,6 @@ pub fn shared_spec(
         None,
         root_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -54,7 +50,6 @@ fn build_spec(
     database: Option<&str>,
     root_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     let mut env = vec![DockerEnv {
@@ -85,8 +80,6 @@ fn build_spec(
         pids_limit: None,
         data_path,
         data_target: "/var/lib/mysql".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: "/var/run/mysqld".to_string(),
@@ -116,7 +109,6 @@ mod tests {
             "mysql_1",
             SecretString::from("root-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
 
@@ -145,7 +137,6 @@ mod tests {
             "mysql:8.4",
             SecretString::from("root-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
 

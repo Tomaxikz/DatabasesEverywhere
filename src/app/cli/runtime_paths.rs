@@ -85,7 +85,6 @@ pub(super) fn prepare_rootless_paths(
         PathBuf::from(&config.paths.data),
         PathBuf::from(config.paths.volumes_root()),
         logs.clone(),
-        logs.join("instances"),
         PathBuf::from(&config.paths.sockets),
         metadata.clone(),
         metadata.join("runtime"),

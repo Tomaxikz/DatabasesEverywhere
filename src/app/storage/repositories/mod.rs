@@ -273,7 +273,9 @@ impl InstanceRepository {
             &metadata.instance_id,
             metadata.tenant_password.as_deref(),
         )?;
-        let mut transaction = self.pool.begin().await?;
+        // Take the writer slot before reading the recovery fence. A deferred
+        // WAL snapshot cannot wait when upgraded after another writer commits.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if metadata.deployment_mode == DeploymentMode::Dedicated {
             self.save_dedicated_runtime(&mut transaction, metadata, &backend, &limits_json)
                 .await?;

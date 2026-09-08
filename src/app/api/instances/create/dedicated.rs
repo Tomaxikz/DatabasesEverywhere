@@ -280,7 +280,6 @@ async fn build_spec(
                 "PostgreSQL administrator",
             )?),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Redis | Protocol::Valkey => databases::resp::instance_spec(
@@ -288,7 +287,6 @@ async fn build_spec(
             &request.instance_id,
             image,
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::instance_spec(
@@ -304,7 +302,6 @@ async fn build_spec(
                 "MariaDB root",
             )?),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mysql => databases::mysql::docker::instance_spec(
@@ -318,7 +315,6 @@ async fn build_spec(
                 "MySQL root",
             )?),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mongodb => databases::mongodb::docker::instance_spec(
@@ -336,7 +332,6 @@ async fn build_spec(
                 )?),
             },
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
@@ -351,7 +346,6 @@ async fn build_spec(
                 &request.username,
                 password(),
                 data_path,
-                paths.logs.clone(),
                 hosted_config_path,
                 paths.sockets.clone(),
                 paths.socket_bridge_binary.clone(),
@@ -362,7 +356,6 @@ async fn build_spec(
             image,
             password(),
             data_path,
-            paths.logs.clone(),
             paths.sockets.clone(),
             paths.socket_bridge_binary.clone(),
         ),

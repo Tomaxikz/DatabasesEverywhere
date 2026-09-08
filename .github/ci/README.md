@@ -69,6 +69,25 @@ access-entity cleanup. It does not replace Docker/gateway authentication tests.
 For older binaries without local access storage, run `shared_sql_parses_on_clickhouse`
 instead with the same test-module prefix. That checks syntax only.
 
+`hosted_console_config_removes_inherited_file_logging` uses the same binary
+environment variable to verify ClickHouse's actual config merge for dedicated
+and shared engines, without starting a server or touching database data.
+
+## FuseQuota mounts
+
+The FuseQuota mount test runs the embedded helper against disposable data on
+Linux. It checks concurrent read/write integrity, quota rejection, deletion
+recovery, and updating a healthy mount without restarting its helper:
+
+```bash
+cargo test --locked --lib --no-run
+sudo /path/to/the/printed-test-binary \
+  disk::fuse_quota::tests::mounted_helper_enforces_quota_and_reuses_process \
+  --exact --ignored
+```
+
+It requires `/dev/fuse` and `fusermount3`; it is excluded from ordinary CI.
+
 ## Native project quotas
 
 Run only on a disposable Linux host with passwordless sudo, loop/mount

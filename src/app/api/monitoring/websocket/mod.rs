@@ -62,13 +62,17 @@ pub struct ImportExportQuery {
 
 const WEBSOCKET_MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const WEBSOCKET_MAX_FRAME_BYTES: usize = 16 * 1024;
-const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 32 * 1024;
+const WEBSOCKET_READ_BUFFER_BYTES: usize = 4 * 1024;
+const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 16 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const MONITORING_BATCH_TARGET_BYTES: usize = 12 * 1024;
 const MONITORING_SNAPSHOT_TTL: Duration = Duration::from_millis(400);
 
 pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket
+        // Incoming traffic is mostly small controls/pings. Larger permitted
+        // frames are still assembled, with unchanged frame/message limits.
+        .read_buffer_size(WEBSOCKET_READ_BUFFER_BYTES)
         .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
         .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES)
         .write_buffer_size(WEBSOCKET_WRITE_BUFFER_BYTES)

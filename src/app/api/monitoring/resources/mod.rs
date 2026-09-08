@@ -44,8 +44,6 @@ mod activity;
 
 mod network;
 
-mod disk_scan;
-
 mod sampler;
 
 mod pools;
@@ -510,12 +508,6 @@ const fn disk_enforcement_strength(hard: bool, soft: bool) -> &'static str {
     }
 }
 
-async fn directory_size(path: PathBuf, budget: Duration) -> Result<u64, std::io::Error> {
-    tokio::task::spawn_blocking(move || disk_scan::directory_size(&path, budget))
-        .await
-        .map_err(std::io::Error::other)?
-}
-
 impl ResourceCache {
     /// Invalidates samples tied to a physical runtime generation while keeping
     /// the logical tenant's network/activity counters alive. Existing gateway
@@ -848,7 +840,15 @@ impl ResourceCache {
             .acquire()
             .await
             .map_err(|_| IoError::other("disk scan limiter closed"))?;
-        directory_size(path, budget).await
+        crate::disk::usage::scan_directory(
+            path,
+            crate::disk::usage::ScanLimits {
+                timeout: budget,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|usage| usage.logical_bytes)
     }
 
     async fn begin_disk_refresh(&self, instance_id: &str, refresh_lock: &Arc<Mutex<()>>) -> bool {

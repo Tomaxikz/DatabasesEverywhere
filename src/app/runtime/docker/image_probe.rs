@@ -78,7 +78,13 @@ impl DockerRuntime {
             .id
             .ok_or("image has no immutable identity")?;
         let name = format!("dbev-version-{}", uuid::Uuid::new_v4().simple());
-        let body = probe_body(protocol, &image_id, &self.security, self.node_id.as_deref());
+        let body = probe_body(
+            protocol,
+            &image_id,
+            &self.security,
+            self.engine,
+            self.node_id.as_deref(),
+        );
         let created = self
             .docker
             .create_container(
@@ -149,6 +155,7 @@ fn probe_body(
     protocol: Protocol,
     image: &str,
     security: &DockerSecurityPolicy,
+    engine: crate::config::DaemonEngine,
     node_id: Option<&str>,
 ) -> ContainerCreateBody {
     let mut policy = security.clone();
@@ -168,6 +175,7 @@ fn probe_body(
         ])),
         host_config: Some({
             let mut host = HostConfig {
+                log_config: Some(super::container_config::log_config(engine)),
                 network_mode: Some("none".into()),
                 readonly_rootfs: Some(true),
                 cap_drop: Some(vec!["ALL".into()]),
@@ -195,6 +203,7 @@ mod tests {
                 protocol,
                 "sha256:test",
                 &DockerSecurityPolicy::default(),
+                crate::config::DaemonEngine::Docker,
                 Some("test-node"),
             );
             let host = body.host_config.unwrap();

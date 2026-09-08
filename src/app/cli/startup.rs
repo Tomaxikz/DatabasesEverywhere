@@ -712,7 +712,6 @@ pub(super) fn qdrant_migration_spec(
         container.image,
         secrecy::SecretString::from(container.api_key.to_string()),
         container.data_path,
-        paths.logs.clone(),
         paths.sockets.clone(),
         paths.socket_bridge_binary.clone(),
     );

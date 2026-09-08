@@ -36,7 +36,16 @@ pub(crate) async fn sync_shared_compatibility(state: &AppState) -> SharedCompati
         }
     };
     let outcomes = futures::stream::iter(runtimes)
-        .map(|snapshot| attest_runtime(state, snapshot))
+        .map(|snapshot| async move {
+            match crate::api::pools::image::refresh_logging(state, &snapshot.runtime_id).await {
+                Ok(true) => return AttestOutcome::Probed,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(event = "audit pool_console_policy_upgrade_failed", runtime_id = %snapshot.runtime_id, %error, "console-policy repair failed; image replacement containment remains authoritative");
+                }
+            }
+            attest_runtime(state, snapshot).await
+        })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;

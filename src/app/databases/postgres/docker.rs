@@ -25,7 +25,6 @@ pub fn instance_spec(
     password: SecretString,
     admin_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -38,7 +37,6 @@ pub fn instance_spec(
         }),
         admin_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -48,7 +46,6 @@ pub fn shared_spec(
     image: &str,
     admin_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -57,7 +54,6 @@ pub fn shared_spec(
         None,
         admin_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -69,7 +65,6 @@ fn build_spec(
     tenant: Option<TenantBootstrap<'_>>,
     admin_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     let database = tenant
@@ -130,8 +125,6 @@ fn build_spec(
         pids_limit: None,
         data_path,
         data_target: "/var/lib/postgresql".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: "/var/run/postgresql".to_string(),
@@ -159,7 +152,6 @@ mod tests {
             SecretString::from("secret"),
             SecretString::from("admin-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
 
@@ -200,7 +192,6 @@ mod tests {
             "postgres:18.4",
             SecretString::from("admin-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
 

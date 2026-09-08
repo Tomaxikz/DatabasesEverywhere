@@ -31,6 +31,23 @@ range exclusively for DBEV: up to one million IDs starting at
 `disk.project_id_base` (default 200000), bounded by the 32-bit ID space.
 Coordinate with other quota managers.
 
+## FuseQuota memory
+
+Each FUSE-mounted engine has a helper process. New helpers use at most two
+I/O workers instead of libfuse's default ten; each worker retains a receive
+buffer, so this bounds per-mount overhead without disabling quota checks or
+filesystem caching. Very busy mounts trade some peak I/O parallelism for the
+smaller footprint. It is not a hard process-memory limit.
+
+Healthy helpers survive daemon restarts to keep database mounts usable. Their
+worker settings change only when the mount is safely recreated, not merely
+when DBEV restarts. Do not kill helpers or force-unmount active databases to
+reclaim memory. Native project quotas avoid these userspace helpers entirely,
+but changing enforcement needs a planned storage migration.
+
+`systemctl status` reports memory for the whole service cgroup, including
+helpers, charged file cache and kernel memory. Its peak is not DBEV's own RSS.
+
 ## Shared-tenant boundaries
 
 | Tenant / filesystem | Enforcement |

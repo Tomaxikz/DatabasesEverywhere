@@ -357,10 +357,103 @@ async fn concurrent_last_slot_has_one_winner() {
     );
 
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    // The loser must observe the committed capacity, not a SQLite lock error.
+    let loser = first.err().or_else(|| second.err()).unwrap();
+    assert!(matches!(
+        loser,
+        PlacementRepositoryError::CapacityUnavailable(_)
+    ));
     assert_eq!(
         repository.tenant_count(&runtime.runtime_id).await.unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn parallel_pool_recovery_preserves_tenant_state() {
+    use crate::instances::{
+        manager::InstanceManager,
+        metadata::{DesiredInstanceState, InstanceStatus},
+        state::InstanceStore,
+    };
+    use futures::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(dir.path()).await.unwrap();
+    let placements = PlacementRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let instances = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let manager = InstanceManager::new(InstanceStore::default(), instances.clone());
+    let mut runtimes = Vec::new();
+    for index in 0..8 {
+        let mut runtime = shared_runtime(&format!("recovery_{index}"), 2);
+        runtime.admin_secret = Some(format!("admin-{index}"));
+        placements.save(&runtime).await.unwrap();
+        for child in 0..2 {
+            let id = format!("tenant_{index}_{child}");
+            let mut tenant = shared_instance(&id, &runtime.runtime_id, &id, &id, 15432);
+            tenant.tenant_password = Some(format!("secret-{id}"));
+            if child == 0 {
+                tenant.desired_state = DesiredInstanceState::Stopped;
+                tenant.status = InstanceStatus::Stopped;
+            }
+            placements
+                .reserve(metadata_reservation(&runtime.runtime_id, &tenant))
+                .await
+                .unwrap();
+            placements.mark_provisioned(&id).await.unwrap();
+            manager.upsert_preserving_fence(tenant).await.unwrap();
+        }
+        runtimes.push(placements.get(&runtime.runtime_id).await.unwrap().unwrap());
+    }
+
+    // Exercise the same persistence fan-out as restore_shared_limits, with
+    // more pools than SQLite connections. No engine or filesystem work is
+    // serialized to avoid the read-to-write upgrade race.
+    let recovery = futures::stream::iter(runtimes.iter().cloned())
+        .map(|mut runtime| {
+            let placements = &placements;
+            let manager = &manager;
+            async move {
+                for status in [EngineRuntimeStatus::Stopped, EngineRuntimeStatus::Running] {
+                    runtime.status = status;
+                    crate::placement::lifecycle::save_runtime(placements, manager, runtime.clone())
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>();
+    for result in tokio::time::timeout(std::time::Duration::from_secs(15), recovery)
+        .await
+        .unwrap()
+    {
+        result.unwrap();
+    }
+    pool.close().await;
+    let reopened = sqlite::connect(dir.path()).await.unwrap();
+    let placements = PlacementRepository::encrypted(reopened.clone(), dir.path()).unwrap();
+    let instances = InstanceRepository::encrypted(reopened.clone(), dir.path()).unwrap();
+    for runtime in runtimes {
+        let stored = placements.get(&runtime.runtime_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, EngineRuntimeStatus::Running);
+        assert_eq!(stored.reserved, runtime.reserved);
+        assert_eq!(stored.admin_secret, runtime.admin_secret);
+        for id in placements.tenants(&runtime.runtime_id).await.unwrap() {
+            let tenant = instances.get(&id).await.unwrap().unwrap();
+            assert_eq!(tenant.owner, runtime.owner);
+            assert_eq!(tenant.runtime_id, runtime.runtime_id);
+            assert_eq!(tenant.tenant_password, Some(format!("secret-{id}")));
+            assert_eq!(
+                tenant.status,
+                if id.ends_with("_0") {
+                    InstanceStatus::Stopped
+                } else {
+                    InstanceStatus::Running
+                }
+            );
+        }
+    }
+    reopened.close().await;
 }
 
 #[tokio::test]

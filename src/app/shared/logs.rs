@@ -1,3 +1,44 @@
+use super::redaction;
+
+pub(crate) const LOG_RECORD_LIMIT: usize = 128 * 1024;
+pub(crate) const TRUNCATED_RECORD: &str = "[oversized log record omitted]\n";
+pub(crate) const INCOMPLETE_RECORD: &str = "[incomplete secret-bearing log record omitted]\n";
+
+#[derive(Default)]
+pub(crate) struct LogRedactor {
+    pending: String,
+    pub(crate) failed: bool,
+}
+
+impl LogRedactor {
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        let mut output = String::new();
+        for part in text.split_inclusive(['\n', '\r']) {
+            let complete = part.ends_with(['\n', '\r']);
+            if self.failed {
+                break;
+            }
+            if self.pending.len().saturating_add(part.len()) > LOG_RECORD_LIMIT {
+                self.pending.clear();
+                self.failed = true;
+                output.push_str(TRUNCATED_RECORD);
+                break;
+            }
+            self.pending.push_str(part);
+            if complete && let Some(safe) = redaction::redact_log_record(&self.pending) {
+                output.push_str(&safe);
+                self.pending.clear();
+            }
+        }
+        output
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        redaction::redact_log_record(&pending).unwrap_or_else(|| INCOMPLETE_RECORD.into())
+    }
+}
+
 pub fn truncate_log_tail(logs: &str, max_chars: usize) -> String {
     if logs.is_empty() {
         return "<empty>".to_string();

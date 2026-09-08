@@ -27,6 +27,46 @@ fn create_body_does_not_publish_backend_ports_by_default() {
 }
 
 #[test]
+fn every_database_uses_one_bounded_console_history_without_log_binds() {
+    use crate::config::DaemonEngine;
+    for engine in [DaemonEngine::Docker, DaemonEngine::Podman] {
+        let runtime = test_runtime_with_engine(engine, "auto");
+        for protocol in Protocol::ALL {
+            let mut spec = postgres_spec();
+            spec.protocol = protocol;
+            let body = runtime.create_body(&spec).unwrap();
+            let host = body.host_config.unwrap();
+            let logs = host.log_config.unwrap();
+            assert_eq!(
+                logs.typ.as_deref(),
+                Some(if engine == DaemonEngine::Docker {
+                    "local"
+                } else {
+                    "k8s-file"
+                })
+            );
+            let options = logs.config.unwrap();
+            assert_eq!(options.get("max-size").map(String::as_str), Some("5m"));
+            if engine == DaemonEngine::Docker {
+                assert_eq!(options.get("max-file").map(String::as_str), Some("1"));
+                assert_eq!(options.get("compress").map(String::as_str), Some("false"));
+            }
+            assert_eq!(
+                body.labels
+                    .unwrap()
+                    .get("dbev.console-policy")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert!(!host.mounts.unwrap().iter().any(|mount| matches!(
+                mount.target.as_deref(),
+                Some("/logs" | "/var/log/clickhouse-server")
+            )));
+        }
+    }
+}
+
+#[test]
 fn clickhouse_uses_a_loopback_resolvable_hostname_with_network_disabled() {
     let runtime = test_runtime();
     let mut spec = postgres_spec();
@@ -120,12 +160,11 @@ async fn create_preflight_creates_missing_managed_mount_dirs() {
     let temp = tempfile::tempdir().unwrap();
     let mut spec = postgres_spec();
     spec.data_path = temp.path().join("volumes").join("inst_abc");
-    spec.logs_path = temp.path().join("logs").join("instances").join("inst_abc");
 
     ensure_bind_mount_sources(&spec).await.unwrap();
 
     assert!(spec.data_path.is_dir());
-    assert!(spec.logs_path.is_dir());
+    assert!(!temp.path().join("logs").exists());
 }
 
 #[tokio::test]
@@ -133,7 +172,6 @@ async fn create_preflight_rejects_missing_read_only_file_mount() {
     let temp = tempfile::tempdir().unwrap();
     let mut spec = postgres_spec();
     spec.data_path = temp.path().join("volumes").join("inst_abc");
-    spec.logs_path = temp.path().join("logs").join("instances").join("inst_abc");
     spec.extra_mounts.push(DockerMount {
         source: temp.path().join("missing-config.xml"),
         target: "/etc/service/config.xml".to_string(),
@@ -521,8 +559,6 @@ fn postgres_spec() -> DockerInstanceSpec {
         pids_limit: None,
         data_path: PathBuf::from("/var/lib/databases-everywhere/instances/inst_abc/data"),
         data_target: "/var/lib/postgresql".to_string(),
-        logs_path: PathBuf::from("/var/log/databases-everywhere/instances/inst_abc"),
-        logs_target: "/logs".to_string(),
         extra_mounts: Vec::new(),
         socket_bridges: Vec::new(),
         env: vec![DockerEnv {

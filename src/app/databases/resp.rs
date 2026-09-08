@@ -17,7 +17,6 @@ pub(crate) fn instance_spec(
     instance_id: &str,
     image: &str,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     let server = match protocol {
@@ -40,8 +39,6 @@ pub(crate) fn instance_spec(
         pids_limit: None,
         data_path,
         data_target: "/data".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: CONTAINER_SOCKET_DIRECTORY.to_string(),
@@ -162,7 +159,6 @@ mod tests {
                 "instance",
                 image,
                 PathBuf::from("/tmp/data"),
-                PathBuf::from("/tmp/logs"),
                 PathBuf::from("/tmp/run"),
             );
 

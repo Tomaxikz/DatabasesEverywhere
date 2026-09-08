@@ -20,6 +20,7 @@ pub struct RuntimePathStatus {
 pub struct InstancePaths {
     pub instance_id: String,
     pub data: PathBuf,
+    /// Legacy engine-log directory, retained only for explicit instance purge.
     pub logs: PathBuf,
     pub sockets: PathBuf,
     pub artifacts: PathBuf,
@@ -68,7 +69,6 @@ impl InstancePaths {
 
     pub async fn create_dirs(&self) -> Result<(), InstancePathError> {
         create_private_dir(&self.data).await?;
-        create_private_dir(&self.logs).await?;
         create_private_dir(&self.sockets).await?;
         create_private_dir(&self.artifacts).await?;
         create_private_dir(&self.runtime_config).await?;
@@ -95,7 +95,6 @@ impl InstancePaths {
         };
         let paths = vec![
             self.data.clone(),
-            self.logs.clone(),
             self.sockets.clone(),
             self.artifacts.clone(),
         ];
@@ -121,7 +120,6 @@ impl InstancePaths {
         }
         let paths = vec![
             self.data.clone(),
-            self.logs.clone(),
             self.sockets.clone(),
             self.runtime_config.clone(),
         ];

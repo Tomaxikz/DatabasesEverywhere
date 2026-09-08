@@ -75,7 +75,7 @@ fn partial_final_records_and_redaction_overflow_are_explicit() {
     );
     assert_eq!(redactor.push(&huge), TRUNCATED_RECORD);
     assert!(redactor.failed);
-    assert!(redactor.pending.is_empty());
+    assert_eq!(redactor.finish(), "");
     assert_eq!(redactor.push("unclosed secret suffix\n"), "");
 }
 

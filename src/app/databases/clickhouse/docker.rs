@@ -34,7 +34,6 @@ pub fn instance_spec(
     username: &str,
     password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     hosted_config_path: PathBuf,
     runtime_path: PathBuf,
     bridge_binary_path: PathBuf,
@@ -48,7 +47,6 @@ pub fn instance_spec(
             password,
         },
         data_path,
-        logs_path,
         hosted_config_path,
         runtime_path,
         bridge_binary_path,
@@ -61,7 +59,6 @@ pub fn shared_spec(
     image: &str,
     admin_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     hosted_config_path: PathBuf,
     runtime_path: PathBuf,
     bridge_binary_path: PathBuf,
@@ -75,7 +72,6 @@ pub fn shared_spec(
             password: admin_password,
         },
         data_path,
-        logs_path,
         hosted_config_path,
         runtime_path,
         bridge_binary_path,
@@ -88,7 +84,6 @@ fn build_spec(
     image: &str,
     bootstrap: Bootstrap,
     data_path: PathBuf,
-    logs_path: PathBuf,
     hosted_config_path: PathBuf,
     runtime_path: PathBuf,
     bridge_binary_path: PathBuf,
@@ -107,8 +102,6 @@ fn build_spec(
         pids_limit: None,
         data_path,
         data_target: "/var/lib/clickhouse".to_string(),
-        logs_path,
-        logs_target: "/var/log/clickhouse-server".to_string(),
         extra_mounts: vec![
             DockerMount {
                 source: hosted_config_path,
@@ -241,6 +234,14 @@ fn hosted_config_xml(shared: bool) -> String {
     };
     format!(
         r#"<clickhouse>
+    <logger replace="replace">
+        <level>warning</level>
+        <console>1</console>
+        <console_log_level>warning</console_log_level>
+        <log remove="remove"/>
+        <errorlog remove="remove"/>
+        <async_queue_max_size>1024</async_queue_max_size>
+    </logger>
     <!-- Dedicated instances disable internal system logs. Shared pools retain
          one short-lived query log for aggregate tenant accounting; every
          other diagnostic MergeTree log remains disabled. -->
@@ -261,11 +262,92 @@ fn hosted_config_xml(shared: bool) -> String {
     <backup_log remove="1"/>
     <blob_storage_log remove="1"/>
     <background_schedule_pool_log remove="1"/>
+    <histogram_metric_log remove="1"/>
+    <instrumentation_trace_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <iceberg_metadata_log remove="1"/>
+    <delta_lake_metadata_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <aggregated_zookeeper_log remove="1"/>
+    <zookeeper_connection_log remove="1"/>
 {shared_access_control}    <listen_host>127.0.0.1</listen_host>
     <interserver_listen_host>127.0.0.1</interserver_listen_host>
 </clickhouse>
 "#
     )
+}
+
+/// Used only after the managed container has adopted console-only logging.
+/// Keep unknown files and links; never walk or delete database directories.
+pub(crate) async fn remove_legacy_logs(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, statat, unlinkat};
+        let directory = match open(
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => directory,
+            Err(rustix::io::Errno::NOENT) => return Ok((0, 0)),
+            Err(error) => return Err(std::io::Error::from(error)),
+        };
+        let mut entries = Dir::new(directory)?;
+        let mut removed = (0_u64, 0_u64);
+        for _ in 0..1024 {
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_str().is_ok_and(legacy_log_name) {
+                continue;
+            }
+            let fd = entries.fd()?;
+            let stat = match statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => return Err(std::io::Error::from(error)),
+            };
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1
+            {
+                continue;
+            }
+            match unlinkat(fd, name, AtFlags::empty()) {
+                Ok(()) => {
+                    removed.0 += 1;
+                    removed.1 = removed.1.saturating_add(
+                        u64::try_from(stat.st_blocks)
+                            .unwrap_or(0)
+                            .saturating_mul(512),
+                    );
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(std::io::Error::from(error)),
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+fn legacy_log_name(name: &str) -> bool {
+    ["clickhouse-server.log", "clickhouse-server.err.log"]
+        .iter()
+        .any(|base| {
+            if name == *base {
+                return true;
+            }
+            let Some(suffix) = name
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+            else {
+                return false;
+            };
+            let suffix = suffix.strip_suffix(".gz").unwrap_or(suffix);
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
@@ -281,7 +363,6 @@ mod tests {
             "app_ch_1",
             SecretString::from("secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/logs/dbe-hosted-overrides.xml"),
             PathBuf::from("/tmp/run"),
             PathBuf::from("/tmp/dbev-socket-bridge"),
@@ -289,7 +370,6 @@ mod tests {
 
         assert_eq!(spec.protocol, Protocol::Clickhouse);
         assert_eq!(spec.data_target, "/var/lib/clickhouse");
-        assert_eq!(spec.logs_target, "/var/log/clickhouse-server");
         assert_eq!(spec.pids_limit, None);
         assert_eq!(spec.extra_mounts[0].target, HOSTED_CONFIG_TARGET);
         assert!(spec.extra_mounts[0].read_only);
@@ -314,7 +394,6 @@ mod tests {
             "clickhouse/clickhouse-server:26.4",
             SecretString::from("admin-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/logs/dbe-hosted-overrides.xml"),
             PathBuf::from("/tmp/run"),
             PathBuf::from("/tmp/dbev-socket-bridge"),
@@ -342,7 +421,45 @@ mod tests {
         assert!(config.contains("<metric_log remove=\"1\"/>"));
         assert!(config.contains("<asynchronous_metric_log remove=\"1\"/>"));
         assert!(!config.contains("<access_control_improvements>"));
+        assert!(config.contains("<logger replace=\"replace\">"));
+        assert!(config.contains("<console>1</console>"));
+        assert!(config.contains("<level>warning</level>"));
+        assert!(config.contains("<log remove=\"remove\"/>"));
+        assert!(config.contains("<errorlog remove=\"remove\"/>"));
+        assert!(config.contains("<async_queue_max_size>1024</async_queue_max_size>"));
+        assert!(!config.contains("/var/log/"));
         assert!(config.contains("<listen_host>127.0.0.1</listen_host>"));
+    }
+
+    #[tokio::test]
+    async fn legacy_log_cleanup_preserves_unknown_files_and_links() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        for name in ["clickhouse-server.log", "clickhouse-server.err.log.0.gz"] {
+            std::fs::write(logs.join(name), b"old logs").unwrap();
+        }
+        let keep = directory.path().join("keep");
+        std::fs::write(&keep, b"unchanged").unwrap();
+        symlink(&keep, logs.join("clickhouse-server.log.1")).unwrap();
+        std::fs::hard_link(&keep, logs.join("clickhouse-server.err.log.1")).unwrap();
+        std::fs::write(logs.join("database.bin"), b"data").unwrap();
+        std::fs::write(logs.join("clickhouse-server.log.notes"), b"notes").unwrap();
+        std::fs::create_dir(logs.join("clickhouse-server.log.2")).unwrap();
+        let (removed, _) = remove_legacy_logs(&logs).await.unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(std::fs::read(&keep).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read(logs.join("database.bin")).unwrap(), b"data");
+        assert_eq!(
+            std::fs::read(logs.join("clickhouse-server.log.notes")).unwrap(),
+            b"notes"
+        );
+        assert!(logs.join("clickhouse-server.log.2").is_dir());
+        assert_eq!(remove_legacy_logs(&logs).await.unwrap().0, 0);
+        let link = directory.path().join("linked-logs");
+        symlink(&logs, &link).unwrap();
+        assert!(remove_legacy_logs(&link).await.is_err());
     }
 
     #[tokio::test]

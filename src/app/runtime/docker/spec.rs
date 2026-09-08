@@ -19,8 +19,6 @@ pub struct DockerInstanceSpec {
     pub pids_limit: Option<i64>,
     pub data_path: PathBuf,
     pub data_target: String,
-    pub logs_path: PathBuf,
-    pub logs_target: String,
     pub extra_mounts: Vec<DockerMount>,
     pub socket_bridges: Vec<SocketBridge>,
     pub env: Vec<DockerEnv>,

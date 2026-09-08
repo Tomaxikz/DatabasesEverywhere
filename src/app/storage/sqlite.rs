@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use sqlx::{
     SqlitePool,
@@ -50,6 +53,9 @@ pub async fn connect(data_root: &Path) -> Result<SqlitePool, SqliteStorageError>
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
+        // Bound writer admission, including BEGIN IMMEDIATE. Keep concurrent
+        // WAL readers; read/modify/write transactions acquire the writer first.
+        .busy_timeout(Duration::from_secs(5))
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()

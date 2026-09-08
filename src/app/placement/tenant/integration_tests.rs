@@ -1042,7 +1042,6 @@ async fn shared_spec(
             image,
             admin(),
             paths.data.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mysql => databases::mysql::docker::shared_spec(
@@ -1050,7 +1049,6 @@ async fn shared_spec(
             image,
             admin(),
             paths.data.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mariadb => databases::mariadb::docker::shared_spec(
@@ -1058,7 +1056,6 @@ async fn shared_spec(
             image,
             admin(),
             paths.data.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Mongodb => databases::mongodb::docker::shared_spec(
@@ -1066,7 +1063,6 @@ async fn shared_spec(
             image,
             admin(),
             paths.data.clone(),
-            paths.logs.clone(),
             paths.sockets.clone(),
         ),
         Protocol::Clickhouse => {
@@ -1082,7 +1078,6 @@ async fn shared_spec(
                 image,
                 admin(),
                 paths.data.clone(),
-                paths.logs.clone(),
                 config,
                 paths.sockets.clone(),
                 bridge,

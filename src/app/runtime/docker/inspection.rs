@@ -8,10 +8,7 @@ use bollard::{
 };
 use futures::{StreamExt, TryStreamExt};
 use secrecy::SecretString;
-use tokio::{
-    sync::mpsc,
-    time::{Instant, sleep},
-};
+use tokio::time::{Instant, sleep};
 
 use crate::{
     constants::docker::PROJECT_LABEL,
@@ -26,6 +23,17 @@ use crate::{
 const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl DockerRuntime {
+    pub(crate) async fn log_policy_is_current(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<bool, DockerError> {
+        let id = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let inspection = self.docker.inspect_container(&id, None).await?;
+        Ok(log_policy_matches(&inspection, self.engine()))
+    }
     /// Returns the exact protocol-qualified container name when it belongs to
     /// the requested DBE instance. A same-name container without the complete
     /// ownership label tuple is treated as an untrusted collision.
@@ -549,8 +557,10 @@ impl DockerRuntime {
             .required_managed_container_id(protocol, instance_id)
             .await?;
         let tail = tail.unwrap_or(200).clamp(1, 2_000).to_string();
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut stdout = super::CappedExecOutput::default();
+        let mut stderr = super::CappedExecOutput::default();
+        let mut stdout_redactor = crate::shared::logs::LogRedactor::default();
+        let mut stderr_redactor = crate::shared::logs::LogRedactor::default();
         let mut stream = self.docker.logs(
             &name,
             Some(
@@ -562,19 +572,39 @@ impl DockerRuntime {
             ),
         );
 
-        while let Some(chunk) = stream.try_next().await? {
-            match chunk {
-                LogOutput::StdErr { message } => {
-                    stderr.push_str(&String::from_utf8_lossy(&message));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(chunk) = stream.try_next().await? {
+                match chunk {
+                    LogOutput::StdErr { message } => {
+                        stderr.append(
+                            stderr_redactor
+                                .push(&String::from_utf8_lossy(&message))
+                                .as_bytes(),
+                        );
+                    }
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.append(
+                            stdout_redactor
+                                .push(&String::from_utf8_lossy(&message))
+                                .as_bytes(),
+                        );
+                    }
+                    LogOutput::StdIn { .. } => {}
                 }
-                LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    stdout.push_str(&String::from_utf8_lossy(&message));
+                if stdout_redactor.failed || stderr_redactor.failed {
+                    break;
                 }
-                LogOutput::StdIn { .. } => {}
             }
-        }
-
-        Ok(CommandOutput { stdout, stderr })
+            Ok::<_, DockerError>(())
+        })
+        .await
+        .map_err(|_| DockerError::LogsTimedOut)??;
+        stdout.append(stdout_redactor.finish().as_bytes());
+        stderr.append(stderr_redactor.finish().as_bytes());
+        Ok(CommandOutput {
+            stdout: stdout.into_string(),
+            stderr: stderr.into_string(),
+        })
     }
 
     pub async fn follow_logs(
@@ -582,16 +612,19 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
         tail: Option<usize>,
-    ) -> Result<mpsc::Receiver<Result<CommandOutput, DockerError>>, DockerError> {
+    ) -> Result<
+        impl futures::Stream<Item = Result<CommandOutput, DockerError>> + Send + Unpin + 'static,
+        DockerError,
+    > {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        let docker = self.docker.clone();
         let tail = tail.unwrap_or(100).clamp(1, 2_000).to_string();
-        let (tx, rx) = mpsc::channel(128);
-
-        tokio::spawn(async move {
-            let mut stream = docker.logs(
+        // Poll Docker directly: dropping the WebSocket drops this stream too.
+        // No detached producer or per-viewer queue retains console output.
+        Ok(self
+            .docker
+            .logs(
                 &name,
                 Some(
                     LogsOptionsBuilder::default()
@@ -601,31 +634,23 @@ impl DockerRuntime {
                         .follow(true)
                         .build(),
                 ),
-            );
-
-            while let Some(chunk) = stream.next().await {
-                let output = match chunk {
-                    Ok(LogOutput::StdErr { message }) => Ok(CommandOutput {
+            )
+            .filter_map(|chunk| {
+                futures::future::ready(match chunk {
+                    Ok(LogOutput::StdErr { message }) => Some(Ok(CommandOutput {
                         stdout: String::new(),
                         stderr: String::from_utf8_lossy(&message).to_string(),
-                    }),
+                    })),
                     Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
-                        Ok(CommandOutput {
+                        Some(Ok(CommandOutput {
                             stdout: String::from_utf8_lossy(&message).to_string(),
                             stderr: String::new(),
-                        })
+                        }))
                     }
-                    Ok(LogOutput::StdIn { .. }) => continue,
-                    Err(error) => Err(DockerError::from(error)),
-                };
-
-                if tx.send(output).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(rx)
+                    Ok(LogOutput::StdIn { .. }) => None,
+                    Err(error) => Some(Err(DockerError::from(error))),
+                })
+            }))
     }
 
     pub async fn stats(
@@ -652,6 +677,48 @@ impl DockerRuntime {
             container_id,
         })
     }
+}
+
+fn log_policy_matches(
+    inspection: &ContainerInspectResponse,
+    engine: crate::config::DaemonEngine,
+) -> bool {
+    let expected = super::container_config::log_config(engine);
+    let marked = inspection
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(super::container_config::LOG_POLICY_LABEL))
+        .is_some_and(|value| value == super::container_config::LOG_POLICY_VERSION);
+    let configured = inspection
+        .host_config
+        .as_ref()
+        .and_then(|host| host.log_config.as_ref());
+    // Podman's Docker-compatible inspect omits native LogConfig.Size and
+    // reports k8s-file as json-file. Its policy marker is written only by our
+    // bounded create path; do not repeatedly recreate a compliant container.
+    let matches = match engine {
+        crate::config::DaemonEngine::Docker => configured == Some(&expected),
+        crate::config::DaemonEngine::Podman => configured.is_some_and(|value| {
+            matches!(value.typ.as_deref(), Some("json-file" | "k8s-file"))
+                && (value.config.is_none()
+                    || value
+                        .config
+                        .as_ref()
+                        .is_some_and(|values| values.is_empty())
+                    || value.config == expected.config)
+        }),
+    };
+    marked
+        && matches
+        && !inspection.mounts.as_ref().is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                matches!(
+                    mount.destination.as_deref(),
+                    Some("/logs" | "/var/log/clickhouse-server")
+                ) && mount.typ.as_deref() == Some("bind")
+            })
+        })
 }
 
 impl ManagedStatsSampler {
@@ -740,6 +807,190 @@ fn unique_optional_env(environment: &[String], key: &str) -> Result<Option<Strin
         return Err(format!("duplicate {key} entries are present"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use crate::{
+        config::{DaemonConfig, DaemonEngine},
+        constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
+    };
+
+    #[test]
+    fn log_policy_upgrade_is_idempotent_and_rejects_unbounded_or_legacy_layouts() {
+        for engine in [DaemonEngine::Docker, DaemonEngine::Podman] {
+            let mut value = serde_json::json!({
+                "Config":{"Labels":{"dbev.console-policy":"1"}},
+                "HostConfig":{"LogConfig":super::super::container_config::log_config(engine)},
+                "Mounts":[]
+            });
+            let matches = |value: &serde_json::Value| {
+                log_policy_matches(&serde_json::from_value(value.clone()).unwrap(), engine)
+            };
+            assert!(matches(&value));
+            if engine == DaemonEngine::Podman {
+                value["HostConfig"]["LogConfig"] =
+                    serde_json::json!({"Type":"json-file","Config":null});
+                assert!(
+                    matches(&value),
+                    "native Podman size is omitted from Docker-compatible inspect"
+                );
+            }
+            let valid = value.clone();
+            value["Config"]["Labels"] = serde_json::json!({});
+            assert!(!matches(&value));
+            value = valid.clone();
+            value["HostConfig"]["LogConfig"] = serde_json::json!({"Type":"json-file","Config":{}});
+            if engine == DaemonEngine::Docker {
+                assert!(!matches(&value));
+            }
+            value = valid.clone();
+            value["HostConfig"]["LogConfig"]["Config"] = serde_json::json!({"max-size":"-1"});
+            assert!(!matches(&value));
+            value = valid;
+            value["Mounts"] = serde_json::json!([{"Type":"bind","Destination":"/var/log/clickhouse-server","Source":"/logs/legacy"}]);
+            assert!(!matches(&value));
+        }
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_and_dropping_a_live_reader_closes_the_stream() {
+        use axum::body::Body;
+        use bytes::Bytes;
+        use hyper::{Response, server::conn::http1, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use std::{
+            convert::Infallible,
+            sync::{Arc, Mutex},
+        };
+        use tokio::{net::UnixListener, sync::oneshot};
+
+        struct StreamDropped(Option<oneshot::Sender<()>>);
+        impl Drop for StreamDropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        fn frame(channel: u8, contents: &[u8]) -> Bytes {
+            let mut bytes = vec![channel, 0, 0, 0];
+            bytes.extend_from_slice(&(contents.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(contents);
+            Bytes::from(bytes)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let config = DaemonConfig {
+            socket_path: path.display().to_string(),
+            ..Default::default()
+        };
+        let runtime = DockerRuntime::new(&config, false)
+            .unwrap()
+            .with_node_id("test-node");
+        let labels = std::collections::HashMap::from([
+            (MANAGED_LABEL, "true"),
+            (INSTANCE_LABEL, "inst_abc"),
+            (PROTOCOL_LABEL, "postgres"),
+            (NODE_LABEL, "test-node"),
+        ]);
+        let inspection =
+            serde_json::json!({"Id":"a".repeat(64),"Config":{"Labels":labels}}).to_string();
+        let (dropped, finished) = oneshot::channel();
+        let dropped = Arc::new(Mutex::new(Some(dropped)));
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let inspection = inspection.clone();
+                let dropped = dropped.clone();
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let inspection = inspection.clone();
+                            let dropped = dropped.clone();
+                            async move {
+                                let body = if request.uri().path().ends_with("/json") {
+                                    Body::from(inspection)
+                                } else {
+                                    assert!(request.uri().path().ends_with("/logs"));
+                                    let query = request.uri().query().unwrap();
+                                    assert!(query.contains("tail="));
+                                    if query.contains("follow=true") {
+                                        let guard = StreamDropped(dropped.lock().unwrap().take());
+                                        Body::from_stream(futures::stream::unfold(
+                                            (guard, 0),
+                                            |(guard, index)| async move {
+                                                let bytes = match index {
+                                                    0 => frame(1, b"recent tail\n"),
+                                                    1 => frame(2, b"live output\n"),
+                                                    _ => futures::future::pending().await,
+                                                };
+                                                Some((
+                                                    Ok::<_, Infallible>(bytes),
+                                                    (guard, index + 1),
+                                                ))
+                                            },
+                                        ))
+                                    } else {
+                                        let mut history = "old line\n".repeat(160_000);
+                                        history.push_str(
+                                            "PASSWORD=\"hidden-secret\"\nimportant tail\n",
+                                        );
+                                        Body::from(frame(1, history.as_bytes()))
+                                    }
+                                };
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .header("Content-Type", "application/vnd.docker.raw-stream")
+                                        .body(body)
+                                        .unwrap(),
+                                )
+                            }
+                        });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(socket), service)
+                        .await;
+                });
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let history = runtime
+                .logs(Protocol::Postgres, "inst_abc", Some(2000))
+                .await
+                .unwrap();
+            assert!(
+                history
+                    .stdout
+                    .starts_with(super::super::EXEC_OUTPUT_TRUNCATION_MARKER)
+            );
+            assert!(history.stdout.ends_with("important tail\n"));
+            assert!(!history.stdout.contains("hidden-secret"));
+            assert!(
+                history.stdout.len()
+                    <= super::super::MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL
+                        + super::super::EXEC_OUTPUT_TRUNCATION_MARKER.len()
+            );
+            let mut live = runtime
+                .follow_logs(Protocol::Postgres, "inst_abc", None)
+                .await
+                .unwrap();
+            assert_eq!(live.next().await.unwrap().unwrap().stdout, "recent tail\n");
+            assert_eq!(live.next().await.unwrap().unwrap().stderr, "live output\n");
+            drop(live);
+            finished.await.unwrap();
+            assert!(
+                runtime
+                    .logs(Protocol::Postgres, "another_instance", None)
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+        server.abort();
+        result.unwrap();
+    }
 }
 
 #[cfg(test)]

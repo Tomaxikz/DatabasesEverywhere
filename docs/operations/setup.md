@@ -197,8 +197,32 @@ remain visible at the default level.
 
 DBEV writes to stdout/journald and `paths.logs/dbev.log`. The file rotates at
 10 MiB with four numbered archives: **50 MiB total** for those five files.
-Old dated logs, instance/container logs, and the system journal are separate
-and are not covered or deleted by that cap.
+Old dated daemon logs and the system journal are separate and are not covered
+or deleted by that cap.
+
+The file writer queues at most 2,048 records. Its existing best-effort behavior
+drops file copies when the disk writer falls behind instead of blocking API
+tasks. The separate stdout/journald output is unchanged.
+
+Database console history is runtime-owned, not copied into `paths.logs/instances`.
+Docker uses the `local` driver with `max-size=5m`, `max-file=1`, and compression
+disabled; Podman uses its equivalent size-limited `k8s-file` driver. This is
+approximately 5 MiB per physical container, plus runtime bookkeeping—not an
+unlimited log archive. REST/WebSocket log endpoints read this recent history
+and stream new output directly.
+
+ClickHouse emits warning/error console messages, not separate text-log files.
+Its short-lived shared-tenant accounting table and database transaction logs
+are independent of console history and remain intact.
+
+On upgrade, compatible running containers are recreated once through the normal
+replacement workflow to adopt the policy. Data volumes and credentials are kept;
+old Docker console history is discarded. Stopped containers stay stopped and
+adopt the policy when started/restarted. Ambiguous images, missing credentials,
+or interrupted operations are reported rather than blindly recreated.
+After a healthy ClickHouse upgrade, only standard legacy `clickhouse-server.log`
+and `clickhouse-server.err.log` files (including numbered/gzip rotations) are
+removed. Unknown files, links, database data, and backups are preserved.
 
 For temporary request tracing, set this service environment value and restart;
 remove it after diagnosis:

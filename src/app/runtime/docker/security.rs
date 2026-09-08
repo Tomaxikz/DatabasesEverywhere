@@ -116,8 +116,6 @@ impl DockerSecurityPolicy {
     pub fn validate_spec(&self, spec: &DockerInstanceSpec) -> Result<(), DockerSecurityError> {
         validate_mount_source(&spec.data_path)?;
         validate_mount_target(&spec.data_target)?;
-        validate_mount_source(&spec.logs_path)?;
-        validate_mount_target(&spec.logs_target)?;
         for mount in &spec.extra_mounts {
             validate_mount_source(&mount.source)?;
             validate_extra_mount_target(&mount.target)?;
@@ -531,8 +529,6 @@ mod tests {
             pids_limit: None,
             data_path: PathBuf::from("/var/lib/databases-everywhere/instances/inst_abc/data"),
             data_target: "/var/lib/postgresql".to_string(),
-            logs_path: PathBuf::from("/var/log/databases-everywhere/instances/inst_abc"),
-            logs_target: "/logs".to_string(),
             extra_mounts: Vec::new(),
             socket_bridges: Vec::new(),
             env: vec![DockerEnv {

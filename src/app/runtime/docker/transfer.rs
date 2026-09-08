@@ -181,10 +181,7 @@ impl DockerRuntime {
 }
 
 pub(super) fn container_mounts(spec: &DockerInstanceSpec) -> Vec<bollard::models::Mount> {
-    let mut mounts = vec![
-        bind_mount(&spec.data_path, &spec.data_target, false),
-        bind_mount(&spec.logs_path, &spec.logs_target, false),
-    ];
+    let mut mounts = vec![bind_mount(&spec.data_path, &spec.data_target, false)];
     mounts.extend(
         spec.extra_mounts
             .iter()
@@ -197,7 +194,6 @@ pub(super) async fn ensure_bind_mount_sources(
     spec: &DockerInstanceSpec,
 ) -> Result<(), DockerError> {
     ensure_bind_mount_dir(&spec.data_path).await?;
-    ensure_bind_mount_dir(&spec.logs_path).await?;
     for mount in &spec.extra_mounts {
         if mount.read_only {
             ensure_bind_mount_file(&mount.source).await?;

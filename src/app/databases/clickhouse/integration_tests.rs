@@ -14,6 +14,48 @@ const SHARED_DATABASE: &str = "shared_integration_db";
 const SHARED_TENANT: &str = "shared_integration_user";
 const SHARED_PASSWORD: &str = "shared-integration-password";
 
+#[tokio::test]
+#[ignore = "requires DBE_CLICKHOUSE_BINARY; validates the real config merge without starting a database"]
+async fn hosted_console_config_removes_inherited_file_logging() {
+    let binary = std::env::var_os("DBE_CLICKHOUSE_BINARY").expect("set DBE_CLICKHOUSE_BINARY");
+    for shared in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.xml");
+        std::fs::write(&config, r#"<clickhouse><logger><level>trace</level><log>/unwanted/server.log</log><errorlog>/unwanted/error.log</errorlog><console>0</console><size>1000M</size><count>10</count></logger><query_log><database>system</database><table>query_log</table></query_log></clickhouse>"#).unwrap();
+        let overrides = directory.path().join("config.d");
+        if shared {
+            super::docker::write_shared_hosted_config(&overrides)
+                .await
+                .unwrap();
+        } else {
+            super::docker::write_hosted_config(&overrides)
+                .await
+                .unwrap();
+        }
+        for (key, expected) in [
+            ("logger.log", ""),
+            ("logger.errorlog", ""),
+            ("logger.level", "warning"),
+            ("logger.console", "1"),
+            ("logger.async_queue_max_size", "1024"),
+            ("query_log.table", if shared { "query_log" } else { "" }),
+        ] {
+            let output = Command::new(&binary)
+                .args(["extract-from-config", "--config-file"])
+                .arg(&config)
+                .args(["--key", key, "--try"])
+                .output()
+                .unwrap();
+            assert_success(&output, "merge console-only logging configuration");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                expected,
+                "shared={shared}, key={key}"
+            );
+        }
+    }
+}
+
 fn shared_sql_scenario() -> String {
     use super::provision::{self, TenantQuota};
     let create = provision::create_tenant_sql(SHARED_DATABASE, SHARED_TENANT).replace(

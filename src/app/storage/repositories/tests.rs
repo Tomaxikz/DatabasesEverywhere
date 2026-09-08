@@ -6,6 +6,74 @@ use crate::{
 };
 
 #[tokio::test]
+async fn shared_upsert_waits_for_writer_before_reading_recovery_state() {
+    use crate::placement::{PlacementRepository, ReserveTenant};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(dir.path()).await.unwrap();
+    let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
+    let placements = PlacementRepository::new(pool.clone());
+    let runtime =
+        crate::placement::test_support::runtime("pool", Protocol::Postgres, "postgres:18");
+    placements.save(&runtime).await.unwrap();
+    let mut metadata = sample_metadata();
+    metadata.deployment_mode = DeploymentMode::Shared;
+    metadata.runtime_id = runtime.runtime_id.clone();
+    metadata.owner = runtime.owner.clone();
+    metadata.limits.disk_mib = 64;
+    metadata.tenant_password = Some("preserved-secret".into());
+    placements
+        .reserve(ReserveTenant {
+            owner: runtime.owner.unwrap(),
+            instance_id: &metadata.instance_id,
+            runtime_id: &runtime.runtime_id,
+            database: &metadata.database.name,
+            username: &metadata.database.username,
+            limits: &metadata.limits,
+        })
+        .await
+        .unwrap();
+    placements
+        .mark_provisioned(&metadata.instance_id)
+        .await
+        .unwrap();
+    repository.upsert(&metadata).await.unwrap();
+
+    // A second connection updates the recovery fence while startup saves a
+    // shared tenant. A deferred read/write upgrade fails immediately here,
+    // despite SQLite's busy timeout; admission must precede the read.
+    let mut writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE instance_metadata SET protected_secret_recovery_required = 1 WHERE instance_id = ?1")
+        .bind(&metadata.instance_id).execute(&mut *writer).await.unwrap();
+    metadata.tenant_password = Some("must-not-replace-fenced-secret".into());
+    let save = repository.upsert(&metadata);
+    tokio::pin!(save);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut save)
+            .await
+            .is_err()
+    );
+    writer.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), save)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (fenced, encrypted): (bool, String) = sqlx::query_as(
+        "SELECT protected_secret_recovery_required, tenant_password FROM instance_metadata JOIN instance_route_auth USING (instance_id) WHERE instance_id = ?1",
+    ).bind(&metadata.instance_id).fetch_one(&pool).await.unwrap();
+    assert!(fenced);
+    assert!(is_encrypted(&encrypted));
+    assert_eq!(
+        repository
+            .unprotect_route_secret("tenant_password", &metadata.instance_id, Some(encrypted))
+            .unwrap(),
+        Some("preserved-secret".into())
+    );
+}
+
+#[tokio::test]
 async fn upserts_and_lists_instance_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();

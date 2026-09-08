@@ -13,7 +13,9 @@ use crate::{api::monitoring::resources::NetworkCounter, shared::backend::Backend
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const TUNNEL_BUFFER_SIZE: usize = 64 * 1024;
+// Two buffers are retained for the lifetime of every idle tunnel. Stream
+// larger transfers in 16 KiB chunks instead of reserving 128 KiB per client.
+const TUNNEL_BUFFER_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {
@@ -272,6 +274,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn small_buffers_preserve_large_transfers_and_half_closes() {
+        let (client, mut client_proxy) = io::duplex(1024);
+        let (backend_proxy, database) = io::duplex(1024);
+        let network = NetworkCounter::default();
+        let sessions = crate::gateway::sessions::TenantSessions::default();
+        let mut backend =
+            MeteredBackend::new(backend_proxy, network.clone(), sessions.open("tenant"));
+        let request = vec![0x51; 256 * 1024 + 7];
+        let response = vec![0x52; 256 * 1024 + 13];
+        let client_exchange = async {
+            let (mut read, mut write) = io::split(client);
+            let mut received = Vec::new();
+            let send = async {
+                write.write_all(&request).await?;
+                write.shutdown().await
+            };
+            tokio::try_join!(send, read.read_to_end(&mut received)).unwrap();
+            received
+        };
+        let database_exchange = async {
+            let (mut read, mut write) = io::split(database);
+            let mut received = Vec::new();
+            let send = async {
+                write.write_all(b"!").await?;
+                write.write_all(&response).await?;
+                write.shutdown().await
+            };
+            tokio::try_join!(send, read.read_to_end(&mut received)).unwrap();
+            received
+        };
+        let (forwarded, reply, query) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                tunnel_after_backend_reply(&mut client_proxy, &mut backend, "test".into()),
+                client_exchange,
+                database_exchange,
+            )
+        })
+        .await
+        .unwrap();
+        forwarded.unwrap();
+        assert_eq!(query, request);
+        assert_eq!(reply[0], b'!');
+        assert_eq!(reply[1..], response);
+        assert_eq!(
+            network.snapshot(),
+            (request.len() as u64, response.len() as u64 + 1)
+        );
+    }
 
     #[tokio::test]
     async fn legacy_tcp_backends_fail_closed() {

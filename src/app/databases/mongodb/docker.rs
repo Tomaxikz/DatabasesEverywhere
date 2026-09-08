@@ -27,7 +27,6 @@ pub fn instance_spec(
     database: &str,
     auth: MongodbAuth,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -40,7 +39,6 @@ pub fn instance_spec(
         }),
         auth.root_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -50,7 +48,6 @@ pub fn shared_spec(
     image: &str,
     root_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     build_spec(
@@ -59,7 +56,6 @@ pub fn shared_spec(
         None,
         root_password,
         data_path,
-        logs_path,
         runtime_path,
     )
 }
@@ -71,7 +67,6 @@ fn build_spec(
     tenant: Option<TenantBootstrap>,
     root_password: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     let shared = tenant.is_none();
@@ -135,8 +130,6 @@ fn build_spec(
         pids_limit: None,
         data_path,
         data_target: "/data/db".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: CONTAINER_SOCKET_DIRECTORY.to_string(),
@@ -164,7 +157,6 @@ mod tests {
                 root_password: SecretString::from("root-secret"),
             },
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
 
@@ -206,7 +198,6 @@ mod tests {
             "mongo:8",
             SecretString::from("root-secret"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
         );
         let keys = spec

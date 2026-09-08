@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{
@@ -12,8 +10,6 @@ use crate::{
     },
     shared::{limits::InstanceLimits, time::now_rfc3339},
 };
-
-const SQLITE_WRITE_ATTEMPTS: u32 = 5;
 
 impl PlacementRepository {
     pub async fn reserve(
@@ -37,7 +33,8 @@ impl PlacementRepository {
         let now = now_rfc3339();
         let memory_mib = u64_to_i64(requested.memory_mib, "memory_mib")?;
         let disk_mib = u64_to_i64(requested.disk_mib, "disk_mib")?;
-        let mut transaction = self.pool.begin().await?;
+        // Reserve SQLite's writer slot before taking the capacity snapshot.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let runtime_row = sqlx::query(
             "SELECT protocol, reserved_disk_mib FROM engine_runtimes WHERE runtime_id = ?1",
         )
@@ -241,7 +238,7 @@ impl PlacementRepository {
     }
 
     pub async fn release(&self, instance_id: &str) -> Result<bool, PlacementRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let attached = sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS(
@@ -301,29 +298,10 @@ impl PlacementRepository {
         instance_id: &str,
         requested: &InstanceLimits,
     ) -> Result<EngineRuntime, PlacementRepositoryError> {
-        let mut attempt = 1;
-        loop {
-            match self.resize_once(instance_id, requested).await {
-                Err(PlacementRepositoryError::Sqlx(error))
-                    if sqlite_write_contention(&error) && attempt < SQLITE_WRITE_ATTEMPTS =>
-                {
-                    tokio::time::sleep(Duration::from_millis(u64::from(attempt) * 10)).await;
-                    attempt += 1;
-                }
-                result => return result,
-            }
-        }
-    }
-
-    async fn resize_once(
-        &self,
-        instance_id: &str,
-        requested: &InstanceLimits,
-    ) -> Result<EngineRuntime, PlacementRepositoryError> {
         check_reservation(requested)?;
         let new_memory = u64_to_i64(requested.memory_mib, "memory_mib")?;
         let new_disk = u64_to_i64(requested.disk_mib, "disk_mib")?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query(
             r#"
             SELECT reservation.runtime_id, reservation.cpu_cores,
@@ -428,20 +406,6 @@ impl PlacementRepository {
             .await?
             .ok_or(PlacementRepositoryError::RuntimeNotFound(runtime_id))
     }
-}
-
-fn sqlite_write_contention(error: &sqlx::Error) -> bool {
-    let sqlx::Error::Database(error) = error else {
-        return false;
-    };
-    let code_is_busy = error
-        .code()
-        .and_then(|code| code.parse::<u32>().ok())
-        .is_some_and(|code| matches!(code & 0xff, 5 | 6));
-    let message = error.message().to_ascii_lowercase();
-    code_is_busy
-        || message.contains("database is locked")
-        || message.contains("database table is locked")
 }
 
 async fn sync_runtime_capacity(

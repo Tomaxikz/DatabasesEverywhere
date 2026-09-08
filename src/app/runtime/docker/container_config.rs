@@ -1,6 +1,29 @@
-use bollard::models::{HealthConfig, Mount, MountType};
+use bollard::models::{HealthConfig, HostConfigLogConfig, Mount, MountType};
 
 use crate::shared::protocol::Protocol;
+
+pub(super) const LOG_POLICY_LABEL: &str = "dbev.console-policy";
+pub(super) const LOG_POLICY_VERSION: &str = "1";
+
+/// One small runtime-owned history; DBEV streams it without keeping a copy.
+pub(super) fn log_config(engine: crate::config::DaemonEngine) -> HostConfigLogConfig {
+    let (driver, options) = match engine {
+        crate::config::DaemonEngine::Docker => (
+            "local",
+            vec![("max-size", "5m"), ("max-file", "1"), ("compress", "false")],
+        ),
+        crate::config::DaemonEngine::Podman => ("k8s-file", vec![("max-size", "5m")]),
+    };
+    HostConfigLogConfig {
+        typ: Some(driver.into()),
+        config: Some(
+            options
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        ),
+    }
+}
 
 pub(super) fn bind_mount(source: &std::path::Path, target: &str, read_only: bool) -> Mount {
     Mount {

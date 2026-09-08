@@ -230,7 +230,7 @@ impl InstanceRepository {
             .secrets
             .as_ref()
             .ok_or(RepositoryError::EncryptedRepositoryRequired)?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             r#"
             SELECT

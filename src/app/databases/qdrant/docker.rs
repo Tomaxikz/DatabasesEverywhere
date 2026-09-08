@@ -21,7 +21,6 @@ pub fn instance_spec(
     image: &str,
     api_key: SecretString,
     data_path: PathBuf,
-    logs_path: PathBuf,
     runtime_path: PathBuf,
     bridge_binary_path: PathBuf,
 ) -> DockerInstanceSpec {
@@ -39,8 +38,6 @@ pub fn instance_spec(
         pids_limit: None,
         data_path,
         data_target: "/dbe-qdrant".to_string(),
-        logs_path,
-        logs_target: "/logs".to_string(),
         extra_mounts: vec![
             DockerMount {
                 source: runtime_path,
@@ -113,7 +110,6 @@ mod tests {
             "qdrant/qdrant:v1.18.2",
             SecretString::from("api-key"),
             PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs"),
             PathBuf::from("/tmp/run"),
             PathBuf::from("/tmp/dbev-socket-bridge"),
         );
