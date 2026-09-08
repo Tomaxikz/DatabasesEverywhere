@@ -1,13 +1,14 @@
 # CI and local checks
 
-DBEV is Linux-only. Run tests on Linux/WSL, not just a Windows cross-build.
+Run on Linux/WSL with the pinned Rust toolchain:
 
 ```bash
 bash .github/ci/check.sh pre-push
 ```
 
-This runs formatting, strict Clippy, the Rust source-size check, and workspace
-tests. To enable it as this clone's pre-push hook:
+This runs formatting, strict Clippy, source-size checks, and workspace tests.
+Use `lint`, `test`, or `audit` instead of `pre-push` for individual checks.
+To enable the pre-push hook:
 
 ```bash
 chmod +x .githooks/pre-push
@@ -16,58 +17,46 @@ git config core.hooksPath .githooks
 
 ## GitHub Actions
 
-Global lint gates the parallel audit, unit/contract tests, driver tests,
-Podman, documentation, CodeQL, and release-architecture builds.
-Require the final `CI gate` status in branch rules.
+Require the final `CI gate` in branch rules. [CI](../workflows/ci.yml) defines
+the check matrix; [release](../workflows/release.yml) independently validates
+versions and repeats required checks before publishing. Release runs are serialized.
+Protect the `production-release` environment with reviewers and main/version-tag refs.
 
-[Release publication](../workflows/release.yml) independently validates the
-version, repeats required checks/builds, and publishes only after success.
-Release runs are serialized. Configure the `production-release` environment
-with reviewers and protected main/version-tag deployment refs.
-
-Binary builds use the reusable [Linux build workflow](../workflows/build-binaries.yml).
-Consult the workflows for current matrices, tool versions, and deadlines rather
-than duplicating those values here.
+The [Linux build workflow](../workflows/build-binaries.yml) handles architecture packaging.
+Use the workflows as the source for tool versions, matrices, and deadlines.
 
 ## Real database tests
 
-Prerequisites: Linux, Docker, Maven, JDK 21, and OpenSSL.
+Requires Linux, Docker, Maven, JDK 21, and OpenSSL:
 
 ```bash
 bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 26.7.0
 ```
 
-The canonical image/connector cases are in
-[mysql-driver-matrix.yml](../workflows/mysql-driver-matrix.yml), shared by CI
-and release. They test CLI/JDBC/Hikari, explicit/deferred catalogs, and TLS.
-Compilation and bounded runtime execution are separate steps.
+The [matrix](../workflows/mysql-driver-matrix.yml) is shared by CI and release.
+It checks CLI/JDBC/Hikari, explicit/deferred catalogs, and TLS.
 
 ## Shared-pool isolation
 
-Docker-free gateway tests exercise split/chunked HTTP uploads, backpressure,
-half-closes, timeouts, tenant-route rejection, and native authentication errors:
+Gateway checks need no Docker:
 
 ```bash
 cargo test --locked --lib gateway::
 ```
 
-These transport checks do not replace the real-engine lifecycle tests below.
-
-The weekly/manual [shared isolation workflow](../workflows/shared-pool-isolation.yml)
-tests PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse independently.
-It is not part of ordinary push/release gating.
+For real PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse tenants:
 
 ```bash
 bash .github/ci/shared-pool-isolation.sh postgres
 bash .github/ci/shared-pool-isolation.sh all
 ```
 
-Local `all` runs sequentially. Cleanup is restricted to managed test containers.
-Each engine case also exports a tenant backup, changes its data, restores it,
-and verifies the second tenant remains intact, using the production transfer paths.
+These cover tenant isolation and backup/restore with peer-data preservation.
+Local `all` runs sequentially; cleanup targets managed test containers only.
+The [workflow](../workflows/shared-pool-isolation.yml) runs weekly/manually,
+**not as an ordinary push/release gate**.
 
-Without Docker, an official ClickHouse 26.4+ binary can execute the shared
-provisioning SQL in an isolated `clickhouse local` process (no listeners or live data):
+For Docker-free provisioning checks with an official ClickHouse 26.4+ binary:
 
 ```bash
 DBE_CLICKHOUSE_BINARY=/path/to/clickhouse cargo test --locked --lib \
@@ -75,20 +64,15 @@ DBE_CLICKHOUSE_BINARY=/path/to/clickhouse cargo test --locked --lib \
   -- --exact --ignored
 ```
 
-This checks creation, role/profile/quota reapplication, preserved table data and
-access-entity cleanup. It does not replace Docker/gateway authentication tests.
-For older binaries without local access storage, run `shared_sql_parses_on_clickhouse`
-instead with the same test-module prefix. That checks syntax only.
-
-`hosted_console_config_removes_inherited_file_logging` uses the same binary
-environment variable to verify ClickHouse's actual config merge for dedicated
-and shared engines, without starting a server or touching database data.
+This checks SQL execution/reapplication, preserved table data, and access cleanup
+in `clickhouse local`, with no listeners or live data. It does not test gateway auth.
+Older binaries can use `shared_sql_parses_on_clickhouse` with the same prefix
+for syntax only. `hosted_console_config_removes_inherited_file_logging` uses the
+same binary variable to test the actual config merge without starting a server.
 
 ## FuseQuota mounts
 
-The FuseQuota mount test runs the embedded helper against disposable data on
-Linux. It checks concurrent read/write integrity, quota rejection, deletion
-recovery, and updating a healthy mount without restarting its helper:
+Requires Linux, `/dev/fuse`, and `fusermount3`:
 
 ```bash
 cargo test --locked --lib --no-run
@@ -97,30 +81,32 @@ sudo /path/to/the/printed-test-binary \
   --exact --ignored
 ```
 
-It requires `/dev/fuse` and `fusermount3`; it is excluded from ordinary CI.
+Uses disposable data to check append/sync integrity, quota rejection/recovery,
+safe helper reuse, and refusal to remount unsafe helpers beneath open files.
+Excluded from ordinary CI.
 
 ## Native project quotas
 
-Run only on a disposable Linux host with passwordless sudo, loop/mount
-privileges, the pinned Rust toolchain, `xfsprogs`, `e2fsprogs`, and `quota`:
+Use a disposable Linux host with passwordless sudo, loop/mount privileges,
+the pinned Rust toolchain, `xfsprogs`, `e2fsprogs`, and `quota`:
 
 ```bash
 bash .github/ci/project-quota-smoke.sh xfs
 bash .github/ci/project-quota-smoke.sh ext4
 ```
 
-The [weekly/manual workflow](../workflows/project-quota-smoke.yml) verifies
-real DBEV quota adoption, isolation, accounting, exhaustion, resize, and cleanup.
-It temporarily backs up/restores XFS project files. F2FS is optional and also
-needs kernel support and `f2fs-tools`; request `f2fs` or `all`.
+The [weekly/manual workflow](../workflows/project-quota-smoke.yml) checks
+adoption, isolation, accounting, exhaustion, resize, and cleanup, temporarily
+backing up/restoring XFS project files. Optional `f2fs` needs kernel support
+and `f2fs-tools`; use `all` for every backend.
 
 ## Release notes
 
-An empty `release_notes` input uses generated notes. For a local multiline file:
+Empty `release_notes` uses generated notes. To supply a local Markdown file:
 
 ```bash
 gh workflow run release.yml --ref main -f version=vX.Y.Z \
   -F release_notes=@CHANGELOG.md
 ```
 
-The notes file need not be committed.
+The version must match Cargo.toml. The notes file need not be committed.

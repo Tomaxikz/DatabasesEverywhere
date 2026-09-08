@@ -1,33 +1,17 @@
 # DatabasesEverywhere
 
-A Linux daemon for hosting databases behind a control panel.
+A Linux daemon for panel-managed PostgreSQL, MySQL, MariaDB, MongoDB,
+ClickHouse, Redis, Valkey, and Qdrant. Supports dedicated containers and
+server-owned shared pools.
 
-Run each database in a **dedicated container** or place multiple tenants in a
-**server-owned engine pool**. The panel chooses placement; DBEV handles provisioning,
-credentials, gateway routing, limits, and recovery.
+## Install
 
-## Features
-
-- PostgreSQL, MySQL, MariaDB, MongoDB, ClickHouse, Redis, Valkey, and Qdrant.
-- Dedicated deployments for all engines; shared pools for the five SQL/document engines.
-- Authenticated protocol gateways over private container sockets.
-- CPU, memory, and disk limits for dedicated instances; shared-pool limits and tenant disk enforcement.
-- Imports, exports, scheduled backups, and dedicated/shared migrations.
-- REST management and live WebSocket monitoring.
-
-See [engine compatibility and placement](docs/api/instances.md) for supported
-versions and limitations.
-
-## Get started
-
-Requires Linux with glibc 2.35+, Docker or Podman, and the
-[storage prerequisites](docs/operations/disk-limits.md).
-Release binaries support x86-64, ARM64, and RISC-V 64.
+Requires Linux (glibc 2.35+), Docker or Podman, `curl`, the GitHub CLI
+(`gh`), and a supported [storage backend](docs/operations/disk-limits.md).
 
 ### Download and install
 
-Pull the latest release for your architecture. This uses `curl` and the GitHub
-CLI (`gh`) to verify the binary's build attestation before installing it:
+Download the latest release for your architecture and verify its build attestation:
 
 ```bash
 (
@@ -48,32 +32,24 @@ CLI (`gh`) to verify the binary's build attestation before installing it:
 )
 ```
 
-For a pinned [release](https://github.com/Tomaxikz/DatabasesEverywhere/releases),
-replace `releases/latest/download` with `releases/download/vX.Y.Z` in the URL.
-Pin reviewed versions in automated deployments.
+To pin a [release](https://github.com/Tomaxikz/DatabasesEverywhere/releases),
+replace `releases/latest/download` with `releases/download/vX.Y.Z`.
 
 ### Configure and start
 
-Save the panel-generated configuration to
-`/etc/databases-everywhere/config.yml`; see the [example config](config/example.yml).
-Then install and start the systemd service:
+Save your panel-generated configuration to
+`/etc/databases-everywhere/config.yml`; see the [example](config/example.yml).
 
 ```bash
 sudo dbev --setup
 sudo journalctl -u databases-everywhere -f
 ```
 
-Setup runs the manager as root and starts or restarts the service. Database
-containers remain network-isolated. Protect management access and use TLS
-across untrusted networks.
-
-Follow [node setup](docs/operations/setup.md) for installation, configuration,
-upgrades, and logs, or [Docker deployment](deploy/docker/README.md) for Compose.
+Setup starts or restarts a root-run service. Protect management credentials
+and use TLS across untrusted networks.
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [API contract](docs/api/openapi.yml) and [panel authentication](docs/api/auth.md)
-- [Pool management](docs/api/pools.md): engines, child databases, metrics, and logs
-- [Development and checks](docs/development.md)
-- [Private security reporting](SECURITY.md)
+[Node setup](docs/operations/setup.md) · [Docker](deploy/docker/README.md) ·
+[API and operator guides](docs/README.md) · [Build and test](docs/development.md) ·
+[Security](SECURITY.md)
