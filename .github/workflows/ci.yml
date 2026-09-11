@@ -49,7 +49,7 @@ jobs:
           failure-threshold: warning
 
       - name: Install workflow security linter
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: zizmor@1.28.0
           fallback: none
@@ -64,7 +64,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-machete@0.9.2
           fallback: none
@@ -95,7 +95,7 @@ jobs:
           toolchain: 1.95.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-audit@0.22.2
           fallback: none
@@ -121,7 +121,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-llvm-cov@0.9.1
           fallback: none
