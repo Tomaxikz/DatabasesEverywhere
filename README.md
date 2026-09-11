@@ -4,32 +4,25 @@ A Linux daemon for panel-managed PostgreSQL, MySQL, MariaDB, MongoDB,
 ClickHouse, Redis, Valkey, and Qdrant. Supports dedicated containers and
 server-owned shared pools.
 
+## Clone the repository
+
+```bash
+git clone https://github.com/Tomaxikz/DatabasesEverywhere.git
+cd DatabasesEverywhere
+```
+
 ## Install
 
-Requires Linux (glibc 2.35+), Docker or Podman, `curl`, the GitHub CLI
-(`gh`), and a supported [storage backend](docs/operations/disk-limits.md).
+Requires Linux (glibc 2.35+), Docker or Podman, `curl`, and a supported
+[storage backend](docs/operations/disk-limits.md).
 
 ### Download and install
 
-Download the latest release for your architecture and verify its build attestation:
+Run as root to download and install the latest release for your architecture:
 
 ```bash
-(
-  set -eu
-  case "$(uname -m)" in
-    x86_64|amd64) DBEV_ARCH=x86_64 ;;
-    aarch64|arm64) DBEV_ARCH=arm64 ;;
-    riscv64) DBEV_ARCH=riscv64 ;;
-    *) echo "Unsupported architecture" >&2; exit 1 ;;
-  esac
-  DBEV_DOWNLOAD="$(mktemp)"
-  trap 'rm -f -- "$DBEV_DOWNLOAD"' EXIT
-  curl --fail --location \
-    "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-${DBEV_ARCH}-linux" \
-    -o "$DBEV_DOWNLOAD"
-  gh attestation verify "$DBEV_DOWNLOAD" --repo Tomaxikz/DatabasesEverywhere
-  sudo install -m 0755 "$DBEV_DOWNLOAD" /usr/local/bin/dbev
-)
+curl -fL "https://github.com/Tomaxikz/DatabasesEverywhere/releases/latest/download/dbev-$(uname -m | sed 's/^aarch64$/arm64/; s/^amd64$/x86_64/')-linux" -o /usr/local/bin/dbev &&
+chmod +x /usr/local/bin/dbev
 ```
 
 To pin a [release](https://github.com/Tomaxikz/DatabasesEverywhere/releases),
