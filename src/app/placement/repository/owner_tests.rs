@@ -216,11 +216,11 @@ async fn unowned_pools_are_quarantined_without_deleting_data_or_blocking_contain
     .execute(&db)
     .await
     .unwrap();
-    for table in ["engine_runtimes", "instance_metadata"] {
-        let status: String = sqlx::query_scalar(&format!("SELECT status FROM {table}"))
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    for query in [
+        "SELECT status FROM engine_runtimes",
+        "SELECT status FROM instance_metadata",
+    ] {
+        let status: String = sqlx::query_scalar(query).fetch_one(&db).await.unwrap();
         assert_eq!(status, "quarantined");
     }
     sqlx::query("INSERT INTO engine_runtimes(runtime_id,protocol,deployment_mode,status) VALUES ('old-pool','mysql','shared','quarantined') ON CONFLICT(runtime_id) DO UPDATE SET status=excluded.status")

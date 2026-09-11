@@ -12,7 +12,7 @@ async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_d
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();
     let plain = InstanceRepository::new(pool.clone());
-    let ambiguous = "dbev1:user-selected-password";
+    let ambiguous = "dbev1:user-selected-password'; --";
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some(ambiguous.to_string());
     plain.upsert(&affected).await.unwrap();
@@ -39,17 +39,11 @@ async fn daemon_load_quarantines_only_the_ambiguous_instance_and_preserves_raw_d
             .as_deref(),
         Some("healthy-password")
     );
-    assert_eq!(
-        raw_field(&pool, "inst_affected", "tenant_password").await,
-        ambiguous
-    );
+    assert_eq!(raw_tenant_password(&pool, "inst_affected").await, ambiguous);
     assert!(recovery_required(&pool, "inst_affected").await);
 
     manager.upsert(affected).await.unwrap();
-    assert_eq!(
-        raw_field(&pool, "inst_affected", "tenant_password").await,
-        ambiguous
-    );
+    assert_eq!(raw_tenant_password(&pool, "inst_affected").await, ambiguous);
 }
 
 #[tokio::test]
@@ -77,7 +71,7 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
     ));
     assert!(recovery_required(&pool, "inst_affected").await);
     assert_eq!(
-        raw_field(&pool, "inst_affected", "tenant_password").await,
+        raw_tenant_password(&pool, "inst_affected").await,
         "dbev1:ambiguous"
     );
 
@@ -89,7 +83,7 @@ async fn live_verified_replacement_atomically_clears_the_recovery_marker() {
 
     assert!(!recovery_required(&pool, "inst_affected").await);
     assert!(is_encrypted(
-        &raw_field(&pool, "inst_affected", "tenant_password").await
+        &raw_tenant_password(&pool, "inst_affected").await
     ));
     let loaded = encrypted.get("inst_affected").await.unwrap().unwrap();
     assert_eq!(
@@ -121,7 +115,7 @@ async fn exact_offline_repair_encrypts_the_legacy_plaintext_and_leaves_instance_
         .unwrap();
 
     assert!(repair.remaining_fields.is_empty());
-    let raw = raw_field(&pool, "inst_affected", "tenant_password").await;
+    let raw = raw_tenant_password(&pool, "inst_affected").await;
     assert!(is_encrypted(&raw));
     assert_ne!(raw, ambiguous);
     assert!(!recovery_required(&pool, "inst_affected").await);
@@ -147,13 +141,13 @@ async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("actual-password".to_string());
     encrypted.upsert(&affected).await.unwrap();
-    let mut raw = raw_field(&pool, "inst_affected", "tenant_password")
+    let mut raw = raw_tenant_password(&pool, "inst_affected")
         .await
         .into_bytes();
     let last = raw.len() - 1;
     raw[last] = if raw[last] == b'A' { b'B' } else { b'A' };
     let corrupted = String::from_utf8(raw).unwrap();
-    set_raw_field(&pool, "inst_affected", "tenant_password", &corrupted).await;
+    set_raw_tenant_password(&pool, "inst_affected", &corrupted).await;
     encrypted.load_for_daemon().await.unwrap();
 
     let error = encrypted
@@ -169,10 +163,7 @@ async fn repair_mismatch_is_atomic_and_does_not_reinterpret_corruption() {
         error,
         RepositoryError::ProtectedSecretPlaintextMismatch { .. }
     ));
-    assert_eq!(
-        raw_field(&pool, "inst_affected", "tenant_password").await,
-        corrupted
-    );
+    assert_eq!(raw_tenant_password(&pool, "inst_affected").await, corrupted);
     assert!(recovery_required(&pool, "inst_affected").await);
     let (status, desired): (String, String) = sqlx::query_as(
         "SELECT status, desired_state FROM instance_metadata WHERE instance_id = ?1",
@@ -296,7 +287,7 @@ async fn repair_rejects_already_valid_ciphertext_without_changing_state() {
     let mut affected = metadata("inst_affected", "affected_user");
     affected.tenant_password = Some("valid-password".to_string());
     repository.upsert(&affected).await.unwrap();
-    let before = raw_field(&pool, "inst_affected", "tenant_password").await;
+    let before = raw_tenant_password(&pool, "inst_affected").await;
 
     let error = repository
         .repair_ambiguous_secret(
@@ -311,10 +302,7 @@ async fn repair_rejects_already_valid_ciphertext_without_changing_state() {
         error,
         RepositoryError::ProtectedSecretAlreadyValid { .. }
     ));
-    assert_eq!(
-        raw_field(&pool, "inst_affected", "tenant_password").await,
-        before
-    );
+    assert_eq!(raw_tenant_password(&pool, "inst_affected").await, before);
 }
 
 #[test]
@@ -328,20 +316,23 @@ fn protected_secret_field_parser_accepts_cli_spelling_only() {
         Ok(ProtectedSecretField::PostgresAdminPassword)
     );
     assert!("metadata_json".parse::<ProtectedSecretField>().is_err());
+    assert!(
+        "tenant_password = NULL --"
+            .parse::<ProtectedSecretField>()
+            .is_err()
+    );
 }
 
-async fn raw_field(pool: &sqlx::SqlitePool, instance_id: &str, field: &str) -> String {
-    let query = format!("SELECT {field} FROM instance_route_auth WHERE instance_id = ?1");
-    sqlx::query_scalar(&query)
+async fn raw_tenant_password(pool: &sqlx::SqlitePool, instance_id: &str) -> String {
+    sqlx::query_scalar("SELECT tenant_password FROM instance_route_auth WHERE instance_id = ?1")
         .bind(instance_id)
         .fetch_one(pool)
         .await
         .unwrap()
 }
 
-async fn set_raw_field(pool: &sqlx::SqlitePool, instance_id: &str, field: &str, value: &str) {
-    let query = format!("UPDATE instance_route_auth SET {field} = ?1 WHERE instance_id = ?2");
-    sqlx::query(&query)
+async fn set_raw_tenant_password(pool: &sqlx::SqlitePool, instance_id: &str, value: &str) {
+    sqlx::query("UPDATE instance_route_auth SET tenant_password = ?1 WHERE instance_id = ?2")
         .bind(value)
         .bind(instance_id)
         .execute(pool)

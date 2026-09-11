@@ -1,5 +1,5 @@
 use sha1::{Digest, Sha1};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

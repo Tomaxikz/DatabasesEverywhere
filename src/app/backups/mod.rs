@@ -439,7 +439,7 @@ pub async fn sha256_file(path: &Path) -> Result<String, BackupStoreError> {
             }
             hasher.update(&buffer[..read]);
         }
-        Ok::<_, std::io::Error>(format!("{:x}", hasher.finalize()))
+        Ok::<_, std::io::Error>(crate::shared::hex::encode_lower(&hasher.finalize()))
     })
     .await
     .map_err(|error| BackupStoreError::Runtime(format!("backup hash task failed: {error}")))?

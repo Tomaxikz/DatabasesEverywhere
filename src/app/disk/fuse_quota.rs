@@ -943,7 +943,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
         }
         hasher.update(&buffer[..read]);
     }
-    let actual_digest = format!("{:x}", hasher.finalize());
+    let actual_digest = crate::shared::hex::encode_lower(&hasher.finalize());
     if actual_digest != expected_digest {
         return Err(Error::new(
             ErrorKind::InvalidData,

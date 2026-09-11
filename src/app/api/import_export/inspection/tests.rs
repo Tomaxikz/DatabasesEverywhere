@@ -249,7 +249,10 @@ async fn plain_gzip_and_bzip2_are_detected_and_hashed() {
             .unwrap();
         assert_eq!(result.detected_archive_format, expected_format);
         assert_eq!(result.source_size_bytes, contents.len() as u64);
-        assert_eq!(result.sha256, format!("{:x}", Sha256::digest(&contents)));
+        assert_eq!(
+            result.sha256,
+            crate::shared::hex::encode_lower(&Sha256::digest(&contents))
+        );
         assert_eq!(result.objects[0].selection_key, "public.users");
     }
 }

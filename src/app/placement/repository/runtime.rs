@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqliteRow};
 
 use super::{
     PlacementRepository, PlacementRepositoryError, i64_to_u64, parse_protocol, u64_to_i64,
@@ -40,7 +40,8 @@ impl PlacementRepository {
     }
 
     pub async fn list(&self) -> Result<Vec<EngineRuntime>, PlacementRepositoryError> {
-        let rows = sqlx::query(&runtime_select("ORDER BY runtime.runtime_id"))
+        let rows = runtime_select("ORDER BY runtime.runtime_id")
+            .build()
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(|row| self.read_runtime(row)).collect()
@@ -50,7 +51,8 @@ impl PlacementRepository {
         &self,
         runtime_id: &str,
     ) -> Result<Option<EngineRuntime>, PlacementRepositoryError> {
-        let row = sqlx::query(&runtime_select("WHERE runtime.runtime_id = ?1 LIMIT 1"))
+        let row = runtime_select("WHERE runtime.runtime_id = ?1 LIMIT 1")
+            .build()
             .bind(runtime_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -213,9 +215,10 @@ impl PlacementRepository {
         owner
             .check()
             .map_err(PlacementRepositoryError::InvalidReservation)?;
-        let row = sqlx::query(&runtime_select(
+        let row = runtime_select(
             "WHERE runtime.deployment_mode = 'shared' AND runtime.protocol = ?1 AND runtime.owner_panel = ?2 AND runtime.owner_server = ?3",
-        ))
+        )
+        .build()
         .bind(protocol.as_str())
         .bind(&owner.panel_id)
         .bind(&owner.server_id)
@@ -361,17 +364,19 @@ impl PlacementRepository {
     }
 }
 
-fn runtime_select(suffix: &str) -> String {
-    format!(
+fn runtime_select(suffix: &'static str) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new(
         r#"
         SELECT
             runtime.*,
             auth.admin_secret
         FROM engine_runtimes AS runtime
         LEFT JOIN engine_runtime_auth AS auth ON auth.runtime_id = runtime.runtime_id
-        {suffix}
-        "#
-    )
+        "#,
+    );
+    // Only compile-time SQL clauses may be appended; values remain bound by callers.
+    query.push(suffix);
+    query
 }
 
 fn read_backend(row: &SqliteRow) -> Result<BackendEndpoint, PlacementRepositoryError> {

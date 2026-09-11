@@ -139,7 +139,7 @@ fn verify_external_payload(
         .unwrap_or_else(|error| panic!("failed to read {label} payload: {error}"));
     let executable = zstd::decode_all(compressed.as_slice())
         .unwrap_or_else(|error| panic!("{label} payload is not valid zstd: {error}"));
-    let actual_sha256 = format!("{:x}", Sha256::digest(&executable));
+    let actual_sha256 = sha256_hex(&executable);
     if let Some(expected_sha256) = expected_sha256 {
         assert_eq!(
             actual_sha256, expected_sha256,
@@ -216,6 +216,14 @@ fn verify_checked_in_fusequota() -> PathBuf {
 }
 
 fn assert_digest(label: &str, bytes: &[u8], expected: &str) {
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = sha256_hex(bytes);
     assert_eq!(actual, expected, "{label} SHA-256 mismatch");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    // The build script runs before the application's shared helpers exist.
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

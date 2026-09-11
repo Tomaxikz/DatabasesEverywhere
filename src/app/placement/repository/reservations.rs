@@ -179,11 +179,10 @@ impl PlacementRepository {
     }
 
     pub async fn list_orphans(&self) -> Result<Vec<TenantReservation>, PlacementRepositoryError> {
-        let rows = sqlx::query(&orphan_reservation_select(
-            "ORDER BY reservation.instance_id",
-        ))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = orphan_reservation_select("ORDER BY reservation.instance_id")
+            .build()
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter().map(read_reservation).collect()
     }
 
@@ -191,12 +190,11 @@ impl PlacementRepository {
         &self,
         instance_id: &str,
     ) -> Result<Option<TenantReservation>, PlacementRepositoryError> {
-        let row = sqlx::query(&orphan_reservation_select(
-            "AND reservation.instance_id = ?1 LIMIT 1",
-        ))
-        .bind(instance_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = orphan_reservation_select("AND reservation.instance_id = ?1 LIMIT 1")
+            .build()
+            .bind(instance_id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.as_ref().map(read_reservation).transpose()
     }
 
@@ -220,8 +218,8 @@ impl PlacementRepository {
     }
 }
 
-fn orphan_reservation_select(suffix: &str) -> String {
-    format!(
+fn orphan_reservation_select(suffix: &'static str) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut query = sqlx::QueryBuilder::new(
         r#"
         SELECT reservation.*, runtime.protocol
         FROM engine_runtime_reservations AS reservation
@@ -236,9 +234,11 @@ fn orphan_reservation_select(suffix: &str) -> String {
                 AND reservation.instance_id =
                     'migration_' || replace(migration.migration_id, '-', '')
           )
-        {suffix}
-        "#
-    )
+        "#,
+    );
+    // The suffix is SQL syntax from a static call site, never an instance identifier.
+    query.push(suffix);
+    query
 }
 
 fn read_reservation(row: &SqliteRow) -> Result<TenantReservation, PlacementRepositoryError> {

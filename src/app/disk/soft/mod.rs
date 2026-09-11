@@ -63,7 +63,7 @@ impl SoftDiskTarget {
             digest.update(component.len().to_le_bytes());
             digest.update(component);
         }
-        format!("{:x}", digest.finalize())
+        crate::shared::hex::encode_lower(&digest.finalize())
     }
 }
 

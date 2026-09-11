@@ -351,7 +351,7 @@ fn sha256_reader(file: &mut File, deadline: Instant) -> Result<String, Inspectio
         }
         hash.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(crate::shared::hex::encode_lower(&hash.finalize()))
 }
 
 fn detect_archive_format(

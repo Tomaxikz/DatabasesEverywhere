@@ -28,26 +28,11 @@ Protect the `production-release` environment with reviewers and main/version-tag
 The [Linux build workflow](../workflows/build-binaries.yml) handles architecture packaging.
 Use the workflows as the source for tool versions, matrices, and deadlines.
 
-## Dependency updates and Socket
-
-[Dependabot](../dependabot.yml) checks the Cargo workspace, GitHub Actions,
-and the Docker base image every Monday morning in `Europe/Budapest` time.
-Patch/minor version updates are grouped per ecosystem; major updates remain
-individual PRs. Routine updates have a seven-day release cooldown, and each
-ecosystem has a limit of three open version-update PRs.
-Nothing enables automatic merging: review the updates and require `CI gate`.
-The configuration becomes active once it is committed to the default branch.
-
-Enable the dependency graph, Dependabot alerts, and Dependabot security updates
-in the repository's **Settings > Advanced Security** if they are not already
-enabled. Security updates are separate from the weekly version-update schedule
-and are not held by the routine-update cooldown.
-Dependabot does not update arbitrary tool-version inputs or download checksums
-in shell code; verify installer-manifest support whenever changing those pins.
+## Socket
 
 [socket.yml](../../socket.yml) configures Socket's GitHub App to publish PR
-alerts and commit checks, including on Dependabot PRs, without extra dependency
-overview comments. Existing organization security rules remain authoritative;
+alerts and commit checks without extra dependency overview comments.
+Existing organization security rules remain authoritative;
 no alert types or source paths are suppressed by this file.
 
 To activate Socket, install or configure the

@@ -23,6 +23,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sha256_encoding_matches_fixed_vectors() {
+        use sha2::{Digest, Sha256};
+
+        for (input, expected) in [
+            (
+                b"".as_slice(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".as_slice(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            assert_eq!(encode_lower(&Sha256::digest(input)), expected);
+        }
+    }
+
+    #[test]
     fn encodes_and_decodes_ascii_hex() {
         assert_eq!(encode_lower(&[0x00, 0xab, 0xff]), "00abff");
         for (digit, value) in [(b'0', 0), (b'9', 9), (b'a', 10), (b'F', 15)] {

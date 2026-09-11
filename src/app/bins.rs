@@ -319,7 +319,7 @@ fn install_helper_atomically(
 }
 
 fn verify_digest(bytes: &[u8], label: &str, expected_sha256: &str) -> Result<(), Error> {
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = crate::shared::hex::encode_lower(&Sha256::digest(bytes));
     if actual == expected_sha256 {
         return Ok(());
     }

@@ -281,12 +281,14 @@ impl InstanceRepository {
 
         let encrypted =
             secrets.encrypt(field.as_str(), instance_id, known_plaintext.expose_secret())?;
-        let update = format!(
-            "UPDATE instance_route_auth SET {} = ?1, updated_at = ?2 WHERE instance_id = ?3",
-            field.as_str()
-        );
+        let mut update = sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE instance_route_auth SET ");
+        // The identifier comes exclusively from ProtectedSecretField's closed enum.
+        update
+            .push(field.as_str())
+            .push(" = ?1, updated_at = ?2 WHERE instance_id = ?3");
         let updated_at = now_rfc3339();
-        let result = sqlx::query(&update)
+        let result = update
+            .build()
             .bind(encrypted)
             .bind(&updated_at)
             .bind(instance_id)

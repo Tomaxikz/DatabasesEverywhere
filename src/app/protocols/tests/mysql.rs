@@ -68,10 +68,31 @@ fn caching_sha2_backend_tokens_work_for_mysql_8_9_and_26_backends() {
     let second = mariadb::caching_sha2_password_token("secret", seed);
     assert_eq!(first, second);
     assert_eq!(first.len(), 32);
+    assert_eq!(
+        crate::shared::hex::encode_lower(&first),
+        "32ba59bc9c089a5c16872d9f2a14dccab67d1045ae3a721585fe1c37688e8dec"
+    );
     assert_ne!(
         first,
         mariadb::caching_sha2_password_token("different", seed)
     );
+}
+
+#[test]
+fn native_password_tokens_keep_the_existing_sha1_format() {
+    assert_eq!(
+        mariadb::native_password_sha1_stage2_hex("secret"),
+        "14e65567abdb5135d0cfd9a70b3032c179a49ee7"
+    );
+    assert_eq!(
+        crate::shared::hex::encode_lower(&mariadb::native_password_token(
+            "secret",
+            b"12345678901234567890",
+        )),
+        "0f8b9033e0897c0a8338ebe3dea9010dda47ab56"
+    );
+    assert!(mariadb::native_password_token("", b"12345678901234567890").is_empty());
+    assert!(mariadb::caching_sha2_password_token("", b"12345678901234567890").is_empty());
 }
 
 fn handshake_response(username: &str, database: &str, attributes: &[u8]) -> Vec<u8> {

@@ -91,7 +91,7 @@ pub(super) fn watch_fingerprint(
         digest.update(identity.device.to_le_bytes());
         digest.update(identity.inode.to_le_bytes());
     }
-    format!("{:x}", digest.finalize())
+    crate::shared::hex::encode_lower(&digest.finalize())
 }
 
 #[cfg(test)]

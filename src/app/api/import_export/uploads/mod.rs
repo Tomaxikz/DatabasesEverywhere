@@ -744,7 +744,7 @@ async fn receive_upload_body(
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to sync upload: {error}")))?;
     drop(file);
-    let digest = format!("{:x}", hash.finalize());
+    let digest = crate::shared::hex::encode_lower(&hash.finalize());
     if expected_sha256.is_some_and(|expected| expected != digest) {
         return Err(ApiError::BadRequest(
             "uploaded content did not match x-dbev-sha256".to_string(),

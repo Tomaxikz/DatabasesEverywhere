@@ -28,6 +28,13 @@ async fn stores_pool_admin_secret_encrypted() {
     assert!(is_encrypted(&raw));
     assert!(!raw.contains("pool-admin-password"));
     let loaded = repository.get(&runtime.runtime_id).await.unwrap().unwrap();
+    assert!(
+        repository
+            .get("pool_secret' OR 1=1 --")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(loaded.admin_secret.as_deref(), Some("pool-admin-password"));
     assert_eq!(loaded.database_version.as_deref(), Some("18.4"));
     assert_eq!(loaded.compatibility, runtime.compatibility);
@@ -994,6 +1001,13 @@ async fn orphan_scan_excludes_attached_tenants_and_active_migrations() {
             .is_none()
     );
     assert!(placements.get_orphan(temp_id).await.unwrap().is_none());
+    assert!(
+        placements
+            .get_orphan("plain-orphan' OR 1=1 --")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

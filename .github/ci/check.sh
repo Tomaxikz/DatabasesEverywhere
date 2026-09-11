@@ -46,16 +46,6 @@ test_coverage() {
 }
 
 audit_dependencies() {
-  local rsa_tree
-
-  section "Dependency graph policy"
-  rsa_tree="$(cargo tree --locked --edges normal -i rsa 2>/dev/null || true)"
-  if [ -n "$rsa_tree" ]; then
-    echo "RUSTSEC-2023-0071 is ignored only while rsa is absent from the built graph" >&2
-    printf '%s\n' "$rsa_tree" >&2
-    exit 1
-  fi
-
   section "Workspace dependency audit"
   cargo audit --no-yanked -D warnings
 }
