@@ -43,7 +43,7 @@ jobs:
         run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh .github/ci/shared-pool-isolation.sh .github/ci/project-quota-smoke.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@2a66e89f53d0771bb131a7fa31f3136336094aa6 # v3.4.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: deploy/docker/Dockerfile
           failure-threshold: warning
@@ -269,14 +269,14 @@ jobs:
           toolchain: 1.95.0
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
 
       - name: Analyze
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: /language:${{ matrix.language }}
 
