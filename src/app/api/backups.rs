@@ -24,7 +24,7 @@ use crate::{
         catalog::{BackupCatalog, BackupCatalogColumn},
         new_backup_id, prepare_private_dir,
     },
-    instances::metadata::{InstanceMetadata, InstanceStatus},
+    instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
     jobs::import_export::{
         DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError, JobEstimateInput,
         JobResourceCost, SchedulerAcquireError, create_bounded_archive_with_policy,
@@ -45,10 +45,11 @@ pub struct BackupStatusResponse {
     pub browsing_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct RunBackupResponse {
     pub backups: Vec<BackupInfo>,
-    pub skipped: Vec<SkippedBackup>,
+    pub skipped: Vec<BackupIssue>,
+    pub failed: Vec<BackupIssue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,10 +71,63 @@ pub struct RestoreBackupResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SkippedBackup {
+pub struct BackupIssue {
     pub instance_id: String,
     pub protocol: Protocol,
     pub reason: PublicDiagnostic,
+}
+
+enum BackupAttempt {
+    Completed(BackupInfo),
+    Skipped(BackupIssue),
+}
+
+impl RunBackupResponse {
+    fn record(&mut self, metadata: &InstanceMetadata, result: Result<BackupAttempt, ApiError>) {
+        match result {
+            Ok(BackupAttempt::Completed(backup)) => self.backups.push(backup),
+            Ok(BackupAttempt::Skipped(issue)) => {
+                tracing::info!(
+                    event = "audit instance_backup_skipped",
+                    instance_id = issue.instance_id,
+                    protocol = issue.protocol.as_str(),
+                    reason = issue.reason.code,
+                    "backup omitted for an intentionally stopped instance"
+                );
+                self.skipped.push(issue);
+            }
+            Err(error) => {
+                let reason = PublicDiagnostic::from_api_error("instance backup", &error);
+                tracing::error!(
+                    event = "audit instance_backup_failed",
+                    instance_id = metadata.instance_id,
+                    protocol = metadata.protocol.as_str(),
+                    error_id = reason.error_id.as_deref(),
+                    error = %error,
+                    "instance backup failed; no new backup was confirmed for this pass"
+                );
+                self.failed.push(BackupIssue {
+                    instance_id: metadata.instance_id.clone(),
+                    protocol: metadata.protocol,
+                    reason,
+                });
+            }
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        if !self.failed.is_empty() {
+            if self.backups.is_empty() {
+                "failed"
+            } else {
+                "partial_failure"
+            }
+        } else if !self.skipped.is_empty() {
+            "completed_with_skips"
+        } else {
+            "completed"
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -253,9 +307,10 @@ pub async fn run_instance_backup(
     ApiPath(instance_id): ApiPath<String>,
 ) -> ApiResult<BackupInfo> {
     auth.require_scope(scopes::BACKUPS_WRITE)?;
-    Ok(ApiResponse::ok(
-        backup_instance(&state, &instance_id).await?,
-    ))
+    match backup_instance(&state, &instance_id).await? {
+        BackupAttempt::Completed(backup) => Ok(ApiResponse::ok(backup)),
+        BackupAttempt::Skipped(issue) => Err(ApiError::BadRequest(issue.reason.message)),
+    }
 }
 
 pub async fn run_all_backups(
@@ -483,10 +538,7 @@ async fn restore_backup(
     }))
 }
 
-pub(crate) async fn backup_instance(
-    state: &AppState,
-    instance_id: &str,
-) -> Result<BackupInfo, ApiError> {
+async fn backup_instance(state: &AppState, instance_id: &str) -> Result<BackupAttempt, ApiError> {
     let admission = admit_backup(state, instance_id)?;
     let state = state.clone();
     let instance_id = instance_id.to_string();
@@ -499,11 +551,14 @@ async fn run_backup(
     state: AppState,
     instance_id: String,
     _admission: ImportExportJobPermit,
-) -> Result<BackupInfo, ApiError> {
+) -> Result<BackupAttempt, ApiError> {
     let _operation = state.instance_locks.lock(&instance_id).await;
     check_backup_service(&state)?;
     let mut metadata =
         crate::api::instances::reconcile_instance_locked(&state, &instance_id).await?;
+    if let Some(issue) = intentionally_stopped_backup(&metadata) {
+        return Ok(BackupAttempt::Skipped(issue));
+    }
     check_backup_ready(&metadata)?;
     let backup_source_bytes = if metadata.deployment_mode == DeploymentMode::Shared {
         crate::api::import_export::jobs::measure_shared_database_bytes(&state, &metadata).await?
@@ -636,11 +691,12 @@ async fn run_backup(
         event = "audit backup_completed",
         instance_id,
         protocol = metadata.protocol.as_str(),
+        layout = ?layout,
         backup_id,
         storage = storage.kind().as_str(),
         catalog = manifest.catalog_available,
     );
-    Ok(backup_info(manifest))
+    Ok(BackupAttempt::Completed(backup_info(manifest)))
 }
 
 async fn create_physical_archive(
@@ -652,6 +708,12 @@ async fn create_physical_archive(
     let instance_id = &metadata.instance_id;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
+        tracing::info!(
+            event = "audit physical_backup_pause",
+            instance_id,
+            protocol = metadata.protocol.as_str(),
+            "physical backup is stopping the database for a consistent archive; clients may disconnect"
+        );
         crate::api::instances::change_instance_state_locked(
             state,
             instance_id,
@@ -683,37 +745,45 @@ async fn create_physical_archive(
             "failed to archive stopped instance data"
         );
     }
-    crate::api::import_export::finish_physical_change(state, instance_id, was_running, result).await
+    let result =
+        crate::api::import_export::finish_physical_change(state, instance_id, was_running, result)
+            .await;
+    if was_running && result.is_ok() {
+        tracing::info!(
+            event = "audit physical_backup_resumed",
+            instance_id,
+            protocol = metadata.protocol.as_str(),
+            "physical backup archive completed and the database was restarted"
+        );
+    }
+    result
 }
 
 pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse {
-    let mut backups = Vec::new();
-    let mut skipped = Vec::new();
+    let mut response = RunBackupResponse::default();
     for metadata in state.instances.list().await {
-        match backup_instance(state, &metadata.instance_id).await {
-            Ok(response) => backups.push(response),
-            Err(error) => {
-                tracing::warn!(
-                    event = "audit instance_backup_skipped",
-                    instance_id = metadata.instance_id,
-                    protocol = metadata.protocol.as_str(),
-                    error = %error,
-                    "instance backup was skipped"
-                );
-                skipped.push(SkippedBackup {
-                    instance_id: metadata.instance_id,
-                    protocol: metadata.protocol,
-                    reason: PublicDiagnostic::from_api_error("instance backup", &error),
-                });
-            }
-        }
+        let result = backup_instance(state, &metadata.instance_id).await;
+        response.record(&metadata, result);
     }
-    tracing::info!(
-        event = "audit backups_completed",
-        backups = backups.len(),
-        skipped = skipped.len(),
-    );
-    RunBackupResponse { backups, skipped }
+    if response.failed.is_empty() {
+        tracing::info!(
+            event = "audit backup_pass_finished",
+            status = response.status(),
+            backups = response.backups.len(),
+            skipped = response.skipped.len(),
+            failed = response.failed.len(),
+        );
+    } else {
+        tracing::error!(
+            event = "audit backup_pass_finished",
+            status = response.status(),
+            backups = response.backups.len(),
+            skipped = response.skipped.len(),
+            failed = response.failed.len(),
+            "backup pass finished with failures; not every instance has a new backup"
+        );
+    }
+    response
 }
 
 pub fn start_scheduler(state: AppState) {
@@ -732,7 +802,7 @@ pub fn start_scheduler(state: AppState) {
             "automatic backups enabled"
         );
         if run_on_startup && !*shutdown.borrow() {
-            run_scheduled_backups(&state).await;
+            backup_all_instances(&state).await;
         }
         loop {
             tokio::select! {
@@ -743,7 +813,7 @@ pub fn start_scheduler(state: AppState) {
                         break;
                     }
                 }
-                () = sleep(interval) => run_scheduled_backups(&state).await,
+                () = sleep(interval) => { backup_all_instances(&state).await; },
             }
         }
     });
@@ -913,6 +983,21 @@ fn backup_info(backup: StoredBackup) -> BackupInfo {
     }
 }
 
+fn intentionally_stopped_backup(metadata: &InstanceMetadata) -> Option<BackupIssue> {
+    // Classify only the reconciled, locked state. A failed/quarantined instance,
+    // a runtime conflict, or an unexpected stop is a failure, not an exclusion.
+    (metadata.status == InstanceStatus::Stopped
+        && metadata.desired_state == DesiredInstanceState::Stopped)
+        .then(|| BackupIssue {
+            instance_id: metadata.instance_id.clone(),
+            protocol: metadata.protocol,
+            reason: PublicDiagnostic::public(
+                "intentionally_stopped",
+                "instance is intentionally stopped; backup requires the instance to be running",
+            ),
+        })
+}
+
 fn check_backup_ready(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.status != InstanceStatus::Running {
         return Err(ApiError::BadRequest(format!(
@@ -1017,15 +1102,6 @@ fn restore_input_bytes(layout: BackupLayout, stored_bytes: u64, disk_mib: u64) -
     }
 }
 
-async fn run_scheduled_backups(state: &AppState) {
-    let response = backup_all_instances(state).await;
-    tracing::info!(
-        event = "audit scheduled_backup_pass",
-        backups = response.backups.len(),
-        skipped = response.skipped.len(),
-    );
-}
-
 fn store_error(error: BackupStoreError) -> ApiError {
     match error {
         BackupStoreError::InvalidBackupId => ApiError::BadRequest("invalid backup id".to_string()),
@@ -1037,6 +1113,96 @@ fn store_error(error: BackupStoreError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_intentional_observed_stop_is_an_expected_backup_skip() {
+        let mut metadata = crate::instances::test_support::metadata("tenant", Protocol::Postgres);
+        for status in [
+            InstanceStatus::Creating,
+            InstanceStatus::Booting,
+            InstanceStatus::Running,
+            InstanceStatus::Stopped,
+            InstanceStatus::Failed,
+            InstanceStatus::Quarantined,
+            InstanceStatus::Deleting,
+        ] {
+            for desired in [DesiredInstanceState::Running, DesiredInstanceState::Stopped] {
+                metadata.status = status;
+                metadata.desired_state = desired;
+                assert_eq!(
+                    intentionally_stopped_backup(&metadata).is_some(),
+                    status == InstanceStatus::Stopped && desired == DesiredInstanceState::Stopped,
+                    "{status:?} / {desired:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure() {
+        let mut metadata = crate::instances::test_support::metadata("tenant", Protocol::Postgres);
+        metadata.status = InstanceStatus::Stopped;
+        metadata.desired_state = DesiredInstanceState::Stopped;
+        let mut response = RunBackupResponse::default();
+        assert_eq!(response.status(), "completed");
+        response.record(
+            &metadata,
+            Ok(BackupAttempt::Skipped(
+                intentionally_stopped_backup(&metadata).unwrap(),
+            )),
+        );
+        assert_eq!(response.status(), "completed_with_skips");
+        // Even a stopped snapshot must not disguise errors encountered while
+        // checking ownership, reconciling, scheduling, or storing a backup.
+        for error in [
+            ApiError::Conflict("tenant placement does not match its shared runtime".into()),
+            ApiError::BadRequest("instance is not running (status=Failed)".into()),
+            ApiError::RateLimited,
+            ApiError::ServiceUnavailable("scheduler closed".into()),
+            ApiError::Runtime("private-storage-detail".into()),
+        ] {
+            response.record(&metadata, Err(error));
+        }
+        assert_eq!(response.status(), "failed");
+        response.record(
+            &metadata,
+            Ok(BackupAttempt::Completed(BackupInfo {
+                id: "backup.physical.tar.gz".into(),
+                instance_id: "healthy-tenant".into(),
+                protocol: Protocol::Postgres,
+                layout: BackupLayout::Physical,
+                size_bytes: 1,
+                modified_at: "2026-09-11T10:00:00Z".into(),
+                sha256: "ab".repeat(32),
+            })),
+        );
+        assert_eq!(response.status(), "partial_failure");
+        assert_eq!(response.backups.len(), 1);
+        assert_eq!(response.skipped.len(), 1);
+        assert_eq!(response.failed.len(), 5);
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["skipped"][0]["reason"]["code"],
+            "intentionally_stopped"
+        );
+        assert_eq!(value["failed"][0]["reason"]["code"], "conflict");
+        assert_eq!(value["failed"][4]["reason"]["code"], "internal_error");
+        assert!(value["failed"][4]["reason"]["error_id"].is_string());
+        assert!(!value.to_string().contains("private-storage-detail"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_backup_pass_has_no_spurious_failures() {
+        let (state, _directory) = crate::api::test_support::database(Default::default()).await;
+        let response = backup_all_instances(&state).await;
+        assert_eq!(response.status(), "completed");
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "backups": [], "skipped": [], "failed": [],
+            })
+        );
+    }
 
     #[test]
     fn catalog_selection_is_bounded_and_object_scoped() {

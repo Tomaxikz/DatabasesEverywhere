@@ -5,13 +5,15 @@
 Run from the repository root on Linux or WSL with the pinned Rust toolchain:
 
 ```bash
+cargo install --locked cargo-machete --version 0.9.2
 bash .github/ci/check.sh pre-push
 cargo build --release --locked
 ```
 
-The first command runs formatting, strict Clippy, source-size checks, and
-workspace tests. The second builds `target/release/dbev`; a build alone does
-not run tests. External-service tests are opt-in; see [CI checks](../.github/ci/README.md).
+The check script runs unused-dependency detection, formatting, strict Clippy,
+source-size checks, and workspace tests. The build creates `target/release/dbev`;
+a build alone does not run tests. External-service tests are opt-in; see
+[CI checks](../.github/ci/README.md).
 
 For cross-release packaging, `cargo b` runs the workspace's
 [release builder](../tools/release-builder/src/main.rs).

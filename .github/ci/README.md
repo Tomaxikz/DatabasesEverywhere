@@ -3,11 +3,14 @@
 Run on Linux/WSL with the pinned Rust toolchain:
 
 ```bash
+cargo install --locked cargo-machete --version 0.9.2
 bash .github/ci/check.sh pre-push
 ```
 
-This runs formatting, strict Clippy, source-size checks, and workspace tests.
-Use `lint`, `test`, or `audit` instead of `pre-push` for individual checks.
+This runs unused-dependency detection, formatting, strict Clippy, source-size
+checks, and workspace tests. `cargo-machete` failures block CI and releases;
+review any false positives rather than broadly ignoring dependencies.
+Use `lint`, `test`, `coverage`, or `audit` instead of `pre-push` for individual checks.
 To enable the pre-push hook:
 
 ```bash
@@ -24,6 +27,35 @@ Protect the `production-release` environment with reviewers and main/version-tag
 
 The [Linux build workflow](../workflows/build-binaries.yml) handles architecture packaging.
 Use the workflows as the source for tool versions, matrices, and deadlines.
+
+## Coverage
+
+The existing Linux test job runs workspace tests under `cargo-llvm-cov` and
+retains a separate doctest run on stable Rust. It uploads LCOV, HTML, and text
+reports as the `rust-coverage` artifact and adds a summary to the job output.
+Coverage percentages are informational: there is no minimum threshold, but
+test failures still block CI. Doctests and opt-in external-service tests are
+not included in the coverage percentages.
+
+To reproduce locally:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install --locked cargo-llvm-cov --version 0.9.1
+bash .github/ci/check.sh coverage
+cargo llvm-cov report --html --output-dir target/coverage
+```
+
+## Docker vulnerability gate
+
+Release builds export the Docker image to a local OCI layout with its existing
+SBOM and provenance. A checksum-pinned Trivy scans that image before registry
+login or publishing. HIGH/CRITICAL vulnerabilities (including those without
+fixes) and scanner errors block Docker publishing. The JSON results are kept
+as the `docker-vulnerability-report` artifact, including on vulnerability failure.
+Skopeo copies the scanned image and attestations with digest preservation;
+there is no second build or unscanned push path. This gate applies to Docker
+publishing, not the independently published native GitHub release binaries.
 
 ## Real database tests
 

@@ -1103,8 +1103,9 @@ components:
           oneOf:
             - $ref: "#/components/schemas/BackupObjectSelection"
             - type: "null"
-    SkippedBackup:
+    BackupIssue:
       type: object
+      additionalProperties: false
       required: [instance_id, protocol, reason]
       properties:
         instance_id: {type: string}
@@ -1113,14 +1114,20 @@ components:
     RunBackupsResponse:
       type: object
       additionalProperties: false
-      required: [backups, skipped]
+      required: [backups, skipped, failed]
+      description: A completed batch request can contain per-instance failures. Check failed even on HTTP 200; skipped contains only intentionally stopped instances, not operational errors.
       properties:
         backups:
           type: array
           items: {$ref: "#/components/schemas/BackupInfo"}
         skipped:
           type: array
-          items: {$ref: "#/components/schemas/SkippedBackup"}
+          description: Intentionally stopped instances excluded from this pass.
+          items: {$ref: "#/components/schemas/BackupIssue"}
+        failed:
+          type: array
+          description: Instances for which no new backup was created because of an error, failed/quarantined state, or placement conflict.
+          items: {$ref: "#/components/schemas/BackupIssue"}
     RestoreBackupResponse:
       type: object
       additionalProperties: false

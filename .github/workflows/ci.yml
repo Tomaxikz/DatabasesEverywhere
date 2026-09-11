@@ -63,6 +63,12 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
 
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-machete@0.9.2
+          fallback: none
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -100,7 +106,7 @@ jobs:
   tests:
     name: Linux tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     needs: global_lint
     steps:
       - name: Checkout
@@ -112,15 +118,50 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.95.0
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-llvm-cov@0.9.1
+          fallback: none
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: dbev-debug
+          shared-key: dbev-coverage
           cache-on-failure: false
 
-      - name: Check and test Linux workspace
-        run: bash .github/ci/check.sh test
+      - name: Test Linux workspace with coverage
+        id: coverage
+        run: bash .github/ci/check.sh coverage
+
+      - name: Generate informational coverage reports
+        if: ${{ !cancelled() && steps.coverage.outcome != 'skipped' }}
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov report --html --output-dir target/coverage
+          cargo llvm-cov report | tee target/coverage/summary.txt
+          {
+            echo '## Rust coverage'
+            echo
+            echo 'Informational only: no minimum coverage percentage is enforced.'
+            echo 'Doctests and opt-in external-service tests are not included in these percentages.'
+            echo
+            echo '```text'
+            cat target/coverage/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: ${{ !cancelled() && steps.coverage.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-coverage
+          path: target/coverage/
+          if-no-files-found: error
+          retention-days: 7
 
   mysql_driver_matrix:
     name: Real MySQL/MariaDB clients and versions

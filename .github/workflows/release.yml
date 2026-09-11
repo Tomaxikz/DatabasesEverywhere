@@ -156,6 +156,12 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
 
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-machete@0.9.2
+          fallback: none
+
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -244,9 +250,9 @@ jobs:
           echo "Release URL: $RELEASE_URL"
 
   docker-image:
-    name: Build Docker image
+    name: Build, scan, and publish Docker image
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment:
       name: production-release
     permissions:
@@ -321,6 +327,53 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
+      - name: Install image scanning and publishing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --connect-timeout 10 --max-time 120 \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz \
+            --output "$RUNNER_TEMP/trivy.tar.gz"
+          printf '%s  %s\n' \
+            '2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a' \
+            "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
+      - name: Build Docker image without publishing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: ${{ inputs.docker_platforms }}
+          push: false
+          # Assign registry tags only when copying after the scan; keep one OCI root.
+          outputs: type=oci,dest=${{ runner.temp }}/dbev-image,tar=false
+          provenance: mode=max
+          sbom: true
+          # Re-fetch security indexes and upgrade packages on every release.
+          # This image copies prebuilt Rust binaries; no compiler cache is lost.
+          no-cache: true
+
+      - name: Scan the release image
+        id: trivy
+        run: |
+          trivy image --input "$RUNNER_TEMP/dbev-image" \
+            --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL \
+            --exit-code 1 --timeout 10m --format json \
+            --output "$RUNNER_TEMP/trivy-report.json"
+
+      - name: Upload image vulnerability report
+        if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-vulnerability-report
+          path: ${{ runner.temp }}/trivy-report.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -328,16 +381,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          platforms: ${{ inputs.docker_platforms }}
-          push: true
-          tags: ${{ steps.docker_tags.outputs.tags }}
-          provenance: mode=max
-          sbom: true
-          # Re-fetch security indexes and upgrade packages on every release.
-          # This image copies prebuilt Rust binaries; no compiler cache is lost.
-          no-cache: true
+      - name: Publish the scanned image and its attestations
+        env:
+          IMAGE_TAGS: ${{ steps.docker_tags.outputs.tags }}
+        run: |
+          # Copy the exact scanned OCI image, including SBOM/provenance, without rebuilding.
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              "oci:$RUNNER_TEMP/dbev-image" "docker://$tag"
+          done <<< "$IMAGE_TAGS"

@@ -11,6 +11,30 @@
 API clients use opaque IDs, never host paths, commands, helper images, or
 connection URLs. Artifacts and backups are bound to their owning instance.
 
+Batch backups (`POST /api/admin/backups/run`) return `backups`, `skipped`, and
+`failed` arrays. HTTP 200 means the pass finished, not that every instance was
+backed up: panels must surface every `failed` item. Only reconciled instances
+that are intentionally stopped belong in `skipped`; failed/quarantined states,
+unexpected stops, placement conflicts, admission errors, and storage errors
+belong in `failed`. Both issue arrays contain `instance_id`, `protocol`, and a
+public `reason` diagnostic. Internal details remain private behind an `error_id`.
+
+The scheduler uses the same classification and emits one `backup_pass_finished`
+summary with counts and `completed`, `completed_with_skips`, `partial_failure`,
+or `failed` status. Failures are logged at ERROR, not disguised as skipped work.
+
+Dedicated physical backups still stop/archive/restart a running database to
+keep the data directory consistent; they are not hot backups. The
+`physical_backup_pause` and `physical_backup_resumed` events identify planned
+interruptions. Queued container events log `event_action` separately from the
+current `observed_status`, which may already reflect a later restart.
+
+For a shared-runtime placement conflict, inspect the named `mismatched_fields`
+in `tenant_runtime_identity_conflict`. Never infer ownership from an instance ID
+or reassign a tenant to silence the error. Older unowned pools are deliberately
+quarantined by the server-private-pool migration; preserve their data and resolve
+ownership/recovery with the operator before reopening access.
+
 ## Temporary dump uploads
 
 `POST /api/instances/{id}/import` has two modes:

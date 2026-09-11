@@ -3,6 +3,60 @@ use super::*;
 use crate::instances::test_support::shared_metadata;
 
 #[test]
+fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
+    for field in [
+        "none",
+        "runtime_deployment_mode",
+        "protocol",
+        "runtime_id",
+        "tenant_owner_missing",
+        "runtime_owner_missing",
+        "owner",
+        "both_owners_missing",
+    ] {
+        let mut metadata = crate::instances::test_support::metadata("tenant-a", Protocol::Postgres);
+        let mut runtime =
+            crate::placement::test_support::runtime("pool-a", Protocol::Postgres, "postgres:18.4");
+        metadata.deployment_mode = DeploymentMode::Shared;
+        metadata.runtime_id = runtime.runtime_id.clone();
+        metadata.owner = runtime.owner.clone();
+        match field {
+            "none" => {}
+            "runtime_deployment_mode" => runtime.deployment_mode = DeploymentMode::Dedicated,
+            "protocol" => runtime.protocol = Protocol::Clickhouse,
+            "runtime_id" => runtime.runtime_id = "another-pool".into(),
+            "tenant_owner_missing" => metadata.owner = None,
+            "runtime_owner_missing" => runtime.owner = None,
+            "owner" => runtime.owner.as_mut().unwrap().server_id = "private-other-server".into(),
+            "both_owners_missing" => {
+                metadata.owner = None;
+                runtime.owner = None;
+            }
+            _ => unreachable!(),
+        }
+        let original_owner = metadata.owner.clone();
+        let original_runtime_owner = runtime.owner.clone();
+        let result = check_runtime_identity(&metadata, &runtime);
+        if field == "none" {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.status(), http::StatusCode::CONFLICT);
+            let message = error.to_string();
+            if field == "both_owners_missing" {
+                assert!(message.contains("tenant_owner_missing"));
+                assert!(message.contains("runtime_owner_missing"));
+            } else {
+                assert!(message.contains(field), "{message}");
+            }
+            assert!(!message.contains("private-other-server"));
+        }
+        assert_eq!(metadata.owner, original_owner);
+        assert_eq!(runtime.owner, original_runtime_owner);
+    }
+}
+
+#[test]
 fn destructive_shared_states_cannot_be_cleared_by_power_actions() {
     for status in [InstanceStatus::Quarantined, InstanceStatus::Deleting] {
         let mut metadata = shared_metadata();

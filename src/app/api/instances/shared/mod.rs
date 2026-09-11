@@ -947,17 +947,44 @@ async fn load_runtime(
         .await
         .map_err(placement_error)?
         .ok_or_else(|| ApiError::Conflict("the shared database runtime is missing".to_string()))?;
-    if runtime.deployment_mode != DeploymentMode::Shared
-        || runtime.protocol != metadata.protocol
-        || runtime.runtime_id != runtime_id
-        || metadata.owner.is_none()
-        || runtime.owner != metadata.owner
-    {
-        return Err(ApiError::Conflict(
-            "tenant placement does not match its shared runtime".to_string(),
-        ));
-    }
+    check_runtime_identity(metadata, &runtime)?;
     Ok(runtime)
+}
+
+fn check_runtime_identity(
+    metadata: &InstanceMetadata,
+    runtime: &EngineRuntime,
+) -> Result<(), ApiError> {
+    let mismatches: Vec<_> = [
+        (
+            runtime.deployment_mode != DeploymentMode::Shared,
+            "runtime_deployment_mode",
+        ),
+        (runtime.protocol != metadata.protocol, "protocol"),
+        (runtime.runtime_id != metadata.runtime_id(), "runtime_id"),
+        (metadata.owner.is_none(), "tenant_owner_missing"),
+        (runtime.owner.is_none(), "runtime_owner_missing"),
+        (runtime.owner != metadata.owner, "owner"),
+    ]
+    .into_iter()
+    .filter_map(|(mismatch, field)| mismatch.then_some(field))
+    .collect();
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    // Never infer ownership from an instance name or silently attach data to
+    // another pool. Field names are actionable without exposing another owner.
+    tracing::error!(
+        event = "audit tenant_runtime_identity_conflict",
+        instance_id = metadata.instance_id,
+        runtime_id = metadata.runtime_id(),
+        mismatched_fields = ?mismatches,
+        "shared tenant placement needs operator inspection; ownership and routing were not changed"
+    );
+    Err(ApiError::Conflict(format!(
+        "tenant placement does not match its shared runtime; check fields: {}",
+        mismatches.join(", ")
+    )))
 }
 
 fn shared_runtime_id(metadata: &InstanceMetadata) -> Result<&str, ApiError> {

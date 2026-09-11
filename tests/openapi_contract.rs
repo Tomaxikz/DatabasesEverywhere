@@ -433,7 +433,12 @@ fn openapi_describes_the_current_response_contract() {
 
     assert_eq!(
         property_names(&schemas["RunBackupsResponse"]),
-        HashSet::from(["backups", "skipped"])
+        HashSet::from(["backups", "skipped", "failed"])
+    );
+    assert!(schemas.get("SkippedBackup").is_none());
+    assert_eq!(
+        property_names(&schemas["BackupIssue"]),
+        HashSet::from(["instance_id", "protocol", "reason"])
     );
     assert_eq!(
         property_names(&schemas["RestoreBackupResponse"]),

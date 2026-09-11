@@ -365,9 +365,9 @@ pub(super) async fn reconcile_container_state(
             tracing::info!(
                 instance_id = %reconciled.instance_id,
                 protocol = %reconciled.protocol,
-                action = event.action.as_str(),
+                event_action = event.action.as_str(),
                 previous_status = previous_status.as_str(),
-                current_status = current_status.as_str(),
+                observed_status = current_status.as_str(),
                 "enforced durable stopped state after a managed container lifecycle event"
             );
         }
@@ -385,7 +385,7 @@ pub(super) async fn reconcile_container_state(
             tracing::debug!(
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
-                action = event.action.as_str(),
+                event_action = event.action.as_str(),
                 event_container_id = event.container_id.as_deref().unwrap_or("unknown"),
                 current_container_id = current_container_id.as_deref().unwrap_or("unknown"),
                 "ignored a delayed lifecycle event emitted by a replaced managed container"
@@ -506,9 +506,9 @@ pub(super) async fn reconcile_container_state(
                 event = "audit managed_container_startup_readiness_failed",
                 instance_id = %reconciled.instance_id,
                 protocol = %reconciled.protocol,
-                action = event.action.as_str(),
+                event_action = event.action.as_str(),
                 previous_status = previous_status.as_str(),
-                current_status = current_status.as_str(),
+                observed_status = current_status.as_str(),
                 error = %readiness_error,
                 "managed database container activation failed readiness or authentication hardening and was stopped"
             );
@@ -517,19 +517,19 @@ pub(super) async fn reconcile_container_state(
                 event = "audit managed_container_runtime_failure",
                 instance_id = %reconciled.instance_id,
                 protocol = %reconciled.protocol,
-                action = event.action.as_str(),
+                event_action = event.action.as_str(),
                 previous_status = previous_status.as_str(),
-                current_status = current_status.as_str(),
+                observed_status = current_status.as_str(),
                 "managed database container stopped unexpectedly; inspect its container logs and resource limits"
             );
         } else {
             tracing::info!(
                 instance_id = %reconciled.instance_id,
                 protocol = %reconciled.protocol,
-                action = event.action.as_str(),
+                event_action = event.action.as_str(),
                 previous_status = previous_status.as_str(),
-                current_status = current_status.as_str(),
-                "managed container lifecycle event reconciled"
+                observed_status = current_status.as_str(),
+                "reconciled current runtime state after a queued container event; observed status may already supersede the event"
             );
         }
     }
