@@ -1,0 +1,58 @@
+version: 2
+
+# Major updates stay in individual PRs. All updates require review and CI;
+# this configuration does not enable automatic merging.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Europe/Budapest
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      rust-patch-and-minor:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [patch, minor]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:15"
+      timezone: Europe/Budapest
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      actions-patch-and-minor:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [patch, minor]
+
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:30"
+      timezone: Europe/Budapest
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(docker)
+    groups:
+      docker-patch-and-minor:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [patch, minor]

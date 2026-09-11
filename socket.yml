@@ -1,0 +1,11 @@
+# Repository policy for the Socket GitHub App; this file does not install it.
+version: 2
+
+githubApp:
+  enabled: true
+  pullRequestAlertsEnabled: true
+  projectReportsEnabled: true
+  # Keep actionable alerts and checks without a second dependency-summary comment.
+  dependencyOverviewEnabled: false
+  # Dependency-update bots must receive the same scrutiny as human-authored PRs.
+  ignoreUsers: []
