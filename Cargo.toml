@@ -32,7 +32,7 @@ http = "1.1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
 libc = "0.2"
 notify = { version = "8.2.0", default-features = false }
 secrecy = { version = "0.10", features = ["serde"] }
