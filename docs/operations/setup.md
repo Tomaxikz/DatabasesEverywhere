@@ -138,6 +138,18 @@ sudo journalctl -u databases-everywhere -f
 
 - Daemon output goes to journald and `paths.logs/dbev.log`. The file rotates at
   10 MiB with four archives (50 MiB total); old dated logs and journald are separate.
+  File writes use a 64 KiB buffer on the existing bounded background worker,
+  flushed after each queue batch, before rotation, and on graceful shutdown.
+  Full buffers flush during sustained traffic; idle logging adds no timer wakeups.
+  Stdout remains immediate. The file queue remains lossy under overload, and
+  abrupt termination can lose queued/buffered records; this is not a durable audit log.
+  After 250 events passing `RUST_LOG` in a one-second window, further INFO events
+  are suppressed for both outputs until the next window. Suppressed events still
+  count; other levels are unchanged. This also applies to INFO audit messages and
+  stdout-only CLI logging, but not database container logs.
+  Daemon module targets now use `databases_everywhere::daemon`; update custom
+  `RUST_LOG` filters that previously targeted `databases_everywhere::cli`.
+  Crate-wide filters such as `databases_everywhere=info` are unchanged.
 - Database console history stays with Docker/Podman, bounded to approximately
   5 MiB per container plus runtime bookkeeping. REST/WebSockets read that tail
   and stream new output; DBEV keeps no duplicate per-instance log archive.

@@ -24,6 +24,8 @@ pub mod config;
 #[cfg(target_os = "linux")]
 pub mod constants;
 #[cfg(target_os = "linux")]
+mod daemon;
+#[cfg(target_os = "linux")]
 pub mod databases;
 #[cfg(target_os = "linux")]
 pub mod disk;

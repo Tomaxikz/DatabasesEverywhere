@@ -7,6 +7,8 @@ use axum::{
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
+use crate::placement::PlacementRepositoryError;
+
 const ERROR_ID_HEADER: &str = "x-error-id";
 
 /// The single JSON success response used by the HTTP API.
@@ -90,6 +92,16 @@ pub enum ApiError {
     Runtime(String),
     #[error("{message}")]
     RequestRejected { status: StatusCode, message: String },
+}
+
+pub(crate) fn placement_error(error: PlacementRepositoryError) -> ApiError {
+    match error {
+        PlacementRepositoryError::CapacityUnavailable(_) => ApiError::Conflict("shared_pool_full: the server pool has reached its disk or database-count limit; resize it explicitly".into()),
+        PlacementRepositoryError::DatabaseInUse { .. }
+        | PlacementRepositoryError::UsernameInUse { .. }
+        | PlacementRepositoryError::AlreadyReserved(_) => ApiError::Conflict(error.to_string()),
+        _ => ApiError::Runtime(format!("shared runtime storage failed: {error}")),
+    }
 }
 
 impl ApiError {
@@ -361,5 +373,60 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn placement_errors_preserve_shared_pool_conflicts_and_runtime_failures() {
+        let capacity = placement_error(PlacementRepositoryError::CapacityUnavailable(
+            "pool-1".to_string(),
+        ));
+        assert_eq!(capacity.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            capacity.to_string(),
+            "conflict: shared_pool_full: the server pool has reached its disk or database-count limit; resize it explicitly"
+        );
+
+        let database = PlacementRepositoryError::DatabaseInUse {
+            runtime_id: "pool-1".to_string(),
+            database: "tenant_db".to_string(),
+        };
+        let database_error = placement_error(database);
+        assert_eq!(database_error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            database_error.to_string(),
+            "conflict: database \"tenant_db\" already exists in shared runtime pool-1"
+        );
+
+        let username = PlacementRepositoryError::UsernameInUse {
+            runtime_id: "pool-1".to_string(),
+            username: "tenant_user".to_string(),
+        };
+        let username_error = placement_error(username);
+        assert_eq!(username_error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            username_error.to_string(),
+            "conflict: username \"tenant_user\" already exists in shared runtime pool-1"
+        );
+
+        let already_reserved = placement_error(PlacementRepositoryError::AlreadyReserved(
+            "instance-1".to_string(),
+        ));
+        assert_eq!(already_reserved.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            already_reserved.to_string(),
+            "conflict: instance instance-1 already has a runtime reservation"
+        );
+
+        let runtime_not_found = placement_error(PlacementRepositoryError::RuntimeNotFound(
+            "pool-1".to_string(),
+        ));
+        assert_eq!(
+            runtime_not_found.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            runtime_not_found.to_string(),
+            "runtime error: shared runtime storage failed: engine runtime pool-1 does not exist"
+        );
     }
 }

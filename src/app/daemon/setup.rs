@@ -7,7 +7,7 @@ const MEMORY_OVERCOMMIT_SYSCTL_PATH: &str = "/etc/sysctl.d/99-dbev-memory.conf";
 const MEMORY_OVERCOMMIT_PROC_PATH: &str = "/proc/sys/vm/overcommit_memory";
 const SERVICE_UNIT: &str = "databases-everywhere.service";
 
-pub(super) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     require_root()?;
     validate_setup_config(&config_path)?;
     require_existing_config(&config_path)?;

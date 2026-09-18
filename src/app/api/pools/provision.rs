@@ -1,8 +1,10 @@
-use crate::api::instances::create::shared::placement_error;
 use crate::api::instances::docker_error;
 use crate::{
     api::{
-        http::{response::ApiError, router::AppState},
+        http::{
+            response::{ApiError, placement_error},
+            router::AppState,
+        },
         instances::create::{
             backend_endpoint, launch_container_from_spec, prepare_instance_container_user,
             protocol_pids_limit,

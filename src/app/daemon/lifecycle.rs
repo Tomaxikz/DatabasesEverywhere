@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let mut config = load_config(&config_path)?;
     let runtime_directories = prepare_runtime_dirs(&config)
         .await

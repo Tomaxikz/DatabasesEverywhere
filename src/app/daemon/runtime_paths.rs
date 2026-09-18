@@ -536,14 +536,14 @@ pub(super) fn runtime_roots(config: &Config) -> Vec<String> {
     ]
 }
 
-pub(super) async fn validate_runtime_support(config: &Config) -> anyhow::Result<()> {
+pub(crate) async fn validate_runtime_support(config: &Config) -> anyhow::Result<()> {
     DiskLimiter::with_fuse_root(config.disk.clone(), config.paths.fuse_root())
         .verify_startup(Path::new(&config.paths.volumes_root()))
         .await
         .context("failed to verify disk limiter support")
 }
 
-pub(super) fn log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
+pub(crate) fn log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
     let detection = crate::disk::detect_disk_mode(&config.paths, config.disk.selection)
         .context("failed to inspect configured filesystems for disk-limit selection")?;
     for filesystem in &detection.filesystems {

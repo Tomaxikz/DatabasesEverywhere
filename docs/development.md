@@ -24,6 +24,9 @@ For cross-release packaging, `cargo b` runs the workspace's
 | --- | --- |
 | `src/main.rs` | Process entry point |
 | `src/app/` | Daemon code, grouped by API, engine, gateway, storage, and runtime |
+| `src/app/cli/` | Argument parsing, command dispatch, and process umask |
+| `src/app/daemon/` | Startup, host setup, maintenance, listeners, recovery, and shutdown |
+| `src/app/api/http/` | Route wiring, application state, and shared HTTP policy/error adapters |
 | `config/`, `deploy/` | Example configuration and deployment files |
 | `docs/api/` | Integration guides and [OpenAPI](api/openapi.yml) |
 | `migrations/` | SQLite schema migrations |
@@ -32,6 +35,29 @@ For cross-release packaging, `cargo b` runs the workspace's
 | `.github/` | CI scripts and workflows |
 
 `target/`, `dist/`, `.local/`, and virtual environments are generated/local-only.
+
+## Subsystem boundaries
+
+The layout follows the same separation of transport, managed resources, and
+runtime capabilities used by [Calagopus Wings](https://github.com/calagopus/wings/tree/34a1fe19ff30f273cac948b64b72e6d4f1cc4c63/application/src),
+without copying its game-server-specific modules or adding unnecessary crates.
+
+- `cli` parses user input and dispatches commands; `daemon` owns process services
+  and their startup/shutdown ordering. Daemon services do not depend on CLI parsing.
+- `api` groups HTTP handlers by resource (`instances`, `pools`, `backups`, etc.).
+  `api/http/router.rs` wires endpoints and middleware; `api/http/state.rs` owns
+  shared request state and mutation-drain coordination. Shared HTTP error adapters
+  belong in `api/http/response.rs`, not in another resource's provisioning handler.
+- `instances` owns instance metadata and coordination; `placement` owns dedicated
+  and shared runtime placement, tenant lifecycle, and migration state.
+- `runtime` owns container-engine interaction; `databases` and `protocols` own
+  engine-specific operations and wire protocols. `gateway` owns ingress routing.
+- `storage`, `backups`, `disk`, `jobs`, and `monitoring` retain their existing
+  persistence, backup, quota, scheduling, and measurement responsibilities.
+
+Keep behavior with its owner and expose only the capabilities callers need.
+New code should import application state from `api::http::state`; the previous
+`api::http::router` exports remain available for library compatibility.
 
 ## Contributing
 

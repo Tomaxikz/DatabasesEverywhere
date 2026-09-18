@@ -3,7 +3,10 @@ use tokio::sync::OwnedMutexGuard;
 use super::resolve_image;
 use crate::{
     api::{
-        http::{response::ApiError, router::AppState},
+        http::{
+            response::{ApiError, placement_error},
+            router::AppState,
+        },
         instances::requests::CreateInstanceRequest,
     },
     instances::metadata::{
@@ -11,8 +14,8 @@ use crate::{
         InstanceMetadata, InstanceStatus, PublicEndpoint, SCHEMA_VERSION,
     },
     placement::{
-        DeploymentMode, EngineRuntime, EngineRuntimeStatus, PlacementRepositoryError,
-        ReserveTenant, runtime as shared_runtime,
+        DeploymentMode, EngineRuntime, EngineRuntimeStatus, ReserveTenant,
+        runtime as shared_runtime,
         tenant::{self, TenantTarget},
     },
     shared::{limits::InstanceLimits, protocol::Protocol, time::now_rfc3339},
@@ -567,14 +570,6 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
                 "removed the failed reservation but could not reload its physical runtime"
             );
         }
-    }
-}
-
-pub(crate) fn placement_error(error: PlacementRepositoryError) -> ApiError {
-    match error {
-        PlacementRepositoryError::CapacityUnavailable(_) => ApiError::Conflict("shared_pool_full: the server pool has reached its disk or database-count limit; resize it explicitly".into()),
-        PlacementRepositoryError::DatabaseInUse { .. } | PlacementRepositoryError::UsernameInUse { .. } | PlacementRepositoryError::AlreadyReserved(_) => ApiError::Conflict(error.to_string()),
-        _ => ApiError::Runtime(format!("shared runtime storage failed: {error}")),
     }
 }
 

@@ -2,7 +2,7 @@ use super::*;
 
 const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
 
-pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
     let _log_guard = init_logging(&config)?;
@@ -14,7 +14,7 @@ pub(super) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()>
     Ok(())
 }
 
-pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
     let _log_guard = init_logging(&config)?;
@@ -33,7 +33,7 @@ pub(super) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
     let _log_guard = init_logging(&config)?;
@@ -56,7 +56,7 @@ pub(super) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) async fn repair_protected_secret(
+pub(crate) async fn repair_protected_secret(
     config_path: PathBuf,
     instance_id: String,
     field: ProtectedSecretField,
@@ -132,7 +132,7 @@ fn read_secret_from_stdin() -> anyhow::Result<SecretString> {
     Ok(SecretString::from(value))
 }
 
-pub(super) async fn migrate_paths(
+pub(crate) async fn migrate_paths(
     config_path: PathBuf,
     dry_run: bool,
     force: bool,
@@ -499,7 +499,7 @@ pub(super) fn remove_empty_dir(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-pub(super) async fn disk_test(
+pub(crate) async fn disk_test(
     config_path: PathBuf,
     quota_mib: u64,
     write_mib: u64,
