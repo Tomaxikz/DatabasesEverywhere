@@ -139,6 +139,7 @@ async fn quarantine(
         state,
         &runtime,
         "an interrupted shared tenant could not be removed safely",
+        Some(crate::storage::quarantine::QuarantineKind::ProvisioningIncomplete),
     )
     .await;
     tracing::error!(

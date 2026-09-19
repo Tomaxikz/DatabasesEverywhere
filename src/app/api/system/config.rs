@@ -17,6 +17,7 @@ use crate::{
 };
 
 const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
+    &["daemon", "recover_shared_pools"],
     &["token"],
     &["jwt_signing_key"],
     &["token_id"],
@@ -141,6 +142,20 @@ fn value_touches_path(value: &Value, path: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obsolete_recovery_setting_cannot_be_changed_through_the_api() {
+        for patch in [
+            serde_json::json!({"daemon": {"recover_shared_pools": ["pool_x"]}}),
+            serde_json::json!({"daemon": {"recover_shared_pools": null}}),
+            serde_json::json!({"daemon": null}),
+        ] {
+            assert!(reject_forbidden_paths(&patch).is_err());
+        }
+        assert!(
+            reject_forbidden_paths(&serde_json::json!({"daemon": {"engine": "docker"}})).is_ok()
+        );
+    }
 
     #[test]
     fn merge_json_replaces_scalars_and_merges_objects() {

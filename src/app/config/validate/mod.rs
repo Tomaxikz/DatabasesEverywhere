@@ -798,6 +798,18 @@ fn validate_absolute_path(field: &'static str, value: &str) -> Result<(), Config
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_recovery_list_is_accepted_but_no_longer_serialized() {
+        let config: Config =
+            yaml_serde::from_str("daemon:\n  recover_shared_pools: ['*', 'pool_old']\n").unwrap();
+        assert_eq!(config.daemon.recover_shared_pools.len(), 2);
+        assert!(
+            serde_json::to_value(config).unwrap()["daemon"]
+                .get("recover_shared_pools")
+                .is_none()
+        );
+    }
+
     use super::*;
     use crate::config::Config;
 

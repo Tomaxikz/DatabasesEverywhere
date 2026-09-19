@@ -50,6 +50,7 @@ pub(super) async fn maintain_pool_after_delete(state: &AppState, deleted_from: E
                 state,
                 &deleted_from,
                 "tenant deletion released capacity but its shared runtime disappeared",
+                Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
             )
             .await;
             tracing::error!(
@@ -66,6 +67,7 @@ pub(super) async fn maintain_pool_after_delete(state: &AppState, deleted_from: E
                 state,
                 &deleted_from,
                 "tenant deletion released capacity but the shared runtime could not be reloaded",
+                Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
             )
             .await;
             tracing::error!(
@@ -94,6 +96,7 @@ pub(super) async fn maintain_pool_after_delete(state: &AppState, deleted_from: E
             state,
             &runtime,
             "tenant deletion left aggregate shared-pool limits uncertain",
+            Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
         )
         .await;
         tracing::error!(

@@ -488,7 +488,13 @@ async fn quarantine_tenant(
     metadata.status = InstanceStatus::Quarantined;
     metadata.desired_state = DesiredInstanceState::Stopped;
     metadata.updated_at = now_rfc3339();
-    let persistence = state.manager.upsert(metadata.clone()).await;
+    let persistence = state
+        .manager
+        .quarantine(
+            metadata.clone(),
+            crate::storage::quarantine::QuarantineKind::SecurityAttestation,
+        )
+        .await;
 
     if isolation_confirmed(route_fenced, engine_fence.is_ok(), persistence.is_ok()) {
         summary.quarantined += 1;
@@ -529,8 +535,13 @@ async fn contain_pool(
     summary: &mut SharedTenantBootSummary,
 ) -> anyhow::Result<()> {
     summary.pools_contained += 1;
-    let contained =
-        crate::placement::lifecycle::isolate_runtime(state, runtime.clone(), reason).await;
+    let contained = crate::placement::lifecycle::isolate_runtime(
+        state,
+        runtime.clone(),
+        reason,
+        crate::storage::quarantine::QuarantineKind::SecurityAttestation,
+    )
+    .await;
     anyhow::ensure!(
         contained,
         "shared pool {} could not be contained during boot reconciliation",

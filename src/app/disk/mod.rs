@@ -1,6 +1,7 @@
 mod btrfs;
 mod detection;
 mod fuse_quota;
+pub(crate) use fuse_quota::cleanup::cleanup_unused_helpers;
 mod host_quota;
 mod linux_project;
 mod mounts;

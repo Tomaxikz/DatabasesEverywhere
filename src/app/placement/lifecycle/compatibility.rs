@@ -81,6 +81,7 @@ async fn attest_runtime(state: &AppState, snapshot: EngineRuntime) -> AttestOutc
                     state,
                     failed_runtime,
                     "shared compatibility attestation could not be persisted",
+                    crate::storage::quarantine::QuarantineKind::MetadataUncertain,
                 )
                 .await;
                 AttestOutcome::Failed
@@ -89,7 +90,13 @@ async fn attest_runtime(state: &AppState, snapshot: EngineRuntime) -> AttestOutc
             }
         }
         Err(error) => {
-            isolate_runtime(state, runtime, &error).await;
+            isolate_runtime(
+                state,
+                runtime,
+                &error,
+                crate::storage::quarantine::QuarantineKind::SecurityAttestation,
+            )
+            .await;
             AttestOutcome::Failed
         }
     }

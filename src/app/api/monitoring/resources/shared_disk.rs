@@ -539,6 +539,7 @@ async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &s
             state,
             runtime,
             "shared-pool tenant metadata disagreed on protocol during disk sampling",
+            Some(crate::storage::quarantine::QuarantineKind::OwnershipMismatch),
         )
         .await;
         tracing::error!(

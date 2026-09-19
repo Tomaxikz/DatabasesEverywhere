@@ -9,6 +9,28 @@ use clap::CommandFactory;
 use super::*;
 
 #[test]
+fn quarantine_inspection_is_bounded_and_supports_history_paging() {
+    let cli = Cli::try_parse_from([
+        "dbev",
+        "quarantine",
+        "--entity-id",
+        "pool_one",
+        "--history",
+        "--before",
+        "42",
+        "--limit",
+        "50",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(super::Command::Quarantine { entity_id: Some(id), history: true, before: Some(42), limit: 50 }) if id == "pool_one")
+    );
+    for limit in ["0", "1001"] {
+        assert!(Cli::try_parse_from(["dbev", "quarantine", "--limit", limit]).is_err());
+    }
+}
+
+#[test]
 fn cli_exposes_the_package_version() {
     assert_eq!(
         Cli::command().get_version(),

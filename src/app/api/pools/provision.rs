@@ -340,8 +340,13 @@ async fn cleanup_unpersisted_runtime(
 }
 
 async fn fail_pool_start(state: &AppState, runtime: &EngineRuntime) {
-    crate::api::instances::containment::contain_locked(state, runtime, "pool creation failed")
-        .await;
+    crate::api::instances::containment::contain_locked(
+        state,
+        runtime,
+        "pool creation failed",
+        Some(crate::storage::quarantine::QuarantineKind::ProvisioningIncomplete),
+    )
+    .await;
 }
 
 pub(crate) async fn shared_spec(

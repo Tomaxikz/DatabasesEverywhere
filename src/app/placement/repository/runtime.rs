@@ -60,6 +60,38 @@ impl PlacementRepository {
     }
 
     pub async fn save(&self, runtime: &EngineRuntime) -> Result<(), PlacementRepositoryError> {
+        self.save_with_quarantine(runtime, None).await
+    }
+
+    pub(crate) async fn save_quarantined(
+        &self,
+        runtime: &EngineRuntime,
+        kind: crate::storage::quarantine::QuarantineKind,
+    ) -> Result<(), PlacementRepositoryError> {
+        if runtime.status != crate::placement::EngineRuntimeStatus::Quarantined {
+            return Err(PlacementRepositoryError::InvalidReservation(
+                "quarantine reason requires quarantined runtime".into(),
+            ));
+        }
+        self.save_with_quarantine(runtime, Some(kind)).await
+    }
+
+    pub(crate) async fn quarantine_recorded(
+        &self,
+        runtime: &EngineRuntime,
+        kind: crate::storage::quarantine::QuarantineKind,
+    ) -> Result<bool, PlacementRepositoryError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM quarantine_events
+            WHERE entity_kind='pool' AND entity_id=?1 AND generation=?2 AND code=?3 AND closed_at IS NULL)")
+            .bind(&runtime.runtime_id).bind(&runtime.created_at).bind(kind.code())
+            .fetch_one(&self.pool).await?)
+    }
+
+    async fn save_with_quarantine(
+        &self,
+        runtime: &EngineRuntime,
+        quarantine: Option<crate::storage::quarantine::QuarantineKind>,
+    ) -> Result<(), PlacementRepositoryError> {
         runtime.check()?;
         let backend = BackendColumns::from(&runtime.backend);
         let limits = &runtime.limits;
@@ -70,6 +102,17 @@ impl PlacementRepository {
             .map(|secret| self.protect_admin(&runtime.runtime_id, secret))
             .transpose()?;
         let mut transaction = self.pool.begin().await?;
+        if let Some(kind) = quarantine {
+            crate::storage::quarantine::record(
+                &mut transaction,
+                "pool",
+                &runtime.runtime_id,
+                &runtime.created_at,
+                kind,
+                "pool_containment",
+            )
+            .await?;
+        }
 
         sqlx::query(
             r#"

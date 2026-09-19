@@ -9,6 +9,7 @@ use crate::{
 };
 
 mod capacity;
+mod recovery;
 mod reservations;
 mod runtime;
 

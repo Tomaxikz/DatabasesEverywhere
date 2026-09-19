@@ -352,7 +352,7 @@ pub(super) async fn reconcile_container_state(
         let previous_status = metadata.status;
         let reconciled = reconcile::reconcile_one(metadata, &state.docker).await;
         let current_status = reconciled.status;
-        state.manager.upsert(reconciled.clone()).await?;
+        reconcile::persist_reconciled(&state.manager, previous_status, reconciled.clone()).await?;
         state
             .instance_runtime_cache
             .remove(&reconciled.instance_id)
@@ -490,7 +490,7 @@ pub(super) async fn reconcile_container_state(
         reconciled.updated_at = now_rfc3339();
     }
     let current_status = reconciled.status;
-    state.manager.upsert(reconciled.clone()).await?;
+    reconcile::persist_reconciled(&state.manager, previous_status, reconciled.clone()).await?;
     state
         .instance_runtime_cache
         .remove(&reconciled.instance_id)

@@ -116,6 +116,7 @@ pub(super) async fn wipe_clickhouse(
             state,
             &runtime,
             "shared ClickHouse wipe did not finish successfully",
+            Some(crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete),
         )
         .await;
         return Err(RestoreError::HelperUncertain(ApiError::Runtime(format!(
@@ -291,6 +292,7 @@ async fn contain_helper(
         state,
         runtime,
         "shared restore helper cleanup and tenant fencing were both uncertain",
+        Some(crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete),
     )
     .await;
     format!(

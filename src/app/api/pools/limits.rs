@@ -82,6 +82,7 @@ pub(crate) async fn resize_pool(
                 &state,
                 &pool,
                 "pool resize runtime update failed",
+                Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
             )
             .await;
             return Err(ApiError::Runtime(format!(

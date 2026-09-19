@@ -40,6 +40,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Read durable quarantine causes without modifying the daemon or its data.
+    Quarantine {
+        #[arg(long)]
+        entity_id: Option<String>,
+        #[arg(long)]
+        history: bool,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        before: Option<i64>,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        limit: u32,
+    },
     Daemon,
     CheckConfig,
     DiskTest {
@@ -87,6 +98,12 @@ pub async fn run() -> anyhow::Result<()> {
         return migrate_paths(cli.config, false, false).await;
     }
     match cli.command.unwrap_or(Command::Daemon) {
+        Command::Quarantine {
+            entity_id,
+            history,
+            before,
+            limit,
+        } => crate::daemon::quarantine::show(cli.config, entity_id, history, before, limit).await,
         Command::Daemon => run_daemon(cli.config).await,
         Command::CheckConfig => {
             let mut config = load_config(&cli.config)?;

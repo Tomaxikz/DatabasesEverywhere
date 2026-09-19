@@ -288,8 +288,9 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
         .await
         .unwrap();
 
-    // The offline runtime cannot perform a start. Admission must stop before
-    // mount preparation or activation and leave both kinds visibly failed.
+    // Admission stops before mount preparation or activation. The offline
+    // engine cannot confirm the shared pool is down, so its failure must be
+    // escalated to quarantine rather than claiming a verified stopped state.
     assert_eq!(
         start_known_instance(
             &state.config,
@@ -302,7 +303,7 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
         .unwrap(),
         Some(InstanceStatus::Failed)
     );
-    start_shared_runtimes(&state).await.unwrap();
+    assert!(start_shared_runtimes(&state).await.is_err());
     assert_eq!(
         state
             .placements
@@ -311,7 +312,7 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
             .unwrap()
             .unwrap()
             .status,
-        EngineRuntimeStatus::Failed
+        EngineRuntimeStatus::Quarantined
     );
     assert!(state.docker.check_autostart("blocked_boot").await.is_err());
     assert!(state.docker.check_autostart("pool_boot").await.is_err());

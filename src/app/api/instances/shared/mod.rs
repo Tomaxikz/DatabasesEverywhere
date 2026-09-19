@@ -236,7 +236,13 @@ pub(super) async fn change_state(
                 persisted.desired_state = DesiredInstanceState::Stopped;
                 persisted.updated_at = now_rfc3339();
                 route_fence::fence(state, &metadata.instance_id).await;
-                let quarantine = state.manager.upsert(persisted).await;
+                let quarantine = state
+                    .manager
+                    .quarantine(
+                        persisted,
+                        crate::storage::quarantine::QuarantineKind::MetadataUncertain,
+                    )
+                    .await;
                 return Err(ApiError::Runtime(format!(
                     "shared tenant lifecycle changed engine access, but durable state is ambiguous after {error}; tenant remained fenced and quarantine persistence: {}",
                     quarantine
@@ -875,7 +881,13 @@ pub(super) async fn reset_password(
                 persisted.status = InstanceStatus::Quarantined;
                 persisted.desired_state = DesiredInstanceState::Stopped;
                 persisted.updated_at = now_rfc3339();
-                let quarantine = state.manager.upsert(persisted).await;
+                let quarantine = state
+                    .manager
+                    .quarantine(
+                        persisted,
+                        crate::storage::quarantine::QuarantineKind::CredentialIntegrity,
+                    )
+                    .await;
                 return Err(ApiError::Runtime(format!(
                     "shared password rotation completed, but durable credential state is ambiguous after {error}; tenant remained fenced and quarantine persistence: {}",
                     quarantine
@@ -918,7 +930,14 @@ pub(super) async fn recover_lifecycle_panic(state: &AppState, instance_id: &str)
             metadata.status = InstanceStatus::Quarantined;
             metadata.desired_state = DesiredInstanceState::Stopped;
             metadata.updated_at = now_rfc3339();
-            match state.manager.upsert(metadata).await {
+            match state
+                .manager
+                .quarantine(
+                    metadata,
+                    crate::storage::quarantine::QuarantineKind::MetadataUncertain,
+                )
+                .await
+            {
                 Ok(()) => "the tenant was fenced and quarantined without mutating its shared pool"
                     .to_string(),
                 Err(error) => format!(
@@ -1210,6 +1229,7 @@ async fn restore_access(
                     state,
                     runtime,
                     "hard shared tenant disk boundary could not be restored",
+                    Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
                 )
                 .await;
                 let report = format!(
@@ -1233,7 +1253,13 @@ async fn restore_access(
             quarantined.status = InstanceStatus::Quarantined;
             quarantined.desired_state = DesiredInstanceState::Stopped;
             quarantined.updated_at = now_rfc3339();
-            let persisted = state.manager.upsert(quarantined).await;
+            let persisted = state
+                .manager
+                .quarantine(
+                    quarantined,
+                    crate::storage::quarantine::QuarantineKind::StorageBoundary,
+                )
+                .await;
             let report = format!(
                 "failed ({error}); tenant remained fenced and quarantine persistence: {}",
                 persisted
@@ -1359,6 +1385,7 @@ async fn quarantine_resize_failure(
         state,
         fallback_runtime,
         "shared tenant limit rollback could not restore the pool aggregate",
+        Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
     )
     .await;
     if !report.contained() {
@@ -1389,7 +1416,13 @@ async fn rollback_password(
         quarantined.status = InstanceStatus::Quarantined;
         quarantined.desired_state = DesiredInstanceState::Stopped;
         quarantined.updated_at = now_rfc3339();
-        let persist = state.manager.upsert(quarantined).await;
+        let persist = state
+            .manager
+            .quarantine(
+                quarantined,
+                crate::storage::quarantine::QuarantineKind::CredentialIntegrity,
+            )
+            .await;
         return Err(ApiError::Runtime(format!(
             "shared password reset failed ({original_error}) and rollback failed ({rollback_error}); tenant was fenced and quarantine persistence: {}",
             persist

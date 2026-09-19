@@ -9,6 +9,23 @@ pub struct InstanceManager {
 }
 
 impl InstanceManager {
+    pub(crate) async fn quarantine(
+        &self,
+        mut metadata: InstanceMetadata,
+        kind: crate::storage::quarantine::QuarantineKind,
+    ) -> Result<(), RepositoryError> {
+        if metadata.status != super::metadata::InstanceStatus::Quarantined {
+            return Err(RepositoryError::InvalidQuarantineState);
+        }
+        fill_runtime_id(&mut metadata);
+        // A failed incident/state transaction must not leave new connections
+        // admitted while the caller finishes runtime containment.
+        self.store.fence_routes(&metadata.instance_id).await;
+        self.repository.upsert_quarantined(&metadata, kind).await?;
+        self.store.upsert_fenced(metadata).await;
+        Ok(())
+    }
+
     pub fn new(store: InstanceStore, repository: InstanceRepository) -> Self {
         Self { store, repository }
     }

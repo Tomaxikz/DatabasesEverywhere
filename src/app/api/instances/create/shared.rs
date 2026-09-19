@@ -224,6 +224,7 @@ pub(super) async fn create(
                     state,
                     &runtime,
                     "shared tenant metadata commit became ambiguous",
+                    Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
                 )
                 .await;
                 return Err(fail(
@@ -250,6 +251,7 @@ pub(super) async fn create(
             state,
             &runtime,
             "new shared tenant credential verification failed",
+            Some(crate::storage::quarantine::QuarantineKind::CredentialIntegrity),
         )
         .await;
         return Err(fail(
@@ -272,6 +274,7 @@ pub(super) async fn create(
             state,
             &runtime,
             "new shared tenant root quota could not be reconciled",
+            Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
         )
         .await;
         return Err(fail(
@@ -440,6 +443,7 @@ async fn cleanup_failed_tenant(
             state,
             runtime,
             "failed shared tenant storage cleanup could not be prepared",
+            Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
         )
         .await;
         tracing::error!(
@@ -458,6 +462,7 @@ async fn cleanup_failed_tenant(
             state,
             runtime,
             "failed shared tenant creation could not be removed",
+            Some(crate::storage::quarantine::QuarantineKind::ProvisioningIncomplete),
         )
         .await;
         tracing::error!(
@@ -476,6 +481,7 @@ async fn cleanup_failed_tenant(
             state,
             runtime,
             "failed shared tenant quota cleanup remained uncertain",
+            Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
         )
         .await;
         tracing::error!(
@@ -497,6 +503,7 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
             state,
             runtime,
             "shared tenant reservation cleanup became uncertain",
+            Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
         )
         .await;
         tracing::error!(
@@ -524,6 +531,7 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
                     state,
                     &current,
                     "failed reservation cleanup left aggregate pool limits uncertain",
+                    Some(crate::storage::quarantine::QuarantineKind::StorageBoundary),
                 )
                 .await;
                 tracing::error!(
@@ -542,6 +550,7 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
                 state,
                 runtime,
                 "failed tenant creation released capacity but its shared runtime disappeared",
+                Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
             )
             .await;
             tracing::error!(
@@ -557,8 +566,7 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
             let containment = crate::api::instances::containment::contain_locked(
                 state,
                 runtime,
-                "failed tenant creation released capacity but its shared runtime could not be reloaded",
-            )
+                "failed tenant creation released capacity but its shared runtime could not be reloaded", Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain))
             .await;
             tracing::error!(
                 event = "audit shared_runtime_limit_cleanup_failed",

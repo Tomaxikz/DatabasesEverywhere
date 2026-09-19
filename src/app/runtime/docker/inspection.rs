@@ -536,6 +536,30 @@ impl DockerRuntime {
             .map(SecretString::from))
     }
 
+    /// Legacy recovery rejects duplicate keys, even if their first value looks valid.
+    pub(crate) async fn legacy_environment_secret(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        key: &str,
+    ) -> Result<Option<SecretString>, DockerError> {
+        let id = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        let response = self.docker.inspect_container(&id, None).await?;
+        let environment = response
+            .config
+            .and_then(|config| config.env)
+            .unwrap_or_default();
+        unique_optional_env(&environment, key)
+            .map(|value| value.map(SecretString::from))
+            .map_err(|reason| DockerError::InvalidLegacyCredentialEnvironment {
+                instance_id: instance_id.to_string(),
+                protocol: protocol.as_str().to_string(),
+                reason,
+            })
+    }
+
     /// Preserves the optional project ownership label across a same-image
     /// container recreation.
     pub async fn container_project_id(

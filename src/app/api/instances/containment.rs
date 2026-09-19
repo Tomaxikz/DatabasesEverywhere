@@ -34,12 +34,14 @@ impl ContainmentReport {
 /// Fails one shared runtime closed while its runtime operation lock is held.
 ///
 /// Routes are removed before any fallible durable or container operation. A
-/// durable `Quarantined` state is never automatically restarted at boot, and
-/// the physical pool is force-stopped if graceful shutdown is inconclusive.
+/// durable `Quarantined` state blocks ordinary startup. Boot recovery may only
+/// release it after full validation; the physical pool is force-stopped if
+/// graceful shutdown is inconclusive.
 pub(crate) async fn contain_locked(
     state: &AppState,
     snapshot: &EngineRuntime,
     reason: &str,
+    kind: Option<crate::storage::quarantine::QuarantineKind>,
 ) -> ContainmentReport {
     let tenant_ids = tenant_ids(state, &snapshot.runtime_id).await;
     for instance_id in &tenant_ids {
@@ -56,7 +58,7 @@ pub(crate) async fn contain_locked(
         ..ContainmentReport::default()
     };
     report.quarantine_persisted =
-        persist_quarantine(state, snapshot, &tenant_ids, &mut report).await;
+        persist_quarantine(state, snapshot, &tenant_ids, kind, &mut report).await;
     report.pool_stopped = match stop_pool(state, snapshot).await {
         Ok(()) => true,
         Err(error) => {
@@ -65,6 +67,12 @@ pub(crate) async fn contain_locked(
         }
     };
 
+    if kind.is_none() && snapshot.status == EngineRuntimeStatus::Quarantined && report.contained() {
+        tracing::info!(event = "audit shared_runtime_quarantine_reconciled",
+            runtime_id = %snapshot.runtime_id, protocol = %snapshot.protocol, %reason,
+            "confirmed existing quarantine before recovery; routes fenced and pool stopped");
+        return report;
+    }
     tracing::error!(
         event = "audit shared_runtime_contained",
         runtime_id = %snapshot.runtime_id,
@@ -108,6 +116,7 @@ async fn persist_quarantine(
     state: &AppState,
     snapshot: &EngineRuntime,
     tenant_ids: &[String],
+    kind: Option<crate::storage::quarantine::QuarantineKind>,
     report: &mut ContainmentReport,
 ) -> bool {
     let mut persisted = false;
@@ -119,20 +128,33 @@ async fn persist_quarantine(
         {
             runtime.status = EngineRuntimeStatus::Quarantined;
             runtime.updated_at = now_rfc3339();
-            persisted = match state.placements.save(&runtime).await {
+            let saved = match kind {
+                Some(kind) => state.placements.save_quarantined(&runtime, kind).await,
+                None => state.placements.save(&runtime).await,
+            };
+            persisted = match saved {
                 Ok(()) => true,
                 Err(error) => {
-                    let confirmed = state
-                        .placements
-                        .get(&snapshot.runtime_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some_and(|stored| {
-                            stored.status == EngineRuntimeStatus::Quarantined
-                                && stored.protocol == snapshot.protocol
-                                && stored.created_at == snapshot.created_at
-                        });
+                    let recorded = match kind {
+                        Some(kind) => state
+                            .placements
+                            .quarantine_recorded(&runtime, kind)
+                            .await
+                            .unwrap_or(false),
+                        None => true,
+                    };
+                    let confirmed = recorded
+                        && state
+                            .placements
+                            .get(&snapshot.runtime_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|stored| {
+                                stored.status == EngineRuntimeStatus::Quarantined
+                                    && stored.protocol == snapshot.protocol
+                                    && stored.created_at == snapshot.created_at
+                            });
                     if !confirmed {
                         report
                             .errors
@@ -176,7 +198,11 @@ async fn persist_quarantine(
         metadata.status = InstanceStatus::Quarantined;
         metadata.desired_state = DesiredInstanceState::Stopped;
         metadata.updated_at = now_rfc3339();
-        if let Err(error) = state.manager.upsert(metadata).await {
+        let saved = match kind {
+            Some(kind) => state.manager.quarantine(metadata, kind).await,
+            None => state.manager.upsert_fenced(metadata).await,
+        };
+        if let Err(error) = saved {
             report.errors.push(format!(
                 "failed to persist tenant {instance_id} quarantine: {error}"
             ));
@@ -185,7 +211,7 @@ async fn persist_quarantine(
     persisted
 }
 
-async fn stop_pool(state: &AppState, runtime: &EngineRuntime) -> Result<(), String> {
+pub(crate) async fn stop_pool(state: &AppState, runtime: &EngineRuntime) -> Result<(), String> {
     let graceful = tokio::time::timeout(
         STOP_TIMEOUT,
         state

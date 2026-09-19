@@ -424,7 +424,16 @@ pub(super) async fn restore_disk_limits(
         };
         isolate_disk_failure(&mut metadata, stop_failed);
         metadata.updated_at = now_rfc3339();
-        manager.upsert(metadata).await?;
+        if stop_failed {
+            manager
+                .quarantine(
+                    metadata,
+                    crate::storage::quarantine::QuarantineKind::ShutdownUnconfirmed,
+                )
+                .await?;
+        } else {
+            manager.upsert(metadata).await?;
+        }
     }
     if failed > 0 {
         tracing::warn!(

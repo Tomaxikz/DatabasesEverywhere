@@ -164,7 +164,7 @@ async fn quarantine_instance(
     let quarantined = quarantined_metadata(metadata);
     super::super::route_fence::fence(state, &metadata.instance_id).await;
     state.instances.upsert(quarantined.clone()).await;
-    let persistence_error = state.manager.upsert(quarantined).await.err().map(|error| {
+    let persistence_error = state.manager.quarantine(quarantined, crate::storage::quarantine::QuarantineKind::CredentialIntegrity).await.err().map(|error| {
         tracing::error!(
             instance_id = %metadata.instance_id,
             error = %error,

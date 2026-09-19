@@ -18,6 +18,8 @@ use crate::shared::limits::mib_to_bytes;
 
 use super::{DiskLimitError, mounts};
 
+pub(crate) mod cleanup;
+
 #[derive(Debug, Clone)]
 struct FuseQuotaPaths {
     root_path: PathBuf,

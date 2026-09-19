@@ -23,6 +23,7 @@ pub(crate) struct CompatibilityBootSummary {
     pub(crate) probed: usize,
     pub(crate) images_upgraded: usize,
     pub(crate) failed: usize,
+    pub(crate) deferred: usize,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,7 @@ struct InstanceBootOutcome {
     probed: bool,
     upgraded: bool,
     failed: bool,
+    deferred: bool,
 }
 
 pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSummary {
@@ -58,6 +60,7 @@ pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSum
         summary.probed += usize::from(outcome.probed);
         summary.images_upgraded += usize::from(outcome.upgraded);
         summary.failed += usize::from(outcome.failed);
+        summary.deferred += usize::from(outcome.deferred);
     }
     summary
 }
@@ -70,6 +73,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
             probed: false,
             upgraded: false,
             failed: false,
+            deferred: false,
         };
     };
     if metadata.desired_state != DesiredInstanceState::Running
@@ -80,6 +84,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
             probed: false,
             upgraded: false,
             failed: false,
+            deferred: false,
         };
     }
 
@@ -143,6 +148,14 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
         return attest_without_upgrade(state, metadata, false, Some(operation)).await;
     }
     if current_image != target_image || runtime_spec_upgrade {
+        if let Some(reason) = upgrade_blocker(&metadata, &state.config.disk) {
+            tracing::warn!(event = "audit boot_image_upgrade_deferred",
+                instance_id = %metadata.instance_id, reason,
+                "retaining the current container; repair legacy credentials/storage before retrying its upgrade");
+            let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
+            outcome.deferred = true;
+            return outcome;
+        }
         if runtime_spec_upgrade && current_image == target_image {
             tracing::info!(
                 event = "audit boot_runtime_spec_upgrade_started",
@@ -221,6 +234,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
                     probed: true,
                     upgraded: true,
                     failed: false,
+                    deferred: false,
                 }
             }
             Err(error) => {
@@ -251,6 +265,40 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
 
 fn boot_image<'a>(current: &'a str, configured: &'a str, console_repair: bool) -> &'a str {
     if console_repair { current } else { configured }
+}
+
+fn upgrade_blocker(
+    metadata: &InstanceMetadata,
+    disk: &crate::config::DiskConfig,
+) -> Option<&'static str> {
+    use crate::shared::protocol::Protocol;
+    let missing = |secret: &Option<String>| secret.as_ref().is_none_or(String::is_empty);
+    if !matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey)
+        && missing(&metadata.tenant_password)
+    {
+        return Some("saved tenant credential is missing; reset the instance password first");
+    }
+    let missing_admin = match metadata.protocol {
+        Protocol::Postgres => missing(&metadata.postgres_admin_password),
+        Protocol::Mysql => missing(&metadata.mysql_root_password),
+        Protocol::Mariadb => missing(&metadata.mariadb_root_password),
+        Protocol::Mongodb => missing(&metadata.mongodb_root_password),
+        _ => false,
+    };
+    if missing_admin {
+        return Some(
+            "saved administrator credential is missing; repair credentials before image replacement",
+        );
+    }
+    let selected = crate::disk::DiskLimiter::new(disk.clone()).mode_for_protocol(metadata.protocol);
+    if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
+        != Some(selected)
+    {
+        return Some(
+            "persisted disk backend differs from the selected backend; storage migration must complete first",
+        );
+    }
+    None
 }
 
 async fn runtime_spec_upgrade_required(metadata: &InstanceMetadata) -> bool {
@@ -293,6 +341,7 @@ async fn attest_without_upgrade(
             probed: !outcome.reused,
             upgraded,
             failed: false,
+            deferred: false,
         },
         Ok(outcome) => {
             let reason = outcome
@@ -319,6 +368,7 @@ fn failed_outcome(upgraded: bool) -> InstanceBootOutcome {
         probed: false,
         upgraded,
         failed: true,
+        deferred: false,
     }
 }
 
@@ -367,6 +417,37 @@ mod tests {
             assert_eq!(boot_image(current, configured, true), current);
             assert_eq!(boot_image(current, configured, false), configured);
         }
+    }
+
+    #[test]
+    fn legacy_upgrade_preflight_preserves_missing_credentials_and_storage() {
+        let disk = crate::config::DiskConfig::default();
+        let mut instance = metadata(Protocol::Mariadb, "/tmp/mariadb.sock".into());
+        instance.tenant_password = None;
+        assert!(
+            upgrade_blocker(&instance, &disk)
+                .unwrap()
+                .contains("tenant credential")
+        );
+        instance.tenant_password = Some("saved-secret".into());
+        instance.mariadb_root_password = None;
+        assert!(
+            upgrade_blocker(&instance, &disk)
+                .unwrap()
+                .contains("administrator credential")
+        );
+        let mut instance = metadata(Protocol::Qdrant, "/tmp/qdrant.sock".into());
+        instance.limits.disk_enforcement_method = "fuse_quota".into();
+        assert!(
+            upgrade_blocker(&instance, &disk)
+                .unwrap()
+                .contains("storage migration")
+        );
+        instance.limits.disk_enforcement_method = crate::disk::DiskLimiter::new(disk.clone())
+            .mode_for_protocol(Protocol::Qdrant)
+            .method()
+            .into();
+        assert_eq!(upgrade_blocker(&instance, &disk), None);
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ mod engine;
 mod events;
 mod image_probe;
 mod inspection;
+mod mounts;
 mod podman_api;
 mod remote_import;
 mod security;

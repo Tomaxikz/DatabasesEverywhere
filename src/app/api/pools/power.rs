@@ -169,7 +169,7 @@ pub(super) async fn change(
                     && !error.is_not_found()
                     && !error.is_not_running()
                 {
-                    instances::containment::contain_locked(&state, &pool, "pool stop failed").await;
+                    instances::containment::contain_locked(&state, &pool, "pool stop failed", Some(crate::storage::quarantine::QuarantineKind::ShutdownUnconfirmed)).await;
                     return Err(ApiError::Runtime(error.to_string()));
                 }
                 pool.status = EngineRuntimeStatus::Stopped;

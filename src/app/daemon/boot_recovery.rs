@@ -14,8 +14,7 @@ pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result
                     "could not disable engine restarts; stopping this container before boot recovery");
                 if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
                     crate::api::instances::containment::contain_locked(
-                        state, &runtime, "engine restart policy could not be repaired",
-                    ).await;
+                        state, &runtime, "engine restart policy could not be repaired", Some(crate::storage::quarantine::QuarantineKind::SecurityAttestation)).await;
                     return;
                 }
                 if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
@@ -134,6 +133,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
             attestations_reused = compatibility.attestations_reused,
             probed = compatibility.probed,
             images_upgraded = compatibility.images_upgraded,
+            upgrades_deferred = compatibility.deferred,
             unchanged_images = compatibility
                 .checked
                 .saturating_sub(compatibility.images_upgraded),
@@ -149,6 +149,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
             attestations_reused = compatibility.attestations_reused,
             probed = compatibility.probed,
             images_upgraded = compatibility.images_upgraded,
+            upgrades_deferred = compatibility.deferred,
             failed = compatibility.failed,
             shared_pools_checked = shared_compatibility.checked,
             shared_attestations_reused = shared_compatibility.reused,
@@ -390,7 +391,10 @@ pub(super) async fn quarantine_interrupted_jobs(
         metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
         metadata.updated_at = crate::jobs::import_export::now_rfc3339();
         manager
-            .upsert(metadata.clone())
+            .quarantine(
+                metadata.clone(),
+                crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete,
+            )
             .await
             .with_context(|| format!("failed to quarantine interrupted instance {instance_id}"))?;
         quarantined += 1;
@@ -477,14 +481,28 @@ pub(super) async fn quarantine_restore_workspaces(
         let already_safe = instance.status == InstanceStatus::Quarantined
             && instance.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped;
         if already_safe {
+            // Preserve older causes, but also record this currently observed
+            // rollback blocker even if the target was already quarantined.
+            manager
+                .quarantine(
+                    instance,
+                    crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete,
+                )
+                .await?;
             continue;
         }
         instance.status = InstanceStatus::Quarantined;
         instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
         instance.updated_at = crate::jobs::import_export::now_rfc3339();
-        manager.upsert(instance).await.with_context(|| {
-            format!("failed to persist physical restore recovery quarantine for {instance_id}")
-        })?;
+        manager
+            .quarantine(
+                instance,
+                crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete,
+            )
+            .await
+            .with_context(|| {
+                format!("failed to persist physical restore recovery quarantine for {instance_id}")
+            })?;
         quarantined += 1;
     }
     Ok(quarantined)
@@ -616,13 +634,26 @@ pub(super) async fn quarantine_import_manifests(
             instance.status = InstanceStatus::Quarantined;
             instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
             instance.updated_at = crate::jobs::import_export::now_rfc3339();
-            manager.upsert(instance).await.with_context(|| {
-                format!(
-                    "failed to persist recovery quarantine for {}",
-                    identity.instance_id
+            manager
+                .quarantine(
+                    instance,
+                    crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete,
                 )
-            })?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist recovery quarantine for {}",
+                        identity.instance_id
+                    )
+                })?;
             quarantined += 1;
+        } else {
+            manager
+                .quarantine(
+                    instance,
+                    crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete,
+                )
+                .await?;
         }
     }
     Ok(quarantined)

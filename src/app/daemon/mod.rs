@@ -59,11 +59,15 @@ use crate::{
 mod admission;
 mod boot_recovery;
 mod container_events;
+mod fuse_cleanup;
 mod import_temp_cleanup;
+mod legacy_credentials;
 mod lifecycle;
 pub(crate) mod logging;
 pub(crate) mod maintenance;
 mod orphan_reservations;
+mod pool_recovery;
+pub(crate) mod quarantine;
 pub(crate) mod runtime_paths;
 mod server;
 pub(crate) mod setup;

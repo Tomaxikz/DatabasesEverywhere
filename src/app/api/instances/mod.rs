@@ -133,10 +133,9 @@ pub(crate) async fn reconcile_instance_locked(
     if metadata.deployment_mode == crate::placement::DeploymentMode::Shared {
         return shared::reconcile(state, metadata).await;
     }
+    let previous = metadata.status;
     let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
-    state
-        .manager
-        .upsert(metadata.clone())
+    reconcile::persist_reconciled(&state.manager, previous, metadata.clone())
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     state
@@ -1128,12 +1127,14 @@ pub(crate) async fn change_instance_state_locked(
         );
     }
 
+    let previous = metadata.status;
     let mut metadata = reconcile::reconcile_one(metadata, &state.docker).await;
     if startup_readiness_failed {
         metadata.status = InstanceStatus::Failed;
         metadata.updated_at = now_rfc3339();
     }
-    let persistence_result = state.manager.upsert(metadata.clone()).await;
+    let persistence_result =
+        reconcile::persist_reconciled(&state.manager, previous, metadata.clone()).await;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)

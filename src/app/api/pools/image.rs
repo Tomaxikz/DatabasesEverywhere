@@ -250,8 +250,13 @@ pub(crate) async fn replace_image_locked(
             .complete(&pool.runtime_id, "pool image update completed"),
         Err(error) => {
             if replaced || pool.pending_image.is_some() {
-                instances::containment::contain_locked(state, pool, "pool image update failed")
-                    .await;
+                instances::containment::contain_locked(
+                    state,
+                    pool,
+                    "pool image update failed",
+                    Some(crate::storage::quarantine::QuarantineKind::ImageChangeIncomplete),
+                )
+                .await;
             }
             state
                 .install_progress
@@ -333,21 +338,28 @@ pub(super) async fn refresh_logging_locked(
 
 fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), ApiError> {
     let parse = |value: &str| {
-        value
+        let normalized =
+            crate::compatibility::normalize_database_version(protocol, value).ok_or(())?;
+        // Attested versions retain vendor/package suffixes. Compare all numeric
+        // components (including ClickHouse's fourth), not the package build.
+        let numeric = normalized.split(['-', ' ', '+']).next().ok_or(())?;
+        numeric
             .split('.')
             .map(str::parse::<u64>)
             .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ())
     };
-    let current = parse(current)
+    let mut current = parse(current)
         .map_err(|_| ApiError::Conflict("current version cannot be compared".into()))?;
-    let next =
+    let mut next =
         parse(next).map_err(|_| ApiError::Conflict("image version cannot be compared".into()))?;
     let series = if protocol == Protocol::Postgres { 1 } else { 2 };
-    if current.len() < series
-        || next.len() < series
-        || current[..series] != next[..series]
-        || next < current
-    {
+    let same_series =
+        current.len() >= series && next.len() >= series && current[..series] == next[..series];
+    let length = current.len().max(next.len());
+    current.resize(length, 0);
+    next.resize(length, 0);
+    if !same_series || next < current {
         return Err(ApiError::Conflict("pool image changes must stay on the same engine release line without downgrading; use a planned data migration for a major/release-line change".into()));
     }
     Ok(())
@@ -398,6 +410,32 @@ mod tests {
             (Protocol::Mongodb, "8.0.1", "8.0.2", true),
             (Protocol::Clickhouse, "26.4.4.38", "26.4.5.1", true),
             (Protocol::Mysql, "8.4.5", "8.4.4", false),
+            (
+                Protocol::Postgres,
+                "18.4 (Debian 18.4-1.pgdg13+1)",
+                "18.4",
+                true,
+            ),
+            (Protocol::Mariadb, "12.3.2-MariaDB-ubu2404", "12.3.2", true),
+            (Protocol::Mariadb, "12.3.2-MariaDB", "12.3.1-MariaDB", false),
+            (Protocol::Postgres, "18.4", "18.4.0", true),
+            (Protocol::Postgres, "18.4.0", "18.4", true),
+            (Protocol::Clickhouse, "26.4.4.38", "26.4.4.37", false),
+            (Protocol::Mysql, "8..4", "8.4.6", false),
+            (Protocol::Mysql, "unknown", "8.4.6", false),
+            (
+                Protocol::Mariadb,
+                "mariadb Ver 15.1 Distrib 12.3.2-MariaDB, for debian-linux-gnu",
+                "12.3.2",
+                true,
+            ),
+            (
+                Protocol::Mysql,
+                "mysql Ver 8.4.6-commercial for Linux",
+                "8.4.6",
+                true,
+            ),
+            (Protocol::Postgres, "18.4 (Debian 18.4-1)", "18.3", false),
         ] {
             assert_eq!(check_version(protocol, current, next).is_ok(), allowed);
         }

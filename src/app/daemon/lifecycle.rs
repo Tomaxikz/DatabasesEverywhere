@@ -343,6 +343,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         daemon_shutdown: crate::api::http::router::DaemonShutdown::default(),
     });
     disable_runtime_restarts(&state).await?;
+    super::legacy_credentials::recover(&state).await?;
     // Interrupted migration recovery may start its authoritative source or
     // target in order to verify credentials and finish cleanup. Re-establish
     // the recorded data bind and disk boundary before any such activation;
@@ -413,6 +414,10 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         "startup phase 4/5: dedicated instances and physical shared pools reconciled"
     );
     sync_cpu_burst_limits(&manager, &docker).await;
+    // Scan failed/quarantined pools before API handlers, container
+    // event workers, or database gateway listeners can mutate/publish tenants.
+    super::pool_recovery::recover_dead_pools(&state).await?;
+    super::fuse_cleanup::cleanup(&state).await;
     sync_shared_cpu_burst(&placements, &docker, &instance_locks)
         .await
         .context("failed to reconcile shared pool CPU burst policy")?;

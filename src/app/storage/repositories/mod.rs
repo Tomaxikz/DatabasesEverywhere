@@ -123,7 +123,7 @@ impl InstanceRepository {
     }
 
     pub async fn upsert(&self, metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
-        self.upsert_protected_secrets(metadata, false).await
+        self.upsert_protected_secrets(metadata, false, None).await
     }
 
     /// Atomically replaces protected route authentication and clears an
@@ -133,7 +133,19 @@ impl InstanceRepository {
         &self,
         metadata: &InstanceMetadata,
     ) -> Result<(), RepositoryError> {
-        self.upsert_protected_secrets(metadata, true).await
+        self.upsert_protected_secrets(metadata, true, None).await
+    }
+
+    pub(crate) async fn upsert_quarantined(
+        &self,
+        metadata: &InstanceMetadata,
+        kind: crate::storage::quarantine::QuarantineKind,
+    ) -> Result<(), RepositoryError> {
+        if metadata.status != InstanceStatus::Quarantined {
+            return Err(RepositoryError::InvalidQuarantineState);
+        }
+        self.upsert_protected_secrets(metadata, false, Some(kind))
+            .await
     }
 
     /// Persists only a provisional dedicated runtime's maintenance secrets.
@@ -229,6 +241,7 @@ impl InstanceRepository {
         &self,
         metadata: &InstanceMetadata,
         clear_protected_secret_recovery: bool,
+        quarantine: Option<crate::storage::quarantine::QuarantineKind>,
     ) -> Result<(), RepositoryError> {
         validate_metadata_schema(metadata)?;
         if clear_protected_secret_recovery {
@@ -276,6 +289,17 @@ impl InstanceRepository {
         // Take the writer slot before reading the recovery fence. A deferred
         // WAL snapshot cannot wait when upgraded after another writer commits.
         let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(kind) = quarantine {
+            crate::storage::quarantine::record(
+                &mut transaction,
+                "instance",
+                &metadata.instance_id,
+                &metadata.created_at,
+                kind,
+                "instance_lifecycle",
+            )
+            .await?;
+        }
         if metadata.deployment_mode == DeploymentMode::Dedicated {
             self.save_dedicated_runtime(&mut transaction, metadata, &backend, &limits_json)
                 .await?;
@@ -800,6 +824,8 @@ fn valid_hex_secret(value: Option<&str>, expected_len: usize) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
+    #[error("quarantine reason requires quarantined metadata")]
+    InvalidQuarantineState,
     #[error("sqlite query failed: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("metadata json serialization failed: {0}")]

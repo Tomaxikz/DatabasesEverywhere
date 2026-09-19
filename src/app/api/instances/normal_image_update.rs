@@ -543,7 +543,10 @@ pub(super) async fn quarantine_image_update(
 
     let (runtime_result, persistence_result) = tokio::join!(
         stop_uncertain_image_update(state, &quarantined),
-        state.manager.upsert(quarantined.clone()),
+        state.manager.quarantine(
+            quarantined.clone(),
+            crate::storage::quarantine::QuarantineKind::ImageChangeIncomplete
+        ),
     );
     let persistence_result = persistence_result
         .map_err(|error| format!("failed to persist image-update quarantine: {error}"));

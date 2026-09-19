@@ -211,7 +211,10 @@ pub(crate) async fn quarantine_uncertain_import(
             &metadata,
             "after an import lost durable commit or rollback certainty",
         ),
-        state.manager.upsert(metadata.clone()),
+        state.manager.quarantine(
+            metadata.clone(),
+            crate::storage::quarantine::QuarantineKind::ImportRestoreIncomplete
+        ),
     );
     let persistence_result =
         persistence_result.map_err(|error| format!("failed to persist quarantine: {error}"));

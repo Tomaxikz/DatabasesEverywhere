@@ -72,13 +72,16 @@ pub async fn reconcile_all(
             metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
         });
     let outcomes = futures::stream::iter(instances)
-        .map(|metadata| reconcile_one(metadata, docker))
+        .map(|metadata| async move {
+            let previous = metadata.status;
+            (previous, reconcile_one(metadata, docker).await)
+        })
         .buffer_unordered(RECONCILE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
     let mut summary = ReconcileSummary::default();
 
-    for reconciled in outcomes {
+    for (previous, reconciled) in outcomes {
         summary.checked += 1;
         match reconciled.status {
             InstanceStatus::Booting => summary.booting += 1,
@@ -88,10 +91,27 @@ pub async fn reconcile_all(
             InstanceStatus::Quarantined => summary.quarantined += 1,
             InstanceStatus::Creating | InstanceStatus::Deleting => {}
         }
-        manager.upsert(reconciled).await?;
+        persist_reconciled(manager, previous, reconciled).await?;
     }
 
     Ok(summary)
+}
+
+pub(crate) async fn persist_reconciled(
+    manager: &InstanceManager,
+    previous: InstanceStatus,
+    metadata: InstanceMetadata,
+) -> Result<(), crate::storage::repositories::RepositoryError> {
+    if previous != InstanceStatus::Quarantined && metadata.status == InstanceStatus::Quarantined {
+        manager
+            .quarantine(
+                metadata,
+                crate::storage::quarantine::QuarantineKind::IsolationMismatch,
+            )
+            .await
+    } else {
+        manager.upsert(metadata).await
+    }
 }
 
 pub async fn reconcile_one(

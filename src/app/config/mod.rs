@@ -679,6 +679,9 @@ impl std::fmt::Debug for SensitiveString {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    /// Ignored legacy setting. Boot recovery discovers failed/quarantined pools.
+    #[serde(skip_serializing)]
+    pub recover_shared_pools: Vec<String>,
     pub engine: DaemonEngine,
     pub socket_path: String,
     pub container_read_only_rootfs: bool,
@@ -691,6 +694,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            recover_shared_pools: Vec::new(),
             engine: DaemonEngine::Docker,
             socket_path: String::new(),
             container_read_only_rootfs: false,

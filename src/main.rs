@@ -9,12 +9,12 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     databases_everywhere::cli::set_safe_umask();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(databases_everywhere::cli::run());
-    // Tokio otherwise waits indefinitely for detached blocking work while the runtime drops.
-    // Durable jobs are reconciled on the next boot, so the process exit itself must stay bounded.
+
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     result
 }

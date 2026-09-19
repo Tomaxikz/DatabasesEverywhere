@@ -229,6 +229,8 @@ disk:
     shutdown_grace_seconds: 30
 
 daemon:
+  # Failed/quarantined shared pools are checked for recovery automatically at boot.
+  # Intentionally stopped pools are not started. No pool-ID allowlist is needed.
   # docker or podman. Both use the Docker-compatible container API.
   engine: docker
   # Optional. Docker uses its normal local socket when empty. A root-run Podman
