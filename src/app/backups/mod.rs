@@ -214,10 +214,6 @@ impl Drop for MaterializedBackup {
     }
 }
 
-const MAX_MATERIALIZATIONS: usize = 8;
-static MATERIALIZATION_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_MATERIALIZATIONS);
-
 #[derive(Debug, Clone)]
 pub enum BackupStorage {
     Local(drivers::local::LocalBackupDriver),
@@ -308,6 +304,7 @@ impl BackupStorage {
         backup_id: &str,
         tmp_root: &Path,
         capacity: Option<crate::api::import_export::DiskCapacityReservation>,
+        slots: std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<MaterializedBackup, BackupStoreError> {
         validate_backup_id(backup_id)?;
         if let Self::Local(driver) = self {
@@ -318,7 +315,7 @@ impl BackupStorage {
                 "remote backup materialization requires a disk reservation".to_string(),
             )
         })?;
-        let slot = MATERIALIZATION_SLOTS.try_acquire().map_err(|_| {
+        let slot = slots.try_acquire_owned().map_err(|_| {
             BackupStoreError::Runtime(
                 "remote backup materialization is at capacity; retry later".to_string(),
             )

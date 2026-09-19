@@ -146,10 +146,11 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             .max_queued_jobs_per_instance,
         "import/export scheduler initialized"
     );
-    let import_uploads = crate::api::import_export::ImportUploadService::new_with_staging_limit(
+    let import_uploads = crate::api::import_export::ImportUploadService::with_limits(
         ImportUploadRepository::new(pool.clone()),
         config.artifacts.import_upload_max_concurrent,
         scheduler_capacity.max_active_jobs,
+        config.daemon.limits.upload_inspections,
     );
     let manager = InstanceManager::new(store.clone(), repository);
     manager
@@ -175,10 +176,13 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         );
     }
     let volumes_root = config.paths.volumes_root();
-    let quarantined_physical_restore_instances =
-        quarantine_restore_workspaces(&manager, Path::new(&volumes_root))
-            .await
-            .context("failed to quarantine instances with retained physical restore workspaces")?;
+    let quarantined_physical_restore_instances = quarantine_restore_workspaces(
+        &manager,
+        Path::new(&volumes_root),
+        config.daemon.limits.recovery_volume_entries,
+    )
+    .await
+    .context("failed to quarantine instances with retained physical restore workspaces")?;
     if quarantined_physical_restore_instances > 0 {
         tracing::warn!(
             quarantined_physical_restore_instances,
@@ -311,7 +315,8 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .context("failed to verify disk limiter support")?;
     let instance_locks = crate::instances::locks::InstanceLocks::default();
     let shutdown_jobs = import_export_jobs.clone();
-    let install_progress = InstallProgressStore::default();
+    let install_progress =
+        InstallProgressStore::with_creation_limit(config.daemon.limits.instance_creations);
     let shutdown_creations = install_progress.clone();
     let state = AppState::new(AppStateData {
         config: config.clone(),
@@ -325,8 +330,9 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         docker: docker.clone(),
         import_export_jobs: import_export_jobs.clone(),
         import_uploads: import_uploads.clone(),
-        api_rate_limiter: crate::api::http::limits::ApiRateLimiter::new(
+        api_rate_limiter: crate::api::http::limits::ApiRateLimiter::with_limits(
             config.security.api_rate_limit_per_minute,
+            &config.daemon.limits,
         ),
         install_progress,
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),

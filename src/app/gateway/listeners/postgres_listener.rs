@@ -19,7 +19,7 @@ pub(super) async fn handle_postgres_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let initial = client_handshake("postgres", async {
+    let initial = client_handshake("postgres", resolver.handshake_slots(), async {
         let direct_tls = tls.is_some() && postgres_wants_direct_tls(&client).await?;
         let (mut client, mut packet, encrypted) = if direct_tls {
             let tls = tls
@@ -115,7 +115,7 @@ pub(super) async fn handle_postgres_client(
     let route_revision = target.route_revision;
     let target = target.target;
     let instance_id = target.instance_id.clone();
-    let authenticated = client_handshake("postgres", async {
+    let authenticated = client_handshake("postgres", resolver.handshake_slots(), async {
         let backend = tunnel::connect_backend(&target.endpoint)
             .await
             .map_err(|source| ListenerError::Backend {

@@ -1,5 +1,6 @@
 use std::{
     path::{Path as FsPath, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -477,6 +478,7 @@ async fn restore_backup(
             &backup_id,
             FsPath::new(&state.config.paths.tmp_root()),
             temporary_capacity,
+            Arc::clone(&state.config.budgets.backup_materializations),
         )
         .await
         .map_err(store_error)?;
@@ -844,7 +846,13 @@ pub(crate) async fn prepare_backup_download(
         )
     };
     storage
-        .materialize(instance_id, backup_id, &tmp_root, capacity)
+        .materialize(
+            instance_id,
+            backup_id,
+            &tmp_root,
+            capacity,
+            Arc::clone(&state.config.budgets.backup_materializations),
+        )
         .await
         .map_err(store_error)
 }

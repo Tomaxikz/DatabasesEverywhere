@@ -58,6 +58,10 @@ pub struct TenantSessions {
 }
 
 impl TenantSessions {
+    pub(crate) fn config(&self) -> &crate::config::RuntimeConfig {
+        &self.config
+    }
+
     pub(crate) fn with_config(config: Arc<crate::config::RuntimeConfig>) -> Self {
         Self {
             state: Arc::default(),

@@ -2,6 +2,38 @@ use super::*;
 use crate::storage::{migrations, test_support};
 use std::sync::atomic::Ordering;
 
+#[tokio::test]
+async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_lazy("sqlite::memory:")
+        .unwrap();
+    let service =
+        ImportUploadService::with_limits(ImportUploadRepository::new(pool.clone()), 8, 2, 3);
+    let other = service.clone();
+    let held = service
+        .inspection_admission
+        .clone()
+        .try_acquire_many_owned(3)
+        .unwrap();
+    assert!(
+        other
+            .inspection_admission
+            .clone()
+            .try_acquire_owned()
+            .is_err()
+    );
+    drop(held);
+    assert!(
+        other
+            .inspection_admission
+            .clone()
+            .try_acquire_many_owned(3)
+            .is_ok()
+    );
+    let service = ImportUploadService::with_limits(ImportUploadRepository::new(pool), 2, 2, 8);
+    assert_eq!(service.inspection_admission.available_permits(), 2);
+}
+
 #[test]
 fn disk_reservation_guard_releases_exactly_once() {
     let filesystem = FilesystemIdentity("test-device".to_string());

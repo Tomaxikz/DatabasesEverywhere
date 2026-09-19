@@ -590,6 +590,13 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
             field: "max_concurrent_scans",
         });
     }
+    if scanner.max_cached_directories_global == 0
+        || scanner.max_cached_directories_global > u32::MAX as usize
+    {
+        return Err(ConfigValidationError::InvalidSoftDiskScanner {
+            field: "max_cached_directories_global",
+        });
+    }
     if scanner.max_entries_per_scan == 0 || scanner.max_entries_per_scan > 10_000_000 {
         return Err(ConfigValidationError::InvalidSoftDiskScanner {
             field: "max_entries_per_scan",

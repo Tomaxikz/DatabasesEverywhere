@@ -12,8 +12,12 @@ pub(super) async fn handle_redis_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, initial) =
-        client_handshake("redis", prepare_resp_tunnel(client, resolver, tls, false)).await?;
+    let (client, target, initial) = client_handshake(
+        "redis",
+        resolver.handshake_slots(),
+        prepare_resp_tunnel(client, resolver, tls, false),
+    )
+    .await?;
 
     let instance_id = target.instance_id;
     tunnel::connect_replay_and_tunnel(
@@ -36,8 +40,12 @@ pub(super) async fn handle_valkey_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, initial) =
-        client_handshake("valkey", prepare_resp_tunnel(client, resolver, tls, true)).await?;
+    let (client, target, initial) = client_handshake(
+        "valkey",
+        resolver.handshake_slots(),
+        prepare_resp_tunnel(client, resolver, tls, true),
+    )
+    .await?;
 
     let instance_id = target.instance_id;
     tunnel::connect_replay_and_tunnel(

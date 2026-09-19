@@ -46,7 +46,6 @@ const SHA256_HEADER: &str = "x-dbev-sha256";
 const MAX_ORIGINAL_FILENAME_BYTES: usize = 180;
 const DISK_SAFETY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LISTED_UPLOADS: u32 = 100;
-const MAX_CONCURRENT_INSPECTIONS: usize = 2;
 const MAX_CONCURRENT_IMPORT_STAGING: usize = 2;
 
 mod mongodb;
@@ -84,12 +83,26 @@ impl ImportUploadService {
         max_concurrent: usize,
         max_concurrent_staging: usize,
     ) -> Self {
+        Self::with_limits(
+            repository,
+            max_concurrent,
+            max_concurrent_staging,
+            crate::config::RuntimeLimits::default().upload_inspections,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        repository: ImportUploadRepository,
+        max_concurrent: usize,
+        max_concurrent_staging: usize,
+        max_inspections: usize,
+    ) -> Self {
         let max_concurrent = max_concurrent.max(1);
         Self {
             repository,
             admission: Arc::new(Semaphore::new(max_concurrent)),
             inspection_admission: Arc::new(Semaphore::new(
-                max_concurrent.min(MAX_CONCURRENT_INSPECTIONS),
+                max_concurrent.min(max_inspections.max(1)),
             )),
             disk_reservation_gate: Arc::new(Mutex::new(())),
             reserved_disk_bytes_by_filesystem: Arc::new(StdMutex::new(HashMap::new())),

@@ -17,39 +17,40 @@ pub(super) async fn handle_clickhouse_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, target, initial) = client_handshake("clickhouse", async move {
-        let mut client = accept_direct_tls(client, tls).await?;
-        let initial = read_clickhouse_hello(&mut client).await?;
-        let route = clickhouse::parse_native_initial_route(&initial)?;
-        let resolution = resolver
-            .resolve_clickhouse(
-                &route.username,
-                (!route.database.is_empty()).then_some(route.database.as_str()),
-            )
-            .await;
-        let (database, target) = match resolution {
-            DatabaseRouteResolution::Found { database, target } => (database, target),
-            DatabaseRouteResolution::NotFound => {
-                client.write_all(&clickhouse::auth_error_packet()).await?;
-                client.shutdown().await?;
-                return Err(ListenerError::RouteNotFound);
-            }
-            DatabaseRouteResolution::Ambiguous => {
-                client.write_all(&clickhouse::auth_error_packet()).await?;
-                client.shutdown().await?;
-                return Err(ListenerError::AmbiguousDatabaseRoute {
-                    protocol: "clickhouse",
-                });
-            }
-        };
-        let initial = if route.database == database {
-            initial
-        } else {
-            clickhouse::native_hello_with_database(&initial, &database)?
-        };
-        Ok((client, target, initial))
-    })
-    .await?;
+    let (client, target, initial) =
+        client_handshake("clickhouse", resolver.handshake_slots(), async move {
+            let mut client = accept_direct_tls(client, tls).await?;
+            let initial = read_clickhouse_hello(&mut client).await?;
+            let route = clickhouse::parse_native_initial_route(&initial)?;
+            let resolution = resolver
+                .resolve_clickhouse(
+                    &route.username,
+                    (!route.database.is_empty()).then_some(route.database.as_str()),
+                )
+                .await;
+            let (database, target) = match resolution {
+                DatabaseRouteResolution::Found { database, target } => (database, target),
+                DatabaseRouteResolution::NotFound => {
+                    client.write_all(&clickhouse::auth_error_packet()).await?;
+                    client.shutdown().await?;
+                    return Err(ListenerError::RouteNotFound);
+                }
+                DatabaseRouteResolution::Ambiguous => {
+                    client.write_all(&clickhouse::auth_error_packet()).await?;
+                    client.shutdown().await?;
+                    return Err(ListenerError::AmbiguousDatabaseRoute {
+                        protocol: "clickhouse",
+                    });
+                }
+            };
+            let initial = if route.database == database {
+                initial
+            } else {
+                clickhouse::native_hello_with_database(&initial, &database)?
+            };
+            Ok((client, target, initial))
+        })
+        .await?;
 
     let instance_id = target.instance_id;
     tunnel::connect_replay_and_tunnel(
@@ -73,7 +74,7 @@ pub(super) async fn handle_clickhouse_http(
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
     let (client, instance_id, endpoint, network, session, initial) =
-        client_handshake("clickhouse_http", async move {
+        client_handshake("clickhouse_http", resolver.handshake_slots(), async move {
             let mut client = accept_direct_tls(client, tls).await?;
             let initial = read_http_headers(&mut client).await?;
             let route = match clickhouse::parse_http_initial_route(&initial) {

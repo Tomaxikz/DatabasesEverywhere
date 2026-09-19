@@ -221,6 +221,8 @@ disk:
     inotify_debounce_milliseconds: 500
     max_dirty_paths_per_instance: 512
     max_concurrent_scans: 2
+    # Across all instances. Cache saturation falls back to bounded full scans.
+    max_cached_directories_global: 32768
     max_entries_per_scan: 1000000
     scan_timeout_seconds: 30
     max_consecutive_scan_failures: 3
@@ -232,6 +234,24 @@ daemon:
   # Combined shared SQL command buffers across this daemon, in MiB.
   # 1024 MiB = 1 GiB. Not preallocated; restart after changing this value.
   sql_buffer_global_mib: 1024
+  # Admission counts, not bytes. All changes require a restart; zero is invalid.
+  limits:
+    # IPv4 address / IPv6 /64, shared across protocols. The configured
+    # security.db_connection_limit_per_minute also bounds active peer capacity.
+    gateway_connections_per_peer: 64
+    gateway_connections_per_listener: 1024
+    gateway_handshakes: 256
+    api_connections: 2048
+    api_connections_per_peer: 256
+    api_requests: 1024
+    api_heartbeat_requests: 16
+    api_websockets: 1024
+    instance_creations: 64
+    # Also bounded by artifacts.import_upload_max_concurrent.
+    upload_inspections: 2
+    backup_materializations: 8
+    # Volume-root entries examined during retained restore/pool recovery.
+    recovery_volume_entries: 4096
   # Failed/quarantined shared pools are checked for recovery automatically at boot.
   # Intentionally stopped pools are not started. No pool-ID allowlist is needed.
   # docker or podman. Both use the Docker-compatible container API.

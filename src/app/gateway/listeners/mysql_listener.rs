@@ -18,8 +18,12 @@ pub(super) async fn handle_mariadb_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let Some((client, backend, shared, activity)) =
-        client_handshake("mariadb", prepare_mariadb_tunnel(client, resolver, tls)).await?
+    let Some((client, backend, shared, activity)) = client_handshake(
+        "mariadb",
+        resolver.handshake_slots(),
+        prepare_mariadb_tunnel(client, resolver, tls),
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -40,8 +44,12 @@ pub(super) async fn handle_mysql_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let Some((client, backend, shared, activity)) =
-        client_handshake("mysql", prepare_mysql_tunnel(client, resolver, tls)).await?
+    let Some((client, backend, shared, activity)) = client_handshake(
+        "mysql",
+        resolver.handshake_slots(),
+        prepare_mysql_tunnel(client, resolver, tls),
+    )
+    .await?
     else {
         return Ok(());
     };

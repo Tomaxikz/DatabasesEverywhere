@@ -70,9 +70,11 @@ and gateway sessions. Ordinary settings remain accessible as
 settings for background jobs or serialization.
 
 For a new setting, define its field/default in `config/mod.rs` and read it in the
-consumer. Add daemon-limit validation to `DaemonConfig::validate_runtime_limits`
-in the same file. When the setting controls a shared resource such as a semaphore,
-add that resource and its construction to `RuntimeConfig`, also in that file.
+consumer. Admission settings under `daemon.limits` keep their fields, defaults,
+validation, and shared-budget construction together in `config/limits.rs`.
+Other daemon-limit validation belongs in `DaemonConfig::validate_runtime_limits`.
+When an admission setting controls a shared semaphore, construct it in
+`RuntimeLimits::shared_budgets`; `RuntimeConfig` owns the result once per daemon.
 Consumers clone the resource's `Arc`, not a new semaphore. Do not add a separate
 process static, per-limit daemon initializer, or test-only global setup.
 

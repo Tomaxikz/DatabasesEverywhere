@@ -1,4 +1,6 @@
+mod limits;
 pub mod load;
+pub use limits::RuntimeLimits;
 pub mod path_policy;
 pub mod validate;
 
@@ -85,6 +87,7 @@ impl Default for Config {
 pub struct RuntimeConfig {
     settings: Arc<Config>,
     pub(crate) sql_buffer_budget: Arc<tokio::sync::Semaphore>,
+    pub(crate) budgets: limits::SharedBudgets,
 }
 
 impl RuntimeConfig {
@@ -98,6 +101,7 @@ impl RuntimeConfig {
             "shared SQL buffer capacity configured; changes require a restart"
         );
         Ok(Self {
+            budgets: settings.daemon.limits.shared_budgets(),
             settings: Arc::new(settings),
             sql_buffer_budget: Arc::new(tokio::sync::Semaphore::new(sql_buffer_bytes)),
         })
@@ -786,6 +790,7 @@ impl std::fmt::Debug for SensitiveString {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    pub limits: RuntimeLimits,
     /// Ignored legacy setting. Boot recovery discovers failed/quarantined pools.
     #[serde(skip_serializing)]
     pub recover_shared_pools: Vec<String>,
@@ -803,6 +808,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            limits: RuntimeLimits::default(),
             recover_shared_pools: Vec::new(),
             engine: DaemonEngine::Docker,
             socket_path: String::new(),
@@ -818,6 +824,7 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     pub(crate) fn validate_runtime_limits(&self) -> Result<(), validate::ConfigValidationError> {
+        self.limits.validate()?;
         self.sql_buffer_global_bytes()?;
         Ok(())
     }
@@ -1155,6 +1162,8 @@ pub struct SoftDiskScannerConfig {
     pub max_dirty_paths_per_instance: usize,
     /// Concurrent directory walks across all instances.
     pub max_concurrent_scans: usize,
+    /// Cached directory records across all instances; overflow uses full scans.
+    pub max_cached_directories_global: usize,
     /// Per-instance entry bound for a single walk.
     pub max_entries_per_scan: usize,
     /// Per-instance wall-clock budget for a single walk.
@@ -1181,6 +1190,7 @@ impl Default for SoftDiskScannerConfig {
             inotify_debounce_milliseconds: 500,
             max_dirty_paths_per_instance: 512,
             max_concurrent_scans: 2,
+            max_cached_directories_global: 32_768,
             max_entries_per_scan: 1_000_000,
             scan_timeout_seconds: 30,
             max_consecutive_scan_failures: 3,

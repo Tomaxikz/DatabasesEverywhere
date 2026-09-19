@@ -47,6 +47,49 @@ Serialized configs include the field, but loading an older config does not rewri
 it. Add the key to your panel's config template if it should be visible in newly
 generated YAML; older templates can omit it and use the default.
 
+### Runtime admission limits
+
+The existing defaults can be overridden under `daemon.limits`. Counts are not
+bytes; zero is invalid, and changes require a daemon restart. The example config
+lists every key and its unchanged default. For example:
+
+```yaml
+daemon:
+  limits:
+    gateway_connections_per_peer: 64
+    gateway_connections_per_listener: 1024
+    gateway_handshakes: 256
+    api_connections: 2048
+    api_connections_per_peer: 256
+    api_requests: 1024
+    api_heartbeat_requests: 16
+    api_websockets: 1024
+    instance_creations: 64
+    upload_inspections: 2
+    backup_materializations: 8
+    recovery_volume_entries: 4096
+```
+
+Gateway peer accounting is shared across all protocols and groups IPv6 addresses
+by /64. The active peer ceiling remains the smaller of
+`gateway_connections_per_peer` and `security.db_connection_limit_per_minute`.
+The listener cap is separate for each database listener; handshake slots are
+shared across the daemon and still have a 15-second deadline. API request,
+heartbeat, and WebSocket budgets are separate. Upload inspection concurrency is
+also bounded by `artifacts.import_upload_max_concurrent`. Backup materialization
+limits concurrent remote-backup downloads/staging, not the number of backups.
+
+`recovery_volume_entries` applies to both physical-restore and shared-pool recovery
+inventories. Nodes with more entries in the volumes root can raise it without a
+code change; exceeding the configured budget still refuses incomplete recovery.
+This does not bypass ownership, credential, rollback, or quarantine checks.
+
+`disk.soft_scanner.max_cached_directories_global` defaults to 32768 across all
+instances. At cache capacity the scanner still falls back to bounded full scans;
+the per-instance cache bound and disk enforcement remain intact. Raising admission
+or cache limits increases potential memory/CPU use; OS file-descriptor limits,
+protocol limits, rate limits, and engine capacities still apply.
+
 ### Addresses and TLS
 
 - `api.host` / `api.port` bind the management listener; the panel stores its public URL.

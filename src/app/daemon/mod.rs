@@ -76,9 +76,7 @@ mod startup;
 
 use crate::placement::lifecycle::*;
 use crate::placement::tenant::recovery::*;
-use admission::{
-    ApiConnectionAcceptor, MAX_ACTIVE_API_CONNECTIONS, MAX_ACTIVE_API_CONNECTIONS_PER_PEER,
-};
+use admission::ApiConnectionAcceptor;
 use boot_recovery::*;
 use container_events::*;
 use import_temp_cleanup::*;

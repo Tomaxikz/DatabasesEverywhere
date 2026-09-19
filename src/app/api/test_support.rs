@@ -20,8 +20,9 @@ pub(crate) fn state(
     manager: InstanceManager,
     pool: SqlitePool,
 ) -> AppState {
+    let config = Arc::new(crate::config::RuntimeConfig::new(config).unwrap());
     AppState::new(AppStateData {
-        config: Arc::new(crate::config::RuntimeConfig::new(config).unwrap()),
+        config: Arc::clone(&config),
         config_path,
         config_patches: crate::api::system::config::ConfigPatchCoordinator::default(),
         api_token,
@@ -32,15 +33,25 @@ pub(crate) fn state(
         docker: DockerRuntime::offline_for_tests(&Default::default(), false)
             .with_startup_history(pool.clone()),
         import_export_jobs: ImportExportJobs::default(),
-        import_uploads: crate::api::import_export::ImportUploadService::new(
+        import_uploads: crate::api::import_export::ImportUploadService::with_limits(
             crate::storage::import_uploads::ImportUploadRepository::new(pool),
+            config.artifacts.import_upload_max_concurrent,
             2,
+            config.daemon.limits.upload_inspections,
         ),
-        api_rate_limiter: crate::api::http::limits::ApiRateLimiter::default(),
-        install_progress: crate::api::instances::progress::InstallProgressStore::default(),
+        api_rate_limiter: crate::api::http::limits::ApiRateLimiter::with_limits(
+            config.security.api_rate_limit_per_minute,
+            &config.daemon.limits,
+        ),
+        install_progress:
+            crate::api::instances::progress::InstallProgressStore::with_creation_limit(
+                config.daemon.limits.instance_creations,
+            ),
         artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::api::monitoring::resources::ResourceCache::default(),
-        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
+        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(
+            config.disk.soft_scanner.clone(),
+        ),
         monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
         daemon_shutdown: DaemonShutdown::default(),

@@ -130,13 +130,10 @@ impl AsyncWrite for GatewayStream {
 }
 
 const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_ACTIVE_CONNECTIONS_PER_LISTENER: usize = 1024;
-const MAX_CONCURRENT_CLIENT_HANDSHAKES: usize = 256;
 const MAX_ROUTING_HANDSHAKE_BYTES: usize = 64 * 1024;
 const BACKEND_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKEND_FAILURE_LOG_KEYS: usize = 4_096;
 
-static CLIENT_HANDSHAKE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static BACKEND_FAILURE_LOGS: OnceLock<StdMutex<HashMap<String, BackendFailureLogWindow>>> =
     OnceLock::new();
 
@@ -401,10 +398,20 @@ where
         bind,
         tls = tls.is_some(),
         protocol,
-        max_active_connections = MAX_ACTIVE_CONNECTIONS_PER_LISTENER,
+        max_active_connections = resolver
+            .config()
+            .daemon
+            .limits
+            .gateway_connections_per_listener,
         "database listener started"
     );
-    let active_connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS_PER_LISTENER));
+    let active_connections = Arc::new(Semaphore::new(
+        resolver
+            .config()
+            .daemon
+            .limits
+            .gateway_connections_per_listener,
+    ));
     let mut global_limit_logged = false;
 
     loop {
@@ -481,12 +488,11 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 
 async fn client_handshake<T>(
     protocol: &'static str,
+    slots: Arc<Semaphore>,
     future: impl Future<Output = Result<T, ListenerError>>,
 ) -> Result<T, ListenerError> {
     timeout(CLIENT_HANDSHAKE_TIMEOUT, async move {
-        let slots = CLIENT_HANDSHAKE_SLOTS
-            .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_HANDSHAKES)));
-        let _permit = Arc::clone(slots)
+        let _permit = slots
             .acquire_owned()
             .await
             .map_err(|_| IoError::other("gateway handshake admission closed"))?;
@@ -619,6 +625,105 @@ fn expected_client_failure(error: &ListenerError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn listener_applies_configured_connection_capacity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut settings = crate::config::Config::default();
+        settings.daemon.limits.gateway_connections_per_listener = 2;
+        let config = Arc::new(crate::config::RuntimeConfig::new(settings).unwrap());
+        let supervisor = crate::gateway::supervisor::GatewaySupervisor::with_config(config);
+        supervisor.begin(1);
+        supervisor.mark_ready();
+        let resolver = RouteResolver::new(
+            crate::instances::state::InstanceStore::default(),
+            crate::api::monitoring::resources::ResourceCache::default(),
+            crate::protocols::qdrant::QdrantRouteKey::new(b"test"),
+            supervisor.tenant_sessions(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(run_listener(
+            ListenerRuntime {
+                listener,
+                bind: address.to_string(),
+                protocol: "mysql",
+                resolver,
+                tls: None,
+                limiter: GatewayConnectionLimiter::default(),
+                shutdown: supervisor.subscribe_shutdown(),
+                connections: supervisor.connection_tracker(),
+            },
+            |mut client, _, _| async move {
+                client.write_all(b"x").await?;
+                let _ = client.read_u8().await;
+                Ok(())
+            },
+        ));
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(5), client.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b'x'
+            );
+            clients.push(client);
+        }
+        let mut rejected = TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), rejected.read_u8())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(supervisor.active_connections(), 2);
+        drop(clients);
+        let drained = supervisor
+            .drain_connections(Duration::from_secs(5), Duration::from_secs(1))
+            .await;
+        assert_eq!(drained.remaining, 0);
+        supervisor.shutdown();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_handshake_budget_waits_times_out_and_releases() {
+        let mut settings = crate::config::Config::default();
+        settings.daemon.limits.gateway_handshakes = 1;
+        let config = crate::config::RuntimeConfig::new(settings).unwrap();
+        let held = Arc::clone(&config.budgets.gateway_handshakes)
+            .try_acquire_owned()
+            .unwrap();
+        assert!(matches!(
+            client_handshake(
+                "mysql",
+                Arc::clone(&config.budgets.gateway_handshakes),
+                async { Ok(()) }
+            )
+            .await,
+            Err(ListenerError::HandshakeTimeout { .. })
+        ));
+        drop(held);
+        assert!(
+            client_handshake(
+                "postgres",
+                Arc::clone(&config.budgets.gateway_handshakes),
+                async { Ok(()) }
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(config.budgets.gateway_handshakes.available_permits(), 1);
+    }
 
     #[test]
     fn clickhouse_incomplete_handshakes_are_expected_client_failures() {

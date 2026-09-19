@@ -81,7 +81,7 @@ pub(super) async fn handle_qdrant_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let (client, h2) = client_handshake("qdrant", async move {
+    let (client, h2) = client_handshake("qdrant", resolver.handshake_slots(), async move {
         let mut client = accept_direct_tls(client, tls).await?;
         let alpn = client.alpn_protocol().map(<[u8]>::to_vec);
         let mut prefix = [0_u8; 4];
@@ -114,7 +114,7 @@ async fn handle_qdrant_h2_client(
 ) -> Result<(), ListenerError> {
     let request_verifier = resolver.clone();
     let (mut server, backend, first_request, first_respond, route_key_sha256) =
-        client_handshake("qdrant", async move {
+        client_handshake("qdrant", resolver.handshake_slots(), async move {
             let mut server = qdrant::server_handshake(client).await?;
             let Some(first_request) = server.accept().await else {
                 return Err(qdrant::QdrantProxyError::MissingApiKey.into());

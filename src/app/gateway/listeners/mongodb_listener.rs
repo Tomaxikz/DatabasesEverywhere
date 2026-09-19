@@ -17,73 +17,75 @@ pub(super) async fn handle_mongodb_client(
     resolver: RouteResolver,
     tls: Option<TlsAcceptor>,
 ) -> Result<(), ListenerError> {
-    let Some((client, backend, activity)) = client_handshake("mongodb", async move {
-        let mut client = accept_direct_tls(client, tls).await?;
-        let mut backend_hello = None;
-        for _ in 0..MAX_HELLO_MESSAGES {
-            let message =
-                mongodb::read_message_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
-            let route = match if mongodb::is_hello(&message) {
-                mongodb::parse_hello_speculative_route(&message)
-            } else {
-                mongodb::parse_sasl_start_route(&message).map(Some)
-            } {
-                Ok(None) => {
-                    backend_hello = Some(message.raw.clone());
+    let Some((client, backend, activity)) =
+        client_handshake("mongodb", resolver.handshake_slots(), async move {
+            let mut client = accept_direct_tls(client, tls).await?;
+            let mut backend_hello = None;
+            for _ in 0..MAX_HELLO_MESSAGES {
+                let message =
+                    mongodb::read_message_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
+                let route = match if mongodb::is_hello(&message) {
+                    mongodb::parse_hello_speculative_route(&message)
+                } else {
+                    mongodb::parse_sasl_start_route(&message).map(Some)
+                } {
+                    Ok(None) => {
+                        backend_hello = Some(message.raw.clone());
+                        mongodb::write_response(
+                            &mut client,
+                            &message,
+                            mongodb::hello_response(&message),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Ok(Some(route)) => route,
+                    Err(error) => {
+                        mongodb::write_response(
+                            &mut client,
+                            &message,
+                            mongodb::command_error(&error.to_string(), 18),
+                        )
+                        .await?;
+                        return Err(error.into());
+                    }
+                };
+                let Some(pending) = resolver
+                    .resolve_mongodb_pending(&route.username, &route.database)
+                    .await
+                else {
                     mongodb::write_response(
                         &mut client,
                         &message,
-                        mongodb::hello_response(&message),
+                        mongodb::command_error("Authentication failed", 18),
                     )
                     .await?;
-                    continue;
-                }
-                Ok(Some(route)) => route,
-                Err(error) => {
-                    mongodb::write_response(
-                        &mut client,
-                        &message,
-                        mongodb::command_error(&error.to_string(), 18),
-                    )
-                    .await?;
-                    return Err(error.into());
-                }
-            };
-            let Some(pending) = resolver
-                .resolve_mongodb_pending(&route.username, &route.database)
-                .await
-            else {
-                mongodb::write_response(
-                    &mut client,
-                    &message,
-                    mongodb::command_error("Authentication failed", 18),
+                    return Err(ListenerError::RouteNotFound);
+                };
+                let backend =
+                    tunnel::connect_backend(&pending.endpoint)
+                        .await
+                        .map_err(|source| ListenerError::Backend {
+                            instance_id: pending.instance_id.clone(),
+                            source,
+                        })?;
+                return authenticate_mongodb(
+                    client,
+                    backend,
+                    resolver,
+                    pending,
+                    route,
+                    message,
+                    backend_hello,
                 )
-                .await?;
-                return Err(ListenerError::RouteNotFound);
-            };
-            let backend = tunnel::connect_backend(&pending.endpoint)
-                .await
-                .map_err(|source| ListenerError::Backend {
-                    instance_id: pending.instance_id.clone(),
-                    source,
-                })?;
-            return authenticate_mongodb(
-                client,
-                backend,
-                resolver,
-                pending,
-                route,
-                message,
-                backend_hello,
-            )
-            .await;
-        }
+                .await;
+            }
 
-        Err(ListenerError::HandshakeMessageLimit {
-            protocol: "mongodb",
+            Err(ListenerError::HandshakeMessageLimit {
+                protocol: "mongodb",
+            })
         })
-    })
-    .await?
+        .await?
     else {
         return Ok(());
     };

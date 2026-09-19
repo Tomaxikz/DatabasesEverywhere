@@ -24,7 +24,6 @@ use super::usage::{DirectoryUsage, ScanLimits, scan_directory_with_id};
 
 // Bound tenant-controlled incremental state; larger trees stream full scans.
 const DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET: usize = 4_096;
-const DEFAULT_MAX_CACHED_DIRECTORIES_GLOBAL: usize = 32_768;
 
 pub(crate) mod planner;
 pub(crate) mod usage_tree;
@@ -392,11 +391,12 @@ struct TargetScanFailures {
 
 impl SoftDiskLimiter {
     pub fn new(config: SoftDiskScannerConfig) -> Self {
+        let global_directories = config.max_cached_directories_global;
         Self::with_usage_cache_limits(
             config,
             UsageCacheLimits {
                 per_target_directories: DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET,
-                global_directories: DEFAULT_MAX_CACHED_DIRECTORIES_GLOBAL,
+                global_directories,
             },
         )
     }
@@ -1142,6 +1142,7 @@ mod tests {
             inotify_debounce_milliseconds: 1,
             max_dirty_paths_per_instance: 32,
             max_concurrent_scans: 1,
+            max_cached_directories_global: 32_768,
             max_entries_per_scan: 100,
             scan_timeout_seconds: 2,
             max_consecutive_scan_failures: 3,

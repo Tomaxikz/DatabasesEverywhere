@@ -411,9 +411,8 @@ pub(super) async fn quarantine_interrupted_jobs(
 pub(super) async fn quarantine_restore_workspaces(
     manager: &InstanceManager,
     volumes_root: &Path,
+    max_entries: usize,
 ) -> anyhow::Result<usize> {
-    const MAX_SCANNED_ENTRIES: usize = 4096;
-
     let mut entries = match tokio::fs::read_dir(volumes_root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -436,11 +435,11 @@ pub(super) async fn quarantine_restore_workspaces(
         )
     })? {
         scanned += 1;
-        if scanned > MAX_SCANNED_ENTRIES {
+        if scanned > max_entries {
             anyhow::bail!(
                 "volumes root {} exceeds the {}-entry physical restore recovery scan safety limit",
                 volumes_root.display(),
-                MAX_SCANNED_ENTRIES
+                max_entries
             );
         }
         let Some(instance_id) = workspace_instance_id(&entry.file_name()) else {

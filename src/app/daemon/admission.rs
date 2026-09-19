@@ -15,9 +15,6 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 
-pub(super) const MAX_ACTIVE_API_CONNECTIONS: usize = 2_048;
-pub(super) const MAX_ACTIVE_API_CONNECTIONS_PER_PEER: usize = 256;
-
 #[derive(Debug, Clone)]
 pub(super) struct ApiConnectionAcceptor<A> {
     inner: A,
@@ -25,12 +22,12 @@ pub(super) struct ApiConnectionAcceptor<A> {
 }
 
 impl<A> ApiConnectionAcceptor<A> {
-    pub(super) fn new(inner: A) -> Self {
+    pub(super) fn new(inner: A, limits: &crate::config::RuntimeLimits) -> Self {
         Self {
             inner,
             limiter: Arc::new(ApiConnectionLimiter::new(
-                MAX_ACTIVE_API_CONNECTIONS,
-                MAX_ACTIVE_API_CONNECTIONS_PER_PEER,
+                limits.api_connections,
+                limits.api_connections_per_peer,
             )),
         }
     }
@@ -197,6 +194,31 @@ mod tests {
     use std::{net::IpAddr, sync::Arc};
 
     use super::ApiConnectionLimiter;
+
+    #[test]
+    fn acceptor_uses_configured_limits() {
+        let limits = crate::config::RuntimeLimits {
+            api_connections: 2,
+            api_connections_per_peer: 1,
+            ..Default::default()
+        };
+        let acceptor = super::ApiConnectionAcceptor::new((), &limits);
+        let first_ip = "192.0.2.10".parse().unwrap();
+        let first = acceptor.limiter.try_acquire(first_ip).unwrap();
+        assert!(acceptor.limiter.try_acquire(first_ip).is_none());
+        let _second = acceptor
+            .limiter
+            .try_acquire("192.0.2.11".parse().unwrap())
+            .unwrap();
+        assert!(
+            acceptor
+                .limiter
+                .try_acquire("192.0.2.12".parse().unwrap())
+                .is_none()
+        );
+        drop(first);
+        assert!(acceptor.limiter.try_acquire(first_ip).is_some());
+    }
 
     #[test]
     fn enforces_and_releases_peer_and_global_capacity() {

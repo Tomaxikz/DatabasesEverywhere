@@ -29,9 +29,8 @@ const MAX_API_RATE_LIMIT_KEYS: usize = 65_536;
 const API_RATE_LIMIT_SHARDS: usize = 64;
 const MAX_API_RATE_LIMIT_KEYS_PER_SHARD: usize = MAX_API_RATE_LIMIT_KEYS / API_RATE_LIMIT_SHARDS;
 const UNAUTHENTICATED_RATE_LIMIT_BUCKETS: u16 = 4096;
-const MAX_ACTIVE_WEBSOCKETS: usize = 1024;
+#[cfg(test)]
 const MAX_ACTIVE_API_REQUESTS: usize = 1024;
-const MAX_ACTIVE_HEARTBEAT_REQUESTS: usize = 16;
 const MAX_CONSUMED_WEBSOCKET_JTIS: usize = 65_536;
 
 #[derive(Debug, Clone)]
@@ -44,6 +43,7 @@ pub struct ApiRateLimiter {
     active_heartbeat_requests: Arc<Semaphore>,
     request_capacity_logged: Arc<AtomicBool>,
     max_requests: u32,
+    limits: crate::config::RuntimeLimits,
 }
 
 impl Default for ApiRateLimiter {
@@ -54,17 +54,22 @@ impl Default for ApiRateLimiter {
 
 impl ApiRateLimiter {
     pub fn new(max_requests: u32) -> Self {
+        Self::with_limits(max_requests, &crate::config::RuntimeLimits::default())
+    }
+
+    pub(crate) fn with_limits(max_requests: u32, limits: &crate::config::RuntimeLimits) -> Self {
         Self {
             inner: Arc::new(std::array::from_fn(|_| {
                 Mutex::new(RateLimitShard::default())
             })),
             consumed_websocket_jtis: Arc::default(),
-            active_websockets: Arc::new(Semaphore::new(MAX_ACTIVE_WEBSOCKETS)),
+            active_websockets: Arc::new(Semaphore::new(limits.api_websockets)),
             websocket_drain: Arc::default(),
-            active_requests: Arc::new(Semaphore::new(MAX_ACTIVE_API_REQUESTS)),
-            active_heartbeat_requests: Arc::new(Semaphore::new(MAX_ACTIVE_HEARTBEAT_REQUESTS)),
+            active_requests: Arc::new(Semaphore::new(limits.api_requests)),
+            active_heartbeat_requests: Arc::new(Semaphore::new(limits.api_heartbeat_requests)),
             request_capacity_logged: Arc::new(AtomicBool::new(false)),
             max_requests: max_requests.max(1),
+            limits: limits.clone(),
         }
     }
 
@@ -181,11 +186,15 @@ impl ApiRateLimiter {
     }
 
     pub(crate) fn active_websocket_count(&self) -> usize {
-        MAX_ACTIVE_WEBSOCKETS.saturating_sub(self.active_websockets.available_permits())
+        self.limits
+            .api_websockets
+            .saturating_sub(self.active_websockets.available_permits())
     }
 
     pub(crate) fn active_request_count(&self) -> usize {
-        MAX_ACTIVE_API_REQUESTS.saturating_sub(self.active_requests.available_permits())
+        self.limits
+            .api_requests
+            .saturating_sub(self.active_requests.available_permits())
     }
 
     pub(crate) async fn wait_for_websocket_drain(&self, deadline: Duration) -> bool {
@@ -517,6 +526,46 @@ fn credential_fingerprint(kind: CredentialKind, credential_identity: &str) -> [u
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn custom_concurrency_limits_are_counted_and_released() {
+        let limits = crate::config::RuntimeLimits {
+            api_requests: 2,
+            api_heartbeat_requests: 1,
+            api_websockets: 1,
+            ..Default::default()
+        };
+        let limiter = ApiRateLimiter::with_limits(600, &limits);
+        let first = limiter.admit_request(false).unwrap();
+        let second = limiter.admit_request(false).unwrap();
+        assert_eq!(limiter.active_request_count(), 2);
+        assert!(matches!(
+            limiter.admit_request(false),
+            Err(ApiError::RateLimited)
+        ));
+        let heartbeat = limiter.admit_request(true).unwrap();
+        assert!(limiter.admit_request(true).is_err());
+        drop((first, second, heartbeat));
+        assert_eq!(limiter.active_request_count(), 0);
+        assert!(limiter.admit_request(true).is_ok());
+        let websocket = limiter
+            .admit_websocket("one", now_unix() + 60)
+            .await
+            .unwrap();
+        assert_eq!(limiter.active_websocket_count(), 1);
+        assert!(matches!(
+            limiter.admit_websocket("two", now_unix() + 60).await,
+            Err(WebSocketAdmissionError::ConnectionCapacity)
+        ));
+        drop(websocket);
+        assert_eq!(limiter.active_websocket_count(), 0);
+        assert!(
+            limiter
+                .admit_websocket("two", now_unix() + 60)
+                .await
+                .is_ok()
+        );
+    }
+
     use std::{collections::HashSet, net::Ipv4Addr};
 
     use super::*;

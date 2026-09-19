@@ -16,6 +16,37 @@ fn runtime() -> EngineRuntime {
     runtime
 }
 
+#[tokio::test]
+async fn configured_volume_scan_budget_supports_more_than_4096_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.paths.data = dir.path().to_string_lossy().into_owned();
+    let volumes = std::path::PathBuf::from(config.paths.volumes_root());
+    std::fs::create_dir_all(&volumes).unwrap();
+    for index in 0..4097 {
+        std::fs::create_dir(volumes.join(format!("inst_{index}"))).unwrap();
+    }
+    let workspace = volumes.join(format!(
+        ".dbe-restore-tenant_recover-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&workspace).unwrap();
+    assert!(
+        retained_recovery_targets(&config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_volume_entries")
+    );
+    config.daemon.limits.recovery_volume_entries = 5000;
+    let blocked = retained_recovery_targets(&config).await.unwrap();
+    assert!(blocked.contains("tenant_recover"));
+    assert!(
+        workspace.is_dir(),
+        "recovery inventory must not remove rollback data"
+    );
+}
+
 #[test]
 fn recovery_accepts_an_attested_pinned_image_without_accepting_drift() {
     let mut pool = runtime();

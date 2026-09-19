@@ -7,7 +7,6 @@ use std::{
 
 const DB_CONNECTION_WINDOW: Duration = Duration::from_secs(60);
 const MAX_GATEWAY_RATE_LIMIT_KEYS: usize = 8192;
-const MAX_ACTIVE_CONNECTIONS_PER_IP: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct GatewayConnectionLimiter {
@@ -59,11 +58,18 @@ impl Default for GatewayConnectionLimiter {
 
 impl GatewayConnectionLimiter {
     pub fn new(max_connections: u32) -> Self {
+        Self::with_active_limit(
+            max_connections,
+            crate::config::RuntimeLimits::default().gateway_connections_per_peer,
+        )
+    }
+
+    pub(crate) fn with_active_limit(max_connections: u32, max_active: usize) -> Self {
         let max_connections = max_connections.max(1);
         Self {
             inner: Arc::default(),
             max_connections,
-            max_active_per_ip: max_connections.min(MAX_ACTIVE_CONNECTIONS_PER_IP),
+            max_active_per_ip: max_active.max(1).min(max_connections as usize) as u32,
         }
     }
 
@@ -184,6 +190,25 @@ fn evict_expired_windows(state: &mut LimiterState, now: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_peer_limit_is_configurable_and_releases_capacity() {
+        let limiter = GatewayConnectionLimiter::with_active_limit(1000, 80);
+        let ip = "192.0.2.20".parse().unwrap();
+        let mut permits = Vec::new();
+        for _ in 0..80 {
+            permits.push(limiter.try_acquire(ip).unwrap());
+        }
+        assert!(matches!(
+            limiter.try_acquire(ip),
+            Err(GatewayConnectionRejection {
+                reason: GatewayConnectionRejectionReason::TooManyActive,
+                ..
+            })
+        ));
+        permits.pop();
+        assert!(limiter.try_acquire(ip).is_ok());
+    }
 
     #[test]
     fn rejects_excess_active_connections_and_releases_permit() {

@@ -18,6 +18,7 @@ use crate::{
 
 const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;
 const MAX_PROGRESS_TEXT_CHARS: usize = 2_048;
+#[cfg(test)]
 const MAX_ADMITTED_CREATIONS: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,7 @@ pub struct InstallProgressStore {
     accepting: Arc<AtomicBool>,
     active_creations: Arc<RwLock<HashSet<String>>>,
     drain_notify: Arc<Notify>,
+    max_creations: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +47,19 @@ pub struct CreationPermit {
 
 impl Default for InstallProgressStore {
     fn default() -> Self {
+        Self::with_creation_limit(crate::config::RuntimeLimits::default().instance_creations)
+    }
+}
+
+impl InstallProgressStore {
+    pub(crate) fn with_creation_limit(max_creations: usize) -> Self {
         Self {
             revision: Arc::new(AtomicU64::new(1)),
             inner: Arc::default(),
             accepting: Arc::new(AtomicBool::new(true)),
             active_creations: Arc::default(),
             drain_notify: Arc::default(),
+            max_creations: max_creations.max(1),
         }
     }
 }
@@ -68,6 +77,7 @@ impl InstallProgressStore {
             &mut entries,
             progress,
             self.revision.fetch_add(1, Ordering::Relaxed),
+            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
         );
     }
 
@@ -95,13 +105,14 @@ impl InstallProgressStore {
         {
             return Err(BeginCreationError::AlreadyRunning);
         }
-        if active.len() >= MAX_ADMITTED_CREATIONS {
+        if active.len() >= self.max_creations {
             return Err(BeginCreationError::Capacity);
         }
         if !set_progress(
             &mut entries,
             creation_progress(instance_id, protocol, image),
             self.revision.fetch_add(1, Ordering::Relaxed),
+            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
         ) {
             return Err(BeginCreationError::Capacity);
         }
@@ -317,6 +328,7 @@ impl InstallProgressStore {
             &mut entries,
             progress,
             self.revision.fetch_add(1, Ordering::Relaxed),
+            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
         );
     }
 
@@ -399,9 +411,9 @@ fn set_progress(
     entries: &mut HashMap<String, InstallProgress>,
     mut progress: InstallProgress,
     revision: u64,
+    capacity: usize,
 ) -> bool {
-    if entries.len() >= MAX_INSTALL_PROGRESS_ENTRIES && !entries.contains_key(&progress.instance_id)
-    {
+    if entries.len() >= capacity && !entries.contains_key(&progress.instance_id) {
         let candidate = entries
             .values()
             .filter(|entry| entry.status != InstallProgressStatus::Running)
@@ -444,6 +456,36 @@ fn apply_failure(progress: &mut InstallProgress, diagnostic: PublicDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_creation_capacity_can_exceed_the_old_progress_cache_limit() {
+        let capacity = MAX_INSTALL_PROGRESS_ENTRIES + 1;
+        let store = InstallProgressStore::with_creation_limit(capacity);
+        let mut permits = Vec::new();
+        for index in 0..capacity {
+            permits.push(
+                store
+                    .try_begin_creation(
+                        &format!("inst_{index}"),
+                        Protocol::Postgres,
+                        "postgres:18.4",
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            store.try_begin_creation("inst_full", Protocol::Postgres, "postgres:18.4"),
+            Err(BeginCreationError::Capacity)
+        ));
+        permits.pop();
+        // A completed progress entry may be evicted, but active work must not be.
+        store.complete(&format!("inst_{}", capacity - 1), "done");
+        assert!(
+            store
+                .try_begin_creation("inst_reused", Protocol::Postgres, "postgres:18.4")
+                .is_ok()
+        );
+    }
+
     #[test]
     fn progress_revisions_survive_reuse_but_are_not_public() {
         let store = InstallProgressStore::default();

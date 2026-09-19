@@ -34,6 +34,29 @@ fn startup_banner_identifies_the_release_and_security_model() {
 }
 
 #[tokio::test]
+async fn physical_restore_scan_uses_configured_entry_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let pool = sqlite::connect(&temp.path().join("metadata"))
+        .await
+        .unwrap();
+    let manager = InstanceManager::new(InstanceStore::default(), InstanceRepository::new(pool));
+    let volumes = temp.path().join("volumes");
+    fs::create_dir_all(volumes.join("one")).unwrap();
+    fs::create_dir_all(volumes.join("two")).unwrap();
+    assert!(
+        quarantine_restore_workspaces(&manager, &volumes, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        quarantine_restore_workspaces(&manager, &volumes, 2)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn retained_manifest_quarantines_target_even_when_job_is_already_terminal() {
     let temp = tempfile::tempdir().unwrap();
     let metadata_root = temp.path().join("metadata");
@@ -111,7 +134,7 @@ async fn retained_physical_restore_workspace_quarantines_target() {
     .unwrap();
 
     assert_eq!(
-        quarantine_restore_workspaces(&manager, &volumes)
+        quarantine_restore_workspaces(&manager, &volumes, 4096)
             .await
             .unwrap(),
         1
@@ -147,7 +170,7 @@ async fn physical_restore_recovery_scan_does_not_follow_workspace_symlinks() {
     .unwrap();
 
     assert_eq!(
-        quarantine_restore_workspaces(&manager, &volumes)
+        quarantine_restore_workspaces(&manager, &volumes, 4096)
             .await
             .unwrap(),
         0

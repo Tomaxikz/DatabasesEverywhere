@@ -510,7 +510,11 @@ async fn retained_recovery_targets(
     let mut scanned = 0;
     while let Some(entry) = entries.next_entry().await? {
         scanned += 1;
-        ensure!(scanned <= 4096, "pool recovery volumes scan limit exceeded");
+        ensure!(
+            scanned <= config.daemon.limits.recovery_volume_entries,
+            "pool recovery volumes scan exceeded daemon.limits.recovery_volume_entries ({})",
+            config.daemon.limits.recovery_volume_entries
+        );
         if let Some(id) = super::boot_recovery::workspace_instance_id(&entry.file_name()) {
             blocked.insert(id);
         }

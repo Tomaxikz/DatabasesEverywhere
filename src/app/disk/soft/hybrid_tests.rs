@@ -38,6 +38,7 @@ fn hybrid_config() -> SoftDiskScannerConfig {
         inotify_debounce_milliseconds: 1,
         max_dirty_paths_per_instance: 32,
         max_concurrent_scans: 2,
+        max_cached_directories_global: 32_768,
         max_entries_per_scan: 1_000,
         scan_timeout_seconds: 5,
         max_consecutive_scan_failures: 3,
@@ -385,13 +386,9 @@ async fn global_cache_bound_is_released_when_a_target_leaves_monitoring() {
     std::fs::create_dir_all(second_root.join("nested")).unwrap();
     std::fs::write(first_root.join("nested/value"), b"first").unwrap();
     std::fs::write(second_root.join("nested/value"), b"second").unwrap();
-    let limiter = SoftDiskLimiter::with_usage_cache_limits(
-        hybrid_config(),
-        UsageCacheLimits {
-            per_target_directories: 4,
-            global_directories: 2,
-        },
-    );
+    let mut config = hybrid_config();
+    config.max_cached_directories_global = 2;
+    let limiter = SoftDiskLimiter::new(config);
     let first = target(first_root);
     let mut second = target(second_root);
     second.instance_id = "inst_hybrid_second".to_string();

@@ -54,6 +54,14 @@ pub struct RouteResolver {
 }
 
 impl RouteResolver {
+    pub(crate) fn config(&self) -> &crate::config::RuntimeConfig {
+        self.sessions.config()
+    }
+
+    pub(super) fn handshake_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.config().budgets.gateway_handshakes)
+    }
+
     pub(crate) fn new(
         store: InstanceStore,
         resources: ResourceCache,
