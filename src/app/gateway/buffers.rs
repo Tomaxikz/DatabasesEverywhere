@@ -4,7 +4,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 // Shared SQL inspection must buffer a complete command. Bound the combined
 // allocations, not just individual packets or the number of connections.
 const TENANT_BYTES: usize = 32 * 1024 * 1024;
-static GLOBAL_BYTES: Semaphore = Semaphore::const_new(256 * 1024 * 1024);
+static GLOBAL_BYTES: Semaphore = Semaphore::const_new(1024 * 1024 * 1024);
 
 #[derive(Debug, Clone)]
 pub(crate) struct QueryBudget(Arc<Semaphore>);
@@ -60,8 +60,9 @@ mod tests {
     #[test]
     fn global_rejection_releases_tenant_reservation() {
         // Reserve permits only; this test never allocates a query buffer.
-        let budget = QueryBudget(Arc::new(Semaphore::new(300 * 1024 * 1024)));
-        assert!(budget.reserve(300 * 1024 * 1024).is_err());
-        assert_eq!(budget.0.available_permits(), 300 * 1024 * 1024);
+        let bytes = 1024 * 1024 * 1024 + 1;
+        let budget = QueryBudget(Arc::new(Semaphore::new(bytes)));
+        assert!(budget.reserve(bytes).is_err());
+        assert_eq!(budget.0.available_permits(), bytes);
     }
 }
