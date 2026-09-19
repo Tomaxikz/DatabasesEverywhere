@@ -13,7 +13,7 @@ use tokio::sync::{Notify, watch};
 use crate::{
     api::http::policy::OriginPolicy,
     auth::api_token::ApiToken,
-    config::Config,
+    config::RuntimeConfig,
     instances::{manager::InstanceManager, state::InstanceStore},
     jobs::import_export::ImportExportJobs,
     runtime::docker::DockerRuntime,
@@ -23,11 +23,12 @@ use crate::{
 pub struct AppState {
     inner: Arc<AppStateData>,
     origin_policy: Arc<OriginPolicy>,
+    pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
 }
 
 #[cfg_attr(test, derive(Clone))]
 pub struct AppStateData {
-    pub config: Arc<Config>,
+    pub config: Arc<RuntimeConfig>,
     pub config_path: PathBuf,
     pub config_patches: crate::api::system::config::ConfigPatchCoordinator,
     pub api_token: ApiToken,
@@ -45,16 +46,18 @@ pub struct AppStateData {
     pub soft_disk_limiter: crate::disk::soft::SoftDiskLimiter,
     pub monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache,
     pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
-    pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
     pub daemon_shutdown: DaemonShutdown,
 }
 
 impl AppState {
     pub fn new(data: AppStateData) -> Self {
         let origin_policy = Arc::new(OriginPolicy::from_config(&data.config));
+        let gateway_supervisor =
+            crate::gateway::supervisor::GatewaySupervisor::with_config(Arc::clone(&data.config));
         Self {
             inner: Arc::new(data),
             origin_policy,
+            gateway_supervisor,
         }
     }
 
@@ -168,6 +171,29 @@ fn release_mutation(active: &AtomicUsize, drain: &Notify) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cloned_state_gateways_use_the_configured_shared_budget() {
+        let settings = crate::config::Config {
+            daemon: crate::config::DaemonConfig {
+                sql_buffer_global_mib: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (state, _directory) = crate::api::test_support::database(settings).await;
+        let other = state.clone();
+        assert!(Arc::ptr_eq(&state.config, &other.config));
+        let first = state.gateway_supervisor.tenant_sessions().open("tenant-a");
+        let second = other.gateway_supervisor.tenant_sessions().open("tenant-b");
+        let reserved = first.query_budget().reserve(1024 * 1024).unwrap();
+        assert_eq!(
+            second.query_budget().reserve(1).err().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(reserved);
+        assert!(second.query_budget().reserve(1024 * 1024).is_ok());
+    }
+
     use super::*;
 
     #[tokio::test]

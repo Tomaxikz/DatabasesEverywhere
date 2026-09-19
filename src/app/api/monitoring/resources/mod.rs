@@ -957,7 +957,7 @@ impl ResourceCache {
         futures::stream::iter(instance_ids)
             .map(|instance_id| {
                 let cache = self.clone();
-                let config = state.config.clone();
+                let config = state.config.snapshot();
                 async move {
                     let paths = match InstancePaths::new(&config.paths, &instance_id) {
                         Ok(paths) => paths,

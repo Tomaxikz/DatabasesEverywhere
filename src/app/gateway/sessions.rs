@@ -33,7 +33,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TenantEntry {
     sessions: HashMap<u64, Weak<SessionState>>,
     drained: Arc<Notify>,
@@ -54,9 +54,18 @@ struct RegistryState {
 pub struct TenantSessions {
     state: Arc<Mutex<RegistryState>>,
     next_id: Arc<AtomicU64>,
+    config: Arc<crate::config::RuntimeConfig>,
 }
 
 impl TenantSessions {
+    pub(crate) fn with_config(config: Arc<crate::config::RuntimeConfig>) -> Self {
+        Self {
+            state: Arc::default(),
+            next_id: Arc::default(),
+            config,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn open(&self, instance_id: &str) -> TenantSession {
         self.try_open(instance_id, None)
@@ -85,7 +94,14 @@ impl TenantSessions {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(SessionState::default());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let entry = state.tenants.entry(instance_id.to_string()).or_default();
+        let entry = state
+            .tenants
+            .entry(instance_id.to_string())
+            .or_insert_with(|| TenantEntry {
+                sessions: HashMap::new(),
+                drained: Arc::default(),
+                buffers: super::buffers::QueryBudget::new(&self.config),
+            });
         entry
             .sessions
             .retain(|_, session| session.strong_count() > 0);
@@ -345,5 +361,33 @@ mod tests {
         assert!(other.query_budget().reserve(1).is_ok());
         drop(reserved);
         assert!(second.query_budget().reserve(1).is_ok());
+    }
+
+    #[test]
+    fn session_registries_share_the_same_daemon_budget() {
+        let settings = crate::config::Config {
+            daemon: crate::config::DaemonConfig {
+                sql_buffer_global_mib: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = Arc::new(crate::config::RuntimeConfig::new(settings).unwrap());
+        let first = TenantSessions::with_config(Arc::clone(&config));
+        let second = TenantSessions::with_config(config);
+        let first_session = first.open("tenant-a");
+        let second_session = second.open("tenant-b");
+        let reservation = first_session.query_budget().reserve(1024 * 1024).unwrap();
+        assert_eq!(
+            second_session
+                .query_budget()
+                .reserve(1)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(reservation);
+        assert!(second_session.query_budget().reserve(1024 * 1024).is_ok());
     }
 }

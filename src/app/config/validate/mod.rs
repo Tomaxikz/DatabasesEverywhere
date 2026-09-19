@@ -22,8 +22,8 @@ const MAX_BACKUP_CATALOG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
-    #[error("daemon.sql_buffer_global_mib must be between 1 and {maximum}, inclusive")]
-    InvalidSqlBufferGlobalLimit { maximum: u64 },
+    #[error("daemon.{field} must be between 1 and {maximum}, inclusive")]
+    InvalidDaemonLimit { field: &'static str, maximum: u64 },
     #[error("uuid must not be empty")]
     EmptyUuid,
     #[error("token_id must not be empty")]
@@ -160,7 +160,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
         return Err(ConfigValidationError::InvalidBackupRetentionKeepLatest);
     }
     validate_backups(config)?;
-    config.daemon.sql_buffer_global_bytes()?;
+    config.daemon.validate_runtime_limits()?;
 
     if let Some(socket_path) = config.daemon.configured_socket_path() {
         validate_absolute_path("daemon.socket_path", socket_path)?;
@@ -817,7 +817,10 @@ mod tests {
             config.daemon.sql_buffer_global_mib = mib;
             assert!(matches!(
                 validate_config(&config),
-                Err(ConfigValidationError::InvalidSqlBufferGlobalLimit { .. })
+                Err(ConfigValidationError::InvalidDaemonLimit {
+                    field: "sql_buffer_global_mib",
+                    ..
+                })
             ));
         }
     }

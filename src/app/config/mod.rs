@@ -2,7 +2,11 @@ pub mod load;
 pub mod path_policy;
 pub mod validate;
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    ops::Deref,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +75,109 @@ impl Default for Config {
             images: ImageConfig::default(),
             paths: PathConfig::default(),
         }
+    }
+}
+
+/// One immutable configuration and its shared resources for a daemon run.
+/// Clone the Arc, not the budgets: all consumers must share the same capacity.
+/// YAML remains represented by Config; changing it takes effect on restart.
+#[derive(Debug)]
+pub struct RuntimeConfig {
+    settings: Arc<Config>,
+    pub(crate) sql_buffer_budget: Arc<tokio::sync::Semaphore>,
+}
+
+impl RuntimeConfig {
+    pub fn new(settings: Config) -> Result<Self, validate::ConfigValidationError> {
+        settings.daemon.validate_runtime_limits()?;
+        let sql_buffer_bytes = settings.daemon.sql_buffer_global_bytes()?;
+        tracing::info!(
+            event = "sql_buffer_budget_initialized",
+            global_mib = settings.daemon.sql_buffer_global_mib,
+            global_bytes = sql_buffer_bytes,
+            "shared SQL buffer capacity configured; changes require a restart"
+        );
+        Ok(Self {
+            settings: Arc::new(settings),
+            sql_buffer_budget: Arc::new(tokio::sync::Semaphore::new(sql_buffer_bytes)),
+        })
+    }
+
+    /// Read-only YAML settings for jobs that do not need runtime resources.
+    pub fn snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.settings)
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::new(Config::default()).expect("default runtime limits must be valid")
+    }
+}
+
+impl Deref for RuntimeConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_rejects_invalid_limits_before_constructing_resources() {
+        let mut settings = Config::default();
+        for mib in [
+            0,
+            u64::MAX,
+            (tokio::sync::Semaphore::MAX_PERMITS / (1024 * 1024)) as u64 + 1,
+        ] {
+            settings.daemon.sql_buffer_global_mib = mib;
+            assert!(matches!(
+                RuntimeConfig::new(settings.clone()),
+                Err(validate::ConfigValidationError::InvalidDaemonLimit {
+                    field: "sql_buffer_global_mib",
+                    ..
+                })
+            ));
+        }
+        assert_eq!(
+            RuntimeConfig::default()
+                .sql_buffer_budget
+                .available_permits(),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn snapshots_contain_only_settings_and_do_not_replace_live_budgets() {
+        let settings: Config =
+            yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 1\n").unwrap();
+        let running = Arc::new(RuntimeConfig::new(settings).unwrap());
+        let consumer = Arc::clone(&running);
+        let reservation = running
+            .sql_buffer_budget
+            .try_acquire_many(1024 * 1024)
+            .unwrap();
+        assert!(consumer.sql_buffer_budget.try_acquire().is_err());
+        let snapshot = running.snapshot();
+        let yaml = yaml_serde::to_string(snapshot.as_ref()).unwrap();
+        assert!(yaml.contains("sql_buffer_global_mib: 1"));
+        assert!(!yaml.contains("sql_buffer_budget:"));
+        let mut updated = (*snapshot).clone();
+        updated.daemon.sql_buffer_global_mib = 2;
+        let next_run = RuntimeConfig::new(updated).unwrap();
+        assert_eq!(
+            next_run.sql_buffer_budget.available_permits(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(running.daemon.sql_buffer_global_mib, 1);
+        assert_eq!(consumer.sql_buffer_budget.available_permits(), 0);
+        drop(reservation);
+        assert_eq!(consumer.sql_buffer_budget.available_permits(), 1024 * 1024);
     }
 }
 
@@ -710,16 +817,20 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    pub(crate) fn validate_runtime_limits(&self) -> Result<(), validate::ConfigValidationError> {
+        self.sql_buffer_global_bytes()?;
+        Ok(())
+    }
+
     pub(crate) fn sql_buffer_global_bytes(&self) -> Result<usize, validate::ConfigValidationError> {
         self.sql_buffer_global_mib
             .checked_mul(1024 * 1024)
             .and_then(|bytes| usize::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0 && *bytes <= tokio::sync::Semaphore::MAX_PERMITS)
-            .ok_or(
-                validate::ConfigValidationError::InvalidSqlBufferGlobalLimit {
-                    maximum: (tokio::sync::Semaphore::MAX_PERMITS / (1024 * 1024)) as u64,
-                },
-            )
+            .ok_or(validate::ConfigValidationError::InvalidDaemonLimit {
+                field: "sql_buffer_global_mib",
+                maximum: (tokio::sync::Semaphore::MAX_PERMITS / (1024 * 1024)) as u64,
+            })
     }
 
     pub fn configured_socket_path(&self) -> Option<&str> {

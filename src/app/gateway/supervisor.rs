@@ -162,6 +162,10 @@ impl Default for GatewaySupervisor {
 
 impl GatewaySupervisor {
     pub fn new() -> Self {
+        Self::with_config(Arc::new(crate::config::RuntimeConfig::default()))
+    }
+
+    pub(crate) fn with_config(config: Arc<crate::config::RuntimeConfig>) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             state: Arc::new(RwLock::new(GatewayState {
@@ -172,7 +176,7 @@ impl GatewaySupervisor {
             })),
             shutdown,
             connections: GatewayConnectionTracker::new(),
-            tenant_sessions: crate::gateway::sessions::TenantSessions::default(),
+            tenant_sessions: crate::gateway::sessions::TenantSessions::with_config(config),
         }
     }
 

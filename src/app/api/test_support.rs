@@ -21,7 +21,7 @@ pub(crate) fn state(
     pool: SqlitePool,
 ) -> AppState {
     AppState::new(AppStateData {
-        config: Arc::new(config),
+        config: Arc::new(crate::config::RuntimeConfig::new(config).unwrap()),
         config_path,
         config_patches: crate::api::system::config::ConfigPatchCoordinator::default(),
         api_token,
@@ -43,7 +43,6 @@ pub(crate) fn state(
         soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(Default::default()),
         monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
-        gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor::default(),
         daemon_shutdown: DaemonShutdown::default(),
     })
 }

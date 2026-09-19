@@ -61,6 +61,29 @@ New code should import application state from `api::http::state`; the previous
 
 ## Contributing
 
+### Adding configuration and shared runtime limits
+
+`config::Config` is the serializable YAML model. The daemon constructs one
+`Arc<config::RuntimeConfig>` around it and shares that object through `AppState`
+and gateway sessions. Ordinary settings remain accessible as
+`state.config.daemon.some_setting`; `snapshot()` returns only the immutable YAML
+settings for background jobs or serialization.
+
+For a new setting, define its field/default in `config/mod.rs` and read it in the
+consumer. Add daemon-limit validation to `DaemonConfig::validate_runtime_limits`
+in the same file. When the setting controls a shared resource such as a semaphore,
+add that resource and its construction to `RuntimeConfig`, also in that file.
+Consumers clone the resource's `Arc`, not a new semaphore. Do not add a separate
+process static, per-limit daemon initializer, or test-only global setup.
+
+Tests can construct independent `RuntimeConfig` objects with small capacities;
+multiple consumers of the same object must still share its allowance. Keep
+config/behavior tests and example YAML in sync. Config changes remain
+restart-required: editing YAML does not replace live semaphores or invalidate
+existing reservations.
+
+### Code changes
+
 Change the module that owns the behavior; avoid duplicate implementations and
 forwarding modules. Keep focused tests beside the code and real-driver fixtures
 in `tests/real_drivers/`. Keep routes and OpenAPI in sync.

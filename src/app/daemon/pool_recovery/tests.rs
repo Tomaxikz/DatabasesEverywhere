@@ -327,14 +327,14 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
     other.desired_state = DesiredInstanceState::Running;
     state.placements.save(&other).await.unwrap();
     let mut data = (*state).clone();
-    let mut config = (*state.config).clone();
+    let mut config = (**state.config).clone();
     config.paths.data = dir.path().to_string_lossy().into_owned();
     config.token_id = "wrong-panel".into();
     config.daemon.recover_shared_pools = vec![pool.runtime_id.clone()];
     tokio::fs::create_dir_all(config.paths.volumes_root())
         .await
         .unwrap();
-    data.config = std::sync::Arc::new(config);
+    data.config = std::sync::Arc::new(crate::config::RuntimeConfig::new(config).unwrap());
     let state = AppState::new(data);
     let summary = recover_dead_pools(&state).await.unwrap();
     // Even a legacy selector naming just one pool no longer limits discovery.
