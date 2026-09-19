@@ -365,6 +365,15 @@ jobs:
             --exit-code 1 --timeout 10m --format json \
             --output "$RUNNER_TEMP/trivy-report.json"
 
+      - name: Print image vulnerability report
+        if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
+        run: |
+          if [ ! -s "$RUNNER_TEMP/trivy-report.json" ]; then
+            echo "::error::Trivy produced no report. Check the scan step for a scanner or database-download error."
+            exit 1
+          fi
+          trivy convert --format table "$RUNNER_TEMP/trivy-report.json"
+
       - name: Upload image vulnerability report
         if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

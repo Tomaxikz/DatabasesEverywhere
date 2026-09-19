@@ -68,6 +68,10 @@ SBOM and provenance. A checksum-pinned Trivy scans that image before registry
 login or publishing. HIGH/CRITICAL vulnerabilities (including those without
 fixes) and scanner errors block Docker publishing. The JSON results are kept
 as the `docker-vulnerability-report` artifact, including on vulnerability failure.
+The `Print image vulnerability report` step also renders those same findings in
+the job log after a failed scan, including package names, CVEs, and fixed versions
+when available. Missing reports are reported explicitly; printing the report
+does not override the failed scan or permit publication.
 Skopeo copies the scanned image and attestations with digest preservation;
 there is no second build or unscanned push path. This gate applies to Docker
 publishing, not the independently published native GitHub release binaries.
