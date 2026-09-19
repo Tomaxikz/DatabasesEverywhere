@@ -22,6 +22,8 @@ const MAX_BACKUP_CATALOG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
+    #[error("daemon.sql_buffer_global_mib must be between 1 and {maximum}, inclusive")]
+    InvalidSqlBufferGlobalLimit { maximum: u64 },
     #[error("uuid must not be empty")]
     EmptyUuid,
     #[error("token_id must not be empty")]
@@ -158,6 +160,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
         return Err(ConfigValidationError::InvalidBackupRetentionKeepLatest);
     }
     validate_backups(config)?;
+    config.daemon.sql_buffer_global_bytes()?;
 
     if let Some(socket_path) = config.daemon.configured_socket_path() {
         validate_absolute_path("daemon.socket_path", socket_path)?;
@@ -798,6 +801,27 @@ fn validate_absolute_path(field: &'static str, value: &str) -> Result<(), Config
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validates_global_sql_buffer_capacity() {
+        let mut config = valid_config();
+        for mib in [1, 1024, 2048] {
+            config.daemon.sql_buffer_global_mib = mib;
+            validate_config(&config).unwrap();
+            assert_eq!(
+                config.daemon.sql_buffer_global_bytes().unwrap() as u64,
+                mib * 1024 * 1024
+            );
+        }
+        let maximum = (tokio::sync::Semaphore::MAX_PERMITS / (1024 * 1024)) as u64;
+        for mib in [0, maximum + 1, u64::MAX] {
+            config.daemon.sql_buffer_global_mib = mib;
+            assert!(matches!(
+                validate_config(&config),
+                Err(ConfigValidationError::InvalidSqlBufferGlobalLimit { .. })
+            ));
+        }
+    }
+
     #[test]
     fn legacy_recovery_list_is_accepted_but_no_longer_serialized() {
         let config: Config =

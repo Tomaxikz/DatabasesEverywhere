@@ -1,4 +1,5 @@
 mod buffers;
+pub(crate) use buffers::initialize_global_budget;
 pub mod listeners;
 mod postgres_sessions;
 pub mod resolver;

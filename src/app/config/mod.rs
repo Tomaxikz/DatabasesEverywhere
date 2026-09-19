@@ -689,6 +689,8 @@ pub struct DaemonConfig {
     pub container_seccomp_profile: String,
     pub container_apparmor_profile: String,
     pub container_security_opts: Vec<String>,
+    /// Process-wide shared SQL buffer capacity in MiB; restart required.
+    pub sql_buffer_global_mib: u64,
 }
 
 impl Default for DaemonConfig {
@@ -702,11 +704,24 @@ impl Default for DaemonConfig {
             container_seccomp_profile: String::new(),
             container_apparmor_profile: String::new(),
             container_security_opts: Vec::new(),
+            sql_buffer_global_mib: 1024,
         }
     }
 }
 
 impl DaemonConfig {
+    pub(crate) fn sql_buffer_global_bytes(&self) -> Result<usize, validate::ConfigValidationError> {
+        self.sql_buffer_global_mib
+            .checked_mul(1024 * 1024)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0 && *bytes <= tokio::sync::Semaphore::MAX_PERMITS)
+            .ok_or(
+                validate::ConfigValidationError::InvalidSqlBufferGlobalLimit {
+                    maximum: (tokio::sync::Semaphore::MAX_PERMITS / (1024 * 1024)) as u64,
+                },
+            )
+    }
+
     pub fn configured_socket_path(&self) -> Option<&str> {
         let socket_path = self.socket_path.trim();
         if socket_path.is_empty() {

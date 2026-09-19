@@ -70,6 +70,7 @@ paths:
         let config = load_config(&path).unwrap();
 
         assert_eq!(config.daemon.engine, crate::config::DaemonEngine::Docker);
+        assert_eq!(config.daemon.sql_buffer_global_mib, 1024);
         assert_eq!(config.images.postgres, "postgres:18.4");
         assert_eq!(config.images.mongodb, "mongo:7.0.37");
         assert_eq!(config.api.bind_addr(), "127.0.0.1:8090");
@@ -87,6 +88,28 @@ paths:
             0
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn global_sql_buffer_setting_roundtrips_and_rejects_non_integer_values() {
+        let config: Config =
+            yaml_serde::from_str("daemon:\n  sql_buffer_global_mib: 2048\n").unwrap();
+        assert_eq!(
+            config.daemon.sql_buffer_global_bytes().unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+        let yaml = yaml_serde::to_string(&config).unwrap();
+        assert!(yaml.contains("sql_buffer_global_mib: 2048"));
+        let restored: Config = yaml_serde::from_str(&yaml).unwrap();
+        assert_eq!(restored.daemon.sql_buffer_global_mib, 2048);
+        for value in ["-1", "1.5", "true", "null"] {
+            assert!(
+                yaml_serde::from_str::<Config>(&format!(
+                    "daemon:\n  sql_buffer_global_mib: {value}\n"
+                ))
+                .is_err()
+            );
+        }
     }
 
     #[test]

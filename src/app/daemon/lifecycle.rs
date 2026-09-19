@@ -7,6 +7,15 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .context("failed to create runtime directories")?;
     let _daemon_lock = lock_daemon(&config).await?;
     let _log_guard = init_logging(&config)?;
+    let sql_buffer_bytes = config.daemon.sql_buffer_global_bytes()?;
+    crate::gateway::initialize_global_budget(sql_buffer_bytes)
+        .context("failed to initialize global SQL buffer budget")?;
+    tracing::info!(
+        event = "sql_buffer_budget_initialized",
+        global_mib = config.daemon.sql_buffer_global_mib,
+        global_bytes = sql_buffer_bytes,
+        "shared SQL buffer capacity configured; changes require a restart"
+    );
     warn_memory_overcommit();
     log_disk_mode(&mut config)?;
     let config = Arc::new(config);

@@ -28,6 +28,25 @@ The [example config](../../config/example.yml) lists settings and defaults.
 Never deploy placeholder secrets or commit real credentials. Generate `token`
 and `jwt_signing_key` independently, for example with `openssl rand -base64 32`.
 
+### Shared SQL buffer capacity
+
+Set the process-wide buffer limit in MiB under the existing `daemon` section:
+
+```yaml
+daemon:
+  sql_buffer_global_mib: 1024
+```
+
+Omitting the setting defaults to 1024 MiB (1 GiB). The memory is not preallocated;
+the separate per-tenant limit remains 32 MiB. Zero, overflow, and values beyond
+the platform's semaphore capacity are rejected by `dbev check-config` and startup.
+Changing this setting requires a daemon restart. Startup logs the effective limit
+as `sql_buffer_budget_initialized`.
+
+Serialized configs include the field, but loading an older config does not rewrite
+it. Add the key to your panel's config template if it should be visible in newly
+generated YAML; older templates can omit it and use the default.
+
 ### Addresses and TLS
 
 - `api.host` / `api.port` bind the management listener; the panel stores its public URL.
