@@ -1,11 +1,11 @@
-FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
 LABEL org.opencontainers.image.title="DatabasesEverywhere"
 LABEL org.opencontainers.image.description="Container-backed database hosting daemon"
 LABEL org.opencontainers.image.source="https://github.com/Tomaxikz/DatabasesEverywhere"
 
 # The base image is digest-pinned; package versions intentionally follow its
-# Debian security repository instead of freezing vulnerable package revisions.
+# Ubuntu security repository instead of freezing vulnerable package revisions.
 # hadolint ignore=DL3008
 RUN apt-get update --error-on=any \
     && apt-get upgrade -y --with-new-pkgs --no-install-recommends \
@@ -16,6 +16,9 @@ RUN apt-get update --error-on=any \
 ARG TARGETPLATFORM
 
 COPY --chown=0:0 --chmod=0555 .docker/${TARGETPLATFORM#linux/}/dbev /usr/local/bin/dbev
+
+# Fail the build if the copied GNU binary or required FUSE/cleanup tools cannot run.
+RUN dbev --version && fusermount3 --version && umount --version
 
 VOLUME ["/etc/databases-everywhere", "/var/lib/dbev", "/var/log/dbev", "/run/dbev"]
 

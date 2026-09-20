@@ -32,5 +32,10 @@ stages them automatically. After staging, run from the repository root:
 docker build --no-cache -f deploy/docker/Dockerfile .
 ```
 
-Keep `.dockerignore` aligned with those paths. Fresh builds apply Debian package
+The runtime uses a digest-pinned Ubuntu 24.04 LTS base, retaining glibc, CA
+certificates, FUSE 3, and the mount-cleanup utilities. It does not change the
+host OS or the images used by managed database containers. The Docker build
+checks that `dbev`, `fusermount3`, and `umount` execute before image scanning.
+
+Keep `.dockerignore` aligned with those paths. Fresh builds apply Ubuntu package
 updates; rebuild and rescan to verify fixes. Existing published images do not change.
