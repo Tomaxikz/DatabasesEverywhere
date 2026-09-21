@@ -19,7 +19,7 @@ anyhow = "1.0.103"
 aws-lc-rs = "1.18.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-base64 = "0.22"
+base64 = "0.23"
 bzip2 = { version = "0.6", features = ["static"] }
 bollard = { version = "0.21.0", default-features = false, features = ["pipe"] }
 bson = "2.13"
