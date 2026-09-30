@@ -26,7 +26,8 @@ For cross-release packaging, `cargo b` runs the workspace's
 | `src/app/` | Daemon code, grouped by API, engine, gateway, storage, and runtime |
 | `src/app/cli/` | Argument parsing, command dispatch, and process umask |
 | `src/app/daemon/` | Startup, host setup, maintenance, listeners, recovery, and shutdown |
-| `src/app/api/http/` | Route wiring, application state, and shared HTTP policy/error adapters |
+| `src/app/state.rs` | Application composition, shared resources, and mutation draining |
+| `src/app/api/http/` | Route wiring and shared HTTP policy/error adapters |
 | `config/`, `deploy/` | Example configuration and deployment files |
 | `docs/api/` | Integration guides and [OpenAPI](api/openapi.yml) |
 | `migrations/` | SQLite schema migrations |
@@ -44,9 +45,12 @@ without copying its game-server-specific modules or adding unnecessary crates.
 
 - `cli` parses user input and dispatches commands; `daemon` owns process services
   and their startup/shutdown ordering. Daemon services do not depend on CLI parsing.
+  `daemon::services::BackgroundServices` owns maintenance and lifecycle task
+  handles. Shutdown closes admission before aborting maintenance and draining
+  lifecycle work; managed database containers are not stopped by daemon shutdown.
 - `api` groups HTTP handlers by resource (`instances`, `pools`, `backups`, etc.).
-  `api/http/router.rs` wires endpoints and middleware; `api/http/state.rs` owns
-  shared request state and mutation-drain coordination. Shared HTTP error adapters
+  `api/http/router.rs` wires endpoints and middleware; `state.rs` owns application
+  composition, shared resources, and mutation-drain coordination. Shared HTTP error adapters
   belong in `api/http/response.rs`, not in another resource's provisioning handler.
 - `instances` owns instance metadata and coordination; `placement` owns dedicated
   and shared runtime placement, tenant lifecycle, and migration state.
@@ -56,8 +60,48 @@ without copying its game-server-specific modules or adding unnecessary crates.
   persistence, backup, quota, scheduling, and measurement responsibilities.
 
 Keep behavior with its owner and expose only the capabilities callers need.
-New code should import application state from `api::http::state`; the previous
-`api::http::router` exports remain available for library compatibility.
+New code should import application state from `crate::state`; the previous
+`api::http::state` and `api::http::router` exports remain available for library
+compatibility. `AppState` is a composition object for handlers and coordinators,
+not a backend interface. Backends receive the specific resources they need.
+
+### Backend contracts and ownership
+
+Subsystem facades own policy and orchestration; private backends implement the
+variable engine or provider behavior. Traits are used at real interchangeable
+boundaries, not as a mandatory wrapper around every module.
+
+| Subsystem | Contract / entry point | Responsibility kept outside the backend |
+| --- | --- | --- |
+| Backups | `backups::drivers::BackupDriver`, selected by `BackupStorage` | ID validation, inventory sorting, materialization guards and cancellation ownership |
+| Shared tenants | `placement::tenant::backends::TenantBackend` | Credential-validation order, verified reopening/refencing, strict storage-result validation |
+| Engine telemetry | `monitoring::engine::backends::EngineTelemetry` | Tenant identity/generation checks, backoff, accounting baselines, committing successful checkpoints |
+| Shared-pool safety | `placement::containment` | One fencing/quarantine/verified-stop sequence shared by HTTP and boot recovery |
+| Soft disk enforcement | Existing `disk::soft::SoftDiskRuntime` | Scanning and quota policy remain owned by `disk::soft` |
+| Import/export scheduling | Existing `SchedulerResourceProvider` | Queue admission, resource budgets, and job lifecycle remain owned by the scheduler |
+| Output disk capacity | `disk::capacity::DiskCapacityService` | One reservation ledger shared by uploads, staging, and backups; HTTP error mapping remains in the upload adapter |
+
+The new backend traits are internal. HTTP routes, JSON models, configuration,
+public backup provider methods, and persisted metadata do not change. Async
+backend calls return borrowed `Send` futures; they do not spawn independent
+workers or transfer cleanup ownership just to implement an interface.
+
+For a new provider, implement the relevant contract and register it in that
+subsystem's selector. Test successful operations, rejected inputs, and failure
+semantics through the facade. Engine-specific capabilities stay explicit:
+PostgreSQL catalog hardening, MySQL rollback inspection, ClickHouse telemetry
+windows, and backup materialization/purging must not become generic no-op
+defaults. Unsupported shared engines continue to return errors.
+
+This is an incremental architecture: API modules still contain some application
+workflows and `AppState` still composes HTTP services. Move those workflows to
+their owning subsystem when changing them; do not make lower-level providers
+depend on HTTP response types or add a universal `Subsystem` trait. Container
+runtime, storage repositories, gateway protocols, and configuration already have
+concrete subsystem interfaces and do not need artificial alternate backends.
+Resource monitoring and instance progress remain in their existing API modules
+for now. Capacity accounting still calls the existing host-disk sampler; moving
+that sampler and the remaining workflow services is a follow-up migration.
 
 ## Contributing
 

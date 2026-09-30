@@ -20,6 +20,25 @@ use crate::{
 
 const ID: &str = "pool_failure";
 
+#[test]
+fn oom_is_an_operational_failure_with_a_useful_memory_diagnostic() {
+    let error = engine_exit(true, 1024);
+    assert_eq!(decide(Phase::Readiness, &error), Decision::KeepDown);
+    assert!(error.to_string().contains("OOM-killed"));
+    assert!(error.to_string().contains("1024 MiB"));
+    assert!(engine_exit(false, 1024).is::<EngineExited>());
+    assert_eq!(decide(Phase::TenantSecurity, &error), Decision::Quarantine);
+    let disk_full: anyhow::Error = std::io::Error::from_raw_os_error(libc::ENOSPC).into();
+    assert_eq!(decide(Phase::HostedConfig, &disk_full), Decision::KeepDown);
+    assert_eq!(
+        decide(
+            Phase::HostedConfig,
+            &anyhow::anyhow!("unsafe configuration bind")
+        ),
+        Decision::Quarantine
+    );
+}
+
 fn readiness_error() -> anyhow::Error {
     DockerError::ContainerNotReady {
         instance_id: ID.into(),
@@ -118,6 +137,7 @@ fn missing_or_unwritable_socket_paths_are_not_confused_with_unsafe_paths() {
 #[derive(Default)]
 struct Engine {
     running: bool,
+    oom_killed: bool,
     refuses_stop: bool,
     stops: usize,
     kills: usize,
@@ -153,8 +173,8 @@ async fn serve(
         (NODE_LABEL, "test-node"),
     ]);
     let value = serde_json::json!({"Id": "a".repeat(64), "Config": {"Labels": labels},
-        "State": {"Running": engine.running, "Status": if engine.running {"running"} else {"exited"}, "ExitCode": 1},
-        "HostConfig": {"NetworkMode": "none"}});
+        "State": {"Running": engine.running, "Status": if engine.running {"running"} else {"exited"}, "ExitCode": 1, "OOMKilled": engine.oom_killed},
+        "HostConfig": {"NetworkMode": "none", "Memory": 1073741824}});
     Ok(Response::builder()
         .header("Content-Type", "application/json")
         .body(Body::from(value.to_string()))
@@ -334,6 +354,50 @@ async fn uncertain_stop_escalates_to_quarantine_instead_of_claiming_stopped() {
             .iter()
             .all(|cause| cause.code == "shutdown_unconfirmed"
                 && cause.recovery_class == "validated_retry")
+    );
+}
+
+#[tokio::test]
+async fn oom_with_wrapper_exit_one_keeps_pool_down_and_reports_the_cause() {
+    let f = fixture(false).await;
+    {
+        let mut engine = f.engine.lock().unwrap();
+        engine.running = false;
+        engine.oom_killed = true;
+    }
+    let inspection = f
+        .state
+        .docker
+        .inspect_instance(Protocol::Postgres, ID)
+        .await
+        .unwrap();
+    assert!(inspection.oom_killed);
+    assert_eq!(inspection.memory_limit_bytes, Some(1073741824));
+    super::super::reconcile_shared_event(
+        &f.state,
+        crate::runtime::docker::ManagedContainerEvent {
+            container_id: Some("a".repeat(64)),
+            instance_id: ID.into(),
+            protocol: Protocol::Postgres,
+            action: crate::runtime::docker::ManagedContainerAction::Exited { exit_code: Some(1) },
+        },
+    )
+    .await
+    .unwrap();
+    let pool = f.state.placements.get(ID).await.unwrap().unwrap();
+    assert_eq!(pool.status, EngineRuntimeStatus::Failed);
+    assert_eq!(pool.desired_state, DesiredInstanceState::Stopped);
+    assert!(f.state.instances.routes_fenced("tenant_failure").await);
+    let reports = crate::api::monitoring::resources::pool_reports(&f.state, &[pool])
+        .await
+        .unwrap();
+    let json = serde_json::to_value(reports).unwrap();
+    assert_eq!(json[0]["diagnostic"]["code"], "pool_oom_killed");
+    assert!(
+        json[0]["diagnostic"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1024 MiB")
     );
 }
 

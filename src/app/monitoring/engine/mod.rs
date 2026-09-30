@@ -8,19 +8,21 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{OperationCounts, counter::EngineObservation};
 use crate::{
-    api::http::router::AppState,
     instances::metadata::InstanceMetadata,
-    placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus, tenant},
+    placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
     runtime::docker::ManagedContainerIdentity,
     shared::protocol::Protocol,
+    state::AppState,
 };
 
+mod backends;
 mod queries;
-use queries::parse_clickhouse_window;
+pub(crate) use queries::keep_tenant_rows;
+#[cfg(test)]
 pub(crate) use queries::{
-    clickhouse_collect_sql, keep_tenant_rows, mariadb_collect_sql, mariadb_prepare_sql,
-    mysql_collect_sql, mysql_prepare_sql, parse_mariadb_ready, parse_mariadb_rows,
-    parse_mysql_capabilities, parse_mysql_rows,
+    clickhouse_collect_sql, mariadb_collect_sql, mariadb_prepare_sql, mysql_collect_sql,
+    mysql_prepare_sql, parse_mariadb_ready, parse_mariadb_rows, parse_mysql_capabilities,
+    parse_mysql_rows,
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
@@ -210,10 +212,7 @@ async fn mark_inactive_instances(
 }
 
 fn engine_protocol(protocol: Protocol) -> bool {
-    matches!(
-        protocol,
-        Protocol::Mysql | Protocol::Mariadb | Protocol::Clickhouse
-    )
+    backends::for_protocol(protocol).is_some()
 }
 
 fn tenant_identity(instance: &InstanceMetadata) -> TenantIdentity {
@@ -361,7 +360,8 @@ impl PoolState {
         Self {
             protocol,
             generation: None,
-            prepared: protocol == Protocol::Clickhouse,
+            prepared: backends::for_protocol(protocol)
+                .is_some_and(|backend| !backend.requires_preparation()),
             capabilities: Capabilities::default(),
             baselines: HashMap::new(),
             clickhouse_checkpoint: None,
@@ -386,7 +386,8 @@ impl PoolState {
     }
 
     fn reset_generation_state(&mut self) {
-        self.prepared = self.protocol == Protocol::Clickhouse;
+        self.prepared = backends::for_protocol(self.protocol)
+            .is_some_and(|backend| !backend.requires_preparation());
         self.capabilities = Capabilities::default();
         self.baselines.clear();
         self.clickhouse_checkpoint = None;
@@ -467,23 +468,10 @@ async fn prepare_pool(
     runtime: &EngineRuntime,
     pool: &mut PoolState,
 ) -> Result<(), CollectError> {
-    let sql = match runtime.protocol {
-        Protocol::Mysql => mysql_prepare_sql(),
-        Protocol::Mariadb => mariadb_prepare_sql(),
-        Protocol::Clickhouse => {
-            pool.prepared = true;
-            return Ok(());
-        }
-        _ => return Err(CollectError::Unavailable),
-    };
-    let output = tenant::telemetry_sql(&state.docker, runtime, sql)
-        .await
-        .map_err(|_| CollectError::Unavailable)?;
-    pool.capabilities = match runtime.protocol {
-        Protocol::Mysql => parse_mysql_capabilities(&output.stdout)?,
-        Protocol::Mariadb => parse_mariadb_ready(&output.stdout)?,
-        _ => return Err(CollectError::Unavailable),
-    };
+    let backend = backends::for_protocol(runtime.protocol).ok_or(CollectError::Unavailable)?;
+    if let Some(capabilities) = backend.prepare(&state.docker, runtime).await? {
+        pool.capabilities = capabilities;
+    }
     pool.prepared = true;
     Ok(())
 }
@@ -493,67 +481,15 @@ async fn collect_pool(
     runtime: &EngineRuntime,
     pool: &PoolState,
 ) -> Result<EngineSample, CollectError> {
-    let capabilities = pool.capabilities;
-    let (rows, capabilities, mode, next_clickhouse_checkpoint) = match runtime.protocol {
-        Protocol::Mysql if capabilities.cpu || capabilities.memory => {
-            let output =
-                tenant::telemetry_sql(&state.docker, runtime, mysql_collect_sql(capabilities))
-                    .await
-                    .map_err(|_| CollectError::Unavailable)?;
-            (
-                parse_mysql_rows(&output.stdout, capabilities)?,
-                capabilities,
-                SampleMode::Cumulative,
-                None,
-            )
-        }
-        Protocol::Mysql => (HashMap::new(), capabilities, SampleMode::Cumulative, None),
-        Protocol::Mariadb => {
-            let output = tenant::telemetry_sql(&state.docker, runtime, mariadb_collect_sql())
-                .await
-                .map_err(|_| CollectError::Unavailable)?;
-            (
-                parse_mariadb_rows(&output.stdout)?,
-                capabilities,
-                SampleMode::Cumulative,
-                None,
-            )
-        }
-        Protocol::Clickhouse => {
-            let output = tenant::clickhouse_telemetry_window(
-                &state.docker,
-                runtime,
-                pool.clickhouse_checkpoint,
-                clickhouse_collect_sql(),
-            )
-            .await
-            .map_err(|_| CollectError::Unavailable)?;
-            let (checkpoint, rows) = parse_clickhouse_window(&output.stdout)?;
-            if pool
-                .clickhouse_checkpoint
-                .is_some_and(|previous| checkpoint < previous)
-            {
-                return Err(CollectError::InvalidOutput);
-            }
-            (
-                rows,
-                Capabilities {
-                    cpu: true,
-                    memory: true,
-                    operations: true,
-                },
-                SampleMode::Interval,
-                Some(checkpoint),
-            )
-        }
-        _ => return Err(CollectError::Unavailable),
-    };
-    Ok(EngineSample {
-        capabilities,
-        rows,
-        mode,
-        next_clickhouse_checkpoint,
-    })
+    let backend = backends::for_protocol(runtime.protocol).ok_or(CollectError::Unavailable)?;
+    backend
+        .collect(
+            &state.docker,
+            runtime,
+            pool.capabilities,
+            pool.clickhouse_checkpoint,
+        )
+        .await
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -736,6 +672,58 @@ impl PeakBaseline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_preparation_preserves_pool_state() {
+        let (state, _directory) = crate::api::test_support::database(Default::default()).await;
+        for protocol in [Protocol::Mysql, Protocol::Mariadb, Protocol::Postgres] {
+            let mut runtime = test_runtime(protocol);
+            runtime.admin_secret = None;
+            let mut pool = PoolState::new(protocol);
+            pool.capabilities.memory = true;
+            pool.clickhouse_checkpoint = Some(42);
+            pool.failures = 3;
+
+            assert!(matches!(
+                prepare_pool(&state, &runtime, &mut pool).await,
+                Err(CollectError::Unavailable)
+            ));
+            assert!(!pool.prepared);
+            assert_eq!(
+                pool.capabilities,
+                Capabilities {
+                    memory: true,
+                    ..Capabilities::default()
+                }
+            );
+            assert_eq!(pool.clickhouse_checkpoint, Some(42));
+            assert_eq!(pool.failures, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn clickhouse_preparation_only_marks_the_pool_prepared() {
+        let (state, _directory) = crate::api::test_support::database(Default::default()).await;
+        let runtime = test_runtime(Protocol::Clickhouse);
+        let mut pool = PoolState::new(runtime.protocol);
+        pool.prepared = false;
+        pool.capabilities.cpu = true;
+        pool.clickhouse_checkpoint = Some(42);
+        pool.failures = 3;
+
+        prepare_pool(&state, &runtime, &mut pool).await.unwrap();
+
+        assert!(pool.prepared);
+        assert_eq!(
+            pool.capabilities,
+            Capabilities {
+                cpu: true,
+                ..Capabilities::default()
+            }
+        );
+        assert_eq!(pool.clickhouse_checkpoint, Some(42));
+        assert_eq!(pool.failures, 3);
+    }
 
     #[test]
     fn cumulative_baselines_never_charge_startup_or_resets() {

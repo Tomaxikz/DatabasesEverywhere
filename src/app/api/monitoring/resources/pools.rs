@@ -29,6 +29,8 @@ pub(crate) struct SharedPoolReport {
     pub image: String,
     pub pending_image: Option<String>,
     pub database_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<PublicDiagnostic>,
     pub tenant_count: u32,
     pub max_tenants: u32,
     pub cpu: PoolCpu,
@@ -273,6 +275,22 @@ pub(crate) async fn pool_reports(
     let clock = ReportClock::now();
     let mut reports = Vec::with_capacity(runtimes.len());
     for runtime in runtimes {
+        // Docker retains the OOM flag after exit, including across daemon
+        // restarts. Do not infer OOM from exit code 137 or stale metadata alone.
+        let diagnostic = if matches!(
+            runtime.status,
+            EngineRuntimeStatus::Failed | EngineRuntimeStatus::Stopped
+        ) {
+            state
+                .docker
+                .inspect_instance(runtime.protocol, &runtime.runtime_id)
+                .await
+                .ok()
+                .as_ref()
+                .and_then(oom_diagnostic)
+        } else {
+            None
+        };
         let usage = usage.get(&runtime.runtime_id);
         let stats = usage.map(|usage| &usage.runtime_stats);
         let (cpu_usage_percent, cpu_sample) = runtime_metric(
@@ -304,6 +322,7 @@ pub(crate) async fn pool_reports(
             image: runtime.image.clone(),
             pending_image: runtime.pending_image.clone(),
             database_version: runtime.database_version.clone(),
+            diagnostic,
             tenant_count: runtime.reserved.tenants,
             max_tenants: runtime.max_tenants,
             cpu: PoolCpu {
@@ -328,6 +347,30 @@ pub(crate) async fn pool_reports(
     }
     reports.sort_unstable_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
     Ok(reports)
+}
+
+fn oom_diagnostic(
+    inspection: &crate::runtime::docker::DockerInstanceInspection,
+) -> Option<PublicDiagnostic> {
+    use crate::runtime::docker::DockerContainerStatus;
+    if !inspection.oom_killed
+        || matches!(
+            inspection.status,
+            DockerContainerStatus::Running | DockerContainerStatus::Starting
+        )
+    {
+        return None;
+    }
+    let limit = inspection
+        .memory_limit_bytes
+        .map(|bytes| format!(" (container memory limit: {} MiB)", bytes / (1024 * 1024)))
+        .unwrap_or_default();
+    Some(PublicDiagnostic::public(
+        "pool_oom_killed",
+        format!(
+            "The database engine was killed due to memory exhaustion{limit}. Review pool capacity and engine memory usage before retrying."
+        ),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,6 +639,30 @@ mod tests {
 
     use super::*;
     use crate::api::monitoring::resources::CachedRuntimeStats;
+
+    #[test]
+    fn oom_diagnostic_requires_confirmed_oom_and_an_inactive_container() {
+        use crate::runtime::docker::{DockerContainerStatus, DockerInstanceInspection};
+        let mut inspection = DockerInstanceInspection {
+            status: DockerContainerStatus::Stopped,
+            oom_killed: true,
+            memory_limit_bytes: Some(1024 * 1024 * 1024),
+            network_mode: Some("none".into()),
+            health: None,
+            image: None,
+        };
+        let diagnostic = oom_diagnostic(&inspection).unwrap();
+        assert_eq!(diagnostic.code, "pool_oom_killed");
+        assert!(diagnostic.message.contains("1024 MiB"));
+        inspection.oom_killed = false;
+        assert!(oom_diagnostic(&inspection).is_none());
+        inspection.oom_killed = true;
+        inspection.status = DockerContainerStatus::Running;
+        assert!(oom_diagnostic(&inspection).is_none());
+        inspection.status = DockerContainerStatus::Stopped;
+        inspection.memory_limit_bytes = None;
+        assert!(!oom_diagnostic(&inspection).unwrap().message.contains("MiB"));
+    }
 
     async fn get_pool_route(
         state: &AppState,

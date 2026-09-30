@@ -21,11 +21,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 use crate::{
     api::{
-        http::{
-            response::ApiError,
-            router::build_router,
-            state::{AppState, AppStateData},
-        },
+        http::{response::ApiError, router::build_router},
         instances::progress::InstallProgressStore,
     },
     auth::api_token::ApiToken,
@@ -48,6 +44,7 @@ use crate::{
         ids::validate_instance_id, images::has_sha256_digest, limits::mib_to_bytes,
         logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
     },
+    state::{AppState, AppStateData},
     storage::{
         import_export_jobs::ImportExportJobRepository,
         import_uploads::ImportUploadRepository,
@@ -70,6 +67,7 @@ mod pool_recovery;
 pub(crate) mod quarantine;
 pub(crate) mod runtime_paths;
 mod server;
+mod services;
 pub(crate) mod setup;
 mod soft_disk_limiter;
 mod startup;

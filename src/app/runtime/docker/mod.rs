@@ -71,6 +71,8 @@ const EXEC_OUTPUT_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\
 #[derive(Debug, Clone)]
 pub struct DockerInstanceInspection {
     pub status: DockerContainerStatus,
+    pub oom_killed: bool,
+    pub memory_limit_bytes: Option<u64>,
     pub network_mode: Option<String>,
     pub health: Option<String>,
     pub image: Option<String>,

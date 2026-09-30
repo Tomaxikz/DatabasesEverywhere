@@ -1,4 +1,4 @@
-use crate::{api::http::state::AppState, disk::DiskLimiter, instances::paths::InstancePaths};
+use crate::{disk::DiskLimiter, instances::paths::InstancePaths, state::AppState};
 
 /// Cleanup runs synchronously before routes and background jobs are published.
 pub(super) async fn cleanup(state: &AppState) {

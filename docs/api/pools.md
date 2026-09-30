@@ -7,6 +7,28 @@ databases. One game server can own one pool of each supported engine on a node.
 PostgreSQL, MySQL, MariaDB, MongoDB and ClickHouse support pools; Redis, Valkey
 and Qdrant remain dedicated-only. Dedicated database provisioning is unchanged.
 
+## ClickHouse memory and recovery
+
+Shared ClickHouse configuration caps the server memory ratio at 0.8 and enables
+the background worker's memory-tracker correction using cgroup information.
+This leaves more headroom inside the pool's existing container limit; it does
+not increase allocated RAM or guarantee that a 1 GiB pool suits every workload.
+The settings are supported by the tested
+[ClickHouse 25.8 settings](https://github.com/ClickHouse/ClickHouse/blob/v25.8.25.37-lts/src/Core/ServerSettings.cpp)
+and the affected
+[ClickHouse 26.4 settings](https://github.com/ClickHouse/ClickHouse/blob/v26.4.4.38-stable/src/Core/ServerSettings.cpp).
+
+New pools receive this configuration at creation. Existing shared ClickHouse
+pools refresh their daemon-owned configuration before a managed start/restart
+or boot recovery, after checking the expected configuration bind. A running
+pool is not restarted merely to change the file. Deploying the daemon alone
+does not guarantee adoption by a container that stays running.
+
+OOM failures remain stopped pending validated recovery or an explicit retry;
+there is no unconditional restart loop. Pool reports expose a confirmed OOM as
+`diagnostic.code: pool_oom_killed`. Missing shared-tenant disk measurements are
+reported as `disk.used_bytes: null`; clients must display unavailable, not zero.
+
 ## Ownership and panel authorization
 
 The panel backend derives `server_id` from the authorized game-server record.

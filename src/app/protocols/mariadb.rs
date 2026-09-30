@@ -48,6 +48,7 @@ pub struct MariadbRoute {
     pub username: String,
     pub database: String,
     pub auth_response: Vec<u8>,
+    pub character_set: u8,
 }
 
 #[derive(Debug)]
@@ -206,6 +207,7 @@ pub fn parse_client_handshake_response(payload: &[u8]) -> Result<MariadbRoute, M
         username,
         database,
         auth_response,
+        character_set: payload[8],
     })
 }
 
@@ -233,7 +235,9 @@ pub fn parse_backend_handshake(payload: &[u8]) -> Result<BackendHandshake, Maria
     let upper_capabilities = read_u16_le(payload, offset)? as u32;
     offset += 2;
     let capabilities = lower_capabilities | (upper_capabilities << 16);
-    let auth_data_len = payload[offset] as usize;
+    let auth_data_len = *payload
+        .get(offset)
+        .ok_or(MariadbProxyError::MalformedPacket)? as usize;
     offset += 1 + 10;
 
     let mut seed = part_1;
@@ -308,7 +312,9 @@ pub fn backend_handshake_response(
     let mut payload = Vec::new();
     payload.extend_from_slice(&capabilities.to_le_bytes());
     payload.extend_from_slice(&16_777_216_u32.to_le_bytes());
-    payload.push(45);
+    // Queries are tunneled without transcoding, so the backend must use the
+    // character set selected by the client, not the greeting's default.
+    payload.push(route.character_set);
     payload.extend_from_slice(&[0_u8; 23]);
     payload.extend_from_slice(route.username.as_bytes());
     payload.push(0);
@@ -751,6 +757,24 @@ mod tests {
     }
 
     #[test]
+    fn truncated_backend_auth_length_returns_an_error_instead_of_panicking() {
+        let mut payload =
+            gateway_handshake_payload(b"12345678901234567890", GatewayFlavor::Mariadb, false)
+                .unwrap();
+        let mut offset = 1;
+        read_null_string(&payload, &mut offset).unwrap();
+        offset += 4 + 8 + 1 + 2 + 1 + 2 + 2;
+        payload.truncate(offset);
+        // A long server version passes the minimum-size check even when the
+        // authentication-data length byte is absent.
+        assert!(payload.len() >= 34);
+        assert!(matches!(
+            parse_backend_handshake(&payload),
+            Err(MariadbProxyError::MalformedPacket)
+        ));
+    }
+
+    #[test]
     fn gateway_auth_seed_is_not_static() {
         let first = new_gateway_auth_seed();
         let second = new_gateway_auth_seed();
@@ -795,6 +819,7 @@ mod tests {
             username: "app_mysql_1".to_string(),
             database: "mysql_1".to_string(),
             auth_response: native_password_token(password, &gateway_seed),
+            character_set: 45,
         };
         let handshake = BackendHandshake {
             auth_seed: b"backend-seed-1234567".to_vec(),
@@ -833,6 +858,7 @@ mod tests {
             username: "app_mysql_1".to_string(),
             database: "mysql_1".to_string(),
             auth_response: native_password_token("wrong-password", &gateway_seed),
+            character_set: 45,
         };
         let handshake = BackendHandshake {
             auth_seed: b"backend-seed-1234567".to_vec(),
@@ -859,6 +885,7 @@ mod tests {
             username: "app_mysql_1".to_string(),
             database: "mysql_1".to_string(),
             auth_response: native_password_token(password, &gateway_seed),
+            character_set: 45,
         };
         let handshake = BackendHandshake {
             auth_seed: b"backend-seed-1234567".to_vec(),
@@ -897,6 +924,7 @@ mod tests {
             username: "app_mysql_1".to_string(),
             database: "mysql_1".to_string(),
             auth_response: native_password_token(password, &gateway_seed),
+            character_set: 45,
         };
         let switch = BackendHandshake {
             auth_seed: backend_seed.to_vec(),

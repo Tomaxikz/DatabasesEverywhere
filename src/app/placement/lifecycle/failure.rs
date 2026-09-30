@@ -2,11 +2,12 @@ use crate::storage::quarantine::QuarantineKind;
 use anyhow::{Context, ensure};
 
 use crate::{
-    api::{http::state::AppState, instances::containment},
     instances::metadata::DesiredInstanceState,
+    placement::containment,
     placement::{EngineRuntime, EngineRuntimeStatus},
     runtime::docker::DockerError,
     shared::time::now_rfc3339,
+    state::AppState,
 };
 
 /// These are the decision points, not guesses based on text in an engine error.
@@ -15,6 +16,7 @@ pub(crate) enum Phase {
     Metadata,
     StorageBoundary,
     SocketDirectory,
+    HostedConfig,
     ResourceLimits,
     EngineStart,
     Readiness,
@@ -36,6 +38,20 @@ pub(crate) struct CapacityUnavailable;
 #[derive(Debug, thiserror::Error)]
 #[error("shared pool exited unexpectedly")]
 pub(crate) struct EngineExited;
+
+#[derive(Debug, thiserror::Error)]
+#[error("shared pool was OOM-killed (configured pool memory limit: {memory_mib} MiB)")]
+pub(crate) struct EngineOutOfMemory {
+    pub memory_mib: u64,
+}
+
+pub(crate) fn engine_exit(oom_killed: bool, memory_mib: u64) -> anyhow::Error {
+    if oom_killed {
+        EngineOutOfMemory { memory_mib }.into()
+    } else {
+        EngineExited.into()
+    }
+}
 
 pub(crate) fn decide(phase: Phase, error: &anyhow::Error) -> Decision {
     // Once credentials/tenant state or durable publication are uncertain, a
@@ -65,10 +81,11 @@ pub(crate) fn decide(phase: Phase, error: &anyhow::Error) -> Decision {
     if phase == Phase::StorageBoundary && error.is::<CapacityUnavailable>() {
         return Decision::KeepDown;
     }
-    if phase == Phase::Readiness && error.is::<EngineExited>() {
+    if phase == Phase::Readiness && (error.is::<EngineExited>() || error.is::<EngineOutOfMemory>())
+    {
         return Decision::KeepDown;
     }
-    if phase == Phase::SocketDirectory {
+    if matches!(phase, Phase::SocketDirectory | Phase::HostedConfig) {
         let errno = error
             .downcast_ref::<rustix::io::Errno>()
             .map(|e| e.raw_os_error())
@@ -209,7 +226,7 @@ fn quarantine_kind(phase: Phase, error: &anyhow::Error) -> QuarantineKind {
     match phase {
         Phase::Metadata => QuarantineKind::MetadataUncertain,
         Phase::StorageBoundary => QuarantineKind::StorageBoundary,
-        Phase::SocketDirectory => QuarantineKind::RuntimePathUnsafe,
+        Phase::SocketDirectory | Phase::HostedConfig => QuarantineKind::RuntimePathUnsafe,
         Phase::PoolSecurity | Phase::TenantSecurity => QuarantineKind::SecurityAttestation,
         Phase::Isolation => QuarantineKind::IsolationMismatch,
         _ => QuarantineKind::Unknown,

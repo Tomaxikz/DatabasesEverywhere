@@ -2,7 +2,6 @@ use futures::{StreamExt, stream};
 use std::time::Duration;
 
 use crate::{
-    api::http::router::AppState,
     constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
     instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
     placement::{
@@ -11,6 +10,7 @@ use crate::{
         tenant::{self, TenantTarget},
     },
     shared::time::now_rfc3339,
+    state::AppState,
 };
 
 const SOFT_USAGE_TIMEOUT: Duration = Duration::from_secs(20);

@@ -58,6 +58,8 @@ pub(crate) async fn activate_locked(
         crate::placement::runtime::apply_root_disk_limit(&state.config, &state.placements, runtime)
             .await
             .map_err(anyhow::Error::msg)?;
+        phase = Phase::HostedConfig;
+        paths::prepare_hosted_config(state, runtime).await?;
         phase = Phase::EngineStart;
         if restart {
             state

@@ -95,6 +95,35 @@ fn native_password_tokens_keep_the_existing_sha1_format() {
     assert!(mariadb::caching_sha2_password_token("", b"12345678901234567890").is_empty());
 }
 
+#[test]
+fn backend_handshake_preserves_the_client_character_set() {
+    let seed = b"12345678901234567890";
+    let verifier = mariadb::native_password_sha1_stage2_hex("secret");
+    for character_set in [8, 33, 45, 63, 224, 255] {
+        let mut payload = handshake_response("tenant_user", "tenant_db", &[]);
+        payload[8] = character_set;
+        let token_offset = 32 + "tenant_user".len() + 2;
+        payload[token_offset..token_offset + 20]
+            .copy_from_slice(&mariadb::native_password_token("secret", seed));
+        let route = mariadb::parse_client_handshake_response(&payload).unwrap();
+        for plugin in ["mysql_native_password", "caching_sha2_password"] {
+            let backend = mariadb::BackendHandshake {
+                auth_seed: seed.to_vec(),
+                auth_plugin: plugin.to_string(),
+            };
+            let response = mariadb::backend_handshake_response(
+                &backend,
+                &route,
+                seed,
+                &verifier,
+                Some("secret"),
+            )
+            .unwrap();
+            assert_eq!(response[8], character_set);
+        }
+    }
+}
+
 fn handshake_response(username: &str, database: &str, attributes: &[u8]) -> Vec<u8> {
     let capabilities = CLIENT_PROTOCOL_41
         | CLIENT_SECURE_CONNECTION

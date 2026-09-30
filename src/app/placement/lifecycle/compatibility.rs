@@ -1,7 +1,6 @@
 use futures::StreamExt;
 
 use crate::{
-    api::http::router::AppState,
     compatibility::{COMPATIBILITY_PROBE_REVISION, compatibility_profile},
     constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
     placement::{
@@ -9,6 +8,7 @@ use crate::{
         tenant as tenant_ops,
     },
     shared::time::now_rfc3339,
+    state::AppState,
 };
 
 use super::{isolate_runtime, save_runtime, shared_runtimes};

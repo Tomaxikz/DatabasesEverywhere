@@ -13,7 +13,7 @@ pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result
                 tracing::error!(runtime_id = %runtime.runtime_id, %error,
                     "could not disable engine restarts; stopping this container before boot recovery");
                 if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
-                    crate::api::instances::containment::contain_locked(
+                    crate::placement::containment::contain_locked(
                         state, &runtime, "engine restart policy could not be repaired", Some(crate::storage::quarantine::QuarantineKind::SecurityAttestation)).await;
                     return;
                 }

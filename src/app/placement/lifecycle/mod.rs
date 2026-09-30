@@ -15,7 +15,6 @@ pub(crate) use compatibility::attestation_matches;
 pub(crate) use compatibility::sync_shared_compatibility;
 
 use crate::{
-    api::http::router::AppState,
     config::{Config, DiskLimitMode},
     constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
     disk::{DiskLimiter, soft::SoftDiskTarget},
@@ -31,6 +30,7 @@ use crate::{
     },
     runtime::docker::{DockerContainerStatus, DockerRuntime, ManagedContainerEvent},
     shared::{limits::mib_to_bytes, time::now_rfc3339},
+    state::AppState,
 };
 
 const POOL_READY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -75,7 +75,7 @@ pub(crate) async fn restore_shared_limits(
             match result {
                 Ok(()) => save_runtime(&state.placements, &state.manager, runtime).await,
                 Err(error) => {
-                    let containment = crate::api::instances::containment::contain_locked(
+                    let containment = crate::placement::containment::contain_locked(
                         state,
                         &runtime,
                         "aggregate shared-pool limit recovery failed", Some(crate::storage::quarantine::QuarantineKind::StorageBoundary))
@@ -143,7 +143,7 @@ pub(crate) async fn recover_pool_deletions(state: &AppState) -> usize {
             match crate::api::instances::delete_empty_pool(state, &runtime_id).await {
                 Ok(deleted) => deleted,
                 Err(error) => {
-                    let containment = crate::api::instances::containment::contain_locked(
+                    let containment = crate::placement::containment::contain_locked(
                         state,
                         &snapshot,
                         "interrupted empty shared-pool cleanup failed", Some(crate::storage::quarantine::QuarantineKind::ProvisioningIncomplete))
@@ -296,7 +296,7 @@ pub(crate) async fn reconcile_one_runtime(
         return Ok(runtime);
     }
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::api::instances::containment::contain_locked(
+        let containment = crate::placement::containment::contain_locked(
             state,
             &runtime,
             "reconciled a durably quarantined shared pool",
@@ -327,7 +327,7 @@ pub(crate) async fn reconcile_one_runtime(
                     crate::shared::backend::BackendEndpoint::UnixSocket { .. }
                 )
             {
-                let containment = crate::api::instances::containment::contain_locked(
+                let containment = crate::placement::containment::contain_locked(
                     state,
                     &runtime,
                     "physical shared-pool isolation no longer matched durable placement",
@@ -382,7 +382,7 @@ pub(crate) async fn honor_stop(
     runtime: &mut EngineRuntime,
 ) -> anyhow::Result<bool> {
     if runtime.pending_image.is_some() {
-        let report = crate::api::instances::containment::contain_locked(
+        let report = crate::placement::containment::contain_locked(
             state,
             runtime,
             "interrupted pool image update",
@@ -407,7 +407,7 @@ pub(crate) async fn honor_stop(
         return Ok(false);
     }
     fence_runtime(state, &runtime.runtime_id).await;
-    if let Err(error) = crate::api::instances::containment::stop_pool(state, runtime).await {
+    if let Err(error) = crate::placement::containment::stop_pool(state, runtime).await {
         failure::handle(
             state,
             runtime,
@@ -591,7 +591,7 @@ pub(crate) async fn reconcile_shared_event(
         fence_runtime(state, &runtime_id).await;
     }
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::api::instances::containment::contain_locked(
+        let containment = crate::placement::containment::contain_locked(
             state,
             &runtime,
             "a container event targeted a durably quarantined shared pool",
@@ -634,6 +634,10 @@ pub(crate) async fn reconcile_shared_event(
         .docker
         .inspect_instance(runtime.protocol, &runtime_id)
         .await;
+    let oom_killed = event.action == crate::runtime::docker::ManagedContainerAction::OutOfMemory
+        || inspection
+            .as_ref()
+            .is_ok_and(|inspection| inspection.oom_killed);
     runtime.status = match inspection {
         Ok(inspection)
             if inspection.network_mode.as_deref() == Some("none")
@@ -663,7 +667,7 @@ pub(crate) async fn reconcile_shared_event(
         }
     };
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::api::instances::containment::contain_locked(
+        let containment = crate::placement::containment::contain_locked(
             state,
             &runtime,
             "a container event exposed invalid physical shared-pool isolation",
@@ -687,7 +691,10 @@ pub(crate) async fn reconcile_shared_event(
                 | EngineRuntimeStatus::Failed
         );
     if unexpected_failure && activation_error.is_none() {
-        activation_error = Some((failure::Phase::Readiness, failure::EngineExited.into()));
+        activation_error = Some((
+            failure::Phase::Readiness,
+            failure::engine_exit(oom_killed, runtime.limits.memory_mib),
+        ));
     }
     if let Some((phase, error)) = &activation_error {
         failure::handle(state, &mut runtime, *phase, error).await?;
@@ -735,7 +742,7 @@ pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
                 return Ok(());
             }
             if runtime.status == EngineRuntimeStatus::Quarantined {
-                let containment = crate::api::instances::containment::contain_locked(
+                let containment = crate::placement::containment::contain_locked(
                     state,
                     &runtime,
                     "snapshot reconciliation found a durably quarantined shared pool", None)
@@ -793,7 +800,7 @@ pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
                             crate::shared::backend::BackendEndpoint::UnixSocket { .. }
                         )
                     {
-                        let containment = crate::api::instances::containment::contain_locked(
+                        let containment = crate::placement::containment::contain_locked(
                             state,
                             &runtime,
                             "snapshot reconciliation found invalid physical shared-pool isolation", Some(crate::storage::quarantine::QuarantineKind::IsolationMismatch))
@@ -820,7 +827,8 @@ pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
                         if runtime.status != EngineRuntimeStatus::Running {
                             fence_runtime(state, &runtime_id).await;
                             if matches!(previous, EngineRuntimeStatus::Running | EngineRuntimeStatus::Booting) {
-                                failure::handle(state, &mut runtime, failure::Phase::Readiness, &failure::EngineExited.into()).await?;
+                                let error = failure::engine_exit(inspection.oom_killed, runtime.limits.memory_mib);
+                                failure::handle(state, &mut runtime, failure::Phase::Readiness, &error).await?;
                                 return Ok(());
                             }
                         }
@@ -896,7 +904,7 @@ pub(crate) async fn isolate_runtime(
     reason: &str,
     kind: crate::storage::quarantine::QuarantineKind,
 ) -> bool {
-    crate::api::instances::containment::contain_locked(state, &runtime, reason, Some(kind))
+    crate::placement::containment::contain_locked(state, &runtime, reason, Some(kind))
         .await
         .contained()
 }

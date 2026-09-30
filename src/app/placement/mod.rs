@@ -1,3 +1,4 @@
+pub(crate) mod containment;
 pub(crate) mod lifecycle;
 mod migration;
 mod model;

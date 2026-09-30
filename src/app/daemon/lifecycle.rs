@@ -345,7 +345,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         ),
         monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache::default(),
         instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
-        daemon_shutdown: crate::api::http::router::DaemonShutdown::default(),
+        daemon_shutdown: crate::state::DaemonShutdown::default(),
     });
     disable_runtime_restarts(&state).await?;
     super::legacy_credentials::recover(&state).await?;
@@ -455,126 +455,18 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     if pruned_jobs > 0 {
         tracing::info!(pruned_jobs, "pruned old completed import/export jobs");
     }
-    crate::api::monitoring::resources::start_resource_sampler(state.clone());
-    let one_use_export_sweeper =
-        tokio::spawn(crate::api::artifacts::run_export_sweeper(state.clone()));
-    let import_upload_sweeper =
-        tokio::spawn(crate::api::import_export::run_upload_sweeper(state.clone()));
-    let soft_disk_limits = tokio::spawn(monitor_soft_disk_limits(state.clone()));
-    tracing::info!(
-        phase = "service_start",
-        "startup phase 5/5: background services launched"
-    );
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        api = %config.api.bind_addr(),
-        "DBEV is ready; the management API is accepting requests while managed databases finish recovery in the background"
-    );
-    let mut managed_container_events = tokio::spawn(monitor_container_events(state.clone()));
-    let mut managed_runtime_boot = tokio::spawn(finish_runtime_boot(state.clone()));
-    let gateway_supervisor = state.gateway_supervisor.clone();
-    let daemon_shutdown = state.daemon_shutdown.clone();
+    let services = super::services::BackgroundServices::start(&state);
     let server_result = serve_api(
         &config,
         build_router(state.clone()),
-        shutdown_jobs.clone(),
-        shutdown_creations.clone(),
+        shutdown_jobs,
+        shutdown_creations,
         state.api_rate_limiter.clone(),
-        daemon_shutdown.clone(),
-        gateway_supervisor.clone(),
+        state.daemon_shutdown.clone(),
+        state.gateway_supervisor.clone(),
     )
     .await;
-    let shutdown_started = std::time::Instant::now();
-    daemon_shutdown.trigger();
-    shutdown_jobs.close_admission();
-    shutdown_creations.close_creation_admission();
-    gateway_supervisor.shutdown();
-    tracing::info!(
-        phase = "background_stop",
-        api_server_error = server_result.is_err(),
-        active_import_export_jobs = shutdown_jobs.active_count(),
-        active_instance_creations = shutdown_creations.active_creation_count(),
-        active_mutations = daemon_shutdown.active_mutation_count(),
-        active_websockets = state.api_rate_limiter.active_websocket_count(),
-        active_gateway_connections = gateway_supervisor.active_connections(),
-        "API listener stopped; shutting down daemon-owned background tasks"
-    );
-    soft_disk_limits.abort();
-    let _ = soft_disk_limits.await;
-    one_use_export_sweeper.abort();
-    let _ = one_use_export_sweeper.await;
-    import_upload_sweeper.abort();
-    let _ = import_upload_sweeper.await;
-    let (
-        jobs_drained,
-        creations_drained,
-        mutations_drained,
-        websocket_drained,
-        gateway_drain,
-        container_events_drained,
-        runtime_boot_drained,
-    ) = tokio::join!(
-        shutdown_jobs.wait_for_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
-        shutdown_creations.wait_for_creation_drain(ACTIVE_OPERATION_DRAIN_TIMEOUT),
-        daemon_shutdown.wait_for_mutation_drain(API_MUTATION_DRAIN_TIMEOUT),
-        state
-            .api_rate_limiter
-            .wait_for_websocket_drain(WEBSOCKET_DRAIN_TIMEOUT),
-        gateway_supervisor.drain_connections(
-            GATEWAY_CONNECTION_DRAIN_TIMEOUT,
-            GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT,
-        ),
-        drain_daemon_task(
-            &mut managed_container_events,
-            ACTIVE_OPERATION_DRAIN_TIMEOUT,
-            "managed container event monitor",
-        ),
-        drain_daemon_task(
-            &mut managed_runtime_boot,
-            ACTIVE_OPERATION_DRAIN_TIMEOUT,
-            "managed runtime boot",
-        ),
-    );
-    tracing::info!(
-        phase = "drain_complete",
-        elapsed_ms = shutdown_started.elapsed().as_millis(),
-        jobs_drained,
-        creations_drained,
-        mutations_drained,
-        container_events_drained,
-        runtime_boot_drained,
-        websocket_drained,
-        gateway_connections_at_start = gateway_drain.active_at_start,
-        gateway_connections_remaining = gateway_drain.remaining,
-        gateway_connections_gracefully_drained = gateway_drain.gracefully_drained,
-        "daemon shutdown drain finished; managed database containers were not stopped"
-    );
-    if !jobs_drained {
-        anyhow::bail!(
-            "timed out after {} seconds waiting for import/export jobs to finish safely",
-            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
-        );
-    }
-    if !creations_drained {
-        anyhow::bail!(
-            "timed out after {} seconds waiting for instance creations to finish safely",
-            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
-        );
-    }
-    if !mutations_drained {
-        anyhow::bail!(
-            "timed out after {} seconds waiting for active API mutations to finish",
-            API_MUTATION_DRAIN_TIMEOUT.as_secs()
-        );
-    }
-    if !container_events_drained || !runtime_boot_drained {
-        anyhow::bail!(
-            "timed out after {} seconds waiting for daemon-owned lifecycle work to finish safely",
-            ACTIVE_OPERATION_DRAIN_TIMEOUT.as_secs()
-        );
-    }
-    tracing::info!("active import/export jobs drained");
-    tracing::info!("active instance creations drained");
+    services.shutdown(&state, server_result.is_err()).await?;
     server_result
 }
 
@@ -599,28 +491,4 @@ async fn migrate_qdrant_fingerprints(
         migrated += 1;
     }
     Ok(migrated)
-}
-
-async fn drain_daemon_task(
-    task: &mut tokio::task::JoinHandle<()>,
-    deadline: Duration,
-    name: &'static str,
-) -> bool {
-    match tokio::time::timeout(deadline, &mut *task).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::error!(%error, task = name, "daemon-owned lifecycle task stopped unexpectedly");
-            false
-        }
-        Err(_) => {
-            tracing::error!(
-                task = name,
-                timeout_seconds = deadline.as_secs(),
-                "daemon-owned lifecycle task did not finish before the shutdown deadline"
-            );
-            task.abort();
-            let _ = task.await;
-            false
-        }
-    }
 }

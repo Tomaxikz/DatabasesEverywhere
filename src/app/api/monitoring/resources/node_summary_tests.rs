@@ -18,6 +18,16 @@ fn disk_enforcement_strength_prefers_the_persisted_hard_quota() {
 }
 
 #[test]
+fn missing_disk_measurement_does_not_turn_into_zero_in_node_totals() {
+    let mut report = shared_resource_report("dedicated", "dedicated", 0.0, 0, 42);
+    report.deployment_mode = DeploymentMode::Dedicated;
+    report.scope = ResourceScope::DedicatedInstance;
+    report.disk.used_bytes = None;
+    let reports = vec![(DeploymentMode::Dedicated, Ok(report))];
+    assert_eq!(aggregate_managed_usage(&reports, &[]).disk_used_bytes, None);
+}
+
+#[test]
 fn generic_disk_sampler_excludes_shared_pool_roots() {
     let limits = InstanceLimits::default();
     let dedicated = metadata_with_limits("dedicated", InstanceStatus::Running, limits.clone());
@@ -422,7 +432,7 @@ fn managed_usage_is_null_when_a_running_instance_lacks_a_sample() {
             disk: DiskReport {
                 configured_mib: 1024,
                 limit_bytes: mib_to_bytes(1024),
-                used_bytes: 123,
+                used_bytes: Some(123),
                 enforced: true,
                 enforcement_method: "fuse_quota".to_string(),
                 enforcement_strength: "hard",
@@ -693,7 +703,7 @@ fn shared_resource_report(
         disk: DiskReport {
             configured_mib: 1_024,
             limit_bytes: mib_to_bytes(1_024),
-            used_bytes: disk_used_bytes,
+            used_bytes: Some(disk_used_bytes),
             enforced: true,
             enforcement_method: "tenant_quota".to_string(),
             enforcement_strength: "hard",

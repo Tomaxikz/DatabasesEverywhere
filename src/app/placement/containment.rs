@@ -1,11 +1,17 @@
+//! Shared-pool containment for HTTP operations and boot reconciliation alike.
+//!
+//! Callers hold the runtime operation lock. This coordinator owns fencing,
+//! durable quarantine, and verified stopping; transport handlers only report
+//! its outcome and must not implement a separate containment sequence.
+
 use std::{collections::HashSet, time::Duration};
 
 use crate::{
-    api::http::router::AppState,
     instances::metadata::{DesiredInstanceState, InstanceStatus},
     placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
     runtime::docker::DockerContainerStatus,
     shared::time::now_rfc3339,
+    state::AppState,
 };
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -277,5 +283,30 @@ async fn pool_is_stopped(state: &AppState, runtime: &EngineRuntime) -> Result<bo
         Err(error) => Err(format!(
             "could not verify shared pool shutdown before forced kill: {error}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContainmentReport;
+
+    #[test]
+    fn containment_requires_every_safety_boundary() {
+        for routes_fenced in [false, true] {
+            for quarantine_persisted in [false, true] {
+                for pool_stopped in [false, true] {
+                    let report = ContainmentReport {
+                        routes_fenced,
+                        quarantine_persisted,
+                        pool_stopped,
+                        errors: Vec::new(),
+                    };
+                    assert_eq!(
+                        report.contained(),
+                        routes_fenced && quarantine_persisted && pool_stopped,
+                    );
+                }
+            }
+        }
     }
 }

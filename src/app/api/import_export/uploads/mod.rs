@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
-    time::Duration,
-};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -16,13 +10,11 @@ use futures::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, Semaphore},
-};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
 
 use crate::{
     api::http::response::{ApiError, ApiJson, ApiPath, ApiResponse},
+    disk::capacity::{CapacityError, DiskCapacityService},
     instances::paths::InstancePaths,
     shared::{hex::nibble, time::now_rfc3339},
     storage::import_uploads::{
@@ -44,7 +36,6 @@ use super::{
 const FILENAME_HEADER: &str = "x-dbev-filename";
 const SHA256_HEADER: &str = "x-dbev-sha256";
 const MAX_ORIGINAL_FILENAME_BYTES: usize = 180;
-const DISK_SAFETY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LISTED_UPLOADS: u32 = 100;
 const MAX_CONCURRENT_IMPORT_STAGING: usize = 2;
 
@@ -64,8 +55,7 @@ pub struct ImportUploadService {
     repository: ImportUploadRepository,
     admission: Arc<Semaphore>,
     inspection_admission: Arc<Semaphore>,
-    disk_reservation_gate: Arc<Mutex<()>>,
-    reserved_disk_bytes_by_filesystem: Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
+    disk_capacity: DiskCapacityService,
     staging_admission: Arc<Semaphore>,
 }
 
@@ -104,8 +94,7 @@ impl ImportUploadService {
             inspection_admission: Arc::new(Semaphore::new(
                 max_concurrent.min(max_inspections.max(1)),
             )),
-            disk_reservation_gate: Arc::new(Mutex::new(())),
-            reserved_disk_bytes_by_filesystem: Arc::new(StdMutex::new(HashMap::new())),
+            disk_capacity: DiskCapacityService::default(),
             staging_admission: Arc::new(Semaphore::new(max_concurrent_staging.max(1))),
         }
     }
@@ -143,13 +132,11 @@ impl ImportUploadService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::RateLimited)?;
-        let reservation = reserve_shared_disk_capacity(
-            &self.disk_reservation_gate,
-            &self.reserved_disk_bytes_by_filesystem,
-            root,
-            requested,
-        )
-        .await?;
+        let reservation = self
+            .disk_capacity
+            .reserve(root, requested)
+            .await
+            .map_err(|error| capacity_api_error(error, "import staging"))?;
         Ok(ImportStagingPermit {
             _admission: admission,
             _reservation: reservation,
@@ -169,13 +156,10 @@ impl ImportUploadService {
                 "output filesystem root must be a real directory".to_string(),
             ));
         }
-        reserve_shared_disk_capacity(
-            &self.disk_reservation_gate,
-            &self.reserved_disk_bytes_by_filesystem,
-            root,
-            requested,
-        )
-        .await
+        self.disk_capacity
+            .reserve(root, requested)
+            .await
+            .map_err(|error| capacity_api_error(error, "output"))
     }
 
     pub(crate) async fn output_roots_share_filesystem(
@@ -183,9 +167,10 @@ impl ImportUploadService {
         first: &std::path::Path,
         second: &std::path::Path,
     ) -> Result<bool, ApiError> {
-        let first = output_filesystem_id(first).await?;
-        let second = output_filesystem_id(second).await?;
-        Ok(first == second)
+        self.disk_capacity
+            .roots_share_filesystem(first, second)
+            .await
+            .map_err(|error| capacity_api_error(error, "output"))
     }
 }
 
@@ -193,6 +178,8 @@ pub(super) struct ImportStagingPermit {
     _admission: tokio::sync::OwnedSemaphorePermit,
     _reservation: DiskCapacityReservation,
 }
+
+pub(crate) use crate::disk::capacity::DiskCapacityReservation;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ImportUploadResponse {
@@ -1155,134 +1142,46 @@ pub(super) async fn finish_upload_import_job(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct FilesystemIdentity(String);
-
-#[derive(Debug)]
-pub(crate) struct DiskCapacityReservation {
-    filesystem: FilesystemIdentity,
-    bytes: u64,
-    totals: Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
-}
-
-impl Drop for DiskCapacityReservation {
-    fn drop(&mut self) {
-        let mut totals = self
-            .totals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(total) = totals.get_mut(&self.filesystem) else {
-            debug_assert!(false, "output capacity reservation identity was missing");
-            return;
-        };
-        let Some(remaining) = total.checked_sub(self.bytes) else {
-            debug_assert!(false, "output capacity reservation underflow");
-            return;
-        };
-        if remaining == 0 {
-            totals.remove(&self.filesystem);
-        } else {
-            *total = remaining;
-        }
-    }
-}
-
 async fn reserve_upload_disk_space(
     state: &AppState,
     root: &std::path::Path,
     requested: u64,
 ) -> Result<DiskCapacityReservation, ApiError> {
-    reserve_shared_disk_capacity(
-        &state.import_uploads.disk_reservation_gate,
-        &state.import_uploads.reserved_disk_bytes_by_filesystem,
-        root,
-        requested,
-    )
-    .await
+    state
+        .import_uploads
+        .disk_capacity
+        .reserve(root, requested)
+        .await
+        .map_err(|error| capacity_api_error(error, "output"))
 }
 
-async fn reserve_shared_disk_capacity(
-    gate: &Mutex<()>,
-    totals: &Arc<StdMutex<HashMap<FilesystemIdentity, u64>>>,
-    root: &std::path::Path,
-    requested: u64,
-) -> Result<DiskCapacityReservation, ApiError> {
-    let _reservation_gate = gate.lock().await;
-    let metadata = std::fs::metadata(root).map_err(|error| {
-        ApiError::Runtime(format!("failed to identify output filesystem: {error}"))
-    })?;
-    let filesystem = filesystem_identity(root, &metadata)?;
-    let already_reserved = totals
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&filesystem)
-        .copied()
-        .unwrap_or(0);
-    ensure_disk_space(root, requested, already_reserved).await?;
-    let mut totals_guard = totals
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let total = totals_guard.entry(filesystem.clone()).or_default();
-    *total = total
-        .checked_add(requested)
-        .ok_or_else(|| ApiError::Conflict("output capacity reservation overflowed".to_string()))?;
-    drop(totals_guard);
-    Ok(DiskCapacityReservation {
-        filesystem,
-        bytes: requested,
-        totals: totals.clone(),
-    })
-}
-
-fn filesystem_identity(
-    _root: &std::path::Path,
-    metadata: &std::fs::Metadata,
-) -> Result<FilesystemIdentity, ApiError> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(FilesystemIdentity(format!(
-        "unix-device:{}",
-        metadata.dev()
-    )))
-}
-
-async fn output_filesystem_id(root: &std::path::Path) -> Result<FilesystemIdentity, ApiError> {
-    let metadata = tokio::fs::symlink_metadata(root).await.map_err(|error| {
-        ApiError::Runtime(format!("failed to inspect output filesystem: {error}"))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ApiError::Runtime(
-            "output filesystem root must be a real directory".to_string(),
-        ));
+fn capacity_api_error(error: CapacityError, root_kind: &str) -> ApiError {
+    match error {
+        CapacityError::InspectRoot(error) => {
+            ApiError::Runtime(format!("failed to inspect {root_kind} filesystem: {error}"))
+        }
+        CapacityError::InvalidRoot => ApiError::Runtime(format!(
+            "{root_kind} filesystem root must be a real directory"
+        )),
+        CapacityError::IdentifyFilesystem(error) => {
+            ApiError::Runtime(format!("failed to identify output filesystem: {error}"))
+        }
+        CapacityError::PathNotUtf8 => {
+            ApiError::Runtime("storage path is not valid UTF-8".to_string())
+        }
+        CapacityError::InspectCapacity(error) => {
+            ApiError::Runtime(format!("failed to inspect storage capacity: {error}"))
+        }
+        CapacityError::Overflow => {
+            ApiError::Conflict("output capacity reservation overflowed".to_string())
+        }
+        CapacityError::Insufficient {
+            required,
+            available,
+        } => ApiError::Conflict(format!(
+            "operation needs {required} bytes of output capacity including the safety reserve, but only {available} bytes are available"
+        )),
     }
-    filesystem_identity(root, &metadata)
-}
-
-async fn ensure_disk_space(
-    root: &std::path::Path,
-    requested: u64,
-    already_reserved: u64,
-) -> Result<(), ApiError> {
-    let sample = crate::api::monitoring::resources::read_host_disk(
-        root.to_str()
-            .ok_or_else(|| ApiError::Runtime("storage path is not valid UTF-8".to_string()))?,
-    )
-    .await
-    .map_err(|error| ApiError::Runtime(format!("failed to inspect storage capacity: {error}")))?;
-    let required = required_disk_capacity(requested, already_reserved)?;
-    if sample.available_bytes < required {
-        return Err(ApiError::Conflict(format!(
-            "operation needs {required} bytes of output capacity including the safety reserve, but only {} bytes are available",
-            sample.available_bytes
-        )));
-    }
-    Ok(())
-}
-
-fn required_disk_capacity(requested: u64, already_reserved: u64) -> Result<u64, ApiError> {
-    requested
-        .checked_add(already_reserved)
-        .and_then(|bytes| bytes.checked_add(DISK_SAFETY_RESERVE_BYTES))
-        .ok_or_else(|| ApiError::Conflict("output capacity reservation overflowed".to_string()))
 }
 
 fn expiration_timestamp(ttl_hours: u64) -> Result<String, ApiError> {

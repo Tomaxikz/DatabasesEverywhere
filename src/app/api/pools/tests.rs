@@ -90,6 +90,78 @@ async fn issued_pool_tokens_bind_owner_generation_and_scope() {
 }
 
 #[tokio::test]
+async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
+    use crate::{
+        instances::metadata::InstanceStatus,
+        placement::{DeploymentMode, ReserveTenant},
+    };
+    let (state, _dir) = test_support::database(Config::default()).await;
+    let mut pool = runtime(
+        "pool-oom",
+        Protocol::Clickhouse,
+        "clickhouse/clickhouse-server:26.4.4.38",
+    );
+    pool.limits.disk_mib = 64 * 1024;
+    state.placements.save(&pool).await.unwrap();
+    let mut tenant = crate::instances::test_support::metadata("oom-tenant", Protocol::Clickhouse);
+    tenant.owner = pool.owner.clone();
+    tenant.deployment_mode = DeploymentMode::Shared;
+    tenant.runtime_id = pool.runtime_id.clone();
+    tenant.status = InstanceStatus::Failed;
+    tenant.limits.disk_enforced = false;
+    tenant.limits.disk_enforcement_method = "soft_scanner".into();
+    state
+        .placements
+        .reserve(ReserveTenant {
+            owner: pool.owner.clone().unwrap(),
+            instance_id: &tenant.instance_id,
+            runtime_id: &pool.runtime_id,
+            database: &tenant.database.name,
+            username: &tenant.database.username,
+            limits: &tenant.limits,
+        })
+        .await
+        .unwrap();
+    state
+        .placements
+        .mark_provisioned(&tenant.instance_id)
+        .await
+        .unwrap();
+    state.manager.upsert(tenant).await.unwrap();
+    pool = state
+        .placements
+        .get(&pool.runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    for status in [
+        EngineRuntimeStatus::Failed,
+        EngineRuntimeStatus::Stopped,
+        EngineRuntimeStatus::Quarantined,
+    ] {
+        pool.status = status;
+        state.placements.save(&pool).await.unwrap();
+        let report = crate::api::monitoring::resources::list_pool_tenants(
+            State(state.clone()),
+            auth(&state).await,
+            ApiPath(pool.runtime_id.clone()),
+        )
+        .await
+        .unwrap()
+        .into_body();
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["instance_id"], "oom-tenant");
+        assert!(
+            json[0]["resources"]["disk"]
+                .get("used_bytes")
+                .unwrap()
+                .is_null()
+        );
+    }
+}
+
+#[tokio::test]
 async fn pool_lock_wait_does_not_hold_node_admission() {
     let (state, _dir) = test_support::database(Config::default()).await;
     let pool = runtime("server-a", Protocol::Mysql, "mysql:8.4");

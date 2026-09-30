@@ -437,6 +437,7 @@ mod shared_security;
 mod upload_recovery;
 mod uploads;
 
+pub(crate) use crate::disk::capacity::DiskCapacityReservation;
 pub(crate) use files::logical_staging_root;
 pub(crate) use jobs::{
     export_default_artifact, public_job_response, queue_import_instance, register_default_artifact,
@@ -448,7 +449,7 @@ pub(crate) use physical::{
     check_restore_layout, finish_physical_change, restore_bounded_archive, rollback_from_archive,
 };
 pub(crate) use upload_recovery::{reconcile_import_uploads, run_upload_sweeper};
-pub(crate) use uploads::{DiskCapacityReservation, ImportUploadService};
+pub(crate) use uploads::ImportUploadService;
 pub(crate) use uploads::{
     delete_import_upload, get_import_catalog, get_import_upload, import_entry,
     inspect_import_upload, list_import_uploads,

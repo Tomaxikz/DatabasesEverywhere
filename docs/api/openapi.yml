@@ -1421,8 +1421,8 @@ components:
               type: integer
               description: Configured tenant boundary in bytes. The enforced and enforcement_method fields state whether this individual boundary is hard or catalog-guarded.
             used_bytes:
-              type: integer
-              description: Latest sampled tenant usage in bytes. Hard shared tenants use the authoritative kernel project-quota counter; soft shared tenants use engine-catalog measurement.
+              type: [integer, "null"]
+              description: Latest sampled tenant usage in bytes, or null when unavailable (never assume zero). Hard shared tenants use the authoritative kernel project-quota counter; soft shared tenants use engine-catalog measurement. A stopped or unmeasurable shared pool does not prevent listing its tenants.
             enforced: {type: boolean}
             enforcement_method: {type: string}
             enforcement_strength:
@@ -1602,6 +1602,7 @@ components:
         image: {type: string}
         database_version: {type: [string, "null"]}
         tenant_count: {type: integer, minimum: 0}
+        diagnostic: {$ref: "#/components/schemas/PublicDiagnostic"}
         max_tenants: {type: integer, minimum: 1}
         cpu:
           type: object

@@ -595,6 +595,46 @@ async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &s
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn stopped_pool_measurements_stay_strict_but_reporting_is_nullable() {
+        use super::super::{ResourceView, resource_report};
+        let (state, _dir) = crate::api::test_support::database(Default::default()).await;
+        let mut runtime = crate::placement::test_support::runtime(
+            "pool-a",
+            crate::shared::protocol::Protocol::Mysql,
+            "mysql:8.4",
+        );
+        runtime.status = EngineRuntimeStatus::Failed;
+        state.placements.save(&runtime).await.unwrap();
+        let mut tenant = crate::instances::test_support::shared_metadata();
+        tenant.limits.disk_enforced = false;
+        state.instances.upsert_fenced(tenant.clone()).await;
+        assert!(usage(&state, &tenant).await.is_err());
+        let report = resource_report(&state, &tenant, ResourceView::Tenant)
+            .await
+            .unwrap();
+        assert_eq!(report.disk.used_bytes, None);
+        assert!(state.instances.routes_fenced(&tenant.instance_id).await);
+
+        for (age, expected) in [(Duration::ZERO, Some(42)), (SAMPLE_STALE_AFTER, None)] {
+            state
+                .resource_cache
+                .store_disk_usage(
+                    tenant.instance_id.clone(),
+                    CachedDiskUsage {
+                        used_bytes: 42,
+                        sampled_at: Instant::now() - age,
+                    },
+                )
+                .await;
+            let report = resource_report(&state, &tenant, ResourceView::Tenant)
+                .await
+                .unwrap();
+            assert_eq!(report.disk.used_bytes, expected);
+        }
+        assert!(usage(&state, &tenant).await.is_err());
+    }
+
     fn hard_tenant() -> InstanceMetadata {
         let mut metadata = crate::instances::test_support::shared_metadata();
         metadata.limits = crate::shared::limits::InstanceLimits {

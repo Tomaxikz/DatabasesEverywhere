@@ -169,6 +169,16 @@ impl DockerRuntime {
             .await?;
         let response = self.docker.inspect_container(&name, None).await?;
         let state = response.state;
+        let oom_killed = state
+            .as_ref()
+            .and_then(|state| state.oom_killed)
+            .unwrap_or(false);
+        let memory_limit_bytes = response
+            .host_config
+            .as_ref()
+            .and_then(|config| config.memory)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0);
         let health = state
             .as_ref()
             .and_then(|state| state.health.as_ref())
@@ -197,6 +207,8 @@ impl DockerRuntime {
 
         Ok(DockerInstanceInspection {
             status,
+            oom_killed,
+            memory_limit_bytes,
             network_mode,
             health,
             image,

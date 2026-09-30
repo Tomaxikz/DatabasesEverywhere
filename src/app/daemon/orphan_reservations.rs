@@ -1,8 +1,8 @@
 use anyhow::Context;
 
 use crate::{
-    api::http::router::AppState,
     placement::{EngineRuntime, EngineRuntimeStatus, TenantReservation, tenant::TenantTarget},
+    state::AppState,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -135,7 +135,7 @@ async fn quarantine(
     orphan: &TenantReservation,
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
-    let containment = crate::api::instances::containment::contain_locked(
+    let containment = crate::placement::containment::contain_locked(
         state,
         &runtime,
         "an interrupted shared tenant could not be removed safely",

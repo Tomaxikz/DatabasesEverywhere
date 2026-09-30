@@ -136,6 +136,8 @@ async fn runtime_cache_invalidation_rejects_a_late_stale_publication() {
 #[test]
 fn live_runtime_cannot_publish_a_durable_pre_ready_or_failed_state() {
     let running_inspection = Ok(DockerInstanceInspection {
+        oom_killed: false,
+        memory_limit_bytes: None,
         status: DockerContainerStatus::Running,
         network_mode: Some("none".to_string()),
         health: Some("healthy".to_string()),

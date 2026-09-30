@@ -2,10 +2,10 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    api::http::state::AppState,
     instances::metadata::InstanceMetadata,
     placement::DeploymentMode,
     shared::{protocol::Protocol, time::now_rfc3339},
+    state::AppState,
 };
 
 /// Recover only absent tenant secrets, before storage migration or image repair.

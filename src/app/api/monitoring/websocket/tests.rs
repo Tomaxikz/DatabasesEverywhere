@@ -123,7 +123,7 @@ fn monitoring_instance(
         disk: DiskReport {
             configured_mib: 1_024,
             limit_bytes: 1_024 * 1024 * 1024,
-            used_bytes: 64,
+            used_bytes: Some(64),
             enforced: false,
             enforcement_method: "none".to_string(),
             enforcement_strength: "none",

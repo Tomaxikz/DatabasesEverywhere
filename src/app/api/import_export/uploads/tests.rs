@@ -34,31 +34,14 @@ async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() {
     assert_eq!(service.inspection_admission.available_permits(), 2);
 }
 
-#[test]
-fn disk_reservation_guard_releases_exactly_once() {
-    let filesystem = FilesystemIdentity("test-device".to_string());
-    let totals = Arc::new(StdMutex::new(HashMap::from([(filesystem.clone(), 4096)])));
-    let guard = DiskCapacityReservation {
-        filesystem,
-        bytes: 4096,
-        totals: totals.clone(),
-    };
+#[tokio::test]
+async fn disk_reservation_guard_releases_exactly_once() {
+    let service = DiskCapacityService::default();
+    let directory = tempfile::tempdir().unwrap();
+    let guard = service.reserve(directory.path(), 4096).await.unwrap();
+    assert_eq!(service.reserved_bytes(), 4096);
     drop(guard);
-    assert!(
-        totals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
-}
-
-#[test]
-fn disk_capacity_includes_other_in_flight_uploads_and_reserve() {
-    assert_eq!(
-        required_disk_capacity(1024, 2048).unwrap(),
-        DISK_SAFETY_RESERVE_BYTES + 3072
-    );
-    assert!(required_disk_capacity(u64::MAX, 1).is_err());
+    assert_eq!(service.reserved_bytes(), 0);
 }
 
 #[tokio::test]
@@ -115,24 +98,8 @@ async fn output_roots_on_the_same_device_are_identified_as_one_filesystem() {
     );
 }
 
-#[test]
-fn filesystem_reservation_totals_aggregate_only_matching_identities() {
-    let first = FilesystemIdentity("device-a".to_string());
-    let same = first.clone();
-    let different = FilesystemIdentity("device-b".to_string());
-    let totals = HashMap::from([(first, 1024), (different.clone(), 2048)]);
-    assert_eq!(totals.get(&same).copied(), Some(1024));
-    assert_eq!(totals.get(&different).copied(), Some(2048));
-}
-
 fn reserved_total(service: &ImportUploadService) -> u64 {
-    service
-        .reserved_disk_bytes_by_filesystem
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .copied()
-        .sum()
+    service.disk_capacity.reserved_bytes()
 }
 
 #[tokio::test]
@@ -288,16 +255,12 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
     let admission_permit = admission.clone().try_acquire_owned().unwrap();
     let locks = crate::instances::locks::InstanceLocks::default();
     let instance_operation = locks.lock("inst").await;
-    let filesystem = FilesystemIdentity("upload-worker-device".to_string());
-    let totals = Arc::new(StdMutex::new(HashMap::from([(filesystem.clone(), 3)])));
+    let disk_capacity = DiskCapacityService::default();
+    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
     let guards = Arc::new(UploadWorkerGuards::new(
         admission_permit,
         instance_operation,
-        DiskCapacityReservation {
-            filesystem,
-            bytes: 3,
-            totals: totals.clone(),
-        },
+        disk_reservation,
     ));
     let recovery = UploadWorkerRecovery::new(
         repository.clone(),
@@ -334,15 +297,7 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
             .await
             .is_err()
     );
-    assert_eq!(
-        totals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .copied()
-            .sum::<u64>(),
-        3
-    );
+    assert_eq!(disk_capacity.reserved_bytes(), 3);
 
     release_sender.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -364,11 +319,7 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
     assert!(!partial_path.exists());
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if admission.clone().try_acquire_owned().is_ok()
-                && totals
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_empty()
+            if admission.clone().try_acquire_owned().is_ok() && disk_capacity.reserved_bytes() == 0
             {
                 break;
             }
@@ -385,20 +336,16 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
 
 #[tokio::test]
 async fn panicking_upload_worker_durably_cleans_files_and_row() {
-    let (repository, upload, _directory, partial_path, final_path) = upload_worker_fixture().await;
+    let (repository, upload, directory, partial_path, final_path) = upload_worker_fixture().await;
     std::fs::write(&final_path, b"orphan").unwrap();
     let admission = Arc::new(Semaphore::new(1));
     let locks = crate::instances::locks::InstanceLocks::default();
-    let filesystem = FilesystemIdentity("panic-worker-device".to_string());
-    let totals = Arc::new(StdMutex::new(HashMap::from([(filesystem.clone(), 3)])));
+    let disk_capacity = DiskCapacityService::default();
+    let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
     let guards = Arc::new(UploadWorkerGuards::new(
         admission.clone().try_acquire_owned().unwrap(),
         locks.lock("inst").await,
-        DiskCapacityReservation {
-            filesystem,
-            bytes: 3,
-            totals: totals.clone(),
-        },
+        disk_reservation,
     ));
     let recovery = UploadWorkerRecovery::new(
         repository.clone(),
@@ -438,12 +385,7 @@ async fn panicking_upload_worker_durably_cleans_files_and_row() {
     assert!(!partial_path.exists());
     assert!(!final_path.exists());
     assert!(admission.try_acquire_owned().is_ok());
-    assert!(
-        totals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
+    assert_eq!(disk_capacity.reserved_bytes(), 0);
     tokio::time::timeout(Duration::from_secs(1), locks.lock("inst"))
         .await
         .unwrap();

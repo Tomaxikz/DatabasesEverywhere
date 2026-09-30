@@ -55,13 +55,7 @@ impl RedisRoute {
                 _ => return Err(RedisParseError::Unsupported),
             }
         } else if args[0].eq_ignore_ascii_case(b"HELLO") {
-            let auth = args
-                .iter()
-                .position(|argument| argument.eq_ignore_ascii_case(b"AUTH"))
-                .ok_or(RedisParseError::MissingUsername)?;
-            if auth + 2 >= args.len() {
-                return Err(RedisParseError::MissingUsername);
-            }
+            let auth = hello_auth_index(&args)?;
             args[auth + 1] = resolved_username.as_bytes().to_vec();
         } else {
             return Err(RedisParseError::Unsupported);
@@ -143,20 +137,37 @@ fn parse_auth(args: &[Vec<u8>]) -> Result<RedisRoute, RedisParseError> {
 }
 
 fn parse_hello(args: &[Vec<u8>]) -> Result<RedisRoute, RedisParseError> {
-    let mut index = 1;
+    let auth = hello_auth_index(args)?;
+    Ok(RedisRoute {
+        username: Some(redis_string(&args[auth + 1])?),
+        password: args[auth + 2].clone(),
+    })
+}
+
+fn hello_auth_index(args: &[Vec<u8>]) -> Result<usize, RedisParseError> {
+    let version = args.get(1).ok_or(RedisParseError::MissingUsername)?;
+    if !matches!(version.as_slice(), b"2" | b"3") {
+        return Err(RedisParseError::Unsupported);
+    }
+
+    let mut auth = None;
+    let mut index = 2;
     while index < args.len() {
         if args[index].eq_ignore_ascii_case(b"AUTH") {
             if index + 2 >= args.len() {
                 return Err(RedisParseError::MissingUsername);
             }
-            return Ok(RedisRoute {
-                username: Some(redis_string(&args[index + 1])?),
-                password: args[index + 2].clone(),
-            });
+            // Redis and Valkey use the last AUTH option. Its values must not
+            // be interpreted as options, even if they contain "AUTH".
+            auth = Some(index);
+            index += 3;
+        } else if args[index].eq_ignore_ascii_case(b"SETNAME") && index + 1 < args.len() {
+            index += 2;
+        } else {
+            return Err(RedisParseError::Unsupported);
         }
-        index += 1;
     }
-    Err(RedisParseError::MissingUsername)
+    auth.ok_or(RedisParseError::MissingUsername)
 }
 
 pub fn password_route_sha256(password: &[u8]) -> String {
@@ -259,6 +270,91 @@ fn parse_decimal(bytes: &[u8]) -> Result<usize, RedisParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hello(arguments: &[&[u8]]) -> Vec<u8> {
+        serialize_resp_array(&arguments.iter().map(|arg| arg.to_vec()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn hello_client_name_is_not_an_auth_option() {
+        let packet = hello(&[
+            b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"default", b"secret",
+        ]);
+        let route = parse_initial_route(&packet).unwrap();
+        assert_eq!(route.username(), Some("default"));
+        assert_eq!(
+            route.password_route_sha256(),
+            password_route_sha256(b"secret")
+        );
+    }
+
+    #[test]
+    fn hello_rewrite_preserves_client_name_and_pipelined_bytes() {
+        let mut packet = hello(&[
+            b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"default", b"secret",
+        ]);
+        let consumed = packet.len();
+        packet.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        let route = RedisRoute {
+            username: Some("default".into()),
+            password: b"secret".to_vec(),
+        };
+        let rewritten = route
+            .rewrite_with_resolved_username(&packet, consumed, "tenant")
+            .unwrap();
+        let mut expected = hello(&[
+            b"HELLO", b"3", b"SETNAME", b"AUTH", b"AUTH", b"tenant", b"secret",
+        ]);
+        expected.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn hello_uses_and_rewrites_the_last_auth_option_like_the_backend() {
+        let packet = hello(&[
+            b"HELLO", b"2", b"AUTH", b"ignored", b"old", b"AUTH", b"default", b"secret",
+        ]);
+        let route = parse_initial_route(&packet).unwrap();
+        assert_eq!(route.username(), Some("default"));
+        assert_eq!(
+            route.password_route_sha256(),
+            password_route_sha256(b"secret")
+        );
+        assert_eq!(
+            route
+                .rewrite_with_resolved_username(&packet, packet.len(), "tenant")
+                .unwrap(),
+            hello(&[
+                b"HELLO", b"2", b"AUTH", b"ignored", b"old", b"AUTH", b"tenant", b"secret"
+            ])
+        );
+    }
+
+    #[test]
+    fn hello_rejects_malformed_options_even_after_auth() {
+        for arguments in [
+            vec![
+                b"HELLO".as_slice(),
+                b"3",
+                b"AUTH",
+                b"user",
+                b"pass",
+                b"SETNAME",
+            ],
+            vec![
+                b"HELLO".as_slice(),
+                b"3",
+                b"AUTH",
+                b"user",
+                b"pass",
+                b"UNKNOWN",
+            ],
+            vec![b"HELLO".as_slice(), b"3", b"SETNAME", b"AUTH"],
+            vec![b"HELLO".as_slice(), b"AUTH", b"user", b"pass"],
+        ] {
+            assert!(parse_initial_route(&hello(&arguments)).is_err());
+        }
+    }
 
     #[test]
     fn rejects_trailing_bytes_for_exact_initial_route_parse() {

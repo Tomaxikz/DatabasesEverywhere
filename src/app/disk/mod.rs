@@ -1,4 +1,5 @@
 mod btrfs;
+pub(crate) mod capacity;
 mod detection;
 mod fuse_quota;
 pub(crate) use fuse_quota::cleanup::cleanup_unused_helpers;

@@ -387,7 +387,7 @@ pub(super) async fn serve_api(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
     api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
-    daemon_shutdown: crate::api::http::router::DaemonShutdown,
+    daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind = config.api.bind_addr();
@@ -454,7 +454,7 @@ pub(super) async fn serve_api_tls(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
     api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
-    daemon_shutdown: crate::api::http::router::DaemonShutdown,
+    daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let bind_addr = config.api.bind_addr();
@@ -589,7 +589,7 @@ pub(super) async fn shutdown_signal(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
     api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
-    daemon_shutdown: crate::api::http::router::DaemonShutdown,
+    daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) {
     let signal = wait_for_shutdown().await;

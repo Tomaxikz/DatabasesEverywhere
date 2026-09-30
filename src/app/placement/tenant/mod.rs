@@ -1,136 +1,31 @@
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use secrecy::SecretString;
 
 use crate::{
     databases,
-    placement::{DeploymentMode, EngineRuntime, policy},
-    runtime::docker::{CommandOutput, DockerError, DockerRuntime, ExecRecovery},
-    shared::{
-        limits::{InstanceLimits, mib_to_bytes},
-        protocol::Protocol,
-        shell::sh_quote,
-    },
+    placement::{DeploymentMode, EngineRuntime},
+    runtime::docker::{CommandOutput, DockerError, DockerRuntime},
+    shared::{limits::InstanceLimits, protocol::Protocol, shell::sh_quote},
 };
 
 const TENANT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const TELEMETRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
+mod backends;
+pub(crate) mod disk;
 mod manifest;
 pub(crate) mod recovery;
+
+#[cfg(test)]
+use backends::clickhouse_telemetry_script;
+use backends::{MysqlFlavor, TenantOperation, clickhouse_telemetry_command, postgres_sql};
 pub(crate) use manifest::{ManifestChallenge, TenantManifest, measure_manifest};
-pub(crate) mod disk;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TenantTarget<'a> {
     pub database: &'a str,
     pub username: &'a str,
-}
-
-#[derive(Clone, Copy)]
-enum MysqlFlavor {
-    Mysql,
-    Mariadb,
-}
-
-impl TryFrom<Protocol> for MysqlFlavor {
-    type Error = TenantEngineError;
-
-    fn try_from(protocol: Protocol) -> Result<Self, Self::Error> {
-        match protocol {
-            Protocol::Mysql => Ok(Self::Mysql),
-            Protocol::Mariadb => Ok(Self::Mariadb),
-            protocol => Err(TenantEngineError::Unsupported(protocol)),
-        }
-    }
-}
-
-impl MysqlFlavor {
-    fn protocol(self) -> Protocol {
-        match self {
-            Self::Mysql => Protocol::Mysql,
-            Self::Mariadb => Protocol::Mariadb,
-        }
-    }
-
-    fn client(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Mysql => ("mysql", "/var/run/mysqld/mysqld.sock"),
-            Self::Mariadb => ("mariadb", "/run/mysqld/mysqld.sock"),
-        }
-    }
-
-    fn quota_sql(self, username: &str, limits: &InstanceLimits) -> String {
-        match self {
-            Self::Mysql => {
-                databases::mysql::provision::tenant_quota_sql(username, policy::mysql_quota(limits))
-            }
-            Self::Mariadb => databases::mariadb::provision::tenant_quota_sql(
-                username,
-                policy::mariadb_quota(limits),
-            ),
-        }
-    }
-
-    async fn sql(
-        self,
-        docker: &DockerRuntime,
-        runtime: &EngineRuntime,
-        sql: &str,
-    ) -> Result<CommandOutput, TenantEngineError> {
-        sql_client(docker, runtime, self, sql, TENANT_OPERATION_TIMEOUT, false).await
-    }
-
-    async fn telemetry(
-        self,
-        docker: &DockerRuntime,
-        runtime: &EngineRuntime,
-        sql: &str,
-    ) -> Result<CommandOutput, TenantEngineError> {
-        sql_client(
-            docker,
-            runtime,
-            self,
-            sql,
-            TELEMETRY_OPERATION_TIMEOUT,
-            true,
-        )
-        .await
-    }
-
-    async fn terminate(
-        self,
-        docker: &DockerRuntime,
-        runtime: &EngineRuntime,
-        username: &str,
-    ) -> Result<(), TenantEngineError> {
-        let output = self
-            .sql(docker, runtime, &databases::mysql_session_ids_sql(username))
-            .await?;
-        for line in output
-            .stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            let id = line
-                .parse::<u64>()
-                .map_err(|_| TenantEngineError::InvalidConnectionId(line.to_string()))?;
-            self.sql(docker, runtime, &databases::mysql_kill_sql(id))
-                .await?;
-        }
-        Ok(())
-    }
-
-    fn verify_command(self, target: TenantTarget<'_>) -> String {
-        let (client, socket) = self.client();
-        format!(
-            "MYSQL_PWD=\"$DBE_TENANT_PASSWORD\" {client} --protocol=socket --socket={socket} -u {} {} -N -B -e 'SELECT 1' >/dev/null",
-            sh_quote(target.username),
-            sh_quote(target.database),
-        )
-    }
 }
 
 /// Reconciles engine-wide isolation that cannot be expressed per tenant.
@@ -209,21 +104,6 @@ pub(crate) async fn clickhouse_telemetry_window(
         .await?)
 }
 
-fn clickhouse_telemetry_command(prior_cutoff_micros: Option<u64>, sql: &str) -> String {
-    telemetry_command(clickhouse_telemetry_script(prior_cutoff_micros, sql))
-}
-
-fn clickhouse_telemetry_script(prior_cutoff_micros: Option<u64>, sql: &str) -> String {
-    let prior = prior_cutoff_micros
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    format!(
-        "set -eu\ncutoff=\"$(CLICKHOUSE_PASSWORD=\"$DBE_ADMIN_PASSWORD\" clickhouse-client --user dbe_admin --max_execution_time 3 --timeout_before_checking_execution_speed 0 --query 'SELECT toUnixTimestamp64Micro(now64(6))')\"\ncase \"$cutoff\" in ''|*[!0-9]*) exit 2 ;; esac\nprevious={}\nif [ -z \"$previous\" ]; then previous=\"$cutoff\"; fi\nCLICKHOUSE_PASSWORD=\"$DBE_ADMIN_PASSWORD\" clickhouse-client --user dbe_admin --max_execution_time 3 --timeout_before_checking_execution_speed 0 --query 'SYSTEM FLUSH LOGS'\nprintf '__DBE_CUTOFF__\\t%s\\n' \"$cutoff\"\nCLICKHOUSE_PASSWORD=\"$DBE_ADMIN_PASSWORD\" clickhouse-client --user dbe_admin --max_execution_time 3 --timeout_before_checking_execution_speed 0 --param_dbe_previous=\"$previous\" --param_dbe_cutoff=\"$cutoff\" --query {}",
-        sh_quote(&prior),
-        sh_quote(sql),
-    )
-}
-
 pub(crate) async fn create(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -232,111 +112,18 @@ pub(crate) async fn create(
     limits: &InstanceLimits,
 ) -> Result<(), TenantEngineError> {
     let admin = admin_secret(runtime)?;
-    match runtime.protocol {
-        Protocol::Postgres => {
-            databases::postgres::hardening::provision_shared_tenant_role(
-                docker,
-                &runtime.runtime_id,
-                target.database,
-                target.username,
-                &SecretString::from(password.to_string()),
-                &admin,
-                ExecRecovery::CallerHandles,
-            )
-            .await?;
-            postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &databases::postgres::provision::tenant_quota_sql(
-                    target.database,
-                    target.username,
-                    policy::postgres_quota(limits),
-                ),
-            )
-            .await?;
-        }
-        Protocol::Mysql => {
-            mysql_password_sql(
-                docker,
-                runtime,
-                &databases::mysql::provision::shared_tenant_user_sql(
-                    target.database,
-                    target.username,
-                ),
+    backends::for_protocol(runtime.protocol)?
+        .apply(
+            docker,
+            runtime,
+            target,
+            TenantOperation::Create {
                 password,
-            )
-            .await?;
-            MysqlFlavor::Mysql
-                .sql(
-                    docker,
-                    runtime,
-                    &MysqlFlavor::Mysql.quota_sql(target.username, limits),
-                )
-                .await?;
-        }
-        Protocol::Mariadb => {
-            let flavor = MysqlFlavor::Mariadb;
-            let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
-            flavor
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mariadb::provision::shared_tenant_user_sql(
-                        target.database,
-                        target.username,
-                        &verifier,
-                    )?,
-                )
-                .await?;
-            flavor
-                .sql(docker, runtime, &flavor.quota_sql(target.username, limits))
-                .await?;
-        }
-        Protocol::Mongodb => {
-            let script = databases::mongodb::provision::create_tenant_script(
-                target.database,
-                target.username,
-            )?;
-            mongo_script(
-                docker,
-                runtime,
-                &script,
-                &[(
-                    "DBE_TENANT_PASSWORD",
-                    SecretString::from(password.to_string()),
-                )],
-            )
-            .await?;
-        }
-        Protocol::Clickhouse => {
-            let create = databases::clickhouse::provision::create_tenant_sql(
-                target.database,
-                target.username,
-            );
-            let admin = admin_secret(runtime)?;
-            clickhouse_password_sql(
-                docker,
-                runtime,
-                databases::clickhouse::docker::INTERNAL_ADMIN_USERNAME,
+                limits,
                 admin,
-                &create,
-                password,
-            )
-            .await?;
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::tenant_quota_sql(
-                    target.username,
-                    policy::clickhouse_quota(limits),
-                ),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+            },
+        )
+        .await
 }
 
 pub(crate) async fn fence(
@@ -344,63 +131,9 @@ pub(crate) async fn fence(
     runtime: &EngineRuntime,
     target: TenantTarget<'_>,
 ) -> Result<(), TenantEngineError> {
-    match runtime.protocol {
-        Protocol::Postgres => {
-            postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &format!(
-                    "{}\n{}",
-                    databases::postgres::provision::fence_tenant_sql(
-                        target.database,
-                        target.username,
-                    ),
-                    databases::postgres::provision::terminate_tenant_sql(
-                        target.database,
-                        target.username,
-                    ),
-                ),
-            )
-            .await?;
-        }
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            let flavor = MysqlFlavor::try_from(protocol)?;
-            flavor
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_fence_sql(target.username),
-                )
-                .await?;
-            flavor.terminate(docker, runtime, target.username).await?;
-        }
-        Protocol::Mongodb => {
-            let fence = databases::mongodb::provision::fence_tenant_script(
-                target.database,
-                target.username,
-            )?;
-            let terminate = databases::mongodb::provision::terminate_tenant_script(
-                target.database,
-                target.username,
-            )?;
-            mongo_script(docker, runtime, &format!("{fence}\n{terminate}"), &[]).await?;
-        }
-        Protocol::Clickhouse => {
-            clickhouse_sql(
-                docker,
-                runtime,
-                &format!(
-                    "{}\n{}",
-                    databases::clickhouse::provision::fence_tenant_sql(target.username),
-                    databases::clickhouse::provision::terminate_tenant_sql(target.username),
-                ),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+    backends::for_protocol(runtime.protocol)?
+        .apply(docker, runtime, target, TenantOperation::Fence)
+        .await
 }
 
 pub(crate) async fn unfence(
@@ -408,46 +141,9 @@ pub(crate) async fn unfence(
     runtime: &EngineRuntime,
     target: TenantTarget<'_>,
 ) -> Result<(), TenantEngineError> {
-    match runtime.protocol {
-        Protocol::Postgres => {
-            postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &databases::postgres::provision::unfence_tenant_sql(
-                    target.database,
-                    target.username,
-                ),
-            )
-            .await?;
-        }
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            MysqlFlavor::try_from(protocol)?
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_unfence_sql(target.username),
-                )
-                .await?;
-        }
-        Protocol::Mongodb => {
-            let script = databases::mongodb::provision::unfence_tenant_script(
-                target.database,
-                target.username,
-            )?;
-            mongo_script(docker, runtime, &script, &[]).await?;
-        }
-        Protocol::Clickhouse => {
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::unfence_tenant_sql(target.username),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+    backends::for_protocol(runtime.protocol)?
+        .apply(docker, runtime, target, TenantOperation::Unfence)
+        .await
 }
 
 /// Fails closed when a MySQL-family tenant contains objects omitted from the
@@ -488,65 +184,9 @@ pub(crate) async fn drop_tenant(
     runtime: &EngineRuntime,
     target: TenantTarget<'_>,
 ) -> Result<(), TenantEngineError> {
-    match runtime.protocol {
-        Protocol::Postgres => {
-            let sql =
-                databases::postgres::provision::drop_tenant_sql(target.database, target.username);
-            let exists = postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &databases::postgres::provision::tenant_database_exists_sql(target.database),
-            )
-            .await?;
-            if exists.stdout.lines().any(|line| line.trim() == "1") {
-                postgres_sql(docker, runtime, target.database, &sql.database_sql).await?;
-                postgres_sql(docker, runtime, "dbe_control", &sql.maintenance_sql).await?;
-            } else {
-                postgres_sql(
-                    docker,
-                    runtime,
-                    "dbe_control",
-                    &databases::postgres::provision::drop_tenant_identity_sql(
-                        target.database,
-                        target.username,
-                    ),
-                )
-                .await?;
-            }
-        }
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            let flavor = MysqlFlavor::try_from(protocol)?;
-            flavor.terminate(docker, runtime, target.username).await?;
-            flavor
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_drop_sql(target.database, target.username),
-                )
-                .await?;
-        }
-        Protocol::Mongodb => {
-            let script = databases::mongodb::provision::drop_tenant_script(
-                target.database,
-                target.username,
-            )?;
-            mongo_script(docker, runtime, &script, &[]).await?;
-        }
-        Protocol::Clickhouse => {
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::drop_tenant_sql(
-                    target.database,
-                    target.username,
-                ),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+    backends::for_protocol(runtime.protocol)?
+        .apply(docker, runtime, target, TenantOperation::Drop)
+        .await
 }
 
 pub(crate) async fn set_quota(
@@ -555,50 +195,14 @@ pub(crate) async fn set_quota(
     target: TenantTarget<'_>,
     limits: &InstanceLimits,
 ) -> Result<(), TenantEngineError> {
-    match runtime.protocol {
-        Protocol::Postgres => {
-            postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &databases::postgres::provision::tenant_quota_sql(
-                    target.database,
-                    target.username,
-                    policy::postgres_quota(limits),
-                ),
-            )
-            .await?;
-        }
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            let flavor = MysqlFlavor::try_from(protocol)?;
-            flavor
-                .sql(docker, runtime, &flavor.quota_sql(target.username, limits))
-                .await?;
-        }
-        Protocol::Mongodb => {
-            let policy = databases::mongodb::provision::tenant_quota_policy(
-                databases::mongodb::provision::TenantQuota {
-                    max_connections: policy::max_connections(limits),
-                    max_operation_time_ms: 15 * 60 * 1_000,
-                    storage_bytes: mib_to_bytes(limits.disk_mib),
-                },
-            );
-            debug_assert!(!policy.engine_enforced);
-        }
-        Protocol::Clickhouse => {
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::tenant_quota_sql(
-                    target.username,
-                    policy::clickhouse_quota(limits),
-                ),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+    backends::for_protocol(runtime.protocol)?
+        .apply(
+            docker,
+            runtime,
+            target,
+            TenantOperation::SetQuota { limits },
+        )
+        .await
 }
 
 pub(crate) async fn rotate_password(
@@ -607,93 +211,14 @@ pub(crate) async fn rotate_password(
     target: TenantTarget<'_>,
     password: &str,
 ) -> Result<(), TenantEngineError> {
-    match runtime.protocol {
-        Protocol::Postgres => {
-            postgres_password_sql(
-                docker,
-                runtime,
-                &databases::postgres::provision::reset_tenant_password_sql(target.username),
-                password,
-            )
-            .await?;
-        }
-        Protocol::Mysql => {
-            mysql_password_sql(
-                docker,
-                runtime,
-                &databases::mysql::provision::reset_tenant_password_sql(target.username),
-                password,
-            )
-            .await?;
-            MysqlFlavor::Mysql
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_shared_grant_sql(target.database, target.username),
-                )
-                .await?;
-        }
-        Protocol::Mariadb => {
-            let flavor = MysqlFlavor::Mariadb;
-            let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
-            flavor
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mariadb::provision::reset_tenant_password_sql(
-                        target.username,
-                        &verifier,
-                    )?,
-                )
-                .await?;
-            flavor
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_shared_grant_sql(target.database, target.username),
-                )
-                .await?;
-        }
-        Protocol::Mongodb => {
-            let script = databases::mongodb::provision::password_update_script(
-                target.database,
-                target.username,
-            )?;
-            mongo_script(
-                docker,
-                runtime,
-                &script,
-                &[(
-                    "DBE_ROTATED_PASSWORD",
-                    SecretString::from(password.to_string()),
-                )],
-            )
-            .await?;
-        }
-        Protocol::Clickhouse => {
-            let admin = admin_secret(runtime)?;
-            clickhouse_password_sql(
-                docker,
-                runtime,
-                databases::clickhouse::docker::INTERNAL_ADMIN_USERNAME,
-                admin,
-                &databases::clickhouse::provision::reset_tenant_password_sql(target.username),
-                password,
-            )
-            .await?;
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::shared_grant_sql(
-                    target.database,
-                    target.username,
-                ),
-            )
-            .await?;
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    }
-    Ok(())
+    backends::for_protocol(runtime.protocol)?
+        .apply(
+            docker,
+            runtime,
+            target,
+            TenantOperation::RotatePassword { password },
+        )
+        .await
 }
 
 pub(crate) async fn verify_password(
@@ -703,28 +228,7 @@ pub(crate) async fn verify_password(
     password: &str,
 ) -> Result<(), TenantEngineError> {
     let password = SecretString::from(password.to_string());
-    let command = match runtime.protocol {
-        Protocol::Postgres => format!(
-            "PGPASSWORD=\"$DBE_TENANT_PASSWORD\" psql -X -h /var/run/postgresql -U {} -d {} -Atqc 'SELECT 1' >/dev/null",
-            sh_quote(target.username),
-            sh_quote(target.database),
-        ),
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            MysqlFlavor::try_from(protocol)?.verify_command(target)
-        }
-        Protocol::Mongodb => format!(
-            "mongosh --quiet --host 127.0.0.1 --username {} --password \"$DBE_TENANT_PASSWORD\" --authenticationDatabase {} {} --eval 'quit(db.runCommand({{ ping: 1 }}).ok === 1 ? 0 : 2)' >/dev/null",
-            sh_quote(target.username),
-            sh_quote(target.database),
-            sh_quote(target.database),
-        ),
-        Protocol::Clickhouse => format!(
-            "clickhouse-client --host 127.0.0.1 --user {} --password \"$DBE_TENANT_PASSWORD\" --database {} --query 'SELECT 1' >/dev/null",
-            sh_quote(target.username),
-            sh_quote(target.database),
-        ),
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    };
+    let command = backends::for_protocol(runtime.protocol)?.verify_command(target);
     docker
         .exec_tenant_shell(
             runtime.protocol,
@@ -776,39 +280,9 @@ pub(crate) async fn measure_storage(
         .iter()
         .map(|target| target.database)
         .collect::<Vec<_>>();
-    let output = match runtime.protocol {
-        Protocol::Postgres => {
-            postgres_sql(
-                docker,
-                runtime,
-                "dbe_control",
-                &databases::postgres::provision::tenant_storage_sql(&database_names),
-            )
-            .await?
-        }
-        protocol @ (Protocol::Mysql | Protocol::Mariadb) => {
-            MysqlFlavor::try_from(protocol)?
-                .sql(
-                    docker,
-                    runtime,
-                    &databases::mysql_storage_sql(&database_names),
-                )
-                .await?
-        }
-        Protocol::Mongodb => {
-            let script = databases::mongodb::provision::tenant_storage_script(&database_names)?;
-            mongo_script(docker, runtime, &script, &[]).await?
-        }
-        Protocol::Clickhouse => {
-            clickhouse_sql(
-                docker,
-                runtime,
-                &databases::clickhouse::provision::tenant_storage_sql(&database_names),
-            )
-            .await?
-        }
-        protocol => return Err(TenantEngineError::Unsupported(protocol)),
-    };
+    let output = backends::for_protocol(runtime.protocol)?
+        .measure_storage(docker, runtime, &database_names)
+        .await?;
     parse_storage(&output.stdout, targets.len())
 }
 
@@ -839,210 +313,8 @@ fn admin_secret(runtime: &EngineRuntime) -> Result<SecretString, TenantEngineErr
         .ok_or_else(|| TenantEngineError::MissingAdminSecret(runtime.runtime_id.clone()))
 }
 
-async fn postgres_sql(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    database: &str,
-    sql: &str,
-) -> Result<CommandOutput, TenantEngineError> {
-    let admin = admin_secret(runtime)?;
-    let script = format!(
-        "set -eu\nprintf %s {} | PGPASSWORD=\"$DBE_ADMIN_PASSWORD\" psql -X -A -t -q -h /var/run/postgresql -U dbe_admin -d {} -v ON_ERROR_STOP=1",
-        sh_quote(sql),
-        sh_quote(database),
-    );
-    Ok(docker
-        .exec_tenant_shell(
-            Protocol::Postgres,
-            &runtime.runtime_id,
-            &script,
-            &[("DBE_ADMIN_PASSWORD", &admin)],
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?)
-}
-
-async fn postgres_password_sql(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    sql: &str,
-    password: &str,
-) -> Result<(), TenantEngineError> {
-    let admin = admin_secret(runtime)?;
-    let password = SecretString::from(password.to_string());
-    let script = format!(
-        "set -eu\n{{ printf '%s\\n' '\\getenv tenant_password DBE_TENANT_PASSWORD'; printf %s {}; }} | PGPASSWORD=\"$DBE_ADMIN_PASSWORD\" psql -X -h /var/run/postgresql -U dbe_admin -d dbe_control -v ON_ERROR_STOP=1",
-        sh_quote(sql),
-    );
-    docker
-        .exec_tenant_shell(
-            Protocol::Postgres,
-            &runtime.runtime_id,
-            &script,
-            &[
-                ("DBE_ADMIN_PASSWORD", &admin),
-                ("DBE_TENANT_PASSWORD", &password),
-            ],
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?;
-    Ok(())
-}
-
-async fn mysql_password_sql(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    sql: &str,
-    password: &str,
-) -> Result<(), TenantEngineError> {
-    let (before, after) = databases::mysql::provision::password_sql_fragments(sql)?;
-    let password = SecretString::from(STANDARD.encode(password));
-    let admin = admin_secret(runtime)?;
-    let script = format!(
-        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$DBE_ADMIN_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot",
-        sh_quote(before),
-        sh_quote(after),
-    );
-    docker
-        .exec_tenant_shell(
-            Protocol::Mysql,
-            &runtime.runtime_id,
-            &script,
-            &[
-                ("DBE_ADMIN_PASSWORD", &admin),
-                ("DBE_PASSWORD_B64", &password),
-            ],
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?;
-    Ok(())
-}
-
-async fn sql_client(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    flavor: MysqlFlavor,
-    sql: &str,
-    timeout: Duration,
-    telemetry: bool,
-) -> Result<CommandOutput, TenantEngineError> {
-    let protocol = flavor.protocol();
-    let (client, socket) = flavor.client();
-    let admin = admin_secret(runtime)?;
-    let script = format!(
-        "set -eu\nprintf %s {} | MYSQL_PWD=\"$DBE_ADMIN_PASSWORD\" {client} --protocol=socket --socket={} --batch --skip-column-names --raw -uroot",
-        sh_quote(sql),
-        sh_quote(socket),
-    );
-    let script = if telemetry {
-        telemetry_command(script)
-    } else {
-        script
-    };
-    let output = if telemetry {
-        docker
-            .exec_telemetry(
-                protocol,
-                &runtime.runtime_id,
-                &script,
-                &[("DBE_ADMIN_PASSWORD", &admin)],
-                timeout,
-            )
-            .await?
-    } else {
-        docker
-            .exec_tenant_shell(
-                protocol,
-                &runtime.runtime_id,
-                &script,
-                &[("DBE_ADMIN_PASSWORD", &admin)],
-                timeout,
-            )
-            .await?
-    };
-    Ok(output)
-}
-
 fn telemetry_command(script: String) -> String {
     format!("exec timeout -k 1s 6s sh -c {}", sh_quote(&script))
-}
-
-async fn mongo_script(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    script: &str,
-    extra: &[(&str, SecretString)],
-) -> Result<CommandOutput, TenantEngineError> {
-    let admin = admin_secret(runtime)?;
-    let mut secrets = vec![("DBE_ADMIN_PASSWORD", &admin)];
-    secrets.extend(extra.iter().map(|(key, value)| (*key, value)));
-    let script = databases::mongodb::provision::admin_script(script);
-    let command = format!(
-        "set -eu\nmongosh --quiet --nodb --eval {}",
-        sh_quote(&script)
-    );
-    Ok(docker
-        .exec_tenant_shell(
-            Protocol::Mongodb,
-            &runtime.runtime_id,
-            &command,
-            &secrets,
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?)
-}
-
-async fn clickhouse_password_sql(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    admin_user: &str,
-    admin: SecretString,
-    sql: &str,
-    password: &str,
-) -> Result<(), TenantEngineError> {
-    let (before, after) = databases::clickhouse::provision::password_sql_fragments(sql)?;
-    let password_literal = databases::clickhouse::provision::password_literal(password);
-    let password = SecretString::from(STANDARD.encode(password_literal));
-    let command = format!(
-        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\" | base64 -d; printf %s {}; }} | CLICKHOUSE_PASSWORD=\"$DBE_ADMIN_PASSWORD\" clickhouse-client --user {} --multiquery",
-        sh_quote(before),
-        sh_quote(after),
-        sh_quote(admin_user),
-    );
-    docker
-        .exec_tenant_shell(
-            Protocol::Clickhouse,
-            &runtime.runtime_id,
-            &command,
-            &[
-                ("DBE_ADMIN_PASSWORD", &admin),
-                ("DBE_PASSWORD_B64", &password),
-            ],
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?;
-    Ok(())
-}
-
-async fn clickhouse_sql(
-    docker: &DockerRuntime,
-    runtime: &EngineRuntime,
-    sql: &str,
-) -> Result<CommandOutput, TenantEngineError> {
-    let admin = admin_secret(runtime)?;
-    let command = format!(
-        "set -eu\nprintf %s {} | CLICKHOUSE_PASSWORD=\"$DBE_ADMIN_PASSWORD\" clickhouse-client --user dbe_admin --multiquery",
-        sh_quote(sql),
-    );
-    Ok(docker
-        .exec_tenant_shell(
-            Protocol::Clickhouse,
-            &runtime.runtime_id,
-            &command,
-            &[("DBE_ADMIN_PASSWORD", &admin)],
-            TENANT_OPERATION_TIMEOUT,
-        )
-        .await?)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1095,7 +367,10 @@ mod tests {
     #[test]
     fn unsupported_engines_are_explicit() {
         for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
-            assert!(policy::engine_disk_overhead(protocol).is_none());
+            assert!(matches!(
+                backends::for_protocol(protocol),
+                Err(TenantEngineError::Unsupported(actual)) if actual == protocol
+            ));
         }
     }
 
@@ -1156,3 +431,6 @@ mod tests {
 
 #[cfg(test)]
 mod integration_tests;
+
+#[cfg(test)]
+mod dispatch_tests;

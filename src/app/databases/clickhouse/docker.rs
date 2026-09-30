@@ -15,8 +15,9 @@ use crate::{
     },
 };
 
-const HOSTED_CONFIG_FILENAME: &str = "dbe-hosted-overrides.xml";
-const HOSTED_CONFIG_TARGET: &str = "/etc/clickhouse-server/config.d/dbe-hosted-overrides.xml";
+pub(crate) const HOSTED_CONFIG_FILENAME: &str = "dbe-hosted-overrides.xml";
+pub(crate) const HOSTED_CONFIG_TARGET: &str =
+    "/etc/clickhouse-server/config.d/dbe-hosted-overrides.xml";
 pub const INTERNAL_ADMIN_USERNAME: &str = "dbe_admin";
 pub const CONTROL_DATABASE: &str = "dbe_control";
 
@@ -211,6 +212,17 @@ fn write_hosted_config_sync(
 }
 
 fn hosted_config_xml(shared: bool) -> String {
+    // Shared engines must leave cgroup headroom for the bridge, clients and
+    // allocations outside query tracking. This mitigates, not guarantees
+    // against, OOM; the container's configured memory limit stays unchanged.
+    let shared_memory = if shared {
+        r#"    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+    <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
+    <memory_worker_use_cgroup>1</memory_worker_use_cgroup>
+"#
+    } else {
+        ""
+    };
     let shared_access_control = if shared {
         r#"    <access_control_improvements>
         <table_engines_require_grant>true</table_engines_require_grant>
@@ -270,7 +282,7 @@ fn hosted_config_xml(shared: bool) -> String {
     <opentelemetry_span_log remove="1"/>
     <aggregated_zookeeper_log remove="1"/>
     <zookeeper_connection_log remove="1"/>
-{shared_access_control}    <listen_host>127.0.0.1</listen_host>
+{shared_memory}{shared_access_control}    <listen_host>127.0.0.1</listen_host>
     <interserver_listen_host>127.0.0.1</interserver_listen_host>
 </clickhouse>
 "#
@@ -478,6 +490,14 @@ mod tests {
         assert!(config.contains("toStartOfHour(event_time)"));
         assert!(config.contains("event_time + INTERVAL 2 HOUR DELETE"));
         assert!(!config.contains("<query_log remove=\"1\"/>"));
+        assert!(config.contains(
+            "<max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>"
+        ));
+        assert!(config.contains(
+            "<memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>"
+        ));
+        assert!(config.contains("<memory_worker_use_cgroup>1</memory_worker_use_cgroup>"));
+        assert!(!hosted_config_xml(false).contains("<max_server_memory_usage_to_ram_ratio>"));
     }
 
     #[tokio::test]

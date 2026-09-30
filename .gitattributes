@@ -3,6 +3,8 @@
 /helpers/payloads/*.version text eol=lf
 /helpers/payloads/*.zst binary
 *.sh text eol=lf
+# SQLx migration checksums include line endings.
+*.sql text eol=lf
 .githooks/* text eol=lf
 .github/workflows/*.yml text eol=lf
 Dockerfile text eol=lf

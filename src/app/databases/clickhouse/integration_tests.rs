@@ -39,6 +39,15 @@ async fn hosted_console_config_removes_inherited_file_logging() {
             ("logger.console", "1"),
             ("logger.async_queue_max_size", "1024"),
             ("query_log.table", if shared { "query_log" } else { "" }),
+            (
+                "max_server_memory_usage_to_ram_ratio",
+                if shared { "0.8" } else { "" },
+            ),
+            (
+                "memory_worker_correct_memory_tracker",
+                if shared { "1" } else { "" },
+            ),
+            ("memory_worker_use_cgroup", if shared { "1" } else { "" }),
         ] {
             let output = Command::new(&binary)
                 .args(["extract-from-config", "--config-file"])

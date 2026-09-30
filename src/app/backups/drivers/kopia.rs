@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -71,6 +72,43 @@ struct CommandResult {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+impl super::BackupDriver for KopiaBackupDriver {
+    fn preflight(&self) -> BoxFuture<'_, Result<(), BackupStoreError>> {
+        Box::pin(Self::preflight(self))
+    }
+
+    fn commit<'a>(
+        &'a self,
+        bundle: &'a BackupBundle,
+        manifest: &'a StoredBackup,
+    ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
+        Box::pin(Self::commit(self, bundle, manifest))
+    }
+
+    fn list<'a>(
+        &'a self,
+        instance_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<StoredBackup>, BackupStoreError>> {
+        Box::pin(Self::list(self, instance_id))
+    }
+
+    fn find<'a>(
+        &'a self,
+        instance_id: &'a str,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<StoredBackup, BackupStoreError>> {
+        Box::pin(Self::find(self, instance_id, backup_id))
+    }
+
+    fn delete<'a>(
+        &'a self,
+        instance_id: &'a str,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
+        Box::pin(Self::delete(self, instance_id, backup_id))
+    }
 }
 
 impl KopiaBackupDriver {

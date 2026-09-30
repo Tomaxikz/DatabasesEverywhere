@@ -195,7 +195,7 @@ async fn cleanup_internal_dir(path: &Path, label: &str) -> Result<bool, BackupSt
 pub struct MaterializedBackup {
     pub path: PathBuf,
     pub temporary: bool,
-    capacity: Option<crate::api::import_export::DiskCapacityReservation>,
+    capacity: Option<crate::disk::capacity::DiskCapacityReservation>,
 }
 
 impl Drop for MaterializedBackup {
@@ -247,11 +247,7 @@ impl BackupStorage {
     }
 
     pub async fn preflight(&self) -> Result<(), BackupStoreError> {
-        match self {
-            Self::Local(driver) => driver.preflight().await,
-            Self::S3(driver) => driver.preflight().await,
-            Self::Kopia(driver) => driver.preflight().await,
-        }
+        self.driver().preflight().await
     }
 
     pub async fn commit(
@@ -259,19 +255,11 @@ impl BackupStorage {
         bundle: &BackupBundle,
         manifest: &StoredBackup,
     ) -> Result<(), BackupStoreError> {
-        match self {
-            Self::Local(driver) => driver.commit(bundle, manifest).await,
-            Self::S3(driver) => driver.commit(bundle, manifest).await,
-            Self::Kopia(driver) => driver.commit(bundle, manifest).await,
-        }
+        self.driver().commit(bundle, manifest).await
     }
 
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
-        let mut backups = match self {
-            Self::Local(driver) => driver.list(instance_id).await?,
-            Self::S3(driver) => driver.list(instance_id).await?,
-            Self::Kopia(driver) => driver.list(instance_id).await?,
-        };
+        let mut backups = self.driver().list(instance_id).await?;
         backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));
         Ok(backups)
     }
@@ -282,19 +270,19 @@ impl BackupStorage {
         backup_id: &str,
     ) -> Result<StoredBackup, BackupStoreError> {
         validate_backup_id(backup_id)?;
-        match self {
-            Self::Local(driver) => driver.find(instance_id, backup_id).await,
-            Self::S3(driver) => driver.find(instance_id, backup_id).await,
-            Self::Kopia(driver) => driver.find(instance_id, backup_id).await,
-        }
+        self.driver().find(instance_id, backup_id).await
     }
 
     pub async fn delete(&self, instance_id: &str, backup_id: &str) -> Result<(), BackupStoreError> {
         validate_backup_id(backup_id)?;
+        self.driver().delete(instance_id, backup_id).await
+    }
+
+    fn driver(&self) -> &dyn drivers::BackupDriver {
         match self {
-            Self::Local(driver) => driver.delete(instance_id, backup_id).await,
-            Self::S3(driver) => driver.delete(instance_id, backup_id).await,
-            Self::Kopia(driver) => driver.delete(instance_id, backup_id).await,
+            Self::Local(driver) => driver,
+            Self::S3(driver) => driver.as_ref(),
+            Self::Kopia(driver) => driver,
         }
     }
 
@@ -303,7 +291,7 @@ impl BackupStorage {
         instance_id: &str,
         backup_id: &str,
         tmp_root: &Path,
-        capacity: Option<crate::api::import_export::DiskCapacityReservation>,
+        capacity: Option<crate::disk::capacity::DiskCapacityReservation>,
         slots: std::sync::Arc<tokio::sync::Semaphore>,
     ) -> Result<MaterializedBackup, BackupStoreError> {
         validate_backup_id(backup_id)?;
@@ -571,6 +559,142 @@ pub enum BackupStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn commit_test_backup(
+        storage: &BackupStorage,
+        root: &Path,
+        backup_id: &str,
+        created_at_unix: i64,
+    ) -> StoredBackup {
+        let bundle = BackupBundle::create(root, "inst_one", backup_id)
+            .await
+            .unwrap();
+        tokio::fs::write(&bundle.archive, b"archive").await.unwrap();
+        let mut manifest = build_manifest(
+            backup_id.to_string(),
+            "inst_one".to_string(),
+            Protocol::Postgres,
+            BackupLayout::Physical,
+            &bundle.archive,
+            false,
+        )
+        .await
+        .unwrap();
+        manifest.created_at_unix = created_at_unix;
+        manifest.created_at = OffsetDateTime::from_unix_timestamp(created_at_unix)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
+        bundle.write_metadata(&manifest).await.unwrap();
+        storage.commit(&bundle, &manifest).await.unwrap();
+        bundle.cleanup().await;
+        manifest
+    }
+
+    #[tokio::test]
+    async fn storage_facade_round_trips_backups_and_lists_newest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
+        storage.preflight().await.unwrap();
+        assert!(storage.list("inst_one").await.unwrap().is_empty());
+
+        for (backup_id, timestamp) in [
+            ("a-old.physical.tar.gz", 100),
+            ("b-new.physical.tar.gz", 300),
+            ("c-middle.physical.tar.gz", 200),
+        ] {
+            let manifest = commit_test_backup(&storage, &root, backup_id, timestamp).await;
+            let found = storage.find("inst_one", backup_id).await.unwrap();
+            assert_eq!(found.backup_id, manifest.backup_id);
+            assert_eq!(found.sha256, manifest.sha256);
+            assert_eq!(found.created_at_unix, timestamp);
+        }
+
+        let listed = storage.list("inst_one").await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|backup| backup.backup_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "b-new.physical.tar.gz",
+                "c-middle.physical.tar.gz",
+                "a-old.physical.tar.gz"
+            ]
+        );
+        assert!(storage.list("inst_other").await.unwrap().is_empty());
+        for backup in listed {
+            storage.delete("inst_one", &backup.backup_id).await.unwrap();
+        }
+        assert!(storage.list("inst_one").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn storage_facade_preserves_validation_and_missing_backup_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
+        storage.preflight().await.unwrap();
+        let manifest = commit_test_backup(&storage, &root, "valid.physical.tar.gz", 100).await;
+
+        for backup_id in ["../outside", "valid.physical.tar.gz.metadata.json"] {
+            assert!(matches!(
+                storage.find("inst_one", backup_id).await,
+                Err(BackupStoreError::InvalidBackupId)
+            ));
+            assert!(matches!(
+                storage.delete("inst_one", backup_id).await,
+                Err(BackupStoreError::InvalidBackupId)
+            ));
+        }
+        assert!(matches!(
+            storage.list("../outside").await,
+            Err(BackupStoreError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            storage.find("inst_one", "missing.physical.tar.gz").await,
+            Err(BackupStoreError::NotFound)
+        ));
+        assert!(matches!(
+            storage.delete("inst_one", "missing.physical.tar.gz").await,
+            Err(BackupStoreError::NotFound)
+        ));
+        assert_eq!(storage.list("inst_one").await.unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .find("inst_one", &manifest.backup_id)
+                .await
+                .unwrap()
+                .sha256,
+            manifest.sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_facade_preserves_corrupt_manifest_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let storage = BackupStorage::Local(drivers::local::LocalBackupDriver::new(root.clone()));
+        storage.preflight().await.unwrap();
+        let manifest = commit_test_backup(&storage, &root, "valid.physical.tar.gz", 100).await;
+        tokio::fs::write(
+            root.join("inst_one")
+                .join(metadata_file_name(&manifest.backup_id)),
+            b"invalid metadata",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            storage.find("inst_one", &manifest.backup_id).await,
+            Err(BackupStoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            storage.list("inst_one").await,
+            Err(BackupStoreError::Corrupt(_))
+        ));
+    }
 
     #[tokio::test]
     async fn materialized_guard_cleans_only_temporary_files() {

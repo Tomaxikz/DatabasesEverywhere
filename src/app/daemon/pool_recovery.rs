@@ -3,11 +3,11 @@ use std::{collections::HashSet, path::Path, time::Duration};
 use anyhow::{Context, ensure};
 
 use crate::{
-    api::{http::state::AppState, instances::containment::contain_locked},
     instances::{
         metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
         paths::InstancePaths,
     },
+    placement::containment::contain_locked,
     placement::{
         DeploymentMode, EngineRuntime, EngineRuntimeStatus, TenantReservation,
         TenantReservationState, lifecycle, tenant,
@@ -17,6 +17,7 @@ use crate::{
         backend::{BackendEndpoint, backend_socket_path},
         time::now_rfc3339,
     },
+    state::AppState,
 };
 
 /// Called synchronously at boot before the API or gateway workers exist. The
@@ -110,7 +111,7 @@ pub(super) async fn recover_dead_pools(state: &AppState) -> anyhow::Result<Recov
             } else {
                 tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error,
                     "pool retry failed; lifecycle failure policy keeps it down");
-                crate::api::instances::containment::stop_pool(state, &runtime)
+                crate::placement::containment::stop_pool(state, &runtime)
                     .await
                     .map_err(anyhow::Error::msg)
                     .context("could not verify shutdown after automatic pool retry")?;
@@ -387,6 +388,7 @@ async fn recover_locked(
         "could not fence every pool tenant before recovery"
     );
     lifecycle::paths::prepare_socket_directory(state, &runtime).await?;
+    lifecycle::paths::prepare_hosted_config(state, &runtime).await?;
     crate::placement::runtime::apply_limits(
         &state.docker,
         &state.config,

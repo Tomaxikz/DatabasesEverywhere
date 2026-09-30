@@ -3,7 +3,7 @@ pub mod images;
 pub mod progress;
 pub mod requests;
 
-pub(crate) mod containment;
+pub(crate) use crate::placement::containment;
 mod deployment;
 pub(crate) mod major_upgrade;
 mod normal_image_update;

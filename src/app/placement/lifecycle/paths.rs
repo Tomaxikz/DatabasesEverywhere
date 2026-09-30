@@ -7,7 +7,6 @@ use rustix::{
 };
 
 use crate::{
-    api::http::state::AppState,
     instances::paths::InstancePaths,
     placement::EngineRuntime,
     shared::{
@@ -18,6 +17,7 @@ use crate::{
         ownership::HostOwner,
         protocol::Protocol,
     },
+    state::AppState,
 };
 
 /// Boot and API power operations hold the pool lock before entering here.
@@ -48,6 +48,39 @@ pub(crate) async fn prepare_socket_directory(
     tokio::task::spawn_blocking(move || ensure_socket_directory(&sockets, owner))
         .await
         .context("shared pool socket preparation task failed")??;
+    Ok(())
+}
+
+/// Refresh only daemon-owned ClickHouse configuration for the next container
+/// start. An atomic replacement is not assumed to update a live file bind.
+pub(crate) async fn prepare_hosted_config(
+    state: &AppState,
+    runtime: &EngineRuntime,
+) -> anyhow::Result<()> {
+    if runtime.protocol != Protocol::Clickhouse {
+        return Ok(());
+    }
+    use crate::databases::clickhouse::docker;
+    let paths = InstancePaths::new(&state.config.paths, &runtime.runtime_id)?;
+    let expected = paths.runtime_config.join(docker::HOSTED_CONFIG_FILENAME);
+    let source = state
+        .docker
+        .container_bind_source(
+            runtime.protocol,
+            &runtime.runtime_id,
+            docker::HOSTED_CONFIG_TARGET,
+        )
+        .await?;
+    ensure!(
+        source.as_deref() == Some(expected.as_path()),
+        "shared ClickHouse configuration bind does not match the configured runtime path"
+    );
+    let directory = tokio::fs::symlink_metadata(&paths.runtime_config).await?;
+    ensure!(
+        directory.is_dir() && !directory.file_type().is_symlink(),
+        "shared ClickHouse configuration directory is missing or unsafe"
+    );
+    docker::write_shared_hosted_config(&paths.runtime_config).await?;
     Ok(())
 }
 

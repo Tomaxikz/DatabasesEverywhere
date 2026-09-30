@@ -15,6 +15,17 @@ Use [WebSockets](websockets.md) for live dashboards rather than polling each DB.
 
 ## Resource scope
 
+Shared-tenant `disk.used_bytes` is nullable. When storage cannot be measured,
+including while its pool is stopped or failed, resource and tenant-list responses
+remain available with `used_bytes: null`. Display this as unavailable, not zero.
+This reporting fallback does not relax disk quota admission or enforcement.
+
+Pool reports can include a `diagnostic` with code `pool_oom_killed` when the
+managed container's inspection confirms an OOM kill. The diagnostic includes
+the container memory limit when known; an exit code alone is not treated as proof.
+The diagnostic is observational, not a durable incident history, and disappears
+once the container runs again or is replaced.
+
 | Value | Dedicated instance | Shared tenant |
 | --- | --- | --- |
 | Scope | `dedicated_instance` | `shared_tenant` |

@@ -605,7 +605,10 @@ pub(super) fn aggregate_managed_usage(
         runtime.expects_live_sample |= expects_live_sample;
         runtime.cpu_usage_percent = runtime.cpu_usage_percent.or(report.cpu.usage_percent);
         runtime.memory_usage_bytes = runtime.memory_usage_bytes.or(report.memory.usage_bytes);
-        disk_used_bytes = disk_used_bytes.saturating_add(report.disk.used_bytes);
+        match report.disk.used_bytes {
+            Some(bytes) => disk_used_bytes = disk_used_bytes.saturating_add(bytes),
+            None => disk_complete = false,
+        }
     }
 
     let mut seen_shared = HashSet::new();

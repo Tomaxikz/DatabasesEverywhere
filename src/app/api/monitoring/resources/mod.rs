@@ -175,7 +175,8 @@ pub struct MemoryReport {
 pub struct DiskReport {
     pub configured_mib: u64,
     pub limit_bytes: u64,
-    pub used_bytes: u64,
+    /// Null means no current measurement; it never means an empty database.
+    pub used_bytes: Option<u64>,
     pub enforced: bool,
     pub enforcement_method: String,
     /// `hard` means writes are rejected by a filesystem quota; `soft` means
@@ -391,9 +392,9 @@ pub(crate) async fn resource_report(
         && metadata.limits.disk_enforcement_method == "fuse_quota";
     let scanner_active = !shared && (soft_enforcement || legacy_qdrant_safety_monitor);
     let (scanner, disk_used) = if shared {
-        let used = shared_disk::usage(state, metadata)
-            .await
-            .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
+        // Telemetry must not make a stopped/unmeasurable tenant unlistable.
+        // Enforcement and admission still use the strict measurement paths.
+        let used = shared_disk::usage(state, metadata).await.ok();
         (None, used)
     } else {
         let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
@@ -420,7 +421,7 @@ pub(crate) async fn resource_report(
         })
         .await
         .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
-        (scanner, used)
+        (scanner, Some(used))
     };
     let usage = pools::runtime_report_usage(
         metadata.deployment_mode,
