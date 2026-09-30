@@ -59,9 +59,9 @@ pub enum MongodbProxyError {
     #[error("mongodb authentication response is malformed")]
     InvalidAuthResponse,
     #[error("mongodb bson decode failed: {0}")]
-    BsonDecode(#[from] bson::de::Error),
+    BsonDecode(bson::error::Error),
     #[error("mongodb bson encode failed: {0}")]
-    BsonEncode(#[from] bson::ser::Error),
+    BsonEncode(bson::error::Error),
 }
 
 pub async fn read_message<S>(stream: &mut S) -> Result<MongoMessage, MongodbProxyError>
@@ -156,7 +156,7 @@ pub async fn write_op_msg_response(
     let mut payload = Vec::new();
     payload.extend_from_slice(&0_i32.to_le_bytes());
     payload.push(0);
-    payload.extend_from_slice(&bson::to_vec(&body)?);
+    payload.extend_from_slice(&body.to_vec().map_err(MongodbProxyError::BsonEncode)?);
 
     let len = MESSAGE_HEADER_LEN + payload.len();
     let mut message = Vec::with_capacity(len);
@@ -174,7 +174,7 @@ async fn write_op_reply_response(
     response_to: i32,
     body: Document,
 ) -> Result<(), MongodbProxyError> {
-    let doc_bytes = bson::to_vec(&body)?;
+    let doc_bytes = body.to_vec().map_err(MongodbProxyError::BsonEncode)?;
     let len = MESSAGE_HEADER_LEN + 20 + doc_bytes.len();
     let mut message = Vec::with_capacity(len);
     message.extend_from_slice(&(len as i32).to_le_bytes());
@@ -313,7 +313,7 @@ fn parse_op_msg_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
         match kind {
             0 => {
                 let mut cursor = Cursor::new(&payload[offset..]);
-                return Ok(Document::from_reader(&mut cursor)?);
+                return Document::from_reader(&mut cursor).map_err(MongodbProxyError::BsonDecode);
             }
             1 => {
                 if offset + 4 > payload.len() {
@@ -351,7 +351,7 @@ fn parse_op_query_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
         return Err(MongodbProxyError::MalformedMessage);
     }
     let mut cursor = Cursor::new(&payload[offset..]);
-    Ok(Document::from_reader(&mut cursor)?)
+    Document::from_reader(&mut cursor).map_err(MongodbProxyError::BsonDecode)
 }
 
 fn parse_speculative_route(
@@ -436,7 +436,7 @@ fn command_succeeded(body: &Document) -> Result<bool, MongodbProxyError> {
 }
 
 pub(crate) fn encode_command(body: Document) -> Result<Vec<u8>, MongodbProxyError> {
-    let body = bson::to_vec(&body)?;
+    let body = body.to_vec().map_err(MongodbProxyError::BsonEncode)?;
     let len = MESSAGE_HEADER_LEN
         .checked_add(5)
         .and_then(|len| len.checked_add(body.len()))

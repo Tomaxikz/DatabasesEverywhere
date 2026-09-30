@@ -466,7 +466,7 @@ mod tests {
     fn mongo_archive(database: &str, collection: &str, metadata: &str) -> Vec<u8> {
         let mut bytes = vec![0x6d, 0xe2, 0x99, 0x81];
         bytes.extend(
-            bson::to_vec(&bson::doc! {
+            bson::Document::to_vec(&bson::doc! {
                 "concurrent_collections": 1_i32,
                 "version": "0.1",
                 "server_version": "8.0.0",
@@ -475,7 +475,7 @@ mod tests {
             .unwrap(),
         );
         bytes.extend(
-            bson::to_vec(&bson::doc! {
+            bson::Document::to_vec(&bson::doc! {
                 "db": database,
                 "collection": collection,
                 "metadata": metadata,

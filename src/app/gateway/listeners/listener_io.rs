@@ -1181,7 +1181,7 @@ mod tests {
     }
 
     fn mongodb_message(body: bson::Document) -> Vec<u8> {
-        let body = bson::to_vec(&body).unwrap();
+        let body = bson::Document::to_vec(&body).unwrap();
         let len = 16 + 5 + body.len();
         let mut message = Vec::with_capacity(len);
         message.extend_from_slice(&(len as i32).to_le_bytes());

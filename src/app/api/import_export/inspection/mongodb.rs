@@ -192,7 +192,7 @@ fn validate_header(bytes: &[u8]) -> Result<(), InspectionError> {
         let value = element
             .value()
             .map_err(|_| InspectionError::Invalid(MALFORMED))?;
-        match element.key() {
+        match element.key().as_str() {
             "concurrent_collections" => {
                 set_required_once(&mut concurrent_collections, value.as_i32(), MALFORMED)?;
             }
@@ -244,7 +244,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<MongoMetadata<'_>, InspectionError> {
         let value = element
             .value()
             .map_err(|_| InspectionError::Invalid(MALFORMED))?;
-        match element.key() {
+        match element.key().as_str() {
             "db" => set_required_once(&mut database, value.as_str(), MALFORMED)?,
             "collection" => set_required_once(&mut collection, value.as_str(), MALFORMED)?,
             "metadata" => {
@@ -403,7 +403,7 @@ mod tests {
     }
 
     fn metadata_document(database: &str, collection: &str) -> Vec<u8> {
-        bson::to_vec(&bson::doc! {
+        bson::Document::to_vec(&bson::doc! {
             "db": database,
             "collection": collection,
             "metadata": "{}",
@@ -416,7 +416,7 @@ mod tests {
     fn archive_documents(documents: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
         let mut bytes = ARCHIVE_MAGIC.to_vec();
         bytes.extend(
-            bson::to_vec(&bson::doc! {
+            bson::Document::to_vec(&bson::doc! {
                 "concurrent_collections": 4_i32,
                 "version": ARCHIVE_FORMAT_VERSION,
                 "server_version": "8.0.0",
@@ -510,7 +510,7 @@ mod tests {
 
         let mut unsupported = ARCHIVE_MAGIC.to_vec();
         unsupported.extend(
-            bson::to_vec(&bson::doc! {
+            bson::Document::to_vec(&bson::doc! {
                 "concurrent_collections": 1_i32,
                 "version": "999",
                 "server_version": "8.0",
@@ -524,7 +524,7 @@ mod tests {
         let empty_archive = archive(&[]);
         let mut missing_collection = ARCHIVE_MAGIC.to_vec();
         missing_collection.extend(&empty_archive[4..empty_archive.len() - 4]);
-        missing_collection.extend(bson::to_vec(&bson::doc! { "db": "tenant" }).unwrap());
+        missing_collection.extend(bson::Document::to_vec(&bson::doc! { "db": "tenant" }).unwrap());
         missing_collection.extend(ARCHIVE_TERMINATOR.to_le_bytes());
         assert_invalid_contains(&missing_collection, "collection metadata");
 

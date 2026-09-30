@@ -31,7 +31,7 @@ fn gzip(contents: &[u8]) -> Vec<u8> {
 fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
     let mut bytes = vec![0x6d, 0xe2, 0x99, 0x81];
     bytes.extend(
-        bson::to_vec(&bson::doc! {
+        bson::Document::to_vec(&bson::doc! {
             "concurrent_collections": 4_i32,
             "version": "0.1",
             "server_version": "8.0.0",
@@ -41,7 +41,7 @@ fn mongodb_archive(metadata: &[(&str, &str)]) -> Vec<u8> {
     );
     for (database, collection) in metadata {
         bytes.extend(
-            bson::to_vec(&bson::doc! {
+            bson::Document::to_vec(&bson::doc! {
                 "db": database,
                 "collection": collection,
                 "metadata": "{}",
