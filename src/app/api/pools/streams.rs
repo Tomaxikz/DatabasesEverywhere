@@ -29,7 +29,9 @@ use axum::{
     response::Response,
 };
 use serde::Serialize;
-use tokio::time::{Duration, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Duration, Instant, MissedTickBehavior, interval, sleep_until};
+
+const MAX_POOL_STATS_MESSAGE_BYTES: usize = 16 * 1024;
 
 fn grant_for(claims: &Claims, pool: &EngineRuntime) -> Result<PoolGrant, ApiError> {
     if claims.all_instances || !claims.instances.is_empty() {
@@ -131,27 +133,91 @@ async fn monitor(mut socket: WebSocket, state: AppState, grant: PoolGrant, exp: 
     let mut cursor = ProgressCursor::default();
     loop {
         tokio::select! {
-            _ = websocket::wait_for_daemon_shutdown(&mut shutdown) => { websocket::close_shutdown_socket(&mut socket).await; break; }
-            _ = &mut expiration => { websocket::close_expired_socket(&mut socket).await; break; }
+            _ = websocket::wait_for_daemon_shutdown(&mut shutdown) => {
+                websocket::close_shutdown_socket(&mut socket).await;
+                break;
+            }
+            _ = &mut expiration => {
+                websocket::close_expired_socket(&mut socket).await;
+                break;
+            }
             incoming = socket.recv() => {
-                if matches!(incoming, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) { break; }
+                if matches!(incoming, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) {
+                    break;
+                }
             }
             _ = timer.tick() => {
-                let Ok(Ok(pool)) = websocket::complete_before(deadline, super::load(&state, &grant.runtime_id)).await else { break; };
-                if !grant.matches(&pool) { websocket::close_replaced_socket(&mut socket).await; break; }
-                let Ok(Ok(mut reports)) = websocket::complete_before(deadline, pool_reports(&state, std::slice::from_ref(&pool))).await else { break; };
-                let Some(report) = reports.pop() else { break; };
-                let progress = state.install_progress.get(&pool.runtime_id);
-                let updates = cursor.select(&progress.iter().collect::<Vec<_>>());
-                sequence += 1;
-                let event = PoolStats { r#type:"pool_stats", sequence, sampled_at_unix:crate::shared::time::now_unix(), pool:report, progress_reset:updates.reset, install_progress:updates.updates, install_progress_removed:updates.removed };
-                let Ok(Ok(current)) = websocket::complete_before(deadline, super::load(&state, &grant.runtime_id)).await else { break; };
-                if !grant.matches(&current) { break; }
-                if serde_json::to_vec(&event).map_or(true, |body| body.len() > 16 * 1024) { break; }
-                if websocket::send_json_before(&mut socket, &event, deadline).await.is_err() { break; }
+                let keep_streaming = send_pool_stats(
+                    &mut socket,
+                    &state,
+                    &grant,
+                    &mut cursor,
+                    &mut sequence,
+                    deadline,
+                )
+                .await;
+                if !keep_streaming {
+                    break;
+                }
             }
         }
     }
+}
+
+async fn send_pool_stats(
+    socket: &mut WebSocket,
+    state: &AppState,
+    grant: &PoolGrant,
+    cursor: &mut ProgressCursor,
+    sequence: &mut u64,
+    deadline: Instant,
+) -> bool {
+    let Ok(Ok(pool)) =
+        websocket::complete_before(deadline, super::load(state, &grant.runtime_id)).await
+    else {
+        return false;
+    };
+    if !grant.matches(&pool) {
+        websocket::close_replaced_socket(socket).await;
+        return false;
+    }
+    let Ok(Ok(mut reports)) =
+        websocket::complete_before(deadline, pool_reports(state, std::slice::from_ref(&pool)))
+            .await
+    else {
+        return false;
+    };
+    let Some(report) = reports.pop() else {
+        return false;
+    };
+    let progress = state.install_progress.get(&pool.runtime_id);
+    let updates = cursor.select(&progress.iter().collect::<Vec<_>>());
+    *sequence += 1;
+    let event = PoolStats {
+        r#type: "pool_stats",
+        sequence: *sequence,
+        sampled_at_unix: crate::shared::time::now_unix(),
+        pool: report,
+        progress_reset: updates.reset,
+        install_progress: updates.updates,
+        install_progress_removed: updates.removed,
+    };
+    let Ok(Ok(current)) =
+        websocket::complete_before(deadline, super::load(state, &grant.runtime_id)).await
+    else {
+        return false;
+    };
+    if !grant.matches(&current) {
+        return false;
+    }
+    let fits_message_limit =
+        serde_json::to_vec(&event).is_ok_and(|body| body.len() <= MAX_POOL_STATS_MESSAGE_BYTES);
+    if !fits_message_limit {
+        return false;
+    }
+    websocket::send_json_before(socket, &event, deadline)
+        .await
+        .is_ok()
 }
 
 pub(crate) async fn backups(

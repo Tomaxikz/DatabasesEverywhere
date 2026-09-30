@@ -43,20 +43,12 @@ impl ActivityStore {
             .get_mut(&(instance_id.to_string(), instance_generation.to_string()))?;
         let snapshot = entry.counter.snapshot();
         entry.sync_epoch(snapshot);
-        Some(ActivityCurrent {
-            instance_id: instance_id.to_string(),
-            stats_epoch: entry.epoch.clone(),
+        Some(activity_current(
+            instance_id,
+            entry.epoch.clone(),
             sampled_at_unix,
-            accepted: snapshot.accepted,
-            operations_measured: snapshot.operations_available,
-            rejected: snapshot.rejected,
-            active_connections: snapshot.gateway.active_connections,
-            opened_connections: snapshot.gateway.opened_connections,
-            rx_bytes: snapshot.gateway.rx_bytes,
-            tx_bytes: snapshot.gateway.tx_bytes,
-            cpu_time_micros: snapshot.current_cpu_time(),
-            peak_query_memory_bytes: snapshot.current_peak_memory(),
-        })
+            snapshot,
+        ))
     }
 
     pub fn current_with_network(
@@ -75,20 +67,7 @@ impl ActivityStore {
         entry.counter.observe_network(rx_bytes, tx_bytes);
         let snapshot = entry.counter.snapshot();
         entry.sync_epoch(snapshot);
-        ActivityCurrent {
-            instance_id: instance_id.to_string(),
-            stats_epoch: entry.epoch.clone(),
-            sampled_at_unix,
-            accepted: snapshot.accepted,
-            operations_measured: snapshot.operations_available,
-            rejected: snapshot.rejected,
-            active_connections: snapshot.gateway.active_connections,
-            opened_connections: snapshot.gateway.opened_connections,
-            rx_bytes: snapshot.gateway.rx_bytes,
-            tx_bytes: snapshot.gateway.tx_bytes,
-            cpu_time_micros: snapshot.current_cpu_time(),
-            peak_query_memory_bytes: snapshot.current_peak_memory(),
-        }
+        activity_current(instance_id, entry.epoch.clone(), sampled_at_unix, snapshot)
     }
 
     /// Takes all due rolling samples. Callers may invoke this more frequently
@@ -131,45 +110,15 @@ impl ActivityStore {
                     current.gateway.active_connections,
                 ));
             } else {
-                let accepted = current
-                    .accepted
-                    .checked_delta(baseline.snapshot.accepted)
-                    .unwrap_or_default();
-                let rejected = current
-                    .rejected
-                    .checked_delta(baseline.snapshot.rejected)
-                    .unwrap_or_default();
-                let cpu_time_micros = current.cpu_available.then(|| {
-                    current
-                        .cpu_time_micros
-                        .saturating_sub(baseline.snapshot.cpu_time_micros)
-                });
-                buckets.push(ActivityBucket {
-                    instance_id: instance_id.clone(),
-                    instance_generation: instance_generation.clone(),
-                    bucket_start_unix: baseline.sampled_at_unix,
+                buckets.push(delta_bucket(
+                    instance_id.clone(),
+                    instance_generation.clone(),
+                    entry.epoch.clone(),
+                    baseline,
+                    current,
                     duration_seconds,
-                    stats_epoch: entry.epoch.clone(),
-                    gap: false,
-                    operations_observed: current.operations_available,
-                    accepted,
-                    rejected,
-                    active_connections: current.gateway.active_connections,
-                    opened_connections: current
-                        .gateway
-                        .opened_connections
-                        .saturating_sub(baseline.snapshot.gateway.opened_connections),
-                    rx_bytes: current
-                        .gateway
-                        .rx_bytes
-                        .saturating_sub(baseline.snapshot.gateway.rx_bytes),
-                    tx_bytes: current
-                        .gateway
-                        .tx_bytes
-                        .saturating_sub(baseline.snapshot.gateway.tx_bytes),
-                    cpu_time_micros,
-                    peak_query_memory_bytes: bucket_peak,
-                });
+                    bucket_peak,
+                ));
             }
             entry.baseline = Some(Baseline {
                 sampled_at_unix,
@@ -195,6 +144,79 @@ impl ActivityStore {
         lock(&self.inner)
             .entries
             .retain(|key, _| generations.contains(key));
+    }
+}
+
+fn activity_current(
+    instance_id: &str,
+    stats_epoch: String,
+    sampled_at_unix: i64,
+    snapshot: CounterSnapshot,
+) -> ActivityCurrent {
+    ActivityCurrent {
+        instance_id: instance_id.to_string(),
+        stats_epoch,
+        sampled_at_unix,
+        accepted: snapshot.accepted,
+        operations_measured: snapshot.operations_available,
+        rejected: snapshot.rejected,
+        active_connections: snapshot.gateway.active_connections,
+        opened_connections: snapshot.gateway.opened_connections,
+        rx_bytes: snapshot.gateway.rx_bytes,
+        tx_bytes: snapshot.gateway.tx_bytes,
+        cpu_time_micros: snapshot.current_cpu_time(),
+        peak_query_memory_bytes: snapshot.current_peak_memory(),
+    }
+}
+
+fn delta_bucket(
+    instance_id: String,
+    instance_generation: String,
+    stats_epoch: String,
+    baseline: Baseline,
+    current: CounterSnapshot,
+    duration_seconds: u32,
+    bucket_peak: Option<u64>,
+) -> ActivityBucket {
+    let earlier = baseline.snapshot;
+    let accepted = current
+        .accepted
+        .checked_delta(earlier.accepted)
+        .unwrap_or_default();
+    let rejected = current
+        .rejected
+        .checked_delta(earlier.rejected)
+        .unwrap_or_default();
+    let cpu_time_micros = current.cpu_available.then(|| {
+        current
+            .cpu_time_micros
+            .saturating_sub(earlier.cpu_time_micros)
+    });
+    ActivityBucket {
+        instance_id,
+        instance_generation,
+        bucket_start_unix: baseline.sampled_at_unix,
+        duration_seconds,
+        stats_epoch,
+        gap: false,
+        operations_observed: current.operations_available,
+        accepted,
+        rejected,
+        active_connections: current.gateway.active_connections,
+        opened_connections: current
+            .gateway
+            .opened_connections
+            .saturating_sub(earlier.gateway.opened_connections),
+        rx_bytes: current
+            .gateway
+            .rx_bytes
+            .saturating_sub(earlier.gateway.rx_bytes),
+        tx_bytes: current
+            .gateway
+            .tx_bytes
+            .saturating_sub(earlier.gateway.tx_bytes),
+        cpu_time_micros,
+        peak_query_memory_bytes: bucket_peak,
     }
 }
 

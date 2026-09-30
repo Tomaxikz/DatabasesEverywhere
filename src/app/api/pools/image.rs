@@ -42,11 +42,7 @@ pub(crate) async fn update(
     let (mut pool, guard) = super::power::PoolGuard::acquire(&state, &id).await?;
     instances::images::validate_image(&request.image)?;
     instances::images::check_image_allowed(&state, pool.protocol, &request.image)?;
-    if matches!(
-        pool.status,
-        EngineRuntimeStatus::Creating | EngineRuntimeStatus::Deleting
-    ) || (pool.status == EngineRuntimeStatus::Quarantined && pool.pending_image.is_none())
-    {
+    if image_update_blocked(&pool) {
         return Err(ApiError::Conflict(
             "pool requires recovery before its image can change".into(),
         ));
@@ -69,6 +65,16 @@ pub(crate) async fn update(
             replace_image_locked(&state, &mut pool, request.image, previous_version, None).await;
     });
     Ok(response)
+}
+
+fn image_update_blocked(pool: &crate::placement::EngineRuntime) -> bool {
+    let busy = matches!(
+        pool.status,
+        EngineRuntimeStatus::Creating | EngineRuntimeStatus::Deleting
+    );
+    let quarantined_without_pending_image =
+        pool.status == EngineRuntimeStatus::Quarantined && pool.pending_image.is_none();
+    busy || quarantined_without_pending_image
 }
 
 /// Caller owns PoolGuard. Boot configuration repair and API image updates use
@@ -166,30 +172,7 @@ pub(crate) async fn replace_image_locked(
             "replace_image",
             "replacing the pool container; database volumes are retained",
         );
-        state
-            .docker
-            .stop(pool.protocol, &pool.runtime_id)
-            .await
-            .or_else(|error| {
-                if error.is_not_running() || error.is_not_found() {
-                    Ok(crate::runtime::docker::CommandOutput::empty())
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        state
-            .docker
-            .delete(pool.protocol, &pool.runtime_id)
-            .await
-            .or_else(|error| {
-                if error.is_not_found() {
-                    Ok(crate::runtime::docker::CommandOutput::empty())
-                } else {
-                    Err(error)
-                }
-            })
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        remove_pool_container(state, pool).await?;
         paths
             .clear_socket_dir()
             .await
@@ -266,6 +249,37 @@ pub(crate) async fn replace_image_locked(
     result
 }
 
+async fn remove_pool_container(
+    state: &AppState,
+    pool: &crate::placement::EngineRuntime,
+) -> Result<(), ApiError> {
+    state
+        .docker
+        .stop(pool.protocol, &pool.runtime_id)
+        .await
+        .or_else(|error| {
+            if error.is_not_running() || error.is_not_found() {
+                Ok(crate::runtime::docker::CommandOutput::empty())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    state
+        .docker
+        .delete(pool.protocol, &pool.runtime_id)
+        .await
+        .or_else(|error| {
+            if error.is_not_found() {
+                Ok(crate::runtime::docker::CommandOutput::empty())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    Ok(())
+}
+
 pub(crate) async fn refresh_logging(state: &AppState, runtime_id: &str) -> Result<bool, ApiError> {
     let current = super::load(state, runtime_id).await?;
     if current.status != EngineRuntimeStatus::Running
@@ -337,23 +351,11 @@ pub(super) async fn refresh_logging_locked(
 }
 
 fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), ApiError> {
-    let parse = |value: &str| {
-        let normalized =
-            crate::compatibility::normalize_database_version(protocol, value).ok_or(())?;
-        // Attested versions retain vendor/package suffixes. Compare all numeric
-        // components (including ClickHouse's fourth), not the package build.
-        let numeric = normalized.split(['-', ' ', '+']).next().ok_or(())?;
-        numeric
-            .split('.')
-            .map(str::parse::<u64>)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())
-    };
-    let mut current = parse(current)
-        .map_err(|_| ApiError::Conflict("current version cannot be compared".into()))?;
-    let mut next =
-        parse(next).map_err(|_| ApiError::Conflict("image version cannot be compared".into()))?;
-    let series = if protocol == Protocol::Postgres { 1 } else { 2 };
+    let mut current = numeric_version_components(protocol, current)
+        .ok_or_else(|| ApiError::Conflict("current version cannot be compared".into()))?;
+    let mut next = numeric_version_components(protocol, next)
+        .ok_or_else(|| ApiError::Conflict("image version cannot be compared".into()))?;
+    let series = release_line_components(protocol);
     let same_series =
         current.len() >= series && next.len() >= series && current[..series] == next[..series];
     let length = current.len().max(next.len());
@@ -363,6 +365,22 @@ fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), Ap
         return Err(ApiError::Conflict("pool image changes must stay on the same engine release line without downgrading; use a planned data migration for a major/release-line change".into()));
     }
     Ok(())
+}
+
+fn numeric_version_components(protocol: Protocol, version: &str) -> Option<Vec<u64>> {
+    let normalized = crate::compatibility::normalize_database_version(protocol, version)?;
+    // Attested versions retain vendor/package suffixes. Compare all numeric
+    // components (including ClickHouse's fourth), not the package build.
+    let numeric = normalized.split(['-', ' ', '+']).next()?;
+    numeric
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
+fn release_line_components(protocol: Protocol) -> usize {
+    if protocol == Protocol::Postgres { 1 } else { 2 }
 }
 
 #[cfg(test)]

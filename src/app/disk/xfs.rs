@@ -6,10 +6,11 @@ use std::{
 
 use super::{
     DiskLimitError, NativeProjectQuotaFs, displayed_privileged_command, privileged_command,
-    project_id, project_tree, project_usage, real_directory_exists,
+    project_id, project_tree, project_usage,
 };
 use crate::shared::limits::mib_to_bytes;
 
+const METHOD: &str = "host_xfs_project_quota";
 const PROJECTS_FILE: &str = "/etc/projects";
 const PROJID_FILE: &str = "/etc/projid";
 const PROJECT_FILES_LOCK: &str = "/etc/.dbe-project-quota.lock";
@@ -29,11 +30,7 @@ pub(super) async fn apply_in(
     mount: &Path,
 ) -> Result<String, DiskLimitError> {
     let id = project_id::allocate_in(owner_id, registry_root, project_id_base).await?;
-    let project = ProjectQuota {
-        id,
-        name: project_name(id),
-        path: data_path.to_path_buf(),
-    };
+    let project = ProjectQuota::new(id, data_path);
 
     prepare_project_files(project.clone()).await?;
     // Bound the pending ID before any inode leaves the aggregate/root
@@ -42,7 +39,7 @@ pub(super) async fn apply_in(
     set_limit(mount, project.id, disk_mib).await?;
     project_tree::assign(data_path, project.id).await?;
     project_id::activate_in(owner_id, registry_root, project.id).await?;
-    Ok("host_xfs_project_quota".to_string())
+    Ok(METHOD.to_string())
 }
 
 /// Change an existing XFS project limit without running `project -s` again.
@@ -63,14 +60,9 @@ pub(super) async fn update_in(
             registry_root: registry_root.to_path_buf(),
         })?;
     project_tree::verify_root(data_path, id).await?;
-    prepare_project_files(ProjectQuota {
-        id,
-        name: project_name(id),
-        path: data_path.to_path_buf(),
-    })
-    .await?;
+    prepare_project_files(ProjectQuota::new(id, data_path)).await?;
     set_limit(mount, id, disk_mib).await?;
-    Ok("host_xfs_project_quota".to_string())
+    Ok(METHOD.to_string())
 }
 
 pub(super) async fn remove_in(
@@ -87,25 +79,13 @@ pub(super) async fn remove_in(
     if claim.state == project_id::ProjectIdState::Released {
         return Ok(());
     }
-    let project = ProjectQuota {
-        id: claim.id,
-        name: project_name(claim.id),
-        path: data_path.to_path_buf(),
-    };
+    let project = ProjectQuota::new(claim.id, data_path);
 
     // Keep the old cap active until every reachable inode has left the claim.
     // A pending adoption can contain both source- and target-owned entries,
     // so roll it back to the trusted source instead of treating it as a fully
     // established active boundary.
-    if real_directory_exists(data_path)? {
-        match claim.state {
-            project_id::ProjectIdState::Pending => {
-                project_tree::rollback_pending(data_path, claim.id).await?
-            }
-            project_id::ProjectIdState::Active => project_tree::clear(data_path, claim.id).await?,
-            project_id::ProjectIdState::Released => unreachable!("released claims return above"),
-        }
-    }
+    project_tree::release_claimed_tree(data_path, claim).await?;
     project_usage::verify_unused(NativeProjectQuotaFs::Xfs, mount, claim.id).await?;
     clear_limit(mount, claim.id).await?;
     remove_project_files(project).await?;
@@ -119,6 +99,18 @@ struct ProjectQuota {
     name: String,
     path: PathBuf,
 }
+
+impl ProjectQuota {
+    fn new(id: u32, path: &Path) -> Self {
+        Self {
+            id,
+            name: project_name(id),
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+type RegistryPlan = fn(&str, &ProjectQuota) -> Result<Option<String>, std::io::Error>;
 
 async fn check_project_files_writable() -> Result<(), DiskLimitError> {
     tokio::task::spawn_blocking(|| {
@@ -144,10 +136,19 @@ async fn remove_project_files(project: ProjectQuota) -> Result<(), DiskLimitErro
 }
 
 fn prepare_project_files_sync(project: &ProjectQuota) -> Result<(), DiskLimitError> {
-    validate_project_path(project).map_err(|source| DiskLimitError::ProjectFile {
-        path: PROJECTS_FILE,
-        source,
-    })?;
+    rewrite_project_files(project, updated_projects, updated_projid)
+}
+
+fn remove_project_files_sync(project: &ProjectQuota) -> Result<(), DiskLimitError> {
+    rewrite_project_files(project, removed_projects, removed_projid)
+}
+
+fn rewrite_project_files(
+    project: &ProjectQuota,
+    plan_projects: RegistryPlan,
+    plan_projid: RegistryPlan,
+) -> Result<(), DiskLimitError> {
+    validate_project_path(project).map_err(project_file_error(PROJECTS_FILE))?;
     let _lock = lock_project_files()?;
     let projects = read_project_file(PROJECTS_FILE)?;
     let projid = read_project_file(PROJID_FILE)?;
@@ -156,80 +157,27 @@ fn prepare_project_files_sync(project: &ProjectQuota) -> Result<(), DiskLimitErr
     // conflicting external allocation fail closed without modifying the other
     // registry file.
     let projects_update =
-        updated_projects(&projects, project).map_err(|source| DiskLimitError::ProjectFile {
-            path: PROJECTS_FILE,
-            source,
-        })?;
-    let projid_update =
-        updated_projid(&projid, project).map_err(|source| DiskLimitError::ProjectFile {
-            path: PROJID_FILE,
-            source,
-        })?;
+        plan_projects(&projects, project).map_err(project_file_error(PROJECTS_FILE))?;
+    let projid_update = plan_projid(&projid, project).map_err(project_file_error(PROJID_FILE))?;
 
     if let Some(contents) = projects_update {
-        replace_project_file(Path::new(PROJECTS_FILE), &contents).map_err(|source| {
-            DiskLimitError::ProjectFile {
-                path: PROJECTS_FILE,
-                source,
-            }
-        })?;
+        replace_project_file(Path::new(PROJECTS_FILE), &contents)
+            .map_err(project_file_error(PROJECTS_FILE))?;
     }
     if let Some(contents) = projid_update {
-        replace_project_file(Path::new(PROJID_FILE), &contents).map_err(|source| {
-            DiskLimitError::ProjectFile {
-                path: PROJID_FILE,
-                source,
-            }
-        })?;
+        replace_project_file(Path::new(PROJID_FILE), &contents)
+            .map_err(project_file_error(PROJID_FILE))?;
     }
     Ok(())
 }
 
-fn remove_project_files_sync(project: &ProjectQuota) -> Result<(), DiskLimitError> {
-    validate_project_path(project).map_err(|source| DiskLimitError::ProjectFile {
-        path: PROJECTS_FILE,
-        source,
-    })?;
-    let _lock = lock_project_files()?;
-    let projects = read_project_file(PROJECTS_FILE)?;
-    let projid = read_project_file(PROJID_FILE)?;
-    let projects_update =
-        removed_projects(&projects, project).map_err(|source| DiskLimitError::ProjectFile {
-            path: PROJECTS_FILE,
-            source,
-        })?;
-    let projid_update =
-        removed_projid(&projid, project).map_err(|source| DiskLimitError::ProjectFile {
-            path: PROJID_FILE,
-            source,
-        })?;
-
-    if let Some(contents) = projects_update {
-        replace_project_file(Path::new(PROJECTS_FILE), &contents).map_err(|source| {
-            DiskLimitError::ProjectFile {
-                path: PROJECTS_FILE,
-                source,
-            }
-        })?;
-    }
-    if let Some(contents) = projid_update {
-        replace_project_file(Path::new(PROJID_FILE), &contents).map_err(|source| {
-            DiskLimitError::ProjectFile {
-                path: PROJID_FILE,
-                source,
-            }
-        })?;
-    }
-    Ok(())
+fn project_file_error(path: &'static str) -> impl FnOnce(std::io::Error) -> DiskLimitError {
+    move |source| DiskLimitError::ProjectFile { path, source }
 }
 
 fn lock_project_files() -> Result<File, DiskLimitError> {
-    acquire_exclusive_lock(Path::new(PROJECT_FILES_LOCK)).map_err(|source| {
-        DiskLimitError::ProjectFile {
-            path: PROJECT_FILES_LOCK,
-            source,
-        }
-    })
+    acquire_exclusive_lock(Path::new(PROJECT_FILES_LOCK))
+        .map_err(project_file_error(PROJECT_FILES_LOCK))
 }
 
 fn acquire_exclusive_lock(path: &Path) -> Result<File, std::io::Error> {
@@ -260,23 +208,16 @@ fn acquire_exclusive_lock(path: &Path) -> Result<File, std::io::Error> {
 }
 
 fn check_regular_file_writable(path: &'static str) -> Result<(), DiskLimitError> {
-    let path_ref = Path::new(path);
-    match std::fs::symlink_metadata(path_ref) {
+    open_or_create_regular_file(Path::new(path)).map_err(project_file_error(path))
+}
+
+fn open_or_create_regular_file(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(DiskLimitError::ProjectFile {
-                    path,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "project registry must be a real regular file",
-                    ),
-                });
+                return Err(not_a_regular_registry_file());
             }
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path_ref)
-                .map_err(|source| DiskLimitError::ProjectFile { path, source })?;
+            OpenOptions::new().read(true).write(true).open(path)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut options = OpenOptions::new();
@@ -286,28 +227,29 @@ fn check_regular_file_writable(path: &'static str) -> Result<(), DiskLimitError>
 
                 options.mode(0o644);
             }
-            options
-                .open(path_ref)
-                .map_err(|source| DiskLimitError::ProjectFile { path, source })?;
+            options.open(path)?;
         }
-        Err(source) => return Err(DiskLimitError::ProjectFile { path, source }),
+        Err(source) => return Err(source),
     }
     Ok(())
 }
 
+fn not_a_regular_registry_file() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "project registry must be a real regular file",
+    )
+}
+
 fn read_project_file(path: &'static str) -> Result<String, DiskLimitError> {
-    read_regular_file(Path::new(path))
-        .map_err(|source| DiskLimitError::ProjectFile { path, source })
+    read_regular_file(Path::new(path)).map_err(project_file_error(path))
 }
 
 fn read_regular_file(path: &Path) -> Result<String, std::io::Error> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "project registry must be a real regular file",
-                ));
+                return Err(not_a_regular_registry_file());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
@@ -523,10 +465,7 @@ fn replace_project_file(path: &Path, contents: &str) -> Result<(), std::io::Erro
     let existing_metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "project registry must be a real regular file",
-                ));
+                return Err(not_a_regular_registry_file());
             }
             Some(metadata)
         }

@@ -24,8 +24,9 @@ use crate::{
 use self::{
     http::{BenchClient, FixedWindowPacing, LoadTarget, MAX_RETAINED_REQUEST_SAMPLES},
     metrics::{
-        BenchmarkOptionsReport, BenchmarkReport, EnvironmentReport, HttpPhaseReport, RequestSample,
-        ResourceSample, TargetInstanceReport,
+        BenchmarkOptionsReport, BenchmarkReport, EnvironmentReport, HttpPhaseReport,
+        JobBenchmarkReport, ManualActiveJobsRecommendationReport, RequestSample, ResourceSample,
+        TargetInstanceReport,
     },
     recommendation::recommend_job_limit,
     report::{print_terminal_report, reserve_report_directory, write_reports},
@@ -220,70 +221,14 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         args.bench_concurrency,
         args.bench_insecure_tls,
     )?;
-    let timed_requests_per_minute = args
-        .bench_time_minutes
-        .filter(|_| !args.bench_unthrottled)
-        .map(|_| timed_request_budget(&args, &config));
-    let concurrent_load_mode = match (args.bench_time_minutes, args.bench_unthrottled) {
-        (Some(_), true) => "timed_unthrottled",
-        (Some(_), false) => "timed_rate_limit_aware_bursts",
-        (None, _) => "fixed_request_burst",
-    }
-    .to_string();
-    let options = BenchmarkOptionsReport {
-        warmup_requests: args.bench_warmup_requests,
-        latency_samples: args.bench_latency_samples,
-        concurrent_requests: args
-            .bench_time_minutes
-            .is_none()
-            .then_some(args.bench_requests),
-        concurrent_duration_minutes: args.bench_time_minutes,
-        concurrent_load_mode,
-        timed_requests_per_minute,
-        concurrency: args.bench_concurrency,
-        websocket_connections: args.bench_websockets,
-        max_instances: args.bench_max_instances,
-        retained_request_sample_limit: MAX_RETAINED_REQUEST_SAMPLES,
-        timeout_seconds: args.bench_timeout_seconds,
-        sample_interval_ms: args.bench_sample_interval_ms,
-        import_export_enabled: args.bench_import_export,
-        recommend_manual_active_jobs: args.bench_recommend_manual_active_jobs,
-        keep_artifact: args.bench_keep_artifact,
-    };
-    let mut report = BenchmarkReport {
-        schema_version: REPORT_SCHEMA_VERSION,
-        benchmark_id: benchmark_id.clone(),
+    let mut report = initial_report(
+        &args,
+        &config,
+        benchmark_id.clone(),
         started_at,
-        finished_at: String::new(),
-        total_duration_ms: 0.0,
-        status: "running".to_string(),
-        options,
-        environment: EnvironmentReport {
-            benchmark_client_version: env!("CARGO_PKG_VERSION").to_string(),
-            operating_system: std::env::consts::OS.to_string(),
-            architecture: std::env::consts::ARCH.to_string(),
-            logical_cpu_count: std::thread::available_parallelism()
-                .map(usize::from)
-                .unwrap_or(1),
-            api_url: base_url.clone(),
-            host_header: host_header.clone(),
-            configured_api_rate_limit_per_minute: config.security.api_rate_limit_per_minute,
-            api_rate_limit_scope: None,
-            server_version: None,
-            api_version: None,
-            node_uuid: None,
-            daemon_engine: None,
-            target_instance: None,
-            selected_instances: Vec::new(),
-        },
-        http_phases: Vec::new(),
-        websocket: None,
-        jobs: Vec::new(),
-        manual_active_jobs_recommendation: None,
-        resources: None,
-        warnings: Vec::new(),
-        errors: Vec::new(),
-    };
+        base_url.clone(),
+        host_header,
+    );
     let mut request_samples = Vec::<RequestSample>::new();
     let mut resource_samples = Vec::<ResourceSample>::new();
     let mut sampler = None;
@@ -315,82 +260,13 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
             return Err(anyhow!("daemon API did not report ready"));
         }
 
-        let mut selected_instances = Vec::<SelectedBenchmarkInstance>::new();
-        if let Some(instance_id) = args.bench_instance.as_deref() {
-            validate_instance_id(instance_id)
-                .map_err(|error| anyhow!("invalid --bench-instance: {error}"))?;
-            let instance = client
-                .required_json(
-                    &format!("/api/instances/{instance_id}"),
-                    "instance preflight",
-                )
-                .await?;
-            let protocol = instance["protocol"]
-                .as_str()
-                .ok_or_else(|| anyhow!("instance response did not contain protocol"))?
-                .parse::<Protocol>()
-                .context("instance response contained an unsupported protocol")?;
-            let status = instance["status"]
-                .as_str()
-                .ok_or_else(|| anyhow!("instance response did not contain status"))?
-                .to_string();
-            let disk_mib = instance["limits"]["disk_mib"].as_u64();
-            if args.bench_recommend_manual_active_jobs && disk_mib.is_none() {
-                return Err(anyhow!(
-                    "manual active-job recommendation requires limits.disk_mib in the instance response"
-                ));
-            }
-            if args.bench_import_export && status != "running" {
-                return Err(anyhow!(
-                    "destructive import/export benchmark requires a running instance; {instance_id} is {status}"
-                ));
-            }
-            selected_instances.push(SelectedBenchmarkInstance {
-                instance_id: instance_id.to_string(),
-                protocol,
-                initial_status: status,
-                disk_mib,
-            });
+        let selected_instances = if let Some(instance_id) = args.bench_instance.as_deref() {
+            vec![select_explicit_instance(&client, &args, instance_id).await?]
         } else if args.bench_max_instances > 0 {
-            let value = client
-                .required_json("/api/instances", "instance discovery")
-                .await?;
-            let mut running = serde_json::from_value::<Vec<InstanceListEntry>>(value)
-                .context("instance discovery response was not a valid instance list")?
-                .into_iter()
-                .filter(|instance| instance.status == "running")
-                .map(|instance| SelectedBenchmarkInstance {
-                    instance_id: instance.instance_id,
-                    protocol: instance.protocol,
-                    initial_status: instance.status,
-                    disk_mib: None,
-                })
-                .collect::<Vec<_>>();
-            if running.is_empty() {
-                return Err(anyhow!(
-                    "--max_instances {} requested automatic selection, but the daemon has no running instances",
-                    args.bench_max_instances
-                ));
-            }
-            shuffle_instances(&mut running, benchmark_seed(&benchmark_id));
-            if running.len() < args.bench_max_instances {
-                report.warnings.push(format!(
-                    "--max_instances requested {}, but only {} running instances were available; all available instances were selected",
-                    args.bench_max_instances,
-                    running.len()
-                ));
-            }
-            running.truncate(args.bench_max_instances);
-            for instance in &running {
-                validate_instance_id(&instance.instance_id).map_err(|error| {
-                    anyhow!(
-                        "daemon returned invalid instance ID {}: {error}",
-                        instance.instance_id
-                    )
-                })?;
-            }
-            selected_instances = running;
-        }
+            select_random_instances(&client, &args, &benchmark_id, &mut report.warnings).await?
+        } else {
+            Vec::new()
+        };
 
         report.environment.selected_instances = selected_instances
             .iter()
@@ -423,18 +299,10 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
             .map(|instance| LoadTarget::instance_status(&instance.instance_id))
             .collect::<Vec<_>>();
 
-        let docker = if !instance_targets.is_empty() {
-            match DockerRuntime::new(&config.daemon, false) {
-                Ok(docker) => Some(docker),
-                Err(error) => {
-                    report.warnings.push(format!(
-                        "could not initialize direct container resource sampling: {error}"
-                    ));
-                    None
-                }
-            }
-        } else {
+        let docker = if instance_targets.is_empty() {
             None
+        } else {
+            container_sampling_runtime(&config, &mut report.warnings)
         };
         let sample_interval = Duration::from_millis(args.bench_sample_interval_ms);
         let (resource_sampler, sampler_warnings) = ResourceSampler::start(
@@ -464,11 +332,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         if args.bench_websockets > 0 {
             set_sampler_phase(&sampler, "websocket", sample_interval).await;
             let websocket = client
-                .benchmark_websockets(
-                    args.bench_websockets,
-                    args.bench_concurrency,
-                    &benchmark_id,
-                )
+                .benchmark_websockets(args.bench_websockets, args.bench_concurrency, &benchmark_id)
                 .await;
             evaluate_phase(
                 &websocket.report.token_mint,
@@ -510,27 +374,9 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
                     &import_export.jobs,
                 )
                 .await;
-                if recommendation.status != "available" {
-                    report.warnings.push(format!(
-                        "manual active-job recommendation unavailable: {}",
-                        recommendation
-                            .unavailable_reason
-                            .as_deref()
-                            .unwrap_or("no diagnostic")
-                    ));
-                }
-                report.manual_active_jobs_recommendation = Some(recommendation);
+                record_recommendation(&mut report, recommendation);
             }
-            for job in &import_export.jobs {
-                if job.status != "succeeded" {
-                    report.errors.push(format!(
-                        "{} benchmark did not succeed (status={}): {}",
-                        job.action,
-                        job.status,
-                        job.error.as_deref().unwrap_or("no diagnostic")
-                    ));
-                }
-            }
+            record_unsuccessful_jobs(&import_export.jobs, &mut report.errors);
             report.jobs.extend(import_export.jobs);
             report.warnings.extend(import_export.warnings);
             request_samples.extend(import_export.samples);
@@ -538,58 +384,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
 
         if !report.environment.selected_instances.is_empty() {
             set_sampler_phase(&sampler, "final_validation", sample_interval).await;
-            let selected_ids = report
-                .environment
-                .selected_instances
-                .iter()
-                .map(|instance| instance.instance_id.clone())
-                .collect::<Vec<_>>();
-            for instance_id in selected_ids {
-                match client
-                    .required_json(
-                        &format!("/api/instances/{instance_id}/status"),
-                        "final instance validation",
-                    )
-                    .await
-                {
-                    Ok(value) => {
-                        let final_status = value["status"].as_str().map(str::to_string);
-                        if args.bench_import_export && final_status.as_deref() != Some("running") {
-                            report.errors.push(format!(
-                                "target instance did not return to running after benchmark (status={})",
-                                final_status.as_deref().unwrap_or("unknown")
-                            ));
-                        } else if final_status.as_deref() != Some("running")
-                            && args.bench_max_instances > 0
-                        {
-                            report.warnings.push(format!(
-                                "automatically selected instance {instance_id} ended in status {}",
-                                final_status.as_deref().unwrap_or("unknown")
-                            ));
-                        }
-                        if let Some(target) = report
-                            .environment
-                            .selected_instances
-                            .iter_mut()
-                            .find(|target| target.instance_id == instance_id)
-                        {
-                            target.final_status = final_status;
-                        }
-                    }
-                    Err(error) => report.warnings.push(format!(
-                        "final status check for instance {instance_id} failed: {error}"
-                    )),
-                }
-            }
-            if let Some(explicit) = &mut report.environment.target_instance
-                && let Some(selected) = report
-                    .environment
-                    .selected_instances
-                    .iter()
-                    .find(|selected| selected.instance_id == explicit.instance_id)
-            {
-                explicit.final_status = selected.final_status.clone();
-            }
+            validate_final_instance_statuses(&client, &args, &mut report).await;
         }
 
         // Run saturation last. WebSocket token minting, import/export control
@@ -602,12 +397,13 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         };
         set_sampler_phase(&sampler, concurrent_phase, sample_interval).await;
         let concurrent = if let Some(minutes) = args.bench_time_minutes {
-            let pacing = report.options.timed_requests_per_minute.map(
-                |requests_per_window| FixedWindowPacing {
+            let pacing = report
+                .options
+                .timed_requests_per_minute
+                .map(|requests_per_window| FixedWindowPacing {
                     window_started: api_rate_window_started,
                     requests_per_window,
-                },
-            );
+                });
             client
                 .benchmark_concurrency(
                     Duration::from_secs(minutes.saturating_mul(60)),
@@ -647,14 +443,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
     }
     report.finished_at = now_rfc3339();
     report.total_duration_ms = run_started.elapsed().as_secs_f64() * 1_000.0;
-    report.status = if !report.errors.is_empty() {
-        "failed"
-    } else if !report.warnings.is_empty() {
-        "completed_with_warnings"
-    } else {
-        "completed"
-    }
-    .to_string();
+    report.status = final_report_status(&report).to_string();
 
     let paths = write_reports(&output_dir, &report, &request_samples, &resource_samples).await?;
     print_terminal_report(&report, &paths);
@@ -671,6 +460,287 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn initial_report(
+    args: &BenchArgs,
+    config: &Config,
+    benchmark_id: String,
+    started_at: String,
+    api_url: String,
+    host_header: Option<String>,
+) -> BenchmarkReport {
+    let timed_requests_per_minute = args
+        .bench_time_minutes
+        .filter(|_| !args.bench_unthrottled)
+        .map(|_| timed_request_budget(args, config));
+    let options = BenchmarkOptionsReport {
+        warmup_requests: args.bench_warmup_requests,
+        latency_samples: args.bench_latency_samples,
+        concurrent_requests: args
+            .bench_time_minutes
+            .is_none()
+            .then_some(args.bench_requests),
+        concurrent_duration_minutes: args.bench_time_minutes,
+        concurrent_load_mode: concurrent_load_mode(args).to_string(),
+        timed_requests_per_minute,
+        concurrency: args.bench_concurrency,
+        websocket_connections: args.bench_websockets,
+        max_instances: args.bench_max_instances,
+        retained_request_sample_limit: MAX_RETAINED_REQUEST_SAMPLES,
+        timeout_seconds: args.bench_timeout_seconds,
+        sample_interval_ms: args.bench_sample_interval_ms,
+        import_export_enabled: args.bench_import_export,
+        recommend_manual_active_jobs: args.bench_recommend_manual_active_jobs,
+        keep_artifact: args.bench_keep_artifact,
+    };
+    BenchmarkReport {
+        schema_version: REPORT_SCHEMA_VERSION,
+        benchmark_id,
+        started_at,
+        finished_at: String::new(),
+        total_duration_ms: 0.0,
+        status: "running".to_string(),
+        options,
+        environment: EnvironmentReport {
+            benchmark_client_version: env!("CARGO_PKG_VERSION").to_string(),
+            operating_system: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            logical_cpu_count: std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1),
+            api_url,
+            host_header,
+            configured_api_rate_limit_per_minute: config.security.api_rate_limit_per_minute,
+            api_rate_limit_scope: None,
+            server_version: None,
+            api_version: None,
+            node_uuid: None,
+            daemon_engine: None,
+            target_instance: None,
+            selected_instances: Vec::new(),
+        },
+        http_phases: Vec::new(),
+        websocket: None,
+        jobs: Vec::new(),
+        manual_active_jobs_recommendation: None,
+        resources: None,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+fn concurrent_load_mode(args: &BenchArgs) -> &'static str {
+    match (args.bench_time_minutes, args.bench_unthrottled) {
+        (Some(_), true) => "timed_unthrottled",
+        (Some(_), false) => "timed_rate_limit_aware_bursts",
+        (None, _) => "fixed_request_burst",
+    }
+}
+
+fn final_report_status(report: &BenchmarkReport) -> &'static str {
+    if !report.errors.is_empty() {
+        "failed"
+    } else if !report.warnings.is_empty() {
+        "completed_with_warnings"
+    } else {
+        "completed"
+    }
+}
+
+async fn select_explicit_instance(
+    client: &BenchClient,
+    args: &BenchArgs,
+    instance_id: &str,
+) -> anyhow::Result<SelectedBenchmarkInstance> {
+    validate_instance_id(instance_id)
+        .map_err(|error| anyhow!("invalid --bench-instance: {error}"))?;
+    let instance = client
+        .required_json(
+            &format!("/api/instances/{instance_id}"),
+            "instance preflight",
+        )
+        .await?;
+    let protocol = instance["protocol"]
+        .as_str()
+        .ok_or_else(|| anyhow!("instance response did not contain protocol"))?
+        .parse::<Protocol>()
+        .context("instance response contained an unsupported protocol")?;
+    let status = instance["status"]
+        .as_str()
+        .ok_or_else(|| anyhow!("instance response did not contain status"))?
+        .to_string();
+    let disk_mib = instance["limits"]["disk_mib"].as_u64();
+    if args.bench_recommend_manual_active_jobs && disk_mib.is_none() {
+        return Err(anyhow!(
+            "manual active-job recommendation requires limits.disk_mib in the instance response"
+        ));
+    }
+    if args.bench_import_export && status != "running" {
+        return Err(anyhow!(
+            "destructive import/export benchmark requires a running instance; {instance_id} is {status}"
+        ));
+    }
+    Ok(SelectedBenchmarkInstance {
+        instance_id: instance_id.to_string(),
+        protocol,
+        initial_status: status,
+        disk_mib,
+    })
+}
+
+async fn select_random_instances(
+    client: &BenchClient,
+    args: &BenchArgs,
+    benchmark_id: &str,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<Vec<SelectedBenchmarkInstance>> {
+    let value = client
+        .required_json("/api/instances", "instance discovery")
+        .await?;
+    let mut running = serde_json::from_value::<Vec<InstanceListEntry>>(value)
+        .context("instance discovery response was not a valid instance list")?
+        .into_iter()
+        .filter(|instance| instance.status == "running")
+        .map(|instance| SelectedBenchmarkInstance {
+            instance_id: instance.instance_id,
+            protocol: instance.protocol,
+            initial_status: instance.status,
+            disk_mib: None,
+        })
+        .collect::<Vec<_>>();
+    if running.is_empty() {
+        return Err(anyhow!(
+            "--max_instances {} requested automatic selection, but the daemon has no running instances",
+            args.bench_max_instances
+        ));
+    }
+    shuffle_instances(&mut running, benchmark_seed(benchmark_id));
+    if running.len() < args.bench_max_instances {
+        warnings.push(format!(
+            "--max_instances requested {}, but only {} running instances were available; all available instances were selected",
+            args.bench_max_instances,
+            running.len()
+        ));
+    }
+    running.truncate(args.bench_max_instances);
+    for instance in &running {
+        validate_instance_id(&instance.instance_id).map_err(|error| {
+            anyhow!(
+                "daemon returned invalid instance ID {}: {error}",
+                instance.instance_id
+            )
+        })?;
+    }
+    Ok(running)
+}
+
+fn container_sampling_runtime(
+    config: &Config,
+    warnings: &mut Vec<String>,
+) -> Option<DockerRuntime> {
+    match DockerRuntime::new(&config.daemon, false) {
+        Ok(docker) => Some(docker),
+        Err(error) => {
+            warnings.push(format!(
+                "could not initialize direct container resource sampling: {error}"
+            ));
+            None
+        }
+    }
+}
+
+fn record_recommendation(
+    report: &mut BenchmarkReport,
+    recommendation: ManualActiveJobsRecommendationReport,
+) {
+    if recommendation.status != "available" {
+        report.warnings.push(format!(
+            "manual active-job recommendation unavailable: {}",
+            recommendation
+                .unavailable_reason
+                .as_deref()
+                .unwrap_or("no diagnostic")
+        ));
+    }
+    report.manual_active_jobs_recommendation = Some(recommendation);
+}
+
+fn record_unsuccessful_jobs(jobs: &[JobBenchmarkReport], errors: &mut Vec<String>) {
+    for job in jobs.iter().filter(|job| job.status != "succeeded") {
+        errors.push(format!(
+            "{} benchmark did not succeed (status={}): {}",
+            job.action,
+            job.status,
+            job.error.as_deref().unwrap_or("no diagnostic")
+        ));
+    }
+}
+
+async fn validate_final_instance_statuses(
+    client: &BenchClient,
+    args: &BenchArgs,
+    report: &mut BenchmarkReport,
+) {
+    let selected_ids = report
+        .environment
+        .selected_instances
+        .iter()
+        .map(|instance| instance.instance_id.clone())
+        .collect::<Vec<_>>();
+    for instance_id in selected_ids {
+        let status_response = client
+            .required_json(
+                &format!("/api/instances/{instance_id}/status"),
+                "final instance validation",
+            )
+            .await;
+        match status_response {
+            Ok(value) => {
+                let final_status = value["status"].as_str().map(str::to_string);
+                record_final_status(args, report, &instance_id, final_status);
+            }
+            Err(error) => report.warnings.push(format!(
+                "final status check for instance {instance_id} failed: {error}"
+            )),
+        }
+    }
+    if let Some(explicit) = &mut report.environment.target_instance
+        && let Some(selected) = report
+            .environment
+            .selected_instances
+            .iter()
+            .find(|selected| selected.instance_id == explicit.instance_id)
+    {
+        explicit.final_status = selected.final_status.clone();
+    }
+}
+
+fn record_final_status(
+    args: &BenchArgs,
+    report: &mut BenchmarkReport,
+    instance_id: &str,
+    final_status: Option<String>,
+) {
+    let is_running = final_status.as_deref() == Some("running");
+    let status_label = final_status.as_deref().unwrap_or("unknown");
+    if args.bench_import_export && !is_running {
+        report.errors.push(format!(
+            "target instance did not return to running after benchmark (status={status_label})"
+        ));
+    } else if !is_running && args.bench_max_instances > 0 {
+        report.warnings.push(format!(
+            "automatically selected instance {instance_id} ended in status {status_label}"
+        ));
+    }
+    if let Some(target) = report
+        .environment
+        .selected_instances
+        .iter_mut()
+        .find(|target| target.instance_id == instance_id)
+    {
+        target.final_status = final_status;
+    }
 }
 
 fn load_benchmark_config(path: &std::path::Path) -> Result<Config, ConfigLoadError> {
@@ -818,7 +888,7 @@ fn default_api_url(config: &Config) -> String {
         "http"
     };
     let configured = config.api.host.trim();
-    let connect_host = if matches!(configured, "0.0.0.0" | "::" | "[::]") {
+    let connect_host = if is_wildcard_listener(configured) {
         "127.0.0.1".to_string()
     } else if configured
         .parse::<IpAddr>()
@@ -839,10 +909,14 @@ fn benchmark_host_header(config: &Config, args: &BenchArgs) -> Option<String> {
         return None;
     }
     let configured = config.api.host.trim();
-    if !matches!(configured, "0.0.0.0" | "::" | "[::]") {
-        return Some(configured.trim_matches(['[', ']']).to_string());
+    if is_wildcard_listener(configured) {
+        return None;
     }
-    None
+    Some(configured.trim_matches(['[', ']']).to_string())
+}
+
+fn is_wildcard_listener(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]")
 }
 
 fn report_directory(args: &BenchArgs, benchmark_id: &str, started_at: &str) -> PathBuf {

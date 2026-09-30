@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::config::{DiskLimitMode, DiskLimitSelection, PathConfig};
 
-use super::{DiskLimitError, mounts};
+use super::{DiskLimitError, has_project_quota_option, mounts};
 
 #[derive(Debug, Clone)]
 pub struct FilesystemInspection {
@@ -52,11 +52,15 @@ pub fn detect_disk_mode(
             options: mount.options,
         });
     }
-    let volumes = filesystems
+    let volumes_filesystem = filesystems
         .iter()
         .find(|inspection| inspection.field == "paths.volumes")
         .expect("paths.volumes is always inspected");
-    let (mode, reason) = select_disk_mode(&volumes.fstype, &volumes.options, selection);
+    let (mode, reason) = select_disk_mode(
+        &volumes_filesystem.fstype,
+        &volumes_filesystem.options,
+        selection,
+    );
     Ok(DiskModeDetection {
         mode,
         reason,
@@ -87,9 +91,7 @@ pub(super) fn select_disk_mode(
 }
 
 fn auto_mode(fstype: &str, options: &[String]) -> (DiskLimitMode, &'static str) {
-    let project_quota_mounted = options
-        .iter()
-        .any(|option| matches!(option.as_str(), "prjquota" | "pquota"));
+    let project_quota_mounted = has_project_quota_option(options);
     match fstype {
         "btrfs" => (
             DiskLimitMode::ProjectQuota,

@@ -149,8 +149,7 @@ pub async fn harden_instance_auth(
     admin_password: &SecretString,
     recovery: ExecRecovery,
 ) -> Result<bool, DockerError> {
-    let invalid_password =
-        SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()));
+    let invalid_password = random_invalid_password();
     let tenant_database_secret = SecretString::from(tenant_database.to_string());
     let tenant_username_secret = SecretString::from(tenant_username.to_string());
     let script = hardening_script(tenant_username);
@@ -290,8 +289,7 @@ async fn repair_admin_password(
     instance_id: &str,
     replacement: &SecretString,
 ) -> Result<bool, DockerError> {
-    let invalid_password =
-        SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()));
+    let invalid_password = random_invalid_password();
     let reset = sh_quote(&super::provision::reset_tenant_password_sql(
         super::docker::INTERNAL_ADMIN_USERNAME,
     ));
@@ -332,6 +330,10 @@ printf 'rotated\n'
                     .to_string(),
         }),
     }
+}
+
+fn random_invalid_password() -> SecretString {
+    SecretString::from(format!("dbev-invalid-{}", uuid::Uuid::new_v4().simple()))
 }
 
 fn verify_scram_password(password: &str, verifier: &str) -> bool {
@@ -514,60 +516,23 @@ async fn harden_postgres(
         .postgres_admin_password
         .as_deref()
         .map(|password| SecretString::from(password.to_string()));
-    let mut migrate_admin_password = false;
-    let admin_password = if let Some(persisted) = persisted_admin {
-        if verify_admin_password(docker, &metadata.instance_id, &persisted)
-            .await
-            .is_ok()
-        {
-            persisted
-        } else if persisted.expose_secret() != bootstrap_password.expose_secret()
-            && verify_admin_password(docker, &metadata.instance_id, &bootstrap_password)
-                .await
-                .is_ok()
-        {
-            migrate_admin_password = true;
-            bootstrap_password
-        } else {
-            match repair_admin_password(docker, &metadata.instance_id, &persisted).await {
-                Ok(true) => persisted,
-                _ => {
-                    record_auth_failure(
-                        manager,
-                        &metadata,
-                        "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
-                            .to_string(),
-                        &mut summary,
-                    )
-                    .await;
-                    return summary;
-                }
-            }
-        }
-    } else if verify_admin_password(docker, &metadata.instance_id, &bootstrap_password)
-        .await
-        .is_ok()
-    {
-        migrate_admin_password = true;
-        bootstrap_password
-    } else {
-        match repair_admin_password(docker, &metadata.instance_id, &bootstrap_password).await {
-            Ok(true) => {
-                migrate_admin_password = true;
-                bootstrap_password
-            }
-            _ => {
-                record_auth_failure(
-                    manager,
-                    &metadata,
-                    "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
-                        .to_string(),
-                    &mut summary,
-                )
-                .await;
-                return summary;
-            }
-        }
+    let resolved_admin = resolve_admin_password(
+        docker,
+        &metadata.instance_id,
+        persisted_admin,
+        bootstrap_password,
+    )
+    .await;
+    let Some((admin_password, migrate_admin_password)) = resolved_admin else {
+        record_auth_failure(
+            manager,
+            &metadata,
+            "the existing PostgreSQL administrator credential could not be verified or safely repaired against the database SCRAM secret"
+                .to_string(),
+            &mut summary,
+        )
+        .await;
+        return summary;
     };
     if verify_admin_password(docker, &metadata.instance_id, &admin_password)
         .await
@@ -587,67 +552,14 @@ async fn harden_postgres(
     if migrate_admin_password {
         metadata.postgres_admin_password = Some(admin_password.expose_secret().to_string());
     }
-    let mut migrate_tenant_password = false;
-    let tenant_password = match metadata.tenant_password.as_deref() {
-        Some(password) if !password.is_empty() => SecretString::from(password.to_string()),
-        _ => {
-            let candidate = match docker
-                .postgres_legacy_credentials(&metadata.instance_id)
-                .await
-            {
-                Ok(Some((username, password))) if username == metadata.database.username => {
-                    password
-                }
-                Ok(Some(_)) => {
-                    record_auth_failure(
-                        manager,
-                        &metadata,
-                        "the legacy PostgreSQL tenant username does not match protected instance metadata; refusing to adopt it"
-                            .to_string(),
-                        &mut summary,
-                    )
-                    .await;
-                    return summary;
-                }
-                Ok(None) | Err(_) => {
-                    record_auth_failure(
-                        manager,
-                        &metadata,
-                        "the encrypted tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway"
-                            .to_string(),
-                        &mut summary,
-                    )
-                    .await;
-                    return summary;
-                }
-            };
-            match verify_tenant_scram(
-                docker,
-                &metadata.instance_id,
-                &metadata.database.username,
-                &candidate,
-                &admin_password,
-            )
-            .await
-            {
-                Ok(true) => {
-                    migrate_tenant_password = true;
-                    candidate
-                }
-                _ => {
-                    record_auth_failure(
-                        manager,
-                        &metadata,
-                        "the legacy PostgreSQL tenant credential does not match the live database SCRAM verifier; reset this legacy instance before opening its gateway"
-                            .to_string(),
-                        &mut summary,
-                    )
-                    .await;
-                    return summary;
-                }
+    let (tenant_password, migrate_tenant_password) =
+        match resolve_tenant_password(docker, &metadata, &admin_password).await {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                record_auth_failure(manager, &metadata, reason.to_string(), &mut summary).await;
+                return summary;
             }
-        }
-    };
+        };
     summary.checked = 1;
     let hardening = harden_instance_auth(
         docker,
@@ -731,6 +643,87 @@ async fn harden_postgres(
         }
     }
     summary
+}
+
+async fn resolve_admin_password(
+    docker: &DockerRuntime,
+    instance_id: &str,
+    persisted_admin: Option<SecretString>,
+    bootstrap_password: SecretString,
+) -> Option<(SecretString, bool)> {
+    let Some(persisted) = persisted_admin else {
+        if verify_admin_password(docker, instance_id, &bootstrap_password)
+            .await
+            .is_ok()
+        {
+            return Some((bootstrap_password, true));
+        }
+        return match repair_admin_password(docker, instance_id, &bootstrap_password).await {
+            Ok(true) => Some((bootstrap_password, true)),
+            _ => None,
+        };
+    };
+    if verify_admin_password(docker, instance_id, &persisted)
+        .await
+        .is_ok()
+    {
+        return Some((persisted, false));
+    }
+    if persisted.expose_secret() != bootstrap_password.expose_secret()
+        && verify_admin_password(docker, instance_id, &bootstrap_password)
+            .await
+            .is_ok()
+    {
+        return Some((bootstrap_password, true));
+    }
+    match repair_admin_password(docker, instance_id, &persisted).await {
+        Ok(true) => Some((persisted, false)),
+        _ => None,
+    }
+}
+
+async fn resolve_tenant_password(
+    docker: &DockerRuntime,
+    metadata: &InstanceMetadata,
+    admin_password: &SecretString,
+) -> Result<(SecretString, bool), &'static str> {
+    if let Some(password) = metadata
+        .tenant_password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+    {
+        return Ok((SecretString::from(password.to_string()), false));
+    }
+    let legacy_credentials = docker
+        .postgres_legacy_credentials(&metadata.instance_id)
+        .await;
+    let candidate = match legacy_credentials {
+        Ok(Some((username, password))) if username == metadata.database.username => password,
+        Ok(Some(_)) => {
+            return Err(
+                "the legacy PostgreSQL tenant username does not match protected instance metadata; refusing to adopt it",
+            );
+        }
+        Ok(None) | Err(_) => {
+            return Err(
+                "the encrypted tenant credential is missing and no unambiguous legacy container credential is available; reset this legacy instance before opening its gateway",
+            );
+        }
+    };
+    let verified = verify_tenant_scram(
+        docker,
+        &metadata.instance_id,
+        &metadata.database.username,
+        &candidate,
+        admin_password,
+    )
+    .await;
+    match verified {
+        Ok(true) => Ok((candidate, true)),
+        _ => Err(
+            "the legacy PostgreSQL tenant credential does not match the live database SCRAM verifier; reset this legacy instance before opening its gateway",
+        ),
+    }
 }
 
 fn merge_postgres_hardening(outcomes: Vec<PostgresHardeningSummary>) -> PostgresHardeningSummary {

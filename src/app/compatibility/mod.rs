@@ -55,32 +55,22 @@ pub enum CompatibilityPolicyError {
 }
 
 pub fn parse_engine_version(value: &str) -> Result<EngineVersion, CompatibilityPolicyError> {
-    let bytes = value.as_bytes();
-    let mut start = None;
-    for (index, byte) in bytes.iter().enumerate() {
-        if byte.is_ascii_digit() {
-            start = Some(index);
-            break;
-        }
-    }
-    let start = start.ok_or(CompatibilityPolicyError::Unparseable)?;
+    let start = value
+        .find(|character: char| character.is_ascii_digit())
+        .ok_or(CompatibilityPolicyError::Unparseable)?;
     let token = value[start..]
         .split(|character: char| !(character.is_ascii_digit() || character == '.'))
         .next()
         .unwrap_or_default();
     let mut components = token.split('.');
-    let major = components
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or(CompatibilityPolicyError::Unparseable)?;
-    let minor = components
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    let patch = components
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+    let mut next_component = || {
+        components
+            .next()
+            .and_then(|component| component.parse::<u32>().ok())
+    };
+    let major = next_component().ok_or(CompatibilityPolicyError::Unparseable)?;
+    let minor = next_component().unwrap_or(0);
+    let patch = next_component().unwrap_or(0);
     Ok(EngineVersion {
         major,
         minor,
@@ -93,7 +83,21 @@ pub fn compatibility_profile(
     normalized_version: &str,
 ) -> Result<CompatibilityProfile, CompatibilityPolicyError> {
     let version = parse_engine_version(normalized_version)?;
-    let supported = match protocol {
+    if !is_supported_version(protocol, version) {
+        return Err(CompatibilityPolicyError::Unsupported {
+            protocol,
+            version,
+            supported: supported_versions(protocol),
+        });
+    }
+    Ok(CompatibilityProfile {
+        version,
+        capabilities: capabilities_for(protocol, version),
+    })
+}
+
+fn is_supported_version(protocol: Protocol, version: EngineVersion) -> bool {
+    match protocol {
         Protocol::Postgres => (14..=18).contains(&version.major),
         Protocol::Mysql => {
             (version.major == 8 && (version.minor > 0 || version.patch >= 11))
@@ -112,15 +116,10 @@ pub fn compatibility_profile(
         }
         Protocol::Clickhouse => matches!(version.major, 25 | 26),
         Protocol::Qdrant => version.major == 1 && matches!(version.minor, 17 | 18),
-    };
-    if !supported {
-        return Err(CompatibilityPolicyError::Unsupported {
-            protocol,
-            version,
-            supported: supported_versions(protocol),
-        });
     }
+}
 
+fn capabilities_for(protocol: Protocol, version: EngineVersion) -> ProtocolCapabilities {
     let mut capabilities = ProtocolCapabilities::default();
     match protocol {
         Protocol::Postgres => {
@@ -140,10 +139,7 @@ pub fn compatibility_profile(
         }
         Protocol::Clickhouse => {}
     }
-    Ok(CompatibilityProfile {
-        version,
-        capabilities,
-    })
+    capabilities
 }
 
 pub const fn supported_versions(protocol: Protocol) -> &'static str {
@@ -184,20 +180,12 @@ pub(crate) fn normalize_database_version(protocol: Protocol, stdout: &str) -> Op
             .strip_prefix("postgres (PostgreSQL) ")
             .or_else(|| line.strip_prefix("psql (PostgreSQL) "))
             .unwrap_or(line),
-        Protocol::Mariadb => line
-            .split("Distrib ")
-            .nth(1)
-            .and_then(|rest| rest.split([',', ' ']).next())
-            .unwrap_or(line),
+        Protocol::Mariadb => distrib_version(line).unwrap_or(line),
         Protocol::Mysql => line
             .split("Ver ")
             .nth(1)
             .and_then(|rest| rest.split_whitespace().next())
-            .or_else(|| {
-                line.split("Distrib ")
-                    .nth(1)
-                    .and_then(|rest| rest.split([',', ' ']).next())
-            })
+            .or_else(|| distrib_version(line))
             .unwrap_or(line),
         Protocol::Redis | Protocol::Valkey => line
             .split_whitespace()
@@ -221,6 +209,12 @@ pub(crate) fn normalize_database_version(protocol: Protocol, stdout: &str) -> Op
     .trim_end_matches('.');
 
     (!version.is_empty()).then(|| version.to_string())
+}
+
+fn distrib_version(line: &str) -> Option<&str> {
+    line.split("Distrib ")
+        .nth(1)
+        .and_then(|rest| rest.split([',', ' ']).next())
 }
 
 #[cfg(test)]

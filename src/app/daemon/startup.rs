@@ -1,5 +1,9 @@
 use super::*;
 
+const QDRANT_MIGRATION_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const BOOT_ACTIVATION_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const BOOT_FAILURE_LOG_TAIL_CHARS: usize = 4_000;
+
 pub(super) fn log_boot_config(config: &Config, config_path: &Path) {
     tracing::info!(
         config = %config_path.display(),
@@ -299,108 +303,31 @@ pub(super) async fn restore_disk_limits(
         manager.store().list().await.into_iter().filter(|metadata| {
             metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
         });
-    let outcomes =
-        futures::stream::iter(instances)
-            .map(|metadata| async move {
-                let outcome = async {
-                let paths = InstancePaths::new(&config.paths, &metadata.instance_id).with_context(
-                    || format!("failed to build paths for {}", metadata.instance_id),
-                )?;
-                if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
-                    paths.create_dirs().await.with_context(|| {
-                        format!(
-                            "failed to create rootless Podman paths for {}",
-                            metadata.instance_id
-                        )
-                    })?;
-                    paths
-                        .apply_rootless_owner(uid, gid)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to apply rootless Podman ownership for {}",
-                                metadata.instance_id
-                            )
-                        })?;
-                }
-                let legacy_qdrant_fuse_retained = if metadata.protocol == Protocol::Qdrant {
-                    !migrate_qdrant_storage(config, docker, disk_limiter, &metadata, &paths).await?
-                } else {
-                    false
-                };
-                let effective_limiter = if legacy_qdrant_fuse_retained {
-                    // Migration was deliberately deferred or rolled back. The
-                    // existing container is still bound to FuseQuota, even if
-                    // the operator has since selected soft/native enforcement.
-                    disk_limiter.legacy_fuse_limiter()
-                } else {
-                    disk_limiter.for_protocol(metadata.protocol)
-                };
-                effective_limiter.check_method_change(&metadata.limits.disk_enforcement_method)?;
-                ensure_disk_mounted(docker, &metadata, &paths, &effective_limiter).await?;
-                if !effective_limiter
-                    .runtime_is_healthy(&paths.data)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to inspect disk-limit runtime for {}",
-                            metadata.instance_id
-                        )
-                    })?
-                {
-                    match docker.stop(metadata.protocol, &metadata.instance_id).await {
-                        Ok(_) => tracing::warn!(
-                            instance_id = %metadata.instance_id,
-                            protocol = %metadata.protocol,
-                            "stopped managed instance to recover an unavailable disk-limit runtime"
-                        ),
-                        Err(error) if error.is_not_found() || error.is_not_running() => {}
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!(
-                                    "failed to stop {} before recovering its disk-limit runtime",
-                                    metadata.instance_id
-                                )
-                            });
-                        }
-                    }
-                    effective_limiter.teardown_instance_mount(&paths.data).await?;
-                }
-                let enforcement = effective_limiter
-                    .apply_instance_limit(
-                        &metadata.instance_id,
-                        &paths.data,
-                        metadata.limits.disk_mib,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("failed to apply disk limit for {}", metadata.instance_id)
-                    })?;
-                Ok::<(crate::config::DiskLimitMode, crate::disk::DiskEnforcement), anyhow::Error>((
-                    effective_limiter.mode(),
-                    enforcement,
-                ))
-            }
-            .await;
-                (metadata, outcome)
-            })
-            .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+    let outcomes = futures::stream::iter(instances)
+        .map(|metadata| async move {
+            let outcome =
+                reconcile_instance_disk_limit(config, docker, disk_limiter, &metadata).await;
+            (metadata, outcome)
+        })
+        .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     let mut failed = 0_usize;
     for (mut metadata, outcome) in outcomes {
-        if let Ok((_effective_mode, enforcement)) = outcome.as_ref() {
-            if metadata.limits.disk_enforced != enforcement.enforced
-                || metadata.limits.disk_enforcement_method != enforcement.method
-            {
-                metadata.limits.disk_enforced = enforcement.enforced;
-                metadata.limits.disk_enforcement_method = enforcement.method.clone();
-                metadata.updated_at = now_rfc3339();
-                manager.upsert(metadata).await?;
+        let error = match outcome {
+            Ok((_effective_mode, enforcement)) => {
+                let enforcement_changed = metadata.limits.disk_enforced != enforcement.enforced
+                    || metadata.limits.disk_enforcement_method != enforcement.method;
+                if enforcement_changed {
+                    metadata.limits.disk_enforced = enforcement.enforced;
+                    metadata.limits.disk_enforcement_method = enforcement.method;
+                    metadata.updated_at = now_rfc3339();
+                    manager.upsert(metadata).await?;
+                }
+                continue;
             }
-            continue;
-        }
-        let error = outcome.expect_err("disk-limit error checked above");
+            Err(error) => error,
+        };
         failed += 1;
         tracing::error!(
             instance_id = %metadata.instance_id,
@@ -440,6 +367,91 @@ pub(super) async fn restore_disk_limits(
             failed,
             "one or more instance disk limits could not be reconciled; affected instances were isolated while daemon startup continues"
         );
+    }
+    Ok(())
+}
+
+async fn reconcile_instance_disk_limit(
+    config: &Config,
+    docker: &DockerRuntime,
+    disk_limiter: &DiskLimiter,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> anyhow::Result<(crate::config::DiskLimitMode, crate::disk::DiskEnforcement)> {
+    let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
+        .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
+    if let Some((uid, gid)) = docker.rootless_podman_host_owner() {
+        paths.create_dirs().await.with_context(|| {
+            format!(
+                "failed to create rootless Podman paths for {}",
+                metadata.instance_id
+            )
+        })?;
+        paths
+            .apply_rootless_owner(uid, gid)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to apply rootless Podman ownership for {}",
+                    metadata.instance_id
+                )
+            })?;
+    }
+    let legacy_qdrant_fuse_retained = if metadata.protocol == Protocol::Qdrant {
+        !migrate_qdrant_storage(config, docker, disk_limiter, metadata, &paths).await?
+    } else {
+        false
+    };
+    let effective_limiter = if legacy_qdrant_fuse_retained {
+        // Migration was deliberately deferred or rolled back. The
+        // existing container is still bound to FuseQuota, even if
+        // the operator has since selected soft/native enforcement.
+        disk_limiter.legacy_fuse_limiter()
+    } else {
+        disk_limiter.for_protocol(metadata.protocol)
+    };
+    effective_limiter.check_method_change(&metadata.limits.disk_enforcement_method)?;
+    ensure_disk_mounted(docker, metadata, &paths, &effective_limiter).await?;
+    let runtime_healthy = effective_limiter
+        .runtime_is_healthy(&paths.data)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect disk-limit runtime for {}",
+                metadata.instance_id
+            )
+        })?;
+    if !runtime_healthy {
+        stop_for_disk_runtime_recovery(docker, metadata).await?;
+        effective_limiter
+            .teardown_instance_mount(&paths.data)
+            .await?;
+    }
+    let enforcement = effective_limiter
+        .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+        .await
+        .with_context(|| format!("failed to apply disk limit for {}", metadata.instance_id))?;
+    Ok((effective_limiter.mode(), enforcement))
+}
+
+async fn stop_for_disk_runtime_recovery(
+    docker: &DockerRuntime,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> anyhow::Result<()> {
+    match docker.stop(metadata.protocol, &metadata.instance_id).await {
+        Ok(_) => tracing::warn!(
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            "stopped managed instance to recover an unavailable disk-limit runtime"
+        ),
+        Err(error) if error.is_not_found() || error.is_not_running() => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to stop {} before recovering its disk-limit runtime",
+                    metadata.instance_id
+                )
+            });
+        }
     }
     Ok(())
 }
@@ -620,16 +632,7 @@ async fn migrate_qdrant_storage(
             .await?;
         docker.create(&raw_spec).await?;
         if should_run {
-            docker
-                .start(metadata.protocol, &metadata.instance_id)
-                .await?;
-            docker
-                .wait_until_ready(
-                    metadata.protocol,
-                    &metadata.instance_id,
-                    Duration::from_secs(120),
-                )
-                .await?;
+            start_migrated_qdrant(docker, metadata).await?;
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -651,16 +654,7 @@ async fn migrate_qdrant_storage(
                 .await?;
             docker.create(&legacy_spec).await?;
             if should_run {
-                docker
-                    .start(metadata.protocol, &metadata.instance_id)
-                    .await?;
-                docker
-                    .wait_until_ready(
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        Duration::from_secs(120),
-                    )
-                    .await?;
+                start_migrated_qdrant(docker, metadata).await?;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -690,6 +684,23 @@ async fn migrate_qdrant_storage(
         "migrated legacy Qdrant storage from FuseQuota to raw filesystem storage governed by the selected non-FUSE enforcement"
     );
     Ok(true)
+}
+
+async fn start_migrated_qdrant(
+    docker: &DockerRuntime,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> anyhow::Result<()> {
+    docker
+        .start(metadata.protocol, &metadata.instance_id)
+        .await?;
+    docker
+        .wait_until_ready(
+            metadata.protocol,
+            &metadata.instance_id,
+            QDRANT_MIGRATION_READY_TIMEOUT,
+        )
+        .await?;
+    Ok(())
 }
 
 pub(super) fn qdrant_migration_actions(
@@ -1011,50 +1022,8 @@ pub(super) async fn start_known_instance(
                 %error,
                 "failed to prepare managed instance disk limit during daemon boot; skipping container activation"
             );
-        } else {
-            let activation = match action {
-                ManagedBootAction::Start => {
-                    docker.start(metadata.protocol, &metadata.instance_id).await
-                }
-                ManagedBootAction::Restart => {
-                    docker
-                        .restart(metadata.protocol, &metadata.instance_id)
-                        .await
-                }
-            };
-            match activation {
-                Ok(_) => {
-                    if let Err(error) = docker
-                        .wait_until_ready(
-                            metadata.protocol,
-                            &metadata.instance_id,
-                            Duration::from_secs(180),
-                        )
-                        .await
-                    {
-                        boot_failed = true;
-                        log_boot_container_failure(
-                            docker,
-                            metadata.protocol,
-                            &metadata.instance_id,
-                            "managed instance did not become ready during daemon boot",
-                            error.to_string(),
-                        )
-                        .await;
-                    }
-                }
-                Err(error) => {
-                    boot_failed = true;
-                    log_boot_container_failure(
-                        docker,
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        "failed to activate managed instance during daemon boot",
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            }
+        } else if !activate_container_on_boot(docker, &metadata, action).await {
+            boot_failed = true;
         }
     }
 
@@ -1088,6 +1057,50 @@ pub(super) async fn start_known_instance(
     let status = reconciled.status;
     manager.upsert(reconciled).await?;
     Ok(Some(status))
+}
+
+async fn activate_container_on_boot(
+    docker: &DockerRuntime,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    action: ManagedBootAction,
+) -> bool {
+    let activation = match action {
+        ManagedBootAction::Start => docker.start(metadata.protocol, &metadata.instance_id).await,
+        ManagedBootAction::Restart => {
+            docker
+                .restart(metadata.protocol, &metadata.instance_id)
+                .await
+        }
+    };
+    let (message, error) = match activation {
+        Err(error) => (
+            "failed to activate managed instance during daemon boot",
+            error.to_string(),
+        ),
+        Ok(_) => match docker
+            .wait_until_ready(
+                metadata.protocol,
+                &metadata.instance_id,
+                BOOT_ACTIVATION_READY_TIMEOUT,
+            )
+            .await
+        {
+            Ok(_) => return true,
+            Err(error) => (
+                "managed instance did not become ready during daemon boot",
+                error.to_string(),
+            ),
+        },
+    };
+    log_boot_container_failure(
+        docker,
+        metadata.protocol,
+        &metadata.instance_id,
+        message,
+        error,
+    )
+    .await;
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,7 +1145,7 @@ pub(super) async fn log_boot_container_failure(
     let recent_container_logs = match docker.logs(protocol, instance_id, None).await {
         Ok(output) => {
             let combined = format!("{}{}", output.stdout, output.stderr);
-            truncate_log_tail(combined.trim(), 4_000)
+            truncate_log_tail(combined.trim(), BOOT_FAILURE_LOG_TAIL_CHARS)
         }
         Err(log_error) => format!("failed to read container logs: {log_error}"),
     };

@@ -5,8 +5,7 @@ pub fn create_tenant_script(
     database: &str,
     username: &str,
 ) -> Result<String, MongodbProvisionError> {
-    validate_identifier("database", database)?;
-    validate_identifier("username", username)?;
+    validate_tenant_identifiers(database, username)?;
 
     Ok(format!(
         r#"
@@ -76,8 +75,7 @@ fn tenant_roles_script(
     username: &str,
     roles: &[&str],
 ) -> Result<String, MongodbProvisionError> {
-    validate_identifier("database", database)?;
-    validate_identifier("username", username)?;
+    validate_tenant_identifiers(database, username)?;
     let roles = roles
         .iter()
         .map(|role| serde_json::json!({ "role": role, "db": database }))
@@ -94,8 +92,7 @@ pub fn terminate_tenant_script(
     database: &str,
     username: &str,
 ) -> Result<String, MongodbProvisionError> {
-    validate_identifier("database", database)?;
-    validate_identifier("username", username)?;
+    validate_tenant_identifiers(database, username)?;
     Ok(format!(
         "db = db.getSiblingDB(\"admin\");\ndb.runCommand({{ killAllSessions: [{{ user: {}, db: {} }}] }});\n",
         serde_json::to_string(username)?,
@@ -104,8 +101,7 @@ pub fn terminate_tenant_script(
 }
 
 pub fn drop_tenant_script(database: &str, username: &str) -> Result<String, MongodbProvisionError> {
-    validate_identifier("database", database)?;
-    validate_identifier("username", username)?;
+    validate_tenant_identifiers(database, username)?;
     Ok(format!(
         "const database = {};\nconst username = {};\ndb = db.getSiblingDB(database);\nif (db.getUser(username) !== null) {{ db.dropUser(username); }}\ndb.dropDatabase();\n",
         serde_json::to_string(database)?,
@@ -166,8 +162,7 @@ pub fn password_update_script(
     database: &str,
     username: &str,
 ) -> Result<String, MongodbProvisionError> {
-    validate_identifier("database", database)?;
-    validate_identifier("username", username)?;
+    validate_tenant_identifiers(database, username)?;
 
     Ok(format!(
         r#"
@@ -207,6 +202,14 @@ db.createUser({{
 "#,
         username = serde_json::to_string(username)?,
     ))
+}
+
+fn validate_tenant_identifiers(
+    database: &str,
+    username: &str,
+) -> Result<(), MongodbProvisionError> {
+    validate_identifier("database", database)?;
+    validate_identifier("username", username)
 }
 
 fn validate_identifier(kind: &'static str, value: &str) -> Result<(), MongodbProvisionError> {

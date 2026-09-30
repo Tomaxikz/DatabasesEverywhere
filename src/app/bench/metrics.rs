@@ -177,13 +177,7 @@ impl HttpPhaseReport {
             .map(|sample| sample.duration_micros)
             .collect::<Vec<_>>();
         let seconds = wall_duration.as_secs_f64();
-        let rate = |count: usize| {
-            if seconds > 0.0 {
-                count as f64 / seconds
-            } else {
-                0.0
-            }
-        };
+        let rate = |count: usize| per_second(count, seconds);
         Self {
             name: name.into(),
             attempted_requests: samples.len(),
@@ -224,21 +218,9 @@ impl HttpPhaseReport {
         successful_latencies: &Histogram<u64>,
     ) -> Self {
         let seconds = wall_duration.as_secs_f64();
-        let wall_rate = |count: usize| {
-            if seconds > 0.0 {
-                count as f64 / seconds
-            } else {
-                0.0
-            }
-        };
+        let wall_rate = |count: usize| per_second(count, seconds);
         let active_seconds = active_load_duration.as_secs_f64();
-        let active_rate = |count: usize| {
-            if active_seconds > 0.0 {
-                count as f64 / active_seconds
-            } else {
-                0.0
-            }
-        };
+        let active_rate = |count: usize| per_second(count, active_seconds);
         Self {
             name: name.into(),
             attempted_requests,
@@ -468,6 +450,14 @@ pub(super) struct BenchmarkReport {
     pub resources: Option<ResourceSummary>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+fn per_second(count: usize, seconds: f64) -> f64 {
+    if seconds > 0.0 {
+        count as f64 / seconds
+    } else {
+        0.0
+    }
 }
 
 fn micros_to_ms(value: u64) -> f64 {

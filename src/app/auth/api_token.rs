@@ -5,6 +5,8 @@ use subtle::ConstantTimeEq;
 
 use crate::auth::scopes;
 
+const BEARER_PREFIX: &str = "Bearer ";
+
 #[derive(Debug, Clone)]
 pub struct ApiToken {
     tokens: Arc<[NamedToken]>,
@@ -37,38 +39,26 @@ impl AcceptedApiToken {
 
 impl ApiToken {
     pub fn new(expected: impl Into<String>) -> Self {
-        let expected = expected.into();
-        let tokens = if expected.trim().is_empty() {
+        Self::with_full_access_token("default".to_string(), expected.into())
+    }
+
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self::with_full_access_token(config.token_id.clone(), config.token.clone())
+    }
+
+    fn with_full_access_token(name: String, token: String) -> Self {
+        let tokens = if token.trim().is_empty() {
             Vec::new()
         } else {
-            vec![named_token(
-                "default".to_string(),
-                expected,
-                vec![scopes::ALL.to_string()],
-            )]
+            vec![named_token(name, token, vec![scopes::ALL.to_string()])]
         };
         Self {
             tokens: tokens.into(),
         }
     }
 
-    pub fn from_config(config: &crate::config::Config) -> Self {
-        let mut tokens = Vec::new();
-        if !config.token.trim().is_empty() {
-            tokens.push(named_token(
-                config.token_id.clone(),
-                config.token.clone(),
-                vec![scopes::ALL.to_string()],
-            ));
-        }
-        Self {
-            tokens: tokens.into(),
-        }
-    }
-
     pub fn from_auth_header(&self, header: Option<&str>) -> Option<AcceptedApiToken> {
-        let header = header?;
-        let token = header.strip_prefix("Bearer ")?;
+        let token = header?.strip_prefix(BEARER_PREFIX)?;
         self.accepted_token(token)
     }
 

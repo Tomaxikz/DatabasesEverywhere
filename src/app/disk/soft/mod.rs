@@ -24,6 +24,11 @@ use super::usage::{DirectoryUsage, ScanLimits, scan_directory_with_id};
 
 // Bound tenant-controlled incremental state; larger trees stream full scans.
 const DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET: usize = 4_096;
+const MAX_SCAN_DEPTH: usize = 128;
+const WARNING_USAGE_PERCENT: u64 = 75;
+const OUTER_SCAN_DEADLINE_SLACK: Duration = Duration::from_secs(1);
+
+type ScanMeasurement = (DirectoryUsage, PerformedScanKind, usage_tree::RootIdentity);
 
 pub(crate) mod planner;
 pub(crate) mod usage_tree;
@@ -196,6 +201,17 @@ pub(crate) struct HybridScanExecution {
     pub(crate) root_identity: Option<usage_tree::RootIdentity>,
 }
 
+impl HybridScanExecution {
+    fn unmeasured(outcome: ScanOutcome) -> Self {
+        Self {
+            outcome,
+            performed: PerformedScanKind::Full,
+            measurement_succeeded: false,
+            root_identity: None,
+        }
+    }
+}
+
 impl ScanOutcome {
     pub fn snapshot(&self) -> &SoftDiskSnapshot {
         match self {
@@ -271,22 +287,9 @@ impl UsageTreeSlot {
         if state.streaming_only {
             return false;
         }
-        let old_count = state.cached_directory_count;
-        let new_count = cache.directory_count();
-        if new_count > old_count
-            && !reserve_cached_directories(
-                &self.cached_directories,
-                new_count - old_count,
-                self.global_directory_limit,
-            )
-        {
-            self.switch_to_streaming(state);
+        if !self.resize_directory_accounting(state, cache.directory_count()) {
             return false;
         }
-        if old_count > new_count {
-            release_cached_directories(&self.cached_directories, old_count - new_count);
-        }
-        state.cached_directory_count = new_count;
         state.cache = Some(cache);
         true
     }
@@ -300,6 +303,14 @@ impl UsageTreeSlot {
         else {
             return false;
         };
+        self.resize_directory_accounting(state, new_count)
+    }
+
+    fn resize_directory_accounting(
+        &self,
+        state: &mut UsageTreeSlotState,
+        new_count: usize,
+    ) -> bool {
         let old_count = state.cached_directory_count;
         if new_count > old_count
             && !reserve_cached_directories(
@@ -481,21 +492,11 @@ impl SoftDiskLimiter {
             }
             Err(ScanFailure::Capacity(error)) => {
                 let outcome = self.enforce_capacity_outage(runtime, target, error).await?;
-                return Ok(HybridScanExecution {
-                    outcome,
-                    performed: PerformedScanKind::Full,
-                    measurement_succeeded: false,
-                    root_identity: None,
-                });
+                return Ok(HybridScanExecution::unmeasured(outcome));
             }
             Err(ScanFailure::Measurement(error)) => {
                 let outcome = self.enforce_unmeasurable(runtime, target, error).await?;
-                return Ok(HybridScanExecution {
-                    outcome,
-                    performed: PerformedScanKind::Full,
-                    measurement_succeeded: false,
-                    root_identity: None,
-                });
+                return Ok(HybridScanExecution::unmeasured(outcome));
             }
         };
         let outcome = self.enforce_measured_usage(runtime, target, usage).await?;
@@ -570,7 +571,7 @@ impl SoftDiskLimiter {
         &self,
         target: &SoftDiskTarget,
         request: HybridScanRequest,
-    ) -> Result<(DirectoryUsage, PerformedScanKind, usage_tree::RootIdentity), ScanFailure> {
+    ) -> Result<ScanMeasurement, ScanFailure> {
         let scan_timeout = Duration::from_secs(self.config.scan_timeout_seconds.max(1));
         let permit = tokio::time::timeout(scan_timeout, self.permits.clone().acquire_owned())
             .await
@@ -596,7 +597,7 @@ impl SoftDiskLimiter {
         let limits = ScanLimits {
             timeout: scan_timeout,
             max_entries: self.config.max_entries_per_scan.max(1),
-            max_depth: 128,
+            max_depth: MAX_SCAN_DEPTH,
         };
         let per_target_cache_limit = self
             .usage_cache_limits
@@ -605,72 +606,39 @@ impl SoftDiskLimiter {
         // A wedged worker keeps its permit, bounding leaked blocking workers.
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let Some(cache) = cache else {
-                return scan_directory_with_id(&scan_path, limits)
-                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
+            let Some(slot) = cache else {
+                return streaming_full_scan(&scan_path, limits);
             };
-            let mut state = cache
+            let mut state = slot
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.streaming_only {
-                return scan_directory_with_id(&scan_path, limits)
-                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity));
+                return streaming_full_scan(&scan_path, limits);
             }
+            let cached_scan = CachedScan {
+                slot: &slot,
+                scan_path: &scan_path,
+                generation,
+                limits,
+                per_target_cache_limit,
+            };
             match request {
-                HybridScanRequest::StreamingFull => scan_directory_with_id(&scan_path, limits)
-                    .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity)),
-                HybridScanRequest::Full => scan_full_with_bounded_cache(
-                    &cache,
-                    &mut state,
-                    &scan_path,
-                    generation,
-                    limits,
-                    per_target_cache_limit,
-                ),
+                HybridScanRequest::StreamingFull => streaming_full_scan(&scan_path, limits),
+                HybridScanRequest::Full => cached_scan.full(&mut state),
                 HybridScanRequest::Partial {
                     relative_directories,
-                } => {
-                    let reconcile = state.cache.as_mut().map(|existing| {
-                        existing.reconcile(&scan_path, &generation, &relative_directories, limits)
-                    });
-                    match reconcile {
-                        Some(Ok(usage)) => {
-                            let identity = state
-                                .cache
-                                .as_ref()
-                                .expect("successful reconciliation retains its cache")
-                                .root_identity();
-                            cache.account_reconciled_cache(&mut state);
-                            Ok((usage, PerformedScanKind::Partial, identity))
-                        }
-                        Some(Err(error)) if !error.requires_full_scan() => match error {
-                            usage_tree::ReconcileError::Io(error) => Err(error),
-                            usage_tree::ReconcileError::FullScanRequired(_) => {
-                                unreachable!("full reconciliation was handled above")
-                            }
-                        },
-                        Some(Err(_)) | None => scan_full_with_bounded_cache(
-                            &cache,
-                            &mut state,
-                            &scan_path,
-                            generation,
-                            limits,
-                            per_target_cache_limit,
-                        ),
-                    }
-                }
+                } => cached_scan.partial(&mut state, &relative_directories),
             }
         });
-        tokio::time::timeout(scan_timeout.saturating_add(Duration::from_secs(1)), worker)
+        let outer_deadline = scan_timeout.saturating_add(OUTER_SCAN_DEADLINE_SLACK);
+        tokio::time::timeout(outer_deadline, worker)
             .await
             .map_err(|_| {
                 ScanFailure::Measurement(format!(
                     "soft disk scan of {} exceeded its outer {} second deadline",
                     target.data_path.display(),
-                    scan_timeout
-                        .saturating_add(Duration::from_secs(1))
-                        .as_secs()
+                    outer_deadline.as_secs()
                 ))
             })?
             .map_err(|error| {
@@ -692,23 +660,21 @@ impl SoftDiskLimiter {
         let mut states = self.usage_trees.lock().await;
         let state = states
             .entry(target.instance_id.clone())
-            .or_insert_with(|| UsageTreeState {
-                target: fingerprint.clone(),
-                slot: Arc::new(UsageTreeSlot::new(
-                    Arc::clone(&self.cached_directories),
-                    self.usage_cache_limits.global_directories,
-                )),
-            });
+            .or_insert_with(|| self.new_usage_tree_state(fingerprint.clone()));
         if state.target != fingerprint {
-            *state = UsageTreeState {
-                target: fingerprint,
-                slot: Arc::new(UsageTreeSlot::new(
-                    Arc::clone(&self.cached_directories),
-                    self.usage_cache_limits.global_directories,
-                )),
-            };
+            *state = self.new_usage_tree_state(fingerprint);
         }
         Arc::clone(&state.slot)
+    }
+
+    fn new_usage_tree_state(&self, target: TargetFingerprint) -> UsageTreeState {
+        UsageTreeState {
+            target,
+            slot: Arc::new(UsageTreeSlot::new(
+                Arc::clone(&self.cached_directories),
+                self.usage_cache_limits.global_directories,
+            )),
+        }
     }
 
     pub(crate) async fn evict_usage_cache(&self, instance_id: &str) {
@@ -758,12 +724,13 @@ impl SoftDiskLimiter {
             target.limit_bytes,
             growth_bytes_per_second,
         );
-        let warning_now = !blocked
-            && (usage.physical_bytes >= target.limit_bytes.saturating_mul(75) / 100
-                || predicted_seconds_to_limit.is_some_and(|seconds| {
-                    seconds
-                        <= full_scan_interval_secs(&self.config, target.protocol).saturating_mul(2)
-                }));
+        let near_limit =
+            usage.physical_bytes >= target.limit_bytes.saturating_mul(WARNING_USAGE_PERCENT) / 100;
+        let warning_horizon_seconds =
+            full_scan_interval_secs(&self.config, target.protocol).saturating_mul(2);
+        let limit_reached_soon =
+            predicted_seconds_to_limit.is_some_and(|seconds| seconds <= warning_horizon_seconds);
+        let warning_now = !blocked && (near_limit || limit_reached_soon);
         let previously_warned = previous.is_some_and(|state| state.warned);
         let warning = warning_now && !previously_warned;
         let warned = warning_now;
@@ -801,24 +768,7 @@ impl SoftDiskLimiter {
         target: &SoftDiskTarget,
         error: String,
     ) -> Result<ScanOutcome, String> {
-        let consecutive_failures = {
-            let mut failures = self.scan_failures.lock().await;
-            let fingerprint = TargetFingerprint::from(target);
-            let state = failures
-                .entry(target.instance_id.clone())
-                .or_insert_with(|| TargetScanFailures {
-                    target: fingerprint.clone(),
-                    consecutive: 0,
-                });
-            if state.target != fingerprint {
-                *state = TargetScanFailures {
-                    target: fingerprint,
-                    consecutive: 0,
-                };
-            }
-            state.consecutive = state.consecutive.saturating_add(1);
-            state.consecutive
-        };
+        let consecutive_failures = self.record_target_scan_failure(target).await;
         let threshold = self.config.max_consecutive_scan_failures.max(1);
         if consecutive_failures < threshold {
             return Err(format!(
@@ -839,6 +789,25 @@ impl SoftDiskLimiter {
             .enforce_disk_stop(target, &exceeded, self.shutdown_grace())
             .await?;
         Ok(ScanOutcome::Stopped { snapshot, outcome })
+    }
+
+    async fn record_target_scan_failure(&self, target: &SoftDiskTarget) -> u8 {
+        let mut failures = self.scan_failures.lock().await;
+        let fingerprint = TargetFingerprint::from(target);
+        let state = failures
+            .entry(target.instance_id.clone())
+            .or_insert_with(|| TargetScanFailures {
+                target: fingerprint.clone(),
+                consecutive: 0,
+            });
+        if state.target != fingerprint {
+            *state = TargetScanFailures {
+                target: fingerprint,
+                consecutive: 0,
+            };
+        }
+        state.consecutive = state.consecutive.saturating_add(1);
+        state.consecutive
     }
 
     async fn enforce_capacity_outage<R: SoftDiskRuntime>(
@@ -918,36 +887,74 @@ impl SoftDiskLimiter {
     }
 }
 
-fn scan_full_with_bounded_cache(
-    slot: &UsageTreeSlot,
-    state: &mut UsageTreeSlotState,
+fn streaming_full_scan(
     scan_path: &std::path::Path,
+    limits: ScanLimits,
+) -> Result<ScanMeasurement, std::io::Error> {
+    scan_directory_with_id(scan_path, limits)
+        .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
+}
+
+struct CachedScan<'a> {
+    slot: &'a UsageTreeSlot,
+    scan_path: &'a std::path::Path,
     generation: String,
     limits: ScanLimits,
     per_target_cache_limit: usize,
-) -> Result<(DirectoryUsage, PerformedScanKind, usage_tree::RootIdentity), std::io::Error> {
-    match usage_tree::UsageTreeCache::scan_full_bounded(
-        scan_path,
-        generation,
-        limits,
-        per_target_cache_limit,
-    )? {
-        usage_tree::BoundedFullScan::Cached(replacement) => {
-            let identity = replacement.root_identity();
-            if slot.install_cache(state, replacement) {
-                let usage = state
-                    .cache
-                    .as_ref()
-                    .map_or_else(DirectoryUsage::default, usage_tree::UsageTreeCache::usage);
-                return Ok((usage, PerformedScanKind::Full, identity));
+}
+
+impl CachedScan<'_> {
+    fn full(self, state: &mut UsageTreeSlotState) -> Result<ScanMeasurement, std::io::Error> {
+        match usage_tree::UsageTreeCache::scan_full_bounded(
+            self.scan_path,
+            self.generation,
+            self.limits,
+            self.per_target_cache_limit,
+        )? {
+            usage_tree::BoundedFullScan::Cached(replacement) => {
+                let identity = replacement.root_identity();
+                if self.slot.install_cache(state, replacement) {
+                    let usage = state
+                        .cache
+                        .as_ref()
+                        .map_or_else(DirectoryUsage::default, usage_tree::UsageTreeCache::usage);
+                    return Ok((usage, PerformedScanKind::Full, identity));
+                }
+            }
+            usage_tree::BoundedFullScan::DirectoryLimitExceeded => {
+                self.slot.switch_to_streaming(state);
             }
         }
-        usage_tree::BoundedFullScan::DirectoryLimitExceeded => {
-            slot.switch_to_streaming(state);
+        streaming_full_scan(self.scan_path, self.limits)
+    }
+
+    fn partial(
+        self,
+        state: &mut UsageTreeSlotState,
+        relative_directories: &[PathBuf],
+    ) -> Result<ScanMeasurement, std::io::Error> {
+        let reconcile = state.cache.as_mut().map(|existing| {
+            existing.reconcile(
+                self.scan_path,
+                &self.generation,
+                relative_directories,
+                self.limits,
+            )
+        });
+        match reconcile {
+            Some(Ok(usage)) => {
+                let identity = state
+                    .cache
+                    .as_ref()
+                    .expect("successful reconciliation retains its cache")
+                    .root_identity();
+                self.slot.account_reconciled_cache(state);
+                Ok((usage, PerformedScanKind::Partial, identity))
+            }
+            Some(Err(usage_tree::ReconcileError::Io(error))) => Err(error),
+            Some(Err(usage_tree::ReconcileError::FullScanRequired(_))) | None => self.full(state),
         }
     }
-    scan_directory_with_id(scan_path, limits)
-        .map(|(usage, identity)| (usage, PerformedScanKind::Full, identity))
 }
 
 enum ScanFailure {

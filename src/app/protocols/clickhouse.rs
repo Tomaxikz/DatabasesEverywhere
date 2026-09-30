@@ -46,17 +46,18 @@ pub enum ClickhouseParseError {
     InvalidHttpBasicAuth,
 }
 
+const CLIENT_HELLO_PACKET_TYPE: u64 = 0;
+const HTTP_HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+const BASIC_AUTH_SCHEME_PREFIX: &[u8] = b"basic ";
+
 pub fn parse_native_initial_route(bytes: &[u8]) -> Result<ClickhouseRoute, ClickhouseParseError> {
     let mut reader = NativeReader::new(bytes);
     let packet_type = reader.read_uvarint()?;
-    if packet_type != 0 {
+    if packet_type != CLIENT_HELLO_PACKET_TYPE {
         return Err(ClickhouseParseError::InvalidNativeHello);
     }
 
-    reader.read_string()?;
-    reader.read_uvarint()?;
-    reader.read_uvarint()?;
-    reader.read_uvarint()?;
+    reader.skip_client_identity()?;
     let database = reader.read_string()?;
     let username = reader.read_string()?;
     reader.read_string()?;
@@ -78,10 +79,7 @@ pub fn native_hello_with_database(
 
     let mut reader = NativeReader::new(bytes);
     reader.read_uvarint()?;
-    reader.read_string()?;
-    reader.read_uvarint()?;
-    reader.read_uvarint()?;
-    reader.read_uvarint()?;
+    reader.skip_client_identity()?;
     let database_start = reader.offset;
     reader.read_string()?;
     let database_end = reader.offset;
@@ -161,7 +159,7 @@ pub fn http_request_for_gateway(
         return Err(ClickhouseParseError::InvalidHttpRequest);
     }
     let header_end = find_header_end(bytes).ok_or(ClickhouseParseError::IncompleteHttpRequest)?;
-    let header_block = std::str::from_utf8(&bytes[..header_end - 4])
+    let header_block = std::str::from_utf8(&bytes[..header_end - HTTP_HEADER_TERMINATOR.len()])
         .map_err(|_| ClickhouseParseError::InvalidHttpRequest)?;
     let mut lines = header_block.split("\r\n");
     let request_line = lines
@@ -189,9 +187,7 @@ pub fn http_request_for_gateway(
         };
         let name = name.trim();
         if name.eq_ignore_ascii_case("x-clickhouse-database") {
-            rewritten.push_str("X-ClickHouse-Database: ");
-            rewritten.push_str(database);
-            rewritten.push_str("\r\n");
+            push_database_header(&mut rewritten, database);
             database_header_seen = true;
         } else if name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("proxy-connection")
@@ -205,9 +201,7 @@ pub fn http_request_for_gateway(
         }
     }
     if !database_header_seen {
-        rewritten.push_str("X-ClickHouse-Database: ");
-        rewritten.push_str(database);
-        rewritten.push_str("\r\n");
+        push_database_header(&mut rewritten, database);
     }
     rewritten.push_str("Connection: close\r\n");
     rewritten.push_str("\r\n");
@@ -215,6 +209,12 @@ pub fn http_request_for_gateway(
     let mut output = rewritten.into_bytes();
     output.extend_from_slice(&bytes[header_end..]);
     Ok(output)
+}
+
+fn push_database_header(headers: &mut String, database: &str) {
+    headers.push_str("X-ClickHouse-Database: ");
+    headers.push_str(database);
+    headers.push_str("\r\n");
 }
 
 fn target_with_database(target: &str, database: &str) -> String {
@@ -233,9 +233,9 @@ fn target_with_database(target: &str, database: &str) -> String {
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| index + 4)
+        .windows(HTTP_HEADER_TERMINATOR.len())
+        .position(|window| window == HTTP_HEADER_TERMINATOR)
+        .map(|index| index + HTTP_HEADER_TERMINATOR.len())
 }
 
 fn basic_auth_username(value: &str) -> Result<String, ClickhouseParseError> {
@@ -258,13 +258,14 @@ fn basic_authorization_payload(value: &str) -> Result<Option<&str>, ClickhousePa
     if !value.is_ascii() {
         return Err(ClickhouseParseError::InvalidHttpBasicAuth);
     }
-    let Some(prefix) = value.as_bytes().get(..6) else {
+    let prefix_len = BASIC_AUTH_SCHEME_PREFIX.len();
+    let Some(prefix) = value.as_bytes().get(..prefix_len) else {
         return Ok(None);
     };
-    if !prefix.eq_ignore_ascii_case(b"basic ") {
+    if !prefix.eq_ignore_ascii_case(BASIC_AUTH_SCHEME_PREFIX) {
         return Ok(None);
     }
-    Ok(value.get(6..))
+    Ok(value.get(prefix_len..))
 }
 
 fn merge_route_field(
@@ -332,6 +333,14 @@ impl<'a> NativeReader<'a> {
             }
         }
         Err(ClickhouseParseError::InvalidNativeHello)
+    }
+
+    fn skip_client_identity(&mut self) -> Result<(), ClickhouseParseError> {
+        self.read_string()?;
+        self.read_uvarint()?;
+        self.read_uvarint()?;
+        self.read_uvarint()?;
+        Ok(())
     }
 
     fn read_string(&mut self) -> Result<String, ClickhouseParseError> {

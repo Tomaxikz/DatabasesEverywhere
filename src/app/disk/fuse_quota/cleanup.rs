@@ -2,6 +2,13 @@ use std::{collections::HashSet, os::unix::fs::MetadataExt};
 
 use super::*;
 
+const MAX_SCANNED_ENTRIES: usize = 8192;
+const MAX_CANDIDATES: usize = 4096;
+const MOUNT_NAME_PART_LENGTH: usize = 24;
+const CONTAINER_INVENTORY_TIMEOUT: Duration = Duration::from_secs(15);
+const HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+const HELPER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Default, Debug)]
 pub(crate) struct CleanupSummary {
     pub checked: usize,
@@ -28,35 +35,7 @@ pub(crate) async fn cleanup_unused_helpers(
     let mounts = fuse_root.join("instances");
     check_private_directory(&sockets)?;
     check_private_directory(&mounts)?;
-    let mut candidates = HashSet::new();
-    let mut scanned = 0;
-    for (directory, socket) in [(&sockets, true), (&mounts, false)] {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            scanned += 1;
-            anyhow::ensure!(
-                scanned <= 8192,
-                "FUSE runtime directory scan limit exceeded"
-            );
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let name = if socket {
-                let Some(name) = name.strip_suffix(".sock") else {
-                    continue;
-                };
-                name
-            } else {
-                name
-            };
-            if valid_name(name) {
-                candidates.insert(name.to_owned());
-            }
-            anyhow::ensure!(
-                candidates.len() <= 4096,
-                "FUSE cleanup inventory limit exceeded"
-            );
-        }
-    }
+    let candidates = collect_candidates(&sockets, &mounts)?;
     let mut summary = CleanupSummary::default();
     for name in candidates {
         summary.checked += 1;
@@ -68,7 +47,7 @@ pub(crate) async fn cleanup_unused_helpers(
         // Re-inspect all containers immediately before each candidate, including
         // those outside DBEV. Failure leaves everything untouched.
         let sources = timeout(
-            Duration::from_secs(15),
+            CONTAINER_INVENTORY_TIMEOUT,
             docker.all_container_mount_sources(),
         )
         .await??;
@@ -91,6 +70,41 @@ pub(crate) async fn cleanup_unused_helpers(
         }
     }
     Ok(summary)
+}
+
+fn collect_candidates(sockets: &Path, mounts: &Path) -> anyhow::Result<HashSet<String>> {
+    let mut candidates = HashSet::new();
+    let mut scanned = 0;
+    for (directory, is_socket_directory) in [(sockets, true), (mounts, false)] {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            scanned += 1;
+            anyhow::ensure!(
+                scanned <= MAX_SCANNED_ENTRIES,
+                "FUSE runtime directory scan limit exceeded"
+            );
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let name = if is_socket_directory {
+                let Some(name) = file_name.strip_suffix(".sock") else {
+                    continue;
+                };
+                name
+            } else {
+                file_name
+            };
+            if valid_name(name) {
+                candidates.insert(name.to_owned());
+            }
+            anyhow::ensure!(
+                candidates.len() <= MAX_CANDIDATES,
+                "FUSE cleanup inventory limit exceeded"
+            );
+        }
+    }
+    Ok(candidates)
 }
 
 fn check_private_directory(path: &Path) -> anyhow::Result<()> {
@@ -118,11 +132,11 @@ fn check_private_directory(path: &Path) -> anyhow::Result<()> {
 
 fn valid_name(name: &str) -> bool {
     let (prefix, hash) = name.rsplit_once('-').unwrap_or(("", name));
-    prefix.len() <= 24
+    prefix.len() <= MOUNT_NAME_PART_LENGTH
         && prefix
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        && hash.len() == 24
+        && hash.len() == MOUNT_NAME_PART_LENGTH
         && hash
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
@@ -173,14 +187,7 @@ async fn cleanup_one(root: &Path, mount: &Path, socket: &Path) -> anyhow::Result
             Some(response.peer_pid)
         }
         Err(error) if mounted => return Err(error.into()),
-        Err(DiskLimitError::PathIo { source, .. })
-            if matches!(
-                source.kind(),
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused
-            ) =>
-        {
-            None
-        }
+        Err(error) if helper_is_absent(&error) => None,
         Err(error) => return Err(error.into()),
     };
     anyhow::ensure!(
@@ -197,27 +204,36 @@ async fn cleanup_one(root: &Path, mount: &Path, socket: &Path) -> anyhow::Result
                 verify_helper(pid, root, mount, socket).await?;
                 send_command_detailed(socket, "do end", Some(pid)).await?;
             }
-            Err(DiskLimitError::PathIo { source, .. })
-                if matches!(
-                    source.kind(),
-                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
-                ) => {}
+            Err(error) if helper_is_absent(&error) => {}
             Err(error) => return Err(error.into()),
         }
-        let started = Instant::now();
-        while Path::new(&format!("/proc/{pid}")).exists() {
-            anyhow::ensure!(
-                started.elapsed() < Duration::from_secs(3),
-                "helper shutdown is not yet confirmed; runtime paths retained"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
+        wait_for_helper_exit(pid).await?;
     }
     remove_control_socket(socket).await?;
     match fs::remove_dir(mount) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn helper_is_absent(error: &DiskLimitError) -> bool {
+    matches!(
+        error,
+        DiskLimitError::PathIo { source, .. }
+            if matches!(source.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused)
+    )
+}
+
+async fn wait_for_helper_exit(pid: i32) -> anyhow::Result<()> {
+    let started = Instant::now();
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        anyhow::ensure!(
+            started.elapsed() < HELPER_EXIT_TIMEOUT,
+            "helper shutdown is not yet confirmed; runtime paths retained"
+        );
+        sleep(HELPER_EXIT_POLL_INTERVAL).await;
     }
     Ok(())
 }
@@ -233,11 +249,7 @@ async fn verify_helper(pid: i32, root: &Path, mount: &Path, socket: &Path) -> an
         executable.starts_with(root.join("bin")) && name.starts_with("fusequota-"),
         "helper executable is not a managed FuseQuota binary"
     );
-    let file = tokio::fs::File::open(format!("/proc/{pid}/cmdline")).await?;
-    let mut bytes = Vec::new();
-    file.take((MAX_HELPER_CMDLINE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
+    let bytes = read_helper_cmdline(pid).await?;
     anyhow::ensure!(
         bytes.len() <= MAX_HELPER_CMDLINE_BYTES && bytes.ends_with(&[0]),
         "invalid helper command line"

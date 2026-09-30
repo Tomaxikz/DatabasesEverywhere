@@ -69,20 +69,20 @@ impl ActivityRepository {
             .bind(&bucket.stats_epoch)
             .bind(bucket.gap)
             .bind(bucket.operations_observed)
-            .bind(as_i64(bucket.accepted.read))
-            .bind(as_i64(bucket.accepted.write))
-            .bind(as_i64(bucket.accepted.ddl))
-            .bind(as_i64(bucket.accepted.other))
-            .bind(as_i64(bucket.rejected.read))
-            .bind(as_i64(bucket.rejected.write))
-            .bind(as_i64(bucket.rejected.ddl))
-            .bind(as_i64(bucket.rejected.other))
-            .bind(as_i64(bucket.active_connections))
-            .bind(as_i64(bucket.opened_connections))
-            .bind(as_i64(bucket.rx_bytes))
-            .bind(as_i64(bucket.tx_bytes))
-            .bind(bucket.cpu_time_micros.map(as_i64))
-            .bind(bucket.peak_query_memory_bytes.map(as_i64))
+            .bind(clamp_to_i64(bucket.accepted.read))
+            .bind(clamp_to_i64(bucket.accepted.write))
+            .bind(clamp_to_i64(bucket.accepted.ddl))
+            .bind(clamp_to_i64(bucket.accepted.other))
+            .bind(clamp_to_i64(bucket.rejected.read))
+            .bind(clamp_to_i64(bucket.rejected.write))
+            .bind(clamp_to_i64(bucket.rejected.ddl))
+            .bind(clamp_to_i64(bucket.rejected.other))
+            .bind(clamp_to_i64(bucket.active_connections))
+            .bind(clamp_to_i64(bucket.opened_connections))
+            .bind(clamp_to_i64(bucket.rx_bytes))
+            .bind(clamp_to_i64(bucket.tx_bytes))
+            .bind(bucket.cpu_time_micros.map(clamp_to_i64))
+            .bind(bucket.peak_query_memory_bytes.map(clamp_to_i64))
             .execute(&mut *transaction)
             .await?;
         }
@@ -166,7 +166,7 @@ fn row_to_bucket(row: sqlx::sqlite::SqliteRow) -> Result<ActivityBucket, Activit
     })
 }
 
-fn as_i64(value: u64) -> i64 {
+fn clamp_to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 

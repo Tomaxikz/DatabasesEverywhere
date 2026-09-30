@@ -26,6 +26,8 @@ use crate::{
 use root_identity::{ObservationDisposition, RootIdentityTracker, watch_fingerprint};
 use watch_operations::{DesiredWatch, WatchOperation, WatchOperationQueue};
 
+const GRACEFUL_STOP_TIMEOUT_PADDING: Duration = Duration::from_secs(5);
+
 pub(super) async fn monitor_soft_disk_limits(state: AppState) {
     let scanner = &state.config.disk.soft_scanner;
     let base_interval = state.soft_disk_limiter.scan_interval();
@@ -251,16 +253,13 @@ async fn sync_soft_disk_targets(
     let mut current = HashMap::new();
     let mut candidates = Vec::new();
     for metadata in state.instances.list().await {
+        let active = matches!(
+            metadata.status,
+            InstanceStatus::Running | InstanceStatus::Booting
+        );
         if metadata.deployment_mode != crate::placement::DeploymentMode::Dedicated
-            || !matches!(
-                metadata.status,
-                InstanceStatus::Running | InstanceStatus::Booting
-            )
-            || !(crate::disk::soft::SoftDiskLimiter::enforcement_required(
-                state.config.disk.mode,
-                metadata.protocol,
-            ) || (metadata.protocol == Protocol::Qdrant
-                && metadata.limits.disk_enforcement_method == "fuse_quota"))
+            || !active
+            || !soft_monitoring_required(&metadata, state.config.disk.mode)
         {
             continue;
         }
@@ -354,9 +353,7 @@ async fn sync_soft_disk_targets(
         let watcher_trusted = target.protocol != Protocol::Qdrant
             && watcher.as_ref().is_some_and(|watcher| {
                 watch_queue.is_confirmed(&target_id, &watch_fingerprint)
-                    && watcher
-                        .status(&target_id)
-                        .is_some_and(|status| status.status == RegistrationStatus::Watching)
+                    && is_watching(watcher, &target_id)
             });
         planner.upsert_target(
             now,
@@ -728,10 +725,7 @@ fn refresh_watcher_work(
         if !targets.contains_key(&target_id) {
             continue;
         }
-        let trusted = watch_queue.is_current_desire_confirmed(&target_id)
-            && watcher
-                .status(&target_id)
-                .is_some_and(|status| status.status == RegistrationStatus::Watching);
+        let trusted = watcher_is_trusted(watcher, watch_queue, &target_id);
         planner.set_watcher_trusted(&target_id, trusted, now);
         if !trusted {
             continue;
@@ -746,6 +740,20 @@ fn refresh_watcher_work(
         }
     }
     changes.sequence
+}
+
+fn watcher_is_trusted(
+    watcher: &SoftDiskWatcher,
+    watch_queue: &WatchOperationQueue,
+    target_id: &str,
+) -> bool {
+    watch_queue.is_current_desire_confirmed(target_id) && is_watching(watcher, target_id)
+}
+
+fn is_watching(watcher: &SoftDiskWatcher, target_id: &str) -> bool {
+    watcher
+        .status(target_id)
+        .is_some_and(|status| status.status == RegistrationStatus::Watching)
 }
 
 fn dispatch_due_scans(
@@ -765,12 +773,9 @@ fn dispatch_due_scans(
             planner.complete(&candidate, now, ScanCompletion::Failed);
             continue;
         };
-        let watcher_trusted = watcher.as_ref().is_some_and(|watcher| {
-            watch_queue.is_current_desire_confirmed(&candidate.target_id)
-                && watcher
-                    .status(&candidate.target_id)
-                    .is_some_and(|status| status.status == RegistrationStatus::Watching)
-        });
+        let watcher_trusted = watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher_is_trusted(watcher, watch_queue, &candidate.target_id));
         let batch = watcher_trusted
             .then(|| {
                 watcher
@@ -1027,6 +1032,51 @@ impl AppStateSoftDiskRuntime {
     ) -> bool {
         is_current_target(metadata, target, self.state.config.disk.mode)
     }
+
+    async fn lock_unless_held(
+        &self,
+        instance_id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.lifecycle_lock_held {
+            None
+        } else {
+            Some(self.state.instance_locks.lock(instance_id).await)
+        }
+    }
+
+    async fn persist_disk_block(
+        &self,
+        target: &SoftDiskTarget,
+        exceeded: &SoftDiskLimitExceeded,
+    ) -> Result<bool, String> {
+        if let Some(mut metadata) = self.state.instances.get(&target.instance_id).await {
+            if !self.target_is_current(&metadata, target) {
+                return Ok(false);
+            }
+            metadata.desired_state = DesiredInstanceState::Stopped;
+            metadata.disk_limit_blocked = true;
+            metadata.updated_at = now_rfc3339();
+            self.state
+                .manager
+                .upsert(metadata)
+                .await
+                .map_err(|error| format!("failed to persist disk-limit stop intent: {error}"))?;
+        } else if !mark_shared_disk_blocked(&self.state, target).await? {
+            return Ok(false);
+        }
+        tracing::warn!(
+            event = "audit soft_disk_restart_blocked",
+            instance_id = %target.instance_id,
+            protocol = %target.protocol,
+            physical_bytes = exceeded.snapshot.usage.physical_bytes,
+            stop_threshold_bytes = exceeded.snapshot.stop_threshold_bytes,
+            recovery_threshold_bytes = exceeded.snapshot.recovery_threshold_bytes,
+            block_reason = exceeded.reason.as_str(),
+            scan_error = exceeded.reason.scan_error(),
+            "persisted an intentional stopped state until disk usage recovers"
+        );
+        Ok(true)
+    }
 }
 
 pub(super) fn is_current_target(
@@ -1034,10 +1084,6 @@ pub(super) fn is_current_target(
     target: &SoftDiskTarget,
     global_mode: crate::config::DiskLimitMode,
 ) -> bool {
-    let monitoring_required =
-        crate::disk::soft::SoftDiskLimiter::enforcement_required(global_mode, metadata.protocol)
-            || (metadata.protocol == Protocol::Qdrant
-                && metadata.limits.disk_enforcement_method == "fuse_quota");
     metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
         && metadata.instance_id == target.instance_id
         && metadata.created_at == target.created_at
@@ -1047,7 +1093,17 @@ pub(super) fn is_current_target(
             InstanceStatus::Running | InstanceStatus::Booting
         )
         && mib_to_bytes(metadata.limits.disk_mib) == target.limit_bytes
-        && monitoring_required
+        && soft_monitoring_required(metadata, global_mode)
+}
+
+fn soft_monitoring_required(
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    global_mode: crate::config::DiskLimitMode,
+) -> bool {
+    let legacy_qdrant_fuse = metadata.protocol == Protocol::Qdrant
+        && metadata.limits.disk_enforcement_method == "fuse_quota";
+    crate::disk::soft::SoftDiskLimiter::enforcement_required(global_mode, metadata.protocol)
+        || legacy_qdrant_fuse
 }
 
 impl SoftDiskRuntime for AppStateSoftDiskRuntime {
@@ -1057,35 +1113,8 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         exceeded: &'a SoftDiskLimitExceeded,
     ) -> crate::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
-            let _operation = if self.lifecycle_lock_held {
-                None
-            } else {
-                Some(self.state.instance_locks.lock(&target.instance_id).await)
-            };
-            if let Some(mut metadata) = self.state.instances.get(&target.instance_id).await {
-                if !self.target_is_current(&metadata, target) {
-                    return Ok(());
-                }
-                metadata.desired_state = DesiredInstanceState::Stopped;
-                metadata.disk_limit_blocked = true;
-                metadata.updated_at = now_rfc3339();
-                self.state.manager.upsert(metadata).await.map_err(|error| {
-                    format!("failed to persist disk-limit stop intent: {error}")
-                })?;
-            } else if !mark_shared_disk_blocked(&self.state, target).await? {
-                return Ok(());
-            }
-            tracing::warn!(
-                event = "audit soft_disk_restart_blocked",
-                instance_id = %target.instance_id,
-                protocol = %target.protocol,
-                physical_bytes = exceeded.snapshot.usage.physical_bytes,
-                stop_threshold_bytes = exceeded.snapshot.stop_threshold_bytes,
-                recovery_threshold_bytes = exceeded.snapshot.recovery_threshold_bytes,
-                block_reason = exceeded.reason.as_str(),
-                scan_error = exceeded.reason.scan_error(),
-                "persisted an intentional stopped state until disk usage recovers"
-            );
+            let _operation = self.lock_unless_held(&target.instance_id).await;
+            self.persist_disk_block(target, exceeded).await?;
             Ok(())
         })
     }
@@ -1097,20 +1126,16 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
     ) -> crate::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
             // Leave the exact stop deadline and SIGKILL fallback to the supervisor.
-            match self
+            let stopped = self
                 .state
                 .docker
                 .stop_with_timeout(
                     target.protocol,
                     &target.instance_id,
-                    grace.saturating_add(Duration::from_secs(5)),
+                    grace.saturating_add(GRACEFUL_STOP_TIMEOUT_PADDING),
                 )
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(error) if error.is_not_found() || error.is_not_running() => Ok(()),
-                Err(error) => Err(error.to_string()),
-            }
+                .await;
+            ignore_absent_container(stopped)
         })
     }
 
@@ -1119,16 +1144,12 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         target: &'a SoftDiskTarget,
     ) -> crate::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
-            match self
+            let killed = self
                 .state
                 .docker
                 .kill(target.protocol, &target.instance_id)
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(error) if error.is_not_found() || error.is_not_running() => Ok(()),
-                Err(error) => Err(error.to_string()),
-            }
+                .await;
+            ignore_absent_container(killed)
         })
     }
 
@@ -1137,11 +1158,7 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         target: &'a SoftDiskTarget,
     ) -> crate::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
-            let _operation = if self.lifecycle_lock_held {
-                None
-            } else {
-                Some(self.state.instance_locks.lock(&target.instance_id).await)
-            };
+            let _operation = self.lock_unless_held(&target.instance_id).await;
             let Some(mut metadata) = self.state.instances.get(&target.instance_id).await else {
                 return Ok(());
             };
@@ -1166,36 +1183,21 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
     ) -> crate::disk::soft::StopRuntimeFuture<'a> {
         Box::pin(async move {
             // Keep Start serialized through durable intent and runtime shutdown.
-            let _operation = if self.lifecycle_lock_held {
-                None
-            } else {
-                Some(self.state.instance_locks.lock(&target.instance_id).await)
-            };
-            if let Some(mut metadata) = self.state.instances.get(&target.instance_id).await {
-                if !self.target_is_current(&metadata, target) {
-                    return Ok(StopOutcome::SkippedStale);
-                }
-                metadata.desired_state = DesiredInstanceState::Stopped;
-                metadata.disk_limit_blocked = true;
-                metadata.updated_at = now_rfc3339();
-                self.state.manager.upsert(metadata).await.map_err(|error| {
-                    format!("failed to persist disk-limit stop intent: {error}")
-                })?;
-            } else if !mark_shared_disk_blocked(&self.state, target).await? {
+            let _operation = self.lock_unless_held(&target.instance_id).await;
+            if !self.persist_disk_block(target, exceeded).await? {
                 return Ok(StopOutcome::SkippedStale);
             }
-            tracing::warn!(
-                event = "audit soft_disk_restart_blocked",
-                instance_id = %target.instance_id,
-                protocol = %target.protocol,
-                physical_bytes = exceeded.snapshot.usage.physical_bytes,
-                stop_threshold_bytes = exceeded.snapshot.stop_threshold_bytes,
-                recovery_threshold_bytes = exceeded.snapshot.recovery_threshold_bytes,
-                block_reason = exceeded.reason.as_str(),
-                scan_error = exceeded.reason.scan_error(),
-                "persisted an intentional stopped state until disk usage recovers"
-            );
             crate::disk::soft::stop_with_kill_fallback(self, target, grace).await
         })
+    }
+}
+
+fn ignore_absent_container<T>(
+    result: Result<T, crate::runtime::docker::DockerError>,
+) -> Result<(), String> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_not_found() || error.is_not_running() => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }

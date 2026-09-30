@@ -21,6 +21,8 @@ use crate::disk::usage::{DirectoryUsage, ScanLimits};
 
 const ALLOCATION_BLOCK_BYTES: u64 = 512;
 const CACHE_DIRECTORY_LIMIT_MESSAGE: &str = "usage-tree directory cache limit exceeded";
+const STAGING_DIRECTORY_BOUND_MESSAGE: &str =
+    "the cumulative incremental cache directory bound was exceeded while staging dirty subtrees";
 
 /// Open `path` without following its final component and return its identity.
 pub(crate) fn root_identity(path: &Path) -> Result<RootIdentity, Error> {
@@ -63,6 +65,7 @@ pub(crate) enum ReconcileError {
 }
 
 impl ReconcileError {
+    #[cfg(test)]
     pub(crate) fn requires_full_scan(&self) -> bool {
         matches!(self, Self::FullScanRequired(_))
     }
@@ -184,56 +187,8 @@ impl UsageTreeCache {
         let mut staged_directory_count = 0_usize;
         for candidate in candidates {
             budget.check()?;
-            let directory = match open_relative_directory(&root_fd, &candidate) {
-                Ok(directory) => directory,
-                Err(OpenRelativeError::Unavailable) => {
-                    return Err(ReconcileError::full(
-                        "a dirty subtree changed while it was being scanned",
-                    ));
-                }
-                Err(OpenRelativeError::Io(error)) => return Err(ReconcileError::Io(error)),
-            };
-            let stat = fstat(&directory)
-                .map_err(Error::from)
-                .map_err(ReconcileError::Io)?;
-            let identity = identity_from_stat(&stat).map_err(ReconcileError::Io)?;
-            if identity == self.root_identity && !candidate.as_os_str().is_empty() {
-                return Err(ReconcileError::full(
-                    "a dirty subtree unexpectedly resolves to the scan root",
-                ));
-            }
-            let mut replacement = HashMap::new();
-            let remaining_staging_capacity = self
-                .max_cached_directories
-                .checked_sub(staged_directory_count)
-                .ok_or_else(|| {
-                    ReconcileError::full(
-                        "the cumulative incremental cache directory bound was exceeded while staging dirty subtrees",
-                    )
-                })?;
-            if remaining_staging_capacity == 0 {
-                return Err(ReconcileError::full(
-                    "the cumulative incremental cache directory bound was exceeded while staging dirty subtrees",
-                ));
-            }
-            scan_directory_tree(
-                &directory,
-                &stat,
-                &candidate,
-                component_count(&candidate),
-                &mut budget,
-                &mut replacement,
-                remaining_staging_capacity,
-            )
-            .map_err(|error| {
-                if is_cache_directory_limit_error(&error) {
-                    ReconcileError::full(
-                        "the cumulative incremental cache directory bound was exceeded while staging dirty subtrees",
-                    )
-                } else {
-                    ReconcileError::Io(error)
-                }
-            })?;
+            let replacement =
+                self.stage_replacement(&root_fd, &candidate, staged_directory_count, &mut budget)?;
             staged_directory_count = staged_directory_count
                 .checked_add(replacement.len())
                 .ok_or_else(|| {
@@ -252,6 +207,58 @@ impl UsageTreeCache {
         }
 
         self.commit_replacements(staged, limits)
+    }
+
+    fn stage_replacement(
+        &self,
+        root_fd: &OwnedFd,
+        candidate: &Path,
+        staged_directory_count: usize,
+        budget: &mut ScanBudget,
+    ) -> Result<HashMap<PathBuf, CachedDirectory>, ReconcileError> {
+        let directory = match open_relative_directory(root_fd, candidate) {
+            Ok(directory) => directory,
+            Err(OpenRelativeError::Unavailable) => {
+                return Err(ReconcileError::full(
+                    "a dirty subtree changed while it was being scanned",
+                ));
+            }
+            Err(OpenRelativeError::Io(error)) => return Err(ReconcileError::Io(error)),
+        };
+        let stat = fstat(&directory)
+            .map_err(Error::from)
+            .map_err(ReconcileError::Io)?;
+        let identity = identity_from_stat(&stat).map_err(ReconcileError::Io)?;
+        if identity == self.root_identity && !candidate.as_os_str().is_empty() {
+            return Err(ReconcileError::full(
+                "a dirty subtree unexpectedly resolves to the scan root",
+            ));
+        }
+        let mut replacement = HashMap::new();
+        let remaining_staging_capacity = self
+            .max_cached_directories
+            .checked_sub(staged_directory_count)
+            .ok_or_else(|| ReconcileError::full(STAGING_DIRECTORY_BOUND_MESSAGE))?;
+        if remaining_staging_capacity == 0 {
+            return Err(ReconcileError::full(STAGING_DIRECTORY_BOUND_MESSAGE));
+        }
+        scan_directory_tree(
+            &directory,
+            &stat,
+            candidate,
+            component_count(candidate),
+            budget,
+            &mut replacement,
+            remaining_staging_capacity,
+        )
+        .map_err(|error| {
+            if is_cache_directory_limit_error(&error) {
+                ReconcileError::full(STAGING_DIRECTORY_BOUND_MESSAGE)
+            } else {
+                ReconcileError::Io(error)
+            }
+        })?;
+        Ok(replacement)
     }
 
     fn plan_candidates(
@@ -566,12 +573,7 @@ fn scan_directory_tree(
                         format!("disk scan exceeded depth {}", budget.limits.max_depth),
                     ));
                 }
-                let child = match openat(
-                    directory,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                ) {
+                let child = match openat(directory, name, directory_open_flags(), Mode::empty()) {
                     Ok(child) => child,
                     Err(error) if transient_entry_error(error) => {
                         base.physical_bytes =
@@ -726,12 +728,7 @@ fn validate_complete_tree(
 }
 
 fn open_root(path: &Path) -> Result<(OwnedFd, RootIdentity, Stat), Error> {
-    let directory = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(Error::from)?;
+    let directory = open(path, directory_open_flags(), Mode::empty()).map_err(Error::from)?;
     let stat = fstat(&directory).map_err(Error::from)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         return Err(Error::new(
@@ -741,6 +738,10 @@ fn open_root(path: &Path) -> Result<(OwnedFd, RootIdentity, Stat), Error> {
     }
     let identity = identity_from_stat(&stat)?;
     Ok((directory, identity, stat))
+}
+
+fn directory_open_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
 enum OpenRelativeError {
@@ -762,12 +763,7 @@ fn open_relative_directory(
                 "disk scan path is not a clean relative path",
             )));
         };
-        directory = match openat(
-            &directory,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
+        directory = match openat(&directory, name, directory_open_flags(), Mode::empty()) {
             Ok(directory) => directory,
             Err(error) if unavailable_path_error(error) => {
                 return Err(OpenRelativeError::Unavailable);

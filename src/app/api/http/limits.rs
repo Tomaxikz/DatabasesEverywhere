@@ -108,67 +108,37 @@ impl ApiRateLimiter {
         } else {
             Arc::clone(&self.active_requests)
         };
-        match admission.try_acquire_owned() {
-            Ok(permit) => Ok(ApiRequestPermit {
-                _permit: permit,
-                capacity_logged: Arc::clone(&self.request_capacity_logged),
-            }),
-            Err(_) => {
-                if !self.request_capacity_logged.swap(true, Ordering::AcqRel) {
-                    tracing::warn!("audit api_request_capacity_reached");
-                }
-                Err(ApiError::RateLimited)
+        let Ok(permit) = admission.try_acquire_owned() else {
+            let already_logged = self.request_capacity_logged.swap(true, Ordering::AcqRel);
+            if !already_logged {
+                tracing::warn!("audit api_request_capacity_reached");
             }
-        }
+            return Err(ApiError::RateLimited);
+        };
+        Ok(ApiRequestPermit {
+            _permit: permit,
+            capacity_logged: Arc::clone(&self.request_capacity_logged),
+        })
     }
 
     async fn allow(&self, identity: &RateLimitIdentity) -> RateLimitDecision {
         let now = Instant::now();
-        let shard = rate_limit_shard(&identity.key);
-        let mut inner = self.inner[shard].lock().await;
-        evict_expired_windows(&mut inner, now);
-        if inner.windows.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD
-            && !inner.windows.contains_key(&identity.key)
-        {
-            let eviction_candidate = inner
-                .windows
-                .iter()
-                .filter(|(_, window)| !window.trusted)
-                .min_by_key(|(_, window)| window.last_seen)
-                .map(|(key, _)| key.clone());
-            if let Some(key) = eviction_candidate {
-                inner.windows.remove(&key);
-                inner.capacity_rejection_logged = false;
-            } else if !identity.trusted {
-                let should_log = !inner.capacity_rejection_logged;
-                inner.capacity_rejection_logged = true;
-                return RateLimitDecision::Rejected { should_log };
-            } else if let Some(key) = inner
-                .windows
-                .iter()
-                .min_by_key(|(_, window)| window.last_seen)
-                .map(|(key, _)| key.clone())
-            {
-                inner.windows.remove(&key);
-                inner.capacity_rejection_logged = false;
-            }
+        let shard_index = rate_limit_shard(&identity.key);
+        let mut shard = self.inner[shard_index].lock().await;
+        evict_expired_windows(&mut shard, now);
+        if let Some(rejection) = make_room_for_new_key(&mut shard, identity) {
+            return rejection;
         }
-        if !inner.windows.contains_key(&identity.key) {
-            inner.windows.insert(
-                identity.key.clone(),
-                RateWindow {
-                    started_at: now,
-                    last_seen: now,
-                    count: 0,
-                    trusted: identity.trusted,
-                    rejection_logged: false,
-                },
-            );
-        }
-        let window = inner
+        let window = shard
             .windows
-            .get_mut(&identity.key)
-            .expect("rate-limit window was inserted");
+            .entry(identity.key.clone())
+            .or_insert_with(|| RateWindow {
+                started_at: now,
+                last_seen: now,
+                count: 0,
+                trusted: identity.trusted,
+                rejection_logged: false,
+            });
         if now.duration_since(window.started_at) >= API_RATE_LIMIT_WINDOW {
             window.started_at = now;
             window.count = 0;
@@ -260,6 +230,38 @@ fn evict_expired_windows(inner: &mut RateLimitShard, now: Instant) {
     if inner.windows.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
         inner.capacity_rejection_logged = false;
     }
+}
+
+fn make_room_for_new_key(
+    shard: &mut RateLimitShard,
+    identity: &RateLimitIdentity,
+) -> Option<RateLimitDecision> {
+    let shard_is_full = shard.windows.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD;
+    if !shard_is_full || shard.windows.contains_key(&identity.key) {
+        return None;
+    }
+    let untrusted_victim =
+        least_recently_seen_key(shard.windows.iter().filter(|(_, window)| !window.trusted));
+    let victim = match untrusted_victim {
+        Some(key) => key,
+        None if !identity.trusted => {
+            let should_log = !shard.capacity_rejection_logged;
+            shard.capacity_rejection_logged = true;
+            return Some(RateLimitDecision::Rejected { should_log });
+        }
+        None => least_recently_seen_key(shard.windows.iter())?,
+    };
+    shard.windows.remove(&victim);
+    shard.capacity_rejection_logged = false;
+    None
+}
+
+fn least_recently_seen_key<'a>(
+    windows: impl Iterator<Item = (&'a RateLimitKey, &'a RateWindow)>,
+) -> Option<RateLimitKey> {
+    windows
+        .min_by_key(|(_, window)| window.last_seen)
+        .map(|(key, _)| key.clone())
 }
 
 fn rate_limit_shard(key: &RateLimitKey) -> usize {
@@ -425,31 +427,25 @@ fn rate_limit_identity(
     peer: Option<SocketAddr>,
 ) -> RateLimitIdentity {
     let peer = peer_rate_limit_group(peer);
+    let trusted_identity = |kind, fingerprint| RateLimitIdentity {
+        key: RateLimitKey::Authenticated {
+            kind,
+            fingerprint,
+            peer,
+        },
+        trusted: true,
+    };
     match authentication {
-        RequestAuthentication::Api(accepted) => RateLimitIdentity {
-            key: RateLimitKey::Authenticated {
-                kind: CredentialKind::Api,
-                fingerprint: accepted.rate_limit_fingerprint(),
-                peer,
-            },
-            trusted: true,
-        },
-        RequestAuthentication::WebSocket(claims) => RateLimitIdentity {
-            key: RateLimitKey::Authenticated {
-                kind: CredentialKind::Jwt,
-                fingerprint: credential_fingerprint(CredentialKind::Jwt, &claims.jti),
-                peer,
-            },
-            trusted: true,
-        },
-        RequestAuthentication::SignedJwt { fingerprint } => RateLimitIdentity {
-            key: RateLimitKey::Authenticated {
-                kind: CredentialKind::Jwt,
-                fingerprint: *fingerprint,
-                peer,
-            },
-            trusted: true,
-        },
+        RequestAuthentication::Api(accepted) => {
+            trusted_identity(CredentialKind::Api, accepted.rate_limit_fingerprint())
+        }
+        RequestAuthentication::WebSocket(claims) => trusted_identity(
+            CredentialKind::Jwt,
+            credential_fingerprint(CredentialKind::Jwt, &claims.jti),
+        ),
+        RequestAuthentication::SignedJwt { fingerprint } => {
+            trusted_identity(CredentialKind::Jwt, *fingerprint)
+        }
         RequestAuthentication::Unauthenticated => RateLimitIdentity {
             key: peer_rate_limit_key(peer),
             trusted: false,

@@ -42,61 +42,79 @@ pub(super) async fn collect(
     let tables = table_catalog(context).await?;
     for table in &tables {
         match table.kind {
-            TableKind::Base => {
-                if !table
-                    .engine
-                    .as_deref()
-                    .is_some_and(|engine| engine.eq_ignore_ascii_case("InnoDB"))
-                {
-                    return Err(ManifestError::UnsupportedFeature(format!(
-                        "{} table {} uses non-transactional engine {}; the logical export cannot provide a consistent snapshot",
-                        context.runtime.protocol.as_str(),
-                        table.name,
-                        table.engine.as_deref().unwrap_or("unknown")
-                    )));
-                }
-                let definition = show_create(context, "TABLE", &table.name).await?;
-                collected.push_schema(SchemaRecord::new(
-                    object_key("table", &[&table.name]),
-                    normalize_qualified_sql(&definition, context.target.database),
-                )?)?;
-                let columns = table_columns(context, &table.name).await?;
-                let digest = table_digest(context, &table.name, &columns).await?;
-                collected.push_data(DataRecord::new(
-                    object_key("table-data", &[&table.name]),
-                    digest,
-                )?)?;
-            }
-            TableKind::View => {
-                let definition = view_definition(context, &table.name).await?;
-                collected.push_schema(SchemaRecord::new(
-                    object_key("view", &[&table.name]),
-                    normalize_qualified_sql(&definition, context.target.database),
-                )?)?;
-            }
-            TableKind::Sequence => {
-                if context.runtime.protocol != Protocol::Mariadb {
-                    return Err(ManifestError::UnsupportedFeature(format!(
-                        "unexpected sequence {} in {}",
-                        table.name,
-                        context.runtime.protocol.as_str()
-                    )));
-                }
-                let definition = show_create(context, "SEQUENCE", &table.name).await?;
-                collected.push_schema(SchemaRecord::new(
-                    object_key("sequence", &[&table.name]),
-                    normalize_qualified_sql(&definition, context.target.database),
-                )?)?;
-                let digest = sequence_digest(context, &table.name).await?;
-                collected.push_data(DataRecord::new(
-                    object_key("sequence-state", &[&table.name]),
-                    digest,
-                )?)?;
-            }
+            TableKind::Base => collect_base_table(context, table, &mut collected).await?,
+            TableKind::View => collect_view(context, table, &mut collected).await?,
+            TableKind::Sequence => collect_sequence(context, table, &mut collected).await?,
         }
     }
     collect_auxiliary_schema(context, &mut collected).await?;
     Ok(collected)
+}
+
+async fn collect_base_table(
+    context: &ManifestContext<'_>,
+    table: &Table,
+    collected: &mut CollectedManifest,
+) -> Result<(), ManifestError> {
+    let is_innodb = table
+        .engine
+        .as_deref()
+        .is_some_and(|engine| engine.eq_ignore_ascii_case("InnoDB"));
+    if !is_innodb {
+        return Err(ManifestError::UnsupportedFeature(format!(
+            "{} table {} uses non-transactional engine {}; the logical export cannot provide a consistent snapshot",
+            context.runtime.protocol.as_str(),
+            table.name,
+            table.engine.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let definition = show_create(context, "TABLE", &table.name).await?;
+    collected.push_schema(SchemaRecord::new(
+        object_key("table", &[&table.name]),
+        normalize_qualified_sql(&definition, context.target.database),
+    )?)?;
+    let columns = table_columns(context, &table.name).await?;
+    let digest = table_digest(context, &table.name, &columns).await?;
+    collected.push_data(DataRecord::new(
+        object_key("table-data", &[&table.name]),
+        digest,
+    )?)
+}
+
+async fn collect_view(
+    context: &ManifestContext<'_>,
+    table: &Table,
+    collected: &mut CollectedManifest,
+) -> Result<(), ManifestError> {
+    let definition = view_definition(context, &table.name).await?;
+    collected.push_schema(SchemaRecord::new(
+        object_key("view", &[&table.name]),
+        normalize_qualified_sql(&definition, context.target.database),
+    )?)
+}
+
+async fn collect_sequence(
+    context: &ManifestContext<'_>,
+    table: &Table,
+    collected: &mut CollectedManifest,
+) -> Result<(), ManifestError> {
+    if context.runtime.protocol != Protocol::Mariadb {
+        return Err(ManifestError::UnsupportedFeature(format!(
+            "unexpected sequence {} in {}",
+            table.name,
+            context.runtime.protocol.as_str()
+        )));
+    }
+    let definition = show_create(context, "SEQUENCE", &table.name).await?;
+    collected.push_schema(SchemaRecord::new(
+        object_key("sequence", &[&table.name]),
+        normalize_qualified_sql(&definition, context.target.database),
+    )?)?;
+    let digest = sequence_digest(context, &table.name).await?;
+    collected.push_data(DataRecord::new(
+        object_key("sequence-state", &[&table.name]),
+        digest,
+    )?)
 }
 
 fn data_size_sql() -> &'static str {
@@ -123,38 +141,42 @@ LIMIT {PAGE_SIZE} OFFSET {offset};"#,
         let mut rows = 0;
         for line in output.lines().filter(|line| !line.trim().is_empty()) {
             rows += 1;
-            let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() != 3 {
-                return Err(ManifestError::InvalidCatalog(
-                    "invalid MySQL table catalog row",
-                ));
-            }
-            let name = decode_utf8(fields[0])?;
-            let table_type = decode_utf8(fields[1])?;
-            let engine = decode_utf8(fields[2])?;
-            validate_identifier(&name)?;
-            let kind = match table_type.as_str() {
-                "BASE TABLE" | "SYSTEM VERSIONED" => TableKind::Base,
-                "VIEW" => TableKind::View,
-                "SEQUENCE" => TableKind::Sequence,
-                other => {
-                    return Err(ManifestError::UnsupportedFeature(format!(
-                        "{} table type {other} is not covered",
-                        context.runtime.protocol.as_str()
-                    )));
-                }
-            };
-            tables.push(Table {
-                name,
-                kind,
-                engine: (!engine.is_empty()).then_some(engine),
-            });
+            tables.push(parse_table_row(context, line)?);
         }
         if rows < PAGE_SIZE {
             return Ok(tables);
         }
         offset += PAGE_SIZE;
     }
+}
+
+fn parse_table_row(context: &ManifestContext<'_>, line: &str) -> Result<Table, ManifestError> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(ManifestError::InvalidCatalog(
+            "invalid MySQL table catalog row",
+        ));
+    }
+    let name = decode_utf8(fields[0])?;
+    let table_type = decode_utf8(fields[1])?;
+    let engine = decode_utf8(fields[2])?;
+    validate_identifier(&name)?;
+    let kind = match table_type.as_str() {
+        "BASE TABLE" | "SYSTEM VERSIONED" => TableKind::Base,
+        "VIEW" => TableKind::View,
+        "SEQUENCE" => TableKind::Sequence,
+        other => {
+            return Err(ManifestError::UnsupportedFeature(format!(
+                "{} table type {other} is not covered",
+                context.runtime.protocol.as_str()
+            )));
+        }
+    };
+    Ok(Table {
+        name,
+        kind,
+        engine: (!engine.is_empty()).then_some(engine),
+    })
 }
 
 async fn show_create(
@@ -356,14 +378,11 @@ async fn collect_auxiliary_schema(
                     "{kind} {name} is not visible under the tenant credential"
                 )));
             }
+            let definition = String::from_utf8(definition)
+                .map_err(|_| ManifestError::InvalidCatalog("MySQL definition is not UTF-8"))?;
             collected.push_schema(SchemaRecord::new(
                 object_key(kind, &[&name]),
-                normalize_qualified_sql(
-                    &String::from_utf8(definition).map_err(|_| {
-                        ManifestError::InvalidCatalog("MySQL definition is not UTF-8")
-                    })?,
-                    context.target.database,
-                ),
+                normalize_qualified_sql(&definition, context.target.database),
             )?)?;
         }
         if rows < PAGE_SIZE {

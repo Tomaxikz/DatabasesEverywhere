@@ -22,7 +22,7 @@ use tokio::{
     sync::oneshot,
 };
 
-use super::{DockerError, DockerRuntime, ExecRecovery};
+use super::{DockerError, DockerRuntime, ExecRecovery, command::shell_command};
 use crate::shared::{files::sync_directory, logs::summarize_failure_logs, protocol::Protocol};
 
 const EXEC_STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -31,6 +31,7 @@ const EXEC_STREAM_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(30)
 const EXEC_STREAM_STDERR_TAIL_BYTES: usize = 32 * 1024;
 const EXEC_STREAM_FAILURE_DIAGNOSTIC_CHARS: usize = 8 * 1024;
 const STREAM_OPERATION: &str = "streaming exec [command and environment redacted]";
+const EXEC_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecStreamResult {
@@ -96,7 +97,7 @@ impl DockerRuntime {
         self.exec_streaming(
             protocol,
             instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            shell_command(script),
             environment,
             ExecStreamOptions {
                 direction: ExecStreamDirection::Input {
@@ -131,7 +132,7 @@ impl DockerRuntime {
         self.exec_streaming(
             protocol,
             instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            shell_command(script),
             environment,
             ExecStreamOptions {
                 direction: ExecStreamDirection::Output {
@@ -394,7 +395,7 @@ impl DockerRuntime {
                     .exit_code
                     .ok_or(DockerError::ExecExitStatusUnavailable);
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(EXEC_EXIT_POLL_INTERVAL).await;
         }
     }
 }

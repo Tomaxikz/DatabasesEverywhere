@@ -188,7 +188,7 @@ impl SchedulerCapacity {
             } else {
                 1
             };
-            available.saturating_mul(3).saturating_div(5).max(1)
+            memory_budget_from_available(available)
         } else {
             config.dynamic_memory_budget_mib
         };
@@ -243,6 +243,10 @@ impl SchedulerCapacity {
     }
 }
 
+fn memory_budget_from_available(available_mib: u64) -> u64 {
+    available_mib.saturating_mul(3).saturating_div(5).max(1)
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SchedulerSnapshot {
     pub capacity: SchedulerCapacity,
@@ -268,6 +272,12 @@ struct Shared {
     capacity_refresh_interval: Duration,
     resource_provider: Arc<dyn SchedulerResourceProvider>,
     state: Mutex<SchedulerState>,
+}
+
+impl Shared {
+    fn refreshes_capacity(&self) -> bool {
+        self.auto_memory_budget || self.auto_cpu_units
+    }
 }
 
 #[derive(Debug)]
@@ -429,10 +439,7 @@ impl Drop for ExecutionPermit {
             return;
         };
         let mut state = lock_unpoisoned(&self.shared.state);
-        state.active_jobs = state.active_jobs.saturating_sub(1);
-        state.active_memory_mib = state.active_memory_mib.saturating_sub(cost.memory_mib);
-        state.active_io_mib = state.active_io_mib.saturating_sub(cost.io_mib);
-        state.active_cpu_units = state.active_cpu_units.saturating_sub(cost.cpu_units);
+        release(&mut state, cost);
         dispatch(&self.shared, &mut state);
     }
 }
@@ -455,18 +462,17 @@ impl Drop for WaitingRegistration {
 }
 
 fn refresh_capacity(shared: &Shared, state: &mut SchedulerState) {
-    if !shared.auto_memory_budget && !shared.auto_cpu_units {
+    if !shared.refreshes_capacity() {
         return;
     }
     let sample = shared.resource_provider.sample();
     if shared.auto_memory_budget {
         if sample.memory_valid {
-            let candidate = sample
-                .available_memory_mib
-                .unwrap_or(FALLBACK_AVAILABLE_MEMORY_MIB)
-                .saturating_mul(3)
-                .saturating_div(5)
-                .max(1);
+            let candidate = memory_budget_from_available(
+                sample
+                    .available_memory_mib
+                    .unwrap_or(FALLBACK_AVAILABLE_MEMORY_MIB),
+            );
             apply_capacity_sample(
                 &mut state.capacity.memory_budget_mib,
                 &mut state.pending_memory_increase_mib,
@@ -557,7 +563,7 @@ fn reject_expired_unfit_jobs(shared: &Shared, state: &mut SchedulerState) {
 }
 
 fn schedule_capacity_refresh(shared: &Arc<Shared>, state: &mut SchedulerState) {
-    if state.refresh_wakeup_scheduled || (!shared.auto_memory_budget && !shared.auto_cpu_units) {
+    if state.refresh_wakeup_scheduled || !shared.refreshes_capacity() {
         return;
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -585,17 +591,16 @@ fn schedule_capacity_refresh(shared: &Arc<Shared>, state: &mut SchedulerState) {
 
 fn runnable_index(shared: &Shared, state: &SchedulerState) -> Option<usize> {
     let head = state.waiting.front()?;
-    if fits(state.capacity, state, head.cost)
-        || (state.active_jobs == 0 && fits_hard_memory(state.capacity, head.cost))
-    {
+    let head_fits_hard_memory = fits_hard_memory(state.capacity, head.cost);
+    let head_runs_alone = state.active_jobs == 0 && head_fits_hard_memory;
+    if fits(state.capacity, state, head.cost) || head_runs_alone {
         return Some(0);
     }
-    let waiting_for_live_capacity = state.capacity.mode == SchedulerMode::Dynamic
-        && !fits_hard_memory(state.capacity, head.cost);
-    if !waiting_for_live_capacity
-        && (head.bypasses >= shared.max_bypass
-            || head.queued_at.elapsed() >= shared.starvation_timeout)
-    {
+    let waiting_for_live_capacity =
+        state.capacity.mode == SchedulerMode::Dynamic && !head_fits_hard_memory;
+    let head_is_starving =
+        head.bypasses >= shared.max_bypass || head.queued_at.elapsed() >= shared.starvation_timeout;
+    if !waiting_for_live_capacity && head_is_starving {
         return None;
     }
     state

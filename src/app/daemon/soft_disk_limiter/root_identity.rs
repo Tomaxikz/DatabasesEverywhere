@@ -46,28 +46,23 @@ impl RootIdentityTracker {
         if completed_fingerprint != current_fingerprint {
             return ObservationDisposition::StaleTarget;
         }
-        match self.observations.get_mut(target_id) {
-            Some(observation) if observation.target_fingerprint == current_fingerprint => {
-                if observation.identity == identity {
-                    ObservationDisposition::Unchanged
-                } else {
-                    observation.identity = identity;
-                    ObservationDisposition::Replaced
-                }
+        if let Some(observation) = self.observations.get_mut(target_id)
+            && observation.target_fingerprint == current_fingerprint
+        {
+            if observation.identity == identity {
+                return ObservationDisposition::Unchanged;
             }
-            observation => {
-                let value = Observation {
-                    target_fingerprint: current_fingerprint.to_string(),
-                    identity,
-                };
-                if let Some(observation) = observation {
-                    *observation = value;
-                } else {
-                    self.observations.insert(target_id.to_string(), value);
-                }
-                ObservationDisposition::Initialized
-            }
+            observation.identity = identity;
+            return ObservationDisposition::Replaced;
         }
+        self.observations.insert(
+            target_id.to_string(),
+            Observation {
+                target_fingerprint: current_fingerprint.to_string(),
+                identity,
+            },
+        );
+        ObservationDisposition::Initialized
     }
 
     pub(super) fn retain_targets(&mut self, current: &HashMap<String, String>) {

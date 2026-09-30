@@ -11,23 +11,19 @@ pub(super) async fn prepare_import_artifact(
     max_unarchived_bytes: u64,
 ) -> Result<(), ApiError> {
     let Some(requested_format) = options.archive_format.as_deref() else {
-        check_source_size(artifact_path, max_unarchived_bytes).await?;
-        copy_file(artifact_path, host_temp).await?;
-        return Ok(());
+        return copy_unarchived_source(artifact_path, host_temp, max_unarchived_bytes).await;
     };
 
     let format = ImportArchiveFormat::parse(requested_format)?;
     match format {
         ImportArchiveFormat::Plain => {
-            check_source_size(artifact_path, max_unarchived_bytes).await?;
-            copy_file(artifact_path, host_temp).await
+            copy_unarchived_source(artifact_path, host_temp, max_unarchived_bytes).await
         }
         // MongoDB's canonical dump is itself a native gzip archive consumed by
         // `mongorestore --gzip`; treating it as a generic wrapper would strip
         // the compression layer and make the prepared stream un-restorable.
         ImportArchiveFormat::Gzip if protocol == Protocol::Mongodb => {
-            check_source_size(artifact_path, max_unarchived_bytes).await?;
-            copy_file(artifact_path, host_temp).await
+            copy_unarchived_source(artifact_path, host_temp, max_unarchived_bytes).await
         }
         ImportArchiveFormat::Gzip => {
             decompress_gzip(artifact_path, host_temp, max_unarchived_bytes).await
@@ -35,33 +31,36 @@ pub(super) async fn prepare_import_artifact(
         ImportArchiveFormat::Bzip2 => {
             decompress_bzip2(artifact_path, host_temp, max_unarchived_bytes).await
         }
-        ImportArchiveFormat::Tar | ImportArchiveFormat::TarGzip => {
+        ImportArchiveFormat::Tar | ImportArchiveFormat::TarGzip | ImportArchiveFormat::Zip => {
             let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
-            let result = match extract_tar_archive(
-                artifact_path,
-                &staging,
-                format == ImportArchiveFormat::TarGzip,
-                max_unarchived_bytes,
-            )
-            .await
-            {
+            let extracted = if format == ImportArchiveFormat::Zip {
+                extract_zip_archive(artifact_path, &staging, max_unarchived_bytes).await
+            } else {
+                extract_tar_archive(
+                    artifact_path,
+                    &staging,
+                    format == ImportArchiveFormat::TarGzip,
+                    max_unarchived_bytes,
+                )
+                .await
+            };
+            let result = match extracted {
                 Ok(()) => install_selected_dump(protocol, &staging, host_temp).await,
                 Err(error) => Err(error),
             };
             cleanup_dir(&staging).await;
             result
         }
-        ImportArchiveFormat::Zip => {
-            let staging = staging_root.join(format!(".dbe-unarchive-{}", uuid::Uuid::new_v4()));
-            let result =
-                match extract_zip_archive(artifact_path, &staging, max_unarchived_bytes).await {
-                    Ok(()) => install_selected_dump(protocol, &staging, host_temp).await,
-                    Err(error) => Err(error),
-                };
-            cleanup_dir(&staging).await;
-            result
-        }
     }
+}
+
+async fn copy_unarchived_source(
+    artifact_path: &FsPath,
+    host_temp: &FsPath,
+    max_unarchived_bytes: u64,
+) -> Result<(), ApiError> {
+    check_source_size(artifact_path, max_unarchived_bytes).await?;
+    copy_file(artifact_path, host_temp).await
 }
 
 async fn check_source_size(path: &FsPath, limit: u64) -> Result<(), ApiError> {

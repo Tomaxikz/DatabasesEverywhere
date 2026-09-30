@@ -3,6 +3,8 @@ use super::super::{
     quote_mysql_ident as quote_identifier,
 };
 
+const NATIVE_PASSWORD_VERIFIER_HEX_LEN: usize = 40;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MariadbProvisionError {
     #[error("native password verifier must be 40 hexadecimal characters")]
@@ -55,13 +57,7 @@ fn build_tenant_user_sql(
     native_password_sha1_stage2_hex: &str,
     access: TenantAccess,
 ) -> Result<String, MariadbProvisionError> {
-    if native_password_sha1_stage2_hex.len() != 40
-        || !native_password_sha1_stage2_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(MariadbProvisionError::InvalidNativePasswordVerifier);
-    }
+    validate_native_password_verifier(native_password_sha1_stage2_hex)?;
 
     let database_ident = quote_identifier(database);
     let username_ident = quote_identifier(username);
@@ -86,18 +82,25 @@ pub fn reset_tenant_password_sql(
     username: &str,
     native_password_sha1_stage2_hex: &str,
 ) -> Result<String, MariadbProvisionError> {
-    if native_password_sha1_stage2_hex.len() != 40
+    validate_native_password_verifier(native_password_sha1_stage2_hex)?;
+    Ok(format!(
+        "ALTER USER {}@'%' IDENTIFIED BY PASSWORD '*{}';",
+        quote_identifier(username),
+        native_password_sha1_stage2_hex.to_ascii_uppercase(),
+    ))
+}
+
+fn validate_native_password_verifier(
+    native_password_sha1_stage2_hex: &str,
+) -> Result<(), MariadbProvisionError> {
+    if native_password_sha1_stage2_hex.len() != NATIVE_PASSWORD_VERIFIER_HEX_LEN
         || !native_password_sha1_stage2_hex
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(MariadbProvisionError::InvalidNativePasswordVerifier);
     }
-    Ok(format!(
-        "ALTER USER {}@'%' IDENTIFIED BY PASSWORD '*{}';",
-        quote_identifier(username),
-        native_password_sha1_stage2_hex.to_ascii_uppercase(),
-    ))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

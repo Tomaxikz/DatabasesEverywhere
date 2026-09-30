@@ -11,13 +11,7 @@ pub(super) async fn run_dedicated_to_shared(
     creation: OwnedMutexGuard<()>,
 ) -> Result<(), ApiError> {
     let mut creation = Some(creation);
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Preflight,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Preflight).await?;
     let source_runtime = state
         .placements
         .get(source.runtime_id())
@@ -28,13 +22,7 @@ pub(super) async fn run_dedicated_to_shared(
         .tenant_password
         .as_deref()
         .ok_or_else(|| ApiError::Conflict("source tenant credential disappeared".into()))?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::TargetPreparing,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::TargetPreparing).await?;
     let temp_id = temp_instance_id(&migration.migration_id)?;
     let temp_password = temporary_password();
     let mut request = target_request(&source, &source_runtime, &temp_id, &temp_password);
@@ -124,25 +112,8 @@ pub(super) async fn run_dedicated_to_shared(
     // permit then covers both structural scans, export, import, and target
     // validation; no expensive manifest phase may bypass the scheduler.
     let copy_admission = admit_logical_copy(state, &source).await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::SourceFencing,
-        MigrationPatch::default(),
-    )
-    .await?;
-    let drained = crate::instances::sessions::fence_and_wait(
-        &state.instances,
-        &state.gateway_supervisor.tenant_sessions(),
-        &source.instance_id,
-        SESSION_DRAIN_TIMEOUT,
-    )
-    .await;
-    if !drained {
-        return Err(ApiError::Conflict(
-            "source gateway sessions did not drain before the migration deadline".to_string(),
-        ));
-    }
+    migration = advance_to(state, migration, MigrationStage::SourceFencing).await?;
+    drain_source_sessions(state, &source).await?;
     migration = advance(
         state,
         migration,
@@ -169,13 +140,7 @@ pub(super) async fn run_dedicated_to_shared(
     .await?;
     migration = copied.migration;
 
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Validating,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Validating).await?;
     validate_target(
         state,
         &mut migration,
@@ -208,21 +173,8 @@ pub(super) async fn run_dedicated_to_shared(
 
     let mut final_metadata = provisional;
     final_metadata.instance_id.clone_from(&source.instance_id);
-    final_metadata.public = source.public.clone();
-    final_metadata.tenant_password = Some(password.to_string());
-    final_metadata.created_at.clone_from(&source.created_at);
-    final_metadata.updated_at = now_rfc3339();
-    final_metadata.mariadb_native_password_sha1_stage2 =
-        source.mariadb_native_password_sha1_stage2.clone();
-    final_metadata.mysql_native_password_sha1_stage2 =
-        source.mysql_native_password_sha1_stage2.clone();
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::CutoverPending,
-        MigrationPatch::default(),
-    )
-    .await?;
+    adopt_source_identity(&mut final_metadata, &source, password);
+    migration = advance_to(state, migration, MigrationStage::CutoverPending).await?;
     migration = state
         .placements
         .migrations()
@@ -254,28 +206,10 @@ pub(super) async fn run_dedicated_to_shared(
     .map_err(|error| ApiError::Runtime(format!("cutover target verification failed: {error}")))?;
     state.instances.upsert(final_metadata).await;
     clear_caches(state, &source.instance_id).await;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::VerifyingCutover,
-        MigrationPatch::default(),
-    )
-    .await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::CleaningSource,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::VerifyingCutover).await?;
+    migration = advance_to(state, migration, MigrationStage::CleaningSource).await?;
     retire_dedicated_source(state, &source_runtime).await?;
-    let completed = advance(
-        state,
-        migration,
-        MigrationStage::Completed,
-        MigrationPatch::default(),
-    )
-    .await?;
+    let completed = advance_to(state, migration, MigrationStage::Completed).await?;
     remove_artifact_root(state, &completed.migration_id).await;
     tracing::info!(
         event = "audit deployment_migration_completed",
@@ -288,19 +222,55 @@ pub(super) async fn run_dedicated_to_shared(
     Ok(())
 }
 
+async fn drain_source_sessions(
+    state: &AppState,
+    source: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let drained = crate::instances::sessions::fence_and_wait(
+        &state.instances,
+        &state.gateway_supervisor.tenant_sessions(),
+        &source.instance_id,
+        SESSION_DRAIN_TIMEOUT,
+    )
+    .await;
+    if !drained {
+        return Err(ApiError::Conflict(
+            "source gateway sessions did not drain before the migration deadline".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn adopt_source_identity(target: &mut InstanceMetadata, source: &InstanceMetadata, password: &str) {
+    target.public = source.public.clone();
+    target.tenant_password = Some(password.to_string());
+    target.created_at.clone_from(&source.created_at);
+    target.updated_at = now_rfc3339();
+    target.mariadb_native_password_sha1_stage2 = source.mariadb_native_password_sha1_stage2.clone();
+    target.mysql_native_password_sha1_stage2 = source.mysql_native_password_sha1_stage2.clone();
+}
+
+async fn save_runtime_without_admin_secret(
+    state: &AppState,
+    runtime: &EngineRuntime,
+) -> Result<(), ApiError> {
+    let mut runtime_record = runtime.clone();
+    runtime_record.admin_secret = None;
+    state
+        .placements
+        .save(&runtime_record)
+        .await
+        .map_err(runtime_error)?;
+    Ok(())
+}
+
 pub(super) async fn run_shared_to_dedicated(
     state: &AppState,
     source: InstanceMetadata,
     mut migration: DeploymentMigration,
     creation: OwnedMutexGuard<()>,
 ) -> Result<(), ApiError> {
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Preflight,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Preflight).await?;
     let source_runtime = state
         .placements
         .get(source.runtime_id())
@@ -322,13 +292,7 @@ pub(super) async fn run_shared_to_dedicated(
     )
     .await?;
 
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::TargetPreparing,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::TargetPreparing).await?;
     // This private engine has no gateway route until cutover. Bootstrap with
     // the durable credential: changing it later would reapply shared grants
     // and cannot work for ClickHouse's XML-managed dedicated account.
@@ -351,13 +315,7 @@ pub(super) async fn run_shared_to_dedicated(
         .await
         .map_err(runtime_error)?;
     let mut target_runtime = target.runtime();
-    let mut runtime_record = target_runtime.clone();
-    runtime_record.admin_secret = None;
-    state
-        .placements
-        .save(&runtime_record)
-        .await
-        .map_err(runtime_error)?;
+    save_runtime_without_admin_secret(state, &target_runtime).await?;
     // The provisional engine row is the durable node-capacity commit. Release
     // global admission before credential probes and container launch.
     drop(creation);
@@ -373,13 +331,7 @@ pub(super) async fn run_shared_to_dedicated(
     attest_dedicated_target(state, &target.metadata).await?;
     target_runtime.status = EngineRuntimeStatus::Running;
     target_runtime.updated_at = now_rfc3339();
-    runtime_record = target_runtime.clone();
-    runtime_record.admin_secret = None;
-    state
-        .placements
-        .save(&runtime_record)
-        .await
-        .map_err(runtime_error)?;
+    save_runtime_without_admin_secret(state, &target_runtime).await?;
     migration = advance(
         state,
         migration,
@@ -393,25 +345,8 @@ pub(super) async fn run_shared_to_dedicated(
     // Wait for scheduler capacity before making the shared source
     // unavailable. The permit remains held through target validation.
     let copy_admission = admit_logical_copy(state, &source).await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::SourceFencing,
-        MigrationPatch::default(),
-    )
-    .await?;
-    let drained = crate::instances::sessions::fence_and_wait(
-        &state.instances,
-        &state.gateway_supervisor.tenant_sessions(),
-        &source.instance_id,
-        SESSION_DRAIN_TIMEOUT,
-    )
-    .await;
-    if !drained {
-        return Err(ApiError::Conflict(
-            "source gateway sessions did not drain before the migration deadline".to_string(),
-        ));
-    }
+    migration = advance_to(state, migration, MigrationStage::SourceFencing).await?;
+    drain_source_sessions(state, &source).await?;
     // Kill live tenant sessions at the engine too. Re-enable the role only for
     // DBE's private export connection; the gateway route remains fenced.
     tenant::fence(&state.docker, &source_runtime, tenant_target(&source))
@@ -444,13 +379,7 @@ pub(super) async fn run_shared_to_dedicated(
     )
     .await?;
     migration = copied.migration;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Validating,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Validating).await?;
     validate_target(
         state,
         &mut migration,
@@ -465,14 +394,7 @@ pub(super) async fn run_shared_to_dedicated(
 
     let mut final_metadata = target.metadata;
     final_metadata.status = crate::instances::metadata::InstanceStatus::Running;
-    final_metadata.public = source.public.clone();
-    final_metadata.tenant_password = Some(password.to_string());
-    final_metadata.created_at.clone_from(&source.created_at);
-    final_metadata.updated_at = now_rfc3339();
-    final_metadata.mariadb_native_password_sha1_stage2 =
-        source.mariadb_native_password_sha1_stage2.clone();
-    final_metadata.mysql_native_password_sha1_stage2 =
-        source.mysql_native_password_sha1_stage2.clone();
+    adopt_source_identity(&mut final_metadata, &source, password);
     tenant::verify_password(
         &state.docker,
         &target_runtime,
@@ -484,13 +406,7 @@ pub(super) async fn run_shared_to_dedicated(
         ApiError::Runtime(format!("target credential verification failed: {error}"))
     })?;
 
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::CutoverPending,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::CutoverPending).await?;
     let source_reservation_id = temp_instance_id(&migration.migration_id)?;
     migration = state
         .placements
@@ -514,28 +430,10 @@ pub(super) async fn run_shared_to_dedicated(
     .map_err(|error| ApiError::Runtime(format!("cutover target verification failed: {error}")))?;
     state.instances.upsert(final_metadata).await;
     clear_caches(state, &source.instance_id).await;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::VerifyingCutover,
-        MigrationPatch::default(),
-    )
-    .await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::CleaningSource,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::VerifyingCutover).await?;
+    migration = advance_to(state, migration, MigrationStage::CleaningSource).await?;
     retire_shared_source(state, &source_runtime, &source, &migration.migration_id).await?;
-    let completed = advance(
-        state,
-        migration,
-        MigrationStage::Completed,
-        MigrationPatch::default(),
-    )
-    .await?;
+    let completed = advance_to(state, migration, MigrationStage::Completed).await?;
     remove_artifact_root(state, &completed.migration_id).await;
     tracing::info!(
         event = "audit deployment_migration_completed",

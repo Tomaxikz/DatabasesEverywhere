@@ -172,24 +172,21 @@ where
                 return Ok::<(), ListenerError>(());
             }
             client_read.read_exact(&mut header[1..]).await?;
-            let payload_len = usize::from(header[0])
-                | (usize::from(header[1]) << 8)
-                | (usize::from(header[2]) << 16);
-            if header[3] == 0 {
+            let payload_len = mysql_payload_len(&header);
+            let is_command_packet = header[3] == 0;
+            if is_command_packet {
                 continued_command = None;
             }
             if payload_len == 0 {
                 backend_write.write_all(&header).await?;
-                if header[3] != 0
-                    && let Some(kind) = continued_command.take()
-                {
+                if !is_command_packet && let Some(kind) = continued_command.take() {
                     activity.accept(kind);
                 }
                 continue;
             }
             let mut first = [0_u8; 1];
             client_read.read_exact(&mut first).await?;
-            if header[3] == 0 && first[0] == MYSQL_COM_CHANGE_USER {
+            if is_command_packet && first[0] == MYSQL_COM_CHANGE_USER {
                 activity.reject_kind(OperationKind::Other);
                 return Err(ListenerError::IdentitySwitchRejected {
                     protocol: protocol.as_str(),
@@ -199,7 +196,7 @@ where
             // Nonzero packets can contain arbitrary continuation or LOCAL
             // INFILE bytes, so their first payload byte is not a command.
             if shared
-                && header[3] == 0
+                && is_command_packet
                 && matches!(first[0], MYSQL_COM_CREATE_DB | MYSQL_COM_DROP_DB)
             {
                 activity.reject_kind(OperationKind::Ddl);
@@ -210,7 +207,7 @@ where
                 .into());
             }
             if shared
-                && header[3] == 0
+                && is_command_packet
                 && matches!(first[0], MYSQL_COM_QUERY | MYSQL_COM_STMT_PREPARE)
             {
                 if payload_len == MYSQL_MAX_SINGLE_PACKET_PAYLOAD {
@@ -250,7 +247,7 @@ where
             }
             backend_write.write_all(&header).await?;
             backend_write.write_all(&first).await?;
-            let command = (header[3] == 0).then_some(first[0]);
+            let command = is_command_packet.then_some(first[0]);
             let remaining = payload_len - 1;
             let prefix_len = remaining.min(SQL_PREFIX_BYTES);
             let mut prefix = [0_u8; SQL_PREFIX_BYTES];
@@ -277,7 +274,7 @@ where
                 } else {
                     activity.accept(kind);
                 }
-            } else if header[3] != 0
+            } else if !is_command_packet
                 && payload_len < MYSQL_MAX_SINGLE_PACKET_PAYLOAD
                 && let Some(kind) = continued_command.take()
             {
@@ -355,7 +352,7 @@ async fn read_mongodb_prefix(
     reader.read_exact(&mut header[1..]).await?;
     let message_len = i32::from_le_bytes(header[..4].try_into().unwrap());
     if !(16..=crate::protocols::mongodb::MAX_WIRE_MESSAGE_BYTES as i32).contains(&message_len) {
-        return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+        return Err(malformed_mongodb_message());
     }
     let message_len = message_len as usize;
     let opcode = i32::from_le_bytes(header[12..16].try_into().unwrap());
@@ -370,7 +367,7 @@ async fn read_mongodb_prefix(
         MONGODB_OP_MSG => {
             append_exact(reader, &mut prefix, 5, message_len).await?;
             if prefix[20] != 0 {
-                return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+                return Err(malformed_mongodb_message());
             }
             Some(read_mongodb_command_key(reader, &mut prefix, message_len).await?)
         }
@@ -450,6 +447,10 @@ where
     Ok(())
 }
 
+fn mysql_payload_len(header: &[u8; 4]) -> usize {
+    usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16)
+}
+
 async fn copy_exact(
     reader: &mut (impl AsyncRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
@@ -463,45 +464,62 @@ async fn copy_exact(
     Ok(())
 }
 
+const SQL_READ_KEYWORDS: &[&[u8]] = &[b"SELECT", b"SHOW", b"DESCRIBE", b"DESC", b"EXPLAIN"];
+const SQL_WRITE_KEYWORDS: &[&[u8]] = &[
+    b"INSERT", b"UPDATE", b"DELETE", b"REPLACE", b"MERGE", b"LOAD",
+];
+const SQL_DDL_KEYWORDS: &[&[u8]] = &[
+    b"CREATE",
+    b"ALTER",
+    b"DROP",
+    b"TRUNCATE",
+    b"RENAME",
+    b"GRANT",
+    b"REVOKE",
+];
+
+const MONGODB_READ_COMMANDS: &[&[u8]] = &[b"find", b"getMore", b"aggregate", b"count", b"distinct"];
+const MONGODB_WRITE_COMMANDS: &[&[u8]] = &[
+    b"insert",
+    b"update",
+    b"delete",
+    b"findAndModify",
+    b"bulkWrite",
+];
+const MONGODB_DDL_COMMANDS: &[&[u8]] = &[
+    b"create",
+    b"drop",
+    b"renameCollection",
+    b"createIndexes",
+    b"dropIndexes",
+];
+const MONGODB_IDENTITY_COMMANDS: &[&[u8]] = &[
+    b"saslStart",
+    b"saslContinue",
+    b"authenticate",
+    b"logout",
+    b"getnonce",
+    b"hello",
+    b"isMaster",
+    b"ismaster",
+    b"$query",
+];
+
+fn matches_any_ignore_case(word: &[u8], candidates: &[&[u8]]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
+}
+
 fn classify_sql(sql: &[u8]) -> OperationKind {
     let Some(keyword) = sql_keyword(sql) else {
         return OperationKind::Other;
     };
-    if [
-        b"SELECT".as_slice(),
-        b"SHOW",
-        b"DESCRIBE",
-        b"DESC",
-        b"EXPLAIN",
-    ]
-    .iter()
-    .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-    {
+    if matches_any_ignore_case(keyword, SQL_READ_KEYWORDS) {
         OperationKind::Read
-    } else if [
-        b"INSERT".as_slice(),
-        b"UPDATE",
-        b"DELETE",
-        b"REPLACE",
-        b"MERGE",
-        b"LOAD",
-    ]
-    .iter()
-    .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-    {
+    } else if matches_any_ignore_case(keyword, SQL_WRITE_KEYWORDS) {
         OperationKind::Write
-    } else if [
-        b"CREATE".as_slice(),
-        b"ALTER",
-        b"DROP",
-        b"TRUNCATE",
-        b"RENAME",
-        b"GRANT",
-        b"REVOKE",
-    ]
-    .iter()
-    .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-    {
+    } else if matches_any_ignore_case(keyword, SQL_DDL_KEYWORDS) {
         OperationKind::Ddl
     } else {
         OperationKind::Other
@@ -535,38 +553,11 @@ fn sql_keyword(mut sql: &[u8]) -> Option<&[u8]> {
 }
 
 fn classify_mongodb(command: &[u8]) -> OperationKind {
-    if [
-        b"find".as_slice(),
-        b"getMore",
-        b"aggregate",
-        b"count",
-        b"distinct",
-    ]
-    .iter()
-    .any(|candidate| command.eq_ignore_ascii_case(candidate))
-    {
+    if matches_any_ignore_case(command, MONGODB_READ_COMMANDS) {
         OperationKind::Read
-    } else if [
-        b"insert".as_slice(),
-        b"update",
-        b"delete",
-        b"findAndModify",
-        b"bulkWrite",
-    ]
-    .iter()
-    .any(|candidate| command.eq_ignore_ascii_case(candidate))
-    {
+    } else if matches_any_ignore_case(command, MONGODB_WRITE_COMMANDS) {
         OperationKind::Write
-    } else if [
-        b"create".as_slice(),
-        b"drop",
-        b"renameCollection",
-        b"createIndexes",
-        b"dropIndexes",
-    ]
-    .iter()
-    .any(|candidate| command.eq_ignore_ascii_case(candidate))
-    {
+    } else if matches_any_ignore_case(command, MONGODB_DDL_COMMANDS) {
         OperationKind::Ddl
     } else {
         OperationKind::Other
@@ -582,10 +573,10 @@ async fn read_mongodb_command_key(
     append_exact(reader, prefix, 5, message_len).await?;
     let document_len = i32::from_le_bytes(prefix[start..start + 4].try_into().unwrap());
     if document_len < 5 || document_len as usize > message_len - start {
-        return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+        return Err(malformed_mongodb_message());
     }
     if prefix[start + 4] == 0 {
-        return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+        return Err(malformed_mongodb_message());
     }
     append_cstring(reader, prefix, message_len).await
 }
@@ -598,7 +589,7 @@ async fn append_cstring(
     let mut value = Vec::new();
     loop {
         if value.len() >= MONGODB_MAX_CSTRING_BYTES || prefix.len() >= message_len {
-            return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+            return Err(malformed_mongodb_message());
         }
         let mut byte = [0_u8; 1];
         reader.read_exact(&mut byte).await?;
@@ -621,7 +612,7 @@ async fn append_exact(
         .checked_add(bytes)
         .is_none_or(|end| end > message_len)
     {
-        return Err(crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into());
+        return Err(malformed_mongodb_message());
     }
     let start = prefix.len();
     prefix.resize(start + bytes, 0);
@@ -629,20 +620,12 @@ async fn append_exact(
     Ok(())
 }
 
+fn malformed_mongodb_message() -> ListenerError {
+    crate::protocols::mongodb::MongodbProxyError::MalformedMessage.into()
+}
+
 fn is_mongodb_identity_command(command: &[u8]) -> bool {
-    [
-        b"saslStart".as_slice(),
-        b"saslContinue".as_slice(),
-        b"authenticate".as_slice(),
-        b"logout".as_slice(),
-        b"getnonce".as_slice(),
-        b"hello".as_slice(),
-        b"isMaster".as_slice(),
-        b"ismaster".as_slice(),
-        b"$query".as_slice(),
-    ]
-    .iter()
-    .any(|blocked| command.eq_ignore_ascii_case(blocked))
+    matches_any_ignore_case(command, MONGODB_IDENTITY_COMMANDS)
 }
 
 #[cfg(test)]

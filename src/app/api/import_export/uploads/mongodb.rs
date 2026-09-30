@@ -41,14 +41,7 @@ fn resolve_source_database(
     source_database: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     if let Some(source_database) = source_database {
-        if catalog.is_some_and(|catalog| {
-            catalog.catalog_complete
-                && !catalog.namespaces.is_empty()
-                && !catalog
-                    .namespaces
-                    .iter()
-                    .any(|database| database == source_database)
-        }) {
+        if catalog.is_some_and(|catalog| catalog_rules_out_database(catalog, source_database)) {
             return Err(ApiError::Conflict(
                 "source.source_database does not match a source database detected in the uploaded MongoDB archive"
                     .to_string(),
@@ -82,6 +75,15 @@ fn resolve_source_database(
         ApiError::Runtime("stored upload catalog contains an invalid database".to_string())
     })?;
     Ok(Some(database.clone()))
+}
+
+fn catalog_rules_out_database(catalog: &DumpInspection, database: &str) -> bool {
+    catalog.catalog_complete
+        && !catalog.namespaces.is_empty()
+        && !catalog
+            .namespaces
+            .iter()
+            .any(|detected| detected == database)
 }
 
 fn manual_source_database_error(reason: &str) -> ApiError {

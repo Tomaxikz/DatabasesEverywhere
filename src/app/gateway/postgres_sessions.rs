@@ -12,6 +12,12 @@ use crate::{
 
 const MAX_ACTIVE_POSTGRES_CANCEL_KEYS: usize = 65_536;
 const MAX_POSTGRES_STARTUP_MESSAGE_BYTES: usize = 1024 * 1024;
+const MESSAGE_HEADER_BYTES: usize = 5;
+const AUTHENTICATION_REQUEST: u8 = b'R';
+const BACKEND_KEY_DATA: u8 = b'K';
+const READY_FOR_QUERY: u8 = b'Z';
+const ERROR_RESPONSE: u8 = b'E';
+const AUTH_REQUESTS_NEEDING_FRONTEND_REPLY: [i32; 7] = [3, 5, 7, 8, 9, 10, 11];
 
 #[derive(Debug, Clone)]
 struct CancelTarget {
@@ -72,13 +78,13 @@ where
     loop {
         let backend_message = read_message(backend).await?;
         let message_type = backend_message[0];
-        if message_type == b'K' {
+        if message_type == BACKEND_KEY_DATA {
             cancel_key = Some(
-                CancelKey::from_backend_data(&backend_message[5..])
+                CancelKey::from_backend_data(&backend_message[MESSAGE_HEADER_BYTES..])
                     .ok_or(PostgresSessionError::Malformed)?,
             );
         }
-        if message_type == b'Z' {
+        if message_type == READY_FOR_QUERY {
             // Do not tell the client it can send queries until the caller has
             // rechecked the route and acquired an authenticated tenant slot.
             return Ok(Some(Startup {
@@ -88,7 +94,7 @@ where
         }
         client.write_all(&backend_message).await?;
 
-        if message_type == b'E' {
+        if message_type == ERROR_RESPONSE {
             return Ok(None);
         }
 
@@ -111,11 +117,11 @@ impl Startup {
             let mut targets = cancel_targets()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if targets.len() >= MAX_ACTIVE_POSTGRES_CANCEL_KEYS && !targets.contains_key(key) {
-                return Err(PostgresSessionError::RegistryFull);
-            }
             if targets.contains_key(key) {
                 return Err(PostgresSessionError::RegistryCollision);
+            }
+            if targets.len() >= MAX_ACTIVE_POSTGRES_CANCEL_KEYS {
+                return Err(PostgresSessionError::RegistryFull);
             }
             targets.insert(
                 key.clone(),
@@ -160,7 +166,7 @@ pub(crate) async fn forward_cancel(
 async fn read_message(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<Vec<u8>, PostgresSessionError> {
-    let mut header = [0_u8; 5];
+    let mut header = [0_u8; MESSAGE_HEADER_BYTES];
     stream.read_exact(&mut header).await?;
     let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if !(4..=MAX_POSTGRES_STARTUP_MESSAGE_BYTES).contains(&length) {
@@ -172,12 +178,14 @@ async fn read_message(
     let mut message = Vec::with_capacity(total);
     message.extend_from_slice(&header);
     message.resize(total, 0);
-    stream.read_exact(&mut message[5..]).await?;
+    stream
+        .read_exact(&mut message[MESSAGE_HEADER_BYTES..])
+        .await?;
     Ok(message)
 }
 
 fn auth_needs_frontend_reply(message: &[u8]) -> Result<bool, PostgresSessionError> {
-    if message.first() != Some(&b'R') {
+    if message.first() != Some(&AUTHENTICATION_REQUEST) {
         return Ok(false);
     }
     if message.len() < 9 {
@@ -188,7 +196,7 @@ fn auth_needs_frontend_reply(message: &[u8]) -> Result<bool, PostgresSessionErro
             .try_into()
             .map_err(|_| PostgresSessionError::Malformed)?,
     );
-    Ok(matches!(code, 3 | 5 | 7 | 8 | 9 | 10 | 11))
+    Ok(AUTH_REQUESTS_NEEDING_FRONTEND_REPLY.contains(&code))
 }
 
 #[cfg(test)]

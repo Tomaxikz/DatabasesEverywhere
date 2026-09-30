@@ -22,6 +22,8 @@ const POSTGRES_TENANT_ROOT: &str = "dbev-tenants";
 const MYSQL_BOUNDARY_MARKER: &str = ".dbev-quota-boundary";
 const POSTGRES_CONTAINER_ROOT: &str = "/var/lib/postgresql/dbev-tenants";
 const SOFT_RECOVERY_PERCENT: u64 = 90;
+const SOFT_TENANT_ROOT: &str = "dbev-soft-tenants";
+const POSTGRES_STORAGE_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reconciles durable tenant metadata with the boundary the host actually
 /// restored. A hard boundary is a one-way safety promise: losing it must keep
@@ -58,9 +60,8 @@ pub(crate) fn check_transition(
 /// tenant is blocked it must fall below the recovery watermark before being
 /// reopened, preventing fence/unfence churn around the exact limit.
 pub(crate) fn soft_limit_blocked(used_bytes: u64, disk_mib: u64, already_blocked: bool) -> bool {
-    let limit_bytes = mib_to_bytes(disk_mib);
+    let (limit_bytes, recovery_bytes) = soft_limit_bytes(disk_mib);
     if already_blocked {
-        let recovery_bytes = limit_bytes.saturating_mul(SOFT_RECOVERY_PERCENT) / 100;
         used_bytes > recovery_bytes
     } else {
         used_bytes >= limit_bytes
@@ -101,7 +102,7 @@ pub(crate) async fn prepare(
             &runtime.runtime_id,
             &command,
             &[],
-            std::time::Duration::from_secs(30),
+            POSTGRES_STORAGE_SETUP_TIMEOUT,
         )
         .await?;
 
@@ -214,13 +215,14 @@ pub(crate) async fn prepare_drop(
     runtime: &EngineRuntime,
     target: TenantTarget<'_>,
 ) -> Result<(), TenantDiskError> {
-    if matches!(runtime.protocol, Protocol::Mysql | Protocol::Mariadb) {
-        let boundary = boundary(config, runtime, target)?;
-        let live = live_boundary(config, runtime, &boundary)?;
-        remove_mysql_marker(&live.path).await?;
-        if live.path != boundary.path {
-            require_absent(&boundary.path.join(MYSQL_BOUNDARY_MARKER)).await?;
-        }
+    if !matches!(runtime.protocol, Protocol::Mysql | Protocol::Mariadb) {
+        return Ok(());
+    }
+    let boundary = boundary(config, runtime, target)?;
+    let live = live_boundary(config, runtime, &boundary)?;
+    remove_mysql_marker(&live.path).await?;
+    if live.path != boundary.path {
+        require_absent(&boundary.path.join(MYSQL_BOUNDARY_MARKER)).await?;
     }
     Ok(())
 }
@@ -297,7 +299,7 @@ fn boundary(
     let path = match runtime.protocol {
         Protocol::Postgres => paths.data.join(POSTGRES_TENANT_ROOT).join(&key),
         Protocol::Mysql | Protocol::Mariadb => paths.data.join(mysql_filename(target.database)?),
-        Protocol::Mongodb | Protocol::Clickhouse => paths.data.join("dbev-soft-tenants").join(&key),
+        Protocol::Mongodb | Protocol::Clickhouse => paths.data.join(SOFT_TENANT_ROOT).join(&key),
         protocol => return Err(TenantDiskError::Unsupported(protocol)),
     };
     check_relative_child(&paths.data, &path)?;
@@ -322,13 +324,7 @@ fn live_boundary_for_method(
     persisted_method: &str,
     boundary: &Boundary,
 ) -> Result<LiveBoundary, TenantDiskError> {
-    let relative = boundary.path.strip_prefix(&boundary.root).map_err(|_| {
-        TenantDiskError::StorageIdentity(format!(
-            "tenant storage {} escapes shared root {}",
-            boundary.path.display(),
-            boundary.root.display()
-        ))
-    })?;
+    let relative = relative_to_root(&boundary.root, &boundary.path)?;
     let root = limiter(config)
         .for_persisted_method(persisted_method)
         .container_data_path(&boundary.root)?;
@@ -426,21 +422,41 @@ fn mysql_filename(database: &str) -> Result<String, TenantDiskError> {
 }
 
 fn check_relative_child(root: &Path, path: &Path) -> Result<(), TenantDiskError> {
-    let relative = path.strip_prefix(root).map_err(|_| {
+    let relative = relative_to_root(root, path)?;
+    let has_non_normal_component = relative
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)));
+    if relative.as_os_str().is_empty() || has_non_normal_component {
+        return Err(not_strict_child(path));
+    }
+    Ok(())
+}
+
+fn relative_to_root<'a>(root: &Path, path: &'a Path) -> Result<&'a Path, TenantDiskError> {
+    path.strip_prefix(root).map_err(|_| {
         TenantDiskError::StorageIdentity(format!(
             "tenant storage {} escapes shared root {}",
             path.display(),
             root.display()
         ))
-    })?;
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
+    })
+}
+
+fn not_strict_child(path: &Path) -> TenantDiskError {
+    TenantDiskError::StorageIdentity(format!(
+        "tenant storage path {} is not a strict relative child",
+        path.display()
+    ))
+}
+
+async fn require_real_component(component: &Path) -> Result<(), TenantDiskError> {
+    let metadata = tokio::fs::symlink_metadata(component)
+        .await
+        .map_err(|source| io_error(component, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(TenantDiskError::StorageIdentity(format!(
-            "tenant storage path {} is not a strict relative child",
-            path.display()
+            "tenant storage component {} must be a real directory",
+            component.display()
         )));
     }
     Ok(())
@@ -468,51 +484,25 @@ async fn require_real_dir(path: &Path) -> Result<(), TenantDiskError> {
 
 async fn require_dir_chain(root: &Path, path: &Path) -> Result<(), TenantDiskError> {
     require_real_dir(root).await?;
-    let relative = path.strip_prefix(root).map_err(|_| {
-        TenantDiskError::StorageIdentity(format!(
-            "tenant storage {} escapes shared root {}",
-            path.display(),
-            root.display()
-        ))
-    })?;
+    let relative = relative_to_root(root, path)?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(component) = component else {
-            return Err(TenantDiskError::StorageIdentity(format!(
-                "tenant storage path {} is not a strict relative child",
-                path.display()
-            )));
+            return Err(not_strict_child(path));
         };
         current.push(component);
-        let metadata = tokio::fs::symlink_metadata(&current)
-            .await
-            .map_err(|source| io_error(&current, source))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(TenantDiskError::StorageIdentity(format!(
-                "tenant storage component {} must be a real directory",
-                current.display()
-            )));
-        }
+        require_real_component(&current).await?;
     }
     Ok(())
 }
 
 async fn ensure_dir_chain(root: &Path, path: &Path) -> Result<(), TenantDiskError> {
     create_real_dir(root).await?;
-    let relative = path.strip_prefix(root).map_err(|_| {
-        TenantDiskError::StorageIdentity(format!(
-            "tenant storage {} escapes shared root {}",
-            path.display(),
-            root.display()
-        ))
-    })?;
+    let relative = relative_to_root(root, path)?;
     let mut current = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(component) = component else {
-            return Err(TenantDiskError::StorageIdentity(format!(
-                "tenant storage path {} is not a strict relative child",
-                path.display()
-            )));
+            return Err(not_strict_child(path));
         };
         current.push(component);
         match tokio::fs::create_dir(&current).await {
@@ -520,15 +510,7 @@ async fn ensure_dir_chain(root: &Path, path: &Path) -> Result<(), TenantDiskErro
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(io_error(&current, source)),
         }
-        let metadata = tokio::fs::symlink_metadata(&current)
-            .await
-            .map_err(|source| io_error(&current, source))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(TenantDiskError::StorageIdentity(format!(
-                "tenant storage component {} must be a real directory",
-                current.display()
-            )));
-        }
+        require_real_component(&current).await?;
     }
     Ok(())
 }

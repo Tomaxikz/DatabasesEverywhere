@@ -16,9 +16,13 @@ use super::{
     RUNTIME_STATS_STALE_AFTER, ResourceCache, ResourceReport, container_cpu_total,
     cpu_percent_over_wall_time, mib_to_bytes,
 };
-use crate::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus};
+use crate::{
+    placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
+    runtime::docker::DockerRuntime,
+};
 
 const HOST_CPU_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
+const HOST_CPU_RESAMPLE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HostCpuSample {
@@ -118,7 +122,7 @@ impl ResourceCache {
             return Ok(usage);
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(HOST_CPU_RESAMPLE_DELAY).await;
         let second = read_host_cpu().await?;
         self.record_host_cpu_sample(second).await.ok_or_else(|| {
             IoError::new(
@@ -742,68 +746,78 @@ async fn sync_tasks(state: &AppState, tasks: &mut HashMap<String, RuntimeStatsTa
             .resource_cache
             .begin_runtime_stats_worker(&runtime_id)
             .await;
-        let cache = state.resource_cache.clone();
-        let docker = state.docker.clone();
-        let protocol = target.protocol;
-        let task_runtime_id = runtime_id.clone();
-        let handle = tokio::spawn(async move {
-            let sampler = match docker.stats_sampler(protocol, &task_runtime_id).await {
-                Ok(sampler) => sampler,
-                Err(error) => {
-                    tracing::debug!(
-                        runtime_id = %task_runtime_id,
-                        %protocol,
-                        %error,
-                        "could not bind the container resource sampler; retrying"
-                    );
-                    cache.finish_stats_worker(&task_runtime_id, worker).await;
-                    return;
-                }
-            };
-            let mut previous_cpu = None::<(u64, Instant)>;
-            loop {
-                // Take one one-shot counter snapshot per second. Sleeping in
-                // parallel prevents a slow runtime request adding another full
-                // interval to the sample cadence.
-                let (result, _) = tokio::join!(
-                    sampler.sample(),
-                    tokio::time::sleep(RUNTIME_STATS_POLL_INTERVAL)
-                );
-                let stats = match result {
-                    Ok(stats) => stats,
-                    Err(error) => {
-                        tracing::debug!(
-                            runtime_id = %task_runtime_id,
-                            %protocol,
-                            %error,
-                            "one-shot container resource sample failed; rebinding the sampler"
-                        );
-                        break;
-                    }
-                };
-                let sampled_at = Instant::now();
-                let current_cpu = container_cpu_total(&stats);
-                let cpu_usage_percent = current_cpu.and_then(|current_total| {
-                    previous_cpu.map(|(previous_total, previous_at)| {
-                        cpu_percent_over_wall_time(
-                            previous_total,
-                            current_total,
-                            sampled_at.duration_since(previous_at),
-                        )
-                    })
-                });
-                previous_cpu = current_cpu.map(|total| (total, sampled_at));
-                if !cache
-                    .store_runtime_stats(&task_runtime_id, worker, cpu_usage_percent, &stats)
-                    .await
-                {
-                    break;
-                }
-            }
-            cache.finish_stats_worker(&task_runtime_id, worker).await;
-        });
+        let handle = tokio::spawn(run_runtime_stats_worker(
+            state.resource_cache.clone(),
+            state.docker.clone(),
+            target.protocol,
+            runtime_id.clone(),
+            worker,
+        ));
         tasks.insert(runtime_id, RuntimeStatsTask { worker, handle });
     }
+}
+
+async fn run_runtime_stats_worker(
+    cache: ResourceCache,
+    docker: DockerRuntime,
+    protocol: Protocol,
+    runtime_id: String,
+    worker: u64,
+) {
+    let sampler = match docker.stats_sampler(protocol, &runtime_id).await {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            tracing::debug!(
+                runtime_id = %runtime_id,
+                %protocol,
+                %error,
+                "could not bind the container resource sampler; retrying"
+            );
+            cache.finish_stats_worker(&runtime_id, worker).await;
+            return;
+        }
+    };
+    let mut previous_cpu = None::<(u64, Instant)>;
+    loop {
+        // Take one one-shot counter snapshot per second. Sleeping in
+        // parallel prevents a slow runtime request adding another full
+        // interval to the sample cadence.
+        let (result, _) = tokio::join!(
+            sampler.sample(),
+            tokio::time::sleep(RUNTIME_STATS_POLL_INTERVAL)
+        );
+        let stats = match result {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::debug!(
+                    runtime_id = %runtime_id,
+                    %protocol,
+                    %error,
+                    "one-shot container resource sample failed; rebinding the sampler"
+                );
+                break;
+            }
+        };
+        let sampled_at = Instant::now();
+        let current_cpu = container_cpu_total(&stats);
+        let cpu_usage_percent = current_cpu.and_then(|current_total| {
+            previous_cpu.map(|(previous_total, previous_at)| {
+                cpu_percent_over_wall_time(
+                    previous_total,
+                    current_total,
+                    sampled_at.duration_since(previous_at),
+                )
+            })
+        });
+        previous_cpu = current_cpu.map(|total| (total, sampled_at));
+        let still_current = cache
+            .store_runtime_stats(&runtime_id, worker, cpu_usage_percent, &stats)
+            .await;
+        if !still_current {
+            break;
+        }
+    }
+    cache.finish_stats_worker(&runtime_id, worker).await;
 }
 
 #[cfg(test)]

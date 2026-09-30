@@ -14,6 +14,7 @@ use crate::{
 
 const DEFAULT_TTL_SECONDS: i64 = 900;
 const MAX_TTL_SECONDS: i64 = 3600;
+const MAX_TARGETS: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,48 +46,10 @@ pub async fn issue_ws_token(
     auth.require_scope(scopes::WS_TOKENS_WRITE)?;
     validate_request(&request)?;
     let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
-    let generation_digest = if request.all_instances || !request.pools.is_empty() {
-        None
-    } else {
-        let mut generations = Vec::with_capacity(request.instances.len());
-        for instance_id in &request.instances {
-            let metadata = state
-                .instances
-                .get(instance_id)
-                .await
-                .ok_or(ApiError::NotFound)?;
-            generations.push((instance_id.clone(), metadata.created_at));
-        }
-        Some(jwt::instance_generation_digest(&generations))
-    };
     let targets = if request.pools.is_empty() {
-        jwt::WsTargets::Instances {
-            instances: request.instances.clone(),
-            all_instances: request.all_instances,
-            generation: generation_digest,
-        }
+        instance_targets(&state, &request).await?
     } else {
-        let owner = crate::placement::PoolOwner {
-            panel_id: state.config.token_id.clone(),
-            server_id: request
-                .server_id
-                .clone()
-                .ok_or_else(|| ApiError::BadRequest("pool tokens require server_id".into()))?,
-        };
-        owner.check().map_err(ApiError::BadRequest)?;
-        let mut grants = Vec::new();
-        for id in &request.pools {
-            let pool = crate::api::pools::load(&state, id).await?;
-            if pool.owner.as_ref() != Some(&owner) {
-                return Err(ApiError::Forbidden("pool ownership".into()));
-            }
-            grants.push(jwt::PoolGrant {
-                runtime_id: pool.runtime_id,
-                owner: owner.clone(),
-                created_at: pool.created_at,
-            });
-        }
-        jwt::WsTargets::Pools(grants)
+        pool_targets(&state, &request).await?
     };
     let (token, expires_at_unix) = jwt::issue_ws_token(
         state.config.websocket_jwt_secret(),
@@ -113,6 +76,66 @@ pub async fn issue_ws_token(
     }))
 }
 
+async fn instance_targets(
+    state: &AppState,
+    request: &IssueWsTokenRequest,
+) -> Result<jwt::WsTargets, ApiError> {
+    let generation = if request.all_instances {
+        None
+    } else {
+        Some(instance_generation_digest(state, &request.instances).await?)
+    };
+    Ok(jwt::WsTargets::Instances {
+        instances: request.instances.clone(),
+        all_instances: request.all_instances,
+        generation,
+    })
+}
+
+async fn instance_generation_digest(
+    state: &AppState,
+    instance_ids: &[String],
+) -> Result<String, ApiError> {
+    let mut generations = Vec::with_capacity(instance_ids.len());
+    for instance_id in instance_ids {
+        let metadata = state
+            .instances
+            .get(instance_id)
+            .await
+            .ok_or(ApiError::NotFound)?;
+        generations.push((instance_id.clone(), metadata.created_at));
+    }
+    Ok(jwt::instance_generation_digest(&generations))
+}
+
+async fn pool_targets(
+    state: &AppState,
+    request: &IssueWsTokenRequest,
+) -> Result<jwt::WsTargets, ApiError> {
+    let server_id = request
+        .server_id
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest("pool tokens require server_id".into()))?;
+    let owner = crate::placement::PoolOwner {
+        panel_id: state.config.token_id.clone(),
+        server_id,
+    };
+    owner.check().map_err(ApiError::BadRequest)?;
+    let mut grants = Vec::new();
+    for pool_id in &request.pools {
+        let pool = crate::api::pools::load(state, pool_id).await?;
+        if pool.owner.as_ref() != Some(&owner) {
+            return Err(ApiError::Forbidden("pool ownership".into()));
+        }
+        grants.push(jwt::PoolGrant {
+            runtime_id: pool.runtime_id,
+            owner: owner.clone(),
+            created_at: pool.created_at,
+        });
+    }
+    Ok(jwt::WsTargets::Pools(grants))
+}
+
 fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
     if request.subject.trim().is_empty() {
         return Err(ApiError::BadRequest(
@@ -132,7 +155,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
             "provide at least one instance or explicitly set all_instances=true".to_string(),
         ));
     }
-    if request.instances.len() > 256 {
+    if request.instances.len() > MAX_TARGETS {
         return Err(ApiError::BadRequest(
             "instances may contain at most 256 entries".to_string(),
         ));
@@ -148,7 +171,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
         }
     }
     if !request.pools.is_empty() {
-        if request.pools.len() > 256
+        if request.pools.len() > MAX_TARGETS
             || request.all_instances
             || !request.instances.is_empty()
             || request.server_id.is_none()

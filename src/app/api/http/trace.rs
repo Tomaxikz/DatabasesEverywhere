@@ -14,6 +14,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
     let uri = request.uri().clone();
+    let path = uri.path();
     let actor = authenticated_actor(&request).to_owned();
     let peer_ip = request
         .extensions()
@@ -28,7 +29,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
             actor,
             peer_ip,
             method = %method,
-            path = %uri.path(),
+            path = %path,
             host,
             user_agent,
             "api request started"
@@ -45,7 +46,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
             actor,
             peer_ip,
             method = %method,
-            path = %uri.path(),
+            path = %path,
             status = status.as_u16(),
             elapsed_ms,
             "api request failed"
@@ -54,7 +55,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
         tracing::debug!(
             request_id,
             method = %method,
-            path = %uri.path(),
+            path = %path,
             status = status.as_u16(),
             elapsed_ms,
             "api request throttled"
@@ -65,7 +66,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
             actor,
             peer_ip,
             method = %method,
-            path = %uri.path(),
+            path = %path,
             status = status.as_u16(),
             elapsed_ms,
             "api request rejected"
@@ -74,7 +75,7 @@ pub async fn trace_request(request: Request<Body>, next: Next) -> Response {
         tracing::debug!(
             request_id,
             method = %method,
-            path = %uri.path(),
+            path = %path,
             status = status.as_u16(),
             elapsed_ms,
             "api request completed"

@@ -22,11 +22,10 @@ pub(super) async fn handle_clickhouse_client(
             let mut client = accept_direct_tls(client, tls).await?;
             let initial = read_clickhouse_hello(&mut client).await?;
             let route = clickhouse::parse_native_initial_route(&initial)?;
+            let requested_database =
+                (!route.database.is_empty()).then_some(route.database.as_str());
             let resolution = resolver
-                .resolve_clickhouse(
-                    &route.username,
-                    (!route.database.is_empty()).then_some(route.database.as_str()),
-                )
+                .resolve_clickhouse(&route.username, requested_database)
                 .await;
             let (database, target) = match resolution {
                 DatabaseRouteResolution::Found { database, target } => (database, target),
@@ -84,11 +83,10 @@ pub(super) async fn handle_clickhouse_http(
                     return Err(error.into());
                 }
             };
+            let requested_database =
+                (!route.database.is_empty()).then_some(route.database.as_str());
             let resolution = resolver
-                .resolve_clickhouse(
-                    &route.username,
-                    (!route.database.is_empty()).then_some(route.database.as_str()),
-                )
+                .resolve_clickhouse(&route.username, requested_database)
                 .await;
             let (database, target) = match resolution {
                 DatabaseRouteResolution::Found { database, target } => (database, target),
@@ -140,8 +138,10 @@ fn clickhouse_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint
     }
 }
 
+const HTTP_ACCESS_DENIED_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nAccess denied.\n";
+
 async fn reject_http(client: &mut super::GatewayStream) -> Result<(), std::io::Error> {
-    client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nAccess denied.\n").await?;
+    client.write_all(HTTP_ACCESS_DENIED_RESPONSE).await?;
     client.shutdown().await
 }
 

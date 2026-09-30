@@ -26,6 +26,10 @@ use crate::{
     shared::{protocol::Protocol, shell::sh_quote},
 };
 
+const ADMIN_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const ADMIN_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CAPTURED_AUTH_BYTES: usize = 4_096;
+
 pub(super) async fn reset_password_in_place(
     context: &InPlaceResetContext<'_>,
     new_verifier: Option<&str>,
@@ -402,18 +406,7 @@ pub(super) async fn capture_maintenance_credential(
         .filter(|value| !value.is_empty())
         .map(|value| SecretString::from(value.to_string()));
     if previous.maintenance.is_none() {
-        for key in keys {
-            let candidate = state
-                .docker
-                .container_environment_value(metadata.protocol, &metadata.instance_id, key)
-                .await
-                .map_err(docker_error)?
-                .filter(|value| !value.expose_secret().is_empty());
-            if candidate.is_some() {
-                previous.maintenance = candidate;
-                break;
-            }
-        }
+        previous.maintenance = first_container_secret(state, metadata, keys).await?;
     }
     if previous.maintenance.is_none() {
         return Err(ApiError::Conflict(format!(
@@ -423,6 +416,25 @@ pub(super) async fn capture_maintenance_credential(
     }
     previous.maintenance_username = username.map(str::to_string);
     Ok(())
+}
+
+pub(super) async fn first_container_secret(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    environment_keys: &[&str],
+) -> Result<Option<SecretString>, ApiError> {
+    for key in environment_keys {
+        let value = state
+            .docker
+            .container_environment_value(metadata.protocol, &metadata.instance_id, key)
+            .await
+            .map_err(docker_error)?
+            .filter(|value| !value.expose_secret().is_empty());
+        if value.is_some() {
+            return Ok(value);
+        }
+    }
+    Ok(None)
 }
 
 pub(super) async fn capture_postgres_verifier(
@@ -463,7 +475,7 @@ pub(super) async fn capture_postgres_verifier(
         })?;
     let verifier = output.stdout.trim();
     if verifier.is_empty()
-        || verifier.len() > 4_096
+        || verifier.len() > MAX_CAPTURED_AUTH_BYTES
         || verifier.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
     {
         return Err(ApiError::Conflict(
@@ -524,7 +536,7 @@ pub(super) async fn capture_mysql_tenant_auth(
                 "the managed MySQL tenant authentication string is malformed".to_string(),
             )
         })?;
-    if decoded.is_empty() || decoded.len() > 4_096 {
+    if decoded.is_empty() || decoded.len() > MAX_CAPTURED_AUTH_BYTES {
         return Err(ApiError::Conflict(
             "the managed MySQL tenant authentication string has an invalid size".to_string(),
         ));
@@ -594,66 +606,14 @@ async fn wait_for_admin_auth(
     };
     let deadline = Instant::now() + ROTATION_READINESS_TIMEOUT;
     let mut last_error = None;
-    let environment = [("DBE_ROTATION_ADMIN_PASSWORD", maintenance)];
     while Instant::now() < deadline {
-        match state
-            .docker
-            .exec_secret_readiness_probe(
-                metadata.protocol,
-                &metadata.instance_id,
-                &command,
-                &environment,
-                Duration::from_secs(5),
-            )
-            .await
-        {
-            Ok(_) => {
-                let invalid_password =
-                    SecretString::from(format!("dbe-invalid-{}", uuid::Uuid::new_v4().simple()));
-                match state
-                    .docker
-                    .exec_secret_readiness_probe(
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        &command,
-                        &[("DBE_ROTATION_ADMIN_PASSWORD", &invalid_password)],
-                        Duration::from_secs(5),
-                    )
-                    .await
-                {
-                    Err(error) if is_password_rejection(metadata.protocol, &error) => {}
-                    Err(error) => {
-                        return Err(ApiError::Runtime(format!(
-                            "incorrect-password enforcement verification failed ambiguously: {error}"
-                        )));
-                    }
-                    Ok(_) => {
-                        return Err(ApiError::Conflict(format!(
-                            "{} maintenance authentication accepted an incorrect password; refusing to adopt or rotate credentials while password enforcement is bypassed",
-                            metadata.protocol
-                        )));
-                    }
-                }
-                return match state
-                    .docker
-                    .exec_secret_readiness_probe(
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        &command,
-                        &environment,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(ApiError::Runtime(format!(
-                        "maintenance authentication became unavailable after password-enforcement verification: {error}"
-                    ))),
-                };
+        match probe_admin_auth(state, metadata, &command, maintenance).await {
+            Ok(()) => {
+                return confirm_password_enforcement(state, metadata, &command, maintenance).await;
             }
             Err(error) => {
                 last_error = Some(error.to_string());
-                sleep(Duration::from_secs(1)).await;
+                sleep(ADMIN_AUTH_RETRY_INTERVAL).await;
             }
         }
     }
@@ -663,6 +623,56 @@ async fn wait_for_admin_auth(
     Err(ApiError::Runtime(format!(
         "database administrator connection did not become ready for password rotation: {last_error}"
     )))
+}
+
+async fn confirm_password_enforcement(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    command: &str,
+    maintenance: &SecretString,
+) -> Result<(), ApiError> {
+    let invalid_password =
+        SecretString::from(format!("dbe-invalid-{}", uuid::Uuid::new_v4().simple()));
+    match probe_admin_auth(state, metadata, command, &invalid_password).await {
+        Err(error) if is_password_rejection(metadata.protocol, &error) => {}
+        Err(error) => {
+            return Err(ApiError::Runtime(format!(
+                "incorrect-password enforcement verification failed ambiguously: {error}"
+            )));
+        }
+        Ok(()) => {
+            return Err(ApiError::Conflict(format!(
+                "{} maintenance authentication accepted an incorrect password; refusing to adopt or rotate credentials while password enforcement is bypassed",
+                metadata.protocol
+            )));
+        }
+    }
+    probe_admin_auth(state, metadata, command, maintenance)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "maintenance authentication became unavailable after password-enforcement verification: {error}"
+            ))
+        })
+}
+
+async fn probe_admin_auth(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    command: &str,
+    admin_password: &SecretString,
+) -> Result<(), DockerError> {
+    state
+        .docker
+        .exec_secret_readiness_probe(
+            metadata.protocol,
+            &metadata.instance_id,
+            command,
+            &[("DBE_ROTATION_ADMIN_PASSWORD", admin_password)],
+            ADMIN_AUTH_PROBE_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
 }
 
 pub(super) fn is_password_rejection(protocol: Protocol, error: &DockerError) -> bool {

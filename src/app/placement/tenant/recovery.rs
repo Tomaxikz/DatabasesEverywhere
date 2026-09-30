@@ -198,50 +198,20 @@ pub(crate) async fn reconcile_runtime_tenants_locked(
         ready = admit_soft_tenants(state, runtime, ready, &mut summary).await?;
     }
     if summary.pools_contained == 0 {
+        publish_ready_tenants(state, runtime, ready, &mut summary).await?;
+    }
+    Ok(summary)
+}
+
+async fn publish_ready_tenants(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    ready: Vec<InstanceMetadata>,
+    summary: &mut SharedTenantBootSummary,
+) -> anyhow::Result<()> {
+    let root_disk_mib =
         match runtime_ops::apply_root_disk_limit(&state.config, &state.placements, runtime).await {
-            Ok(root_disk_mib) => {
-                for metadata in ready {
-                    let password = metadata.tenant_password.as_deref().ok_or_else(|| {
-                        tenant::TenantEngineError::MissingTenantCredential(
-                            metadata.instance_id.clone(),
-                        )
-                    });
-                    let opened = match password {
-                        Ok(password) => {
-                            tenant::open_verified(
-                                &state.docker,
-                                runtime,
-                                target(&metadata),
-                                password,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
-                    match opened {
-                        Ok(()) => {
-                            state.instances.upsert(metadata).await;
-                            summary.opened += 1;
-                        }
-                        Err(error) => {
-                            let reason =
-                                format!("shared tenant access verification failed: {error}");
-                            quarantine_tenant(state, runtime, metadata, &reason, &mut summary)
-                                .await?;
-                            if summary.pools_contained > 0 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                tracing::debug!(
-                    event = "shared_runtime_root_disk_reconciled",
-                    runtime_id = %runtime.runtime_id,
-                    root_disk_mib,
-                    aggregate_disk_mib = runtime.limits.disk_mib,
-                    "reconciled the shared-pool root quota before publishing tenant routes"
-                );
-            }
+            Ok(root_disk_mib) => root_disk_mib,
             Err(error) => {
                 tracing::error!(
                     event = "audit shared_runtime_root_disk_reconciliation_failed",
@@ -253,13 +223,76 @@ pub(crate) async fn reconcile_runtime_tenants_locked(
                     state,
                     runtime,
                     "shared-pool root quota reconciliation failed",
-                    &mut summary,
+                    summary,
                 )
                 .await?;
+                return Ok(());
+            }
+        };
+
+    for metadata in ready {
+        match open_tenant(state, runtime, &metadata).await {
+            Ok(()) => {
+                state.instances.upsert(metadata).await;
+                summary.opened += 1;
+            }
+            Err(error) => {
+                let reason = format!("shared tenant access verification failed: {error}");
+                quarantine_tenant(state, runtime, metadata, &reason, summary).await?;
+                if summary.pools_contained > 0 {
+                    break;
+                }
             }
         }
     }
-    Ok(summary)
+    tracing::debug!(
+        event = "shared_runtime_root_disk_reconciled",
+        runtime_id = %runtime.runtime_id,
+        root_disk_mib,
+        aggregate_disk_mib = runtime.limits.disk_mib,
+        "reconciled the shared-pool root quota before publishing tenant routes"
+    );
+    Ok(())
+}
+
+async fn open_tenant(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    metadata: &InstanceMetadata,
+) -> Result<(), tenant::TenantEngineError> {
+    let password = tenant_password(metadata)?;
+    tenant::open_verified(&state.docker, runtime, target(metadata), password).await
+}
+
+fn tenant_password(metadata: &InstanceMetadata) -> Result<&str, tenant::TenantEngineError> {
+    metadata.tenant_password.as_deref().ok_or_else(|| {
+        tenant::TenantEngineError::MissingTenantCredential(metadata.instance_id.clone())
+    })
+}
+
+async fn restore_disk_boundary(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    metadata: &mut InstanceMetadata,
+) -> anyhow::Result<()> {
+    let disk_state = tenant::disk::set_limit(
+        &state.config,
+        &state.docker,
+        runtime,
+        target(metadata),
+        metadata.limits.disk_mib,
+    )
+    .await?;
+    let changed = tenant::disk::update_state(
+        &mut metadata.limits,
+        &mut metadata.disk_limit_blocked,
+        &disk_state,
+    )?;
+    if changed {
+        metadata.updated_at = now_rfc3339();
+        state.manager.upsert_fenced(metadata.clone()).await?;
+    }
+    Ok(())
 }
 
 async fn secure_tenant(
@@ -271,28 +304,11 @@ async fn secure_tenant(
         match step {
             ReconcileStep::Fence => tenant::fence(&state.docker, runtime, target(metadata)).await?,
             ReconcileStep::RotateCredential => {
-                let password = metadata.tenant_password.as_deref().ok_or_else(|| {
-                    tenant::TenantEngineError::MissingTenantCredential(metadata.instance_id.clone())
-                })?;
+                let password = tenant_password(metadata)?;
                 tenant::rotate_password(&state.docker, runtime, target(metadata), password).await?;
             }
             ReconcileStep::ApplyDiskQuota => {
-                let disk_state = tenant::disk::set_limit(
-                    &state.config,
-                    &state.docker,
-                    runtime,
-                    target(metadata),
-                    metadata.limits.disk_mib,
-                )
-                .await?;
-                if tenant::disk::update_state(
-                    &mut metadata.limits,
-                    &mut metadata.disk_limit_blocked,
-                    &disk_state,
-                )? {
-                    metadata.updated_at = now_rfc3339();
-                    state.manager.upsert_fenced(metadata.clone()).await?;
-                }
+                restore_disk_boundary(state, runtime, metadata).await?
             }
             ReconcileStep::ApplyTenantQuota => {
                 tenant::set_quota(&state.docker, runtime, target(metadata), &metadata.limits)
@@ -432,24 +448,7 @@ async fn verify_hard_disk_boundary(
     if !metadata.limits.disk_enforced {
         return Ok(());
     }
-
-    let disk_state = tenant::disk::set_limit(
-        &state.config,
-        &state.docker,
-        runtime,
-        target(metadata),
-        metadata.limits.disk_mib,
-    )
-    .await?;
-    if tenant::disk::update_state(
-        &mut metadata.limits,
-        &mut metadata.disk_limit_blocked,
-        &disk_state,
-    )? {
-        metadata.updated_at = now_rfc3339();
-        state.manager.upsert_fenced(metadata.clone()).await?;
-    }
-    Ok(())
+    restore_disk_boundary(state, runtime, metadata).await
 }
 
 async fn quarantine_tenant(

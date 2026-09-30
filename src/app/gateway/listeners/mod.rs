@@ -394,24 +394,19 @@ where
         mut shutdown,
         connections,
     } = runtime;
+    let max_active_connections = resolver
+        .config()
+        .daemon
+        .limits
+        .gateway_connections_per_listener;
     tracing::info!(
         bind,
         tls = tls.is_some(),
         protocol,
-        max_active_connections = resolver
-            .config()
-            .daemon
-            .limits
-            .gateway_connections_per_listener,
+        max_active_connections,
         "database listener started"
     );
-    let active_connections = Arc::new(Semaphore::new(
-        resolver
-            .config()
-            .daemon
-            .limits
-            .gateway_connections_per_listener,
-    ));
+    let active_connections = Arc::new(Semaphore::new(max_active_connections));
     let mut global_limit_logged = false;
 
     loop {
@@ -445,11 +440,7 @@ where
         let ip_permit = match limiter.try_acquire(peer.ip()) {
             Ok(permit) => permit,
             Err(GatewayConnectionRejection { reason, should_log }) => {
-                let reason = match reason {
-                    GatewayConnectionRejectionReason::RateLimited => "rate",
-                    GatewayConnectionRejectionReason::TooManyActive => "active",
-                    GatewayConnectionRejectionReason::KeyCapacityReached => "key_capacity",
-                };
+                let reason = rejection_reason_label(reason);
                 if should_log {
                     tracing::warn!(%peer, protocol, reason, "audit database_connection_limited");
                 }
@@ -475,6 +466,14 @@ where
                 }
             }
         });
+    }
+}
+
+fn rejection_reason_label(reason: GatewayConnectionRejectionReason) -> &'static str {
+    match reason {
+        GatewayConnectionRejectionReason::RateLimited => "rate",
+        GatewayConnectionRejectionReason::TooManyActive => "active",
+        GatewayConnectionRejectionReason::KeyCapacityReached => "key_capacity",
     }
 }
 
@@ -589,20 +588,10 @@ fn expected_client_failure(error: &ListenerError) -> bool {
         | ListenerError::HandshakeMessageLimit { .. }
         | ListenerError::IdentitySwitchRejected { .. } => true,
         ListenerError::Mariadb(mariadb::MariadbProxyError::SharedStorageCommandRejected(_)) => true,
-        ListenerError::Io(error) => matches!(
-            error.kind(),
-            ErrorKind::UnexpectedEof
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-        ),
-        ListenerError::Mongodb(mongodb::MongodbProxyError::Io(error)) => matches!(
-            error.kind(),
-            ErrorKind::UnexpectedEof
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-        ),
+        ListenerError::Io(error) => is_disconnect(error.kind()),
+        ListenerError::Mongodb(mongodb::MongodbProxyError::Io(error)) => {
+            is_disconnect(error.kind())
+        }
         ListenerError::Clickhouse(clickhouse::ClickhouseParseError::IncompleteNativeHello)
         | ListenerError::Clickhouse(clickhouse::ClickhouseParseError::IncompleteHttpRequest) => {
             true
@@ -611,15 +600,19 @@ fn expected_client_failure(error: &ListenerError) -> bool {
         ListenerError::Backend {
             source: tunnel::TunnelError::Tunnel(error),
             ..
-        } => matches!(
-            error.kind(),
-            ErrorKind::UnexpectedEof
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-        ),
+        } => is_disconnect(error.kind()),
         _ => false,
     }
+}
+
+fn is_disconnect(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+    )
 }
 
 #[cfg(test)]

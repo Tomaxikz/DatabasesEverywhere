@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use super::{
-    DiskLimitError, NativeProjectQuotaFs, displayed_privileged_command, privileged_command,
-    project_id, project_tree, project_usage, real_directory_exists,
+    DiskLimitError, NativeProjectQuotaFs, displayed_privileged_command, has_project_quota_option,
+    privileged_command, project_id, project_tree, project_usage,
 };
 use crate::shared::limits::mib_to_bytes;
+
+const METHOD: &str = "host_linux_project_quota";
 
 pub(super) async fn verify_startup(
     data_root: &Path,
@@ -34,7 +36,7 @@ pub(super) async fn apply_in(
     set_project_quota(mount, project_id, disk_mib).await?;
     project_tree::assign(data_path, project_id).await?;
     project_id::activate_in(owner_id, registry_root, project_id).await?;
-    Ok("host_linux_project_quota".to_string())
+    Ok(METHOD.to_string())
 }
 
 pub(super) async fn update_in(
@@ -56,7 +58,7 @@ pub(super) async fn update_in(
     // correct. Refuse an active claim whose root boundary was altered.
     project_tree::verify_root(data_path, project_id).await?;
     set_project_quota(mount, project_id, disk_mib).await?;
-    Ok("host_linux_project_quota".to_string())
+    Ok(METHOD.to_string())
 }
 
 pub(super) async fn remove_in(
@@ -77,15 +79,7 @@ pub(super) async fn remove_in(
     // claim. A pending adoption can contain both the trusted source ID and the
     // new target ID, so restore it to that source rather than applying the
     // stricter active-boundary clear.
-    if real_directory_exists(data_path)? {
-        match claim.state {
-            project_id::ProjectIdState::Pending => {
-                project_tree::rollback_pending(data_path, claim.id).await?
-            }
-            project_id::ProjectIdState::Active => project_tree::clear(data_path, claim.id).await?,
-            project_id::ProjectIdState::Released => unreachable!("released claims return above"),
-        }
-    }
+    project_tree::release_claimed_tree(data_path, claim).await?;
     project_usage::verify_unused(NativeProjectQuotaFs::Ext4, mount, claim.id).await?;
     set_project_quota(mount, claim.id, 0).await?;
     project_id::release_in(owner_id, registry_root, project_id_base).await?;
@@ -107,23 +101,21 @@ fn require_project_quota(
     fstype: &str,
     options: &[String],
 ) -> Result<(), DiskLimitError> {
-    let enabled = options
-        .iter()
-        .any(|option| matches!(option.as_str(), "prjquota" | "pquota"));
-    if enabled {
+    if has_project_quota_option(options) {
         return Ok(());
     }
 
+    let displayed_options = if options.is_empty() {
+        "-".to_string()
+    } else {
+        options.join(",")
+    };
     Err(DiskLimitError::ProjectQuotaNotEnabled {
         data_root: data_root.to_path_buf(),
         mountpoint: mount.to_path_buf(),
         device: source.to_string(),
         fstype: fstype.to_string(),
-        options: if options.is_empty() {
-            "-".to_string()
-        } else {
-            options.join(",")
-        },
+        options: displayed_options,
     })
 }
 

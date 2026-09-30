@@ -20,6 +20,10 @@ pub(crate) const HOSTED_CONFIG_TARGET: &str =
     "/etc/clickhouse-server/config.d/dbe-hosted-overrides.xml";
 pub const INTERNAL_ADMIN_USERNAME: &str = "dbe_admin";
 pub const CONTROL_DATABASE: &str = "dbe_control";
+const NATIVE_PORT: u16 = 9000;
+const HTTP_PORT: u16 = 8123;
+const MAX_LEGACY_LOG_DIRECTORY_ENTRIES: usize = 1024;
+const STAT_BLOCK_BYTES: u64 = 512;
 
 struct Bootstrap {
     database: String,
@@ -123,11 +127,11 @@ fn build_spec(
         socket_bridges: vec![
             SocketBridge {
                 socket_path: container_backend_socket_path(Protocol::Clickhouse),
-                target: loopback_target(9000),
+                target: loopback_target(NATIVE_PORT),
             },
             SocketBridge {
                 socket_path: clickhouse_http_socket(),
-                target: loopback_target(8123),
+                target: loopback_target(HTTP_PORT),
             },
         ],
         env: vec![
@@ -305,8 +309,9 @@ pub(crate) async fn remove_legacy_logs(path: &std::path::Path) -> std::io::Resul
             Err(error) => return Err(std::io::Error::from(error)),
         };
         let mut entries = Dir::new(directory)?;
-        let mut removed = (0_u64, 0_u64);
-        for _ in 0..1024 {
+        let mut removed_files = 0_u64;
+        let mut removed_bytes = 0_u64;
+        for _ in 0..MAX_LEGACY_LOG_DIRECTORY_ENTRIES {
             let Some(entry) = entries.next() else {
                 break;
             };
@@ -327,18 +332,18 @@ pub(crate) async fn remove_legacy_logs(path: &std::path::Path) -> std::io::Resul
             }
             match unlinkat(fd, name, AtFlags::empty()) {
                 Ok(()) => {
-                    removed.0 += 1;
-                    removed.1 = removed.1.saturating_add(
+                    removed_files += 1;
+                    removed_bytes = removed_bytes.saturating_add(
                         u64::try_from(stat.st_blocks)
                             .unwrap_or(0)
-                            .saturating_mul(512),
+                            .saturating_mul(STAT_BLOCK_BYTES),
                     );
                 }
                 Err(rustix::io::Errno::NOENT) => {}
                 Err(error) => return Err(std::io::Error::from(error)),
             }
         }
-        Ok(removed)
+        Ok((removed_files, removed_bytes))
     })
     .await
     .map_err(std::io::Error::other)?

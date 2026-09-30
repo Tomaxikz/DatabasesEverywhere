@@ -14,6 +14,8 @@ use crate::{
 
 pub const BACKUP_CATALOG_SCHEMA_VERSION: u32 = 1;
 const CATALOG_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_MYSQL_PREVIEW_COLUMNS: usize = 128;
+const RELATIONAL_SCHEMA_FIELD_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,14 +68,7 @@ impl BackupCatalog {
             protocol: metadata.protocol,
             database_name: metadata.database.name.clone(),
             captured_at: crate::jobs::import_export::now_rfc3339(),
-            consistency: match metadata.deployment_mode {
-                DeploymentMode::Dedicated => {
-                    "captured_immediately_before_physical_archive".to_string()
-                }
-                DeploymentMode::Shared => {
-                    "captured_immediately_before_tenant_logical_dump".to_string()
-                }
-            },
+            consistency: consistency_label(metadata.deployment_mode).to_string(),
             truncated: false,
             warnings: Vec::new(),
             objects: Vec::new(),
@@ -113,10 +108,7 @@ impl BackupCatalog {
         if policy.preview_rows_per_object > 0 && policy.max_preview_objects > 0 {
             capture_previews(docker, metadata, policy, &mut catalog).await;
         }
-        if matches!(
-            metadata.protocol,
-            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-        ) {
+        if is_schema_less(metadata.protocol) {
             catalog.warnings.push(format!(
                 "{} uses a physical, schema-less store; this catalog describes the backup but does not expose record previews",
                 metadata.protocol.as_str()
@@ -179,6 +171,24 @@ impl BackupCatalog {
     }
 }
 
+fn consistency_label(mode: DeploymentMode) -> &'static str {
+    match mode {
+        DeploymentMode::Dedicated => "captured_immediately_before_physical_archive",
+        DeploymentMode::Shared => "captured_immediately_before_tenant_logical_dump",
+    }
+}
+
+fn is_schema_less(protocol: Protocol) -> bool {
+    matches!(
+        protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    )
+}
+
+fn is_previewable(object: &BackupCatalogObject) -> bool {
+    object.kind == "table" || object.kind == "collection"
+}
+
 async fn capture_schema(
     docker: &DockerRuntime,
     metadata: &InstanceMetadata,
@@ -228,8 +238,7 @@ async fn capture_schema(
                 run_query(docker, metadata, &clickhouse_schema_script(max_objects)).await?;
             parse_clickhouse_schema(&output)
         }
-        Protocol::Redis => Ok(vec![schema_less_object(metadata, "keyspace")]),
-        Protocol::Valkey => Ok(vec![schema_less_object(metadata, "keyspace")]),
+        Protocol::Redis | Protocol::Valkey => Ok(vec![schema_less_object(metadata, "keyspace")]),
         Protocol::Qdrant => Ok(vec![schema_less_object(metadata, "collection_store")]),
     }
 }
@@ -240,33 +249,30 @@ async fn capture_previews(
     policy: &BackupBrowsingConfig,
     catalog: &mut BackupCatalog,
 ) {
-    if matches!(
-        metadata.protocol,
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-    ) {
+    if is_schema_less(metadata.protocol) {
         return;
     }
     let mut failures = 0_usize;
     let previewable_objects = catalog
         .objects
         .iter()
-        .filter(|object| object.kind == "table" || object.kind == "collection")
+        .filter(|object| is_previewable(object))
         .count();
     let eligible = catalog
         .objects
         .iter()
         .enumerate()
-        .filter(|(_, object)| object.kind == "table" || object.kind == "collection")
+        .filter(|(_, object)| is_previewable(object))
         .take(policy.max_preview_objects)
         .map(|(index, object)| (index, object.clone()))
         .collect::<Vec<_>>();
     if eligible.len() < previewable_objects {
         catalog.truncated = true;
     }
+    // Read one bounded sentinel row so callers can distinguish a complete
+    // small object from a preview that stopped at the configured limit.
+    let capture_rows = policy.preview_rows_per_object.saturating_add(1);
     for (index, object) in eligible {
-        // Read one bounded sentinel row so callers can distinguish a complete
-        // small object from a preview that stopped at the configured limit.
-        let capture_rows = policy.preview_rows_per_object.saturating_add(1);
         let script = preview_script(metadata, &object, capture_rows, policy.max_row_bytes);
         let Some(script) = script else {
             failures += 1;
@@ -433,15 +439,19 @@ for (const info of infos) {{
   }}));
 }}"#
     );
-    let auth = if shared {
-        "--username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\""
-    } else {
-        "--username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin"
-    };
+    let auth = mongodb_auth_arguments(shared);
     format!(
         "set -eu\nmongosh --quiet --host 127.0.0.1 {auth} \"$DBE_MONGO_DATABASE\" --eval {}\n",
         sh_quote(&javascript)
     )
+}
+
+fn mongodb_auth_arguments(shared: bool) -> &'static str {
+    if shared {
+        "--username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\""
+    } else {
+        "--username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin"
+    }
 }
 
 fn preview_script(
@@ -466,7 +476,7 @@ fn preview_script(
             ))
         }
         Protocol::Mariadb | Protocol::Mysql => {
-            if object.columns.is_empty() || object.columns.len() > 128 {
+            if object.columns.is_empty() || object.columns.len() > MAX_MYSQL_PREVIEW_COLUMNS {
                 return None;
             }
             let fields = object
@@ -498,11 +508,7 @@ fn preview_script(
             let javascript = format!(
                 "const out=[]; for (const value of db.getCollection({collection}).find({{}}).limit({rows}).toArray()) {{ out.push(EJSON.stringify(value).slice(0,{max_row_bytes})); }} print(JSON.stringify(out));"
             );
-            let auth = if metadata.deployment_mode == DeploymentMode::Shared {
-                "--username \"$DBE_MONGO_USER\" --password \"$DBE_MONGO_PASSWORD\" --authenticationDatabase \"$DBE_MONGO_DATABASE\""
-            } else {
-                "--username \"$DBE_MONGO_ROOT_USER\" --password \"$DBE_MONGO_ROOT_PASSWORD\" --authenticationDatabase admin"
-            };
+            let auth = mongodb_auth_arguments(metadata.deployment_mode == DeploymentMode::Shared);
             Some(format!(
                 "set -eu\nmongosh --quiet --host 127.0.0.1 {auth} \"$DBE_MONGO_DATABASE\" --eval {}\n",
                 sh_quote(&javascript)
@@ -631,7 +637,7 @@ where
     let mut objects = BTreeMap::<(String, String), BackupCatalogObject>::new();
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         let fields = line.split(separator).collect::<Vec<_>>();
-        if fields.len() != 8 {
+        if fields.len() != RELATIONAL_SCHEMA_FIELD_COUNT {
             return Err("database schema output contained an invalid field count".to_string());
         }
         let column = parse(&fields).map_err(str::to_string)?;

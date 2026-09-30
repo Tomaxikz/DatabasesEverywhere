@@ -20,12 +20,8 @@ fn strip_clickhouse_uuid(input: &str) -> String {
             cursor = end;
             continue;
         }
-        if bytes[cursor..].len() >= 4
-            && bytes[cursor..cursor + 4].eq_ignore_ascii_case(b"UUID")
-            && (cursor == 0 || !is_word(bytes[cursor - 1]))
-            && (cursor + 4 == bytes.len() || !is_word(bytes[cursor + 4]))
-        {
-            let mut end = cursor + 4;
+        if is_uuid_keyword_at(bytes, cursor) {
+            let mut end = cursor + UUID_KEYWORD.len();
             while end < bytes.len() && bytes[end].is_ascii_whitespace() {
                 end += 1;
             }
@@ -42,6 +38,18 @@ fn strip_clickhouse_uuid(input: &str) -> String {
         cursor += ch.len_utf8();
     }
     output
+}
+
+const UUID_KEYWORD: &[u8] = b"UUID";
+
+fn is_uuid_keyword_at(bytes: &[u8], cursor: usize) -> bool {
+    let end = cursor + UUID_KEYWORD.len();
+    if bytes.len() < end || !bytes[cursor..end].eq_ignore_ascii_case(UUID_KEYWORD) {
+        return false;
+    }
+    let starts_word = cursor == 0 || !is_word(bytes[cursor - 1]);
+    let ends_word = end == bytes.len() || !is_word(bytes[end]);
+    starts_word && ends_word
 }
 
 fn quoted_end(input: &str, start: usize) -> Option<usize> {

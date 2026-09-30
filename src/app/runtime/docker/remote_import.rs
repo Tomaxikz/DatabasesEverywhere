@@ -55,6 +55,9 @@ const MAX_WORK_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_WORK_DIRECTORY_DEPTH: usize = 32;
 const MAX_HELPER_SCRIPT_BYTES: usize = 256 * 1024;
 const MAX_EXTRA_HOSTS: usize = 64;
+const MAX_EXTRA_HOST_BYTES: usize = 512;
+const HELPER_NAME_SUFFIX_LEN: usize = 32;
+const HELPER_STOP_TIMEOUT_SECONDS: i64 = 10;
 const MAX_HELPER_ENVIRONMENT_ENTRIES: usize = 64;
 const MAX_HELPER_ENVIRONMENT_BYTES: usize = 64 * 1024;
 
@@ -249,21 +252,10 @@ impl DockerRuntime {
         let network =
             run_unless_cancelled(&cancellation, self.resolve_helper_network(&spec)).await?;
         if let Some((uid, gid)) = self.rootless_podman_host_owner() {
-            let owned_work_dir = work_dir.clone();
-            run_unless_cancelled(&cancellation, async move {
-                tokio::task::spawn_blocking(move || {
-                    crate::shared::ownership::chown_recursive(
-                        &owned_work_dir,
-                        crate::shared::ownership::HostOwner { uid, gid },
-                    )
-                    .map_err(|source| DockerError::RemoteImportHelperIo {
-                        path: owned_work_dir.display().to_string(),
-                        source,
-                    })
-                })
-                .await
-                .map_err(|error| DockerError::RemoteImportHelperTask(error.to_string()))?
-            })
+            run_unless_cancelled(
+                &cancellation,
+                chown_work_directory(work_dir.clone(), uid, gid),
+            )
             .await?;
         }
         let initial_size = run_unless_cancelled(
@@ -271,12 +263,7 @@ impl DockerRuntime {
             measure_work_directory(&work_dir, spec.max_output_bytes),
         )
         .await?;
-        if initial_size > spec.max_output_bytes {
-            return Err(DockerError::RemoteImportHelperOutputTooLarge {
-                size: initial_size,
-                max_bytes: spec.max_output_bytes,
-            });
-        }
+        ensure_output_within_limit(initial_size, spec.max_output_bytes)?;
 
         // Resolve/pull the trusted caller-selected image before creating any
         // helper container. Remote-import API code writes secrets only after
@@ -519,12 +506,7 @@ impl DockerRuntime {
                 _ = size_interval.tick() => {
                     let size =
                         measure_work_directory(work_dir, spec.max_output_bytes).await?;
-                    if size > spec.max_output_bytes {
-                        return Err(DockerError::RemoteImportHelperOutputTooLarge {
-                            size,
-                            max_bytes: spec.max_output_bytes,
-                        });
-                    }
+                    ensure_output_within_limit(size, spec.max_output_bytes)?;
                 }
                 _ = &mut timeout => return Err(helper_timeout(spec.timeout)),
             }
@@ -535,28 +517,17 @@ impl DockerRuntime {
         }
 
         let final_size = measure_work_directory(work_dir, spec.max_output_bytes).await?;
-        if final_size > spec.max_output_bytes {
-            return Err(DockerError::RemoteImportHelperOutputTooLarge {
-                size: final_size,
-                max_bytes: spec.max_output_bytes,
-            });
-        }
+        ensure_output_within_limit(final_size, spec.max_output_bytes)?;
 
         let output = sanitized_helper_output(stdout, stderr, secret_values);
         let exit_code = exit_code.unwrap_or_default();
         if exit_code == 0 {
-            Ok(output)
-        } else {
-            let failure_output = if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            };
-            Err(DockerError::RemoteImportHelperFailed {
-                exit_code,
-                failure_output: truncate_log_tail(failure_output, HELPER_FAILURE_TAIL_CHARS),
-            })
+            return Ok(output);
         }
+        Err(DockerError::RemoteImportHelperFailed {
+            exit_code,
+            failure_output: truncate_log_tail(output.failure_output(), HELPER_FAILURE_TAIL_CHARS),
+        })
     }
 }
 
@@ -569,6 +540,28 @@ async fn run_unless_cancelled<T>(
         () = cancellation.cancelled() => Err(DockerError::RemoteImportHelperCancelled),
         result = operation => result,
     }
+}
+
+async fn chown_work_directory(work_dir: PathBuf, uid: u32, gid: u32) -> Result<(), DockerError> {
+    tokio::task::spawn_blocking(move || {
+        crate::shared::ownership::chown_recursive(
+            &work_dir,
+            crate::shared::ownership::HostOwner { uid, gid },
+        )
+        .map_err(|source| DockerError::RemoteImportHelperIo {
+            path: work_dir.display().to_string(),
+            source,
+        })
+    })
+    .await
+    .map_err(|error| DockerError::RemoteImportHelperTask(error.to_string()))?
+}
+
+fn ensure_output_within_limit(size: u64, max_bytes: u64) -> Result<(), DockerError> {
+    if size > max_bytes {
+        return Err(DockerError::RemoteImportHelperOutputTooLarge { size, max_bytes });
+    }
+    Ok(())
 }
 
 async fn remove_import_helper(docker: &Docker, name_or_id: &str) -> Result<(), DockerError> {
@@ -612,7 +605,7 @@ fn is_import_helper_name(name: &str) -> bool {
     let Some(suffix) = normalized.strip_prefix(HELPER_NAME_PREFIX) else {
         return false;
     };
-    suffix.len() == 32
+    suffix.len() == HELPER_NAME_SUFFIX_LEN
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -729,7 +722,7 @@ fn import_helper_body(options: ImportHelperCreateOptions<'_>) -> ContainerCreate
         open_stdin: Some(false),
         stdin_once: Some(false),
         tty: Some(false),
-        stop_timeout: Some(10),
+        stop_timeout: Some(HELPER_STOP_TIMEOUT_SECONDS),
         healthcheck: Some(disabled_healthcheck()),
         host_config: Some(host_config),
         exposed_ports: None,
@@ -765,14 +758,12 @@ async fn validate_helper_spec(spec: &RemoteImportHelperSpec) -> Result<PathBuf, 
             "extra_hosts may contain at most {MAX_EXTRA_HOSTS} entries"
         )));
     }
-    for entry in &spec.extra_hosts {
-        if entry.is_empty()
-            || entry.len() > 512
-            || entry.chars().any(char::is_control)
-            || (!entry.contains(':') && !entry.contains('='))
-        {
-            return Err(invalid_helper_spec("extra_hosts contains an invalid entry"));
-        }
+    if !spec
+        .extra_hosts
+        .iter()
+        .all(|entry| is_valid_extra_host(entry))
+    {
+        return Err(invalid_helper_spec("extra_hosts contains an invalid entry"));
     }
     match &spec.network {
         ImportHelperNetwork::Outbound => {}
@@ -790,11 +781,7 @@ async fn validate_helper_spec(spec: &RemoteImportHelperSpec) -> Result<PathBuf, 
     if !spec.work_dir.is_absolute() {
         return Err(invalid_helper_spec("work_dir must be absolute"));
     }
-    if spec
-        .work_dir
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if has_parent_component(&spec.work_dir) {
         return Err(invalid_helper_spec(
             "work_dir must not contain parent components",
         ));
@@ -824,6 +811,18 @@ async fn validate_helper_spec(spec: &RemoteImportHelperSpec) -> Result<PathBuf, 
         )));
     }
     Ok(canonical)
+}
+
+fn is_valid_extra_host(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry.len() <= MAX_EXTRA_HOST_BYTES
+        && !entry.chars().any(char::is_control)
+        && (entry.contains(':') || entry.contains('='))
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 fn validate_helper_environment(
@@ -882,12 +881,7 @@ async fn validate_helper_input(
     let Some(input) = input else {
         return Ok(None);
     };
-    if !input.path.is_absolute()
-        || input
-            .path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if !input.path.is_absolute() || has_parent_component(&input.path) {
         return Err(invalid_helper_spec(
             "helper input must be an absolute path without parent components",
         ));

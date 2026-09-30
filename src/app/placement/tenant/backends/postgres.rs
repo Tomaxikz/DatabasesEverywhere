@@ -4,10 +4,10 @@ use secrecy::SecretString;
 use super::super::{TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget, admin_secret};
 use super::{TenantBackend, TenantOperation};
 use crate::{
-    databases,
+    databases::{self, postgres::docker::CONTROL_DATABASE},
     placement::{EngineRuntime, policy},
     runtime::docker::{CommandOutput, DockerRuntime, ExecRecovery},
-    shared::{protocol::Protocol, shell::sh_quote},
+    shared::{limits::InstanceLimits, protocol::Protocol, shell::sh_quote},
 };
 
 pub(super) struct Postgres;
@@ -40,12 +40,8 @@ impl TenantBackend for Postgres {
                     postgres_sql(
                         docker,
                         runtime,
-                        "dbe_control",
-                        &databases::postgres::provision::tenant_quota_sql(
-                            target.database,
-                            target.username,
-                            policy::postgres_quota(limits),
-                        ),
+                        CONTROL_DATABASE,
+                        &quota_sql(target, limits),
                     )
                     .await?;
                 }
@@ -53,7 +49,7 @@ impl TenantBackend for Postgres {
                     postgres_sql(
                         docker,
                         runtime,
-                        "dbe_control",
+                        CONTROL_DATABASE,
                         &format!(
                             "{}\n{}",
                             databases::postgres::provision::fence_tenant_sql(
@@ -72,7 +68,7 @@ impl TenantBackend for Postgres {
                     postgres_sql(
                         docker,
                         runtime,
-                        "dbe_control",
+                        CONTROL_DATABASE,
                         &databases::postgres::provision::unfence_tenant_sql(
                             target.database,
                             target.username,
@@ -85,23 +81,25 @@ impl TenantBackend for Postgres {
                         target.database,
                         target.username,
                     );
-                    let exists = postgres_sql(
+                    let existence = postgres_sql(
                         docker,
                         runtime,
-                        "dbe_control",
+                        CONTROL_DATABASE,
                         &databases::postgres::provision::tenant_database_exists_sql(
                             target.database,
                         ),
                     )
                     .await?;
-                    if exists.stdout.lines().any(|line| line.trim() == "1") {
+                    let database_exists = existence.stdout.lines().any(|line| line.trim() == "1");
+                    if database_exists {
                         postgres_sql(docker, runtime, target.database, &sql.database_sql).await?;
-                        postgres_sql(docker, runtime, "dbe_control", &sql.maintenance_sql).await?;
+                        postgres_sql(docker, runtime, CONTROL_DATABASE, &sql.maintenance_sql)
+                            .await?;
                     } else {
                         postgres_sql(
                             docker,
                             runtime,
-                            "dbe_control",
+                            CONTROL_DATABASE,
                             &databases::postgres::provision::drop_tenant_identity_sql(
                                 target.database,
                                 target.username,
@@ -114,12 +112,8 @@ impl TenantBackend for Postgres {
                     postgres_sql(
                         docker,
                         runtime,
-                        "dbe_control",
-                        &databases::postgres::provision::tenant_quota_sql(
-                            target.database,
-                            target.username,
-                            policy::postgres_quota(limits),
-                        ),
+                        CONTROL_DATABASE,
+                        &quota_sql(target, limits),
                     )
                     .await?;
                 }
@@ -155,12 +149,20 @@ impl TenantBackend for Postgres {
             postgres_sql(
                 docker,
                 runtime,
-                "dbe_control",
+                CONTROL_DATABASE,
                 &databases::postgres::provision::tenant_storage_sql(database_names),
             )
             .await
         })
     }
+}
+
+fn quota_sql(target: TenantTarget<'_>, limits: &InstanceLimits) -> String {
+    databases::postgres::provision::tenant_quota_sql(
+        target.database,
+        target.username,
+        policy::postgres_quota(limits),
+    )
 }
 
 pub(in crate::placement::tenant) async fn postgres_sql(

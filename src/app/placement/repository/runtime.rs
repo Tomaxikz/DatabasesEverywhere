@@ -315,33 +315,9 @@ impl PlacementRepository {
         let limits: InstanceLimits = serde_json::from_str(&limits_json)?;
         let runtime = EngineRuntime {
             pending_image: row.try_get("pending_image")?,
-            desired_state: crate::instances::metadata::DesiredInstanceState::parse(
-                &row.try_get::<String, _>("desired_state")?,
-            )
-            .ok_or_else(|| {
-                PlacementRepositoryError::InvalidReservation("invalid pool desired state".into())
-            })?,
-            owner: match (
-                row.try_get::<Option<String>, _>("owner_panel")?,
-                row.try_get::<Option<String>, _>("owner_server")?,
-            ) {
-                (Some(panel_id), Some(server_id)) => Some(crate::placement::PoolOwner {
-                    panel_id,
-                    server_id,
-                }),
-                (None, None) => None,
-                _ => {
-                    return Err(PlacementRepositoryError::InvalidReservation(
-                        "incomplete pool owner".into(),
-                    ));
-                }
-            },
-            schema_version: u32::try_from(schema_version).map_err(|_| {
-                PlacementRepositoryError::InvalidInteger {
-                    field: "schema_version",
-                    value: schema_version,
-                }
-            })?,
+            desired_state: read_desired_state(row)?,
+            owner: read_owner(row)?,
+            schema_version: i64_to_u32(schema_version, "schema_version")?,
             runtime_id,
             protocol,
             deployment_mode,
@@ -356,19 +332,9 @@ impl PlacementRepository {
             image: row.try_get("image")?,
             database_version: row.try_get("database_version")?,
             compatibility: read_compatibility(row)?,
-            max_tenants: u32::try_from(max_tenants).map_err(|_| {
-                PlacementRepositoryError::InvalidInteger {
-                    field: "max_tenants",
-                    value: max_tenants,
-                }
-            })?,
+            max_tenants: i64_to_u32(max_tenants, "max_tenants")?,
             reserved: RuntimeReservation {
-                tenants: u32::try_from(tenant_count).map_err(|_| {
-                    PlacementRepositoryError::InvalidInteger {
-                        field: "tenant_count",
-                        value: tenant_count,
-                    }
-                })?,
+                tenants: i64_to_u32(tenant_count, "tenant_count")?,
                 disk_mib: reserved_disk_mib,
             },
             admin_secret,
@@ -420,6 +386,38 @@ fn runtime_select(suffix: &'static str) -> QueryBuilder<Sqlite> {
     // Only compile-time SQL clauses may be appended; values remain bound by callers.
     query.push(suffix);
     query
+}
+
+fn read_desired_state(
+    row: &SqliteRow,
+) -> Result<crate::instances::metadata::DesiredInstanceState, PlacementRepositoryError> {
+    crate::instances::metadata::DesiredInstanceState::parse(
+        &row.try_get::<String, _>("desired_state")?,
+    )
+    .ok_or_else(|| {
+        PlacementRepositoryError::InvalidReservation("invalid pool desired state".into())
+    })
+}
+
+fn read_owner(
+    row: &SqliteRow,
+) -> Result<Option<crate::placement::PoolOwner>, PlacementRepositoryError> {
+    let panel_id = row.try_get::<Option<String>, _>("owner_panel")?;
+    let server_id = row.try_get::<Option<String>, _>("owner_server")?;
+    match (panel_id, server_id) {
+        (Some(panel_id), Some(server_id)) => Ok(Some(crate::placement::PoolOwner {
+            panel_id,
+            server_id,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(PlacementRepositoryError::InvalidReservation(
+            "incomplete pool owner".into(),
+        )),
+    }
+}
+
+fn i64_to_u32(value: i64, field: &'static str) -> Result<u32, PlacementRepositoryError> {
+    u32::try_from(value).map_err(|_| PlacementRepositoryError::InvalidInteger { field, value })
 }
 
 fn read_backend(row: &SqliteRow) -> Result<BackendEndpoint, PlacementRepositoryError> {

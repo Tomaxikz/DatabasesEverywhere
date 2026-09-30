@@ -89,12 +89,12 @@ pub async fn history(
 
 fn history_limit(limit: Option<u16>) -> Result<u16, ApiError> {
     let limit = limit.unwrap_or(DEFAULT_HISTORY_ROWS);
-    (1..=MAX_HISTORY_ROWS)
-        .contains(&limit)
-        .then_some(limit)
-        .ok_or_else(|| {
-            ApiError::BadRequest(format!("limit must be between 1 and {MAX_HISTORY_ROWS}"))
-        })
+    if !(1..=MAX_HISTORY_ROWS).contains(&limit) {
+        return Err(ApiError::BadRequest(format!(
+            "limit must be between 1 and {MAX_HISTORY_ROWS}"
+        )));
+    }
+    Ok(limit)
 }
 
 pub(crate) async fn tenant_activity(
@@ -116,12 +116,12 @@ fn sources(
     deployment_mode: DeploymentMode,
     current: &ActivityCurrent,
 ) -> ActivitySources {
+    let shared_clickhouse_measured = protocol == Protocol::Clickhouse
+        && deployment_mode == DeploymentMode::Shared
+        && current.operations_measured;
     let (connections, operations) = if gateway_ops_available(protocol) {
         ("gateway_authenticated_exact", "gateway_protocol_observed")
-    } else if protocol == Protocol::Clickhouse
-        && deployment_mode == DeploymentMode::Shared
-        && current.operations_measured
-    {
+    } else if shared_clickhouse_measured {
         ("unavailable", "engine_query_log_observed")
     } else {
         ("unavailable", "unavailable")
@@ -130,16 +130,16 @@ fn sources(
         connections,
         network: "gateway_route_exact",
         operations,
-        cpu_time: if current.cpu_time_micros.is_some() {
-            "engine_query_observed"
-        } else {
-            "unavailable"
-        },
-        peak_query_memory: if current.peak_query_memory_bytes.is_some() {
-            "engine_query_observed"
-        } else {
-            "unavailable"
-        },
+        cpu_time: engine_query_source(current.cpu_time_micros.is_some()),
+        peak_query_memory: engine_query_source(current.peak_query_memory_bytes.is_some()),
+    }
+}
+
+const fn engine_query_source(observed: bool) -> &'static str {
+    if observed {
+        "engine_query_observed"
+    } else {
+        "unavailable"
     }
 }
 

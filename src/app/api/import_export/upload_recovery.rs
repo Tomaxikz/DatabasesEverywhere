@@ -52,6 +52,17 @@ impl ImportUploadRecoverySummary {
         }
     }
 
+    fn record_failure(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    fn record_result(&mut self, result: Result<RecoveryOutcome, ()>) {
+        match result {
+            Ok(outcome) => self.record(outcome),
+            Err(()) => self.record_failure(),
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.examined = self.examined.saturating_add(other.examined);
         self.restored_ready = self.restored_ready.saturating_add(other.restored_ready);
@@ -97,10 +108,7 @@ pub(crate) async fn reconcile_import_uploads(
             break;
         };
         for upload in uploads {
-            match recover_one(state, upload).await {
-                Ok(outcome) => summary.record(outcome),
-                Err(()) => summary.failures = summary.failures.saturating_add(1),
-            }
+            summary.record_result(recover_one(state, upload).await);
         }
         after_upload_id = Some(next_cursor);
     }
@@ -135,14 +143,14 @@ pub(crate) async fn run_upload_sweeper(state: AppState) {
                 match retry_cleanup_batch(&state).await {
                     Ok(retries) => summary.merge(retries),
                     Err(_) => {
-                        summary.failures = summary.failures.saturating_add(1);
+                        summary.record_failure();
                         tracing::error!("temporary import upload cleanup retry could not query durable state");
                     }
                 }
                 match retry_recovery_batch(&state).await {
                     Ok(retries) => summary.merge(retries),
                     Err(_) => {
-                        summary.failures = summary.failures.saturating_add(1);
+                        summary.record_failure();
                         tracing::error!("temporary import upload recovery retry could not query durable state");
                     }
                 }
@@ -383,19 +391,14 @@ async fn sweep_expired_batch(
     let mut summary = ImportUploadRecoverySummary::default();
     for snapshot in uploads {
         let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
-        let current = match state
-            .import_uploads
-            .repo()
-            .get(&snapshot.instance_id, &snapshot.upload_id)
-            .await
-        {
+        let current = match reload_upload(state, &snapshot).await {
             Ok(Some(upload)) => upload,
             Ok(None) => {
                 summary.record(RecoveryOutcome::Skipped);
                 continue;
             }
-            Err(_) => {
-                summary.failures = summary.failures.saturating_add(1);
+            Err(()) => {
+                summary.record_failure();
                 continue;
             }
         };
@@ -406,10 +409,7 @@ async fn sweep_expired_batch(
             summary.record(RecoveryOutcome::Skipped);
             continue;
         }
-        match claim_and_delete(state, &current).await {
-            Ok(outcome) => summary.record(outcome),
-            Err(()) => summary.failures = summary.failures.saturating_add(1),
-        }
+        summary.record_result(claim_and_delete(state, &current).await);
     }
     Ok(summary)
 }
@@ -430,19 +430,14 @@ async fn retry_cleanup_batch(
         };
         for snapshot in uploads {
             let _operation = state.instance_locks.lock(&snapshot.instance_id).await;
-            let current = match state
-                .import_uploads
-                .repo()
-                .get(&snapshot.instance_id, &snapshot.upload_id)
-                .await
-            {
+            let current = match reload_upload(state, &snapshot).await {
                 Ok(Some(upload)) => upload,
                 Ok(None) => {
                     summary.record(RecoveryOutcome::Skipped);
                     continue;
                 }
-                Err(_) => {
-                    summary.failures = summary.failures.saturating_add(1);
+                Err(()) => {
+                    summary.record_failure();
                     continue;
                 }
             };
@@ -453,10 +448,7 @@ async fn retry_cleanup_batch(
                 summary.record(RecoveryOutcome::Skipped);
                 continue;
             }
-            match cleanup_terminal_upload(state, &current).await {
-                Ok(outcome) => summary.record(outcome),
-                Err(()) => summary.failures = summary.failures.saturating_add(1),
-            }
+            summary.record_result(cleanup_terminal_upload(state, &current).await);
         }
         after_upload_id = Some(next_cursor);
     }
@@ -484,31 +476,46 @@ async fn retry_recovery_batch(
             break;
         };
         for upload in uploads {
-            if upload.state == ImportUploadState::Importing {
-                let target_quarantined = state
-                    .instances
-                    .get(&upload.instance_id)
-                    .await
-                    .is_some_and(|metadata| metadata.status == InstanceStatus::Quarantined);
-                if !target_quarantined {
-                    match is_active_import_job(state, &upload).await {
-                        Ok(true) => continue,
-                        Ok(false) => {}
-                        Err(()) => {
-                            summary.failures = summary.failures.saturating_add(1);
-                            continue;
-                        }
-                    }
+            match import_still_in_progress(state, &upload).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(()) => {
+                    summary.record_failure();
+                    continue;
                 }
             }
-            match recover_one(state, upload).await {
-                Ok(outcome) => summary.record(outcome),
-                Err(()) => summary.failures = summary.failures.saturating_add(1),
-            }
+            summary.record_result(recover_one(state, upload).await);
         }
         after_upload_id = Some(next_cursor);
     }
     Ok(summary)
+}
+
+async fn reload_upload(
+    state: &AppState,
+    snapshot: &ImportUpload,
+) -> Result<Option<ImportUpload>, ()> {
+    state
+        .import_uploads
+        .repo()
+        .get(&snapshot.instance_id, &snapshot.upload_id)
+        .await
+        .map_err(|_| ())
+}
+
+async fn import_still_in_progress(state: &AppState, upload: &ImportUpload) -> Result<bool, ()> {
+    if upload.state != ImportUploadState::Importing {
+        return Ok(false);
+    }
+    let target_quarantined = state
+        .instances
+        .get(&upload.instance_id)
+        .await
+        .is_some_and(|metadata| metadata.status == InstanceStatus::Quarantined);
+    if target_quarantined {
+        return Ok(false);
+    }
+    is_active_import_job(state, upload).await
 }
 
 async fn is_active_import_job(state: &AppState, upload: &ImportUpload) -> Result<bool, ()> {
@@ -594,17 +601,18 @@ async fn delete_deleting_upload(
 async fn remove_upload_files(state: &AppState, upload: &ImportUpload) -> Result<(), ApiError> {
     remove_upload_file(state, upload).await?;
     let partial_path = managed_partial_path(state, upload)?;
-    tokio::task::spawn_blocking(move || {
+    let removal = tokio::task::spawn_blocking(move || {
         crate::shared::files::remove_private_file_durable(&partial_path)
     })
     .await
-    .map_err(|_| ApiError::Runtime("failed to join temporary upload cleanup".to_string()))?
-    .or_else(|error| {
-        (error.kind() == io::ErrorKind::NotFound)
-            .then_some(())
-            .ok_or(error)
-    })
-    .map_err(|_| ApiError::Runtime("failed to remove temporary upload data".to_string()))
+    .map_err(|_| ApiError::Runtime("failed to join temporary upload cleanup".to_string()))?;
+    match removal {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ApiError::Runtime(
+            "failed to remove temporary upload data".to_string(),
+        )),
+    }
 }
 
 fn managed_partial_path(state: &AppState, upload: &ImportUpload) -> Result<PathBuf, ApiError> {

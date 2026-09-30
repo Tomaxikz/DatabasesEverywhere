@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{DiskLimitError, privileged_command};
+use super::{DiskLimitError, privileged_command, remove_empty_data_directory};
 
 pub(super) async fn verify_startup() -> Result<(), DiskLimitError> {
     list_datasets().await.map(|_| ())
@@ -61,33 +61,9 @@ async fn ensure_dataset(instance_id: &str, data_path: &Path) -> Result<ZfsDatase
 
 async fn ensure_empty_mountpoint(path: &Path) -> Result<(), DiskLimitError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if path.exists() {
-            let mut entries =
-                std::fs::read_dir(&path).map_err(|source| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            if entries
-                .next()
-                .transpose()
-                .map_err(|source| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source,
-                })?
-                .is_some()
-            {
-                return Err(DiskLimitError::DataPathNotEmpty(path));
-            }
-            std::fs::remove_dir(&path).map_err(|source| DiskLimitError::PathIo {
-                path: path.display().to_string(),
-                source,
-            })?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|error| DiskLimitError::Task(error.to_string()))?
+    tokio::task::spawn_blocking(move || remove_empty_data_directory(&path))
+        .await
+        .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
 async fn set_refquota(dataset: &str, disk_mib: u64) -> Result<(), DiskLimitError> {
@@ -131,7 +107,7 @@ fn parse_zfs_datasets(output: &str) -> Vec<ZfsDataset> {
         .lines()
         .filter_map(|line| {
             let (name, mountpoint) = line.split_once('\t')?;
-            if mountpoint == "-" || mountpoint == "legacy" || mountpoint == "none" {
+            if matches!(mountpoint, "-" | "legacy" | "none") {
                 return None;
             }
             Some(ZfsDataset {

@@ -73,24 +73,22 @@ impl ResourceCache {
             .iter()
             .map(|target| (target.instance_id.clone(), target.generation.clone()))
             .collect::<Vec<_>>();
-        let network = {
+        let network_snapshots = {
             let inner = self.inner.lock().await;
             targets
                 .iter()
                 .map(|target| {
-                    (
-                        target,
-                        inner
-                            .network
-                            .get(&target.instance_id)
-                            .map(NetworkCounter::snapshot)
-                            .unwrap_or_default(),
-                    )
+                    let snapshot = inner
+                        .network
+                        .get(&target.instance_id)
+                        .map(NetworkCounter::snapshot)
+                        .unwrap_or_default();
+                    (target, snapshot)
                 })
                 .collect::<Vec<_>>()
         };
         self.activity.retain_generations(&generations);
-        for (target, (rx_bytes, tx_bytes)) in network {
+        for (target, (rx_bytes, tx_bytes)) in network_snapshots {
             let counter = self
                 .activity
                 .counter(&target.instance_id, &target.generation);
@@ -126,30 +124,7 @@ pub(super) fn start(state: AppState) {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        let targets = current_targets(&state).await;
-                        let had_pending = !pending.is_empty();
-                        match state
-                            .resource_cache
-                            .sample_activity(now_unix(), &targets, &mut pending)
-                            .await
-                        {
-                            Ok(_) if had_pending => {
-                                // The first call durably drains the exact
-                                // retry batch. A second call may persist an
-                                // independently due final full-minute bucket.
-                                if let Err(error) = state
-                                    .resource_cache
-                                    .sample_activity(now_unix(), &targets, &mut pending)
-                                    .await
-                                {
-                                    tracing::warn!(%error, "failed to persist final tenant activity bucket");
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, "failed to flush tenant activity during shutdown");
-                            }
-                        }
+                        flush_on_shutdown(&state, &mut pending).await;
                         tracing::info!("tenant activity sampler stopped");
                         break;
                     }
@@ -167,6 +142,33 @@ pub(super) fn start(state: AppState) {
             }
         }
     });
+}
+
+async fn flush_on_shutdown(state: &AppState, pending: &mut Vec<ActivityBucket>) {
+    let targets = current_targets(state).await;
+    let had_pending = !pending.is_empty();
+    match state
+        .resource_cache
+        .sample_activity(now_unix(), &targets, pending)
+        .await
+    {
+        Ok(_) if had_pending => {
+            // The first call durably drains the exact
+            // retry batch. A second call may persist an
+            // independently due final full-minute bucket.
+            if let Err(error) = state
+                .resource_cache
+                .sample_activity(now_unix(), &targets, pending)
+                .await
+            {
+                tracing::warn!(%error, "failed to persist final tenant activity bucket");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to flush tenant activity during shutdown");
+        }
+    }
 }
 
 async fn current_targets(state: &AppState) -> Vec<ActivityTarget> {

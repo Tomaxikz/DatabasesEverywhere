@@ -77,7 +77,7 @@ impl InstallProgressStore {
             &mut entries,
             progress,
             self.revision.fetch_add(1, Ordering::Relaxed),
-            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
+            self.progress_capacity(),
         );
     }
 
@@ -112,7 +112,7 @@ impl InstallProgressStore {
             &mut entries,
             creation_progress(instance_id, protocol, image),
             self.revision.fetch_add(1, Ordering::Relaxed),
-            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
+            self.progress_capacity(),
         ) {
             return Err(BeginCreationError::Capacity);
         }
@@ -203,41 +203,23 @@ impl InstallProgressStore {
     }
 
     pub fn begin_image_update(&self, instance_id: &str, protocol: Protocol, image: &str) {
-        self.set(InstallProgress {
-            revision: 0,
-            instance_id: instance_id.to_string(),
-            protocol: protocol.to_string(),
-            action: "image_update".to_string(),
-            status: InstallProgressStatus::Running,
-            stage: "queued".to_string(),
-            message: "queued image update".to_string(),
-            image: Some(bounded_progress_text(image)),
-            layer: None,
-            current: None,
-            total: None,
-            percent: None,
-            diagnostic: None,
-            updated_at: now_rfc3339(),
-        });
+        self.set(queued_progress(
+            instance_id,
+            protocol,
+            image,
+            "image_update",
+            "queued image update",
+        ));
     }
 
     pub fn begin_major_upgrade(&self, instance_id: &str, protocol: Protocol, image: &str) {
-        self.set(InstallProgress {
-            revision: 0,
-            instance_id: instance_id.to_string(),
-            protocol: protocol.to_string(),
-            action: "major_upgrade".to_string(),
-            status: InstallProgressStatus::Running,
-            stage: "queued".to_string(),
-            message: "queued major version migration".to_string(),
-            image: Some(bounded_progress_text(image)),
-            layer: None,
-            current: None,
-            total: None,
-            percent: None,
-            diagnostic: None,
-            updated_at: now_rfc3339(),
-        });
+        self.set(queued_progress(
+            instance_id,
+            protocol,
+            image,
+            "major_upgrade",
+            "queued major version migration",
+        ));
     }
 
     pub fn stage(&self, instance_id: &str, stage: &str, message: impl Into<String>) {
@@ -328,8 +310,12 @@ impl InstallProgressStore {
             &mut entries,
             progress,
             self.revision.fetch_add(1, Ordering::Relaxed),
-            self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES),
+            self.progress_capacity(),
         );
+    }
+
+    fn progress_capacity(&self) -> usize {
+        self.max_creations.max(MAX_INSTALL_PROGRESS_ENTRIES)
     }
 
     fn update(&self, instance_id: &str, update: impl FnOnce(&mut InstallProgress)) {
@@ -389,14 +375,30 @@ pub enum InstallProgressStatus {
 }
 
 fn creation_progress(instance_id: &str, protocol: Protocol, image: &str) -> InstallProgress {
+    queued_progress(
+        instance_id,
+        protocol,
+        image,
+        "create",
+        "queued instance creation",
+    )
+}
+
+fn queued_progress(
+    instance_id: &str,
+    protocol: Protocol,
+    image: &str,
+    action: &str,
+    message: &str,
+) -> InstallProgress {
     InstallProgress {
         revision: 0,
         instance_id: instance_id.to_string(),
         protocol: protocol.to_string(),
-        action: "create".to_string(),
+        action: action.to_string(),
         status: InstallProgressStatus::Running,
         stage: "queued".to_string(),
-        message: "queued instance creation".to_string(),
+        message: message.to_string(),
         image: Some(bounded_progress_text(image)),
         layer: None,
         current: None,

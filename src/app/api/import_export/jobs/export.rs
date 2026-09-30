@@ -1,6 +1,7 @@
 use super::*;
 
 const LOGICAL_EXPORT_BASE_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
+const PHYSICAL_EXPORT_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) async fn estimate_export_cost(
     state: &AppState,
@@ -9,22 +10,14 @@ pub(super) async fn estimate_export_cost(
 ) -> JobResourceCost {
     let allocated_bytes = mib_to_bytes(metadata.limits.disk_mib)
         .min(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
-    let input_size_bytes = if metadata.deployment_mode == DeploymentMode::Shared {
-        measure_shared_database_bytes(state, metadata)
-            .await
-            .unwrap_or(allocated_bytes)
+    let measured_bytes = if metadata.deployment_mode == DeploymentMode::Shared {
+        measure_shared_database_bytes(state, metadata).await.ok()
     } else {
-        match InstancePaths::new(&state.config.paths, &metadata.instance_id) {
-            Ok(paths) => state
-                .resource_cache
-                .disk_usage(&state.config, &metadata.instance_id, paths.data)
-                .await
-                .map(|usage| usage.used_bytes)
-                .unwrap_or(allocated_bytes),
-            Err(_) => allocated_bytes,
-        }
-    }
-    .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+        cached_dedicated_used_bytes(state, metadata).await
+    };
+    let input_size_bytes = measured_bytes
+        .unwrap_or(allocated_bytes)
+        .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
     JobResourceCost::estimate(JobEstimateInput {
         protocol: metadata.protocol,
         input_size_bytes,
@@ -34,6 +27,16 @@ pub(super) async fn estimate_export_cost(
             || options.archive_format != ExportArchiveFormat::Plain,
         export: true,
     })
+}
+
+async fn cached_dedicated_used_bytes(state: &AppState, metadata: &InstanceMetadata) -> Option<u64> {
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id).ok()?;
+    state
+        .resource_cache
+        .disk_usage(&state.config, &metadata.instance_id, paths.data)
+        .await
+        .ok()
+        .map(|usage| usage.used_bytes)
 }
 
 pub(super) async fn export_artifact(
@@ -186,7 +189,7 @@ pub(super) async fn reserve_export_capacity(
     };
     let output_capacity = match logical_output_capacity {
         None => mib_to_bytes(metadata.limits.disk_mib)
-            .saturating_add(64 * 1024 * 1024)
+            .saturating_add(PHYSICAL_EXPORT_HEADROOM_BYTES)
             .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES),
         Some(logical_output_capacity) => {
             export_artifact_capacity_bytes(logical_output_capacity, options.archive_format)
@@ -195,34 +198,42 @@ pub(super) async fn reserve_export_capacity(
                 })?
         }
     };
-    let _artifact_capacity = state
+    let artifact_reservation = state
         .import_uploads
         .reserve_output_capacity(artifact_root, output_capacity)
         .await?;
-    let staging = if let Some(logical_output_capacity) = logical_output_capacity {
-        let staging_root = logical_staging_root(state).await?;
-        let roots_share_filesystem = state
-            .import_uploads
-            .output_roots_share_filesystem(artifact_root, &staging_root)
-            .await?;
-        if needs_separate_export_staging(options.archive_format, roots_share_filesystem) {
-            Some(
-                state
-                    .import_uploads
-                    .reserve_output_capacity(&staging_root, logical_output_capacity)
-                    .await?,
-            )
-        } else {
-            None
+    let staging_reservation = match logical_output_capacity {
+        Some(capacity) => {
+            reserve_export_staging(state, artifact_root, options.archive_format, capacity).await?
         }
-    } else {
-        None
+        None => None,
     };
     Ok(ExportOutputReservations {
-        _artifact: _artifact_capacity,
-        _staging: staging,
+        _artifact: artifact_reservation,
+        _staging: staging_reservation,
         logical_output_capacity,
     })
+}
+
+async fn reserve_export_staging(
+    state: &AppState,
+    artifact_root: &FsPath,
+    archive_format: ExportArchiveFormat,
+    logical_output_capacity: u64,
+) -> Result<Option<super::uploads::DiskCapacityReservation>, ApiError> {
+    let staging_root = logical_staging_root(state).await?;
+    let roots_share_filesystem = state
+        .import_uploads
+        .output_roots_share_filesystem(artifact_root, &staging_root)
+        .await?;
+    if !needs_separate_export_staging(archive_format, roots_share_filesystem) {
+        return Ok(None);
+    }
+    let reservation = state
+        .import_uploads
+        .reserve_output_capacity(&staging_root, logical_output_capacity)
+        .await?;
+    Ok(Some(reservation))
 }
 
 pub(super) async fn write_reserved_export(

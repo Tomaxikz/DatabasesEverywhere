@@ -9,6 +9,12 @@ use rustix::{
     io::Errno,
 };
 
+const BYTES_PER_BLOCK: u64 = 512;
+const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
 /// Stable identity of an opened directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DirectoryIdentity {
@@ -57,12 +63,7 @@ pub(crate) fn scan_directory_with_id(
     limits: ScanLimits,
 ) -> Result<(DirectoryUsage, DirectoryIdentity), Error> {
     let started = Instant::now();
-    let root = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(Error::from)?;
+    let root = open(path, DIRECTORY_OPEN_FLAGS, Mode::empty()).map_err(Error::from)?;
     let root_stat = fstat(&root).map_err(Error::from)?;
     let identity = identity_from_stat(&root_stat)?;
     let mut scanner = DirectoryScanner {
@@ -84,12 +85,7 @@ pub(crate) fn scan_directory_with_id(
 }
 
 pub(crate) fn directory_identity(path: &Path) -> Result<DirectoryIdentity, Error> {
-    let directory = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(Error::from)?;
+    let directory = open(path, DIRECTORY_OPEN_FLAGS, Mode::empty()).map_err(Error::from)?;
     identity_from_stat(&fstat(&directory).map_err(Error::from)?)
 }
 
@@ -103,7 +99,7 @@ fn identity_from_stat(stat: &rustix::fs::Stat) -> Result<DirectoryIdentity, Erro
 fn allocated_bytes(blocks: i64) -> Result<u64, Error> {
     u64::try_from(blocks)
         .map_err(|_| Error::new(ErrorKind::InvalidData, "directory reported negative blocks"))?
-        .checked_mul(512)
+        .checked_mul(BYTES_PER_BLOCK)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, "allocated disk usage overflow"))
 }
 
@@ -133,15 +129,7 @@ impl DirectoryScanner {
             if matches!(name.to_bytes(), b"." | b"..") {
                 continue;
             }
-            self.usage.entries = self.usage.entries.checked_add(1).ok_or_else(|| {
-                Error::new(ErrorKind::InvalidData, "disk scan entry count overflow")
-            })?;
-            if self.usage.entries > self.limits.max_entries as u64 {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("disk scan exceeded {} entries", self.limits.max_entries),
-                ));
-            }
+            self.count_entry()?;
 
             let stat = match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
@@ -149,20 +137,7 @@ impl DirectoryScanner {
                 Err(error) if transient_entry_error(error) => continue,
                 Err(error) => return Err(Error::from(error)),
             };
-            let blocks = u64::try_from(stat.st_blocks).map_err(|_| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "file reported a negative allocated block count",
-                )
-            })?;
-            let allocated = blocks.checked_mul(512).ok_or_else(|| {
-                Error::new(ErrorKind::InvalidData, "allocated disk usage overflow")
-            })?;
-            self.usage.physical_bytes = self
-                .usage
-                .physical_bytes
-                .checked_add(allocated)
-                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "disk usage overflow"))?;
+            self.add_allocated_blocks(stat.st_blocks)?;
 
             match FileType::from_raw_mode(stat.st_mode) {
                 FileType::Directory => {
@@ -172,30 +147,60 @@ impl DirectoryScanner {
                             format!("disk scan exceeded depth {}", self.limits.max_depth),
                         ));
                     }
-                    let child = match openat(
-                        directory,
-                        name,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    ) {
+                    let child = match openat(directory, name, DIRECTORY_OPEN_FLAGS, Mode::empty()) {
                         Ok(child) => child,
                         Err(error) if transient_entry_error(error) => continue,
                         Err(error) => return Err(Error::from(error)),
                     };
                     self.scan_open_directory(&child, depth + 1)?;
                 }
-                FileType::RegularFile => {
-                    let size = u64::try_from(stat.st_size).map_err(|_| {
-                        Error::new(ErrorKind::InvalidData, "file reported a negative size")
-                    })?;
-                    self.usage.logical_bytes =
-                        self.usage.logical_bytes.checked_add(size).ok_or_else(|| {
-                            Error::new(ErrorKind::InvalidData, "logical disk usage overflow")
-                        })?;
-                }
+                FileType::RegularFile => self.add_logical_size(stat.st_size)?,
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn count_entry(&mut self) -> Result<(), Error> {
+        self.usage.entries =
+            self.usage.entries.checked_add(1).ok_or_else(|| {
+                Error::new(ErrorKind::InvalidData, "disk scan entry count overflow")
+            })?;
+        if self.usage.entries > self.limits.max_entries as u64 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("disk scan exceeded {} entries", self.limits.max_entries),
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_allocated_blocks(&mut self, blocks: i64) -> Result<(), Error> {
+        let blocks = u64::try_from(blocks).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "file reported a negative allocated block count",
+            )
+        })?;
+        let allocated = blocks
+            .checked_mul(BYTES_PER_BLOCK)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "allocated disk usage overflow"))?;
+        self.usage.physical_bytes = self
+            .usage
+            .physical_bytes
+            .checked_add(allocated)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "disk usage overflow"))?;
+        Ok(())
+    }
+
+    fn add_logical_size(&mut self, size: i64) -> Result<(), Error> {
+        let size = u64::try_from(size)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "file reported a negative size"))?;
+        self.usage.logical_bytes = self
+            .usage
+            .logical_bytes
+            .checked_add(size)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "logical disk usage overflow"))?;
         Ok(())
     }
 }

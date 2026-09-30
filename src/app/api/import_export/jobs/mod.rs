@@ -14,7 +14,9 @@ pub(crate) use export::{measure_export_bytes, measure_shared_database_bytes};
 use supervision::{spawn_export_supervisor, spawn_import_supervisor};
 
 pub(super) const MAX_REPLAY_OPTIONS_BYTES: usize = 64 * 1024;
-const MAX_ENQUEUE_READBACK_DELAY_MS: u64 = 1_000;
+const MAX_RETRY_DELAY_MS: u64 = 1_000;
+const ENQUEUE_READBACK_BASE_DELAY_MS: u64 = 25;
+const MAX_ENQUEUE_READBACK_BACKOFF_EXPONENT: u32 = 6;
 
 fn scheduler_capacity_error() -> ApiError {
     ApiError::Conflict(
@@ -182,27 +184,11 @@ pub(crate) async fn queue_import_instance(
         &options.selection,
     )
     .await?;
-    let upload_staging = if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
-        let prepared_bytes = prepared_upload_bytes(state, &options).await;
-        match upload_logical_staging_budget(state, &metadata, prepared_bytes).await? {
-            Some(budget) => Some(UploadStagingBudget::Logical {
-                budget,
-                target_created_at: metadata.created_at.clone(),
-                disk_mib: metadata.limits.disk_mib,
-            }),
-            None => match upload_physical_staging_bytes(&metadata)? {
-                Some(bytes) => Some(UploadStagingBudget::Physical {
-                    extracted_bytes: bytes,
-                    target_created_at: metadata.created_at.clone(),
-                    disk_mib: metadata.limits.disk_mib,
-                }),
-                None => None,
-            },
-        }
+    options.upload_staging = if matches!(&options.source, ImportSourceOptions::Upload { .. }) {
+        upload_staging_budget(state, &metadata, &options).await?
     } else {
         None
     };
-    options.upload_staging = upload_staging;
     let artifact_path = match &options.source {
         ImportSourceOptions::Artifact(path) => Some(path.clone()),
         ImportSourceOptions::Upload { .. } => None,
@@ -273,6 +259,28 @@ async fn wait_for_enqueue(
     supervisor.await.map_err(|error| {
         ApiError::Runtime(format!("import/export enqueue supervisor failed: {error}"))
     })?
+}
+
+async fn upload_staging_budget(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    options: &ImportOptions,
+) -> Result<Option<UploadStagingBudget>, ApiError> {
+    let prepared_bytes = prepared_upload_bytes(state, options).await;
+    if let Some(budget) = upload_logical_staging_budget(state, metadata, prepared_bytes).await? {
+        return Ok(Some(UploadStagingBudget::Logical {
+            budget,
+            target_created_at: metadata.created_at.clone(),
+            disk_mib: metadata.limits.disk_mib,
+        }));
+    }
+    let physical_budget =
+        upload_physical_staging_bytes(metadata)?.map(|bytes| UploadStagingBudget::Physical {
+            extracted_bytes: bytes,
+            target_created_at: metadata.created_at.clone(),
+            disk_mib: metadata.limits.disk_mib,
+        });
+    Ok(physical_budget)
 }
 
 async fn prepared_upload_bytes(state: &AppState, options: &ImportOptions) -> u64 {
@@ -411,41 +419,61 @@ pub(super) async fn enqueue_job(
         updated_at: now,
     };
     if let Err(insert_error) = state.import_export_jobs.insert(job.clone()).await {
-        let mut attempt = 0_u32;
-        loop {
-            attempt = attempt.saturating_add(1);
-            match state.import_export_jobs.get(&job.job_id).await {
-                Ok(Some(stored)) if stored == job => {
-                    state
-                        .import_export_jobs
-                        .cache_durable_job(job.clone())
-                        .await;
-                    tracing::warn!(job_id = job.job_id, %insert_error, attempt, "recovered an acknowledged durable import/export enqueue");
-                    break;
-                }
-                Ok(Some(_)) => {
-                    tracing::error!(job_id = job.job_id, %insert_error, attempt, "import/export enqueue read-back differed from the intended durable job");
-                    return Err(ApiError::Runtime(
-                        "import/export job persistence was inconsistent".to_string(),
-                    ));
-                }
-                Ok(None) => return Err(ApiError::Runtime(insert_error.to_string())),
-                Err(read_error) if state.import_export_jobs.is_accepting() => {
-                    tracing::warn!(job_id = job.job_id, %insert_error, %read_error, attempt, "retrying uncertain import/export enqueue read-back");
-                    let exponent = attempt.saturating_sub(1).min(6);
-                    let delay_ms = 25_u64
-                        .saturating_mul(1_u64 << exponent)
-                        .min(MAX_ENQUEUE_READBACK_DELAY_MS);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(read_error) => {
-                    tracing::error!(job_id = job.job_id, %insert_error, %read_error, attempt, "daemon shutdown interrupted uncertain import/export enqueue classification; startup recovery will reconcile any durable row");
-                    return Err(ApiError::Runtime(insert_error.to_string()));
-                }
+        recover_uncertain_enqueue(state, &job, insert_error).await?;
+    }
+    Ok((job, admission))
+}
+
+async fn recover_uncertain_enqueue(
+    state: &AppState,
+    job: &ImportExportJob,
+    insert_error: impl std::fmt::Display,
+) -> Result<(), ApiError> {
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match state.import_export_jobs.get(&job.job_id).await {
+            Ok(Some(stored)) if stored == *job => {
+                state
+                    .import_export_jobs
+                    .cache_durable_job(job.clone())
+                    .await;
+                tracing::warn!(job_id = job.job_id, %insert_error, attempt, "recovered an acknowledged durable import/export enqueue");
+                return Ok(());
+            }
+            Ok(Some(_)) => {
+                tracing::error!(job_id = job.job_id, %insert_error, attempt, "import/export enqueue read-back differed from the intended durable job");
+                return Err(ApiError::Runtime(
+                    "import/export job persistence was inconsistent".to_string(),
+                ));
+            }
+            Ok(None) => return Err(ApiError::Runtime(insert_error.to_string())),
+            Err(read_error) if state.import_export_jobs.is_accepting() => {
+                tracing::warn!(job_id = job.job_id, %insert_error, %read_error, attempt, "retrying uncertain import/export enqueue read-back");
+                tokio::time::sleep(enqueue_readback_delay(attempt)).await;
+            }
+            Err(read_error) => {
+                tracing::error!(job_id = job.job_id, %insert_error, %read_error, attempt, "daemon shutdown interrupted uncertain import/export enqueue classification; startup recovery will reconcile any durable row");
+                return Err(ApiError::Runtime(insert_error.to_string()));
             }
         }
     }
-    Ok((job, admission))
+}
+
+fn enqueue_readback_delay(attempt: u32) -> Duration {
+    capped_retry_delay(
+        ENQUEUE_READBACK_BASE_DELAY_MS,
+        attempt,
+        MAX_ENQUEUE_READBACK_BACKOFF_EXPONENT,
+    )
+}
+
+fn capped_retry_delay(base_delay_ms: u64, attempt: u32, max_exponent: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(max_exponent);
+    let delay_ms = base_delay_ms
+        .saturating_mul(1_u64 << exponent)
+        .min(MAX_RETRY_DELAY_MS);
+    Duration::from_millis(delay_ms)
 }
 
 pub(super) fn serialize_replay_descriptor(

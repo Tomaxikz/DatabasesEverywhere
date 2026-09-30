@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -15,6 +15,14 @@ struct FilesystemIdentity(String);
 struct ReservationState {
     gate: AsyncMutex<()>,
     reserved_bytes_by_filesystem: Mutex<HashMap<FilesystemIdentity, u64>>,
+}
+
+impl ReservationState {
+    fn lock_reserved_totals(&self) -> MutexGuard<'_, HashMap<FilesystemIdentity, u64>> {
+        self.reserved_bytes_by_filesystem
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Serializes output-capacity checks and tracks reservations across all users
@@ -39,20 +47,14 @@ impl DiskCapacityService {
         let filesystem = filesystem_identity(&metadata);
         let already_reserved = self
             .state
-            .reserved_bytes_by_filesystem
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_reserved_totals()
             .get(&filesystem)
             .copied()
             .unwrap_or(0);
 
         ensure_disk_space(root, requested, already_reserved).await?;
 
-        let mut totals = self
-            .state
-            .reserved_bytes_by_filesystem
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut totals = self.state.lock_reserved_totals();
         let total = totals.entry(filesystem.clone()).or_default();
         *total = total
             .checked_add(requested)
@@ -78,13 +80,7 @@ impl DiskCapacityService {
 
     #[cfg(test)]
     pub(crate) fn reserved_bytes(&self) -> u64 {
-        self.state
-            .reserved_bytes_by_filesystem
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .copied()
-            .sum()
+        self.state.lock_reserved_totals().values().copied().sum()
     }
 }
 
@@ -97,11 +93,7 @@ pub(crate) struct DiskCapacityReservation {
 
 impl Drop for DiskCapacityReservation {
     fn drop(&mut self) {
-        let mut totals = self
-            .state
-            .reserved_bytes_by_filesystem
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut totals = self.state.lock_reserved_totals();
         let Some(total) = totals.get_mut(&self.filesystem) else {
             debug_assert!(false, "output capacity reservation identity was missing");
             return;

@@ -3,7 +3,7 @@ use std::time::Duration;
 use bollard::{
     container::LogOutput,
     errors::Error as BollardError,
-    models::{ContainerInspectResponse, ContainerStatsResponse},
+    models::{ContainerInspectResponse, ContainerStatsResponse, HostConfigLogConfig},
     query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder},
 };
 use futures::{StreamExt, TryStreamExt};
@@ -21,6 +21,11 @@ use crate::{
 };
 
 const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_HISTORY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_LOG_HISTORY_TAIL_LINES: usize = 200;
+const DEFAULT_FOLLOW_TAIL_LINES: usize = 100;
+const MAX_LOG_TAIL_LINES: usize = 2_000;
 
 impl DockerRuntime {
     pub(crate) async fn log_policy_is_current(
@@ -28,10 +33,9 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<bool, DockerError> {
-        let id = self
-            .required_managed_container_id(protocol, instance_id)
+        let inspection = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let inspection = self.docker.inspect_container(&id, None).await?;
         Ok(log_policy_matches(&inspection, self.engine()))
     }
     /// Returns the exact protocol-qualified container name when it belongs to
@@ -159,15 +163,25 @@ impl DockerRuntime {
             })
     }
 
+    async fn inspect_managed_container(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+    ) -> Result<ContainerInspectResponse, DockerError> {
+        let id = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        Ok(self.docker.inspect_container(&id, None).await?)
+    }
+
     pub async fn inspect_instance(
         &self,
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<DockerInstanceInspection, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
         let state = response.state;
         let oom_killed = state
             .as_ref()
@@ -186,24 +200,14 @@ impl DockerRuntime {
             .map(|status| status.as_ref().to_string());
         let status = state
             .and_then(|state| state.status)
-            .map(|status| match status.as_ref() {
-                "running" => DockerContainerStatus::Running,
-                "created" => DockerContainerStatus::Created,
-                "restarting" => DockerContainerStatus::Starting,
-                "paused" | "exited" | "stopping" => DockerContainerStatus::Stopped,
-                _ => DockerContainerStatus::Failed,
-            })
+            .map(|status| container_status(status.as_ref()))
             .unwrap_or(DockerContainerStatus::Failed);
         let network_mode = response
             .host_config
             .and_then(|host_config| host_config.network_mode)
             .map(|mode| mode.trim().to_ascii_lowercase())
             .filter(|mode| !mode.is_empty());
-        let image = response
-            .config
-            .and_then(|config| config.image)
-            .map(|image| image.trim().to_string())
-            .filter(|image| !image.is_empty());
+        let image = trimmed_non_empty(response.config.and_then(|config| config.image));
 
         Ok(DockerInstanceInspection {
             status,
@@ -279,7 +283,7 @@ impl DockerRuntime {
                 return Err(not_ready_error(instance_id, last, last_readiness_error));
             }
 
-            sleep(Duration::from_secs(1)).await;
+            sleep(READINESS_POLL_INTERVAL).await;
             last = self.inspect_instance(protocol, instance_id).await?;
         }
     }
@@ -289,29 +293,22 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        Ok(response
-            .config
-            .and_then(|config| config.user)
-            .map(|user| user.trim().to_string())
-            .filter(|user| !user.is_empty()))
+        Ok(trimmed_non_empty(
+            response.config.and_then(|config| config.user),
+        ))
     }
 
     pub(crate) async fn postgres_bootstrap_credentials(
         &self,
         instance_id: &str,
     ) -> Result<(String, SecretString), DockerError> {
-        let name = self
-            .required_managed_container_id(Protocol::Postgres, instance_id)
+        let response = self
+            .inspect_managed_container(Protocol::Postgres, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        let environment = response
-            .config
-            .and_then(|config| config.env)
-            .unwrap_or_default();
+        let environment = container_environment(response);
         let username = unique_environment_value(&environment, "POSTGRES_USER", instance_id)?;
         let password = unique_environment_value(&environment, "POSTGRES_PASSWORD", instance_id)?;
         if username.trim().is_empty() || password.is_empty() {
@@ -357,52 +354,38 @@ impl DockerRuntime {
         instance_id: &str,
         key_pairs: &[(&str, &str)],
     ) -> Result<Option<(String, SecretString)>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        let environment = response
-            .config
-            .and_then(|config| config.env)
-            .unwrap_or_default();
+        let environment = container_environment(response);
+        let invalid_environment =
+            |reason: String| DockerError::InvalidLegacyCredentialEnvironment {
+                instance_id: instance_id.to_string(),
+                protocol: protocol.as_str().to_string(),
+                reason,
+            };
         let mut credential = None;
         for (username_key, password_key) in key_pairs {
-            let username = unique_optional_env(&environment, username_key).map_err(|reason| {
-                DockerError::InvalidLegacyCredentialEnvironment {
-                    instance_id: instance_id.to_string(),
-                    protocol: protocol.as_str().to_string(),
-                    reason,
-                }
-            })?;
-            let password = unique_optional_env(&environment, password_key).map_err(|reason| {
-                DockerError::InvalidLegacyCredentialEnvironment {
-                    instance_id: instance_id.to_string(),
-                    protocol: protocol.as_str().to_string(),
-                    reason,
-                }
-            })?;
+            let username =
+                unique_optional_env(&environment, username_key).map_err(invalid_environment)?;
+            let password =
+                unique_optional_env(&environment, password_key).map_err(invalid_environment)?;
             match (username, password) {
                 (None, None) => {}
                 (Some(username), Some(password))
                     if !username.trim().is_empty() && !password.is_empty() =>
                 {
                     if credential.is_some() {
-                        return Err(DockerError::InvalidLegacyCredentialEnvironment {
-                            instance_id: instance_id.to_string(),
-                            protocol: protocol.as_str().to_string(),
-                            reason: "multiple tenant credential pairs are present".to_string(),
-                        });
+                        return Err(invalid_environment(
+                            "multiple tenant credential pairs are present".to_string(),
+                        ));
                     }
                     credential = Some((username, SecretString::from(password)));
                 }
                 _ => {
-                    return Err(DockerError::InvalidLegacyCredentialEnvironment {
-                        instance_id: instance_id.to_string(),
-                        protocol: protocol.as_str().to_string(),
-                        reason: format!(
-                            "{username_key} and {password_key} must both be present and non-empty"
-                        ),
-                    });
+                    return Err(invalid_environment(format!(
+                        "{username_key} and {password_key} must both be present and non-empty"
+                    )));
                 }
             }
         }
@@ -414,15 +397,12 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        Ok(response
-            .config
-            .and_then(|config| config.image)
-            .map(|image| image.trim().to_string())
-            .filter(|image| !image.is_empty()))
+        Ok(trimmed_non_empty(
+            response.config.and_then(|config| config.image),
+        ))
     }
 
     /// Return the immutable image ID backing a managed container. Internal
@@ -433,14 +413,10 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        Ok(response
-            .image
-            .map(|image| image.trim().to_string())
-            .filter(|image| !image.is_empty()))
+        Ok(trimmed_non_empty(response.image))
     }
 
     pub async fn container_bind_source(
@@ -449,10 +425,9 @@ impl DockerRuntime {
         instance_id: &str,
         destination: &str,
     ) -> Result<Option<std::path::PathBuf>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
         Ok(response
             .mounts
             .unwrap_or_default()
@@ -495,23 +470,14 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        let Some(reference) = response
-            .config
-            .and_then(|config| config.image)
-            .map(|image| image.trim().to_string())
-            .filter(|image| !image.is_empty())
+        let Some(reference) = trimmed_non_empty(response.config.and_then(|config| config.image))
         else {
             return Ok(None);
         };
-        let Some(container_image_id) = response
-            .image
-            .map(|image| image.trim().to_string())
-            .filter(|image| !image.is_empty())
-        else {
+        let Some(container_image_id) = trimmed_non_empty(response.image) else {
             return Ok(None);
         };
         let resolved = match self.docker.inspect_image(&reference).await {
@@ -536,10 +502,9 @@ impl DockerRuntime {
         instance_id: &str,
         key: &str,
     ) -> Result<Option<SecretString>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
         Ok(response
             .config
             .and_then(|config| config.env)
@@ -555,14 +520,10 @@ impl DockerRuntime {
         instance_id: &str,
         key: &str,
     ) -> Result<Option<SecretString>, DockerError> {
-        let id = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&id, None).await?;
-        let environment = response
-            .config
-            .and_then(|config| config.env)
-            .unwrap_or_default();
+        let environment = container_environment(response);
         unique_optional_env(&environment, key)
             .map(|value| value.map(SecretString::from))
             .map_err(|reason| DockerError::InvalidLegacyCredentialEnvironment {
@@ -579,16 +540,15 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<Option<String>, DockerError> {
-        let name = self
-            .required_managed_container_id(protocol, instance_id)
+        let response = self
+            .inspect_managed_container(protocol, instance_id)
             .await?;
-        let response = self.docker.inspect_container(&name, None).await?;
-        Ok(response
-            .config
-            .and_then(|config| config.labels)
-            .and_then(|labels| labels.get(PROJECT_LABEL).cloned())
-            .map(|project_id| project_id.trim().to_string())
-            .filter(|project_id| !project_id.is_empty()))
+        Ok(trimmed_non_empty(
+            response
+                .config
+                .and_then(|config| config.labels)
+                .and_then(|labels| labels.get(PROJECT_LABEL).cloned()),
+        ))
     }
 
     pub async fn logs(
@@ -600,7 +560,10 @@ impl DockerRuntime {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        let tail = tail.unwrap_or(200).clamp(1, 2_000).to_string();
+        let tail = tail
+            .unwrap_or(DEFAULT_LOG_HISTORY_TAIL_LINES)
+            .clamp(1, MAX_LOG_TAIL_LINES)
+            .to_string();
         let mut stdout = super::CappedExecOutput::default();
         let mut stderr = super::CappedExecOutput::default();
         let mut stdout_redactor = crate::shared::logs::LogRedactor::default();
@@ -616,7 +579,7 @@ impl DockerRuntime {
             ),
         );
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(LOG_HISTORY_TIMEOUT, async {
             while let Some(chunk) = stream.try_next().await? {
                 match chunk {
                     LogOutput::StdErr { message } => {
@@ -663,7 +626,10 @@ impl DockerRuntime {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        let tail = tail.unwrap_or(100).clamp(1, 2_000).to_string();
+        let tail = tail
+            .unwrap_or(DEFAULT_FOLLOW_TAIL_LINES)
+            .clamp(1, MAX_LOG_TAIL_LINES)
+            .to_string();
         // Poll Docker directly: dropping the WebSocket drops this stream too.
         // No detached producer or per-viewer queue retains console output.
         Ok(self
@@ -743,26 +709,35 @@ fn log_policy_matches(
     // bounded create path; do not repeatedly recreate a compliant container.
     let matches = match engine {
         crate::config::DaemonEngine::Docker => configured == Some(&expected),
-        crate::config::DaemonEngine::Podman => configured.is_some_and(|value| {
-            matches!(value.typ.as_deref(), Some("json-file" | "k8s-file"))
-                && (value.config.is_none()
-                    || value
-                        .config
-                        .as_ref()
-                        .is_some_and(|values| values.is_empty())
-                    || value.config == expected.config)
-        }),
+        crate::config::DaemonEngine::Podman => {
+            configured.is_some_and(|configured| podman_log_config_matches(configured, &expected))
+        }
     };
-    marked
-        && matches
-        && !inspection.mounts.as_ref().is_some_and(|mounts| {
-            mounts.iter().any(|mount| {
-                matches!(
-                    mount.destination.as_deref(),
-                    Some("/logs" | "/var/log/clickhouse-server")
-                ) && mount.typ.as_deref() == Some("bind")
-            })
+    marked && matches && !has_legacy_log_bind_mount(inspection)
+}
+
+fn podman_log_config_matches(
+    configured: &HostConfigLogConfig,
+    expected: &HostConfigLogConfig,
+) -> bool {
+    let reports_file_driver = matches!(configured.typ.as_deref(), Some("json-file" | "k8s-file"));
+    let options_match = configured
+        .config
+        .as_ref()
+        .is_none_or(|options| options.is_empty())
+        || configured.config == expected.config;
+    reports_file_driver && options_match
+}
+
+fn has_legacy_log_bind_mount(inspection: &ContainerInspectResponse) -> bool {
+    inspection.mounts.as_ref().is_some_and(|mounts| {
+        mounts.iter().any(|mount| {
+            matches!(
+                mount.destination.as_deref(),
+                Some("/logs" | "/var/log/clickhouse-server")
+            ) && mount.typ.as_deref() == Some("bind")
         })
+    })
 }
 
 impl ManagedStatsSampler {
@@ -795,6 +770,29 @@ fn container_id(
         .ok_or_else(|| DockerError::ManagedContainerIdUnavailable {
             container: container.to_string(),
         })
+}
+
+fn container_status(status: &str) -> DockerContainerStatus {
+    match status {
+        "running" => DockerContainerStatus::Running,
+        "created" => DockerContainerStatus::Created,
+        "restarting" => DockerContainerStatus::Starting,
+        "paused" | "exited" | "stopping" => DockerContainerStatus::Stopped,
+        _ => DockerContainerStatus::Failed,
+    }
+}
+
+fn trimmed_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn container_environment(response: ContainerInspectResponse) -> Vec<String> {
+    response
+        .config
+        .and_then(|config| config.env)
+        .unwrap_or_default()
 }
 
 fn not_ready_error(

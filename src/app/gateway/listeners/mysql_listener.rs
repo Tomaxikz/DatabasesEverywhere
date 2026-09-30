@@ -1,5 +1,5 @@
 use secrecy::ExposeSecret;
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWrite, net::TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use super::{
@@ -97,10 +97,10 @@ async fn prepare_mysql_connection(
     let (mut client, client_response) = if mariadb::is_ssl_request(&first_response.payload)? {
         let Some(tls) = tls else {
             let error = mariadb::MariadbProxyError::TlsUnavailable;
-            mariadb::write_packet(
+            send_error_packet(
                 &mut raw_client,
                 first_response.sequence.wrapping_add(1),
-                &mariadb::error_packet(&error.to_string()),
+                &error.to_string(),
             )
             .await?;
             return Err(error.into());
@@ -112,10 +112,10 @@ async fn prepare_mysql_connection(
     } else {
         if tls_available {
             let error = mariadb::MariadbProxyError::TlsRequired;
-            mariadb::write_packet(
+            send_error_packet(
                 &mut raw_client,
                 first_response.sequence.wrapping_add(1),
-                &mariadb::error_packet(&error.to_string()),
+                &error.to_string(),
             )
             .await?;
             return Err(error.into());
@@ -126,48 +126,37 @@ async fn prepare_mysql_connection(
     let mut route = match mariadb::parse_client_handshake_response(&client_response.payload) {
         Ok(route) => route,
         Err(error) => {
-            let error_message = error.to_string();
-            mariadb::write_packet(
-                &mut client,
-                client_reply_sequence,
-                &mariadb::error_packet(&error_message),
-            )
-            .await?;
+            send_error_packet(&mut client, client_reply_sequence, &error.to_string()).await?;
             return Err(error.into());
         }
     };
 
+    let requested_database = (!route.database.is_empty()).then_some(route.database.as_str());
     let resolution = if mysql {
         resolver
-            .resolve_mysql(
-                &route.username,
-                (!route.database.is_empty()).then_some(route.database.as_str()),
-            )
+            .resolve_mysql(&route.username, requested_database)
             .await
     } else {
         resolver
-            .resolve_mariadb(
-                &route.username,
-                (!route.database.is_empty()).then_some(route.database.as_str()),
-            )
+            .resolve_mariadb(&route.username, requested_database)
             .await
     };
     let (database, target) = match resolution {
         DatabaseRouteResolution::Found { database, target } => (database, target),
         DatabaseRouteResolution::NotFound => {
-            mariadb::write_packet(
+            send_error_packet(
                 &mut client,
                 client_reply_sequence,
-                &mariadb::error_packet("Access denied for requested database"),
+                "Access denied for requested database",
             )
             .await?;
             return Err(ListenerError::RouteNotFound);
         }
         DatabaseRouteResolution::Ambiguous => {
-            mariadb::write_packet(
+            send_error_packet(
                 &mut client,
                 client_reply_sequence,
-                &mariadb::error_packet("Database must be included for routing"),
+                "Database must be included for routing",
             )
             .await?;
             return Err(ListenerError::AmbiguousDatabaseRoute { protocol });
@@ -176,12 +165,7 @@ async fn prepare_mysql_connection(
     route.database = database;
     let Some(native_password_sha1_stage2) = target.native_password_sha1_stage2.as_deref() else {
         let message = mariadb::MariadbProxyError::MissingNativePasswordVerifier.to_string();
-        mariadb::write_packet(
-            &mut client,
-            client_reply_sequence,
-            &mariadb::error_packet(&message),
-        )
-        .await?;
+        send_error_packet(&mut client, client_reply_sequence, &message).await?;
         return Err(mariadb::MariadbProxyError::MissingNativePasswordVerifier.into());
     };
     tracing::debug!(
@@ -214,13 +198,7 @@ async fn prepare_mysql_connection(
     ) {
         Ok(payload) => payload,
         Err(error) => {
-            let message = error.to_string();
-            mariadb::write_packet(
-                &mut client,
-                client_reply_sequence,
-                &mariadb::error_packet(&message),
-            )
-            .await?;
+            send_error_packet(&mut client, client_reply_sequence, &error.to_string()).await?;
             return Err(error.into());
         }
     };
@@ -238,13 +216,7 @@ async fn prepare_mysql_connection(
         ) {
             Ok(payload) => payload,
             Err(error) => {
-                let message = error.to_string();
-                mariadb::write_packet(
-                    &mut client,
-                    client_reply_sequence,
-                    &mariadb::error_packet(&message),
-                )
-                .await?;
+                send_error_packet(&mut client, client_reply_sequence, &error.to_string()).await?;
                 return Err(error.into());
             }
         };
@@ -299,12 +271,7 @@ async fn prepare_mysql_connection(
         } else {
             "unsupported mariadb backend auth response"
         };
-        mariadb::write_packet(
-            &mut client,
-            client_reply_sequence,
-            &mariadb::error_packet(message),
-        )
-        .await?;
+        send_error_packet(&mut client, client_reply_sequence, message).await?;
         return Err(mariadb::MariadbProxyError::MalformedPacket.into());
     }
 
@@ -318,4 +285,12 @@ async fn prepare_mysql_connection(
     )
     .await?;
     Ok(Some((client, backend, target.shared, target.activity)))
+}
+
+async fn send_error_packet(
+    stream: &mut (impl AsyncWrite + Unpin),
+    sequence: u8,
+    message: &str,
+) -> Result<(), mariadb::MariadbProxyError> {
+    mariadb::write_packet(stream, sequence, &mariadb::error_packet(message)).await
 }

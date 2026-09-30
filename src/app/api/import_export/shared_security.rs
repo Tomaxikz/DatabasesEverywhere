@@ -23,11 +23,7 @@ pub(super) async fn admit_import(
     if metadata.deployment_mode != DeploymentMode::Shared {
         return Ok(());
     }
-    let limit = metadata
-        .limits
-        .disk_mib
-        .checked_mul(MIB)
-        .ok_or_else(|| ApiError::Conflict("shared tenant disk limit overflowed".to_string()))?;
+    let limit = disk_limit_bytes(metadata)?;
     check_source(metadata.protocol, prepared_bytes)?;
     check_usage(
         measure_usage(state, metadata).await?,
@@ -61,12 +57,16 @@ pub(super) async fn verify_import_size(
     if metadata.deployment_mode != DeploymentMode::Shared {
         return Ok(());
     }
-    let limit = metadata
+    let limit = disk_limit_bytes(metadata)?;
+    check_usage(measure_usage(state, metadata).await?, limit, "after import")
+}
+
+fn disk_limit_bytes(metadata: &InstanceMetadata) -> Result<u64, ApiError> {
+    metadata
         .limits
         .disk_mib
         .checked_mul(MIB)
-        .ok_or_else(|| ApiError::Conflict("shared tenant disk limit overflowed".to_string()))?;
-    check_usage(measure_usage(state, metadata).await?, limit, "after import")
+        .ok_or_else(|| ApiError::Conflict("shared tenant disk limit overflowed".to_string()))
 }
 
 fn check_usage(used: u64, limit: u64, phase: &str) -> Result<(), ApiError> {

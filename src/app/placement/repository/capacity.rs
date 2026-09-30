@@ -8,7 +8,7 @@ use crate::{
     placement::model::{
         EngineRuntime, PlacementError, ReserveTenant, TenantReservation, TenantReservationState,
     },
-    shared::{limits::InstanceLimits, time::now_rfc3339},
+    shared::{limits::InstanceLimits, protocol::Protocol, time::now_rfc3339},
 };
 
 impl PlacementRepository {
@@ -54,10 +54,7 @@ impl PlacementRepository {
                     "shared runtime disk reservation overflow".to_string(),
                 )
             })?;
-        let limit_disk_mib =
-            crate::placement::policy::pool_disk_mib(protocol, next_reserved_disk_mib)
-                .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let limit_disk_mib = u64_to_i64(limit_disk_mib, "limit_disk_mib")?;
+        let limit_disk_mib = pool_disk_limit(protocol, next_reserved_disk_mib)?;
         let already_reserved = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM engine_runtime_reservations WHERE instance_id = ?1)",
         )
@@ -187,7 +184,7 @@ impl PlacementRepository {
         &self,
         instance_id: &str,
     ) -> Result<TenantReservation, PlacementRepositoryError> {
-        let update = match sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE engine_runtime_reservations
             SET state = 'provisioned', updated_at = ?1
@@ -197,30 +194,10 @@ impl PlacementRepository {
         .bind(now_rfc3339())
         .bind(instance_id)
         .execute(&self.pool)
-        .await
-        {
+        .await;
+        let update = match updated {
             Ok(update) => update,
-            Err(error) => {
-                let committed = self
-                    .get_reservation(instance_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|reservation| {
-                        reservation.state == TenantReservationState::Provisioned
-                    });
-                if !committed {
-                    return Err(error.into());
-                }
-                tracing::warn!(
-                    event = "audit shared_tenant_provision_commit_ack_lost",
-                    %instance_id,
-                    "shared tenant provisioning was committed despite a lost SQLite acknowledgement"
-                );
-                return self.get_reservation(instance_id).await?.ok_or_else(|| {
-                    PlacementRepositoryError::ReservationNotFound(instance_id.to_string())
-                });
-            }
+            Err(error) => return self.recover_lost_provision_ack(instance_id, error).await,
         };
         if update.rows_affected() != 1 {
             if let Some(reservation) = self.get_reservation(instance_id).await?
@@ -232,6 +209,30 @@ impl PlacementRepository {
                 instance_id.to_string(),
             ));
         }
+        self.get_reservation(instance_id)
+            .await?
+            .ok_or_else(|| PlacementRepositoryError::ReservationNotFound(instance_id.to_string()))
+    }
+
+    async fn recover_lost_provision_ack(
+        &self,
+        instance_id: &str,
+        error: sqlx::Error,
+    ) -> Result<TenantReservation, PlacementRepositoryError> {
+        let committed = self
+            .get_reservation(instance_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|reservation| reservation.state == TenantReservationState::Provisioned);
+        if !committed {
+            return Err(error.into());
+        }
+        tracing::warn!(
+            event = "audit shared_tenant_provision_commit_ack_lost",
+            %instance_id,
+            "shared tenant provisioning was committed despite a lost SQLite acknowledgement"
+        );
         self.get_reservation(instance_id)
             .await?
             .ok_or_else(|| PlacementRepositoryError::ReservationNotFound(instance_id.to_string()))
@@ -330,10 +331,7 @@ impl PlacementRepository {
                     "shared runtime disk resize overflow".to_string(),
                 )
             })?;
-        let limit_disk_mib =
-            crate::placement::policy::pool_disk_mib(protocol, next_reserved_disk_mib)
-                .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
-        let limit_disk_mib = u64_to_i64(limit_disk_mib, "limit_disk_mib")?;
+        let limit_disk_mib = pool_disk_limit(protocol, next_reserved_disk_mib)?;
         let now = now_rfc3339();
 
         let update = sqlx::query(
@@ -406,6 +404,15 @@ impl PlacementRepository {
             .await?
             .ok_or(PlacementRepositoryError::RuntimeNotFound(runtime_id))
     }
+}
+
+fn pool_disk_limit(
+    protocol: Protocol,
+    next_reserved_disk_mib: u64,
+) -> Result<i64, PlacementRepositoryError> {
+    let limit_disk_mib = crate::placement::policy::pool_disk_mib(protocol, next_reserved_disk_mib)
+        .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
+    u64_to_i64(limit_disk_mib, "limit_disk_mib")
 }
 
 async fn sync_runtime_capacity(

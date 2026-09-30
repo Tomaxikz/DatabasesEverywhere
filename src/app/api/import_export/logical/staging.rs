@@ -6,6 +6,8 @@ use crate::{
 };
 use std::path::Path as FsPath;
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct LogicalStagingLimits {
     pub(super) remote_staged_limit: Option<u64>,
@@ -40,9 +42,7 @@ pub(in crate::api::import_export) async fn check_remote_staging_space(
 ) -> Result<u64, ApiError> {
     let mut total = retained_bytes;
     if total > max_bytes {
-        return Err(ApiError::BadRequest(format!(
-            "remote import source and rollback data exceed the configured {max_bytes}-byte staging limit; reduce the selected source or target data size"
-        )));
+        return Err(staging_limit_exceeded(max_bytes));
     }
     for path in paths {
         let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
@@ -59,12 +59,16 @@ pub(in crate::api::import_export) async fn check_remote_staging_space(
             ApiError::BadRequest("remote import staging size overflowed".to_string())
         })?;
         if total > max_bytes {
-            return Err(ApiError::BadRequest(format!(
-                "remote import source and rollback data exceed the configured {max_bytes}-byte staging limit; reduce the selected source or target data size"
-            )));
+            return Err(staging_limit_exceeded(max_bytes));
         }
     }
     Ok(total)
+}
+
+fn staging_limit_exceeded(max_bytes: u64) -> ApiError {
+    ApiError::BadRequest(format!(
+        "remote import source and rollback data exceed the configured {max_bytes}-byte staging limit; reduce the selected source or target data size"
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,7 +125,7 @@ pub(in crate::api::import_export) fn physical_staging_bytes(
         return Ok(None);
     }
     let instance_disk_bytes = disk_mib
-        .checked_mul(1024 * 1024)
+        .checked_mul(BYTES_PER_MIB)
         .ok_or_else(|| ApiError::Runtime("instance disk limit overflowed".to_string()))?;
     let bytes = instance_disk_bytes.min(crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
     if bytes == 0 {

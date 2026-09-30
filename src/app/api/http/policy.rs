@@ -186,16 +186,20 @@ fn validate_request_origin(headers: &HeaderMap, policy: &OriginPolicy) -> Result
 }
 
 pub fn reject_query_token(uri: &Uri) -> Result<(), ApiError> {
-    if uri.query().is_some_and(|query| {
-        query.split('&').any(|part| {
-            part.split_once('=')
-                .is_some_and(|(name, _)| name == "token")
-                || part == "token"
-        })
-    }) {
+    let has_token_parameter = uri
+        .query()
+        .is_some_and(|query| query.split('&').any(is_token_parameter));
+    if has_token_parameter {
         return Err(ApiError::QueryTokenRejected);
     }
     Ok(())
+}
+
+fn is_token_parameter(parameter: &str) -> bool {
+    match parameter.split_once('=') {
+        Some((name, _)) => name == "token",
+        None => parameter == "token",
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -249,6 +253,8 @@ impl AuthorizedDestructiveAction {
 
 pub struct DestructiveActionPolicy;
 
+const MAX_DESTRUCTIVE_ACTION_REASON_CHARS: usize = 512;
+
 impl DestructiveActionPolicy {
     pub fn authorize(
         action: &str,
@@ -265,7 +271,7 @@ impl DestructiveActionPolicy {
                 "{action} requires a non-empty reason"
             )));
         }
-        if reason.chars().count() > 512 {
+        if reason.chars().count() > MAX_DESTRUCTIVE_ACTION_REASON_CHARS {
             return Err(ApiError::BadRequest(format!(
                 "{action} reason must be at most 512 characters"
             )));

@@ -77,14 +77,11 @@ pub(super) async fn copy_logical_data(
     {
         Ok(manifest) => manifest,
         Err(error) if error.is_timeout() => {
-            advance(
+            advance_with_failure(
                 state,
                 migration,
                 MigrationStage::RollingBack,
-                MigrationPatch {
-                    failure: Some(MigrationFailure::StructuralValidationTimedOut),
-                    ..MigrationPatch::default()
-                },
+                MigrationFailure::StructuralValidationTimedOut,
             )
             .await?;
             return Err(ApiError::Conflict(MANIFEST_TIMEOUT_MESSAGE.to_string()));
@@ -107,13 +104,7 @@ pub(super) async fn copy_logical_data(
             staging_bytes,
         )
         .await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Exporting,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Exporting).await?;
     import_export::logical::export_for_deployment_migration(
         state,
         source,
@@ -152,28 +143,10 @@ pub(super) async fn copy_logical_data(
         }
     };
     ensure_source_stable(&source_manifest, &stable_source_manifest)?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Exported,
-        MigrationPatch::default(),
-    )
-    .await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Importing,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Exported).await?;
+    migration = advance_to(state, migration, MigrationStage::Importing).await?;
     import_export::logical::import_for_deployment_migration(state, target, &artifact).await?;
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::Imported,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::Imported).await?;
     drop(capacity);
     Ok(LogicalCopy {
         migration,
@@ -208,14 +181,11 @@ pub(super) async fn validate_target(
     {
         Ok(manifest) => manifest,
         Err(error) if error.is_timeout() => {
-            *migration = advance(
+            *migration = advance_with_failure(
                 state,
                 migration.clone(),
                 MigrationStage::RollingBack,
-                MigrationPatch {
-                    failure: Some(MigrationFailure::StructuralValidationTimedOut),
-                    ..MigrationPatch::default()
-                },
+                MigrationFailure::StructuralValidationTimedOut,
             )
             .await?;
             return Err(ApiError::Conflict(MANIFEST_TIMEOUT_MESSAGE.to_string()));

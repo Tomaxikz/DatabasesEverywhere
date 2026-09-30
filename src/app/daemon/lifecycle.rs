@@ -1,5 +1,7 @@
 use super::*;
 
+const RETAINED_COMPLETED_JOBS: u32 = 10_000;
+
 pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let mut config = load_config(&config_path)?;
     let runtime_directories = prepare_runtime_dirs(&config)
@@ -233,66 +235,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "image version probe cleanup incomplete"),
     }
-    let remote_import_helper_reconciliation = docker.reconcile_import_helpers().await;
-    match &remote_import_helper_reconciliation {
-        Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
-            tracing::warn!(
-                reconciled_remote_import_helpers = *reconciled_remote_import_helpers,
-                "removed stale remote import helper containers"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "failed to reconcile stale remote import helper containers; credential cleanup will still run before startup aborts"
-            );
-        }
-    }
-    if remote_import_helper_reconciliation.is_ok() {
-        match cleanup_shared_restore_sandboxes(Path::new(&config.paths.tmp_root())).await {
-            Ok(summary) => tracing::info!(
-                scanned_entries = summary.scanned_entries,
-                removed_directories = summary.removed_directories,
-                skipped_entries = summary.skipped_entries,
-                "stale shared restore sandbox cleanup complete"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                "stale shared restore sandbox cleanup failed; the next boot will retry it"
-            ),
-        }
-    }
-    let remote_import_tmp_root = PathBuf::from(config.paths.tmp_root());
-    let remove_orphaned_remote_import_staging = remote_import_helper_reconciliation.is_ok();
-    let stale_credential_cleanup = crate::api::import_export::remote::cleanup_stale_import_secrets(
-        &remote_import_tmp_root,
-        remove_orphaned_remote_import_staging,
-    )
-    .await;
-    if stale_credential_cleanup.errors > 0 {
-        tracing::warn!(
-            scanned_entries = stale_credential_cleanup.scanned_entries,
-            job_directories = stale_credential_cleanup.job_directories,
-            removed_files = stale_credential_cleanup.removed_files,
-            removed_directories = stale_credential_cleanup.removed_directories,
-            skipped_entries = stale_credential_cleanup.skipped_entries,
-            errors = stale_credential_cleanup.errors,
-            limit_reached = stale_credential_cleanup.limit_reached,
-            "stale remote import credential cleanup completed with errors"
-        );
-    } else {
-        tracing::info!(
-            scanned_entries = stale_credential_cleanup.scanned_entries,
-            job_directories = stale_credential_cleanup.job_directories,
-            removed_files = stale_credential_cleanup.removed_files,
-            removed_directories = stale_credential_cleanup.removed_directories,
-            skipped_entries = stale_credential_cleanup.skipped_entries,
-            "stale remote import credential cleanup completed"
-        );
-    }
-    remote_import_helper_reconciliation
-        .context("failed to reconcile stale remote import helper containers")?;
+    reconcile_remote_import_leftovers(&config, &docker).await?;
     tracing::info!(
         phase = "container_engine",
         engine = %docker.engine_name(),
@@ -449,7 +392,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         );
     }
     let pruned_jobs = job_repository_for_prune
-        .prune_completed(10_000)
+        .prune_completed(RETAINED_COMPLETED_JOBS)
         .await
         .context("failed to prune completed import/export jobs during startup")?;
     if pruned_jobs > 0 {
@@ -468,6 +411,73 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     .await;
     services.shutdown(&state, server_result.is_err()).await?;
     server_result
+}
+
+async fn reconcile_remote_import_leftovers(
+    config: &Config,
+    docker: &DockerRuntime,
+) -> anyhow::Result<()> {
+    let remote_import_helper_reconciliation = docker.reconcile_import_helpers().await;
+    match &remote_import_helper_reconciliation {
+        Ok(reconciled_remote_import_helpers) if *reconciled_remote_import_helpers > 0 => {
+            tracing::warn!(
+                reconciled_remote_import_helpers = *reconciled_remote_import_helpers,
+                "removed stale remote import helper containers"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failed to reconcile stale remote import helper containers; credential cleanup will still run before startup aborts"
+            );
+        }
+    }
+    let helpers_reconciled = remote_import_helper_reconciliation.is_ok();
+    if helpers_reconciled {
+        match cleanup_shared_restore_sandboxes(Path::new(&config.paths.tmp_root())).await {
+            Ok(summary) => tracing::info!(
+                scanned_entries = summary.scanned_entries,
+                removed_directories = summary.removed_directories,
+                skipped_entries = summary.skipped_entries,
+                "stale shared restore sandbox cleanup complete"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "stale shared restore sandbox cleanup failed; the next boot will retry it"
+            ),
+        }
+    }
+    let remote_import_tmp_root = PathBuf::from(config.paths.tmp_root());
+    let stale_credential_cleanup = crate::api::import_export::remote::cleanup_stale_import_secrets(
+        &remote_import_tmp_root,
+        helpers_reconciled,
+    )
+    .await;
+    if stale_credential_cleanup.errors > 0 {
+        tracing::warn!(
+            scanned_entries = stale_credential_cleanup.scanned_entries,
+            job_directories = stale_credential_cleanup.job_directories,
+            removed_files = stale_credential_cleanup.removed_files,
+            removed_directories = stale_credential_cleanup.removed_directories,
+            skipped_entries = stale_credential_cleanup.skipped_entries,
+            errors = stale_credential_cleanup.errors,
+            limit_reached = stale_credential_cleanup.limit_reached,
+            "stale remote import credential cleanup completed with errors"
+        );
+    } else {
+        tracing::info!(
+            scanned_entries = stale_credential_cleanup.scanned_entries,
+            job_directories = stale_credential_cleanup.job_directories,
+            removed_files = stale_credential_cleanup.removed_files,
+            removed_directories = stale_credential_cleanup.removed_directories,
+            skipped_entries = stale_credential_cleanup.skipped_entries,
+            "stale remote import credential cleanup completed"
+        );
+    }
+    remote_import_helper_reconciliation
+        .context("failed to reconcile stale remote import helper containers")?;
+    Ok(())
 }
 
 async fn migrate_qdrant_fingerprints(

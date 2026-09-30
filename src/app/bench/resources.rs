@@ -156,40 +156,15 @@ async fn run_sampler(
                     sample_process(pid, host, &mut previous_process)
                 });
                 let benchmark = sample_process(benchmark_pid, host, &mut previous_process);
-                let mut instance_id = None;
-                let mut instance_protocol = None;
-                let mut instance_sample_failed = false;
-                let mut instance_cpu_percent = None;
-                let mut instance_memory_bytes = None;
-                if let (Some(docker), Some(instance)) = (
-                    &docker,
-                    (!instances.is_empty()).then(|| {
-                        let instance = &instances[instance_cursor % instances.len()];
-                        instance_cursor = instance_cursor.wrapping_add(1);
-                        instance
-                    }),
-                ) {
-                    instance_id = Some(instance.instance_id.clone());
-                    instance_protocol = Some(instance.protocol.to_string());
-                    match timeout(
-                        INSTANCE_STATS_TIMEOUT,
-                        docker.stats(instance.protocol, &instance.instance_id),
-                    )
-                        .await
-                    {
-                        Ok(Ok(stats)) => {
-                            instance_cpu_percent = sample_container_cpu(
-                                &instance.instance_id,
-                                &stats,
-                                &mut previous_container,
-                            );
-                            instance_memory_bytes = memory_usage_bytes(&stats);
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            failed_instance_samples += 1;
-                            instance_sample_failed = true;
-                        }
+                let next_instance = next_round_robin_instance(&instances, &mut instance_cursor);
+                let instance = match (&docker, next_instance) {
+                    (Some(docker), Some(instance)) => {
+                        sample_instance(docker, instance, &mut previous_container).await
                     }
+                    _ => InstanceReading::default(),
+                };
+                if instance.sample_failed {
+                    failed_instance_samples += 1;
                 }
                 samples.push(ResourceSample {
                     elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
@@ -198,11 +173,11 @@ async fn run_sampler(
                     daemon_rss_bytes: daemon.and_then(|sample| sample.rss_bytes),
                     benchmark_cpu_percent: benchmark.and_then(|sample| sample.cpu_percent),
                     benchmark_rss_bytes: benchmark.and_then(|sample| sample.rss_bytes),
-                    instance_id,
-                    instance_protocol,
-                    instance_sample_failed,
-                    instance_cpu_percent,
-                    instance_memory_bytes,
+                    instance_id: instance.instance_id,
+                    instance_protocol: instance.protocol,
+                    instance_sample_failed: instance.sample_failed,
+                    instance_cpu_percent: instance.cpu_percent,
+                    instance_memory_bytes: instance.memory_bytes,
                 });
             }
         }
@@ -211,6 +186,53 @@ async fn run_sampler(
         samples,
         failed_instance_samples,
     }
+}
+
+#[derive(Default)]
+struct InstanceReading {
+    instance_id: Option<String>,
+    protocol: Option<String>,
+    sample_failed: bool,
+    cpu_percent: Option<f64>,
+    memory_bytes: Option<u64>,
+}
+
+fn next_round_robin_instance<'a>(
+    instances: &'a [InstanceSampleTarget],
+    cursor: &mut usize,
+) -> Option<&'a InstanceSampleTarget> {
+    if instances.is_empty() {
+        return None;
+    }
+    let instance = &instances[*cursor % instances.len()];
+    *cursor = cursor.wrapping_add(1);
+    Some(instance)
+}
+
+async fn sample_instance(
+    docker: &DockerRuntime,
+    instance: &InstanceSampleTarget,
+    previous_container: &mut HashMap<String, ContainerCpuCounter>,
+) -> InstanceReading {
+    let mut reading = InstanceReading {
+        instance_id: Some(instance.instance_id.clone()),
+        protocol: Some(instance.protocol.to_string()),
+        ..InstanceReading::default()
+    };
+    let stats = timeout(
+        INSTANCE_STATS_TIMEOUT,
+        docker.stats(instance.protocol, &instance.instance_id),
+    )
+    .await;
+    match stats {
+        Ok(Ok(stats)) => {
+            reading.cpu_percent =
+                sample_container_cpu(&instance.instance_id, &stats, previous_container);
+            reading.memory_bytes = memory_usage_bytes(&stats);
+        }
+        Ok(Err(_)) | Err(_) => reading.sample_failed = true,
+    }
+    reading
 }
 
 #[derive(Debug, Clone, Copy)]

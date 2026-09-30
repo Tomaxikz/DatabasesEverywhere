@@ -2,6 +2,9 @@ use super::*;
 use futures::FutureExt;
 use std::collections::HashSet;
 
+const EVENT_ACTIVATION_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
+
 pub(super) async fn monitor_container_events(state: AppState) {
     let mut shutdown = state.daemon_shutdown.subscribe();
     let mut reconnect_delay = CONTAINER_EVENT_RECONNECT_INITIAL_DELAY;
@@ -310,68 +313,14 @@ pub(super) async fn reconcile_container_state(
             .as_ref()
             .is_none_or(|event| event.action.activates_container());
         if should_stop {
-            match state
-                .docker
-                .inspect_instance(metadata.protocol, &metadata.instance_id)
-                .await
-            {
-                Ok(inspection)
-                    if matches!(
-                        inspection.status,
-                        DockerContainerStatus::Running | DockerContainerStatus::Starting
-                    ) =>
-                {
-                    state
-                        .docker
-                        .stop(metadata.protocol, &metadata.instance_id)
-                        .await?;
-                    tracing::warn!(
-                        event = "audit quarantined_instance_event_stopped",
-                        instance_id = %metadata.instance_id,
-                        protocol = %metadata.protocol,
-                        "stopped an externally activated quarantined instance"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) if error.is_not_found() => {}
-                Err(error) => return Err(error.into()),
-            }
+            stop_active_quarantined_instance(state, &metadata).await?;
         }
-        state
-            .instance_runtime_cache
-            .remove(&metadata.instance_id)
-            .await;
-        state
-            .resource_cache
-            .invalidate_runtime(&metadata.instance_id)
-            .await;
+        invalidate_instance_caches(state, &metadata.instance_id).await;
         return Ok(());
     }
 
     if metadata.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped {
-        let previous_status = metadata.status;
-        let reconciled = reconcile::reconcile_one(metadata, &state.docker).await;
-        let current_status = reconciled.status;
-        reconcile::persist_reconciled(&state.manager, previous_status, reconciled.clone()).await?;
-        state
-            .instance_runtime_cache
-            .remove(&reconciled.instance_id)
-            .await;
-        state
-            .resource_cache
-            .invalidate_runtime(&reconciled.instance_id)
-            .await;
-        if let Some(event) = event {
-            tracing::info!(
-                instance_id = %reconciled.instance_id,
-                protocol = %reconciled.protocol,
-                event_action = event.action.as_str(),
-                previous_status = previous_status.as_str(),
-                observed_status = current_status.as_str(),
-                "enforced durable stopped state after a managed container lifecycle event"
-            );
-        }
-        return Ok(());
+        return enforce_stopped_state(state, metadata, event).await;
     }
 
     if let Some(event) = event.as_ref()
@@ -395,50 +344,10 @@ pub(super) async fn reconcile_container_state(
     }
 
     let previous_status = metadata.status;
-    let activation_observed = if let Some(event) = event.as_ref() {
-        event.action.activates_container()
-    } else if previous_status == InstanceStatus::Running {
-        false
-    } else {
-        match state
-            .docker
-            .inspect_instance(metadata.protocol, &metadata.instance_id)
-            .await
-        {
-            Ok(inspection) => matches!(
-                inspection.status,
-                DockerContainerStatus::Running | DockerContainerStatus::Starting
-            ),
-            Err(error) if error.is_not_found() => false,
-            Err(error) => return Err(error.into()),
-        }
-    };
+    let activation_observed =
+        container_activation_observed(state, &metadata, event.as_ref()).await?;
     let mut activation_error = if activation_observed {
-        crate::instances::sessions::fence(
-            &state.instances,
-            &state.gateway_supervisor.tenant_sessions(),
-            &metadata.instance_id,
-        )
-        .await;
-        state
-            .docker
-            .enforce_cpu_burst_policy(metadata.protocol, &metadata.instance_id)
-            .await;
-        match state
-            .docker
-            .wait_until_ready(
-                metadata.protocol,
-                &metadata.instance_id,
-                Duration::from_secs(120),
-            )
-            .await
-        {
-            Ok(_) => match harden_instance_auth(state, &metadata).await {
-                Ok(()) => probe_after_activation(state, &metadata).await.err(),
-                Err(error) => Some(error),
-            },
-            Err(error) => Some(error.to_string()),
-        }
+        prepare_activated_instance(state, &metadata).await
     } else {
         None
     };
@@ -491,49 +400,159 @@ pub(super) async fn reconcile_container_state(
     }
     let current_status = reconciled.status;
     reconcile::persist_reconciled(&state.manager, previous_status, reconciled.clone()).await?;
-    state
-        .instance_runtime_cache
-        .remove(&reconciled.instance_id)
-        .await;
-    state
-        .resource_cache
-        .invalidate_runtime(&reconciled.instance_id)
-        .await;
+    invalidate_instance_caches(state, &reconciled.instance_id).await;
 
-    if let Some(event) = event {
-        if let Some(readiness_error) = activation_error {
-            tracing::error!(
-                event = "audit managed_container_startup_readiness_failed",
-                instance_id = %reconciled.instance_id,
-                protocol = %reconciled.protocol,
-                event_action = event.action.as_str(),
-                previous_status = previous_status.as_str(),
-                observed_status = current_status.as_str(),
-                error = %readiness_error,
-                "managed database container activation failed readiness or authentication hardening and was stopped"
-            );
-        } else if unexpected_failure {
-            tracing::error!(
-                event = "audit managed_container_runtime_failure",
-                instance_id = %reconciled.instance_id,
-                protocol = %reconciled.protocol,
-                event_action = event.action.as_str(),
-                previous_status = previous_status.as_str(),
-                observed_status = current_status.as_str(),
-                "managed database container stopped unexpectedly; inspect its container logs and resource limits"
-            );
-        } else {
-            tracing::info!(
-                instance_id = %reconciled.instance_id,
-                protocol = %reconciled.protocol,
-                event_action = event.action.as_str(),
-                previous_status = previous_status.as_str(),
-                observed_status = current_status.as_str(),
-                "reconciled current runtime state after a queued container event; observed status may already supersede the event"
-            );
-        }
+    let Some(event) = event else {
+        return Ok(());
+    };
+    if let Some(readiness_error) = activation_error {
+        tracing::error!(
+            event = "audit managed_container_startup_readiness_failed",
+            instance_id = %reconciled.instance_id,
+            protocol = %reconciled.protocol,
+            event_action = event.action.as_str(),
+            previous_status = previous_status.as_str(),
+            observed_status = current_status.as_str(),
+            error = %readiness_error,
+            "managed database container activation failed readiness or authentication hardening and was stopped"
+        );
+    } else if unexpected_failure {
+        tracing::error!(
+            event = "audit managed_container_runtime_failure",
+            instance_id = %reconciled.instance_id,
+            protocol = %reconciled.protocol,
+            event_action = event.action.as_str(),
+            previous_status = previous_status.as_str(),
+            observed_status = current_status.as_str(),
+            "managed database container stopped unexpectedly; inspect its container logs and resource limits"
+        );
+    } else {
+        tracing::info!(
+            instance_id = %reconciled.instance_id,
+            protocol = %reconciled.protocol,
+            event_action = event.action.as_str(),
+            previous_status = previous_status.as_str(),
+            observed_status = current_status.as_str(),
+            "reconciled current runtime state after a queued container event; observed status may already supersede the event"
+        );
     }
     Ok(())
+}
+
+async fn invalidate_instance_caches(state: &AppState, instance_id: &str) {
+    state.instance_runtime_cache.remove(instance_id).await;
+    state.resource_cache.invalidate_runtime(instance_id).await;
+}
+
+async fn stop_active_quarantined_instance(
+    state: &AppState,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> anyhow::Result<()> {
+    match state
+        .docker
+        .inspect_instance(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(inspection) if is_active_container_status(inspection.status) => {
+            state
+                .docker
+                .stop(metadata.protocol, &metadata.instance_id)
+                .await?;
+            tracing::warn!(
+                event = "audit quarantined_instance_event_stopped",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                "stopped an externally activated quarantined instance"
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+async fn enforce_stopped_state(
+    state: &AppState,
+    metadata: crate::instances::metadata::InstanceMetadata,
+    event: Option<ManagedContainerEvent>,
+) -> anyhow::Result<()> {
+    let previous_status = metadata.status;
+    let reconciled = reconcile::reconcile_one(metadata, &state.docker).await;
+    let current_status = reconciled.status;
+    reconcile::persist_reconciled(&state.manager, previous_status, reconciled.clone()).await?;
+    invalidate_instance_caches(state, &reconciled.instance_id).await;
+    if let Some(event) = event {
+        tracing::info!(
+            instance_id = %reconciled.instance_id,
+            protocol = %reconciled.protocol,
+            event_action = event.action.as_str(),
+            previous_status = previous_status.as_str(),
+            observed_status = current_status.as_str(),
+            "enforced durable stopped state after a managed container lifecycle event"
+        );
+    }
+    Ok(())
+}
+
+async fn container_activation_observed(
+    state: &AppState,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    event: Option<&ManagedContainerEvent>,
+) -> anyhow::Result<bool> {
+    if let Some(event) = event {
+        return Ok(event.action.activates_container());
+    }
+    if metadata.status == InstanceStatus::Running {
+        return Ok(false);
+    }
+    match state
+        .docker
+        .inspect_instance(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(inspection) => Ok(is_active_container_status(inspection.status)),
+        Err(error) if error.is_not_found() => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn prepare_activated_instance(
+    state: &AppState,
+    metadata: &crate::instances::metadata::InstanceMetadata,
+) -> Option<String> {
+    crate::instances::sessions::fence(
+        &state.instances,
+        &state.gateway_supervisor.tenant_sessions(),
+        &metadata.instance_id,
+    )
+    .await;
+    state
+        .docker
+        .enforce_cpu_burst_policy(metadata.protocol, &metadata.instance_id)
+        .await;
+    if let Err(error) = state
+        .docker
+        .wait_until_ready(
+            metadata.protocol,
+            &metadata.instance_id,
+            EVENT_ACTIVATION_READY_TIMEOUT,
+        )
+        .await
+    {
+        return Some(error.to_string());
+    }
+    if let Err(error) = harden_instance_auth(state, metadata).await {
+        return Some(error);
+    }
+    probe_after_activation(state, metadata).await.err()
+}
+
+fn is_active_container_status(status: DockerContainerStatus) -> bool {
+    matches!(
+        status,
+        DockerContainerStatus::Running | DockerContainerStatus::Starting
+    )
 }
 
 async fn probe_after_activation(
@@ -618,7 +637,7 @@ fn container_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim().strip_prefix("sha256:").unwrap_or(left.trim());
     let right = right.trim().strip_prefix("sha256:").unwrap_or(right.trim());
     left == right
-        || (left.len().min(right.len()) >= 12
+        || (left.len().min(right.len()) >= MIN_CONTAINER_ID_PREFIX_LEN
             && (left.starts_with(right) || right.starts_with(left)))
 }
 

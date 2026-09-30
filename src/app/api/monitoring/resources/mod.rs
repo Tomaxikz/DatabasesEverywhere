@@ -25,7 +25,10 @@ use crate::{
     },
     auth::scopes,
     config::Config,
-    disk::{DiskLimiter, soft::SoftDiskTarget},
+    disk::{
+        DiskLimiter,
+        soft::{SoftDiskSnapshot, SoftDiskTarget},
+    },
     instances::{
         metadata::{InstanceMetadata, InstanceStatus},
         paths::InstancePaths,
@@ -397,31 +400,7 @@ pub(crate) async fn resource_report(
         let used = shared_disk::usage(state, metadata).await.ok();
         (None, used)
     } else {
-        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        let scanner_target = SoftDiskTarget {
-            instance_id: metadata.instance_id.clone(),
-            created_at: metadata.created_at.clone(),
-            protocol: metadata.protocol,
-            data_path: paths.data.clone(),
-            limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
-            durable_blocked: metadata.disk_limit_blocked,
-        };
-        let scanner = if scanner_active {
-            state.soft_disk_limiter.snapshot(&scanner_target).await
-        } else {
-            None
-        };
-        let used = shared_disk::reported_disk_used_bytes(scanner.as_ref(), || async {
-            state
-                .resource_cache
-                .disk_usage(&state.config, &metadata.instance_id, paths.data)
-                .await
-                .map(|sample| sample.used_bytes)
-        })
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
-        (scanner, Some(used))
+        dedicated_disk_usage(state, metadata, scanner_active).await?
     };
     let usage = pools::runtime_report_usage(
         metadata.deployment_mode,
@@ -499,6 +478,38 @@ pub(crate) async fn resource_report(
     Ok(report)
 }
 
+async fn dedicated_disk_usage(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    scanner_active: bool,
+) -> Result<(Option<SoftDiskSnapshot>, Option<u64>), ApiError> {
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let scanner_target = SoftDiskTarget {
+        instance_id: metadata.instance_id.clone(),
+        created_at: metadata.created_at.clone(),
+        protocol: metadata.protocol,
+        data_path: paths.data.clone(),
+        limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
+        durable_blocked: metadata.disk_limit_blocked,
+    };
+    let scanner = if scanner_active {
+        state.soft_disk_limiter.snapshot(&scanner_target).await
+    } else {
+        None
+    };
+    let used = shared_disk::reported_disk_used_bytes(scanner.as_ref(), || async {
+        state
+            .resource_cache
+            .disk_usage(&state.config, &metadata.instance_id, paths.data)
+            .await
+            .map(|sample| sample.used_bytes)
+    })
+    .await
+    .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
+    Ok((scanner, Some(used)))
+}
+
 const fn disk_enforcement_strength(hard: bool, soft: bool) -> &'static str {
     if hard {
         "hard"
@@ -559,13 +570,9 @@ impl ResourceCache {
         }
 
         if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
-            if self
-                .store_disk_usage_if_current_lock(instance_id, &refresh_lock, sample)
-                .await
-            {
-                return Ok(sample);
-            }
-            return Err("disk usage cache was invalidated during sampling".to_string());
+            return self
+                .publish_disk_sample(instance_id, &refresh_lock, sample)
+                .await;
         }
 
         if let Some(sample) = self
@@ -596,13 +603,9 @@ impl ResourceCache {
             return Err("disk usage scan is still in progress".to_string());
         }
         if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
-            if self
-                .store_disk_usage_if_current_lock(instance_id, &refresh_lock, sample)
-                .await
-            {
-                return Ok(sample);
-            }
-            return Err("disk usage cache was invalidated during sampling".to_string());
+            return self
+                .publish_disk_sample(instance_id, &refresh_lock, sample)
+                .await;
         }
 
         match self
@@ -614,13 +617,8 @@ impl ResourceCache {
                     used_bytes,
                     sampled_at: Instant::now(),
                 };
-                if !self
-                    .store_disk_usage_if_current_lock(instance_id, &refresh_lock, sample)
+                self.publish_disk_sample(instance_id, &refresh_lock, sample)
                     .await
-                {
-                    return Err("disk usage cache was invalidated during sampling".to_string());
-                }
-                Ok(sample)
             }
             Err(error) if error.kind() == ErrorKind::TimedOut => {
                 self.queue_disk_refresh(
@@ -724,13 +722,9 @@ impl ResourceCache {
         let refresh_lock = self.disk_refresh_lock(instance_id).await;
         let _refresh = refresh_lock.lock().await;
         if let Some(sample) = self.quota_disk_usage(config, instance_id, &path).await {
-            if self
-                .store_disk_usage_if_current_lock(instance_id, &refresh_lock, sample)
-                .await
-            {
-                return Ok(sample);
-            }
-            return Err("disk usage cache was invalidated during sampling".to_string());
+            return self
+                .publish_disk_sample(instance_id, &refresh_lock, sample)
+                .await;
         }
         let used_bytes = self
             .scan_directory(path, BACKGROUND_DISK_SCAN_TIMEOUT)
@@ -740,8 +734,18 @@ impl ResourceCache {
             used_bytes,
             sampled_at: Instant::now(),
         };
+        self.publish_disk_sample(instance_id, &refresh_lock, sample)
+            .await
+    }
+
+    async fn publish_disk_sample(
+        &self,
+        instance_id: &str,
+        refresh_lock: &Arc<Mutex<()>>,
+        sample: CachedDiskUsage,
+    ) -> Result<CachedDiskUsage, String> {
         if !self
-            .store_disk_usage_if_current_lock(instance_id, &refresh_lock, sample)
+            .store_disk_usage_if_current_lock(instance_id, refresh_lock, sample)
             .await
         {
             return Err("disk usage cache was invalidated during sampling".to_string());
@@ -785,12 +789,10 @@ impl ResourceCache {
         refresh_lock: &Arc<Mutex<()>>,
     ) -> Option<CachedDiskUsage> {
         let inner = self.inner.lock().await;
-        inner
-            .disk_refresh_locks
-            .get(instance_id)
-            .is_some_and(|current| Arc::ptr_eq(current, refresh_lock))
-            .then(|| inner.disk.get(instance_id).copied())
-            .flatten()
+        if !is_current_refresh_lock(&inner, instance_id, refresh_lock) {
+            return None;
+        }
+        inner.disk.get(instance_id).copied()
     }
 
     async fn store_disk_usage_if_current_lock(
@@ -800,11 +802,7 @@ impl ResourceCache {
         sample: CachedDiskUsage,
     ) -> bool {
         let mut inner = self.inner.lock().await;
-        if !inner
-            .disk_refresh_locks
-            .get(instance_id)
-            .is_some_and(|current| Arc::ptr_eq(current, refresh_lock))
-        {
+        if !is_current_refresh_lock(&inner, instance_id, refresh_lock) {
             return false;
         }
         inner.disk.insert(instance_id.to_string(), sample);
@@ -854,16 +852,12 @@ impl ResourceCache {
 
     async fn begin_disk_refresh(&self, instance_id: &str, refresh_lock: &Arc<Mutex<()>>) -> bool {
         let mut inner = self.inner.lock().await;
-        if !inner
-            .disk_refresh_locks
+        let already_refreshing = inner
+            .disk_refreshing
             .get(instance_id)
-            .is_some_and(|current| Arc::ptr_eq(current, refresh_lock))
-            || inner
-                .disk_refreshing
-                .get(instance_id)
-                .copied()
-                .unwrap_or(false)
-        {
+            .copied()
+            .unwrap_or(false);
+        if !is_current_refresh_lock(&inner, instance_id, refresh_lock) || already_refreshing {
             return false;
         }
         inner.disk_refreshing.insert(instance_id.to_string(), true);
@@ -877,11 +871,7 @@ impl ResourceCache {
         result: Result<u64, std::io::Error>,
     ) -> Option<(String, std::io::Error)> {
         let mut inner = self.inner.lock().await;
-        if !inner
-            .disk_refresh_locks
-            .get(&instance_id)
-            .is_some_and(|current| Arc::ptr_eq(current, refresh_lock))
-        {
+        if !is_current_refresh_lock(&inner, &instance_id, refresh_lock) {
             return None;
         }
         inner.disk_refreshing.remove(&instance_id);
@@ -1024,6 +1014,17 @@ impl ResourceCache {
             );
         }
     }
+}
+
+fn is_current_refresh_lock(
+    inner: &ResourceCacheInner,
+    instance_id: &str,
+    refresh_lock: &Arc<Mutex<()>>,
+) -> bool {
+    inner
+        .disk_refresh_locks
+        .get(instance_id)
+        .is_some_and(|current| Arc::ptr_eq(current, refresh_lock))
 }
 
 fn invalidate_disk_locked(inner: &mut ResourceCacheInner, instance_id: &str) {

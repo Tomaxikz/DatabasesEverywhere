@@ -25,6 +25,9 @@ pub(super) const MAX_RETAINED_REQUEST_SAMPLES: usize = 100_000;
 const MAX_RECORDED_LATENCY_MICROS: u64 = 60_000_000;
 const API_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_PACED_BATCH_REQUESTS: usize = 100_000;
+const LATENCY_SIGNIFICANT_DIGITS: u8 = 3;
+const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+const WEBSOCKET_TARGET: &str = "/ws/monitoring";
 
 #[derive(Debug, Clone)]
 pub(super) struct LoadTarget {
@@ -109,10 +112,8 @@ impl PhaseAccumulator {
             transport_errors: 0,
             status_codes: std::collections::BTreeMap::new(),
             target_requests: std::collections::BTreeMap::new(),
-            all_latencies: Histogram::new_with_max(MAX_RECORDED_LATENCY_MICROS, 3)
-                .expect("valid benchmark latency histogram"),
-            successful_latencies: Histogram::new_with_max(MAX_RECORDED_LATENCY_MICROS, 3)
-                .expect("valid benchmark latency histogram"),
+            all_latencies: latency_histogram(),
+            successful_latencies: latency_histogram(),
             retained_samples: Vec::with_capacity(MAX_RETAINED_REQUEST_SAMPLES.min(1_024)),
             reservoir_rng: XorShift64::new(seed),
         }
@@ -181,6 +182,11 @@ impl PhaseAccumulator {
             samples: self.retained_samples,
         }
     }
+}
+
+fn latency_histogram() -> Histogram<u64> {
+    Histogram::new_with_max(MAX_RECORDED_LATENCY_MICROS, LATENCY_SIGNIFICANT_DIGITS)
+        .expect("valid benchmark latency histogram")
 }
 
 struct XorShift64(u64);
@@ -339,74 +345,98 @@ impl BenchClient {
         let deadline = started + duration;
         let targets = Arc::new(normalize_load_targets(targets));
         let mut accumulator = PhaseAccumulator::new(reservoir_seed);
-        let mut active_load_duration = Duration::ZERO;
 
-        if let Some(pacing) = pacing {
-            let mut window_started = pacing.window_started;
-            let window_budget = pacing.requests_per_window.max(1);
-            let mut sent_in_window = 0_usize;
-            let mut next_index = 0_usize;
-            loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                while now.duration_since(window_started) >= API_RATE_LIMIT_WINDOW {
-                    window_started += API_RATE_LIMIT_WINDOW;
-                    sent_in_window = 0;
-                }
-                if sent_in_window >= window_budget {
-                    let wake_at = (window_started + API_RATE_LIMIT_WINDOW).min(deadline);
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)).await;
-                    continue;
-                }
-                let batch_count = (window_budget - sent_in_window).min(MAX_PACED_BATCH_REQUESTS);
-                active_load_duration += self
-                    .run_concurrent_batch(
-                        next_index,
-                        batch_count,
-                        concurrency,
-                        &targets,
-                        "http_concurrent_timed",
-                        &mut accumulator,
-                    )
-                    .await;
-                next_index = next_index.saturating_add(batch_count);
-                sent_in_window = sent_in_window.saturating_add(batch_count);
-            }
+        let active_load_duration = if let Some(pacing) = pacing {
+            self.run_paced_load(pacing, deadline, concurrency, &targets, &mut accumulator)
+                .await
         } else {
-            let indices = stream::unfold(0_usize, move |index| async move {
-                (Instant::now() < deadline).then_some((index, index.saturating_add(1)))
-            });
-            let requests = indices
-                .map(|index| {
-                    let client = self.clone();
-                    let target = choose_load_target(&targets, index).clone();
-                    async move {
-                        client
-                            .request(
-                                Method::GET,
-                                &target.path,
-                                None,
-                                "http_concurrent_timed",
-                                index,
-                            )
-                            .await
-                            .sample
-                    }
-                })
-                .buffer_unordered(concurrency.max(1));
-            tokio::pin!(requests);
-            while let Some(sample) = requests.next().await {
-                accumulator.record(sample);
-            }
-            active_load_duration = started.elapsed();
-        }
+            self.run_unpaced_load(deadline, concurrency, &targets, &mut accumulator)
+                .await;
+            started.elapsed()
+        };
         accumulator.finish(
             "http_concurrent_timed",
             started.elapsed(),
             active_load_duration,
         )
+    }
+
+    async fn run_paced_load(
+        &self,
+        pacing: FixedWindowPacing,
+        deadline: Instant,
+        concurrency: usize,
+        targets: &Arc<Vec<LoadTarget>>,
+        accumulator: &mut PhaseAccumulator,
+    ) -> Duration {
+        let mut active_load_duration = Duration::ZERO;
+        let mut window_started = pacing.window_started;
+        let window_budget = pacing.requests_per_window.max(1);
+        let mut sent_in_window = 0_usize;
+        let mut next_index = 0_usize;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            while now.duration_since(window_started) >= API_RATE_LIMIT_WINDOW {
+                window_started += API_RATE_LIMIT_WINDOW;
+                sent_in_window = 0;
+            }
+            if sent_in_window >= window_budget {
+                let wake_at = (window_started + API_RATE_LIMIT_WINDOW).min(deadline);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)).await;
+                continue;
+            }
+            let batch_count = (window_budget - sent_in_window).min(MAX_PACED_BATCH_REQUESTS);
+            active_load_duration += self
+                .run_concurrent_batch(
+                    next_index,
+                    batch_count,
+                    concurrency,
+                    targets,
+                    "http_concurrent_timed",
+                    accumulator,
+                )
+                .await;
+            next_index = next_index.saturating_add(batch_count);
+            sent_in_window = sent_in_window.saturating_add(batch_count);
+        }
+        active_load_duration
+    }
+
+    async fn run_unpaced_load(
+        &self,
+        deadline: Instant,
+        concurrency: usize,
+        targets: &Arc<Vec<LoadTarget>>,
+        accumulator: &mut PhaseAccumulator,
+    ) {
+        let indices = stream::unfold(0_usize, move |index| async move {
+            (Instant::now() < deadline).then_some((index, index.saturating_add(1)))
+        });
+        let requests = indices
+            .map(|index| {
+                let client = self.clone();
+                let target = choose_load_target(targets, index).clone();
+                async move {
+                    client
+                        .request(
+                            Method::GET,
+                            &target.path,
+                            None,
+                            "http_concurrent_timed",
+                            index,
+                        )
+                        .await
+                        .sample
+                }
+            })
+            .buffer_unordered(concurrency.max(1));
+        tokio::pin!(requests);
+        while let Some(sample) = requests.next().await {
+            accumulator.record(sample);
+        }
     }
 
     async fn run_concurrent_batch(
@@ -527,64 +557,51 @@ impl BenchClient {
         let export_succeeded = export.status == "succeeded";
         let mut jobs = vec![export];
 
-        if export_succeeded {
-            if let Some(artifact_id) = artifact_id.as_deref() {
-                let import = self
-                    .run_job(
-                        instance_id,
-                        "import",
-                        json!({
-                            "source": {
-                                "type": "artifact",
-                                "artifact_id": artifact_id
-                            }
-                        }),
-                        timeout,
-                        &mut samples,
-                    )
+        if !export_succeeded {
+            jobs.push(skipped_import_report(
+                "import was skipped because benchmark export failed",
+            ));
+        } else if let Some(artifact_id) = artifact_id.as_deref() {
+            let import = self
+                .run_job(
+                    instance_id,
+                    "import",
+                    json!({
+                        "source": {
+                            "type": "artifact",
+                            "artifact_id": artifact_id
+                        }
+                    }),
+                    timeout,
+                    &mut samples,
+                )
+                .await;
+            let import_succeeded = import.status == "succeeded";
+            jobs.push(import);
+            if !import_succeeded {
+                warnings.push(format!(
+                    "retained benchmark artifact {artifact_id} because its import failed"
+                ));
+            } else if !keep_artifact {
+                let path = format!("/api/instances/{instance_id}/artifacts/{artifact_id}");
+                let cleanup = self
+                    .request(Method::DELETE, &path, None, "benchmark_artifact_cleanup", 0)
                     .await;
-                let import_succeeded = import.status == "succeeded";
-                jobs.push(import);
-                if import_succeeded && !keep_artifact {
-                    let path = format!("/api/instances/{instance_id}/artifacts/{artifact_id}");
-                    let cleanup = self
-                        .request(Method::DELETE, &path, None, "benchmark_artifact_cleanup", 0)
-                        .await;
-                    if !cleanup.sample.success {
-                        warnings.push(format!(
-                            "benchmark artifact cleanup failed: {}",
-                            cleanup
-                                .sample
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "unknown request failure".to_string())
-                        ));
-                    }
-                    samples.push(cleanup.sample);
-                } else if !import_succeeded {
+                if !cleanup.sample.success {
                     warnings.push(format!(
-                        "retained benchmark artifact {artifact_id} because its import failed"
+                        "benchmark artifact cleanup failed: {}",
+                        cleanup
+                            .sample
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "unknown request failure".to_string())
                     ));
                 }
-            } else {
-                jobs.push(failed_job_report(
-                    "import",
-                    "skipped",
-                    Duration::ZERO,
-                    None,
-                    Some(
-                        "successful export did not return an artifact_id; import was skipped"
-                            .to_string(),
-                    ),
-                ));
+                samples.push(cleanup.sample);
             }
         } else {
-            jobs.push(failed_job_report(
-                "import",
-                "skipped",
-                Duration::ZERO,
-                None,
-                Some("import was skipped because benchmark export failed".to_string()),
+            jobs.push(skipped_import_report(
+                "successful export did not return an artifact_id; import was skipped",
             ));
         }
 
@@ -710,13 +727,6 @@ impl BenchClient {
                     .as_str()
                     .and_then(|updated_at| rfc3339_duration_ms(created_at, updated_at))
             });
-            let throughput_mib_per_second = size.and_then(|bytes| {
-                let seconds = server_duration_ms
-                    .map(|duration_ms| duration_ms / 1_000.0)
-                    .filter(|seconds| *seconds > 0.0)
-                    .unwrap_or(total.as_secs_f64());
-                (seconds > 0.0).then_some(bytes as f64 / (1024.0 * 1024.0) / seconds)
-            });
             return JobBenchmarkReport {
                 action: action.to_string(),
                 job_id: Some(job_id),
@@ -727,7 +737,11 @@ impl BenchClient {
                 running_observed_after_ms,
                 total_duration_ms: total.as_secs_f64() * 1_000.0,
                 server_duration_ms,
-                throughput_mib_per_second,
+                throughput_mib_per_second: throughput_mib_per_second(
+                    size,
+                    server_duration_ms,
+                    total,
+                ),
                 error: public_job_error(&value),
             };
         }
@@ -739,7 +753,7 @@ impl BenchClient {
         let expected_accept = websocket_accept(&key);
         let mut request = self
             .websocket_client
-            .get(self.endpoint("/ws/monitoring"))
+            .get(self.endpoint(WEBSOCKET_TARGET))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONNECTION, "Upgrade")
             .header(UPGRADE, "websocket")
@@ -749,53 +763,45 @@ impl BenchClient {
         if let Some(host) = &self.host_header {
             request = request.header(HOST, host.clone());
         }
-        match request.send().await {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let selected_protocol = response
-                    .headers()
-                    .get("sec-websocket-protocol")
-                    .and_then(|value| value.to_str().ok());
-                let accept_matches = response
-                    .headers()
-                    .get("sec-websocket-accept")
-                    .and_then(|value| value.to_str().ok())
-                    == Some(expected_accept.as_str());
-                let upgrade_matches =
-                    header_contains_token(response.headers().get(UPGRADE), "websocket");
-                let connection_upgraded =
-                    header_contains_token(response.headers().get(CONNECTION), "upgrade");
-                let success = status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
-                    && selected_protocol == Some("dbe.jwt")
-                    && accept_matches
-                    && upgrade_matches
-                    && connection_upgraded;
-                let error = (!success).then(|| {
-                    format!(
-                        "WebSocket upgrade returned HTTP {status} (protocol={selected_protocol:?}, valid_accept={accept_matches}, upgrade={upgrade_matches}, connection_upgrade={connection_upgraded})"
-                    )
-                });
-                drop(response);
-                RequestSample {
-                    phase: "websocket_handshake".to_string(),
-                    target: "/ws/monitoring".to_string(),
-                    index,
-                    duration_micros: duration_micros(started.elapsed()),
-                    status_code: Some(status),
-                    success,
-                    error,
-                }
-            }
-            Err(error) => RequestSample {
+        let finish_sample =
+            |status_code: Option<u16>, success: bool, error: Option<String>| RequestSample {
                 phase: "websocket_handshake".to_string(),
-                target: "/ws/monitoring".to_string(),
+                target: WEBSOCKET_TARGET.to_string(),
                 index,
                 duration_micros: duration_micros(started.elapsed()),
-                status_code: None,
-                success: false,
-                error: Some(error.to_string()),
-            },
-        }
+                status_code,
+                success,
+                error,
+            };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => return finish_sample(None, false, Some(error.to_string())),
+        };
+        let status = response.status().as_u16();
+        let selected_protocol = response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok());
+        let accept_matches = response
+            .headers()
+            .get("sec-websocket-accept")
+            .and_then(|value| value.to_str().ok())
+            == Some(expected_accept.as_str());
+        let upgrade_matches = header_contains_token(response.headers().get(UPGRADE), "websocket");
+        let connection_upgraded =
+            header_contains_token(response.headers().get(CONNECTION), "upgrade");
+        let success = status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
+            && selected_protocol == Some("dbe.jwt")
+            && accept_matches
+            && upgrade_matches
+            && connection_upgraded;
+        let error = (!success).then(|| {
+            format!(
+                "WebSocket upgrade returned HTTP {status} (protocol={selected_protocol:?}, valid_accept={accept_matches}, upgrade={upgrade_matches}, connection_upgrade={connection_upgraded})"
+            )
+        });
+        drop(response);
+        finish_sample(Some(status), success, error)
     }
 
     async fn request(
@@ -817,51 +823,41 @@ impl BenchClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        match request.send().await {
-            Ok(response) => {
-                let status = response.status();
-                match response.bytes().await {
-                    Ok(body) => {
-                        let success = status.is_success();
-                        let error =
-                            (!success).then(|| format_http_error(status.as_u16(), body.as_ref()));
-                        MeasuredResponse {
-                            sample: RequestSample {
-                                phase: phase.to_string(),
-                                target: path.to_string(),
-                                index,
-                                duration_micros: duration_micros(started.elapsed()),
-                                status_code: Some(status.as_u16()),
-                                success,
-                                error,
-                            },
-                            body: body.to_vec(),
-                        }
-                    }
-                    Err(error) => MeasuredResponse {
-                        sample: RequestSample {
-                            phase: phase.to_string(),
-                            target: path.to_string(),
-                            index,
-                            duration_micros: duration_micros(started.elapsed()),
-                            status_code: Some(status.as_u16()),
-                            success: false,
-                            error: Some(format!("failed to read response body: {error}")),
-                        },
-                        body: Vec::new(),
-                    },
+        let finish_sample =
+            |status_code: Option<u16>, success: bool, error: Option<String>| RequestSample {
+                phase: phase.to_string(),
+                target: path.to_string(),
+                index,
+                duration_micros: duration_micros(started.elapsed()),
+                status_code,
+                success,
+                error,
+            };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return MeasuredResponse {
+                    sample: finish_sample(None, false, Some(error.to_string())),
+                    body: Vec::new(),
+                };
+            }
+        };
+        let status = response.status();
+        match response.bytes().await {
+            Ok(body) => {
+                let success = status.is_success();
+                let error = (!success).then(|| format_http_error(status.as_u16(), body.as_ref()));
+                MeasuredResponse {
+                    sample: finish_sample(Some(status.as_u16()), success, error),
+                    body: body.to_vec(),
                 }
             }
             Err(error) => MeasuredResponse {
-                sample: RequestSample {
-                    phase: phase.to_string(),
-                    target: path.to_string(),
-                    index,
-                    duration_micros: duration_micros(started.elapsed()),
-                    status_code: None,
-                    success: false,
-                    error: Some(error.to_string()),
-                },
+                sample: finish_sample(
+                    Some(status.as_u16()),
+                    false,
+                    Some(format!("failed to read response body: {error}")),
+                ),
                 body: Vec::new(),
             },
         }
@@ -929,6 +925,30 @@ fn failed_job_report(
         throughput_mib_per_second: None,
         error,
     }
+}
+
+fn skipped_import_report(reason: &str) -> JobBenchmarkReport {
+    failed_job_report(
+        "import",
+        "skipped",
+        Duration::ZERO,
+        None,
+        Some(reason.to_string()),
+    )
+}
+
+fn throughput_mib_per_second(
+    size_bytes: Option<u64>,
+    server_duration_ms: Option<f64>,
+    total: Duration,
+) -> Option<f64> {
+    size_bytes.and_then(|bytes| {
+        let seconds = server_duration_ms
+            .map(|duration_ms| duration_ms / 1_000.0)
+            .filter(|seconds| *seconds > 0.0)
+            .unwrap_or(total.as_secs_f64());
+        (seconds > 0.0).then_some(bytes as f64 / BYTES_PER_MIB / seconds)
+    })
 }
 
 fn public_job_error(value: &Value) -> Option<String> {

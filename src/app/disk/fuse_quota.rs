@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::shared::limits::mib_to_bytes;
 
-use super::{DiskLimitError, mounts};
+use super::{DiskLimitError, mounts, path_io_error};
 
 pub(crate) mod cleanup;
 
@@ -49,6 +49,12 @@ const TARGET_FUSEQUOTA_NOFILE: u64 = 1_048_576;
 const UNMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HELPER_CMDLINE_BYTES: usize = 16 * 1024;
+const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const UNMOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const EMBEDDED_BINARY: &str = "embedded";
+const SHA256_HEX_LENGTH: usize = 64;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) async fn verify_startup(
     binary: &str,
@@ -62,10 +68,9 @@ pub(super) async fn verify_startup(
     let fuse_conf = tokio::fs::read_to_string("/etc/fuse.conf")
         .await
         .unwrap_or_default();
-    let allow_other_enabled = fuse_conf.lines().any(|line| {
-        let line = line.trim();
-        !line.starts_with('#') && line == "user_allow_other"
-    });
+    let allow_other_enabled = fuse_conf
+        .lines()
+        .any(|line| line.trim() == "user_allow_other");
     if !allow_other_enabled {
         return Err(DiskLimitError::FuseAllowOtherDisabled);
     }
@@ -103,53 +108,14 @@ pub(super) async fn apply_with_root(
 ) -> Result<PathBuf, DiskLimitError> {
     let paths = fuse_paths_with_root(data_path, fuse_root)?;
     prepare_fuse_dirs(&paths.root_path)?;
-    tokio::fs::create_dir_all(data_path)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: data_path.display().to_string(),
-            source,
-        })?;
-    if let Some(parent) = paths.mount_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| DiskLimitError::PathIo {
-                path: parent.display().to_string(),
-                source,
-            })?;
-    }
-    if let Some(parent) = paths.socket_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| DiskLimitError::PathIo {
-                path: parent.display().to_string(),
-                source,
-            })?;
-    }
-    tokio::fs::create_dir_all(&paths.mount_path)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: paths.mount_path.display().to_string(),
-            source,
-        })?;
+    create_runtime_directories(data_path, &paths).await?;
 
     let expected_owner = path_owner(data_path).await?;
 
     if let Ok(response) = send_command_detailed(&paths.socket_path, "get quota_used", None).await {
-        if !mounts::is_mountpoint(&paths.mount_path)?
-            || !helper_cache_is_safe(response.peer_pid).await
-            || !mount_owner_matches(&paths.mount_path, expected_owner).await
-        {
-            return Err(DiskLimitError::FuseRequiresRestart(paths.mount_path));
-        }
-        set_helper_nofile_limit(response.peer_pid).await?;
-        send_command_detailed(
-            &paths.socket_path,
-            &format!("set quota = {}", mib_to_bytes(disk_mib)),
-            Some(response.peer_pid),
-        )
-        .await?;
-        return Ok(paths.mount_path);
-    } else if mounts::is_mountpoint(&paths.mount_path)? {
+        return resize_running_helper(paths, response.peer_pid, expected_owner, disk_mib).await;
+    }
+    if mounts::is_mountpoint(&paths.mount_path)? {
         // Live resize, password and image preflights also use this function.
         // Only the lifecycle owner may stop the database and then detach it.
         return Err(DiskLimitError::FuseRequiresRestart(paths.mount_path));
@@ -188,6 +154,48 @@ pub(super) async fn apply_with_root(
     Ok(paths.mount_path)
 }
 
+async fn create_runtime_directories(
+    data_path: &Path,
+    paths: &FuseQuotaPaths,
+) -> Result<(), DiskLimitError> {
+    create_directory_all(data_path).await?;
+    if let Some(parent) = paths.mount_path.parent() {
+        create_directory_all(parent).await?;
+    }
+    if let Some(parent) = paths.socket_path.parent() {
+        create_directory_all(parent).await?;
+    }
+    create_directory_all(&paths.mount_path).await
+}
+
+async fn create_directory_all(path: &Path) -> Result<(), DiskLimitError> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(path_io_error(path))
+}
+
+async fn resize_running_helper(
+    paths: FuseQuotaPaths,
+    helper_pid: i32,
+    expected_owner: (u32, u32),
+    disk_mib: u64,
+) -> Result<PathBuf, DiskLimitError> {
+    if !mounts::is_mountpoint(&paths.mount_path)?
+        || !helper_cache_is_safe(helper_pid).await
+        || !mount_owner_matches(&paths.mount_path, expected_owner).await
+    {
+        return Err(DiskLimitError::FuseRequiresRestart(paths.mount_path));
+    }
+    set_helper_nofile_limit(helper_pid).await?;
+    send_command_detailed(
+        &paths.socket_path,
+        &format!("set quota = {}", mib_to_bytes(disk_mib)),
+        Some(helper_pid),
+    )
+    .await?;
+    Ok(paths.mount_path)
+}
+
 pub(super) async fn destroy_with_root(
     data_path: &Path,
     fuse_root: Option<&Path>,
@@ -196,12 +204,7 @@ pub(super) async fn destroy_with_root(
     let graceful_error = match fs::symlink_metadata(&paths.socket_path) {
         Ok(_) => send_command(&paths.socket_path, "do end").await.err(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(DiskLimitError::PathIo {
-                path: paths.socket_path.display().to_string(),
-                source,
-            });
-        }
+        Err(source) => return Err(path_io_error(&paths.socket_path)(source)),
     };
 
     unmount(&paths.mount_path).await?;
@@ -209,12 +212,7 @@ pub(super) async fn destroy_with_root(
     match tokio::fs::remove_dir(&paths.mount_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(DiskLimitError::PathIo {
-                path: paths.mount_path.display().to_string(),
-                source,
-            });
-        }
+        Err(source) => return Err(path_io_error(&paths.mount_path)(source)),
     }
     if let Some(error) = graceful_error {
         tracing::warn!(
@@ -284,7 +282,7 @@ pub(super) async fn runtime_is_healthy(
 async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     let started = Instant::now();
     let mut last_error = String::new();
-    while started.elapsed() < Duration::from_secs(10) {
+    while started.elapsed() < SOCKET_READY_TIMEOUT {
         match send_command_detailed(socket_path, "get quota_used", None).await {
             Ok(response) => {
                 set_helper_nofile_limit(response.peer_pid).await?;
@@ -292,7 +290,7 @@ async fn wait_for_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
             }
             Err(error) => {
                 last_error = error.to_string();
-                sleep(Duration::from_millis(200)).await;
+                sleep(SOCKET_READY_POLL_INTERVAL).await;
             }
         }
     }
@@ -338,19 +336,36 @@ async fn send_command_bounded(
     command: &str,
     expected_pid: Option<i32>,
 ) -> Result<FuseControlResponse, DiskLimitError> {
-    let mut stream =
-        UnixStream::connect(socket_path)
-            .await
-            .map_err(|source| DiskLimitError::PathIo {
-                path: socket_path.display().to_string(),
-                source,
-            })?;
-    let peer = stream
-        .peer_cred()
-        .map_err(|source| DiskLimitError::PathIo {
-            path: socket_path.display().to_string(),
-            source,
-        })?;
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(path_io_error(socket_path))?;
+    let peer_pid = verify_control_peer(&stream, socket_path, expected_pid)?;
+
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .await
+        .map_err(path_io_error(socket_path))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(path_io_error(socket_path))?;
+
+    let mut response = Vec::with_capacity(MAX_CONTROL_RESPONSE_BYTES.min(4096));
+    stream
+        .take((MAX_CONTROL_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response)
+        .await
+        .map_err(path_io_error(socket_path))?;
+    let lines = parse_control_response(&response, command)?;
+    Ok(FuseControlResponse { lines, peer_pid })
+}
+
+fn verify_control_peer(
+    stream: &UnixStream,
+    socket_path: &Path,
+    expected_pid: Option<i32>,
+) -> Result<i32, DiskLimitError> {
+    let peer = stream.peer_cred().map_err(path_io_error(socket_path))?;
     let expected_uid = rustix::process::geteuid().as_raw();
     if peer.uid() != expected_uid {
         return Err(DiskLimitError::FuseSocket(format!(
@@ -370,37 +385,16 @@ async fn send_command_bounded(
             socket_path.to_path_buf(),
         ));
     }
+    Ok(peer_pid)
+}
 
-    stream
-        .write_all(format!("{command}\n").as_bytes())
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: socket_path.display().to_string(),
-            source,
-        })?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: socket_path.display().to_string(),
-            source,
-        })?;
-
-    let mut response = Vec::with_capacity(MAX_CONTROL_RESPONSE_BYTES.min(4096));
-    stream
-        .take((MAX_CONTROL_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut response)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: socket_path.display().to_string(),
-            source,
-        })?;
+fn parse_control_response(response: &[u8], command: &str) -> Result<Vec<String>, DiskLimitError> {
     if response.len() > MAX_CONTROL_RESPONSE_BYTES {
         return Err(DiskLimitError::FuseSocket(format!(
             "fusequota control response exceeded {MAX_CONTROL_RESPONSE_BYTES} bytes"
         )));
     }
-    let response = std::str::from_utf8(&response)
+    let response = std::str::from_utf8(response)
         .map_err(|_| DiskLimitError::FuseSocket("fusequota response was not UTF-8".to_string()))?;
     let mut lines = Vec::new();
     for line in response.lines() {
@@ -417,10 +411,7 @@ async fn send_command_bounded(
         lines.push(line.trim().to_string());
     }
 
-    if lines
-        .iter()
-        .any(|line| line.starts_with("ERROR:") || line.starts_with("ERROR"))
-    {
+    if lines.iter().any(|line| line.starts_with("ERROR")) {
         return Err(DiskLimitError::FuseSocket(lines.join("; ")));
     }
     if !lines.iter().any(|line| line.starts_with("OK")) {
@@ -430,18 +421,12 @@ async fn send_command_bounded(
         )));
     }
 
-    Ok(FuseControlResponse { lines, peer_pid })
+    Ok(lines)
 }
 
 async fn set_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
     let limits_path = PathBuf::from(format!("/proc/{peer_pid}/limits"));
-    let contents = tokio::fs::read_to_string(&limits_path)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: limits_path.display().to_string(),
-            source,
-        })?;
-    let before = parse_nofile_limits(&contents).map_err(DiskLimitError::FuseSocket)?;
+    let before = read_nofile_limits(&limits_path).await?;
     let desired_current = desired_nofile_current(before.maximum)?;
     if nofile_at_least(before.current, desired_current) {
         return Ok(());
@@ -467,13 +452,7 @@ async fn set_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
         ))
     })?;
 
-    let contents = tokio::fs::read_to_string(&limits_path)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: limits_path.display().to_string(),
-            source,
-        })?;
-    let after = parse_nofile_limits(&contents).map_err(DiskLimitError::FuseSocket)?;
+    let after = read_nofile_limits(&limits_path).await?;
     if !nofile_at_least(after.current, desired_current) {
         return Err(DiskLimitError::FuseSocket(format!(
             "fusequota process {peer_pid} kept RLIMIT_NOFILE below {desired_current} after repair"
@@ -487,6 +466,13 @@ async fn set_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
         "raised fusequota open-file limit"
     );
     Ok(())
+}
+
+async fn read_nofile_limits(limits_path: &Path) -> Result<NofileLimits, DiskLimitError> {
+    let contents = tokio::fs::read_to_string(limits_path)
+        .await
+        .map_err(path_io_error(limits_path))?;
+    parse_nofile_limits(&contents).map_err(DiskLimitError::FuseSocket)
 }
 
 fn desired_nofile_current(maximum: Option<u64>) -> Result<u64, DiskLimitError> {
@@ -539,10 +525,7 @@ fn prepare_fuse_dirs(fuse_root: &Path) -> Result<(), DiskLimitError> {
         fuse_root.join("instances"),
         fuse_root.join("mounts"),
     ] {
-        fs::create_dir_all(&path).map_err(|source| DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source,
-        })?;
+        fs::create_dir_all(&path).map_err(path_io_error(&path))?;
         secure_fuse_directory(&path)?;
     }
     Ok(())
@@ -557,16 +540,10 @@ fn secure_fuse_directory(path: &Path) -> Result<(), DiskLimitError> {
         Mode::empty(),
     )
     .map_err(std::io::Error::from)
-    .map_err(|source| DiskLimitError::PathIo {
-        path: path.display().to_string(),
-        source,
-    })?;
+    .map_err(path_io_error(path))?;
     let stat = rustix::fs::fstat(&directory)
         .map_err(std::io::Error::from)
-        .map_err(|source| DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source,
-        })?;
+        .map_err(path_io_error(path))?;
     let expected_uid = rustix::process::geteuid().as_raw();
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != expected_uid {
         return Err(DiskLimitError::FuseSocket(format!(
@@ -586,20 +563,13 @@ fn secure_fuse_directory(path: &Path) -> Result<(), DiskLimitError> {
     };
     rustix::fs::fchmod(&directory, mode)
         .map_err(std::io::Error::from)
-        .map_err(|source| DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source,
-        })?;
-    Ok(())
+        .map_err(path_io_error(path))
 }
 
 fn validate_control_socket(socket_path: &Path) -> Result<(), DiskLimitError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-    let metadata = fs::symlink_metadata(socket_path).map_err(|source| DiskLimitError::PathIo {
-        path: socket_path.display().to_string(),
-        source,
-    })?;
+    let metadata = fs::symlink_metadata(socket_path).map_err(path_io_error(socket_path))?;
     let expected_uid = rustix::process::geteuid().as_raw();
     let mode = metadata.mode() & 0o777;
     if !metadata.file_type().is_socket() || metadata.uid() != expected_uid || mode & 0o022 != 0 {
@@ -615,20 +585,12 @@ async fn remove_control_socket(socket_path: &Path) -> Result<(), DiskLimitError>
     match fs::symlink_metadata(socket_path) {
         Ok(_) => validate_control_socket(socket_path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(DiskLimitError::PathIo {
-                path: socket_path.display().to_string(),
-                source,
-            });
-        }
+        Err(source) => return Err(path_io_error(socket_path)(source)),
     }
     match tokio::fs::remove_file(socket_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DiskLimitError::PathIo {
-            path: socket_path.display().to_string(),
-            source,
-        }),
+        Err(source) => Err(path_io_error(socket_path)(source)),
     }
 }
 
@@ -638,8 +600,13 @@ async fn unmount(mount_path: &Path) -> Result<(), DiskLimitError> {
     }
 
     let mut failures = Vec::new();
-    for program in ["fusermount3", "fusermount"] {
-        match run_unmount_command(program, &["-u"], mount_path).await {
+    let attempts: [(&'static str, &[&str]); 3] = [
+        ("fusermount3", &["-u"]),
+        ("fusermount", &["-u"]),
+        ("umount", &[]),
+    ];
+    for (program, args) in attempts {
+        match run_unmount_command(program, args, mount_path).await {
             Ok(Some(status)) if !status.success() => {
                 failures.push(format!("{program} exited with {status}"));
             }
@@ -649,17 +616,6 @@ async fn unmount(mount_path: &Path) -> Result<(), DiskLimitError> {
         if wait_until_unmounted(mount_path, UNMOUNT_CONFIRM_TIMEOUT).await? {
             return Ok(());
         }
-    }
-
-    match run_unmount_command("umount", &[], mount_path).await {
-        Ok(Some(status)) if !status.success() => {
-            failures.push(format!("umount exited with {status}"));
-        }
-        Ok(_) => {}
-        Err(error) => failures.push(error.to_string()),
-    }
-    if wait_until_unmounted(mount_path, UNMOUNT_CONFIRM_TIMEOUT).await? {
-        return Ok(());
     }
 
     Err(DiskLimitError::FuseSocket(format!(
@@ -708,20 +664,16 @@ async fn wait_until_unmounted(mount_path: &Path, wait: Duration) -> Result<bool,
         if started.elapsed() >= wait {
             return Ok(false);
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(UNMOUNT_POLL_INTERVAL).await;
     }
 }
 
 async fn path_owner(path: &Path) -> Result<(u32, u32), DiskLimitError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|source| DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source,
-        })?;
-
     use std::os::unix::fs::MetadataExt;
 
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(path_io_error(path))?;
     Ok((metadata.uid(), metadata.gid()))
 }
 
@@ -789,16 +741,19 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
 }
 
 async fn helper_cache_is_safe(pid: i32) -> bool {
-    let Ok(file) = tokio::fs::File::open(format!("/proc/{pid}/cmdline")).await else {
+    let Ok(cmdline) = read_helper_cmdline(pid).await else {
         return false;
     };
+    cmdline.len() <= MAX_HELPER_CMDLINE_BYTES && has_nocache_arg(&cmdline)
+}
+
+async fn read_helper_cmdline(pid: i32) -> Result<Vec<u8>, Error> {
+    let file = tokio::fs::File::open(format!("/proc/{pid}/cmdline")).await?;
     let mut bytes = Vec::new();
     file.take((MAX_HELPER_CMDLINE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .await
-        .is_ok()
-        && bytes.len() <= MAX_HELPER_CMDLINE_BYTES
-        && has_nocache_arg(&bytes)
+        .await?;
+    Ok(bytes)
 }
 
 fn has_nocache_arg(cmdline: &[u8]) -> bool {
@@ -852,9 +807,9 @@ async fn resolve_binary(
     binary_sha256: &str,
     runtime_root: Option<&Path>,
 ) -> Result<PathBuf, DiskLimitError> {
-    if binary.trim().eq_ignore_ascii_case("embedded") {
+    if is_embedded_binary(binary) {
         let runtime_root = runtime_root.ok_or_else(|| DiskLimitError::FuseBinaryIo {
-            binary: "embedded".to_string(),
+            binary: EMBEDDED_BINARY.to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "embedded fusequota requires a configured private runtime root",
@@ -863,7 +818,7 @@ async fn resolve_binary(
         return crate::bins::get_fusequota_bin_path(runtime_root)
             .await
             .map_err(|source| DiskLimitError::FuseBinaryIo {
-                binary: "embedded".to_string(),
+                binary: EMBEDDED_BINARY.to_string(),
                 source,
             });
     }
@@ -883,24 +838,32 @@ async fn resolve_binary(
     Ok(binary_path)
 }
 
+fn is_embedded_binary(binary: &str) -> bool {
+    binary.trim().eq_ignore_ascii_case(EMBEDDED_BINARY)
+}
+
+fn has_parent_segment(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn is_lowercase_sha256_hex(digest: &str) -> bool {
+    digest.len() == SHA256_HEX_LENGTH
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Error> {
     use rustix::fs::{FileType, Mode, OFlags};
 
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if !path.is_absolute() || has_parent_segment(path) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "external fuse quota helper must use an absolute path without parent segments",
         ));
     }
-    if expected_digest.len() != 64
-        || !expected_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lowercase_sha256_hex(expected_digest) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "external fuse quota helper requires a lowercase SHA-256 digest",
@@ -935,17 +898,7 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
         stat.st_mode,
     )?;
 
-    let mut file = File::from(binary);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let actual_digest = crate::shared::hex::encode_lower(&hasher.finalize());
+    let actual_digest = sha256_hex(File::from(binary))?;
     if actual_digest != expected_digest {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -956,6 +909,19 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
         ));
     }
     Ok(())
+}
+
+fn sha256_hex(mut file: File) -> Result<String, Error> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::shared::hex::encode_lower(&hasher.finalize()))
 }
 
 fn open_trusted_root_dir(path: &Path) -> Result<rustix::fd::OwnedFd, Error> {
@@ -1015,7 +981,7 @@ fn check_external_binary(
 }
 
 fn display_binary(configured: &str, resolved: &Path) -> String {
-    if configured.trim().eq_ignore_ascii_case("embedded") {
+    if is_embedded_binary(configured) {
         format!("embedded ({})", resolved.display())
     } else {
         configured.to_string()

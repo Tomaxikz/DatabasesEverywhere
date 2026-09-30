@@ -4,6 +4,8 @@ use crate::jobs::import_export::{
     ImportExportAction, ImportExportJob, ImportExportStatus, JobParseError,
 };
 
+const MAX_LIST_LIMIT: u32 = 500;
+
 #[derive(Debug, Clone)]
 pub struct ImportExportJobRepository {
     pool: SqlitePool,
@@ -79,7 +81,7 @@ impl ImportExportJobRepository {
         status: Option<ImportExportStatus>,
         limit: u32,
     ) -> Result<Vec<ImportExportJob>, ImportExportJobStorageError> {
-        let limit = limit.clamp(1, 500);
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
         let status = status.map(ImportExportStatus::as_str);
         let rows = sqlx::query(
             r#"

@@ -35,6 +35,9 @@ mod unix {
     const MAX_QDRANT_COLLECTIONS: usize = 512;
     const MAX_QDRANT_ALIASES: usize = 4096;
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+    const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+    const BRIDGE_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const HOST_BRIDGE_SOCKET_NAME: &str = "qdrant-http-import.sock";
     const TARGET_BRIDGE_SOCKET: &str = "/run/dbev/qdrant-http-import.sock";
     const TARGET_BRIDGE_PID: &str = "/tmp/dbev-qdrant-http-import.pid";
     const TARGET_BRIDGE_LOG: &str = "/tmp/dbev-qdrant-http-import.log";
@@ -90,7 +93,7 @@ mod unix {
         let mut source_snapshots = Vec::new();
         let mut staged_bytes = 0_u64;
 
-        let acquire_result = tokio::time::timeout_at(work_deadline, async {
+        let acquire_result = within_deadline(work_deadline, "source snapshot acquisition", async {
             let source_version = source_client.version().await?;
             source_client.check_standalone().await?;
             let source_collections =
@@ -122,7 +125,7 @@ mod unix {
                 source_client.delete_snapshot(collection, &snapshot).await?;
                 source_snapshots.pop();
             }
-            Ok::<_, ApiError>((
+            Ok((
                 source_version,
                 source_collections,
                 source_names,
@@ -132,73 +135,52 @@ mod unix {
         .await;
         let (source_version, source_collections, source_names, source_aliases) =
             match acquire_result {
-                Ok(Ok(acquired)) => acquired,
-                Ok(Err(error)) => {
-                    cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                    cleanup_staging(&staging).await;
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    abandon_source_phase(&source_client, &source_snapshots, &staging).await;
                     return Err(error);
-                }
-                Err(_) => {
-                    cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                    cleanup_staging(&staging).await;
-                    return Err(operation_timeout_error("source snapshot acquisition"));
                 }
             };
 
         let paths = InstancePaths::new(&state.config.paths, instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        let bridge = match tokio::time::timeout_at(
+        let bridge = match within_deadline(
             work_deadline,
+            "target bridge startup",
             QdrantBridge::start(state, instance_id, &paths),
         )
         .await
         {
-            Ok(Ok(bridge)) => bridge,
-            Ok(Err(error)) => {
-                cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                cleanup_staging(&staging).await;
+            Ok(bridge) => bridge,
+            Err(error) => {
+                abandon_source_phase(&source_client, &source_snapshots, &staging).await;
                 return Err(error);
-            }
-            Err(_) => {
-                cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                cleanup_staging(&staging).await;
-                return Err(operation_timeout_error("target bridge startup"));
             }
         };
         let mut bridge = Some(bridge);
-        let target_key = match tokio::time::timeout_at(
-            work_deadline,
-            target_api_key(state, instance_id),
-        )
-        .await
-        {
-            Ok(Ok(key)) => key,
-            Ok(Err(error)) => {
-                stop_bridge(&mut bridge).await;
-                cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                cleanup_staging(&staging).await;
-                return Err(error);
-            }
-            Err(_) => {
-                stop_bridge(&mut bridge).await;
-                cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                cleanup_staging(&staging).await;
-                return Err(operation_timeout_error("target credential lookup"));
-            }
-        };
-        let target_client = match QdrantHttp::target(&paths, &target_key, timeout) {
-            Ok(client) => client,
+        let target_connection = async {
+            let target_key = within_deadline(
+                work_deadline,
+                "target credential lookup",
+                target_api_key(state, instance_id),
+            )
+            .await?;
+            let target_client = QdrantHttp::target(&paths, &target_key, timeout)?;
+            Ok::<_, ApiError>((target_key, target_client))
+        }
+        .await;
+        let (target_key, target_client) = match target_connection {
+            Ok(connection) => connection,
             Err(error) => {
                 stop_bridge(&mut bridge).await;
-                cleanup_source_snapshots(&source_client, &source_snapshots).await;
-                cleanup_staging(&staging).await;
+                abandon_source_phase(&source_client, &source_snapshots, &staging).await;
                 return Err(error);
             }
         };
 
         let mut target_snapshots = Vec::new();
         let mut retain_staging = false;
-        let preparation = tokio::time::timeout_at(work_deadline, async {
+        let preparation = within_deadline(work_deadline, "target recovery preparation", async {
             let target_version = target_client.version().await?;
             target_client.check_standalone().await?;
             check_snapshot_compatibility(&source_version, &target_version)?;
@@ -246,14 +228,15 @@ mod unix {
                 &target_aliases,
             )
             .await?;
-            Ok::<_, ApiError>((target_aliases, affected, affected_names, rollback))
+            Ok((target_aliases, affected, affected_names, rollback))
         })
         .await;
 
         let mut mutation_started = false;
         let result = match preparation {
-            Ok(Ok((target_aliases, affected, affected_names, rollback))) => {
-                let mutation = tokio::time::timeout_at(work_deadline, async {
+            Err(error) => Err(error),
+            Ok((target_aliases, affected, affected_names, rollback)) => {
+                let mutation = within_deadline(work_deadline, "target mutation", async {
                     for collection in &affected {
                         // A request can mutate Qdrant and then fail while its response is in flight.
                         // Treat every attempted delete as a mutation requiring rollback.
@@ -279,111 +262,125 @@ mod unix {
                         mutation_started = true;
                         target_client.update_aliases(actions).await?;
                     }
-                    Ok::<(), ApiError>(())
+                    Ok(())
                 })
                 .await;
-                let mutation = match mutation {
-                    Ok(result) => result,
-                    Err(_) => Err(operation_timeout_error("target mutation")),
-                };
-                if let Err(primary) = mutation {
-                    let rollback_succeeded = if qdrant_rollback_needs_stop(mutation_started) {
-                        match quiesce_rollback_target(
-                            state,
-                            instance_id,
-                            &paths,
-                            &target_key,
-                            timeout,
-                            operation_deadline,
-                            &mut bridge,
-                        )
-                        .await
-                        {
-                            Ok(rollback_client) => tokio::time::timeout_at(
+                match mutation {
+                    Ok(()) => Ok(()),
+                    Err(primary) => {
+                        let rollback_succeeded = if qdrant_rollback_needs_stop(mutation_started) {
+                            match quiesce_rollback_target(
+                                state,
+                                instance_id,
+                                &paths,
+                                &target_key,
+                                timeout,
                                 operation_deadline,
-                                rollback_target(
-                                    &rollback_client,
-                                    &source_names,
-                                    mode,
-                                    &rollback,
-                                    &target_aliases,
-                                ),
+                                &mut bridge,
                             )
                             .await
-                            .is_ok_and(|result| result.is_ok()),
-                            Err(error) => {
-                                tracing::error!(
-                                    instance_id,
-                                    %error,
-                                    "could not quiesce qdrant before remote import rollback"
-                                );
-                                false
+                            {
+                                Ok(rollback_client) => tokio::time::timeout_at(
+                                    operation_deadline,
+                                    rollback_target(
+                                        &rollback_client,
+                                        &source_names,
+                                        mode,
+                                        &rollback,
+                                        &target_aliases,
+                                    ),
+                                )
+                                .await
+                                .is_ok_and(|result| result.is_ok()),
+                                Err(error) => {
+                                    tracing::error!(
+                                        instance_id,
+                                        %error,
+                                        "could not quiesce qdrant before remote import rollback"
+                                    );
+                                    false
+                                }
                             }
-                        }
-                    } else {
-                        true
-                    };
-                    if !rollback_succeeded {
-                        retain_staging = true;
-                        let quarantine = crate::api::import_export::quarantine_uncertain_import(
-                            state,
-                            instance_id,
-                        )
-                        .await;
-                        if quarantine.is_ok()
-                            && let Some(stopped_bridge) = bridge.take()
-                        {
-                            stopped_bridge.disarm();
-                        }
-                        let quarantine = match quarantine {
-                            Ok(()) => "target was stopped and quarantined".to_string(),
-                            Err(error) => format!(
-                                "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
-                            ),
+                        } else {
+                            true
                         };
-                        Err(ApiError::Runtime(format!(
-                            "qdrant remote import failed ({primary}) and automatic rollback failed or timed out; {quarantine}; recovery snapshots were retained at {}",
-                            staging.display()
-                        )))
-                    } else {
-                        Err(primary)
+                        if rollback_succeeded {
+                            Err(primary)
+                        } else {
+                            retain_staging = true;
+                            let quarantine =
+                                crate::api::import_export::quarantine_uncertain_import(
+                                    state,
+                                    instance_id,
+                                )
+                                .await;
+                            if quarantine.is_ok()
+                                && let Some(stopped_bridge) = bridge.take()
+                            {
+                                stopped_bridge.disarm();
+                            }
+                            let quarantine = describe_quarantine(quarantine);
+                            Err(ApiError::Runtime(format!(
+                                "qdrant remote import failed ({primary}) and automatic rollback failed or timed out; {quarantine}; recovery snapshots were retained at {}",
+                                staging.display()
+                            )))
+                        }
                     }
-                } else {
-                    Ok(())
                 }
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(operation_timeout_error("target recovery preparation")),
         };
 
         cleanup_target_snapshots(&target_client, &target_snapshots).await;
         stop_bridge(&mut bridge).await;
         cleanup_source_snapshots(&source_client, &source_snapshots).await;
-        if !retain_staging {
-            if let Err(commit_error) = commit_recovery_manifest(&recovery_manifest).await {
-                let quarantine =
-                    crate::api::import_export::quarantine_uncertain_import(state, instance_id)
-                        .await;
-                let quarantine = match quarantine {
-                    Ok(()) => "target was stopped and quarantined".to_string(),
-                    Err(error) => format!(
-                        "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
-                    ),
-                };
-                return match result {
-                    Ok(()) => Err(ApiError::Runtime(format!(
-                        "qdrant import was applied, but its recovery commit marker could not be removed: {commit_error}; {quarantine}; recovery staging was retained at {}",
-                        staging.display()
-                    ))),
-                    Err(primary) => Err(ApiError::Runtime(format!(
-                        "qdrant import failed: {primary}; rollback completed, but recovery metadata could not be committed: {commit_error}; {quarantine}; recovery staging was retained at {}",
-                        staging.display()
-                    ))),
-                };
-            }
-            cleanup_staging(&staging).await;
+        if retain_staging {
+            return result;
         }
+        if let Err(commit_error) = commit_recovery_manifest(&recovery_manifest).await {
+            let quarantine = describe_quarantine(
+                crate::api::import_export::quarantine_uncertain_import(state, instance_id).await,
+            );
+            return match result {
+                Ok(()) => Err(ApiError::Runtime(format!(
+                    "qdrant import was applied, but its recovery commit marker could not be removed: {commit_error}; {quarantine}; recovery staging was retained at {}",
+                    staging.display()
+                ))),
+                Err(primary) => Err(ApiError::Runtime(format!(
+                    "qdrant import failed: {primary}; rollback completed, but recovery metadata could not be committed: {commit_error}; {quarantine}; recovery staging was retained at {}",
+                    staging.display()
+                ))),
+            };
+        }
+        cleanup_staging(&staging).await;
         result
+    }
+
+    async fn within_deadline<T>(
+        deadline: tokio::time::Instant,
+        phase: &str,
+        operation: impl std::future::Future<Output = Result<T, ApiError>>,
+    ) -> Result<T, ApiError> {
+        tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| operation_timeout_error(phase))?
+    }
+
+    async fn abandon_source_phase(
+        source_client: &QdrantHttp,
+        source_snapshots: &[(String, String)],
+        staging: &Path,
+    ) {
+        cleanup_source_snapshots(source_client, source_snapshots).await;
+        cleanup_staging(staging).await;
+    }
+
+    fn describe_quarantine(quarantine: Result<(), ApiError>) -> String {
+        match quarantine {
+            Ok(()) => "target was stopped and quarantined".to_string(),
+            Err(error) => format!(
+                "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
+            ),
+        }
     }
 
     fn qdrant_rollback_needs_stop(mutation_started: bool) -> bool {
@@ -485,17 +482,24 @@ mod unix {
         Ok(())
     }
 
-    async fn cleanup_source_snapshots(source: &QdrantHttp, snapshots: &[(String, String)]) {
+    async fn delete_snapshots_within_cleanup_timeout(
+        client: &QdrantHttp,
+        snapshots: &[(String, String)],
+    ) -> Result<usize, tokio::time::error::Elapsed> {
         let cleanup = async {
             let mut failures = 0_usize;
             for (collection, snapshot) in snapshots {
-                if source.delete_snapshot(collection, snapshot).await.is_err() {
+                if client.delete_snapshot(collection, snapshot).await.is_err() {
                     failures += 1;
                 }
             }
             failures
         };
-        match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
+        tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await
+    }
+
+    async fn cleanup_source_snapshots(source: &QdrantHttp, snapshots: &[(String, String)]) {
+        match delete_snapshots_within_cleanup_timeout(source, snapshots).await {
             Ok(0) => {}
             Ok(failures) => {
                 tracing::warn!(
@@ -514,16 +518,7 @@ mod unix {
     }
 
     async fn cleanup_target_snapshots(target: &QdrantHttp, snapshots: &[(String, String)]) {
-        let cleanup = async {
-            let mut failures = 0_usize;
-            for (collection, snapshot) in snapshots {
-                if target.delete_snapshot(collection, snapshot).await.is_err() {
-                    failures += 1;
-                }
-            }
-            failures
-        };
-        match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
+        match delete_snapshots_within_cleanup_timeout(target, snapshots).await {
             Ok(0) => {}
             Ok(failures) => {
                 tracing::warn!(
@@ -796,7 +791,7 @@ mod unix {
                 .no_proxy()
                 .redirect(Policy::none())
                 .timeout(timeout)
-                .unix_socket(paths.sockets.join("qdrant-http-import.sock"))
+                .unix_socket(paths.sockets.join(HOST_BRIDGE_SOCKET_NAME))
                 .build()
                 .map_err(|_| {
                     ApiError::Runtime("failed to build managed qdrant client".to_string())
@@ -1181,8 +1176,8 @@ mod unix {
                 bridge.stop().await;
                 return Err(error);
             }
-            let host_socket = paths.sockets.join("qdrant-http-import.sock");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let host_socket = paths.sockets.join(HOST_BRIDGE_SOCKET_NAME);
+            let deadline = tokio::time::Instant::now() + BRIDGE_READY_TIMEOUT;
             loop {
                 if tokio::fs::symlink_metadata(&host_socket)
                     .await
@@ -1196,7 +1191,7 @@ mod unix {
                         "managed qdrant HTTP bridge did not become ready".to_string(),
                     ));
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(BRIDGE_READY_POLL_INTERVAL).await;
             }
             Ok(bridge)
         }

@@ -26,13 +26,22 @@ pub(crate) struct CompatibilityBootSummary {
     pub(crate) deferred: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct InstanceBootOutcome {
     reused: bool,
     probed: bool,
     upgraded: bool,
     failed: bool,
     deferred: bool,
+}
+
+type OperationGuard = tokio::sync::OwnedMutexGuard<()>;
+
+const QDRANT_SOCKET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn running_as_desired(metadata: &InstanceMetadata) -> bool {
+    metadata.desired_state == DesiredInstanceState::Running
+        && metadata.status == InstanceStatus::Running
 }
 
 pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSummary {
@@ -43,8 +52,7 @@ pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSum
         .into_iter()
         .filter(|metadata| {
             metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
-                && metadata.desired_state == DesiredInstanceState::Running
-                && metadata.status == InstanceStatus::Running
+                && running_as_desired(metadata)
         })
         .collect::<Vec<_>>();
 
@@ -68,24 +76,10 @@ pub(crate) async fn sync_compatibility(state: &AppState) -> CompatibilityBootSum
 async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> InstanceBootOutcome {
     let operation = state.instance_locks.lock(&snapshot.instance_id).await;
     let Some(metadata) = state.instances.get(&snapshot.instance_id).await else {
-        return InstanceBootOutcome {
-            reused: false,
-            probed: false,
-            upgraded: false,
-            failed: false,
-            deferred: false,
-        };
+        return InstanceBootOutcome::default();
     };
-    if metadata.desired_state != DesiredInstanceState::Running
-        || metadata.status != InstanceStatus::Running
-    {
-        return InstanceBootOutcome {
-            reused: false,
-            probed: false,
-            upgraded: false,
-            failed: false,
-            deferred: false,
-        };
+    if !running_as_desired(&metadata) {
+        return InstanceBootOutcome::default();
     }
 
     let configured_image = state
@@ -93,28 +87,10 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
         .images
         .configured_for_protocol(metadata.protocol)
         .to_string();
-    let current_image = match state
-        .docker
-        .container_image(metadata.protocol, &metadata.instance_id)
-        .await
-    {
-        Ok(Some(image)) => image,
-        Ok(None) => {
-            isolate_failure(
-                state,
-                &metadata,
-                "managed container image could not be inspected",
-            )
-            .await;
-            return failed_outcome(false);
-        }
-        Err(error) => {
-            isolate_failure(
-                state,
-                &metadata,
-                &format!("managed container image inspection failed: {error}"),
-            )
-            .await;
+    let current_image = match current_container_image(state, &metadata).await {
+        Ok(image) => image,
+        Err(reason) => {
+            isolate_failure(state, &metadata, &reason).await;
             return failed_outcome(false);
         }
     };
@@ -134,132 +110,156 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
     // default points at a different database version.
     let target_image = boot_image(&current_image, &configured_image, logging_upgrade).to_string();
     let runtime_spec_upgrade = runtime_spec_upgrade_required(&metadata).await || logging_upgrade;
-    if logging_upgrade
-        && !matches!(
-            state
-                .docker
-                .container_recreation_image(metadata.protocol, &metadata.instance_id)
-                .await,
-            Ok(Some(_))
-        )
-    {
+    if logging_upgrade && !recreation_image_is_known(state, &metadata).await {
         tracing::warn!(event = "audit console_policy_upgrade_deferred", instance_id = %metadata.instance_id,
             "console-policy repair cannot preserve the installed image reference; update the image explicitly first");
         return attest_without_upgrade(state, metadata, false, Some(operation)).await;
     }
-    if current_image != target_image || runtime_spec_upgrade {
-        if let Some(reason) = upgrade_blocker(&metadata, &state.config.disk) {
-            tracing::warn!(event = "audit boot_image_upgrade_deferred",
-                instance_id = %metadata.instance_id, reason,
-                "retaining the current container; repair legacy credentials/storage before retrying its upgrade");
-            let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
-            outcome.deferred = true;
-            return outcome;
-        }
-        if runtime_spec_upgrade && current_image == target_image {
-            tracing::info!(
-                event = "audit boot_runtime_spec_upgrade_started",
-                instance_id = %metadata.instance_id,
-                protocol = %metadata.protocol,
-                image = %target_image,
-                "reconstructing a managed container once to apply private runtime sockets and bounded console logging"
-            );
-        }
-        let change = match classify_image_update(metadata.protocol, &current_image, &target_image) {
-            Ok(change) => change,
-            Err(error) => {
-                tracing::error!(
-                    event = "audit boot_image_upgrade_rejected",
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    from_image = %current_image,
-                    to_image = %target_image,
-                    %error,
-                    "configured boot image upgrade could not be classified; retaining the current container"
-                );
-                let mut outcome =
-                    attest_without_upgrade(state, metadata, false, Some(operation)).await;
-                outcome.failed = true;
-                return outcome;
-            }
-        };
-        let major_upgrade = change == ImageVersionChange::Major;
-        if major_upgrade && check_major_upgrade(metadata.protocol).is_err() {
+    if current_image == target_image && !runtime_spec_upgrade {
+        return attest_without_upgrade(state, metadata, false, Some(operation)).await;
+    }
+
+    if let Some(reason) = upgrade_blocker(&metadata, &state.config.disk) {
+        tracing::warn!(event = "audit boot_image_upgrade_deferred",
+            instance_id = %metadata.instance_id, reason,
+            "retaining the current container; repair legacy credentials/storage before retrying its upgrade");
+        let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
+        outcome.deferred = true;
+        return outcome;
+    }
+    if runtime_spec_upgrade && current_image == target_image {
+        tracing::info!(
+            event = "audit boot_runtime_spec_upgrade_started",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            image = %target_image,
+            "reconstructing a managed container once to apply private runtime sockets and bounded console logging"
+        );
+    }
+    let change = match classify_image_update(metadata.protocol, &current_image, &target_image) {
+        Ok(change) => change,
+        Err(error) => {
             tracing::error!(
-                event = "audit boot_major_upgrade_unsupported",
+                event = "audit boot_image_upgrade_rejected",
                 instance_id = %metadata.instance_id,
                 protocol = %metadata.protocol,
                 from_image = %current_image,
                 to_image = %target_image,
-                "configured image crosses a major version that DBEV cannot migrate automatically; retaining the current compatible image"
+                %error,
+                "configured boot image upgrade could not be classified; retaining the current container"
             );
-            let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
-            outcome.failed = true;
-            return outcome;
+            return attest_and_mark_failed(state, metadata, operation).await;
         }
-        let instance_id = metadata.instance_id.clone();
-        let result = if logging_upgrade {
-            // The reference was read and verified from this managed container;
-            // this is not a request to deploy a newly selected image.
-            crate::api::instances::run_image_update(
-                state.clone(),
-                operation,
-                metadata,
-                current_image,
-                target_image,
-                None,
-            )
-            .await
-        } else {
-            update_instance_image_locked(
-                state.clone(),
-                operation,
-                metadata,
-                current_image,
-                target_image,
-                major_upgrade,
-                None,
-            )
-            .await
-        };
-        match result {
-            Ok(_) => {
-                // Both image-update strategies force a compatibility probe
-                // before committing and republishing the replacement. Do not
-                // drop the operation lock and perform a redundant second
-                // probe: an API mutation could otherwise replace the
-                // container between those two checks.
-                InstanceBootOutcome {
-                    reused: false,
-                    probed: true,
-                    upgraded: true,
-                    failed: false,
-                    deferred: false,
-                }
-            }
-            Err(error) => {
-                tracing::error!(
-                    event = "audit boot_image_upgrade_failed",
-                    %instance_id,
-                    %error,
-                    "configured boot image upgrade failed safely; continuing daemon boot for other instances"
-                );
-                let restored_operation = state.instance_locks.lock(&instance_id).await;
-                if let Some(restored) = state.instances.get(&instance_id).await
-                    && restored.status == InstanceStatus::Running
-                    && restored.desired_state == DesiredInstanceState::Running
-                {
-                    let mut outcome =
-                        attest_without_upgrade(state, restored, false, Some(restored_operation))
-                            .await;
-                    outcome.failed = true;
-                    return outcome;
-                }
-                failed_outcome(false)
-            }
-        }
+    };
+    let major_upgrade = change == ImageVersionChange::Major;
+    if major_upgrade && check_major_upgrade(metadata.protocol).is_err() {
+        tracing::error!(
+            event = "audit boot_major_upgrade_unsupported",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            from_image = %current_image,
+            to_image = %target_image,
+            "configured image crosses a major version that DBEV cannot migrate automatically; retaining the current compatible image"
+        );
+        return attest_and_mark_failed(state, metadata, operation).await;
+    }
+    replace_container_image(
+        state,
+        operation,
+        metadata,
+        current_image,
+        target_image,
+        logging_upgrade,
+        major_upgrade,
+    )
+    .await
+}
+
+async fn current_container_image(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<String, String> {
+    match state
+        .docker
+        .container_image(metadata.protocol, &metadata.instance_id)
+        .await
+    {
+        Ok(Some(image)) => Ok(image),
+        Ok(None) => Err("managed container image could not be inspected".to_string()),
+        Err(error) => Err(format!(
+            "managed container image inspection failed: {error}"
+        )),
+    }
+}
+
+async fn recreation_image_is_known(state: &AppState, metadata: &InstanceMetadata) -> bool {
+    matches!(
+        state
+            .docker
+            .container_recreation_image(metadata.protocol, &metadata.instance_id)
+            .await,
+        Ok(Some(_))
+    )
+}
+
+async fn replace_container_image(
+    state: &AppState,
+    operation: OperationGuard,
+    metadata: InstanceMetadata,
+    current_image: String,
+    target_image: String,
+    logging_upgrade: bool,
+    major_upgrade: bool,
+) -> InstanceBootOutcome {
+    let instance_id = metadata.instance_id.clone();
+    let result = if logging_upgrade {
+        // The reference was read and verified from this managed container;
+        // this is not a request to deploy a newly selected image.
+        crate::api::instances::run_image_update(
+            state.clone(),
+            operation,
+            metadata,
+            current_image,
+            target_image,
+            None,
+        )
+        .await
     } else {
-        attest_without_upgrade(state, metadata, false, Some(operation)).await
+        update_instance_image_locked(
+            state.clone(),
+            operation,
+            metadata,
+            current_image,
+            target_image,
+            major_upgrade,
+            None,
+        )
+        .await
+    };
+    let Err(error) = result else {
+        // Both image-update strategies force a compatibility probe
+        // before committing and republishing the replacement. Do not
+        // drop the operation lock and perform a redundant second
+        // probe: an API mutation could otherwise replace the
+        // container between those two checks.
+        return InstanceBootOutcome {
+            probed: true,
+            upgraded: true,
+            ..InstanceBootOutcome::default()
+        };
+    };
+    tracing::error!(
+        event = "audit boot_image_upgrade_failed",
+        %instance_id,
+        %error,
+        "configured boot image upgrade failed safely; continuing daemon boot for other instances"
+    );
+    let restored_operation = state.instance_locks.lock(&instance_id).await;
+    match state.instances.get(&instance_id).await {
+        Some(restored) if running_as_desired(&restored) => {
+            attest_and_mark_failed(state, restored, restored_operation).await
+        }
+        _ => failed_outcome(false),
     }
 }
 
@@ -314,19 +314,18 @@ async fn runtime_spec_upgrade_required(metadata: &InstanceMetadata) -> bool {
     else {
         return true;
     };
-    match tokio::fs::symlink_metadata(&http_socket).await {
-        Ok(metadata) if metadata.file_type().is_socket() => !matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                tokio::net::UnixStream::connect(http_socket),
-            )
-            .await,
-            Ok(Ok(_))
-        ),
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => true,
+    let is_socket = tokio::fs::symlink_metadata(&http_socket)
+        .await
+        .is_ok_and(|metadata| metadata.file_type().is_socket());
+    if !is_socket {
+        return true;
     }
+    let connected = tokio::time::timeout(
+        QDRANT_SOCKET_PROBE_TIMEOUT,
+        tokio::net::UnixStream::connect(http_socket),
+    )
+    .await;
+    !matches!(connected, Ok(Ok(_)))
 }
 
 async fn attest_without_upgrade(
@@ -360,6 +359,16 @@ async fn attest_without_upgrade(
             failed_outcome(upgraded)
         }
     }
+}
+
+async fn attest_and_mark_failed(
+    state: &AppState,
+    metadata: InstanceMetadata,
+    operation: OperationGuard,
+) -> InstanceBootOutcome {
+    let mut outcome = attest_without_upgrade(state, metadata, false, Some(operation)).await;
+    outcome.failed = true;
+    outcome
 }
 
 fn failed_outcome(upgraded: bool) -> InstanceBootOutcome {

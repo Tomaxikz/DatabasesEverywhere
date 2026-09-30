@@ -26,14 +26,17 @@ use crate::{
     },
     placement::{
         DeploymentMode, EngineRuntime, EngineRuntimeStatus, PlacementRepository,
-        TenantReservationState,
+        TenantReservationState, containment,
     },
     runtime::docker::{DockerContainerStatus, DockerRuntime, ManagedContainerEvent},
-    shared::{limits::mib_to_bytes, time::now_rfc3339},
+    shared::{backend::BackendEndpoint, limits::mib_to_bytes, time::now_rfc3339},
     state::AppState,
+    storage::quarantine::QuarantineKind,
 };
 
 const POOL_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const ISOLATED_NETWORK_MODE: &str = "none";
+const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SharedReconcileSummary {
@@ -54,56 +57,55 @@ pub(crate) async fn restore_shared_limits(
 ) -> anyhow::Result<()> {
     let runtimes = shared_runtimes(&state.placements).await?;
     let outcomes = futures::stream::iter(runtimes)
-        .map(|runtime| async move {
-            let runtime_id = runtime.runtime_id.clone();
-            let _operation = state.instance_locks.lock(&runtime_id).await;
-            let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
-                return Ok::<_, anyhow::Error>(());
-            };
-            if runtime.deployment_mode != DeploymentMode::Shared
-                || runtime.status == EngineRuntimeStatus::Deleting
-            {
-                return Ok(());
-            }
-            let result = restore_one_limit(
-                &state.config,
-                &state.docker,
-                disk_limiter,
-                &mut runtime,
-            )
-            .await;
-            match result {
-                Ok(()) => save_runtime(&state.placements, &state.manager, runtime).await,
-                Err(error) => {
-                    let containment = crate::placement::containment::contain_locked(
-                        state,
-                        &runtime,
-                        "aggregate shared-pool limit recovery failed", Some(crate::storage::quarantine::QuarantineKind::StorageBoundary))
-                    .await;
-                    tracing::error!(
-                        event = "audit shared_runtime_limit_recovery_failed",
-                        runtime_id,
-                        %error,
-                        containment = %containment.summary(),
-                        contained = containment.contained(),
-                        "quarantined one shared pool and all of its tenants after aggregate limit recovery failed"
-                    );
-                    if !containment.contained() {
-                        anyhow::bail!(
-                            "shared pool {runtime_id} could not be contained after limit recovery failed: {}",
-                            containment.summary()
-                        );
-                    }
-                    Ok(())
-                }
-            }
-        })
+        .map(|runtime| restore_runtime_limits(state, disk_limiter, runtime.runtime_id))
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
     for outcome in outcomes {
         outcome?;
     }
+    Ok(())
+}
+
+async fn restore_runtime_limits(
+    state: &AppState,
+    disk_limiter: &DiskLimiter,
+    runtime_id: String,
+) -> anyhow::Result<()> {
+    let _operation = state.instance_locks.lock(&runtime_id).await;
+    let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
+        return Ok(());
+    };
+    if runtime.deployment_mode != DeploymentMode::Shared
+        || runtime.status == EngineRuntimeStatus::Deleting
+    {
+        return Ok(());
+    }
+    let restored =
+        restore_one_limit(&state.config, &state.docker, disk_limiter, &mut runtime).await;
+    let Err(error) = restored else {
+        return save_runtime(&state.placements, &state.manager, runtime).await;
+    };
+    let containment = containment::contain_locked(
+        state,
+        &runtime,
+        "aggregate shared-pool limit recovery failed",
+        Some(QuarantineKind::StorageBoundary),
+    )
+    .await;
+    tracing::error!(
+        event = "audit shared_runtime_limit_recovery_failed",
+        runtime_id,
+        %error,
+        containment = %containment.summary(),
+        contained = containment.contained(),
+        "quarantined one shared pool and all of its tenants after aggregate limit recovery failed"
+    );
+    anyhow::ensure!(
+        containment.contained(),
+        "shared pool {runtime_id} could not be contained after limit recovery failed: {}",
+        containment.summary()
+    );
     Ok(())
 }
 
@@ -119,51 +121,54 @@ pub(crate) async fn recover_pool_deletions(state: &AppState) -> usize {
         }
     };
     let outcomes = futures::stream::iter(runtimes)
-        .map(|snapshot| async move {
-            // Unowned pools are quarantined for operator handling, not
-            // guessed empty or automatically adopted/deleted during upgrade.
-            if snapshot.owner.is_none() || snapshot.status != EngineRuntimeStatus::Deleting {
-                return false;
-            }
-            let runtime_id = snapshot.runtime_id.clone();
-            let _operation = state.instance_locks.lock(&runtime_id).await;
-            match state.placements.tenant_count(&runtime_id).await {
-                Ok(0) => {}
-                Ok(_) => return false,
-                Err(error) => {
-                    tracing::error!(
-                        event = "audit empty_shared_runtime_recovery_failed",
-                        runtime_id,
-                        %error,
-                        "could not verify whether a shared pool is empty"
-                    );
-                    return false;
-                }
-            }
-            match crate::api::instances::delete_empty_pool(state, &runtime_id).await {
-                Ok(deleted) => deleted,
-                Err(error) => {
-                    let containment = crate::placement::containment::contain_locked(
-                        state,
-                        &snapshot,
-                        "interrupted empty shared-pool cleanup failed", Some(crate::storage::quarantine::QuarantineKind::ProvisioningIncomplete))
-                    .await;
-                    tracing::error!(
-                        event = "audit empty_shared_runtime_recovery_failed",
-                        runtime_id,
-                        %error,
-                        containment = %containment.summary(),
-                        contained = containment.contained(),
-                        "retained and quarantined an empty shared pool whose cleanup could not finish"
-                    );
-                    false
-                }
-            }
-        })
+        .map(|snapshot| recover_pool_deletion(state, snapshot))
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
     outcomes.into_iter().filter(|deleted| *deleted).count()
+}
+
+async fn recover_pool_deletion(state: &AppState, snapshot: EngineRuntime) -> bool {
+    // Unowned pools are quarantined for operator handling, not
+    // guessed empty or automatically adopted/deleted during upgrade.
+    if snapshot.owner.is_none() || snapshot.status != EngineRuntimeStatus::Deleting {
+        return false;
+    }
+    let runtime_id = snapshot.runtime_id.clone();
+    let _operation = state.instance_locks.lock(&runtime_id).await;
+    match state.placements.tenant_count(&runtime_id).await {
+        Ok(0) => {}
+        Ok(_) => return false,
+        Err(error) => {
+            tracing::error!(
+                event = "audit empty_shared_runtime_recovery_failed",
+                runtime_id,
+                %error,
+                "could not verify whether a shared pool is empty"
+            );
+            return false;
+        }
+    }
+    let error = match crate::api::instances::delete_empty_pool(state, &runtime_id).await {
+        Ok(deleted) => return deleted,
+        Err(error) => error,
+    };
+    let containment = containment::contain_locked(
+        state,
+        &snapshot,
+        "interrupted empty shared-pool cleanup failed",
+        Some(QuarantineKind::ProvisioningIncomplete),
+    )
+    .await;
+    tracing::error!(
+        event = "audit empty_shared_runtime_recovery_failed",
+        runtime_id,
+        %error,
+        containment = %containment.summary(),
+        contained = containment.contained(),
+        "retained and quarantined an empty shared pool whose cleanup could not finish"
+    );
+    false
 }
 
 async fn restore_one_limit(
@@ -254,6 +259,11 @@ fn needs_pool_adoption(current: DiskLimitMode, persisted_method: &str) -> bool {
             != Some(DiskLimitMode::ProjectQuota)
 }
 
+fn pool_is_isolated(runtime: &EngineRuntime, network_mode: Option<&str>) -> bool {
+    network_mode == Some(ISOLATED_NETWORK_MODE)
+        && matches!(&runtime.backend, BackendEndpoint::UnixSocket { .. })
+}
+
 pub(crate) async fn reconcile_shared_runtimes(
     state: &AppState,
 ) -> anyhow::Result<SharedReconcileSummary> {
@@ -296,20 +306,19 @@ pub(crate) async fn reconcile_one_runtime(
         return Ok(runtime);
     }
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::placement::containment::contain_locked(
+        let containment = containment::contain_locked(
             state,
             &runtime,
             "reconciled a durably quarantined shared pool",
             None,
         )
         .await;
-        if !containment.contained() {
-            anyhow::bail!(
-                "durably quarantined shared pool {} could not be physically contained: {}",
-                runtime.runtime_id,
-                containment.summary()
-            );
-        }
+        anyhow::ensure!(
+            containment.contained(),
+            "durably quarantined shared pool {} could not be physically contained: {}",
+            runtime.runtime_id,
+            containment.summary()
+        );
         return Ok(runtime);
     }
     if honor_stop(state, &mut runtime).await? {
@@ -320,46 +329,39 @@ pub(crate) async fn reconcile_one_runtime(
         .inspect_instance(runtime.protocol, &runtime.runtime_id)
         .await
     {
+        Ok(inspection) if pool_is_isolated(&runtime, inspection.network_mode.as_deref()) => {
+            runtime.status = classify_runtime_status(inspection.status);
+            runtime.runtime.network_mode = ISOLATED_NETWORK_MODE.to_string();
+        }
         Ok(inspection) => {
-            if inspection.network_mode.as_deref() != Some("none")
-                || !matches!(
-                    &runtime.backend,
-                    crate::shared::backend::BackendEndpoint::UnixSocket { .. }
-                )
-            {
-                let containment = crate::placement::containment::contain_locked(
-                    state,
-                    &runtime,
-                    "physical shared-pool isolation no longer matched durable placement",
-                    Some(crate::storage::quarantine::QuarantineKind::IsolationMismatch),
-                )
-                .await;
-                tracing::error!(
-                    event = "audit shared_runtime_isolation_mismatch",
-                    runtime_id = %runtime.runtime_id,
-                    protocol = %runtime.protocol,
-                    network_mode = ?inspection.network_mode,
-                    containment = %containment.summary(),
-                    contained = containment.contained(),
-                    "quarantined one shared pool and all tenants because its physical isolation no longer matches durable placement"
-                );
-                if !containment.contained() {
-                    anyhow::bail!(
-                        "shared pool {} had invalid isolation and could not be contained: {}",
-                        runtime.runtime_id,
-                        containment.summary()
-                    );
-                }
-                let quarantined = state
-                    .placements
-                    .get(&runtime.runtime_id)
-                    .await?
-                    .context("contained shared pool disappeared from durable placement")?;
-                return Ok(quarantined);
-            } else {
-                runtime.status = classify_runtime_status(inspection.status);
-                runtime.runtime.network_mode = "none".to_string();
-            }
+            let containment = containment::contain_locked(
+                state,
+                &runtime,
+                "physical shared-pool isolation no longer matched durable placement",
+                Some(QuarantineKind::IsolationMismatch),
+            )
+            .await;
+            tracing::error!(
+                event = "audit shared_runtime_isolation_mismatch",
+                runtime_id = %runtime.runtime_id,
+                protocol = %runtime.protocol,
+                network_mode = ?inspection.network_mode,
+                containment = %containment.summary(),
+                contained = containment.contained(),
+                "quarantined one shared pool and all tenants because its physical isolation no longer matches durable placement"
+            );
+            anyhow::ensure!(
+                containment.contained(),
+                "shared pool {} had invalid isolation and could not be contained: {}",
+                runtime.runtime_id,
+                containment.summary()
+            );
+            let quarantined = state
+                .placements
+                .get(&runtime.runtime_id)
+                .await?
+                .context("contained shared pool disappeared from durable placement")?;
+            return Ok(quarantined);
         }
         Err(error) if error.is_not_found() => runtime.status = EngineRuntimeStatus::Failed,
         Err(error) => {
@@ -382,32 +384,31 @@ pub(crate) async fn honor_stop(
     runtime: &mut EngineRuntime,
 ) -> anyhow::Result<bool> {
     if runtime.pending_image.is_some() {
-        let report = crate::placement::containment::contain_locked(
+        let report = containment::contain_locked(
             state,
             runtime,
             "interrupted pool image update",
-            Some(crate::storage::quarantine::QuarantineKind::ImageChangeIncomplete),
+            Some(QuarantineKind::ImageChangeIncomplete),
         )
         .await;
-        if !report.contained() {
-            anyhow::bail!(
-                "pool image recovery containment failed: {}",
-                report.summary()
-            );
-        }
+        anyhow::ensure!(
+            report.contained(),
+            "pool image recovery containment failed: {}",
+            report.summary()
+        );
         runtime.status = EngineRuntimeStatus::Quarantined;
         return Ok(true);
     }
-    if runtime.desired_state != DesiredInstanceState::Stopped
-        || matches!(
-            runtime.status,
-            EngineRuntimeStatus::Quarantined | EngineRuntimeStatus::Deleting
-        )
-    {
+    let stop_requested = runtime.desired_state == DesiredInstanceState::Stopped;
+    let already_contained = matches!(
+        runtime.status,
+        EngineRuntimeStatus::Quarantined | EngineRuntimeStatus::Deleting
+    );
+    if !stop_requested || already_contained {
         return Ok(false);
     }
     fence_runtime(state, &runtime.runtime_id).await;
-    if let Err(error) = crate::placement::containment::stop_pool(state, runtime).await {
+    if let Err(error) = containment::stop_pool(state, runtime).await {
         failure::handle(
             state,
             runtime,
@@ -431,39 +432,7 @@ pub(crate) async fn honor_stop(
 pub(crate) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()> {
     let runtimes = shared_runtimes(&state.placements).await?;
     let outcomes = futures::stream::iter(runtimes)
-        .map(|snapshot| async move {
-            if shared_boot_action(snapshot.status, snapshot.desired_state).is_none() {
-                return Ok::<_, anyhow::Error>(None);
-            }
-            let runtime_id = snapshot.runtime_id.clone();
-            let _operation = state.instance_locks.lock(&runtime_id).await;
-            let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
-                return Ok(None);
-            };
-            if honor_stop(state, &mut runtime).await? {
-                return Ok(None);
-            }
-            let Some(action) = shared_boot_action(runtime.status, runtime.desired_state) else {
-                return Ok(None);
-            };
-            if let Err(error) = state.docker.check_autostart(&runtime_id).await {
-                tracing::warn!(event = "audit container_autostart_blocked", runtime_id, %error);
-                failure::handle(
-                    state,
-                    &mut runtime,
-                    failure::Phase::EngineStart,
-                    &error.into(),
-                )
-                .await?;
-                return Ok(Some(runtime.status));
-            }
-            let restart = matches!(action, SharedBootAction::Restart);
-            if let Err(error) = activate_locked(state, &mut runtime, restart).await {
-                tracing::error!(runtime_id, %error, "shared pool boot activation failed");
-                return Ok(Some(EngineRuntimeStatus::Failed));
-            }
-            Ok(Some(EngineRuntimeStatus::Running))
-        })
+        .map(|snapshot| start_shared_runtime(state, snapshot))
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
@@ -490,6 +459,43 @@ pub(crate) async fn start_shared_runtimes(state: &AppState) -> anyhow::Result<()
         "shared pool boot activation complete"
     );
     Ok(())
+}
+
+async fn start_shared_runtime(
+    state: &AppState,
+    snapshot: EngineRuntime,
+) -> anyhow::Result<Option<EngineRuntimeStatus>> {
+    if shared_boot_action(snapshot.status, snapshot.desired_state).is_none() {
+        return Ok(None);
+    }
+    let runtime_id = snapshot.runtime_id.clone();
+    let _operation = state.instance_locks.lock(&runtime_id).await;
+    let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
+        return Ok(None);
+    };
+    if honor_stop(state, &mut runtime).await? {
+        return Ok(None);
+    }
+    let Some(action) = shared_boot_action(runtime.status, runtime.desired_state) else {
+        return Ok(None);
+    };
+    if let Err(error) = state.docker.check_autostart(&runtime_id).await {
+        tracing::warn!(event = "audit container_autostart_blocked", runtime_id, %error);
+        failure::handle(
+            state,
+            &mut runtime,
+            failure::Phase::EngineStart,
+            &error.into(),
+        )
+        .await?;
+        return Ok(Some(runtime.status));
+    }
+    let restart = matches!(action, SharedBootAction::Restart);
+    if let Err(error) = activate_locked(state, &mut runtime, restart).await {
+        tracing::error!(runtime_id, %error, "shared pool boot activation failed");
+        return Ok(Some(EngineRuntimeStatus::Failed));
+    }
+    Ok(Some(EngineRuntimeStatus::Running))
 }
 
 pub(crate) async fn sync_shared_cpu_burst(
@@ -591,7 +597,7 @@ pub(crate) async fn reconcile_shared_event(
         fence_runtime(state, &runtime_id).await;
     }
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::placement::containment::contain_locked(
+        let containment = containment::contain_locked(
             state,
             &runtime,
             "a container event targeted a durably quarantined shared pool",
@@ -599,12 +605,11 @@ pub(crate) async fn reconcile_shared_event(
         )
         .await;
         clear_runtime_caches(state, &runtime_id).await;
-        if !containment.contained() {
-            anyhow::bail!(
-                "quarantined shared pool {runtime_id} could not be contained after a container event: {}",
-                containment.summary()
-            );
-        }
+        anyhow::ensure!(
+            containment.contained(),
+            "quarantined shared pool {runtime_id} could not be contained after a container event: {}",
+            containment.summary()
+        );
         return Ok(());
     }
 
@@ -613,23 +618,11 @@ pub(crate) async fn reconcile_shared_event(
     }
     let previous = runtime.status;
     let activation = event.action.activates_container();
-    let mut activation_error = None;
-    if activation {
-        fence_runtime(state, &runtime_id).await;
-        state
-            .docker
-            .enforce_cpu_burst_policy(runtime.protocol, &runtime_id)
-            .await;
-        if let Err(error) = state
-            .docker
-            .wait_until_ready(runtime.protocol, &runtime_id, POOL_READY_TIMEOUT)
-            .await
-        {
-            activation_error = Some((failure::Phase::Readiness, anyhow::Error::from(error)));
-        } else if let Err(error) = attest_runtime_locked(state, &mut runtime).await {
-            activation_error = Some((failure::Phase::PoolSecurity, anyhow::Error::msg(error)));
-        }
-    }
+    let mut activation_error = if activation {
+        verify_event_activation(state, &mut runtime, &runtime_id).await
+    } else {
+        None
+    };
     let inspection = state
         .docker
         .inspect_instance(runtime.protocol, &runtime_id)
@@ -639,13 +632,7 @@ pub(crate) async fn reconcile_shared_event(
             .as_ref()
             .is_ok_and(|inspection| inspection.oom_killed);
     runtime.status = match inspection {
-        Ok(inspection)
-            if inspection.network_mode.as_deref() == Some("none")
-                && matches!(
-                    &runtime.backend,
-                    crate::shared::backend::BackendEndpoint::UnixSocket { .. }
-                ) =>
-        {
+        Ok(inspection) if pool_is_isolated(&runtime, inspection.network_mode.as_deref()) => {
             classify_runtime_status(inspection.status)
         }
         Ok(inspection) => {
@@ -667,20 +654,19 @@ pub(crate) async fn reconcile_shared_event(
         }
     };
     if runtime.status == EngineRuntimeStatus::Quarantined {
-        let containment = crate::placement::containment::contain_locked(
+        let containment = containment::contain_locked(
             state,
             &runtime,
             "a container event exposed invalid physical shared-pool isolation",
-            Some(crate::storage::quarantine::QuarantineKind::IsolationMismatch),
+            Some(QuarantineKind::IsolationMismatch),
         )
         .await;
         clear_runtime_caches(state, &runtime_id).await;
-        if !containment.contained() {
-            anyhow::bail!(
-                "shared pool {runtime_id} had invalid isolation and could not be contained: {}",
-                containment.summary()
-            );
-        }
+        anyhow::ensure!(
+            containment.contained(),
+            "shared pool {runtime_id} had invalid isolation and could not be contained: {}",
+            containment.summary()
+        );
         return Ok(());
     }
     let unexpected_failure = event.action.indicates_unexpected_failure()
@@ -721,6 +707,29 @@ pub(crate) async fn reconcile_shared_event(
     Ok(())
 }
 
+async fn verify_event_activation(
+    state: &AppState,
+    runtime: &mut EngineRuntime,
+    runtime_id: &str,
+) -> Option<(failure::Phase, anyhow::Error)> {
+    fence_runtime(state, runtime_id).await;
+    state
+        .docker
+        .enforce_cpu_burst_policy(runtime.protocol, runtime_id)
+        .await;
+    if let Err(error) = state
+        .docker
+        .wait_until_ready(runtime.protocol, runtime_id, POOL_READY_TIMEOUT)
+        .await
+    {
+        return Some((failure::Phase::Readiness, anyhow::Error::from(error)));
+    }
+    if let Err(error) = attest_runtime_locked(state, runtime).await {
+        return Some((failure::Phase::PoolSecurity, anyhow::Error::msg(error)));
+    }
+    None
+}
+
 pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
     let runtimes = match shared_runtimes(&state.placements).await {
         Ok(runtimes) => runtimes,
@@ -730,130 +739,7 @@ pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
         }
     };
     let outcomes = futures::stream::iter(runtimes)
-        .map(|snapshot| async move {
-            let runtime_id = snapshot.runtime_id.clone();
-            let _operation = state.instance_locks.lock(&runtime_id).await;
-            let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
-                return Ok::<_, anyhow::Error>(());
-            };
-            if honor_stop(state, &mut runtime).await? { return Ok(()); }
-            let previous = runtime.status;
-            if runtime.status == EngineRuntimeStatus::Deleting {
-                return Ok(());
-            }
-            if runtime.status == EngineRuntimeStatus::Quarantined {
-                let containment = crate::placement::containment::contain_locked(
-                    state,
-                    &runtime,
-                    "snapshot reconciliation found a durably quarantined shared pool", None)
-                .await;
-                clear_runtime_caches(state, &runtime_id).await;
-                if !containment.contained() {
-                    anyhow::bail!(
-                        "quarantined shared pool {runtime_id} could not be contained during snapshot reconciliation: {}",
-                        containment.summary()
-                    );
-                }
-                return Ok(());
-            }
-            let mut replay_running = false;
-            match state
-                .docker
-                .inspect_instance(runtime.protocol, &runtime_id)
-                .await
-            {
-                Ok(inspection)
-                    if inspection.status == DockerContainerStatus::Running
-                        && inspection.network_mode.as_deref() == Some("none")
-                        && matches!(
-                            &runtime.backend,
-                            crate::shared::backend::BackendEndpoint::UnixSocket { .. }
-                        ) =>
-                {
-                    // A snapshot is taken only after the container-event
-                    // stream disconnects. Events may have been lost while it
-                    // was down, and a Docker restart keeps the same container
-                    // ID. Fence every live pool before probing, then replay
-                    // tenant quotas and credentials before routes reopen.
-                    fence_runtime(state, &runtime_id).await;
-                    replay_running = true;
-                    if let Err(error) = state
-                        .docker
-                        .wait_until_ready(runtime.protocol, &runtime_id, POOL_READY_TIMEOUT)
-                        .await
-                    {
-                        failure::handle(state, &mut runtime, failure::Phase::Readiness, &error.into()).await?;
-                        clear_runtime_caches(state, &runtime_id).await;
-                        return Ok(());
-                    } else if let Err(error) = attest_runtime_locked(state, &mut runtime).await {
-                        failure::handle(state, &mut runtime, failure::Phase::PoolSecurity, &anyhow::Error::msg(error)).await?;
-                        clear_runtime_caches(state, &runtime_id).await;
-                        return Ok(());
-                    } else {
-                        runtime.status = EngineRuntimeStatus::Running;
-                    }
-                }
-                Ok(inspection) => {
-                    if inspection.network_mode.as_deref() != Some("none")
-                        || !matches!(
-                            &runtime.backend,
-                            crate::shared::backend::BackendEndpoint::UnixSocket { .. }
-                        )
-                    {
-                        let containment = crate::placement::containment::contain_locked(
-                            state,
-                            &runtime,
-                            "snapshot reconciliation found invalid physical shared-pool isolation", Some(crate::storage::quarantine::QuarantineKind::IsolationMismatch))
-                        .await;
-                        tracing::error!(
-                            event = "audit shared_runtime_snapshot_isolation_mismatch",
-                            runtime_id,
-                            protocol = %runtime.protocol,
-                            network_mode = ?inspection.network_mode,
-                            containment = %containment.summary(),
-                            contained = containment.contained(),
-                            "quarantined a shared pool discovered with invalid physical isolation"
-                        );
-                        clear_runtime_caches(state, &runtime_id).await;
-                        if !containment.contained() {
-                            anyhow::bail!(
-                                "shared pool {runtime_id} had invalid isolation and could not be contained during snapshot reconciliation: {}",
-                                containment.summary()
-                            );
-                        }
-                        return Ok(());
-                    } else {
-                        runtime.status = classify_runtime_status(inspection.status);
-                        if runtime.status != EngineRuntimeStatus::Running {
-                            fence_runtime(state, &runtime_id).await;
-                            if matches!(previous, EngineRuntimeStatus::Running | EngineRuntimeStatus::Booting) {
-                                let error = failure::engine_exit(inspection.oom_killed, runtime.limits.memory_mib);
-                                failure::handle(state, &mut runtime, failure::Phase::Readiness, &error).await?;
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    failure::handle(state, &mut runtime, failure::Phase::Isolation, &error.into()).await?;
-                    return Ok(());
-                }
-            }
-            runtime.updated_at = now_rfc3339();
-            save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
-            if replay_running && runtime.status == EngineRuntimeStatus::Running {
-                crate::placement::tenant::recovery::reconcile_runtime_tenants_locked(state, &runtime)
-                    .await?;
-            }
-            clear_runtime_caches(state, &runtime_id).await;
-            tracing::debug!(
-                runtime_id,
-                previous_status = previous.as_str(),
-                current_status = runtime.status.as_str(),
-                "shared pool runtime snapshot reconciled"
-            );
-            Ok(())
-        })
+        .map(|snapshot| reconcile_snapshot_runtime(state, snapshot.runtime_id))
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
@@ -862,6 +748,141 @@ pub(crate) async fn reconcile_shared_snapshot(state: &AppState) {
             tracing::error!(%error, "failed to reconcile shared-pool event snapshot");
         }
     }
+}
+
+async fn reconcile_snapshot_runtime(state: &AppState, runtime_id: String) -> anyhow::Result<()> {
+    let _operation = state.instance_locks.lock(&runtime_id).await;
+    let Some(mut runtime) = state.placements.get(&runtime_id).await? else {
+        return Ok(());
+    };
+    if honor_stop(state, &mut runtime).await? {
+        return Ok(());
+    }
+    let previous = runtime.status;
+    if runtime.status == EngineRuntimeStatus::Deleting {
+        return Ok(());
+    }
+    if runtime.status == EngineRuntimeStatus::Quarantined {
+        let containment = containment::contain_locked(
+            state,
+            &runtime,
+            "snapshot reconciliation found a durably quarantined shared pool",
+            None,
+        )
+        .await;
+        clear_runtime_caches(state, &runtime_id).await;
+        anyhow::ensure!(
+            containment.contained(),
+            "quarantined shared pool {runtime_id} could not be contained during snapshot reconciliation: {}",
+            containment.summary()
+        );
+        return Ok(());
+    }
+    let inspection = match state
+        .docker
+        .inspect_instance(runtime.protocol, &runtime_id)
+        .await
+    {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            failure::handle(
+                state,
+                &mut runtime,
+                failure::Phase::Isolation,
+                &error.into(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if !pool_is_isolated(&runtime, inspection.network_mode.as_deref()) {
+        let containment = containment::contain_locked(
+            state,
+            &runtime,
+            "snapshot reconciliation found invalid physical shared-pool isolation",
+            Some(QuarantineKind::IsolationMismatch),
+        )
+        .await;
+        tracing::error!(
+            event = "audit shared_runtime_snapshot_isolation_mismatch",
+            runtime_id,
+            protocol = %runtime.protocol,
+            network_mode = ?inspection.network_mode,
+            containment = %containment.summary(),
+            contained = containment.contained(),
+            "quarantined a shared pool discovered with invalid physical isolation"
+        );
+        clear_runtime_caches(state, &runtime_id).await;
+        anyhow::ensure!(
+            containment.contained(),
+            "shared pool {runtime_id} had invalid isolation and could not be contained during snapshot reconciliation: {}",
+            containment.summary()
+        );
+        return Ok(());
+    }
+    let replay_running = inspection.status == DockerContainerStatus::Running;
+    if replay_running {
+        // A snapshot is taken only after the container-event
+        // stream disconnects. Events may have been lost while it
+        // was down, and a Docker restart keeps the same container
+        // ID. Fence every live pool before probing, then replay
+        // tenant quotas and credentials before routes reopen.
+        fence_runtime(state, &runtime_id).await;
+        if let Err(error) = state
+            .docker
+            .wait_until_ready(runtime.protocol, &runtime_id, POOL_READY_TIMEOUT)
+            .await
+        {
+            failure::handle(
+                state,
+                &mut runtime,
+                failure::Phase::Readiness,
+                &error.into(),
+            )
+            .await?;
+            clear_runtime_caches(state, &runtime_id).await;
+            return Ok(());
+        }
+        if let Err(error) = attest_runtime_locked(state, &mut runtime).await {
+            failure::handle(
+                state,
+                &mut runtime,
+                failure::Phase::PoolSecurity,
+                &anyhow::Error::msg(error),
+            )
+            .await?;
+            clear_runtime_caches(state, &runtime_id).await;
+            return Ok(());
+        }
+        runtime.status = EngineRuntimeStatus::Running;
+    } else {
+        runtime.status = classify_runtime_status(inspection.status);
+        if runtime.status != EngineRuntimeStatus::Running {
+            fence_runtime(state, &runtime_id).await;
+            if matches!(
+                previous,
+                EngineRuntimeStatus::Running | EngineRuntimeStatus::Booting
+            ) {
+                let error = failure::engine_exit(inspection.oom_killed, runtime.limits.memory_mib);
+                failure::handle(state, &mut runtime, failure::Phase::Readiness, &error).await?;
+                return Ok(());
+            }
+        }
+    }
+    runtime.updated_at = now_rfc3339();
+    save_runtime(&state.placements, &state.manager, runtime.clone()).await?;
+    if replay_running && runtime.status == EngineRuntimeStatus::Running {
+        crate::placement::tenant::recovery::reconcile_runtime_tenants_locked(state, &runtime)
+            .await?;
+    }
+    clear_runtime_caches(state, &runtime_id).await;
+    tracing::debug!(
+        runtime_id,
+        previous_status = previous.as_str(),
+        current_status = runtime.status.as_str(),
+        "shared pool runtime snapshot reconciled"
+    );
+    Ok(())
 }
 
 pub(crate) async fn check_shared_start_disk(
@@ -878,23 +899,24 @@ pub(crate) async fn check_shared_start_disk(
         .docker
         .verify_data_bind(runtime.protocol, &runtime.runtime_id, &expected)
         .await?;
-    if crate::disk::soft::SoftDiskLimiter::enforcement_required(
+    if !crate::disk::soft::SoftDiskLimiter::enforcement_required(
         state.config.disk.mode,
         runtime.protocol,
     ) {
-        crate::disk::soft::SoftDiskLimiter::new(state.config.disk.soft_scanner.clone())
-            .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
-                instance_id: runtime.runtime_id.clone(),
-                created_at: runtime.created_at.clone(),
-                protocol: runtime.protocol,
-                data_path: paths.data,
-                limit_bytes: mib_to_bytes(runtime.limits.disk_mib),
-                durable_blocked: false,
-            })
-            .await
-            .map_err(anyhow::Error::msg)
-            .context(failure::CapacityUnavailable)?;
+        return Ok(());
     }
+    crate::disk::soft::SoftDiskLimiter::new(state.config.disk.soft_scanner.clone())
+        .ensure_start_allowed(&SoftDiskTarget {
+            instance_id: runtime.runtime_id.clone(),
+            created_at: runtime.created_at.clone(),
+            protocol: runtime.protocol,
+            data_path: paths.data,
+            limit_bytes: mib_to_bytes(runtime.limits.disk_mib),
+            durable_blocked: false,
+        })
+        .await
+        .map_err(anyhow::Error::msg)
+        .context(failure::CapacityUnavailable)?;
     Ok(())
 }
 
@@ -902,9 +924,9 @@ pub(crate) async fn isolate_runtime(
     state: &AppState,
     runtime: EngineRuntime,
     reason: &str,
-    kind: crate::storage::quarantine::QuarantineKind,
+    kind: QuarantineKind,
 ) -> bool {
-    crate::placement::containment::contain_locked(state, &runtime, reason, Some(kind))
+    containment::contain_locked(state, &runtime, reason, Some(kind))
         .await
         .contained()
 }
@@ -1151,7 +1173,7 @@ fn container_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim().strip_prefix("sha256:").unwrap_or(left.trim());
     let right = right.trim().strip_prefix("sha256:").unwrap_or(right.trim());
     left == right
-        || (left.len().min(right.len()) >= 12
+        || (left.len().min(right.len()) >= MIN_CONTAINER_ID_PREFIX_LEN
             && (left.starts_with(right) || right.starts_with(left)))
 }
 

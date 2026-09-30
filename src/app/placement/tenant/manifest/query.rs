@@ -13,6 +13,9 @@ use crate::{
 
 const EXEC_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\n";
 const ENGINE_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+const MIN_ENGINE_TIMEOUT: Duration = Duration::from_secs(1);
+const TRUNCATED_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+const MAX_IDENTIFIER_BYTES: usize = 1024;
 
 pub(super) struct ManifestContext<'a> {
     pub docker: &'a DockerRuntime,
@@ -37,7 +40,7 @@ impl ManifestContext<'_> {
         let remaining = self.remaining()?;
         Ok(remaining
             .saturating_sub(ENGINE_TIMEOUT_GRACE)
-            .max(Duration::from_secs(1)))
+            .max(MIN_ENGINE_TIMEOUT))
     }
 
     pub(super) async fn query(&self, statement: &str) -> Result<String, ManifestError> {
@@ -113,7 +116,7 @@ impl ManifestContext<'_> {
         };
         let output = map_exec(result)?;
         if output.stdout.starts_with(EXEC_TRUNCATION_MARKER) {
-            return Err(ManifestError::SchemaLimit(1024 * 1024));
+            return Err(ManifestError::SchemaLimit(TRUNCATED_OUTPUT_LIMIT_BYTES));
         }
         Ok(output.stdout)
     }
@@ -167,8 +170,9 @@ fn parse_scan_bytes(output: &str) -> Result<u64, ManifestError> {
     let line = lines.next().ok_or(ManifestError::InvalidCatalog(
         "missing tenant storage byte count",
     ))?;
-    if lines.next().is_some() || line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    let is_single_row = lines.next().is_none();
+    let is_all_digits = !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit());
+    if !is_single_row || !is_all_digits {
         return Err(ManifestError::InvalidCatalog(
             "invalid tenant storage byte count",
         ));
@@ -189,7 +193,7 @@ pub(super) fn decode_utf8(value: &str) -> Result<String, ManifestError> {
 }
 
 pub(super) fn validate_identifier(value: &str) -> Result<(), ManifestError> {
-    if value.is_empty() || value.len() > 1024 || value.contains('\0') {
+    if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.contains('\0') {
         return Err(ManifestError::InvalidCatalog("invalid catalog identifier"));
     }
     Ok(())

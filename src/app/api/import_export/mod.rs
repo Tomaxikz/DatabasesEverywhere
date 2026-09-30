@@ -243,15 +243,10 @@ enum ReplayDescriptor {
 
 impl ExportArchiveFormat {
     fn detect(format: Option<&str>) -> Result<Self, ApiError> {
-        if format.is_none() {
+        let Some(format) = format else {
             return Ok(Self::Plain);
-        }
-        match format
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        };
+        match format.trim().to_ascii_lowercase().as_str() {
             "plain" => Ok(Self::Plain),
             "gzip" => Ok(Self::Gzip),
             "bzip2" => Ok(Self::Bzip2),

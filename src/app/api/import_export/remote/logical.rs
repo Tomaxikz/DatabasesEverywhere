@@ -27,15 +27,18 @@ pub(super) async fn run_helper(
     work_dir: &Path,
     output_names: &[String],
 ) -> Result<(), ApiError> {
-    let connect_timeout_seconds = state.config.security.remote_import.connect_timeout_seconds;
+    let remote_import = &state.config.security.remote_import;
+    let connect_timeout_seconds = remote_import.connect_timeout_seconds;
     let image = state
         .config
         .images
         .configured_for_protocol(protocol)
         .to_string();
-    if let Err(error) = state.docker.prepare_import_image(&image).await {
-        return Err(remote_helper_error(protocol, &error));
-    }
+    state
+        .docker
+        .prepare_import_image(&image)
+        .await
+        .map_err(|error| remote_helper_error(protocol, &error))?;
 
     let script = match protocol {
         Protocol::Postgres => {
@@ -85,23 +88,19 @@ pub(super) async fn run_helper(
         work_dir: work_dir.to_path_buf(),
         script,
         extra_hosts: source.endpoint.helper_extra_hosts(),
-        timeout: Duration::from_secs(
-            state
-                .config
-                .security
-                .remote_import
-                .operation_timeout_seconds,
-        ),
-        max_output_bytes: state.config.security.remote_import.max_staged_bytes,
+        timeout: Duration::from_secs(remote_import.operation_timeout_seconds),
+        max_output_bytes: remote_import.max_staged_bytes,
         network: ImportHelperNetwork::Outbound,
         input: None,
         environment: Vec::new(),
         read_only_work_dir: false,
     };
-    match state.docker.run_import_helper(&spec).await {
-        Ok(_) => Ok(()),
-        Err(error) => Err(remote_helper_error(protocol, &error)),
-    }
+    state
+        .docker
+        .run_import_helper(&spec)
+        .await
+        .map(|_| ())
+        .map_err(|error| remote_helper_error(protocol, &error))
 }
 
 pub(super) fn output_names(
@@ -612,22 +611,22 @@ fn mysql_definer_filter_script(input: &str, output: &str) -> String {
     )
 }
 
+fn is_safe_definer_username(username: &str) -> bool {
+    let mut bytes = username.bytes();
+    let starts_with_letter = bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic());
+    let rest_is_portable =
+        bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    username.len() <= MAX_DEFINER_USERNAME_BYTES && starts_with_letter && rest_is_portable
+}
+
+const MAX_DEFINER_USERNAME_BYTES: usize = 63;
+
 fn mysql_definer_filter(
     input: &str,
     output: &str,
     target_username: &str,
 ) -> Result<String, ApiError> {
-    if target_username.is_empty()
-        || target_username.len() > 63
-        || !target_username
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic())
-        || !target_username
-            .bytes()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
+    if !is_safe_definer_username(target_username) {
         return Err(ApiError::BadRequest(
             "target mysql username cannot be represented safely in imported object definers"
                 .to_string(),
@@ -666,24 +665,7 @@ fn postgres_schema_query(selection: &ImportExportSelection) -> String {
         let predicates = selection
             .include
             .iter()
-            .map(|item| {
-                let (schema, table) = item
-                    .rsplit_once('.')
-                    .map_or((None, item.as_str()), |(schema, table)| {
-                        (Some(schema), table)
-                    });
-                let table = postgres_string_literal(table);
-                let relation = format!(
-                    "EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relname = {table})"
-                );
-                match schema {
-                    Some(schema) => format!(
-                        "(n.nspname = {} AND {relation})",
-                        postgres_string_literal(schema)
-                    ),
-                    None => relation,
-                }
-            })
+            .map(|item| postgres_include_predicate(item))
             .collect::<Vec<_>>()
             .join(" OR ");
         format!(" AND ({predicates})")
@@ -695,6 +677,24 @@ fn postgres_schema_query(selection: &ImportExportSelection) -> String {
            AND left(n.nspname, 3) <> 'pg_'{scope} \
          ORDER BY n.nspname"
     )
+}
+
+fn postgres_include_predicate(item: &str) -> String {
+    let (schema, table) = match item.rsplit_once('.') {
+        Some((schema, table)) => (Some(schema), table),
+        None => (None, item),
+    };
+    let table = postgres_string_literal(table);
+    let relation = format!(
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace = n.oid AND c.relname = {table})"
+    );
+    match schema {
+        Some(schema) => format!(
+            "(n.nspname = {} AND {relation})",
+            postgres_string_literal(schema)
+        ),
+        None => relation,
+    }
 }
 
 fn postgres_string_literal(value: &str) -> String {
@@ -783,11 +783,14 @@ fn required_secret<'a>(
         .ok_or_else(|| ApiError::BadRequest(format!("remote import requires {field}")))
 }
 
-fn pg_service_value(value: &str) -> Result<String, ApiError> {
-    if value
+fn contains_nul_or_line_break(value: &str) -> bool {
+    value
         .bytes()
         .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-    {
+}
+
+fn pg_service_value(value: &str) -> Result<String, ApiError> {
+    if contains_nul_or_line_break(value) {
         return Err(ApiError::BadRequest(
             "postgres source fields must not contain line breaks".to_string(),
         ));
@@ -799,10 +802,7 @@ fn pg_service_value(value: &str) -> Result<String, ApiError> {
 }
 
 fn pgpass_value(value: &str) -> Result<String, ApiError> {
-    if value
-        .bytes()
-        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-    {
+    if contains_nul_or_line_break(value) {
         return Err(ApiError::BadRequest(
             "postgres pgpass fields must not contain NUL or line breaks".to_string(),
         ));
@@ -811,10 +811,7 @@ fn pgpass_value(value: &str) -> Result<String, ApiError> {
 }
 
 fn mysql_option_value(value: &str) -> Result<String, ApiError> {
-    if value
-        .bytes()
-        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-    {
+    if contains_nul_or_line_break(value) {
         return Err(ApiError::BadRequest(
             "mysql source fields must not contain line breaks".to_string(),
         ));

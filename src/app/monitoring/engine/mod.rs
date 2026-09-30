@@ -155,12 +155,7 @@ fn tenants_by_runtime(instances: &[InstanceMetadata]) -> HashMap<String, Vec<Ten
         grouped
             .entry(instance.runtime_id().to_string())
             .or_default()
-            .push(TenantIdentity {
-                instance_id: instance.instance_id.clone(),
-                created_at: instance.created_at.clone(),
-                username: instance.database.username.clone(),
-                protocol: instance.protocol,
-            });
+            .push(tenant_identity(instance));
     }
     grouped
 }
@@ -251,23 +246,8 @@ async fn sample_pool(
         return (runtime_id, pool);
     }
 
-    let before = match state
-        .docker
-        .verified_container_identity(runtime.protocol, &runtime_id)
-        .await
-    {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
-            pool.clear_generation();
-            mark_unavailable(state, &tenants).await;
-            pool.record_failure(&runtime);
-            return (runtime_id, pool);
-        }
-        Err(_) => {
-            mark_unavailable(state, &tenants).await;
-            pool.record_failure(&runtime);
-            return (runtime_id, pool);
-        }
+    let Some(before) = verified_generation(state, &runtime, &tenants, &mut pool).await else {
+        return (runtime_id, pool);
     };
     if pool.bind_generation(before.clone()) {
         mark_unavailable(state, &tenants).await;
@@ -283,23 +263,8 @@ async fn sample_pool(
         collect_pool(state, &runtime, &pool).await.map(Some)
     };
 
-    let after = match state
-        .docker
-        .verified_container_identity(runtime.protocol, &runtime_id)
-        .await
-    {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
-            pool.clear_generation();
-            mark_unavailable(state, &tenants).await;
-            pool.record_failure(&runtime);
-            return (runtime_id, pool);
-        }
-        Err(_) => {
-            mark_unavailable(state, &tenants).await;
-            pool.record_failure(&runtime);
-            return (runtime_id, pool);
-        }
+    let Some(after) = verified_generation(state, &runtime, &tenants, &mut pool).await else {
+        return (runtime_id, pool);
     };
     if after != before {
         pool.bind_generation(after);
@@ -336,6 +301,32 @@ async fn sample_pool(
     (runtime_id, pool)
 }
 
+async fn verified_generation(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    tenants: &[TenantIdentity],
+    pool: &mut PoolState,
+) -> Option<ManagedContainerIdentity> {
+    match state
+        .docker
+        .verified_container_identity(runtime.protocol, &runtime.runtime_id)
+        .await
+    {
+        Ok(Some(identity)) => Some(identity),
+        Ok(None) => {
+            pool.clear_generation();
+            mark_unavailable(state, tenants).await;
+            pool.record_failure(runtime);
+            None
+        }
+        Err(_) => {
+            mark_unavailable(state, tenants).await;
+            pool.record_failure(runtime);
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Capabilities {
     pub(crate) cpu: bool,
@@ -360,8 +351,7 @@ impl PoolState {
         Self {
             protocol,
             generation: None,
-            prepared: backends::for_protocol(protocol)
-                .is_some_and(|backend| !backend.requires_preparation()),
+            prepared: is_ready_without_preparation(protocol),
             capabilities: Capabilities::default(),
             baselines: HashMap::new(),
             clickhouse_checkpoint: None,
@@ -386,8 +376,7 @@ impl PoolState {
     }
 
     fn reset_generation_state(&mut self) {
-        self.prepared = backends::for_protocol(self.protocol)
-            .is_some_and(|backend| !backend.requires_preparation());
+        self.prepared = is_ready_without_preparation(self.protocol);
         self.capabilities = Capabilities::default();
         self.baselines.clear();
         self.clickhouse_checkpoint = None;
@@ -439,6 +428,10 @@ impl PoolState {
             self.clickhouse_checkpoint = None;
         }
     }
+}
+
+fn is_ready_without_preparation(protocol: Protocol) -> bool {
+    backends::for_protocol(protocol).is_some_and(|backend| !backend.requires_preparation())
 }
 
 fn failure_backoff(failures: u32) -> Duration {
@@ -580,21 +573,17 @@ fn observation_for(
             (cpu, memory, None, cpu_reset || memory_reset)
         }
         SampleMode::Interval => {
-            let ready = baseline.admit_interval();
+            let charged = if baseline.admit_interval() {
+                totals
+            } else {
+                EngineTotals::default()
+            };
             (
+                capabilities.cpu.then_some(charged.cpu_time_micros),
                 capabilities
-                    .cpu
-                    .then_some(if ready { totals.cpu_time_micros } else { 0 }),
-                capabilities.memory.then_some(if ready {
-                    totals.peak_query_memory_bytes
-                } else {
-                    0
-                }),
-                capabilities.operations.then_some(if ready {
-                    totals.operations
-                } else {
-                    OperationCounts::default()
-                }),
+                    .memory
+                    .then_some(charged.peak_query_memory_bytes),
+                capabilities.operations.then_some(charged.operations),
                 false,
             )
         }

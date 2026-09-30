@@ -17,6 +17,20 @@ const MAX_BSON_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BSON_NESTING_DEPTH: usize = 128;
 const MAX_METADATA_DOCUMENTS: usize = 4_096;
 const MAX_PRELUDE_BYTES: usize = 64 * 1024 * 1024;
+const MIN_BSON_DOCUMENT_BYTES: usize = 5;
+const MAX_VERSION_STRING_BYTES: usize = 256;
+const MAX_COLLECTION_NAME_BYTES: usize = 255;
+const UNSAFE_MONGO_OPTION_KEYS: [&str; 9] = [
+    "viewon",
+    "pipeline",
+    "$where",
+    "$function",
+    "$accumulator",
+    "$code",
+    "$scope",
+    "storageengine",
+    "encryptedfields",
+];
 
 #[derive(Debug)]
 pub(super) struct MongoArchiveCatalog {
@@ -67,7 +81,7 @@ fn inspect_native_archive<R: Read>(
         ));
     }
 
-    let mut prelude_bytes = 4_usize;
+    let mut prelude_bytes = ARCHIVE_MAGIC.len();
     let header = read_bson_document(reader, deadline, &mut prelude_bytes)?.ok_or(
         InspectionError::Invalid("MongoDB archive is missing its prelude header"),
     )?;
@@ -128,7 +142,7 @@ fn read_bson_document<R: Read>(
     let length = usize::try_from(declared).map_err(|_| {
         InspectionError::Invalid("MongoDB archive contains an invalid BSON document length")
     })?;
-    if !(5..=MAX_BSON_DOCUMENT_BYTES).contains(&length) {
+    if !(MIN_BSON_DOCUMENT_BYTES..=MAX_BSON_DOCUMENT_BYTES).contains(&length) {
         return Err(InspectionError::Invalid(
             "MongoDB archive contains an invalid BSON document length",
         ));
@@ -202,7 +216,7 @@ fn validate_header(bytes: &[u8]) -> Result<(), InspectionError> {
     }
     for value in [server_version, tool_version] {
         let value = value.ok_or(InspectionError::Invalid(MALFORMED))?;
-        if value.len() > 256 || value.chars().any(char::is_control) {
+        if value.len() > MAX_VERSION_STRING_BYTES || value.chars().any(char::is_control) {
             return Err(InspectionError::Invalid(MALFORMED));
         }
     }
@@ -262,7 +276,7 @@ fn shared_metadata_issue(metadata: &MongoMetadata<'_>) -> Option<MongoSharedIssu
         return Some(MongoSharedIssue::SystemCollection);
     }
     if metadata.collection.is_empty()
-        || metadata.collection.len() > 255
+        || metadata.collection.len() > MAX_COLLECTION_NAME_BYTES
         || metadata
             .collection
             .bytes()
@@ -292,19 +306,9 @@ fn contains_unsafe_mongo_option(root: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Object(fields) => {
                 for (key, value) in fields {
-                    if [
-                        "viewon",
-                        "pipeline",
-                        "$where",
-                        "$function",
-                        "$accumulator",
-                        "$code",
-                        "$scope",
-                        "storageengine",
-                        "encryptedfields",
-                    ]
-                    .into_iter()
-                    .any(|unsafe_key| key.eq_ignore_ascii_case(unsafe_key))
+                    if UNSAFE_MONGO_OPTION_KEYS
+                        .into_iter()
+                        .any(|unsafe_key| key.eq_ignore_ascii_case(unsafe_key))
                     {
                         return true;
                     }

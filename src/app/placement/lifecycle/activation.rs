@@ -33,11 +33,7 @@ pub(crate) async fn activate_locked(
             .inspect_instance(runtime.protocol, &runtime.runtime_id)
             .await?;
         anyhow::ensure!(
-            inspection.network_mode.as_deref() == Some("none")
-                && matches!(
-                    &runtime.backend,
-                    crate::shared::backend::BackendEndpoint::UnixSocket { .. }
-                ),
+            pool_is_isolated(runtime, inspection.network_mode.as_deref()),
             "pool network isolation or backend changed"
         );
         phase = Phase::SocketDirectory;
@@ -86,7 +82,7 @@ pub(crate) async fn activate_locked(
             .docker
             .inspect_instance(runtime.protocol, &runtime.runtime_id)
             .await?;
-        if inspection.network_mode.as_deref() != Some("none") {
+        if inspection.network_mode.as_deref() != Some(ISOLATED_NETWORK_MODE) {
             anyhow::bail!("pool network isolation changed");
         }
         phase = Phase::Metadata;

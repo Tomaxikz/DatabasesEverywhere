@@ -50,18 +50,7 @@ pub(super) async fn recommend_job_limit(
         configured_max_upload_worst_case: None,
         representative_exported_dump: None,
         representative_unavailable_reason: None,
-        caveats: vec![
-            "This is a conservative resource-cost model from one benchmark instance, not an empirical concurrent saturation test."
-                .to_string(),
-            "The result applies to this daemon identity, scheduler budgets, protocol, target disk allocation, and dump-size assumptions."
-                .to_string(),
-            "Dynamic mode remains safer for mixed dump sizes because a single manual ceiling cannot weight large and small jobs differently."
-                .to_string(),
-            "A recommendation of 0 means no job is safe under current live capacity; it is a blocked-headroom signal, not a valid manual configuration value."
-                .to_string(),
-            "CPU and I/O are concurrency weights, so a raw zero ratio may still recommend one isolated job when its memory estimate fits."
-                .to_string(),
-        ],
+        caveats: recommendation_caveats(),
     };
 
     if let Err(reason) = verify_benchmark_daemon(config, system) {
@@ -145,6 +134,21 @@ pub(super) async fn recommend_job_limit(
         Err(error) => report.representative_unavailable_reason = Some(error.to_string()),
     }
     report
+}
+
+fn recommendation_caveats() -> Vec<String> {
+    vec![
+        "This is a conservative resource-cost model from one benchmark instance, not an empirical concurrent saturation test."
+            .to_string(),
+        "The result applies to this daemon identity, scheduler budgets, protocol, target disk allocation, and dump-size assumptions."
+            .to_string(),
+        "Dynamic mode remains safer for mixed dump sizes because a single manual ceiling cannot weight large and small jobs differently."
+            .to_string(),
+        "A recommendation of 0 means no job is safe under current live capacity; it is a blocked-headroom signal, not a valid manual configuration value."
+            .to_string(),
+        "CPU and I/O are concurrency weights, so a raw zero ratio may still recommend one isolated job when its memory estimate fits."
+            .to_string(),
+    ]
 }
 
 fn verify_benchmark_daemon(config: &Config, system: &serde_json::Value) -> Result<(), String> {

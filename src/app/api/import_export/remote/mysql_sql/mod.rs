@@ -11,6 +11,8 @@ use crate::shared::files::sync_directory;
 const MAX_QUOTED_IDENTIFIER_BYTES: usize = 1024;
 const MAX_QUALIFIER_GAP_BYTES: usize = 64 * 1024;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const MYSQL_MAX_DATABASE_CHARS: usize = 64;
+const CLICKHOUSE_MAX_DATABASE_CHARS: usize = 128;
 
 /// Safely rebases MySQL/MariaDB schema-qualified object references in place.
 ///
@@ -31,7 +33,7 @@ pub(super) async fn rewrite_mysql_schema_qualifiers(
         source_database,
         target_database,
         max_staged_bytes,
-        64,
+        MYSQL_MAX_DATABASE_CHARS,
         operation_timeout,
     )
     .await
@@ -49,7 +51,7 @@ pub(super) async fn rewrite_clickhouse_schema(
         source_database,
         target_database,
         max_staged_bytes,
-        128,
+        CLICKHOUSE_MAX_DATABASE_CHARS,
         operation_timeout,
     )
     .await
@@ -131,7 +133,7 @@ enum MysqlSqlRewriteError {
 
 #[cfg(test)]
 fn validate_database_name(database: &str, field: &'static str) -> Result<(), MysqlSqlRewriteError> {
-    validate_database_name_with_limit(database, field, 64)
+    validate_database_name_with_limit(database, field, MYSQL_MAX_DATABASE_CHARS)
 }
 
 fn validate_database_name_with_limit(
@@ -454,15 +456,20 @@ struct SqlContext {
 }
 
 impl SqlContext {
-    fn observe_word(&mut self, word: &[u8]) {
-        if word.eq_ignore_ascii_case(b"BEGIN")
+    fn starts_routine_body(&self, word: &[u8]) -> bool {
+        let is_trigger_row =
+            word.eq_ignore_ascii_case(b"ROW") && self.create_trigger && self.trigger_on_seen;
+        word.eq_ignore_ascii_case(b"BEGIN")
             || word.eq_ignore_ascii_case(b"THEN")
             || word.eq_ignore_ascii_case(b"ELSE")
             || word.eq_ignore_ascii_case(b"DO")
             || word.eq_ignore_ascii_case(b"LOOP")
             || word.eq_ignore_ascii_case(b"REPEAT")
-            || word.eq_ignore_ascii_case(b"ROW") && self.create_trigger && self.trigger_on_seen
-        {
+            || is_trigger_row
+    }
+
+    fn observe_word(&mut self, word: &[u8]) {
+        if self.starts_routine_body(word) {
             self.statement = StatementKind::Unknown;
             self.object_expected = false;
             self.table_list = false;
@@ -631,34 +638,19 @@ fn rewrite_sql<R: Read, W: Write>(
                 Ok(replacements)
             };
         }
-        match special {
-            Some(index) if index > 0 => {
-                if executable_version_pending {
-                    let available = input.available()?;
-                    if available[..index]
-                        .iter()
-                        .any(|byte| !byte.is_ascii_whitespace())
-                    {
-                        executable_version_pending = false;
-                    }
+        if special != Some(0) {
+            let plain_length = special.unwrap_or(available_length);
+            if executable_version_pending {
+                let available = input.available()?;
+                if available[..plain_length]
+                    .iter()
+                    .any(|byte| !byte.is_ascii_whitespace())
+                {
+                    executable_version_pending = false;
                 }
-                copy_normal_prefix(input, output, context, index)?;
-                continue;
             }
-            None => {
-                if executable_version_pending {
-                    let available = input.available()?;
-                    if available[..available_length]
-                        .iter()
-                        .any(|byte| !byte.is_ascii_whitespace())
-                    {
-                        executable_version_pending = false;
-                    }
-                }
-                copy_normal_prefix(input, output, context, available_length)?;
-                continue;
-            }
-            Some(_) => {}
+            copy_normal_prefix(input, output, context, plain_length)?;
+            continue;
         }
 
         let byte = input
@@ -750,20 +742,7 @@ fn rewrite_sql<R: Read, W: Write>(
                         "nested block comment inside executable comment",
                     ));
                 }
-                let is_executable = if input.peek_byte()? == Some(b'!') {
-                    let _ = input.next_byte()?;
-                    output.write_byte(b'!')?;
-                    true
-                } else if input.peek_byte()? == Some(b'M') && input.peek_nth_byte(1)? == Some(b'!')
-                {
-                    let _ = input.next_byte()?;
-                    let _ = input.next_byte()?;
-                    output.write_bytes(b"M!")?;
-                    true
-                } else {
-                    false
-                };
-                if is_executable {
+                if copy_executable_comment_marker(input, output)? {
                     replacements += rewrite_sql(input, output, identifiers, context, true)?;
                 } else {
                     copy_block_comment(input, output)?;
@@ -786,6 +765,24 @@ fn rewrite_sql<R: Read, W: Write>(
             _ => unreachable!("normal scanner returned a non-special byte"),
         }
     }
+}
+
+fn copy_executable_comment_marker<R: Read, W: Write>(
+    input: &mut BoundedInput<R>,
+    output: &mut BoundedOutput<W>,
+) -> Result<bool, MysqlSqlRewriteError> {
+    if input.peek_byte()? == Some(b'!') {
+        let _ = input.next_byte()?;
+        output.write_byte(b'!')?;
+        return Ok(true);
+    }
+    if input.peek_byte()? == Some(b'M') && input.peek_nth_byte(1)? == Some(b'!') {
+        let _ = input.next_byte()?;
+        let _ = input.next_byte()?;
+        output.write_bytes(b"M!")?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn copy_available_prefix<R: Read, W: Write>(
@@ -1238,16 +1235,9 @@ fn copy_quoted_string<R: Read, W: Write>(
                 "unterminated quoted string",
             ));
         }
-        match special {
-            Some(index) if index > 0 => {
-                copy_available_prefix(input, output, index)?;
-                continue;
-            }
-            None => {
-                copy_available_prefix(input, output, available_length)?;
-                continue;
-            }
-            Some(_) => {}
+        if special != Some(0) {
+            copy_available_prefix(input, output, special.unwrap_or(available_length))?;
+            continue;
         }
 
         let byte = input
@@ -1358,16 +1348,9 @@ fn copy_line_comment<R: Read, W: Write>(
                 Ok(())
             };
         }
-        match special {
-            Some(index) if index > 0 => {
-                copy_available_prefix(input, output, index)?;
-                continue;
-            }
-            None => {
-                copy_available_prefix(input, output, available_length)?;
-                continue;
-            }
-            Some(_) => {}
+        if special != Some(0) {
+            copy_available_prefix(input, output, special.unwrap_or(available_length))?;
+            continue;
         }
 
         let byte = input
@@ -1403,16 +1386,9 @@ fn copy_block_comment<R: Read, W: Write>(
                 "unterminated block comment",
             ));
         }
-        match star {
-            Some(index) if index > 0 => {
-                copy_available_prefix(input, output, index)?;
-                continue;
-            }
-            None => {
-                copy_available_prefix(input, output, available_length)?;
-                continue;
-            }
-            Some(_) => {}
+        if star != Some(0) {
+            copy_available_prefix(input, output, star.unwrap_or(available_length))?;
+            continue;
         }
 
         let _ = input.next_byte()?;

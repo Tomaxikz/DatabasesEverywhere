@@ -167,13 +167,8 @@ async fn handle_qdrant_h2_client(
                     }
                 };
                 if !matches_qdrant_route(&request, &route_key_sha256, &request_verifier) {
-                    let response = http::Response::builder()
-                        .status(http::StatusCode::UNAUTHORIZED)
-                        .version(http::Version::HTTP_2)
-                        .body(())
-                        .expect("static qdrant h2 authentication response is valid");
                     respond
-                        .send_response(response, true)
+                        .send_response(qdrant_h2_unauthorized_response(), true)
                         .map_err(qdrant::QdrantProxyError::from)?;
                     continue;
                 }
@@ -191,6 +186,14 @@ async fn handle_qdrant_h2_client(
             }
         }
     }
+}
+
+fn qdrant_h2_unauthorized_response() -> http::Response<()> {
+    http::Response::builder()
+        .status(http::StatusCode::UNAUTHORIZED)
+        .version(http::Version::HTTP_2)
+        .body(())
+        .expect("static qdrant h2 authentication response is valid")
 }
 
 fn matches_qdrant_route<B>(
@@ -231,14 +234,11 @@ async fn proxy_qdrant_http1(
     mut request: http::Request<Incoming>,
     resolver: RouteResolver,
 ) -> Result<http::Response<QdrantHttpBody>, Infallible> {
-    let api_key = match qdrant::api_key_from_request(&request) {
-        Ok(api_key) => api_key,
-        Err(_) => {
-            return Ok(qdrant_http_error(
-                http::StatusCode::UNAUTHORIZED,
-                "missing or invalid api-key",
-            ));
-        }
+    let Ok(api_key) = qdrant::api_key_from_request(&request) else {
+        return Ok(qdrant_http_error(
+            http::StatusCode::UNAUTHORIZED,
+            "missing or invalid api-key",
+        ));
     };
     let route_key_sha256 = resolver.qdrant_route_fingerprint(&api_key);
     let Some(target) = resolver.resolve_qdrant(&route_key_sha256).await else {
@@ -255,10 +255,7 @@ async fn proxy_qdrant_http1(
                 %error,
                 "qdrant REST route has no valid private HTTP socket"
             );
-            return Ok(qdrant_http_error(
-                http::StatusCode::BAD_GATEWAY,
-                "qdrant backend is unavailable",
-            ));
+            return Ok(qdrant_backend_unavailable());
         }
     };
     let backend = match tunnel::connect_backend(&endpoint).await {
@@ -269,10 +266,7 @@ async fn proxy_qdrant_http1(
                 %error,
                 "qdrant REST backend connection failed"
             );
-            return Ok(qdrant_http_error(
-                http::StatusCode::BAD_GATEWAY,
-                "qdrant backend is unavailable",
-            ));
+            return Ok(qdrant_backend_unavailable());
         }
     };
     let backend = tunnel::MeteredBackend::new(backend, target.network, target.session);
@@ -285,10 +279,7 @@ async fn proxy_qdrant_http1(
                     %error,
                     "qdrant REST backend HTTP handshake failed"
                 );
-                return Ok(qdrant_http_error(
-                    http::StatusCode::BAD_GATEWAY,
-                    "qdrant backend is unavailable",
-                ));
+                return Ok(qdrant_backend_unavailable());
             }
         };
     tokio::spawn(async move {
@@ -297,14 +288,7 @@ async fn proxy_qdrant_http1(
         }
     });
 
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/")
-        .parse::<http::Uri>()
-        .unwrap_or_else(|_| http::Uri::from_static("/"));
-    *request.uri_mut() = path;
+    *request.uri_mut() = origin_form_uri(request.uri());
     remove_hop_by_hop_headers(request.headers_mut());
     match sender.send_request(request).await {
         Ok(response) => {
@@ -328,6 +312,14 @@ async fn proxy_qdrant_http1(
             ))
         }
     }
+}
+
+fn origin_form_uri(uri: &http::Uri) -> http::Uri {
+    uri.path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/")
+        .parse::<http::Uri>()
+        .unwrap_or_else(|_| http::Uri::from_static("/"))
 }
 
 fn remove_hop_by_hop_headers(headers: &mut http::HeaderMap) {
@@ -354,6 +346,13 @@ fn remove_hop_by_hop_headers(headers: &mut http::HeaderMap) {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
+}
+
+fn qdrant_backend_unavailable() -> http::Response<QdrantHttpBody> {
+    qdrant_http_error(
+        http::StatusCode::BAD_GATEWAY,
+        "qdrant backend is unavailable",
+    )
 }
 
 fn qdrant_http_error(

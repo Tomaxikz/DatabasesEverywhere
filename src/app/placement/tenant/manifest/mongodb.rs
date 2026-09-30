@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bson::{raw::RawBsonRef, raw::RawDocument};
 use serde::Deserialize;
@@ -10,11 +10,13 @@ use super::{
     model::{CollectedManifest, DataRecord, MultisetAccumulator, SchemaRecord, object_key},
     query::{ManifestContext, validate_identifier},
 };
-use crate::runtime::docker::DockerError;
+use crate::runtime::docker::{DockerError, ExecStreamResult};
 
 const PAGE_SIZE: usize = 64;
 const MAX_BSON_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BSON_NESTING_DEPTH: usize = 128;
+const MIN_BSON_DOCUMENT_BYTES: i32 = 5;
+const MAX_COLLECTION_SCHEMA_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct CollectionRecord {
@@ -41,16 +43,7 @@ pub(super) async fn collect(
         let remaining = context.max_data_bytes.saturating_sub(scanned_bytes);
         let path = temp_path();
         let guard = TempFileGuard(path.clone());
-        let result = match context
-            .mongo_to_file(&collection.name, &path, remaining)
-            .await
-        {
-            Ok(result) => result,
-            Err(ManifestError::Docker(DockerError::ExecStreamOutputTooLarge { .. })) => {
-                return Err(ManifestError::DataLimit(context.max_data_bytes));
-            }
-            Err(error) => return Err(error),
-        };
+        let result = dump_collection(context, &collection.name, &path, remaining).await?;
         scanned_bytes = scanned_bytes
             .checked_add(result.transferred_bytes)
             .ok_or(ManifestError::DataLimit(context.max_data_bytes))?;
@@ -63,6 +56,20 @@ pub(super) async fn collect(
         collected.push_data(DataRecord::new(key, digest)?)?;
     }
     Ok(collected)
+}
+
+async fn dump_collection(
+    context: &ManifestContext<'_>,
+    collection: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<ExecStreamResult, ManifestError> {
+    match context.mongo_to_file(collection, path, max_bytes).await {
+        Err(ManifestError::Docker(DockerError::ExecStreamOutputTooLarge { .. })) => {
+            Err(ManifestError::DataLimit(context.max_data_bytes))
+        }
+        result => result,
+    }
 }
 
 async fn collection_catalog(
@@ -86,8 +93,8 @@ async fn collection_catalog(
                     record.name, record.kind
                 )));
             }
-            if record.schema.len() > 1024 * 1024 {
-                return Err(ManifestError::SchemaLimit(1024 * 1024));
+            if record.schema.len() > MAX_COLLECTION_SCHEMA_BYTES {
+                return Err(ManifestError::SchemaLimit(MAX_COLLECTION_SCHEMA_BYTES));
             }
             collections.push(record);
             if collections.len() > MAX_OBJECTS {
@@ -159,7 +166,7 @@ async fn digest_bson_file(
             break;
         };
         let length = i32::from_le_bytes(prefix);
-        if !(5..=MAX_BSON_DOCUMENT_BYTES as i32).contains(&length) {
+        if !(MIN_BSON_DOCUMENT_BYTES..=MAX_BSON_DOCUMENT_BYTES as i32).contains(&length) {
             return Err(ManifestError::InvalidCatalog(
                 "MongoDB dump contains an invalid BSON document length",
             ));
@@ -194,8 +201,7 @@ async fn read_prefix<R: tokio::io::AsyncRead + Unpin>(
 }
 
 fn validate_bson(bytes: &[u8]) -> Result<(), ManifestError> {
-    let root = RawDocument::from_bytes(bytes)
-        .map_err(|_| ManifestError::InvalidCatalog("MongoDB dump contains malformed BSON"))?;
+    let root = RawDocument::from_bytes(bytes).map_err(|_| malformed_bson())?;
     let mut pending = vec![(root.iter_elements(), 0_usize)];
     while let Some((elements, depth)) = pending.last_mut() {
         let Some(element) = elements.next() else {
@@ -204,13 +210,11 @@ fn validate_bson(bytes: &[u8]) -> Result<(), ManifestError> {
         };
         let value = element
             .and_then(|element| element.value())
-            .map_err(|_| ManifestError::InvalidCatalog("MongoDB dump contains malformed BSON"))?;
+            .map_err(|_| malformed_bson())?;
         let nested = match value {
             RawBsonRef::Document(document) => Some(document),
             RawBsonRef::Array(array) => {
-                Some(RawDocument::from_bytes(array.as_bytes()).map_err(|_| {
-                    ManifestError::InvalidCatalog("MongoDB dump contains malformed BSON")
-                })?)
+                Some(RawDocument::from_bytes(array.as_bytes()).map_err(|_| malformed_bson())?)
             }
             RawBsonRef::JavaScriptCodeWithScope(code) => Some(code.scope),
             _ => None,
@@ -226,6 +230,10 @@ fn validate_bson(bytes: &[u8]) -> Result<(), ManifestError> {
         }
     }
     Ok(())
+}
+
+fn malformed_bson() -> ManifestError {
+    ManifestError::InvalidCatalog("MongoDB dump contains malformed BSON")
 }
 
 fn temp_path() -> PathBuf {

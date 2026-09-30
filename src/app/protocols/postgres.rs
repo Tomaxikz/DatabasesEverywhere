@@ -13,6 +13,9 @@ pub const SSL_REQUEST_CODE: i32 = 80877103;
 pub const GSSENC_REQUEST_CODE: i32 = 80877104;
 pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 const MAX_CANCEL_KEY_BYTES: usize = 256;
+const STARTUP_HEADER_LEN: usize = 8;
+const PROCESS_ID_LEN: usize = 4;
+const MIN_CANCEL_SECRET_LEN: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CancelKey {
@@ -22,12 +25,14 @@ pub(crate) struct CancelKey {
 
 impl CancelKey {
     pub(crate) fn from_backend_data(bytes: &[u8]) -> Option<Self> {
-        if !(8..=4 + MAX_CANCEL_KEY_BYTES).contains(&bytes.len()) {
+        let valid_lengths =
+            PROCESS_ID_LEN + MIN_CANCEL_SECRET_LEN..=PROCESS_ID_LEN + MAX_CANCEL_KEY_BYTES;
+        if !valid_lengths.contains(&bytes.len()) {
             return None;
         }
         Some(Self {
-            process_id: i32::from_be_bytes(bytes[..4].try_into().ok()?),
-            secret: bytes[4..].to_vec(),
+            process_id: i32::from_be_bytes(bytes[..PROCESS_ID_LEN].try_into().ok()?),
+            secret: bytes[PROCESS_ID_LEN..].to_vec(),
         })
     }
 }
@@ -65,7 +70,7 @@ pub enum PostgresParseError {
 }
 
 pub fn is_ssl_request(bytes: &[u8]) -> bool {
-    if bytes.len() != 8 {
+    if bytes.len() != STARTUP_HEADER_LEN {
         return false;
     }
     i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) == SSL_REQUEST_CODE
@@ -79,28 +84,34 @@ pub(crate) fn cancel_request_key(bytes: &[u8]) -> Option<CancelKey> {
     if startup_request_code(bytes) != Some(CANCEL_REQUEST_CODE) {
         return None;
     }
-    CancelKey::from_backend_data(bytes.get(8..)?)
+    CancelKey::from_backend_data(bytes.get(STARTUP_HEADER_LEN..)?)
 }
 
 fn startup_request_code(bytes: &[u8]) -> Option<i32> {
-    if bytes.len() < 8 || u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize != bytes.len() {
+    if bytes.len() < STARTUP_HEADER_LEN {
         return None;
     }
-    Some(i32::from_be_bytes(bytes[4..8].try_into().ok()?))
+    let declared_len = u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize;
+    if declared_len != bytes.len() {
+        return None;
+    }
+    Some(i32::from_be_bytes(
+        bytes[4..STARTUP_HEADER_LEN].try_into().ok()?,
+    ))
 }
 
 pub fn parse_startup_route(bytes: &[u8]) -> Result<StartupRoute, PostgresParseError> {
-    if bytes.len() < 8 {
+    if bytes.len() < STARTUP_HEADER_LEN {
         return Err(PostgresParseError::TooShort);
     }
 
     let declared_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    if declared_len != bytes.len() || declared_len < 8 {
+    if declared_len != bytes.len() || declared_len < STARTUP_HEADER_LEN {
         return Err(PostgresParseError::InvalidLength);
     }
 
     let mut fields = HashMap::new();
-    let mut parts = bytes[8..].split(|byte| *byte == 0);
+    let mut parts = bytes[STARTUP_HEADER_LEN..].split(|byte| *byte == 0);
     while let Some(key) = parts.next() {
         if key.is_empty() {
             break;
@@ -134,7 +145,7 @@ pub fn startup_packet_with_database(
         return Err(PostgresParseError::InvalidLength);
     }
 
-    let mut offset = 8;
+    let mut offset = STARTUP_HEADER_LEN;
     while offset < bytes.len() - 1 {
         let key_start = offset;
         let key_end = find_nul(bytes, key_start)?;

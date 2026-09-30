@@ -5,11 +5,14 @@ use crate::{
         manager::InstanceManager,
         metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, RuntimeKind},
     },
-    runtime::docker::{DockerContainerStatus, DockerError, DockerRuntime},
+    runtime::docker::{
+        DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
+    },
     shared::{backend::BackendEndpoint, time::now_rfc3339},
 };
 
 const RECONCILE_CONCURRENCY: usize = 8;
+const ISOLATED_NETWORK_MODE: &str = "none";
 
 pub async fn validate_runtime(
     manager: &InstanceManager,
@@ -150,38 +153,41 @@ async fn stop_inactive_instance(
     metadata: &InstanceMetadata,
     docker: &DockerRuntime,
 ) -> Result<(), anyhow::Error> {
-    match docker
+    let inspection = match docker
         .inspect_instance(metadata.protocol, &metadata.instance_id)
         .await
     {
-        Ok(inspection)
-            if matches!(
-                inspection.status,
-                DockerContainerStatus::Running | DockerContainerStatus::Starting
-            ) =>
-        {
-            match docker.stop(metadata.protocol, &metadata.instance_id).await {
-                Ok(_) => tracing::warn!(
-                    event = "audit inactive_instance_stopped",
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    desired_state = metadata.desired_state.as_str(),
-                    quarantined = metadata.status == InstanceStatus::Quarantined,
-                    "stopped an instance whose durable desired state is inactive"
-                ),
-                Err(error) if is_benign_stop_error(&error) => tracing::debug!(
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    "inactive instance container was already not running"
-                ),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(_) => {}
-        Err(error) if error.is_not_found() => {}
+        Ok(inspection) => inspection,
+        Err(error) if error.is_not_found() => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !container_is_active(inspection.status) {
+        return Ok(());
+    }
+    match docker.stop(metadata.protocol, &metadata.instance_id).await {
+        Ok(_) => tracing::warn!(
+            event = "audit inactive_instance_stopped",
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            desired_state = metadata.desired_state.as_str(),
+            quarantined = metadata.status == InstanceStatus::Quarantined,
+            "stopped an instance whose durable desired state is inactive"
+        ),
+        Err(error) if is_benign_stop_error(&error) => tracing::debug!(
+            instance_id = %metadata.instance_id,
+            protocol = %metadata.protocol,
+            "inactive instance container was already not running"
+        ),
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn container_is_active(status: DockerContainerStatus) -> bool {
+    matches!(
+        status,
+        DockerContainerStatus::Running | DockerContainerStatus::Starting
+    )
 }
 
 fn is_benign_stop_error(error: &DockerError) -> bool {
@@ -198,33 +204,19 @@ async fn reconcile_metadata(
     {
         Ok(inspection) => {
             let socket_backend = matches!(metadata.backend, BackendEndpoint::UnixSocket { .. });
-            if inspection.network_mode.as_deref() != Some("none") || !socket_backend {
-                if matches!(
-                    inspection.status,
-                    DockerContainerStatus::Running | DockerContainerStatus::Starting
-                ) && let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
-                {
-                    tracing::error!(
-                        %error,
-                        instance_id = %metadata.instance_id,
-                        "failed to stop legacy networked container during quarantine"
-                    );
-                }
-                tracing::warn!(
-                    event = "audit legacy_networked_instance_quarantined",
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    network_mode = ?inspection.network_mode,
+            let network_isolated =
+                inspection.network_mode.as_deref() == Some(ISOLATED_NETWORK_MODE);
+            if !network_isolated || !socket_backend {
+                return quarantine_unisolated_instance(
+                    metadata,
+                    docker,
+                    &inspection,
                     socket_backend,
-                    "quarantined instance that does not satisfy network-none socket isolation; recreate it before reopening gateways"
-                );
-                metadata.status = InstanceStatus::Quarantined;
-                metadata.desired_state = DesiredInstanceState::Stopped;
-                metadata.updated_at = now_rfc3339();
-                return metadata;
+                )
+                .await;
             }
             metadata.status = classify_status(inspection.status);
-            metadata.runtime.network_mode = "none".to_string();
+            metadata.runtime.network_mode = ISOLATED_NETWORK_MODE.to_string();
         }
         Err(error) if error.is_not_found() => {
             metadata.status = InstanceStatus::Failed;
@@ -234,6 +226,35 @@ async fn reconcile_metadata(
             metadata.status = InstanceStatus::Failed;
         }
     }
+    metadata.updated_at = now_rfc3339();
+    metadata
+}
+
+async fn quarantine_unisolated_instance(
+    mut metadata: InstanceMetadata,
+    docker: &DockerRuntime,
+    inspection: &DockerInstanceInspection,
+    socket_backend: bool,
+) -> InstanceMetadata {
+    if container_is_active(inspection.status)
+        && let Err(error) = docker.stop(metadata.protocol, &metadata.instance_id).await
+    {
+        tracing::error!(
+            %error,
+            instance_id = %metadata.instance_id,
+            "failed to stop legacy networked container during quarantine"
+        );
+    }
+    tracing::warn!(
+        event = "audit legacy_networked_instance_quarantined",
+        instance_id = %metadata.instance_id,
+        protocol = %metadata.protocol,
+        network_mode = ?inspection.network_mode,
+        socket_backend,
+        "quarantined instance that does not satisfy network-none socket isolation; recreate it before reopening gateways"
+    );
+    metadata.status = InstanceStatus::Quarantined;
+    metadata.desired_state = DesiredInstanceState::Stopped;
     metadata.updated_at = now_rfc3339();
     metadata
 }

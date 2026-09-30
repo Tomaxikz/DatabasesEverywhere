@@ -67,6 +67,7 @@ const MAX_CONTAINER_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL: usize = 1024 * 1024;
 const FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const EXEC_OUTPUT_TRUNCATION_MARKER: &str = "[... earlier output truncated ...]\n";
+const CONTAINER_STOP_TIMEOUT_SECONDS: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct DockerInstanceInspection {
@@ -288,12 +289,9 @@ impl DockerRuntime {
             }
         })?;
         let security_rootless = info.security_options.as_ref().is_some_and(|options| {
-            options.iter().any(|option| {
-                let option = option.to_ascii_lowercase();
-                option == "rootless"
-                    || option == "name=rootless"
-                    || option.split(',').any(|part| part.trim() == "rootless")
-            })
+            options
+                .iter()
+                .any(|option| is_rootless_security_option(option))
         });
         self.rootless_podman = security_rootless
             || socket_owner.uid != 0
@@ -391,13 +389,9 @@ impl DockerRuntime {
                     .map(|env| format!("{}={}", env.key, env.value.expose_secret()))
                     .collect(),
             ),
-            cmd: if spec.command.is_empty() {
-                None
-            } else {
-                Some(spec.command.clone())
-            },
+            cmd: (!spec.command.is_empty()).then(|| spec.command.clone()),
             labels: Some(labels),
-            stop_timeout: Some(30),
+            stop_timeout: Some(CONTAINER_STOP_TIMEOUT_SECONDS),
             host_config: Some(host_config),
             exposed_ports: None,
             // Do not inherit image healthchecks. DBE runs a bounded readiness
@@ -534,15 +528,7 @@ impl DockerRuntime {
         match self.docker.inspect_image(image).await {
             Ok(_) => {
                 tracing::debug!(image, "docker image already present");
-                if let Some(progress) = progress {
-                    progress(DockerImagePullProgress {
-                        image: image.to_string(),
-                        layer: None,
-                        status: "image already present".to_string(),
-                        current: None,
-                        total: None,
-                    });
-                }
+                report_pull_progress(progress, image, "image already present");
                 return Ok(());
             }
             Err(BollardError::DockerResponseServerError {
@@ -570,56 +556,42 @@ impl DockerRuntime {
                     message: error.message.unwrap_or_else(|| "unknown error".to_string()),
                 });
             }
-            if let Some(status) = info.status {
-                let current = info
-                    .progress_detail
-                    .as_ref()
-                    .and_then(|progress| progress.current)
-                    .and_then(|value| u64::try_from(value).ok());
-                let total = info
-                    .progress_detail
-                    .as_ref()
-                    .and_then(|progress| progress.total)
-                    .and_then(|value| u64::try_from(value).ok());
-                if let Some(progress) = progress {
-                    progress(DockerImagePullProgress {
-                        image: image.to_string(),
-                        layer: info.id.clone(),
-                        status: status.clone(),
-                        current,
-                        total,
-                    });
-                }
-                let key = format!(
-                    "{}:{}:{}",
-                    info.id.as_deref().unwrap_or_default(),
+            let Some(status) = info.status else {
+                continue;
+            };
+            let detail = info.progress_detail.as_ref();
+            let current = detail
+                .and_then(|detail| detail.current)
+                .and_then(|value| u64::try_from(value).ok());
+            let total = detail
+                .and_then(|detail| detail.total)
+                .and_then(|value| u64::try_from(value).ok());
+            if let Some(progress) = progress {
+                progress(DockerImagePullProgress {
+                    image: image.to_string(),
+                    layer: info.id.clone(),
+                    status: status.clone(),
+                    current,
+                    total,
+                });
+            }
+            let layer = info.id.as_deref().unwrap_or_default();
+            let key = format!("{layer}:{status}:{}", current.unwrap_or_default());
+            if logged.insert(key) {
+                tracing::info!(
+                    image,
+                    layer,
                     status,
-                    current.unwrap_or_default()
+                    current = current.unwrap_or_default(),
+                    total = total.unwrap_or_default(),
+                    "docker image pull progress"
                 );
-                if logged.insert(key) {
-                    tracing::info!(
-                        image,
-                        layer = info.id.as_deref().unwrap_or(""),
-                        status,
-                        current = current.unwrap_or_default(),
-                        total = total.unwrap_or_default(),
-                        "docker image pull progress"
-                    );
-                }
             }
         }
 
         self.docker.inspect_image(image).await?;
         tracing::info!(image, "docker image pull complete");
-        if let Some(progress) = progress {
-            progress(DockerImagePullProgress {
-                image: image.to_string(),
-                layer: None,
-                status: "image pull complete".to_string(),
-                current: None,
-                total: None,
-            });
-        }
+        report_pull_progress(progress, image, "image pull complete");
         Ok(())
     }
 
@@ -632,13 +604,13 @@ impl DockerRuntime {
             .required_managed_container_id(protocol, instance_id)
             .await?;
         self.disable_restarts(protocol, instance_id).await?;
-        if self
+        let already_running = self
             .docker
             .inspect_container(&name, None)
             .await?
             .state
-            .is_some_and(|state| state.running == Some(true))
-        {
+            .is_some_and(|state| state.running == Some(true));
+        if already_running {
             return Ok(CommandOutput::empty());
         }
         self.note_start(instance_id, false).await?;
@@ -728,13 +700,7 @@ impl DockerRuntime {
             .required_managed_container_id(protocol, instance_id)
             .await?;
         self.docker
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
+            .remove_container(&name, Some(force_remove_options()))
             .await?;
         Ok(CommandOutput::empty())
     }
@@ -750,23 +716,19 @@ impl DockerRuntime {
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        let docker_body = if self.engine == DaemonEngine::Docker {
-            Some(Self::update_limits_body(cpu_cores, memory_mib)?)
-        } else {
-            None
+        let docker_body = match self.engine {
+            DaemonEngine::Docker => Some(Self::update_limits_body(cpu_cores, memory_mib)?),
+            DaemonEngine::Podman => None,
         };
         self.clear_cpu_burst(protocol, instance_id).await;
-        let update_result: Result<(), DockerError> = match self.engine {
-            DaemonEngine::Docker => self
+        let update_result: Result<(), DockerError> = match docker_body {
+            Some(body) => self
                 .docker
-                .update_container(
-                    &name,
-                    docker_body.expect("Docker limit body is prepared for Docker"),
-                )
+                .update_container(&name, body)
                 .await
                 .map(|_| ())
                 .map_err(Into::into),
-            DaemonEngine::Podman => {
+            None => {
                 podman_api::update_limits(&self.socket_path, &name, cpu_cores, memory_mib).await
             }
         };
@@ -782,13 +744,7 @@ impl DockerRuntime {
                 continue;
             };
             self.docker
-                .remove_container(
-                    &id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
+                .remove_container(&id, Some(force_remove_options()))
                 .await?;
             removed += 1;
         }
@@ -824,6 +780,36 @@ impl DockerRuntime {
     }
 }
 
+fn is_rootless_security_option(option: &str) -> bool {
+    let option = option.to_ascii_lowercase();
+    option == "rootless"
+        || option == "name=rootless"
+        || option.split(',').any(|part| part.trim() == "rootless")
+}
+
+fn force_remove_options() -> RemoveContainerOptions {
+    RemoveContainerOptions {
+        force: true,
+        ..Default::default()
+    }
+}
+
+fn report_pull_progress(
+    progress: Option<&(dyn Fn(DockerImagePullProgress) + Send + Sync)>,
+    image: &str,
+    status: &str,
+) {
+    if let Some(progress) = progress {
+        progress(DockerImagePullProgress {
+            image: image.to_string(),
+            layer: None,
+            status: status.to_string(),
+            current: None,
+            total: None,
+        });
+    }
+}
+
 fn managed_container_filters(node_id: &str) -> HashMap<String, Vec<String>> {
     HashMap::from([(
         "label".to_string(),
@@ -852,13 +838,12 @@ fn rootless_podman_identity(protocol: Protocol) -> (&'static str, &'static str) 
 
 fn storage_opt(enforce_disk_limits: bool, disk_mib: u64) -> Option<HashMap<String, String>> {
     if !enforce_disk_limits || disk_mib == 0 {
-        None
-    } else {
-        Some(HashMap::from([(
-            "size".to_string(),
-            format!("{}m", disk_mib),
-        )]))
+        return None;
     }
+    Some(HashMap::from([(
+        "size".to_string(),
+        format!("{disk_mib}m"),
+    )]))
 }
 
 fn verify_managed_instance_labels(

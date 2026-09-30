@@ -4,13 +4,14 @@ pub const MIN_CPU_CORES: f64 = 0.01;
 pub const MAX_CPU_CORES: f64 = 1024.0;
 pub const MAX_MEMORY_MIB: u64 = 1024 * 1024;
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 pub(crate) const fn mib_to_bytes(mib: u64) -> u64 {
-    mib.saturating_mul(1024 * 1024)
+    mib.saturating_mul(BYTES_PER_MIB)
 }
 
 pub(crate) const fn bytes_to_mib_ceil(bytes: u64) -> u64 {
-    const MIB: u64 = 1024 * 1024;
-    bytes / MIB + (!bytes.is_multiple_of(MIB)) as u64
+    bytes.div_ceil(BYTES_PER_MIB)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]

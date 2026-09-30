@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use super::{DiskLimitError, displayed_privileged_command, privileged_command};
+use super::{
+    DiskLimitError, displayed_privileged_command, privileged_command, remove_empty_data_directory,
+};
 
 pub(super) async fn verify_startup(mount: &Path) -> Result<(), DiskLimitError> {
     ensure_quota_enabled(mount).await
@@ -45,10 +47,13 @@ async fn ensure_quota_enabled(mount: &Path) -> Result<(), DiskLimitError> {
 }
 
 async fn qgroups_available(mount: &Path) -> Result<bool, DiskLimitError> {
+    btrfs_succeeds(&["qgroup", "show"], mount).await
+}
+
+async fn btrfs_succeeds(args: &[&str], path: &Path) -> Result<bool, DiskLimitError> {
     let output = privileged_command("btrfs")
-        .arg("qgroup")
-        .arg("show")
-        .arg(mount)
+        .args(args)
+        .arg(path)
         .output()
         .await
         .map_err(|source| DiskLimitError::CommandIo {
@@ -65,28 +70,7 @@ async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
 
     let path = path.to_path_buf();
     let path = tokio::task::spawn_blocking(move || -> Result<PathBuf, DiskLimitError> {
-        if path.exists() {
-            let mut entries =
-                std::fs::read_dir(&path).map_err(|source| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            if entries
-                .next()
-                .transpose()
-                .map_err(|source| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source,
-                })?
-                .is_some()
-            {
-                return Err(DiskLimitError::DataPathNotEmpty(path));
-            }
-            std::fs::remove_dir(&path).map_err(|source| DiskLimitError::PathIo {
-                path: path.display().to_string(),
-                source,
-            })?;
-        }
+        remove_empty_data_directory(&path)?;
         Ok(path)
     })
     .await
@@ -96,17 +80,7 @@ async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
 }
 
 async fn is_subvolume(path: &Path) -> Result<bool, DiskLimitError> {
-    let output = privileged_command("btrfs")
-        .arg("subvolume")
-        .arg("show")
-        .arg(path)
-        .output()
-        .await
-        .map_err(|source| DiskLimitError::CommandIo {
-            command: "btrfs",
-            source,
-        })?;
-    Ok(output.status.success())
+    btrfs_succeeds(&["subvolume", "show"], path).await
 }
 
 async fn run_limit(path: &Path, disk_mib: u64) -> Result<(), DiskLimitError> {

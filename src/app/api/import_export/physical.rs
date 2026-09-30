@@ -2,6 +2,9 @@
 
 use super::{files::*, protocol::*, *};
 
+const PHYSICAL_ARCHIVE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+const REPLACEMENT_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub(super) async fn export_physical_archive(
     state: &AppState,
     instance_id: &str,
@@ -24,7 +27,7 @@ pub(super) async fn export_physical_archive(
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let max_output_bytes = mib_to_bytes(metadata.limits.disk_mib)
-        .saturating_add(64 * 1024 * 1024)
+        .saturating_add(PHYSICAL_ARCHIVE_HEADROOM_BYTES)
         .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
     let result = crate::jobs::import_export::create_bounded_archive(
         paths.data,
@@ -43,14 +46,14 @@ pub(super) async fn import_physical_archive(
     artifact_path: &FsPath,
     max_extracted_bytes: u64,
 ) -> Result<(), ApiError> {
-    match protocol {
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {}
-        protocol => {
-            return Err(ApiError::BadRequest(format!(
-                "{} is not a physical archive protocol",
-                protocol.as_str()
-            )));
-        }
+    if !matches!(
+        protocol,
+        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
+    ) {
+        return Err(ApiError::BadRequest(format!(
+            "{} is not a physical archive protocol",
+            protocol.as_str()
+        )));
     }
     let metadata = state
         .instances
@@ -81,13 +84,9 @@ pub(crate) fn check_restore_layout(
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
 ) -> Result<(), ApiError> {
-    crate::disk::DiskLimiter::with_fuse_root(
-        state.config.disk.clone(),
-        state.config.paths.fuse_root(),
-    )
-    .for_persisted_method(&metadata.limits.disk_enforcement_method)
-    .check_restore_layout(&paths.data)
-    .map_err(|error| ApiError::Conflict(error.to_string()))
+    physical_disk_limiter(state, metadata)
+        .check_restore_layout(&paths.data)
+        .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
 pub(crate) async fn restore_instance_data_owner(
@@ -300,23 +299,22 @@ async fn restore_archive(
 }
 
 async fn restore_credentials(metadata: &InstanceMetadata, data: &FsPath) -> Result<(), ApiError> {
-    if matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
-        let password = metadata.tenant_password.as_deref().ok_or_else(|| {
-            ApiError::Conflict(
-                "the current tenant credential is missing; refusing to restore archived ACLs"
-                    .to_string(),
-            )
-        })?;
-        crate::databases::resp::write_acl_file(
-            data,
-            &metadata.database.username,
-            &secrecy::SecretString::from(password.to_string()),
-        )
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to restore current tenant ACL: {error}"))
-        })?;
+    if !matches!(metadata.protocol, Protocol::Redis | Protocol::Valkey) {
+        return Ok(());
     }
+    let password = metadata.tenant_password.as_deref().ok_or_else(|| {
+        ApiError::Conflict(
+            "the current tenant credential is missing; refusing to restore archived ACLs"
+                .to_string(),
+        )
+    })?;
+    crate::databases::resp::write_acl_file(
+        data,
+        &metadata.database.username,
+        &secrecy::SecretString::from(password.to_string()),
+    )
+    .await
+    .map_err(|error| ApiError::Runtime(format!("failed to restore current tenant ACL: {error}")))?;
     Ok(())
 }
 
@@ -564,7 +562,11 @@ async fn validate_replacement(
     let readiness = async {
         state
             .docker
-            .wait_until_ready(metadata.protocol, instance_id, Duration::from_secs(120))
+            .wait_until_ready(
+                metadata.protocol,
+                instance_id,
+                REPLACEMENT_READINESS_TIMEOUT,
+            )
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         crate::api::instances::verify_resp_credential(state, &metadata).await

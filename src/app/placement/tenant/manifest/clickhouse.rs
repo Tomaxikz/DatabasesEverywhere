@@ -10,6 +10,7 @@ use crate::{
 };
 
 const PAGE_SIZE: usize = 128;
+const MAX_TABLE_NAME_BYTES: usize = 128;
 
 #[derive(Debug)]
 struct Table {
@@ -36,9 +37,10 @@ pub(super) async fn collect(
             object_key("table", &[&table.name]),
             table.definition,
         )?)?;
+        let digest = table_digest(context, &table.name).await?;
         collected.push_data(DataRecord::new(
             object_key("table-data", &[&table.name]),
-            table_digest(context, &table.name).await?,
+            digest,
         )?)?;
     }
     Ok(collected)
@@ -82,7 +84,7 @@ FORMAT TSVRaw;"#,
                 .map_err(|_| ManifestError::InvalidCatalog("ClickHouse definition is not UTF-8"))?;
             validate_identifier(&name)?;
             validate_identifier(&engine)?;
-            if !portable_identifier(&name, 128) {
+            if !portable_identifier(&name, MAX_TABLE_NAME_BYTES) {
                 return Err(ManifestError::UnsupportedFeature(format!(
                     "ClickHouse table {name} has a name the logical exporter cannot preserve"
                 )));

@@ -272,7 +272,6 @@ impl<'a> SharedObserver<'a> {
                 "client meta-commands are not allowed in a shared-tenant import",
             );
         }
-        self.saw_backslash = false;
 
         let words = statement_words(statement);
         if words.is_empty() {
@@ -350,13 +349,7 @@ impl<'a> SharedObserver<'a> {
         match command {
             value if value.eq_ignore_ascii_case("SET") => Ok(()),
             value if value.eq_ignore_ascii_case("SELECT") => {
-                if words
-                    .get(1)
-                    .is_some_and(|word| word.eq_ignore_ascii_case("PG_CATALOG"))
-                    && words
-                        .get(2)
-                        .is_some_and(|word| word.eq_ignore_ascii_case("SET_CONFIG"))
-                {
+                if word_at_is(words, 1, "PG_CATALOG") && word_at_is(words, 2, "SET_CONFIG") {
                     Ok(())
                 } else {
                     self.reject(
@@ -727,41 +720,33 @@ impl<'a> SharedObserver<'a> {
                 ) =>
             {
                 if command.eq_ignore_ascii_case("CREATE") {
-                    let object = create_object;
-                    if object == Some("DATABASE") {
+                    if create_object == Some("DATABASE") {
                         return self.reject(
                             SharedSqlIssue::PrivilegedStatement,
                             "shared imports cannot create a ClickHouse database",
                         );
                     }
-                    if !matches!(object, Some("TABLE" | "INDEX" | "VIEW")) {
+                    if !matches!(create_object, Some("TABLE" | "INDEX" | "VIEW")) {
                         return self.reject(
                             SharedSqlIssue::UnsupportedStatement,
                             "this ClickHouse CREATE form is not safe for a shared-tenant import",
                         );
                     }
-                    if object == Some("TABLE") && !has_engine {
+                    if create_object == Some("TABLE") && !has_engine {
                         return self.reject(
                             SharedSqlIssue::AmbiguousStatement,
                             "shared ClickHouse CREATE TABLE requires one explicit allowed engine",
                         );
                     }
                 }
-                if command.eq_ignore_ascii_case("DROP")
-                    && words
-                        .get(1)
-                        .is_some_and(|word| word.eq_ignore_ascii_case("DATABASE"))
-                {
+                let targets_database = word_at_is(words, 1, "DATABASE");
+                if command.eq_ignore_ascii_case("DROP") && targets_database {
                     return self.reject(
                         SharedSqlIssue::PrivilegedStatement,
                         "shared imports cannot drop a ClickHouse database",
                     );
                 }
-                if command.eq_ignore_ascii_case("ALTER")
-                    && words
-                        .get(1)
-                        .is_some_and(|word| word.eq_ignore_ascii_case("DATABASE"))
-                {
+                if command.eq_ignore_ascii_case("ALTER") && targets_database {
                     return self.reject(
                         SharedSqlIssue::PrivilegedStatement,
                         "shared imports cannot alter a ClickHouse database",
@@ -845,12 +830,7 @@ impl From<ExecutableCommentTooLarge> for MysqlCommandPolicyError {
 fn executable_mysql_comment(
     comment: &SqlComment,
 ) -> Result<Option<&[u8]>, ExecutableCommentTooLarge> {
-    let whitespace = comment
-        .bytes
-        .iter()
-        .take_while(|byte| byte.is_ascii_whitespace())
-        .count();
-    let trimmed = &comment.bytes[whitespace..];
+    let trimmed = trim_leading(&comment.bytes, u8::is_ascii_whitespace);
     let Some(body) = trimmed
         .strip_prefix(b"!")
         .or_else(|| trimmed.strip_prefix(b"M!"))
@@ -861,17 +841,14 @@ fn executable_mysql_comment(
     if comment.truncated {
         return Err(ExecutableCommentTooLarge);
     }
-    let body = &body[body
-        .iter()
-        .take_while(|byte| byte.is_ascii_whitespace())
-        .count()..];
-    let body = &body[body.iter().take_while(|byte| byte.is_ascii_digit()).count()..];
-    Ok(Some(
-        &body[body
-            .iter()
-            .take_while(|byte| byte.is_ascii_whitespace())
-            .count()..],
-    ))
+    let body = trim_leading(body, u8::is_ascii_whitespace);
+    let without_version = trim_leading(body, u8::is_ascii_digit);
+    Ok(Some(trim_leading(without_version, u8::is_ascii_whitespace)))
+}
+
+fn trim_leading(bytes: &[u8], mut skip: impl FnMut(&u8) -> bool) -> &[u8] {
+    let skipped = bytes.iter().take_while(|byte| skip(byte)).count();
+    &bytes[skipped..]
 }
 
 fn is_mysqldump_sandbox_directive(body: &[u8]) -> bool {
@@ -988,6 +965,12 @@ fn create_object(words: &[String]) -> Option<&str> {
     words.get(index).map(String::as_str)
 }
 
+fn word_at_is(words: &[String], index: usize, expected: &str) -> bool {
+    words
+        .get(index)
+        .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+}
+
 fn contains_any(words: &[String], expected: &[&str]) -> bool {
     words.iter().any(|word| is_any_keyword(word, expected))
 }
@@ -1036,14 +1019,14 @@ fn import_object_qualifiers(tokens: &[SqlToken]) -> Vec<(String, String)> {
         let SqlToken::Identifier(word) = token else {
             continue;
         };
-        let mut object_index = match word.to_ascii_uppercase().as_str() {
-            "REFERENCES" | "UPDATE" => Some(index + 1),
-            "FROM" | "INTO" | "TABLE" | "TABLES" | "ON" | "JOIN" => Some(index + 1),
-            _ => None,
-        };
-        let Some(mut object_index) = object_index.take() else {
+        let precedes_object = matches!(
+            word.to_ascii_uppercase().as_str(),
+            "REFERENCES" | "UPDATE" | "FROM" | "INTO" | "TABLE" | "TABLES" | "ON" | "JOIN"
+        );
+        if !precedes_object {
             continue;
-        };
+        }
+        let mut object_index = index + 1;
         while super::identifier_at(tokens, object_index)
             .is_some_and(|word| is_any_keyword(word, &["IF", "NOT", "EXISTS", "ONLY", "IGNORE"]))
         {
@@ -1066,8 +1049,8 @@ fn validate_engine(
 ) -> Result<bool, SharedSqlError> {
     let mut depth = 0_usize;
     let mut found = false;
-    for index in 0..tokens.len() {
-        match tokens[index] {
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
             SqlToken::OpenParen => {
                 depth = depth.saturating_add(1);
                 continue;
@@ -1081,9 +1064,9 @@ fn validate_engine(
         if depth != 0 {
             continue;
         }
-        if !matches!(tokens.get(index), Some(SqlToken::Identifier(word)) if word.eq_ignore_ascii_case("ENGINE"))
-            || !matches!(tokens.get(index + 1), Some(SqlToken::Equal))
-        {
+        let is_engine_assignment = matches!(token, SqlToken::Identifier(word) if word.eq_ignore_ascii_case("ENGINE"))
+            && matches!(tokens.get(index + 1), Some(SqlToken::Equal));
+        if !is_engine_assignment {
             continue;
         }
         if found {

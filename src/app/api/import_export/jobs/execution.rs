@@ -180,30 +180,7 @@ pub(super) async fn acquire_upload_staging(
     options: &ImportOptions,
 ) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
     if let Some(staging) = options.upload_staging.as_ref() {
-        return match staging {
-            UploadStagingBudget::Logical { budget, .. } => {
-                let root = logical_staging_root(state).await?;
-                state
-                    .import_uploads
-                    .acquire_staging(&root, budget.reservation_bytes)
-                    .await
-                    .map(Some)
-            }
-            UploadStagingBudget::Physical {
-                extracted_bytes, ..
-            } => {
-                let paths = InstancePaths::new(&state.config.paths, instance_id)
-                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-                let data_parent = paths.data.parent().ok_or_else(|| {
-                    ApiError::Runtime("physical import data directory has no parent".to_string())
-                })?;
-                state
-                    .import_uploads
-                    .acquire_staging_on_existing_root(data_parent, *extracted_bytes)
-                    .await
-                    .map(Some)
-            }
-        };
+        return acquire_validated_upload_staging(state, instance_id, staging).await;
     }
 
     let metadata = state
@@ -212,39 +189,7 @@ pub(super) async fn acquire_upload_staging(
         .await
         .ok_or(ApiError::NotFound)?;
     if !protocol_uses_logical_dumps(metadata.protocol) {
-        return match &options.source {
-            ImportSourceOptions::Remote(_) => {
-                let root = PathBuf::from(state.config.paths.tmp_root());
-                state
-                    .import_uploads
-                    .acquire_staging(
-                        &root,
-                        state.config.security.remote_import.max_staged_bytes.max(1),
-                    )
-                    .await
-                    .map(Some)
-            }
-            ImportSourceOptions::Artifact(_) => {
-                let paths = InstancePaths::new(&state.config.paths, instance_id)
-                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-                let data_parent = paths.data.parent().ok_or_else(|| {
-                    ApiError::Runtime("physical import data directory has no parent".to_string())
-                })?;
-                let extracted = mib_to_bytes(metadata.limits.disk_mib)
-                    .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
-                state
-                    .import_uploads
-                    .acquire_staging_on_existing_root(data_parent, extracted)
-                    .await
-                    .map(Some)
-            }
-            ImportSourceOptions::Upload { .. } => Err(ApiError::Runtime(
-                "physical upload import is missing its validated staging budget".to_string(),
-            )),
-            ImportSourceOptions::RemoteRequest(_) => Err(ApiError::Runtime(
-                "remote import source was not validated".to_string(),
-            )),
-        };
+        return acquire_physical_import_staging(state, instance_id, &metadata, options).await;
     }
     let requested = match &options.source {
         ImportSourceOptions::Artifact(path) => {
@@ -286,6 +231,78 @@ pub(super) async fn acquire_upload_staging(
         .acquire_staging(&root, requested.max(1))
         .await
         .map(Some)
+}
+
+async fn acquire_validated_upload_staging(
+    state: &AppState,
+    instance_id: &str,
+    staging: &UploadStagingBudget,
+) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+    match staging {
+        UploadStagingBudget::Logical { budget, .. } => {
+            let root = logical_staging_root(state).await?;
+            state
+                .import_uploads
+                .acquire_staging(&root, budget.reservation_bytes)
+                .await
+                .map(Some)
+        }
+        UploadStagingBudget::Physical {
+            extracted_bytes, ..
+        } => {
+            let data_parent = physical_data_parent(state, instance_id)?;
+            state
+                .import_uploads
+                .acquire_staging_on_existing_root(&data_parent, *extracted_bytes)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+async fn acquire_physical_import_staging(
+    state: &AppState,
+    instance_id: &str,
+    metadata: &InstanceMetadata,
+    options: &ImportOptions,
+) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+    match &options.source {
+        ImportSourceOptions::Remote(_) => {
+            let root = PathBuf::from(state.config.paths.tmp_root());
+            state
+                .import_uploads
+                .acquire_staging(
+                    &root,
+                    state.config.security.remote_import.max_staged_bytes.max(1),
+                )
+                .await
+                .map(Some)
+        }
+        ImportSourceOptions::Artifact(_) => {
+            let data_parent = physical_data_parent(state, instance_id)?;
+            let extracted = mib_to_bytes(metadata.limits.disk_mib)
+                .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+            state
+                .import_uploads
+                .acquire_staging_on_existing_root(&data_parent, extracted)
+                .await
+                .map(Some)
+        }
+        ImportSourceOptions::Upload { .. } => Err(ApiError::Runtime(
+            "physical upload import is missing its validated staging budget".to_string(),
+        )),
+        ImportSourceOptions::RemoteRequest(_) => Err(ApiError::Runtime(
+            "remote import source was not validated".to_string(),
+        )),
+    }
+}
+
+fn physical_data_parent(state: &AppState, instance_id: &str) -> Result<PathBuf, ApiError> {
+    let paths = InstancePaths::new(&state.config.paths, instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    paths.data.parent().map(FsPath::to_path_buf).ok_or_else(|| {
+        ApiError::Runtime("physical import data directory has no parent".to_string())
+    })
 }
 
 pub(in crate::api::import_export) fn import_staging_bytes(
@@ -346,17 +363,7 @@ pub(super) async fn estimate_import_cost(
         metadata.limits.disk_mib,
         compressed,
     );
-    let rollback_size_bytes = if protocol_uses_logical_dumps(metadata.protocol) {
-        if metadata.deployment_mode == DeploymentMode::Shared {
-            measure_export_bytes(state, metadata)
-                .await
-                .unwrap_or_else(|_| estimate_rollback_bytes(metadata))
-        } else {
-            estimate_rollback_bytes(metadata)
-        }
-    } else {
-        0
-    };
+    let rollback_size_bytes = estimate_import_rollback_bytes(state, metadata).await;
     JobResourceCost::estimate(JobEstimateInput {
         protocol: metadata.protocol,
         input_size_bytes: estimated_expanded_bytes.max(1),
@@ -389,6 +396,18 @@ pub(in crate::api::import_export) fn prepared_import_bytes(
         ImportSourceOptions::Remote(_) | ImportSourceOptions::RemoteRequest(_) => remote_limit,
     }
     .max(1)
+}
+
+async fn estimate_import_rollback_bytes(state: &AppState, metadata: &InstanceMetadata) -> u64 {
+    if !protocol_uses_logical_dumps(metadata.protocol) {
+        return 0;
+    }
+    if metadata.deployment_mode != DeploymentMode::Shared {
+        return estimate_rollback_bytes(metadata);
+    }
+    measure_export_bytes(state, metadata)
+        .await
+        .unwrap_or_else(|_| estimate_rollback_bytes(metadata))
 }
 
 fn estimate_rollback_bytes(metadata: &InstanceMetadata) -> u64 {

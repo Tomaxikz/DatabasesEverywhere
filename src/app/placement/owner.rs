@@ -21,12 +21,7 @@ pub struct PoolOwner {
 impl PoolOwner {
     pub fn check(&self) -> Result<(), String> {
         for (name, value) in [("panel_id", &self.panel_id), ("server_id", &self.server_id)] {
-            if value.is_empty()
-                || value.len() > 128
-                || !value
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
-            {
+            if !is_valid_owner_key(value) {
                 return Err(format!(
                     "{name} must be 1-128 ASCII letters, digits, hyphens, dots or underscores"
                 ));
@@ -34,6 +29,13 @@ impl PoolOwner {
         }
         Ok(())
     }
+}
+
+const MAX_OWNER_KEY_LEN: usize = 128;
+
+fn is_valid_owner_key(value: &str) -> bool {
+    let is_allowed_byte = |byte: u8| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte);
+    !value.is_empty() && value.len() <= MAX_OWNER_KEY_LEN && value.bytes().all(is_allowed_byte)
 }
 
 /// Fixed physical engine capacity, charged once, not once per database.

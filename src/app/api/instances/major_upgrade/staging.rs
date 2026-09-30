@@ -199,16 +199,7 @@ async fn replace_and_import(
     validate_replacement(state, metadata, password).await?;
     metadata.backend = backend_endpoint(state, metadata.protocol, &metadata.instance_id)
         .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
-    if metadata.protocol == Protocol::Mariadb {
-        metadata.mariadb_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-        );
-    }
-    if metadata.protocol == Protocol::Mysql {
-        metadata.mysql_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-        );
-    }
+    refresh_native_password_verifier(metadata, password);
     Ok(())
 }
 
@@ -408,28 +399,30 @@ pub(in crate::api::instances) fn replacement_check_command(
     username: &str,
     database: &str,
 ) -> Result<String, ApiError> {
+    use crate::shared::shell::sh_quote;
+
     let command = match protocol {
         Protocol::Postgres => format!(
             "PGPASSWORD=\"$DBE_UPGRADE_PASSWORD\" psql -X -h /var/run/postgresql -U {} -d {} -v ON_ERROR_STOP=1 -c 'select 1' >/dev/null",
-            crate::shared::shell::sh_quote(username),
-            crate::shared::shell::sh_quote(database),
+            sh_quote(username),
+            sh_quote(database),
         ),
         Protocol::Mariadb => "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -u \"$MARIADB_USER\" \"$MARIADB_DATABASE\" -N -B -e 'select 1' >/dev/null".to_string(),
         Protocol::Mysql => format!(
             "MYSQL_PWD=\"$DBE_UPGRADE_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -u {} {} -e 'select 1' >/dev/null",
-            crate::shared::shell::sh_quote(username),
-            crate::shared::shell::sh_quote(database),
+            sh_quote(username),
+            sh_quote(database),
         ),
         Protocol::Mongodb => format!(
             "mongosh --quiet --host 127.0.0.1 --username {} --password \"$DBE_UPGRADE_PASSWORD\" --authenticationDatabase {} {} --eval 'db.runCommand({{ ping: 1 }}).ok' >/dev/null",
-            crate::shared::shell::sh_quote(username),
-            crate::shared::shell::sh_quote(database),
-            crate::shared::shell::sh_quote(database),
+            sh_quote(username),
+            sh_quote(database),
+            sh_quote(database),
         ),
         Protocol::Clickhouse => format!(
             "clickhouse-client --host 127.0.0.1 --user {} --password \"$DBE_UPGRADE_PASSWORD\" --database {} --query 'SELECT 1' >/dev/null",
-            crate::shared::shell::sh_quote(username),
-            crate::shared::shell::sh_quote(database),
+            sh_quote(username),
+            sh_quote(database),
         ),
         Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
             return Err(ApiError::BadRequest(format!(

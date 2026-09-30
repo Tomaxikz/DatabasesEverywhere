@@ -38,6 +38,10 @@ const SHA256_HEADER: &str = "x-dbev-sha256";
 const MAX_ORIGINAL_FILENAME_BYTES: usize = 180;
 const MAX_LISTED_UPLOADS: u32 = 100;
 const MAX_CONCURRENT_IMPORT_STAGING: usize = 2;
+const UPLOADS_DIRECTORY: &str = ".uploads";
+const SHA256_HEX_LEN: usize = 64;
+const UPLOAD_ID_PREFIX: &str = "upl_";
+const UPLOAD_ID_LEN: usize = 36;
 
 mod mongodb;
 #[cfg(test)]
@@ -212,17 +216,8 @@ pub(crate) async fn import_entry(
     request: Request,
 ) -> Result<Response, ApiError> {
     auth.require_scope(scopes::IMPORT_EXPORT_WRITE)?;
-    let content_type = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    match content_type.as_str() {
+    let media_type = request_media_type(request.headers());
+    match media_type.as_str() {
         "application/json" => {
             let ApiJson(request) = ApiJson::<ImportRequest>::from_request(request, &state).await?;
             Ok(queue_import_instance(&state, &instance_id, ImportOptions::from(&request))
@@ -238,6 +233,18 @@ pub(crate) async fn import_entry(
                 .to_string(),
         }),
     }
+}
+
+fn request_media_type(headers: &HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 pub(crate) async fn list_import_uploads(
@@ -322,34 +329,50 @@ pub(crate) async fn inspect_import_upload(
     let upload = match worker.await {
         Ok(result) => result?,
         Err(error) => {
-            let _instance_operation = state.instance_locks.lock(&instance_id).await;
-            let message = "dump inspection worker stopped before it could finalize durable state";
-            let restored = state
-                .import_uploads
-                .repo()
-                .restore_ready(
-                    &instance_id,
-                    &upload_id,
-                    None,
-                    None,
-                    Some(message),
-                    &now_rfc3339(),
-                )
-                .await
-                .map_err(upload_storage_error)?;
-            if !restored {
-                tracing::warn!(
-                    instance_id,
-                    upload_id,
-                    "failed inspection worker did not leave an upload in processing state"
-                );
-            }
-            return Err(ApiError::Runtime(format!(
-                "dump inspection worker task failed: {error}"
-            )));
+            return Err(restore_after_inspection_worker_failure(
+                &state,
+                &instance_id,
+                &upload_id,
+                error,
+            )
+            .await);
         }
     };
     Ok(ApiResponse::ok(upload_catalog(&upload)?))
+}
+
+async fn restore_after_inspection_worker_failure(
+    state: &AppState,
+    instance_id: &str,
+    upload_id: &str,
+    error: tokio::task::JoinError,
+) -> ApiError {
+    let _instance_operation = state.instance_locks.lock(instance_id).await;
+    let message = "dump inspection worker stopped before it could finalize durable state";
+    let restored = match state
+        .import_uploads
+        .repo()
+        .restore_ready(
+            instance_id,
+            upload_id,
+            None,
+            None,
+            Some(message),
+            &now_rfc3339(),
+        )
+        .await
+    {
+        Ok(restored) => restored,
+        Err(storage_error) => return upload_storage_error(storage_error),
+    };
+    if !restored {
+        tracing::warn!(
+            instance_id,
+            upload_id,
+            "failed inspection worker did not leave an upload in processing state"
+        );
+    }
+    ApiError::Runtime(format!("dump inspection worker task failed: {error}"))
 }
 
 fn spawn_owned_inspection<T>(
@@ -381,43 +404,7 @@ async fn inspect_and_finalize_upload(
     )
     .await;
     match inspection {
-        Ok(catalog) => {
-            if catalog.source_size_bytes != upload.size_bytes
-                || upload.sha256.as_deref() != Some(catalog.sha256.as_str())
-            {
-                let message = "temporary import upload changed after reception";
-                let _ = state
-                    .import_uploads
-                    .repo()
-                    .mark_failed(instance_id, &upload_id, message, &now_rfc3339())
-                    .await
-                    .map_err(upload_storage_error)?;
-                return Err(ApiError::Conflict(message.to_string()));
-            }
-            let catalog_json = serde_json::to_string(&catalog).map_err(|error| {
-                ApiError::Runtime(format!("failed to encode upload catalog: {error}"))
-            })?;
-            let confirmed_archive_format =
-                confirmed_storage_archive_format(upload.protocol, catalog.detected_archive_format);
-            if !state
-                .import_uploads
-                .repo()
-                .restore_ready(
-                    instance_id,
-                    &upload_id,
-                    confirmed_archive_format,
-                    Some(&catalog_json),
-                    None,
-                    &now_rfc3339(),
-                )
-                .await
-                .map_err(upload_storage_error)?
-            {
-                return Err(ApiError::Conflict(
-                    "the upload changed while inspection was completing".to_string(),
-                ));
-            }
-        }
+        Ok(catalog) => store_inspection_catalog(state, instance_id, &upload, &catalog).await?,
         Err(DumpInspectionFailure {
             error: error @ ApiError::BadRequest(_),
             ..
@@ -435,33 +422,96 @@ async fn inspect_and_finalize_upload(
             error,
             detected_archive_format,
         }) => {
-            let message = PublicDiagnostic::from_api_error("dump inspection", &error).message;
-            let confirmed_archive_format = detected_archive_format
-                .and_then(|format| confirmed_storage_archive_format(upload.protocol, format));
-            let restored = state
-                .import_uploads
-                .repo()
-                .restore_ready(
-                    instance_id,
-                    &upload_id,
-                    confirmed_archive_format,
-                    None,
-                    Some(&message),
-                    &now_rfc3339(),
-                )
-                .await
-                .map_err(upload_storage_error)?;
-            if !restored {
-                tracing::warn!(
-                    instance_id,
-                    upload_id,
-                    "upload inspection failure could not restore ready state"
-                );
-            }
+            restore_after_inspection_failure(
+                state,
+                instance_id,
+                &upload,
+                &error,
+                detected_archive_format,
+            )
+            .await?;
             return Err(error);
         }
     }
     load_upload(state, instance_id, &upload_id).await
+}
+
+async fn store_inspection_catalog(
+    state: &AppState,
+    instance_id: &str,
+    upload: &ImportUpload,
+    catalog: &DumpInspection,
+) -> Result<(), ApiError> {
+    let upload_id = upload.upload_id.as_str();
+    let content_changed = catalog.source_size_bytes != upload.size_bytes
+        || upload.sha256.as_deref() != Some(catalog.sha256.as_str());
+    if content_changed {
+        let message = "temporary import upload changed after reception";
+        let _ = state
+            .import_uploads
+            .repo()
+            .mark_failed(instance_id, upload_id, message, &now_rfc3339())
+            .await
+            .map_err(upload_storage_error)?;
+        return Err(ApiError::Conflict(message.to_string()));
+    }
+    let catalog_json = serde_json::to_string(catalog)
+        .map_err(|error| ApiError::Runtime(format!("failed to encode upload catalog: {error}")))?;
+    let confirmed_archive_format =
+        confirmed_storage_archive_format(upload.protocol, catalog.detected_archive_format);
+    let restored = state
+        .import_uploads
+        .repo()
+        .restore_ready(
+            instance_id,
+            upload_id,
+            confirmed_archive_format,
+            Some(&catalog_json),
+            None,
+            &now_rfc3339(),
+        )
+        .await
+        .map_err(upload_storage_error)?;
+    if !restored {
+        return Err(ApiError::Conflict(
+            "the upload changed while inspection was completing".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn restore_after_inspection_failure(
+    state: &AppState,
+    instance_id: &str,
+    upload: &ImportUpload,
+    error: &ApiError,
+    detected_archive_format: Option<DumpArchiveFormat>,
+) -> Result<(), ApiError> {
+    let upload_id = upload.upload_id.as_str();
+    let message = PublicDiagnostic::from_api_error("dump inspection", error).message;
+    let confirmed_archive_format = detected_archive_format
+        .and_then(|format| confirmed_storage_archive_format(upload.protocol, format));
+    let restored = state
+        .import_uploads
+        .repo()
+        .restore_ready(
+            instance_id,
+            upload_id,
+            confirmed_archive_format,
+            None,
+            Some(&message),
+            &now_rfc3339(),
+        )
+        .await
+        .map_err(upload_storage_error)?;
+    if !restored {
+        tracing::warn!(
+            instance_id,
+            upload_id,
+            "upload inspection failure could not restore ready state"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn delete_import_upload(
@@ -553,48 +603,30 @@ async fn upload_dump(
         .ok_or(ApiError::NotFound)?;
     let paths = InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let root = paths.imports.join(".uploads");
+    let root = paths.imports.join(UPLOADS_DIRECTORY);
     prepare_private_dir(&root, "managed import upload directory").await?;
     let disk_reservation = reserve_upload_disk_space(state, &root, declared_size).await?;
 
-    let upload_id = format!("upl_{}", uuid::Uuid::new_v4().simple());
+    let upload_id = format!("{UPLOAD_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
     let stored_filename = format!("{upload_id}.upload");
     let archive_format = upload_archive_format(&filename, metadata.protocol);
     let created_at = now_rfc3339();
     let expires_at = expiration_timestamp(config.import_upload_ttl_hours)?;
-    let upload = match state
-        .import_uploads
-        .repo()
-        .insert_within_limits(
-            NewImportUpload {
-                upload_id: upload_id.clone(),
-                instance_id: instance_id.to_string(),
-                original_filename: filename,
-                stored_filename: stored_filename.clone(),
-                protocol: metadata.protocol,
-                archive_format,
-                size_bytes: declared_size,
-                created_at: created_at.clone(),
-                expires_at,
-            },
-            u64::try_from(config.import_upload_max_per_instance).unwrap_or(u64::MAX),
-            config.import_upload_max_total_bytes,
-        )
-        .await
-        .map_err(upload_storage_error)?
-    {
-        ImportUploadAdmission::Admitted(upload) => *upload,
-        ImportUploadAdmission::InstanceCountExceeded { limit, .. } => {
-            return Err(ApiError::Conflict(format!(
-                "instance already has the maximum of {limit} temporary import uploads"
-            )));
-        }
-        ImportUploadAdmission::TotalBytesExceeded { limit, .. } => {
-            return Err(ApiError::Conflict(format!(
-                "temporary import uploads have reached their configured {limit}-byte capacity"
-            )));
-        }
-    };
+    let upload = insert_upload_record(
+        state,
+        NewImportUpload {
+            upload_id: upload_id.clone(),
+            instance_id: instance_id.to_string(),
+            original_filename: filename,
+            stored_filename: stored_filename.clone(),
+            protocol: metadata.protocol,
+            archive_format,
+            size_bytes: declared_size,
+            created_at,
+            expires_at,
+        },
+    )
+    .await?;
     let partial_path = root.join(format!(".{stored_filename}.partial"));
     let final_path = root.join(&stored_filename);
     let recovery = UploadWorkerRecovery::new(
@@ -641,6 +673,32 @@ async fn upload_dump(
         StatusCode::CREATED,
         public_upload(committed),
     ))
+}
+
+async fn insert_upload_record(
+    state: &AppState,
+    new_upload: NewImportUpload,
+) -> Result<ImportUpload, ApiError> {
+    let config = &state.config.artifacts;
+    let admission = state
+        .import_uploads
+        .repo()
+        .insert_within_limits(
+            new_upload,
+            u64::try_from(config.import_upload_max_per_instance).unwrap_or(u64::MAX),
+            config.import_upload_max_total_bytes,
+        )
+        .await
+        .map_err(upload_storage_error)?;
+    match admission {
+        ImportUploadAdmission::Admitted(upload) => Ok(*upload),
+        ImportUploadAdmission::InstanceCountExceeded { limit, .. } => Err(ApiError::Conflict(
+            format!("instance already has the maximum of {limit} temporary import uploads"),
+        )),
+        ImportUploadAdmission::TotalBytesExceeded { limit, .. } => Err(ApiError::Conflict(
+            format!("temporary import uploads have reached their configured {limit}-byte capacity"),
+        )),
+    }
 }
 
 fn storage_archive_format(format: DumpArchiveFormat) -> ImportUploadArchiveFormat {
@@ -778,11 +836,7 @@ fn expected_sha256(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let value = value
         .to_str()
         .map_err(|_| ApiError::BadRequest(format!("{SHA256_HEADER} is invalid")))?;
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if value.len() != SHA256_HEX_LEN || !is_lowercase_hex(value) {
         return Err(ApiError::BadRequest(format!(
             "{SHA256_HEADER} must be 64 lowercase hexadecimal characters"
         )));
@@ -900,7 +954,10 @@ pub(super) fn upload_file_path(
     }
     let paths = InstancePaths::new(&state.config.paths, &upload.instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    Ok(paths.imports.join(".uploads").join(&upload.stored_filename))
+    Ok(paths
+        .imports
+        .join(UPLOADS_DIRECTORY)
+        .join(&upload.stored_filename))
 }
 
 pub(super) async fn harden_upload_source(
@@ -1021,11 +1078,16 @@ pub(super) async fn check_upload_selection(
 }
 
 fn valid_upload_id(upload_id: &str) -> bool {
-    upload_id.len() == 36
-        && upload_id.starts_with("upl_")
-        && upload_id[4..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    upload_id.len() == UPLOAD_ID_LEN
+        && upload_id
+            .strip_prefix(UPLOAD_ID_PREFIX)
+            .is_some_and(is_lowercase_hex)
+}
+
+fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) async fn remove_upload_file(
@@ -1053,36 +1115,57 @@ pub(super) async fn finish_upload_import_job(
     failure: Option<&str>,
 ) {
     let now = now_rfc3339();
-    if !succeeded {
-        match state
-            .import_uploads
-            .repo()
-            .release_failed_claim(
-                instance_id,
-                upload_id,
-                job_id,
-                failure.unwrap_or("import job failed"),
-                &now,
-            )
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::error!(
-                instance_id,
-                upload_id,
-                job_id,
-                "failed import could not release its upload claim"
-            ),
-            Err(error) => {
-                tracing::error!(instance_id, upload_id, job_id, %error, "failed to persist import upload release")
-            }
-        }
-        return;
+    if succeeded {
+        consume_and_delete_upload(state, instance_id, upload_id, job_id, &now).await;
+    } else {
+        release_failed_upload_claim(state, instance_id, upload_id, job_id, failure, &now).await;
     }
+}
+
+async fn release_failed_upload_claim(
+    state: &AppState,
+    instance_id: &str,
+    upload_id: &str,
+    job_id: &str,
+    failure: Option<&str>,
+    now: &str,
+) {
     match state
         .import_uploads
         .repo()
-        .mark_consumed(instance_id, upload_id, job_id, &now)
+        .release_failed_claim(
+            instance_id,
+            upload_id,
+            job_id,
+            failure.unwrap_or("import job failed"),
+            now,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::error!(
+            instance_id,
+            upload_id,
+            job_id,
+            "failed import could not release its upload claim"
+        ),
+        Err(error) => {
+            tracing::error!(instance_id, upload_id, job_id, %error, "failed to persist import upload release")
+        }
+    }
+}
+
+async fn consume_and_delete_upload(
+    state: &AppState,
+    instance_id: &str,
+    upload_id: &str,
+    job_id: &str,
+    now: &str,
+) {
+    match state
+        .import_uploads
+        .repo()
+        .mark_consumed(instance_id, upload_id, job_id, now)
         .await
     {
         Ok(true) => {}

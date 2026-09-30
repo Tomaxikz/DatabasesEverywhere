@@ -470,24 +470,7 @@ impl HybridScanPlanner {
                         self.config.scan_interval,
                     );
                     if performed == ScanKind::Full {
-                        target.baseline_available = true;
-                        target.last_full_at = Some(now);
-                        target.full_deadline = add_tick(now, self.config.full_scan_interval);
-                        let requirement_was_covered =
-                            target.full_requirement.is_some_and(|required| {
-                                required.generation <= candidate.captured_generation
-                            });
-                        if requirement_was_covered {
-                            target.full_requirement = None;
-                        } else if let Some(required) = &mut target.full_requirement {
-                            // Uncovered overflow remains pending at the base cadence.
-                            if required.reason == ScanReason::RetryAfterFailure {
-                                required.reason = ScanReason::Overflow;
-                            }
-                            let cadence_due = add_tick(now, self.config.scan_interval);
-                            required.due_at =
-                                required.due_at.max(cadence_due).min(target.full_deadline);
-                        }
+                        Self::record_full_scan(target, now, candidate, self.config);
                     }
                 }
             }
@@ -538,6 +521,33 @@ impl HybridScanPlanner {
         self.shutdown
     }
 
+    fn record_full_scan(
+        target: &mut TargetState,
+        now: PlannerTick,
+        candidate: &ScanCandidate,
+        config: PlannerConfig,
+    ) {
+        target.baseline_available = true;
+        target.last_full_at = Some(now);
+        target.full_deadline = add_tick(now, config.full_scan_interval);
+        let requirement_was_covered = target
+            .full_requirement
+            .is_some_and(|required| required.generation <= candidate.captured_generation);
+        if requirement_was_covered {
+            target.full_requirement = None;
+            return;
+        }
+        let Some(required) = &mut target.full_requirement else {
+            return;
+        };
+        // Uncovered overflow remains pending at the base cadence.
+        if required.reason == ScanReason::RetryAfterFailure {
+            required.reason = ScanReason::Overflow;
+        }
+        let cadence_due = add_tick(now, config.scan_interval);
+        required.due_at = required.due_at.max(cadence_due).min(target.full_deadline);
+    }
+
     fn require_full_after(
         target: &mut TargetState,
         now: PlannerTick,
@@ -547,7 +557,7 @@ impl HybridScanPlanner {
         scan_interval: Duration,
     ) {
         target.full_requirement = Some(FullRequirement {
-            due_at: add_tick(now, debounce).max(add_tick(now, scan_interval)),
+            due_at: debounced_cadence_due(now, debounce, scan_interval),
             generation: target.dirty_generation.max(candidate.captured_generation),
             reason,
         });
@@ -565,7 +575,7 @@ impl HybridScanPlanner {
             target.dirty_due = None;
         } else {
             // Events arriving in flight remain bounded by the base cadence.
-            target.dirty_due = Some(add_tick(now, debounce).max(add_tick(now, scan_interval)));
+            target.dirty_due = Some(debounced_cadence_due(now, debounce, scan_interval));
         }
     }
 
@@ -618,6 +628,14 @@ fn next_dirty_due(target: &TargetState, now: PlannerTick, config: PlannerConfig)
         .map(|activity| add_tick(activity, config.scan_interval))
         .unwrap_or(Duration::ZERO);
     debounce_due.max(cadence_due)
+}
+
+fn debounced_cadence_due(
+    now: PlannerTick,
+    debounce: Duration,
+    scan_interval: Duration,
+) -> PlannerTick {
+    add_tick(now, debounce).max(add_tick(now, scan_interval))
 }
 
 fn add_tick(left: PlannerTick, right: Duration) -> PlannerTick {

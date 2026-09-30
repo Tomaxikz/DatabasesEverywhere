@@ -12,6 +12,7 @@ use axum::{
 use tower_http::timeout::TimeoutBody;
 
 const API_REQUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const API_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 use crate::api::{
     artifacts, backups,
@@ -75,26 +76,36 @@ async fn apply_request_body_timeout(
         // total deadlines and maps either one to a stable 408 response.
         return next.run(request).await;
     }
-    let timeout = Duration::from_secs(60);
     let (parts, body) = request.into_parts();
-    let body = Body::new(TimeoutBody::new(timeout, body));
+    let body = Body::new(TimeoutBody::new(API_REQUEST_BODY_TIMEOUT, body));
     next.run(Request::from_parts(parts, body)).await
 }
 
 fn is_streaming_import_upload(request: &Request) -> bool {
     request.method() == Method::POST
         && request.uri().path().ends_with("/import")
-        && request
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value.split(';').next().is_some_and(|value| {
-                    value
-                        .trim()
-                        .eq_ignore_ascii_case("application/octet-stream")
-                })
-            })
+        && has_octet_stream_content_type(request)
+}
+
+fn has_octet_stream_content_type(request: &Request) -> bool {
+    let Some(content_type) = request
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let media_type = content_type.split(';').next().unwrap_or_default();
+    media_type
+        .trim()
+        .eq_ignore_ascii_case("application/octet-stream")
+}
+
+fn is_mutating_method(method: &Method) -> bool {
+    matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    )
 }
 
 async fn apply_request_timeout(request: Request, next: Next) -> Response {
@@ -115,10 +126,7 @@ async fn track_mutating_request(
     request: Request,
     next: Next,
 ) -> Response {
-    if !matches!(
-        request.method(),
-        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
-    ) {
+    if !is_mutating_method(request.method()) {
         return next.run(request).await;
     }
     let Some(_mutation) = state.daemon_shutdown.try_admit_mutation() else {

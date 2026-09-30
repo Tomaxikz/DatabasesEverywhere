@@ -150,21 +150,9 @@ pub(super) async fn update_instance_image_normal(
             docker_error(error),
         ));
     }
-    match state
-        .docker
-        .delete(metadata.protocol, &metadata.instance_id)
+    delete_update_container(&state, metadata.protocol, &metadata.instance_id)
         .await
-    {
-        Ok(_) => {}
-        Err(error) if error.is_not_found() => {}
-        Err(error) => {
-            return Err(fail_image_update_api(
-                &state,
-                &metadata.instance_id,
-                docker_error(error),
-            ));
-        }
-    }
+        .map_err(|error| fail_image_update_api(&state, &metadata.instance_id, error))?;
     let replacement_result: Result<(), ApiError> = async {
         launch_container_from_spec(
             &state,
@@ -177,101 +165,14 @@ pub(super) async fn update_instance_image_normal(
         )
         .await
         .map_err(|error| error.into_api_error())?;
-        if metadata.protocol == Protocol::Postgres {
-            harden_postgres_instance_auth(
-                &state,
-                &metadata.instance_id,
-                &metadata.database.name,
-                &metadata.database.username,
-                effective_password.as_deref().ok_or_else(|| {
-                    ApiError::Conflict(
-                        "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before replacing its image".to_string(),
-                    )
-                })?,
-                metadata.postgres_admin_password.as_deref().ok_or_else(|| {
-                    ApiError::Conflict(
-                        "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before replacing its image".to_string(),
-                    )
-                })?,
-            )
-            .await?;
-        }
-        if metadata.protocol == Protocol::Mariadb {
-            let password = effective_password.as_deref().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "password is required when recreating mariadb database containers".to_string(),
-                )
-            })?;
-            let root_password = metadata.mariadb_root_password.as_deref().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "mariadb internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                )
-            })?;
-            state.install_progress.stage(
-                &metadata.instance_id,
-                "provision",
-                "re-provisioning MariaDB user",
-            );
-            provision_mariadb_tenant_user(
-                &state,
-                &metadata.instance_id,
-                &metadata.database.name,
-                &metadata.database.username,
-                password,
-                root_password,
-            )
-            .await?;
-        }
-        if metadata.protocol == Protocol::Mysql {
-            let password = effective_password.as_deref().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "password is required when recreating mysql database containers".to_string(),
-                )
-            })?;
-            let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
-                ApiError::BadRequest(
-                    "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
-                )
-            })?;
-            state.install_progress.stage(
-                &metadata.instance_id,
-                "provision",
-                "re-provisioning MySQL user",
-            );
-            provision_mysql_tenant_user(
-                &state,
-                &metadata.instance_id,
-                &metadata.database.name,
-                &metadata.database.username,
-                password,
-                root_password,
-            )
-            .await?;
-        }
+        reprovision_tenant_auth(&state, &metadata, effective_password.as_deref()).await?;
         state.install_progress.stage(
             &metadata.instance_id,
             "backend",
             "resolving backend endpoint",
         );
-        metadata.backend =
-            backend_endpoint(&state, metadata.protocol, &metadata.instance_id)?;
-        if metadata.protocol == Protocol::Mariadb
-            && let Some(password) = effective_password.as_deref()
-        {
-            metadata.mariadb_native_password_sha1_stage2 = Some(
-                crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-            );
-        }
-        if metadata.protocol == Protocol::Mysql
-            && let Some(password) = effective_password.as_deref()
-        {
-            metadata.mysql_native_password_sha1_stage2 = Some(
-                crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
-            );
-        }
-        if effective_password.is_some() {
-            metadata.tenant_password.clone_from(&effective_password);
-        }
+        metadata.backend = backend_endpoint(&state, metadata.protocol, &metadata.instance_id)?;
+        record_tenant_password(&mut metadata, &effective_password);
         state.install_progress.stage(
             &metadata.instance_id,
             "compatibility",
@@ -290,11 +191,9 @@ pub(super) async fn update_instance_image_normal(
             ))
         })?;
         if !compatibility.compatible {
-            return Err(ApiError::Conflict(
-                compatibility
-                    .diagnostic
-                    .unwrap_or_else(|| "replacement database version is unsupported".to_string()),
-            ));
+            return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
+                || "replacement database version is unsupported".to_string(),
+            )));
         }
         metadata.status = InstanceStatus::Running;
         metadata.limits.disk_enforced = disk_limiter.mode().enforced();
@@ -405,6 +304,103 @@ pub(crate) async fn run_image_update(
             ))
         }
     }
+}
+
+async fn reprovision_tenant_auth(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    password: Option<&str>,
+) -> Result<(), ApiError> {
+    if metadata.protocol == Protocol::Postgres {
+        harden_postgres_instance_auth(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password.ok_or_else(|| {
+                ApiError::Conflict(
+                    "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before replacing its image".to_string(),
+                )
+            })?,
+            metadata.postgres_admin_password.as_deref().ok_or_else(|| {
+                ApiError::Conflict(
+                    "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before replacing its image".to_string(),
+                )
+            })?,
+        )
+        .await?;
+    }
+    if metadata.protocol == Protocol::Mariadb {
+        let password = password.ok_or_else(|| {
+            ApiError::BadRequest(
+                "password is required when recreating mariadb database containers".to_string(),
+            )
+        })?;
+        let root_password = metadata.mariadb_root_password.as_deref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "mariadb internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+            )
+        })?;
+        state.install_progress.stage(
+            &metadata.instance_id,
+            "provision",
+            "re-provisioning MariaDB user",
+        );
+        provision_mariadb_tenant_user(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            root_password,
+        )
+        .await?;
+    }
+    if metadata.protocol == Protocol::Mysql {
+        let password = password.ok_or_else(|| {
+            ApiError::BadRequest(
+                "password is required when recreating mysql database containers".to_string(),
+            )
+        })?;
+        let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "mysql internal root password is missing; old instances must be recreated with purge or repaired manually".to_string(),
+            )
+        })?;
+        state.install_progress.stage(
+            &metadata.instance_id,
+            "provision",
+            "re-provisioning MySQL user",
+        );
+        provision_mysql_tenant_user(
+            state,
+            &metadata.instance_id,
+            &metadata.database.name,
+            &metadata.database.username,
+            password,
+            root_password,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn record_tenant_password(metadata: &mut InstanceMetadata, password: &Option<String>) {
+    let Some(password) = password else {
+        return;
+    };
+    let native_password_hash = || {
+        Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
+            password,
+        ))
+    };
+    if metadata.protocol == Protocol::Mariadb {
+        metadata.mariadb_native_password_sha1_stage2 = native_password_hash();
+    }
+    if metadata.protocol == Protocol::Mysql {
+        metadata.mysql_native_password_sha1_stage2 = native_password_hash();
+    }
+    metadata.tenant_password = Some(password.clone());
 }
 
 pub(crate) fn spawn_owned_mutation_task<F, T>(future: F) -> tokio::task::JoinHandle<T>
@@ -560,18 +556,14 @@ pub(super) async fn quarantine_image_update(
         "image-update runtime or commit state became uncertain; gateway routes were removed and the instance was quarantined"
     );
 
-    match (runtime_result, persistence_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (runtime, persistence) => {
-            let mut failures = Vec::new();
-            if let Err(error) = runtime {
-                failures.push(error);
-            }
-            if let Err(error) = persistence {
-                failures.push(error);
-            }
-            Err(ApiError::Runtime(failures.join("; ")))
-        }
+    let failures: Vec<String> = [runtime_result, persistence_result]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Runtime(failures.join("; ")))
     }
 }
 

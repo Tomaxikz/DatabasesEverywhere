@@ -14,7 +14,6 @@ impl LogRedactor {
     pub(crate) fn push(&mut self, text: &str) -> String {
         let mut output = String::new();
         for part in text.split_inclusive(['\n', '\r']) {
-            let complete = part.ends_with(['\n', '\r']);
             if self.failed {
                 break;
             }
@@ -25,7 +24,8 @@ impl LogRedactor {
                 break;
             }
             self.pending.push_str(part);
-            if complete && let Some(safe) = redaction::redact_log_record(&self.pending) {
+            let record_complete = part.ends_with(['\n', '\r']);
+            if record_complete && let Some(safe) = redaction::redact_log_record(&self.pending) {
                 output.push_str(&safe);
                 self.pending.clear();
             }
@@ -63,7 +63,7 @@ pub fn summarize_failure_logs(logs: &str, max_chars: usize) -> String {
     let important = logs
         .lines()
         .filter(|line| failure_line_is_important(line))
-        .take(20)
+        .take(MAX_IMPORTANT_FAILURE_LINES)
         .collect::<Vec<_>>();
 
     if important.is_empty() {
@@ -78,24 +78,32 @@ pub fn summarize_failure_logs(logs: &str, max_chars: usize) -> String {
     truncate_log_tail(&summary, max_chars)
 }
 
+const MAX_IMPORTANT_FAILURE_LINES: usize = 20;
+
+const IMPORTANT_FAILURE_MARKERS: &[&str] = &[
+    "\"s\":\"f\"",
+    "\"s\":\"e\"",
+    " fatal",
+    "fatal:",
+    " error",
+    "error:",
+    "exception",
+    "cannot start",
+    "not compatible",
+    "incompatible",
+    "upgrade",
+    "downgrade",
+    "permission denied",
+    "operation not permitted",
+    "no space left",
+    "disk quota exceeded",
+];
+
 fn failure_line_is_important(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    lower.contains("\"s\":\"f\"")
-        || lower.contains("\"s\":\"e\"")
-        || lower.contains(" fatal")
-        || lower.contains("fatal:")
-        || lower.contains(" error")
-        || lower.contains("error:")
-        || lower.contains("exception")
-        || lower.contains("cannot start")
-        || lower.contains("not compatible")
-        || lower.contains("incompatible")
-        || lower.contains("upgrade")
-        || lower.contains("downgrade")
-        || lower.contains("permission denied")
-        || lower.contains("operation not permitted")
-        || lower.contains("no space left")
-        || lower.contains("disk quota exceeded")
+    IMPORTANT_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 #[cfg(test)]

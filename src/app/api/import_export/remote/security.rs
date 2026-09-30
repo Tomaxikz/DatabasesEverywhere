@@ -225,40 +225,57 @@ fn classify_address(address: IpAddr) -> AddressClass {
 fn classify_ipv4(address: Ipv4Addr) -> AddressClass {
     // Some cloud control-plane endpoints use otherwise routable-looking
     // addresses rather than the usual IPv4 link-local metadata address.
-    if address == Ipv4Addr::new(100, 100, 100, 200) || address == Ipv4Addr::new(168, 63, 129, 16) {
+    if CLOUD_CONTROL_PLANE_IPV4_ADDRESSES.contains(&address) {
         return AddressClass::Forbidden;
     }
 
-    if in_ipv4_prefix(address, [10, 0, 0, 0], 8)
-        || in_ipv4_prefix(address, [172, 16, 0, 0], 12)
-        || in_ipv4_prefix(address, [192, 168, 0, 0], 16)
-        || in_ipv4_prefix(address, [100, 64, 0, 0], 10)
-    {
+    let in_any_range = |ranges: &[([u8; 4], u32)]| {
+        ranges
+            .iter()
+            .any(|&(network, prefix)| in_ipv4_prefix(address, network, prefix))
+    };
+
+    if in_any_range(PRIVATE_IPV4_RANGES) {
         return AddressClass::Private;
     }
 
     // Reject non-forwardable and IANA special-purpose ranges even when some
     // individual anycast assignments inside them are globally reachable.
-    if in_ipv4_prefix(address, [0, 0, 0, 0], 8)
-        || in_ipv4_prefix(address, [127, 0, 0, 0], 8)
-        || in_ipv4_prefix(address, [169, 254, 0, 0], 16)
-        || in_ipv4_prefix(address, [192, 0, 0, 0], 24)
-        || in_ipv4_prefix(address, [192, 0, 2, 0], 24)
-        || in_ipv4_prefix(address, [192, 31, 196, 0], 24)
-        || in_ipv4_prefix(address, [192, 52, 193, 0], 24)
-        || in_ipv4_prefix(address, [192, 88, 99, 0], 24)
-        || in_ipv4_prefix(address, [192, 175, 48, 0], 24)
-        || in_ipv4_prefix(address, [198, 18, 0, 0], 15)
-        || in_ipv4_prefix(address, [198, 51, 100, 0], 24)
-        || in_ipv4_prefix(address, [203, 0, 113, 0], 24)
-        || in_ipv4_prefix(address, [224, 0, 0, 0], 4)
-        || in_ipv4_prefix(address, [240, 0, 0, 0], 4)
-    {
+    if in_any_range(FORBIDDEN_IPV4_RANGES) {
         AddressClass::Forbidden
     } else {
         AddressClass::Public
     }
 }
+
+const CLOUD_CONTROL_PLANE_IPV4_ADDRESSES: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(100, 100, 100, 200),
+    Ipv4Addr::new(168, 63, 129, 16),
+];
+
+const PRIVATE_IPV4_RANGES: &[([u8; 4], u32)] = &[
+    ([10, 0, 0, 0], 8),
+    ([172, 16, 0, 0], 12),
+    ([192, 168, 0, 0], 16),
+    ([100, 64, 0, 0], 10),
+];
+
+const FORBIDDEN_IPV4_RANGES: &[([u8; 4], u32)] = &[
+    ([0, 0, 0, 0], 8),
+    ([127, 0, 0, 0], 8),
+    ([169, 254, 0, 0], 16),
+    ([192, 0, 0, 0], 24),
+    ([192, 0, 2, 0], 24),
+    ([192, 31, 196, 0], 24),
+    ([192, 52, 193, 0], 24),
+    ([192, 88, 99, 0], 24),
+    ([192, 175, 48, 0], 24),
+    ([198, 18, 0, 0], 15),
+    ([198, 51, 100, 0], 24),
+    ([203, 0, 113, 0], 24),
+    ([224, 0, 0, 0], 4),
+    ([240, 0, 0, 0], 4),
+];
 
 fn in_ipv4_prefix(address: Ipv4Addr, network: [u8; 4], prefix: u32) -> bool {
     let address = u32::from(address);

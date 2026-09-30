@@ -4,6 +4,10 @@ use super::{archive::*, *};
 
 pub(super) use crate::shared::files::ensure_private_dir as create_private_dir;
 
+const COMPRESSION_OVERHEAD_DIVISOR: u64 = 50;
+const COMPRESSION_FIXED_OVERHEAD_BYTES: u64 = 1024 * 1024;
+const EXPORT_GZIP_LEVEL: u32 = 3;
+
 pub(crate) async fn logical_staging_root(state: &AppState) -> Result<PathBuf, ApiError> {
     let root = PathBuf::from(state.config.paths.tmp_root()).join("import-export");
     prepare_private_dir(&root, "logical import/export staging directory").await?;
@@ -68,8 +72,8 @@ pub(super) fn export_artifact_capacity_bytes(
         return Some(source_bytes.max(1));
     }
     source_bytes
-        .checked_add(source_bytes.div_ceil(50))
-        .and_then(|bytes| bytes.checked_add(1024 * 1024))
+        .checked_add(source_bytes.div_ceil(COMPRESSION_OVERHEAD_DIVISOR))
+        .and_then(|bytes| bytes.checked_add(COMPRESSION_FIXED_OVERHEAD_BYTES))
 }
 
 pub(super) async fn move_or_copy_file(from: &FsPath, to: &FsPath) -> Result<(), ApiError> {
@@ -106,8 +110,10 @@ pub(super) async fn compress_gzip(
             let mut input = std::fs::File::open(source)?;
             write_new_private_file(&target, |output| {
                 let output = BoundedExportWriter::new(output, max_output_bytes);
-                let mut encoder =
-                    flate2::write::GzEncoder::new(output, flate2::Compression::new(3));
+                let mut encoder = flate2::write::GzEncoder::new(
+                    output,
+                    flate2::Compression::new(EXPORT_GZIP_LEVEL),
+                );
                 copy_limited_until(&mut input, &mut encoder, u64::MAX, deadline)?;
                 encoder.finish()?;
                 Ok(())
@@ -286,69 +292,11 @@ pub(super) async fn validate_artifact_path(
         return Err(ApiError::BadRequest("invalid artifact_id".to_string()));
     }
 
-    let base_roots = [
-        PathBuf::from(state.config.paths.exports_root()),
-        PathBuf::from(state.config.paths.imports_root()),
-    ];
-    let mut instance_roots = Vec::with_capacity(base_roots.len());
-    for base_root in base_roots {
-        prepare_private_dir(&base_root, "artifact root").await?;
-        let instance_root = base_root.join(instance_id);
-        prepare_private_dir(&instance_root, "instance artifact directory").await?;
-        instance_roots.push(
-            tokio::fs::canonicalize(&instance_root)
-                .await
-                .map_err(|error| {
-                    ApiError::Runtime(format!("failed to resolve instance artifact root: {error}"))
-                })?,
-        );
-    }
-
+    let instance_roots = prepare_instance_artifact_roots(state, instance_id).await?;
     let artifact_path = if path.is_absolute() {
-        let source_metadata = tokio::fs::symlink_metadata(path)
-            .await
-            .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
-        if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-            return Err(ApiError::BadRequest(
-                "artifact_id must name a real regular file".to_string(),
-            ));
-        }
-        let canonical = tokio::fs::canonicalize(path)
-            .await
-            .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
-        let belongs_to_instance = canonical
-            .parent()
-            .is_some_and(|parent| instance_roots.iter().any(|root| parent == root));
-        if !belongs_to_instance {
-            return Err(ApiError::BadRequest(
-                "artifact does not belong to the requested instance".to_string(),
-            ));
-        }
-        canonical
+        resolve_absolute_artifact(path, &instance_roots).await?
     } else {
-        let mut resolved = None;
-        for root in &instance_roots {
-            let candidate = root.join(artifact_id);
-            let metadata = match tokio::fs::symlink_metadata(&candidate).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(ApiError::Runtime(format!(
-                        "failed to inspect import artifact: {error}"
-                    )));
-                }
-            };
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(ApiError::BadRequest(
-                    "artifact_id must name a real regular file".to_string(),
-                ));
-            }
-            resolved = Some(tokio::fs::canonicalize(candidate).await.map_err(|error| {
-                ApiError::Runtime(format!("failed to resolve import artifact: {error}"))
-            })?);
-            break;
-        }
-        resolved.ok_or(ApiError::NotFound)?
+        find_relative_artifact(artifact_id, &instance_roots).await?
     };
 
     if !has_allowed_artifact_extension(&artifact_path) {
@@ -366,6 +314,82 @@ pub(super) async fn validate_artifact_path(
             })?;
     }
     Ok(artifact_path)
+}
+
+async fn prepare_instance_artifact_roots(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<Vec<PathBuf>, ApiError> {
+    let base_roots = [
+        PathBuf::from(state.config.paths.exports_root()),
+        PathBuf::from(state.config.paths.imports_root()),
+    ];
+    let mut instance_roots = Vec::with_capacity(base_roots.len());
+    for base_root in base_roots {
+        prepare_private_dir(&base_root, "artifact root").await?;
+        let instance_root = base_root.join(instance_id);
+        prepare_private_dir(&instance_root, "instance artifact directory").await?;
+        let canonical_root = tokio::fs::canonicalize(&instance_root)
+            .await
+            .map_err(|error| {
+                ApiError::Runtime(format!("failed to resolve instance artifact root: {error}"))
+            })?;
+        instance_roots.push(canonical_root);
+    }
+    Ok(instance_roots)
+}
+
+async fn resolve_absolute_artifact(
+    path: &FsPath,
+    instance_roots: &[PathBuf],
+) -> Result<PathBuf, ApiError> {
+    let source_metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(ApiError::BadRequest(
+            "artifact_id must name a real regular file".to_string(),
+        ));
+    }
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("artifact_id is invalid: {error}")))?;
+    let belongs_to_instance = canonical
+        .parent()
+        .is_some_and(|parent| instance_roots.iter().any(|root| parent == root));
+    if !belongs_to_instance {
+        return Err(ApiError::BadRequest(
+            "artifact does not belong to the requested instance".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn find_relative_artifact(
+    artifact_id: &str,
+    instance_roots: &[PathBuf],
+) -> Result<PathBuf, ApiError> {
+    for root in instance_roots {
+        let candidate = root.join(artifact_id);
+        let metadata = match tokio::fs::symlink_metadata(&candidate).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(ApiError::Runtime(format!(
+                    "failed to inspect import artifact: {error}"
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ApiError::BadRequest(
+                "artifact_id must name a real regular file".to_string(),
+            ));
+        }
+        return tokio::fs::canonicalize(candidate).await.map_err(|error| {
+            ApiError::Runtime(format!("failed to resolve import artifact: {error}"))
+        });
+    }
+    Err(ApiError::NotFound)
 }
 
 pub(super) fn has_allowed_artifact_extension(path: &FsPath) -> bool {

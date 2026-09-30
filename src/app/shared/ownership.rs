@@ -6,14 +6,16 @@ pub struct HostOwner {
     pub gid: u32,
 }
 
-pub fn chown_recursive(path: &Path, owner: HostOwner) -> std::io::Result<()> {
-    use rustix::fs::{Mode, OFlags, open};
+fn no_follow_directory_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
 
-    let directory = match open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+pub fn chown_recursive(path: &Path, owner: HostOwner) -> std::io::Result<()> {
+    use rustix::fs::{Mode, open};
+
+    let directory = match open(path, no_follow_directory_flags(), Mode::empty()) {
         Ok(directory) => directory,
         Err(rustix::io::Errno::NOENT) => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -29,7 +31,7 @@ fn chown_directory_fd(
     use std::os::unix::ffi::OsStrExt;
 
     use rustix::{
-        fs::{AtFlags, Dir, FileType, Mode, OFlags, chownat, fchown, openat, statat},
+        fs::{AtFlags, Dir, FileType, Mode, chownat, fchown, openat, statat},
         process::{Gid, Uid},
     };
 
@@ -42,7 +44,7 @@ fn chown_directory_fd(
     for entry in &mut entries {
         let entry = entry.map_err(std::io::Error::from)?;
         let name = entry.file_name();
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+        if !matches!(name.to_bytes(), b"." | b"..") {
             names.push(name.to_owned());
         }
     }
@@ -57,16 +59,12 @@ fn chown_directory_fd(
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Symlink => {}
             FileType::Directory => {
-                let child = match openat(
-                    directory,
-                    &name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                ) {
-                    Ok(child) => child,
-                    Err(rustix::io::Errno::NOENT) => continue,
-                    Err(error) => return Err(error.into()),
-                };
+                let child =
+                    match openat(directory, &name, no_follow_directory_flags(), Mode::empty()) {
+                        Ok(child) => child,
+                        Err(rustix::io::Errno::NOENT) => continue,
+                        Err(error) => return Err(error.into()),
+                    };
                 chown_directory_fd(&child, &child_path, owner)?;
             }
             _ => {
@@ -88,16 +86,12 @@ fn chown_directory_fd(
 /// runtime group to traverse known bind-mount paths beneath it.
 pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std::io::Result<()> {
     use rustix::{
-        fs::{FileType, Mode, OFlags, fchmod, fchown, fstat, open},
+        fs::{FileType, Mode, fchmod, fchown, fstat, open},
         process::{Gid, Uid},
     };
 
-    let directory = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
+    let directory =
+        open(path, no_follow_directory_flags(), Mode::empty()).map_err(std::io::Error::from)?;
     let stat = fstat(&directory).map_err(std::io::Error::from)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != daemon_uid {
         return Err(std::io::Error::new(

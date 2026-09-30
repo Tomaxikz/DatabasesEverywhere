@@ -126,37 +126,38 @@ pub(super) fn runtime_report_usage(
 ) -> Result<RuntimeReportUsage, ApiError> {
     let cpu_usage_percent = stats.and_then(|stats| stats.cpu_usage_percent);
     let memory_usage_bytes = stats.and_then(|stats| stats.memory_usage_bytes);
-    if deployment_mode == DeploymentMode::Shared {
-        // CPU time and working-set memory are cgroup measurements. They cannot
-        // be attributed honestly to one tenant within a shared engine.
-        let pool = if view == ResourceView::Admin {
-            let capacity = pool_capacity.ok_or_else(|| {
-                ApiError::Runtime("shared runtime capacity is temporarily unavailable".to_string())
-            })?;
-            Some(PoolUsageReport {
-                runtime_id: runtime_id.to_string(),
-                cpu_limit_cores: capacity.cpu_limit_cores,
-                cpu_usage_percent,
-                memory_limit_bytes: capacity.memory_limit_bytes,
-                memory_usage_bytes,
-            })
-        } else {
-            None
-        };
-        Ok(RuntimeReportUsage {
-            cpu_usage_percent: None,
-            memory_usage_bytes: None,
-            memory_limit_bytes: None,
-            pool,
-        })
-    } else {
-        Ok(RuntimeReportUsage {
+    if deployment_mode != DeploymentMode::Shared {
+        return Ok(RuntimeReportUsage {
             cpu_usage_percent,
             memory_usage_bytes,
             memory_limit_bytes: Some(mib_to_bytes(memory_mib)),
             pool: None,
-        })
+        });
     }
+    // CPU time and working-set memory are cgroup measurements. They cannot
+    // be attributed honestly to one tenant within a shared engine.
+    let pool = if view == ResourceView::Admin {
+        let capacity = pool_capacity.ok_or_else(capacity_unavailable)?;
+        Some(PoolUsageReport {
+            runtime_id: runtime_id.to_string(),
+            cpu_limit_cores: capacity.cpu_limit_cores,
+            cpu_usage_percent,
+            memory_limit_bytes: capacity.memory_limit_bytes,
+            memory_usage_bytes,
+        })
+    } else {
+        None
+    };
+    Ok(RuntimeReportUsage {
+        cpu_usage_percent: None,
+        memory_usage_bytes: None,
+        memory_limit_bytes: None,
+        pool,
+    })
+}
+
+fn capacity_unavailable() -> ApiError {
+    ApiError::Runtime("shared runtime capacity is temporarily unavailable".to_string())
 }
 
 pub(super) async fn load_pool_capacity(
@@ -170,16 +171,10 @@ pub(super) async fn load_pool_capacity(
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|_| {
-            ApiError::Runtime("shared runtime capacity is temporarily unavailable".to_string())
-        })?
-        .ok_or_else(|| {
-            ApiError::Runtime("shared runtime capacity is temporarily unavailable".to_string())
-        })?;
+        .map_err(|_| capacity_unavailable())?
+        .ok_or_else(capacity_unavailable)?;
     if runtime.deployment_mode != DeploymentMode::Shared || runtime.protocol != metadata.protocol {
-        return Err(ApiError::Runtime(
-            "shared runtime capacity is temporarily unavailable".to_string(),
-        ));
+        return Err(capacity_unavailable());
     }
     Ok(Some(PoolCapacity {
         cpu_limit_cores: runtime.limits.cpu_cores,
@@ -203,13 +198,7 @@ pub(crate) async fn get_shared_pool(
     ApiPath(runtime_id): ApiPath<String>,
 ) -> ApiResult<SharedPoolReport> {
     auth.require_scope(scopes::POOLS_READ)?;
-    let runtime = state
-        .placements
-        .get(&runtime_id)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared pool: {error}")))?
-        .filter(|runtime| runtime.deployment_mode == DeploymentMode::Shared)
-        .ok_or(ApiError::NotFound)?;
+    let runtime = load_shared_runtime(&state, &runtime_id).await?;
     let mut reports = pool_reports(&state, std::slice::from_ref(&runtime)).await?;
     reports
         .pop()
@@ -225,13 +214,7 @@ pub(crate) async fn list_pool_tenants(
     ApiPath(runtime_id): ApiPath<String>,
 ) -> ApiResult<Vec<SharedPoolTenant>> {
     auth.require_scope(scopes::POOLS_READ)?;
-    let runtime = state
-        .placements
-        .get(&runtime_id)
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared pool: {error}")))?
-        .filter(|runtime| runtime.deployment_mode == DeploymentMode::Shared)
-        .ok_or(ApiError::NotFound)?;
+    let runtime = load_shared_runtime(&state, &runtime_id).await?;
     let members = crate::api::pools::tenants(&state, &runtime).await?;
     let mut tenants = Vec::with_capacity(members.len());
     for metadata in members {
@@ -246,6 +229,19 @@ pub(crate) async fn list_pool_tenants(
         });
     }
     Ok(ApiResponse::ok(tenants))
+}
+
+async fn load_shared_runtime(
+    state: &AppState,
+    runtime_id: &str,
+) -> Result<EngineRuntime, ApiError> {
+    state
+        .placements
+        .get(runtime_id)
+        .await
+        .map_err(|error| ApiError::Runtime(format!("failed to load shared pool: {error}")))?
+        .filter(|runtime| runtime.deployment_mode == DeploymentMode::Shared)
+        .ok_or(ApiError::NotFound)
 }
 
 async fn shared_runtimes(state: &AppState) -> Result<Vec<EngineRuntime>, ApiError> {
@@ -275,22 +271,7 @@ pub(crate) async fn pool_reports(
     let clock = ReportClock::now();
     let mut reports = Vec::with_capacity(runtimes.len());
     for runtime in runtimes {
-        // Docker retains the OOM flag after exit, including across daemon
-        // restarts. Do not infer OOM from exit code 137 or stale metadata alone.
-        let diagnostic = if matches!(
-            runtime.status,
-            EngineRuntimeStatus::Failed | EngineRuntimeStatus::Stopped
-        ) {
-            state
-                .docker
-                .inspect_instance(runtime.protocol, &runtime.runtime_id)
-                .await
-                .ok()
-                .as_ref()
-                .and_then(oom_diagnostic)
-        } else {
-            None
-        };
+        let diagnostic = inactive_runtime_diagnostic(state, runtime).await;
         let usage = usage.get(&runtime.runtime_id);
         let stats = usage.map(|usage| &usage.runtime_stats);
         let (cpu_usage_percent, cpu_sample) = runtime_metric(
@@ -347,6 +328,27 @@ pub(crate) async fn pool_reports(
     }
     reports.sort_unstable_by(|left, right| left.runtime_id.cmp(&right.runtime_id));
     Ok(reports)
+}
+
+async fn inactive_runtime_diagnostic(
+    state: &AppState,
+    runtime: &EngineRuntime,
+) -> Option<PublicDiagnostic> {
+    // Docker retains the OOM flag after exit, including across daemon
+    // restarts. Do not infer OOM from exit code 137 or stale metadata alone.
+    if !matches!(
+        runtime.status,
+        EngineRuntimeStatus::Failed | EngineRuntimeStatus::Stopped
+    ) {
+        return None;
+    }
+    state
+        .docker
+        .inspect_instance(runtime.protocol, &runtime.runtime_id)
+        .await
+        .ok()
+        .as_ref()
+        .and_then(oom_diagnostic)
 }
 
 fn oom_diagnostic(
@@ -407,112 +409,71 @@ fn runtime_metric<T: Copy>(
         status,
         EngineRuntimeStatus::Booting | EngineRuntimeStatus::Running
     ) {
-        let failed = status == EngineRuntimeStatus::Failed;
-        return (
-            None,
-            metric_sample(
-                source,
-                if failed {
-                    PoolMetricState::Failed
-                } else {
-                    PoolMetricState::Stopped
-                },
-                None,
-                Some(PublicDiagnostic::public(
-                    if failed {
-                        "runtime_failed"
-                    } else {
-                        "runtime_stopped"
-                    },
-                    if failed {
-                        "the shared pool runtime is failed"
-                    } else {
-                        "the shared pool runtime is not running"
-                    },
-                )),
-            ),
-        );
+        let (state, code, message) = if status == EngineRuntimeStatus::Failed {
+            (
+                PoolMetricState::Failed,
+                "runtime_failed",
+                "the shared pool runtime is failed",
+            )
+        } else {
+            (
+                PoolMetricState::Stopped,
+                "runtime_stopped",
+                "the shared pool runtime is not running",
+            )
+        };
+        return unavailable_metric(source, state, None, code, message);
     }
 
     let Some(stats) = stats else {
-        return (
+        return unavailable_metric(
+            source,
+            PoolMetricState::Failed,
             None,
-            metric_sample(
-                source,
-                PoolMetricState::Failed,
-                None,
-                Some(PublicDiagnostic::public(
-                    "sampler_report_missing",
-                    "the shared pool sampler did not return this runtime",
-                )),
-            ),
+            "sampler_report_missing",
+            "the shared pool sampler did not return this runtime",
         );
     };
     let Some(sample) = stats.sample() else {
         let warming = status == EngineRuntimeStatus::Booting || stats.worker_active();
-        return (
-            None,
-            metric_sample(
-                source,
-                if warming {
-                    PoolMetricState::Warming
-                } else {
-                    PoolMetricState::Failed
-                },
-                None,
-                Some(PublicDiagnostic::public(
-                    if warming {
-                        "sampler_warming"
-                    } else {
-                        "sampler_unavailable"
-                    },
-                    if warming {
-                        "the shared pool sampler is waiting for its first value"
-                    } else {
-                        "the shared pool sampler is temporarily unavailable"
-                    },
-                )),
-            ),
-        );
+        let (state, code, message) = if warming {
+            (
+                PoolMetricState::Warming,
+                "sampler_warming",
+                "the shared pool sampler is waiting for its first value",
+            )
+        } else {
+            (
+                PoolMetricState::Failed,
+                "sampler_unavailable",
+                "the shared pool sampler is temporarily unavailable",
+            )
+        };
+        return unavailable_metric(source, state, None, code, message);
     };
 
-    let (sampled_at_unix, sample_age_seconds) = clock.sample_time(sample.sampled_at);
+    let sample_time = clock.sample_time(sample.sampled_at);
     if clock.instant.saturating_duration_since(sample.sampled_at) >= RUNTIME_STATS_STALE_AFTER {
-        return (
-            None,
-            metric_sample(
-                source,
-                PoolMetricState::Stale,
-                Some((sampled_at_unix, sample_age_seconds)),
-                Some(PublicDiagnostic::public(
-                    "stale_sample",
-                    "the latest shared pool runtime sample is stale",
-                )),
-            ),
+        return unavailable_metric(
+            source,
+            PoolMetricState::Stale,
+            Some(sample_time),
+            "stale_sample",
+            "the latest shared pool runtime sample is stale",
         );
     }
     let Some(value) = value(sample) else {
-        return (
-            None,
-            metric_sample(
-                source,
-                PoolMetricState::Failed,
-                Some((sampled_at_unix, sample_age_seconds)),
-                Some(PublicDiagnostic::public(
-                    "metric_unavailable",
-                    "the container runtime omitted this metric",
-                )),
-            ),
+        return unavailable_metric(
+            source,
+            PoolMetricState::Failed,
+            Some(sample_time),
+            "metric_unavailable",
+            "the container runtime omitted this metric",
         );
     };
     (
         Some(value),
-        metric_sample(
-            source,
-            PoolMetricState::Fresh,
-            Some((sampled_at_unix, sample_age_seconds)),
-            None,
-        ),
+        metric_sample(source, PoolMetricState::Fresh, Some(sample_time), None),
     )
 }
 
@@ -523,17 +484,12 @@ fn disk_metric(
     clock: ReportClock,
 ) -> (Option<u64>, PoolMetricSample) {
     let Some(disk) = disk else {
-        return (
+        return unavailable_metric(
+            fallback_source,
+            PoolMetricState::Failed,
             None,
-            metric_sample(
-                fallback_source,
-                PoolMetricState::Failed,
-                None,
-                Some(PublicDiagnostic::public(
-                    "sampler_report_missing",
-                    "the shared pool sampler did not return this runtime",
-                )),
-            ),
+            "sampler_report_missing",
+            "the shared pool sampler did not return this runtime",
         );
     };
     let sample = match disk {
@@ -545,45 +501,30 @@ fn disk_metric(
                 %error,
                 "shared pool disk sample unavailable"
             );
-            return (
-                None,
-                metric_sample(
-                    fallback_source,
-                    if warming {
-                        PoolMetricState::Warming
-                    } else {
-                        PoolMetricState::Failed
-                    },
-                    None,
-                    Some(PublicDiagnostic::public(
-                        if warming {
-                            "disk_scan_warming"
-                        } else {
-                            "disk_sample_failed"
-                        },
-                        if warming {
-                            "the shared pool disk scan is still in progress"
-                        } else {
-                            "shared pool disk usage is temporarily unavailable"
-                        },
-                    )),
-                ),
-            );
+            let (state, code, message) = if warming {
+                (
+                    PoolMetricState::Warming,
+                    "disk_scan_warming",
+                    "the shared pool disk scan is still in progress",
+                )
+            } else {
+                (
+                    PoolMetricState::Failed,
+                    "disk_sample_failed",
+                    "shared pool disk usage is temporarily unavailable",
+                )
+            };
+            return unavailable_metric(fallback_source, state, None, code, message);
         }
     };
-    let (sampled_at_unix, sample_age_seconds) = clock.sample_time(sample.sampled_at);
+    let sample_time = clock.sample_time(sample.sampled_at);
     if clock.instant.saturating_duration_since(sample.sampled_at) >= DISK_REFRESH_INTERVAL {
-        return (
-            None,
-            metric_sample(
-                sample.source.into(),
-                PoolMetricState::Stale,
-                Some((sampled_at_unix, sample_age_seconds)),
-                Some(PublicDiagnostic::public(
-                    "stale_sample",
-                    "the latest shared pool disk sample is stale",
-                )),
-            ),
+        return unavailable_metric(
+            sample.source.into(),
+            PoolMetricState::Stale,
+            Some(sample_time),
+            "stale_sample",
+            "the latest shared pool disk sample is stale",
         );
     }
     (
@@ -591,10 +532,21 @@ fn disk_metric(
         metric_sample(
             sample.source.into(),
             PoolMetricState::Fresh,
-            Some((sampled_at_unix, sample_age_seconds)),
+            Some(sample_time),
             None,
         ),
     )
+}
+
+fn unavailable_metric<T>(
+    source: PoolMetricSource,
+    state: PoolMetricState,
+    time: Option<(i64, u64)>,
+    code: &'static str,
+    message: &'static str,
+) -> (Option<T>, PoolMetricSample) {
+    let diagnostic = PublicDiagnostic::public(code, message);
+    (None, metric_sample(source, state, time, Some(diagnostic)))
 }
 
 fn metric_sample(

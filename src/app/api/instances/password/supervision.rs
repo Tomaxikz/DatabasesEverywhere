@@ -164,14 +164,22 @@ async fn quarantine_instance(
     let quarantined = quarantined_metadata(metadata);
     super::super::route_fence::fence(state, &metadata.instance_id).await;
     state.instances.upsert(quarantined.clone()).await;
-    let persistence_error = state.manager.quarantine(quarantined, crate::storage::quarantine::QuarantineKind::CredentialIntegrity).await.err().map(|error| {
-        tracing::error!(
-            instance_id = %metadata.instance_id,
-            error = %error,
-            "failed to persist quarantine after password reset rollback failure; runtime stop will still be attempted"
-        );
-        format!("failed to persist password-reset quarantine: {error}")
-    });
+    let persistence_error = state
+        .manager
+        .quarantine(
+            quarantined,
+            crate::storage::quarantine::QuarantineKind::CredentialIntegrity,
+        )
+        .await
+        .err()
+        .map(|error| {
+            tracing::error!(
+                instance_id = %metadata.instance_id,
+                error = %error,
+                "failed to persist quarantine after password reset rollback failure; runtime stop will still be attempted"
+            );
+            format!("failed to persist password-reset quarantine: {error}")
+        });
     let runtime_error = match state
         .docker
         .stop(metadata.protocol, &metadata.instance_id)
@@ -251,14 +259,12 @@ pub(super) fn classify_password_commit(
     previous: &InstanceMetadata,
     intended: &InstanceMetadata,
 ) -> PasswordMetadataCommitResolution {
-    match super::super::major_upgrade::classify_upgrade_commit(&persisted, previous, intended) {
-        super::super::major_upgrade::MajorUpgradeCommitResolution::Committed => {
-            PasswordMetadataCommitResolution::Committed
-        }
-        super::super::major_upgrade::MajorUpgradeCommitResolution::NotCommitted => {
-            PasswordMetadataCommitResolution::Previous
-        }
-        super::super::major_upgrade::MajorUpgradeCommitResolution::Uncertain(reason) => {
+    use super::super::major_upgrade::{MajorUpgradeCommitResolution, classify_upgrade_commit};
+
+    match classify_upgrade_commit(&persisted, previous, intended) {
+        MajorUpgradeCommitResolution::Committed => PasswordMetadataCommitResolution::Committed,
+        MajorUpgradeCommitResolution::NotCommitted => PasswordMetadataCommitResolution::Previous,
+        MajorUpgradeCommitResolution::Uncertain(reason) => {
             PasswordMetadataCommitResolution::Uncertain {
                 reason,
                 persisted: Some(Box::new(persisted)),
@@ -682,45 +688,39 @@ pub(super) fn apply_new_route_auth(
     previous: &PreviousCredential,
     qdrant_route_secret: &[u8],
 ) {
-    metadata.tenant_password = Some(password.expose_secret().to_string());
+    let plaintext = password.expose_secret();
+    let maintenance_secret = || {
+        previous
+            .maintenance
+            .as_ref()
+            .map(|value| value.expose_secret().to_string())
+    };
+    let native_verifier = || {
+        Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
+            plaintext,
+        ))
+    };
+    metadata.tenant_password = Some(plaintext.to_string());
     match metadata.protocol {
         Protocol::Mariadb => {
-            metadata.mariadb_root_password = previous
-                .maintenance
-                .as_ref()
-                .map(|value| value.expose_secret().to_string());
-            metadata.mariadb_native_password_sha1_stage2 =
-                Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
-                    password.expose_secret(),
-                ));
+            metadata.mariadb_root_password = maintenance_secret();
+            metadata.mariadb_native_password_sha1_stage2 = native_verifier();
         }
         Protocol::Mysql => {
-            metadata.mysql_root_password = previous
-                .maintenance
-                .as_ref()
-                .map(|value| value.expose_secret().to_string());
-            metadata.mysql_native_password_sha1_stage2 =
-                Some(crate::protocols::mariadb::native_password_sha1_stage2_hex(
-                    password.expose_secret(),
-                ));
+            metadata.mysql_root_password = maintenance_secret();
+            metadata.mysql_native_password_sha1_stage2 = native_verifier();
         }
         Protocol::Qdrant => {
             metadata.route_key_sha256 = Some(crate::protocols::qdrant::route_key_fingerprint(
                 qdrant_route_secret,
-                password.expose_secret(),
+                plaintext,
             ));
         }
         Protocol::Postgres => {
-            metadata.postgres_admin_password = previous
-                .maintenance
-                .as_ref()
-                .map(|value| value.expose_secret().to_string());
+            metadata.postgres_admin_password = maintenance_secret();
         }
         Protocol::Mongodb => {
-            metadata.mongodb_root_password = previous
-                .maintenance
-                .as_ref()
-                .map(|value| value.expose_secret().to_string());
+            metadata.mongodb_root_password = maintenance_secret();
         }
         Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse => {}
     }

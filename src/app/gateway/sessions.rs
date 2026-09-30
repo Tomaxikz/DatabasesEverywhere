@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::Context,
@@ -40,9 +40,20 @@ struct TenantEntry {
     buffers: super::buffers::QueryBudget,
 }
 
+impl TenantEntry {
+    fn prune_dropped_sessions(&mut self) {
+        self.sessions
+            .retain(|_, session| session.strong_count() > 0);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RegistryState {
     tenants: HashMap<String, TenantEntry>,
+}
+
+fn lock_registry(registry: &Mutex<RegistryState>) -> MutexGuard<'_, RegistryState> {
+    registry.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// Tracks live gateway sessions by logical tenant rather than physical engine.
@@ -97,7 +108,7 @@ impl TenantSessions {
     ) -> Result<TenantSession, TenantSessionLimit> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let session = Arc::new(SessionState::default());
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = lock_registry(&self.state);
         let entry = state
             .tenants
             .entry(instance_id.to_string())
@@ -106,13 +117,13 @@ impl TenantSessions {
                 drained: Arc::default(),
                 buffers: super::buffers::QueryBudget::new(&self.config),
             });
-        entry
-            .sessions
-            .retain(|_, session| session.strong_count() > 0);
-        if limit.is_some_and(|limit| authenticated_count(entry) >= limit) {
+        entry.prune_dropped_sessions();
+        if let Some(limit) = limit
+            && authenticated_count(entry) >= limit
+        {
             return Err(TenantSessionLimit {
                 instance_id: instance_id.to_string(),
-                limit: limit.unwrap_or_default(),
+                limit,
             });
         }
         entry.sessions.insert(id, Arc::downgrade(&session));
@@ -132,13 +143,11 @@ impl TenantSessions {
     /// affected; callers must fence the tenant route before invoking this.
     pub fn cancel(&self, instance_id: &str) -> usize {
         let sessions = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = lock_registry(&self.state);
             let Some(entry) = state.tenants.get_mut(instance_id) else {
                 return 0;
             };
-            entry
-                .sessions
-                .retain(|_, session| session.strong_count() > 0);
+            entry.prune_dropped_sessions();
             entry
                 .sessions
                 .values()
@@ -152,20 +161,18 @@ impl TenantSessions {
     }
 
     pub fn active(&self, instance_id: &str) -> usize {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = lock_registry(&self.state);
         let Some(entry) = state.tenants.get_mut(instance_id) else {
             return 0;
         };
-        entry
-            .sessions
-            .retain(|_, session| session.strong_count() > 0);
+        entry.prune_dropped_sessions();
         entry.sessions.len()
     }
 
     pub async fn cancel_and_wait(&self, instance_id: &str, timeout: Duration) -> bool {
         self.cancel(instance_id);
         let drained = {
-            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let state = lock_registry(&self.state);
             state
                 .tenants
                 .get(instance_id)
@@ -226,7 +233,7 @@ impl TenantSession {
             )
         };
         let registry = self.registry.upgrade().ok_or_else(aborted)?;
-        let state = registry.lock().unwrap_or_else(|error| error.into_inner());
+        let state = lock_registry(&registry);
         let entry = state.tenants.get(&self.instance_id).ok_or_else(aborted)?;
         if self.session.cancelled.load(Ordering::Acquire) {
             return Err(aborted());
@@ -257,7 +264,7 @@ impl Drop for TenantSession {
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        let mut state = registry.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = lock_registry(&registry);
         let Some(entry) = state.tenants.get_mut(&self.instance_id) else {
             return;
         };

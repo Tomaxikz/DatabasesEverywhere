@@ -9,6 +9,7 @@ use crate::{
     },
     shared::time::now_rfc3339,
     state::AppState,
+    storage::quarantine::QuarantineKind,
 };
 
 use super::{isolate_runtime, save_runtime, shared_runtimes};
@@ -36,16 +37,7 @@ pub(crate) async fn sync_shared_compatibility(state: &AppState) -> SharedCompati
         }
     };
     let outcomes = futures::stream::iter(runtimes)
-        .map(|snapshot| async move {
-            match crate::api::pools::image::refresh_logging(state, &snapshot.runtime_id).await {
-                Ok(true) => return AttestOutcome::Probed,
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(event = "audit pool_console_policy_upgrade_failed", runtime_id = %snapshot.runtime_id, %error, "console-policy repair failed; image replacement containment remains authoritative");
-                }
-            }
-            attest_runtime(state, snapshot).await
-        })
+        .map(|snapshot| refresh_logging_then_attest(state, snapshot))
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
@@ -59,6 +51,22 @@ pub(crate) async fn sync_shared_compatibility(state: &AppState) -> SharedCompati
         }
     }
     summary
+}
+
+async fn refresh_logging_then_attest(state: &AppState, snapshot: EngineRuntime) -> AttestOutcome {
+    match crate::api::pools::image::refresh_logging(state, &snapshot.runtime_id).await {
+        Ok(true) => return AttestOutcome::Probed,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(
+                event = "audit pool_console_policy_upgrade_failed",
+                runtime_id = %snapshot.runtime_id,
+                %error,
+                "console-policy repair failed; image replacement containment remains authoritative"
+            );
+        }
+    }
+    attest_runtime(state, snapshot).await
 }
 
 async fn attest_runtime(state: &AppState, snapshot: EngineRuntime) -> AttestOutcome {
@@ -75,28 +83,21 @@ async fn attest_runtime(state: &AppState, snapshot: EngineRuntime) -> AttestOutc
         Ok(true) => {
             runtime.updated_at = now_rfc3339();
             let failed_runtime = runtime.clone();
-            if let Err(error) = save_runtime(&state.placements, &state.manager, runtime).await {
-                tracing::error!(runtime_id, %error, "failed to persist shared compatibility attestation");
-                isolate_runtime(
-                    state,
-                    failed_runtime,
-                    "shared compatibility attestation could not be persisted",
-                    crate::storage::quarantine::QuarantineKind::MetadataUncertain,
-                )
-                .await;
-                AttestOutcome::Failed
-            } else {
-                AttestOutcome::Probed
-            }
-        }
-        Err(error) => {
+            let Err(error) = save_runtime(&state.placements, &state.manager, runtime).await else {
+                return AttestOutcome::Probed;
+            };
+            tracing::error!(runtime_id, %error, "failed to persist shared compatibility attestation");
             isolate_runtime(
                 state,
-                runtime,
-                &error,
-                crate::storage::quarantine::QuarantineKind::SecurityAttestation,
+                failed_runtime,
+                "shared compatibility attestation could not be persisted",
+                QuarantineKind::MetadataUncertain,
             )
             .await;
+            AttestOutcome::Failed
+        }
+        Err(error) => {
+            isolate_runtime(state, runtime, &error, QuarantineKind::SecurityAttestation).await;
             AttestOutcome::Failed
         }
     }

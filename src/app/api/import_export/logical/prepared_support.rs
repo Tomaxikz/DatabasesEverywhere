@@ -234,44 +234,27 @@ pub(super) async fn apply_prepared_logical_imports(
         .ok_or_else(|| ApiError::BadRequest("prepared import size overflowed".to_string()))?;
     super::super::shared_security::admit_import(state, metadata, prepared_bytes, mode).await?;
     let runtime_id = metadata.runtime_id();
-    if mode == ImportMode::Wipe
-        && let Err(error) = wipe_logical_target(
+    if mode == ImportMode::Wipe {
+        wipe_logical_target(
             state,
             metadata,
             first.exec_timeout,
             first.database_definition_in_dump,
         )
         .await
-    {
-        let uncertain = error.helper_uncertain();
-        return Err(if uncertain {
-            LogicalApplyError::helper(error.into_api_error())
-        } else {
-            error.into_api_error().into()
-        });
+        .map_err(apply_error_from_restore)?;
     }
     let credentials = logical_import_env(metadata, first.database_definition_in_dump)
         .map_err(|error| ApiError::Conflict(error.to_string()))?;
     let environment = credentials.references();
     let import_started = Instant::now();
     for artifact in prepared {
-        let timeout = match artifact.exec_timeout {
-            Some(total) => total
-                .checked_sub(import_started.elapsed())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| {
-                    ApiError::Runtime(format!(
-                        "{} import timed out while applying multiple artifacts",
-                        metadata.protocol.as_str()
-                    ))
-                })?,
-            None => LOGICAL_STREAM_EXEC_TIMEOUT,
-        };
+        let timeout = remaining_artifact_timeout(metadata, artifact, import_started)?;
         if metadata.deployment_mode == DeploymentMode::Shared {
             let input = artifact.pinned_input.as_ref().ok_or_else(|| {
                 ApiError::Runtime("shared import lost its pinned input before mutation".to_string())
             })?;
-            let result = super::super::shared_restore::run(
+            super::super::shared_restore::run(
                 state,
                 super::super::shared_restore::RestoreRequest {
                     metadata,
@@ -281,16 +264,8 @@ pub(super) async fn apply_prepared_logical_imports(
                     timeout,
                 },
             )
-            .await;
-            if let Err(error) = result {
-                let helper_uncertain = error.helper_uncertain();
-                let error = error.into_api_error();
-                return Err(if helper_uncertain {
-                    LogicalApplyError::helper(error)
-                } else {
-                    error.into()
-                });
-            }
+            .await
+            .map_err(apply_error_from_restore)?;
         } else {
             state
                 .docker
@@ -311,6 +286,37 @@ pub(super) async fn apply_prepared_logical_imports(
     }
     super::super::shared_security::verify_import_size(state, metadata).await?;
     Ok(())
+}
+
+fn apply_error_from_restore(
+    error: super::super::shared_restore::RestoreError,
+) -> LogicalApplyError {
+    let helper_uncertain = error.helper_uncertain();
+    let error = error.into_api_error();
+    if helper_uncertain {
+        LogicalApplyError::helper(error)
+    } else {
+        error.into()
+    }
+}
+
+fn remaining_artifact_timeout(
+    metadata: &InstanceMetadata,
+    artifact: &PreparedLogicalImport,
+    import_started: Instant,
+) -> Result<Duration, ApiError> {
+    let Some(total) = artifact.exec_timeout else {
+        return Ok(LOGICAL_STREAM_EXEC_TIMEOUT);
+    };
+    total
+        .checked_sub(import_started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            ApiError::Runtime(format!(
+                "{} import timed out while applying multiple artifacts",
+                metadata.protocol.as_str()
+            ))
+        })
 }
 
 #[cfg(test)]

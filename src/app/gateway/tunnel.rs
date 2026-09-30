@@ -128,7 +128,7 @@ impl<S> MeteredBackend<S> {
         }
     }
 
-    fn cancelled(&self, context: &Context<'_>) -> std::io::Result<()> {
+    fn ensure_not_cancelled(&self, context: &Context<'_>) -> std::io::Result<()> {
         if self
             .session
             .as_ref()
@@ -151,7 +151,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for MeteredBackend<S> {
         buffer: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if let Err(error) = this.cancelled(context) {
+        if let Err(error) = this.ensure_not_cancelled(context) {
             return Poll::Ready(Err(error));
         }
         let before = buffer.filled().len();
@@ -171,7 +171,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredBackend<S> {
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        if let Err(error) = this.cancelled(context) {
+        if let Err(error) = this.ensure_not_cancelled(context) {
             return Poll::Ready(Err(error));
         }
         let result = Pin::new(&mut this.inner).poll_write(context, bytes);
@@ -183,7 +183,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredBackend<S> {
 
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if let Err(error) = this.cancelled(context) {
+        if let Err(error) = this.ensure_not_cancelled(context) {
             return Poll::Ready(Err(error));
         }
         Pin::new(&mut this.inner).poll_flush(context)
