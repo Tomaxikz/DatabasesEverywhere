@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+const SNAPSHOT_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
 fn path_parts(path: &Path) -> Result<(&Path, &OsStr), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidInput, "file path has no parent directory")
@@ -26,6 +28,35 @@ fn open_parent(path: &Path) -> Result<(File, &OsStr), std::io::Error> {
     )
     .map_err(std::io::Error::from)?;
     Ok((File::from(descriptor), name))
+}
+
+fn open_read_no_follow(directory: &File, name: &OsStr) -> Result<File, std::io::Error> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(File::from(descriptor))
+}
+
+fn create_new_private_file<P: rustix::path::Arg>(
+    directory: &File,
+    name: P,
+) -> Result<File, std::io::Error> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(File::from(descriptor))
 }
 
 /// Creates a private directory tree and rejects a symlink or non-directory at
@@ -81,17 +112,11 @@ fn atomic_write_private_inner(
     contents: &[u8],
     require_existing: bool,
 ) -> Result<(), std::io::Error> {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+    use rustix::fs::{AtFlags, FileType, Mode, RenameFlags};
 
     let (directory, file_name) = open_parent(path)?;
     if require_existing {
-        let existing = rustix::fs::openat(
-            &directory,
-            file_name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
+        let existing = open_read_no_follow(&directory, file_name)?;
         let stat = rustix::fs::fstat(&existing).map_err(std::io::Error::from)?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
             return Err(std::io::Error::new(
@@ -108,14 +133,7 @@ fn atomic_write_private_inner(
         file_name.to_string_lossy(),
         uuid::Uuid::new_v4()
     );
-    let temporary_fd = rustix::fs::openat(
-        &directory,
-        temporary_name.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(std::io::Error::from)?;
-    let mut temporary = File::from(temporary_fd);
+    let mut temporary = create_new_private_file(&directory, temporary_name.as_str())?;
 
     let result = (|| {
         temporary.write_all(contents)?;
@@ -155,17 +173,8 @@ pub fn remove_private_file_durable(path: &Path) -> Result<(), std::io::Error> {
 /// Opens a private file without following symlinks, verifies it is regular,
 /// flushes its contents, and then flushes the containing directory.
 pub fn sync_private_file(path: &Path) -> Result<(), std::io::Error> {
-    use rustix::fs::{Mode, OFlags};
-
     let (directory, file_name) = open_parent(path)?;
-    let descriptor = rustix::fs::openat(
-        &directory,
-        file_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let file = File::from(descriptor);
+    let file = open_read_no_follow(&directory, file_name)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
@@ -185,18 +194,11 @@ pub fn copy_private_snapshot(
     expected_bytes: u64,
     expected_sha256: &[u8; 32],
 ) -> Result<(), std::io::Error> {
-    use rustix::fs::{AtFlags, Mode, OFlags};
+    use rustix::fs::{AtFlags, Mode};
     use sha2::{Digest, Sha256};
 
     let (source_directory, source_name) = open_parent(source)?;
-    let source_fd = rustix::fs::openat(
-        &source_directory,
-        source_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let mut input = File::from(source_fd);
+    let mut input = open_read_no_follow(&source_directory, source_name)?;
     let metadata = input.metadata()?;
     if !metadata.is_file() || metadata.len() != expected_bytes {
         return Err(std::io::Error::new(
@@ -206,19 +208,12 @@ pub fn copy_private_snapshot(
     }
 
     let (destination_directory, destination_name) = open_parent(destination)?;
-    let destination_fd = rustix::fs::openat(
-        &destination_directory,
-        destination_name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(std::io::Error::from)?;
-    let mut output = File::from(destination_fd);
+    let mut output = create_new_private_file(&destination_directory, destination_name)?;
 
     let result = (|| {
         let mut digest = Sha256::new();
         let mut copied = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = [0_u8; SNAPSHOT_COPY_BUFFER_BYTES];
         loop {
             let read = input.read(&mut buffer)?;
             if read == 0 {
@@ -259,17 +254,8 @@ pub fn copy_private_snapshot(
 /// Reads a private regular file through a no-follow descriptor and enforces a hard byte limit
 /// even if the file grows after it is opened.
 pub fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
-    use rustix::fs::{Mode, OFlags};
-
     let (directory, file_name) = open_parent(path)?;
-    let descriptor = rustix::fs::openat(
-        &directory,
-        file_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let file = File::from(descriptor);
+    let file = open_read_no_follow(&directory, file_name)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
@@ -278,22 +264,23 @@ pub fn read_bounded_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>,
         ));
     }
     if metadata.len() > max_bytes {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("private input exceeds the {max_bytes}-byte limit"),
-        ));
+        return Err(private_input_too_large(max_bytes));
     }
     let capacity = usize::try_from(metadata.len().min(max_bytes)).unwrap_or(usize::MAX);
     let mut contents = Vec::with_capacity(capacity);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut contents)?;
     if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidData,
-            format!("private input exceeds the {max_bytes}-byte limit"),
-        ));
+        return Err(private_input_too_large(max_bytes));
     }
     Ok(contents)
+}
+
+fn private_input_too_large(max_bytes: u64) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!("private input exceeds the {max_bytes}-byte limit"),
+    )
 }
 
 pub(crate) fn sync_directory(directory: &impl std::os::fd::AsFd) -> Result<(), std::io::Error> {

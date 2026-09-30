@@ -43,6 +43,19 @@ pub(super) fn target(metadata: &InstanceMetadata) -> TenantTarget<'_> {
     }
 }
 
+pub(super) fn mark_quarantined(metadata: &mut InstanceMetadata) {
+    metadata.status = InstanceStatus::Quarantined;
+    metadata.desired_state = DesiredInstanceState::Stopped;
+    metadata.updated_at = now_rfc3339();
+}
+
+pub(super) fn completion_report<E: std::fmt::Display>(result: Result<(), E>) -> String {
+    match result {
+        Ok(()) => "completed".to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
 pub(super) fn placement_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::Runtime(format!("shared runtime storage failed: {error}"))
 }

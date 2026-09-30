@@ -259,6 +259,8 @@ pub(super) async fn start_gateway_listeners(
     Ok(())
 }
 
+type GatewayProtocolListeners<'a> = (bool, bool, &'a [(GatewayListenerKind, &'a String)]);
+
 pub(super) async fn prepare_gateway_listeners(
     config: &Config,
     connection_limit: u32,
@@ -268,103 +270,65 @@ pub(super) async fn prepare_gateway_listeners(
         connection_limit,
         config.daemon.limits.gateway_connections_per_peer,
     );
-    if config.postgres.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Postgres,
-                config.postgres.bind.clone(),
-                listener_tls(config.postgres.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.redis.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Redis,
-                config.redis.bind.clone(),
-                listener_tls(config.redis.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.valkey.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Valkey,
-                config.valkey.bind.clone(),
-                listener_tls(config.valkey.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.mariadb.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Mariadb,
-                config.mariadb.bind.clone(),
-                listener_tls(config.mariadb.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.mysql.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Mysql,
-                config.mysql.bind.clone(),
-                listener_tls(config.mysql.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.mongodb.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Mongodb,
-                config.mongodb.bind.clone(),
-                listener_tls(config.mongodb.tls, config)?,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.clickhouse.enabled {
-        let tls = listener_tls(config.clickhouse.tls, config)?;
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Clickhouse,
-                config.clickhouse.bind.clone(),
-                tls.clone(),
-                limiter.clone(),
-            )
-            .await?,
-        );
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::ClickhouseHttp,
-                config.clickhouse.http_bind.clone(),
-                tls,
-                limiter.clone(),
-            )
-            .await?,
-        );
-    }
-    if config.qdrant.enabled {
-        prepared.push(
-            PreparedGatewayListener::bind(
-                GatewayListenerKind::Qdrant,
-                config.qdrant.bind.clone(),
-                listener_tls(config.qdrant.tls, config)?,
-                limiter,
-            )
-            .await?,
-        );
+    let protocols: [GatewayProtocolListeners<'_>; 8] = [
+        (
+            config.postgres.enabled,
+            config.postgres.tls,
+            &[(GatewayListenerKind::Postgres, &config.postgres.bind)],
+        ),
+        (
+            config.redis.enabled,
+            config.redis.tls,
+            &[(GatewayListenerKind::Redis, &config.redis.bind)],
+        ),
+        (
+            config.valkey.enabled,
+            config.valkey.tls,
+            &[(GatewayListenerKind::Valkey, &config.valkey.bind)],
+        ),
+        (
+            config.mariadb.enabled,
+            config.mariadb.tls,
+            &[(GatewayListenerKind::Mariadb, &config.mariadb.bind)],
+        ),
+        (
+            config.mysql.enabled,
+            config.mysql.tls,
+            &[(GatewayListenerKind::Mysql, &config.mysql.bind)],
+        ),
+        (
+            config.mongodb.enabled,
+            config.mongodb.tls,
+            &[(GatewayListenerKind::Mongodb, &config.mongodb.bind)],
+        ),
+        (
+            config.clickhouse.enabled,
+            config.clickhouse.tls,
+            &[
+                (GatewayListenerKind::Clickhouse, &config.clickhouse.bind),
+                (
+                    GatewayListenerKind::ClickhouseHttp,
+                    &config.clickhouse.http_bind,
+                ),
+            ],
+        ),
+        (
+            config.qdrant.enabled,
+            config.qdrant.tls,
+            &[(GatewayListenerKind::Qdrant, &config.qdrant.bind)],
+        ),
+    ];
+    for (enabled, tls_enabled, endpoints) in protocols {
+        if !enabled {
+            continue;
+        }
+        let tls = listener_tls(tls_enabled, config)?;
+        for &(kind, bind) in endpoints {
+            prepared.push(
+                PreparedGatewayListener::bind(kind, bind.clone(), tls.clone(), limiter.clone())
+                    .await?,
+            );
+        }
     }
     Ok(prepared)
 }

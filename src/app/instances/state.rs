@@ -96,13 +96,7 @@ impl InstanceStore {
     /// only after the runtime is ready and its durable state is settled.
     pub(crate) async fn fence_routes(&self, instance_id: &str) -> bool {
         let mut state = self.inner.write().await;
-        if !state.instances.contains_key(instance_id) {
-            return false;
-        }
-        state.bump_route_revision(instance_id);
-        state.remove_routes_for(instance_id);
-        state.fenced_instances.insert(instance_id.to_string());
-        true
+        state.fence_existing(instance_id)
     }
 
     /// Fences a route until the instance is removed or the daemon rebuilds
@@ -110,12 +104,9 @@ impl InstanceStore {
     /// pinned recovery fence.
     pub(crate) async fn pin_routes_fenced(&self, instance_id: &str) -> bool {
         let mut state = self.inner.write().await;
-        if !state.instances.contains_key(instance_id) {
+        if !state.fence_existing(instance_id) {
             return false;
         }
-        state.bump_route_revision(instance_id);
-        state.remove_routes_for(instance_id);
-        state.fenced_instances.insert(instance_id.to_string());
         state.pinned_fences.insert(instance_id.to_string());
         true
     }
@@ -162,17 +153,7 @@ impl InstanceStore {
 
     pub async fn resolve_redis(&self, username: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state.redis_routes.get(username)?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                instance_generation: metadata.created_at.clone(),
-                endpoint: metadata.backend.clone(),
-                connection_limit: connection_limit(metadata),
-                route_revision: state.route_revision(instance_id),
-            })
+        state.route_target_for(state.redis_routes.get(username)?)
     }
 
     pub async fn resolve_redis_password(
@@ -185,17 +166,7 @@ impl InstanceStore {
 
     pub async fn resolve_valkey(&self, username: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state.valkey_routes.get(username)?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                instance_generation: metadata.created_at.clone(),
-                endpoint: metadata.backend.clone(),
-                connection_limit: connection_limit(metadata),
-                route_revision: state.route_revision(instance_id),
-            })
+        state.route_target_for(state.valkey_routes.get(username)?)
     }
 
     pub async fn resolve_valkey_password(
@@ -241,16 +212,7 @@ impl InstanceStore {
         let instance_id = state
             .mongodb_routes
             .get(&(username.to_string(), database.to_string()))?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                instance_generation: metadata.created_at.clone(),
-                endpoint: metadata.backend.clone(),
-                connection_limit: connection_limit(metadata),
-                route_revision: state.route_revision(instance_id),
-            })
+        state.route_target_for(instance_id)
     }
 
     pub async fn resolve_clickhouse(
@@ -264,17 +226,7 @@ impl InstanceStore {
 
     pub async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<RouteTarget> {
         let state = self.inner.read().await;
-        let instance_id = state.qdrant_routes.get(route_key_sha256)?;
-        state
-            .instances
-            .get(instance_id)
-            .map(|metadata| RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                instance_generation: metadata.created_at.clone(),
-                endpoint: metadata.backend.clone(),
-                connection_limit: connection_limit(metadata),
-                route_revision: state.route_revision(instance_id),
-            })
+        state.route_target_for(state.qdrant_routes.get(route_key_sha256)?)
     }
 }
 
@@ -325,37 +277,25 @@ fn resolve_mariadb_route(
     database: Option<&str>,
     verifier: impl FnOnce(&InstanceMetadata) -> Option<String>,
 ) -> DatabaseRouteResolution<MariadbRouteTarget> {
-    match resolve_database_route(routes, username, database) {
-        RouteKeyResolution::Found {
-            database,
-            instance_id,
-        } => {
-            state
-                .instances
-                .get(instance_id)
-                .map_or(DatabaseRouteResolution::NotFound, |metadata| {
-                    DatabaseRouteResolution::Found {
-                        database: database.clone(),
-                        target: MariadbRouteTarget {
-                            instance_id: metadata.instance_id.clone(),
-                            instance_generation: metadata.created_at.clone(),
-                            endpoint: metadata.backend.clone(),
-                            shared: metadata.deployment_mode
-                                == crate::placement::DeploymentMode::Shared,
-                            native_password_sha1_stage2: verifier(metadata),
-                            tenant_password: metadata
-                                .tenant_password
-                                .as_ref()
-                                .map(|password| SecretString::from(password.clone())),
-                            connection_limit: connection_limit(metadata),
-                            route_revision: state.route_revision(instance_id),
-                        },
-                    }
-                })
-        }
-        RouteKeyResolution::NotFound => DatabaseRouteResolution::NotFound,
-        RouteKeyResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
-    }
+    resolve_database_target(
+        state,
+        routes,
+        username,
+        database,
+        |instance_id, metadata| MariadbRouteTarget {
+            instance_id: metadata.instance_id.clone(),
+            instance_generation: metadata.created_at.clone(),
+            endpoint: metadata.backend.clone(),
+            shared: metadata.deployment_mode == crate::placement::DeploymentMode::Shared,
+            native_password_sha1_stage2: verifier(metadata),
+            tenant_password: metadata
+                .tenant_password
+                .as_ref()
+                .map(|password| SecretString::from(password.clone())),
+            connection_limit: connection_limit(metadata),
+            route_revision: state.route_revision(instance_id),
+        },
+    )
 }
 
 fn resolve_plain_route(
@@ -364,27 +304,33 @@ fn resolve_plain_route(
     username: &str,
     database: Option<&str>,
 ) -> DatabaseRouteResolution<RouteTarget> {
+    resolve_database_target(
+        state,
+        routes,
+        username,
+        database,
+        |instance_id, metadata| state.route_target(instance_id, metadata),
+    )
+}
+
+fn resolve_database_target<T>(
+    state: &InstanceState,
+    routes: &HashMap<(String, String), String>,
+    username: &str,
+    database: Option<&str>,
+    build_target: impl FnOnce(&str, &InstanceMetadata) -> T,
+) -> DatabaseRouteResolution<T> {
     match resolve_database_route(routes, username, database) {
         RouteKeyResolution::Found {
             database,
             instance_id,
-        } => {
-            state
-                .instances
-                .get(instance_id)
-                .map_or(DatabaseRouteResolution::NotFound, |metadata| {
-                    DatabaseRouteResolution::Found {
-                        database: database.clone(),
-                        target: RouteTarget {
-                            instance_id: metadata.instance_id.clone(),
-                            instance_generation: metadata.created_at.clone(),
-                            endpoint: metadata.backend.clone(),
-                            connection_limit: connection_limit(metadata),
-                            route_revision: state.route_revision(instance_id),
-                        },
-                    }
-                })
-        }
+        } => match state.instances.get(instance_id) {
+            Some(metadata) => DatabaseRouteResolution::Found {
+                database: database.clone(),
+                target: build_target(instance_id, metadata),
+            },
+            None => DatabaseRouteResolution::NotFound,
+        },
         RouteKeyResolution::NotFound => DatabaseRouteResolution::NotFound,
         RouteKeyResolution::Ambiguous => DatabaseRouteResolution::Ambiguous,
     }
@@ -434,94 +380,92 @@ impl InstanceState {
             return;
         }
         self.fenced_instances.remove(&metadata.instance_id);
-        if !route_eligible(&metadata) {
-            self.instances
-                .insert(metadata.instance_id.clone(), metadata);
-            return;
+        if route_eligible(&metadata) {
+            self.publish_routes(&metadata);
         }
+        self.instances
+            .insert(metadata.instance_id.clone(), metadata);
+    }
+
+    fn publish_routes(&mut self, metadata: &InstanceMetadata) {
+        let instance_id = metadata.instance_id.clone();
+        let username = metadata.database.username.clone();
+        let username_and_database = || {
+            (
+                metadata.database.username.clone(),
+                metadata.database.name.clone(),
+            )
+        };
         match metadata.protocol {
             Protocol::Postgres => {
-                self.postgres_routes.insert(
-                    (
-                        metadata.database.username.clone(),
-                        metadata.database.name.clone(),
-                    ),
-                    metadata.instance_id.clone(),
-                );
+                self.postgres_routes
+                    .insert(username_and_database(), instance_id);
             }
             Protocol::Redis => {
-                self.redis_routes.insert(
-                    metadata.database.username.clone(),
-                    metadata.instance_id.clone(),
+                self.redis_routes.insert(username, instance_id.clone());
+                add_password_route(
+                    &mut self.redis_password_routes,
+                    metadata.tenant_password.as_deref(),
+                    instance_id,
                 );
-                if let Some(password) = metadata.tenant_password.as_deref() {
-                    self.redis_password_routes
-                        .entry(crate::protocols::redis::password_route_sha256(
-                            password.as_bytes(),
-                        ))
-                        .or_default()
-                        .insert(metadata.instance_id.clone());
-                }
             }
             Protocol::Valkey => {
-                self.valkey_routes.insert(
-                    metadata.database.username.clone(),
-                    metadata.instance_id.clone(),
+                self.valkey_routes.insert(username, instance_id.clone());
+                add_password_route(
+                    &mut self.valkey_password_routes,
+                    metadata.tenant_password.as_deref(),
+                    instance_id,
                 );
-                if let Some(password) = metadata.tenant_password.as_deref() {
-                    self.valkey_password_routes
-                        .entry(crate::protocols::redis::password_route_sha256(
-                            password.as_bytes(),
-                        ))
-                        .or_default()
-                        .insert(metadata.instance_id.clone());
-                }
             }
             Protocol::Mariadb => {
-                self.mariadb_routes.insert(
-                    (
-                        metadata.database.username.clone(),
-                        metadata.database.name.clone(),
-                    ),
-                    metadata.instance_id.clone(),
-                );
+                self.mariadb_routes
+                    .insert(username_and_database(), instance_id);
             }
             Protocol::Mysql => {
-                self.mysql_routes.insert(
-                    (
-                        metadata.database.username.clone(),
-                        metadata.database.name.clone(),
-                    ),
-                    metadata.instance_id.clone(),
-                );
+                self.mysql_routes
+                    .insert(username_and_database(), instance_id);
             }
             Protocol::Mongodb => {
-                self.mongodb_routes.insert(
-                    (
-                        metadata.database.username.clone(),
-                        metadata.database.name.clone(),
-                    ),
-                    metadata.instance_id.clone(),
-                );
+                self.mongodb_routes
+                    .insert(username_and_database(), instance_id);
             }
             Protocol::Clickhouse => {
-                self.clickhouse_routes.insert(
-                    (
-                        metadata.database.username.clone(),
-                        metadata.database.name.clone(),
-                    ),
-                    metadata.instance_id.clone(),
-                );
+                self.clickhouse_routes
+                    .insert(username_and_database(), instance_id);
             }
             Protocol::Qdrant => {
                 if let Some(route_key_sha256) = &metadata.route_key_sha256 {
                     self.qdrant_routes
-                        .insert(route_key_sha256.clone(), metadata.instance_id.clone());
+                        .insert(route_key_sha256.clone(), instance_id);
                 }
             }
         }
+    }
+
+    fn fence_existing(&mut self, instance_id: &str) -> bool {
+        if !self.instances.contains_key(instance_id) {
+            return false;
+        }
+        self.bump_route_revision(instance_id);
+        self.remove_routes_for(instance_id);
+        self.fenced_instances.insert(instance_id.to_string());
+        true
+    }
+
+    fn route_target(&self, instance_id: &str, metadata: &InstanceMetadata) -> RouteTarget {
+        RouteTarget {
+            instance_id: metadata.instance_id.clone(),
+            instance_generation: metadata.created_at.clone(),
+            endpoint: metadata.backend.clone(),
+            connection_limit: connection_limit(metadata),
+            route_revision: self.route_revision(instance_id),
+        }
+    }
+
+    fn route_target_for(&self, instance_id: &str) -> Option<RouteTarget> {
         self.instances
-            .insert(metadata.instance_id.clone(), metadata);
+            .get(instance_id)
+            .map(|metadata| self.route_target(instance_id, metadata))
     }
 
     fn upsert_fenced(&mut self, metadata: InstanceMetadata) {
@@ -602,15 +546,25 @@ fn resolve_password_route(
     state.instances.get(instance_id).map(|metadata| {
         (
             metadata.database.username.clone(),
-            RouteTarget {
-                instance_id: metadata.instance_id.clone(),
-                instance_generation: metadata.created_at.clone(),
-                endpoint: metadata.backend.clone(),
-                connection_limit: connection_limit(metadata),
-                route_revision: state.route_revision(instance_id),
-            },
+            state.route_target(instance_id, metadata),
         )
     })
+}
+
+fn add_password_route(
+    routes: &mut HashMap<String, HashSet<String>>,
+    password: Option<&str>,
+    instance_id: String,
+) {
+    let Some(password) = password else {
+        return;
+    };
+    routes
+        .entry(crate::protocols::redis::password_route_sha256(
+            password.as_bytes(),
+        ))
+        .or_default()
+        .insert(instance_id);
 }
 
 fn remove_password_route(routes: &mut HashMap<String, HashSet<String>>, instance_id: &str) {

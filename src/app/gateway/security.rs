@@ -7,6 +7,7 @@ use std::{
 
 const DB_CONNECTION_WINDOW: Duration = Duration::from_secs(60);
 const MAX_GATEWAY_RATE_LIMIT_KEYS: usize = 8192;
+const DEFAULT_MAX_CONNECTIONS_PER_WINDOW: u32 = 240;
 
 #[derive(Debug, Clone)]
 pub struct GatewayConnectionLimiter {
@@ -52,7 +53,7 @@ impl Drop for GatewayConnectionPermit {
 
 impl Default for GatewayConnectionLimiter {
     fn default() -> Self {
-        Self::new(240)
+        Self::new(DEFAULT_MAX_CONNECTIONS_PER_WINDOW)
     }
 }
 
@@ -93,12 +94,10 @@ impl GatewayConnectionLimiter {
         }
 
         if state.active.get(&peer).copied().unwrap_or_default() >= self.max_active_per_ip {
-            let window = state.windows.entry(peer).or_insert(ConnectionWindow {
-                started_at: now,
-                count: 0,
-                rate_rejection_logged: false,
-                active_rejection_logged: false,
-            });
+            let window = state
+                .windows
+                .entry(peer)
+                .or_insert_with(|| ConnectionWindow::new(now));
             let should_log = !window.active_rejection_logged;
             window.active_rejection_logged = true;
             return Err(GatewayConnectionRejection {
@@ -107,12 +106,10 @@ impl GatewayConnectionLimiter {
             });
         }
 
-        let window = state.windows.entry(peer).or_insert(ConnectionWindow {
-            started_at: now,
-            count: 0,
-            rate_rejection_logged: false,
-            active_rejection_logged: false,
-        });
+        let window = state
+            .windows
+            .entry(peer)
+            .or_insert_with(|| ConnectionWindow::new(now));
         if now.duration_since(window.started_at) >= DB_CONNECTION_WINDOW {
             window.started_at = now;
             window.count = 0;
@@ -150,6 +147,17 @@ struct ConnectionWindow {
     count: u32,
     rate_rejection_logged: bool,
     active_rejection_logged: bool,
+}
+
+impl ConnectionWindow {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            count: 0,
+            rate_rejection_logged: false,
+            active_rejection_logged: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

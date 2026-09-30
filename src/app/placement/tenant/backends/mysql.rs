@@ -16,6 +16,9 @@ use crate::{
     shared::{limits::InstanceLimits, protocol::Protocol, shell::sh_quote},
 };
 
+const MYSQL_SOCKET: &str = "/var/run/mysqld/mysqld.sock";
+const MARIADB_SOCKET: &str = "/run/mysqld/mysqld.sock";
+
 #[derive(Clone, Copy)]
 pub(in crate::placement::tenant) enum MysqlFlavor {
     Mysql,
@@ -44,8 +47,8 @@ impl MysqlFlavor {
 
     fn client(self) -> (&'static str, &'static str) {
         match self {
-            Self::Mysql => ("mysql", "/var/run/mysqld/mysqld.sock"),
-            Self::Mariadb => ("mariadb", "/run/mysqld/mysqld.sock"),
+            Self::Mysql => ("mysql", MYSQL_SOCKET),
+            Self::Mariadb => ("mariadb", MARIADB_SOCKET),
         }
     }
 
@@ -96,18 +99,97 @@ impl MysqlFlavor {
         let output = self
             .sql(docker, runtime, &databases::mysql_session_ids_sql(username))
             .await?;
-        for line in output
+        let session_lines = output
             .stdout
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            let id = line
+            .filter(|line| !line.is_empty());
+        for line in session_lines {
+            let connection_id = line
                 .parse::<u64>()
                 .map_err(|_| TenantEngineError::InvalidConnectionId(line.to_string()))?;
-            self.sql(docker, runtime, &databases::mysql_kill_sql(id))
+            self.sql(docker, runtime, &databases::mysql_kill_sql(connection_id))
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn create_tenant(
+        self,
+        docker: &DockerRuntime,
+        runtime: &EngineRuntime,
+        target: TenantTarget<'_>,
+        password: &str,
+        limits: &InstanceLimits,
+    ) -> Result<(), TenantEngineError> {
+        match self {
+            Self::Mysql => {
+                mysql_password_sql(
+                    docker,
+                    runtime,
+                    &databases::mysql::provision::shared_tenant_user_sql(
+                        target.database,
+                        target.username,
+                    ),
+                    password,
+                )
+                .await?;
+            }
+            Self::Mariadb => {
+                let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
+                self.sql(
+                    docker,
+                    runtime,
+                    &databases::mariadb::provision::shared_tenant_user_sql(
+                        target.database,
+                        target.username,
+                        &verifier,
+                    )?,
+                )
+                .await?;
+            }
+        }
+        self.sql(docker, runtime, &self.quota_sql(target.username, limits))
+            .await?;
+        Ok(())
+    }
+
+    async fn rotate_password(
+        self,
+        docker: &DockerRuntime,
+        runtime: &EngineRuntime,
+        target: TenantTarget<'_>,
+        password: &str,
+    ) -> Result<(), TenantEngineError> {
+        match self {
+            Self::Mysql => {
+                mysql_password_sql(
+                    docker,
+                    runtime,
+                    &databases::mysql::provision::reset_tenant_password_sql(target.username),
+                    password,
+                )
+                .await?;
+            }
+            Self::Mariadb => {
+                let verifier = crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
+                self.sql(
+                    docker,
+                    runtime,
+                    &databases::mariadb::provision::reset_tenant_password_sql(
+                        target.username,
+                        &verifier,
+                    )?,
+                )
+                .await?;
+            }
+        }
+        self.sql(
+            docker,
+            runtime,
+            &databases::mysql_shared_grant_sql(target.database, target.username),
+        )
+        .await?;
         Ok(())
     }
 
@@ -135,56 +217,18 @@ impl TenantBackend for MysqlFlavor {
                     password,
                     limits,
                     admin: _,
-                } => match self {
-                    Self::Mysql => {
-                        mysql_password_sql(
-                            docker,
-                            runtime,
-                            &databases::mysql::provision::shared_tenant_user_sql(
-                                target.database,
-                                target.username,
-                            ),
-                            password,
-                        )
+                } => {
+                    self.create_tenant(docker, runtime, target, password, limits)
                         .await?;
-                        MysqlFlavor::Mysql
-                            .sql(
-                                docker,
-                                runtime,
-                                &MysqlFlavor::Mysql.quota_sql(target.username, limits),
-                            )
-                            .await?;
-                    }
-                    Self::Mariadb => {
-                        let flavor = MysqlFlavor::Mariadb;
-                        let verifier =
-                            crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
-                        flavor
-                            .sql(
-                                docker,
-                                runtime,
-                                &databases::mariadb::provision::shared_tenant_user_sql(
-                                    target.database,
-                                    target.username,
-                                    &verifier,
-                                )?,
-                            )
-                            .await?;
-                        flavor
-                            .sql(docker, runtime, &flavor.quota_sql(target.username, limits))
-                            .await?;
-                    }
-                },
+                }
                 TenantOperation::Fence => {
-                    let flavor = *self;
-                    flavor
-                        .sql(
-                            docker,
-                            runtime,
-                            &databases::mysql_fence_sql(target.username),
-                        )
-                        .await?;
-                    flavor.terminate(docker, runtime, target.username).await?;
+                    self.sql(
+                        docker,
+                        runtime,
+                        &databases::mysql_fence_sql(target.username),
+                    )
+                    .await?;
+                    self.terminate(docker, runtime, target.username).await?;
                 }
                 TenantOperation::Unfence => {
                     self.sql(
@@ -195,70 +239,22 @@ impl TenantBackend for MysqlFlavor {
                     .await?;
                 }
                 TenantOperation::Drop => {
-                    let flavor = *self;
-                    flavor.terminate(docker, runtime, target.username).await?;
-                    flavor
-                        .sql(
-                            docker,
-                            runtime,
-                            &databases::mysql_drop_sql(target.database, target.username),
-                        )
-                        .await?;
+                    self.terminate(docker, runtime, target.username).await?;
+                    self.sql(
+                        docker,
+                        runtime,
+                        &databases::mysql_drop_sql(target.database, target.username),
+                    )
+                    .await?;
                 }
                 TenantOperation::SetQuota { limits } => {
-                    let flavor = *self;
-                    flavor
-                        .sql(docker, runtime, &flavor.quota_sql(target.username, limits))
+                    self.sql(docker, runtime, &self.quota_sql(target.username, limits))
                         .await?;
                 }
-                TenantOperation::RotatePassword { password } => match self {
-                    Self::Mysql => {
-                        mysql_password_sql(
-                            docker,
-                            runtime,
-                            &databases::mysql::provision::reset_tenant_password_sql(
-                                target.username,
-                            ),
-                            password,
-                        )
+                TenantOperation::RotatePassword { password } => {
+                    self.rotate_password(docker, runtime, target, password)
                         .await?;
-                        MysqlFlavor::Mysql
-                            .sql(
-                                docker,
-                                runtime,
-                                &databases::mysql_shared_grant_sql(
-                                    target.database,
-                                    target.username,
-                                ),
-                            )
-                            .await?;
-                    }
-                    Self::Mariadb => {
-                        let flavor = MysqlFlavor::Mariadb;
-                        let verifier =
-                            crate::protocols::mariadb::native_password_sha1_stage2_hex(password);
-                        flavor
-                            .sql(
-                                docker,
-                                runtime,
-                                &databases::mariadb::provision::reset_tenant_password_sql(
-                                    target.username,
-                                    &verifier,
-                                )?,
-                            )
-                            .await?;
-                        flavor
-                            .sql(
-                                docker,
-                                runtime,
-                                &databases::mysql_shared_grant_sql(
-                                    target.database,
-                                    target.username,
-                                ),
-                            )
-                            .await?;
-                    }
-                },
+                }
             }
             Ok(())
         })
@@ -295,7 +291,7 @@ async fn mysql_password_sql(
     let password = SecretString::from(STANDARD.encode(password));
     let admin = admin_secret(runtime)?;
     let script = format!(
-        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$DBE_ADMIN_PASSWORD\" mysql --protocol=socket --socket=/var/run/mysqld/mysqld.sock -uroot",
+        "set -eu\n{{ printf %s {}; printf %s \"$DBE_PASSWORD_B64\"; printf %s {}; }} | MYSQL_PWD=\"$DBE_ADMIN_PASSWORD\" mysql --protocol=socket --socket={MYSQL_SOCKET} -uroot",
         sh_quote(before),
         sh_quote(after),
     );
@@ -330,17 +326,12 @@ async fn sql_client(
         sh_quote(sql),
         sh_quote(socket),
     );
-    let script = if telemetry {
-        telemetry_command(script)
-    } else {
-        script
-    };
     let output = if telemetry {
         docker
             .exec_telemetry(
                 protocol,
                 &runtime.runtime_id,
-                &script,
+                &telemetry_command(script),
                 &[("DBE_ADMIN_PASSWORD", &admin)],
                 timeout,
             )

@@ -15,10 +15,11 @@ pub(super) async fn usage_bytes(
     let target = target.clone();
     let registry_root = registry_root.to_path_buf();
     let path = target.path.clone();
-    let usage =
-        tokio::task::spawn_blocking(move || usage_bytes_sync(&target, &registry_root, project_id))
-            .await
-            .map_err(|error| DiskLimitError::Task(error.to_string()))??;
+    let usage = tokio::task::spawn_blocking(move || {
+        linux::usage_bytes(&target, &registry_root, project_id)
+    })
+    .await
+    .map_err(|error| DiskLimitError::Task(error.to_string()))??;
     project_tree::verify_root(&path, project_id).await?;
     Ok(usage)
 }
@@ -35,7 +36,7 @@ pub(super) async fn verify_hard_limit(
 ) -> Result<(), DiskLimitError> {
     let mountpoint = mountpoint.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        verify_hard_limit_sync(filesystem, &mountpoint, project_id, expected_bytes)
+        linux::verify_hard_limit(filesystem, &mountpoint, project_id, expected_bytes)
     })
     .await
     .map_err(|error| DiskLimitError::Task(error.to_string()))?
@@ -51,34 +52,9 @@ pub(super) async fn verify_unused(
     project_id: u32,
 ) -> Result<(), DiskLimitError> {
     let mountpoint = mountpoint.to_path_buf();
-    tokio::task::spawn_blocking(move || verify_unused_sync(filesystem, &mountpoint, project_id))
+    tokio::task::spawn_blocking(move || linux::verify_unused(filesystem, &mountpoint, project_id))
         .await
         .map_err(|error| DiskLimitError::Task(error.to_string()))?
-}
-
-fn usage_bytes_sync(
-    target: &NativeProjectQuota,
-    registry_root: &Path,
-    project_id: u32,
-) -> Result<u64, DiskLimitError> {
-    linux::usage_bytes(target, registry_root, project_id)
-}
-
-fn verify_hard_limit_sync(
-    filesystem: NativeProjectQuotaFs,
-    mountpoint: &Path,
-    project_id: u32,
-    expected_bytes: u64,
-) -> Result<(), DiskLimitError> {
-    linux::verify_hard_limit(filesystem, mountpoint, project_id, expected_bytes)
-}
-
-fn verify_unused_sync(
-    filesystem: NativeProjectQuotaFs,
-    mountpoint: &Path,
-    project_id: u32,
-) -> Result<(), DiskLimitError> {
-    linux::verify_unused(filesystem, mountpoint, project_id)
 }
 
 mod linux {
@@ -298,32 +274,40 @@ mod linux {
     ) -> Result<QuotaState, DiskLimitError> {
         let mount = open_dir(mountpoint, project_id)?;
         match filesystem {
-            NativeProjectQuotaFs::Xfs => {
-                let mut state = XfsQuotaState {
-                    version: XFS_QUOTA_STATE_VERSION,
-                    ..XfsQuotaState::default()
-                };
-                query(
-                    mount.as_raw_fd(),
-                    project_id,
-                    QuotaBuffer::XfsState(&mut state),
-                )
-                .map_err(|source| io_error(project_id, mountpoint, source))?;
-                validate_xfs_enforcement(&state)
-                    .map_err(|error| invalid(project_id, mountpoint, error))?;
-                let mut quota = XfsDiskQuota::default();
-                query(mount.as_raw_fd(), project_id, QuotaBuffer::Xfs(&mut quota))
-                    .map_err(|source| io_error(project_id, mountpoint, source))?;
-                xfs_state(&quota, project_id)
-                    .map_err(|error| invalid(project_id, mountpoint, error))
-            }
+            NativeProjectQuotaFs::Xfs => xfs_quota_state(mount.as_raw_fd(), mountpoint, project_id),
             NativeProjectQuotaFs::Ext4 | NativeProjectQuotaFs::F2fs => {
-                let mut quota = empty_vfs_quota();
-                query(mount.as_raw_fd(), project_id, QuotaBuffer::Vfs(&mut quota))
-                    .map_err(|source| io_error(project_id, mountpoint, source))?;
-                vfs_state(&quota).map_err(|error| invalid(project_id, mountpoint, error))
+                vfs_quota_state(mount.as_raw_fd(), mountpoint, project_id)
             }
         }
+    }
+
+    fn xfs_quota_state(
+        mount_fd: libc::c_int,
+        mountpoint: &Path,
+        project_id: u32,
+    ) -> Result<QuotaState, DiskLimitError> {
+        let mut state = XfsQuotaState {
+            version: XFS_QUOTA_STATE_VERSION,
+            ..XfsQuotaState::default()
+        };
+        query(mount_fd, project_id, QuotaBuffer::XfsState(&mut state))
+            .map_err(|source| io_error(project_id, mountpoint, source))?;
+        validate_xfs_enforcement(&state).map_err(|error| invalid(project_id, mountpoint, error))?;
+        let mut quota = XfsDiskQuota::default();
+        query(mount_fd, project_id, QuotaBuffer::Xfs(&mut quota))
+            .map_err(|source| io_error(project_id, mountpoint, source))?;
+        xfs_state(&quota, project_id).map_err(|error| invalid(project_id, mountpoint, error))
+    }
+
+    fn vfs_quota_state(
+        mount_fd: libc::c_int,
+        mountpoint: &Path,
+        project_id: u32,
+    ) -> Result<QuotaState, DiskLimitError> {
+        let mut quota = empty_vfs_quota();
+        query(mount_fd, project_id, QuotaBuffer::Vfs(&mut quota))
+            .map_err(|source| io_error(project_id, mountpoint, source))?;
+        vfs_state(&quota).map_err(|error| invalid(project_id, mountpoint, error))
     }
 
     fn open_dir(path: &Path, project_id: u32) -> Result<rustix::fd::OwnedFd, DiskLimitError> {

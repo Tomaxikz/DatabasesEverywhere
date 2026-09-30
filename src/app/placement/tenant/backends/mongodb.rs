@@ -10,6 +10,8 @@ use crate::{
     shared::{limits::mib_to_bytes, protocol::Protocol, shell::sh_quote},
 };
 
+const MAX_OPERATION_TIME_MS: u64 = 15 * 60 * 1_000;
+
 pub(super) struct Mongodb;
 
 impl TenantBackend for Mongodb {
@@ -73,7 +75,7 @@ impl TenantBackend for Mongodb {
                     let policy = databases::mongodb::provision::tenant_quota_policy(
                         databases::mongodb::provision::TenantQuota {
                             max_connections: policy::max_connections(limits),
-                            max_operation_time_ms: 15 * 60 * 1_000,
+                            max_operation_time_ms: MAX_OPERATION_TIME_MS,
                             storage_bytes: mib_to_bytes(limits.disk_mib),
                         },
                     );

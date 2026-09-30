@@ -36,6 +36,7 @@ use crate::api::instances::requests::MAX_PASSWORD_CHARACTERS;
 const MAX_ACL_FILE_BYTES: u64 = 64 * 1024;
 const ROTATION_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const PASSWORD_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
+const CURRENT_CREDENTIAL_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 mod rotation;
 mod supervision;
@@ -89,23 +90,7 @@ pub async fn reset_instance_password(
     let permit = state
         .import_export_jobs
         .try_admit_exclusive(&instance_id)
-        .map_err(|error| match error {
-            crate::jobs::import_export::JobAdmissionError::GlobalCapacity => {
-                ApiError::ServiceUnavailable(
-                    "database maintenance queue is at capacity; retry later".to_string(),
-                )
-            }
-            crate::jobs::import_export::JobAdmissionError::InstanceCapacity => {
-                ApiError::Conflict(format!(
-                    "another database maintenance operation is already running for {instance_id}"
-                ))
-            }
-            crate::jobs::import_export::JobAdmissionError::ShuttingDown => {
-                ApiError::ServiceUnavailable(
-                    "daemon shutdown has started; password resets are not accepted".to_string(),
-                )
-            }
-        })?;
+        .map_err(|error| password_admission_error(&instance_id, error))?;
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     let worker_instance_id = instance_id.clone();
     tokio::spawn(async move {
@@ -142,6 +127,41 @@ pub async fn reset_instance_password(
     })?
 }
 
+fn password_admission_error(
+    instance_id: &str,
+    error: crate::jobs::import_export::JobAdmissionError,
+) -> ApiError {
+    match error {
+        crate::jobs::import_export::JobAdmissionError::GlobalCapacity => {
+            ApiError::ServiceUnavailable(
+                "database maintenance queue is at capacity; retry later".to_string(),
+            )
+        }
+        crate::jobs::import_export::JobAdmissionError::InstanceCapacity => ApiError::Conflict(
+            format!("another database maintenance operation is already running for {instance_id}"),
+        ),
+        crate::jobs::import_export::JobAdmissionError::ShuttingDown => {
+            ApiError::ServiceUnavailable(
+                "daemon shutdown has started; password resets are not accepted".to_string(),
+            )
+        }
+    }
+}
+
+fn password_scheduler_error(error: crate::jobs::import_export::SchedulerAcquireError) -> ApiError {
+    match error {
+        crate::jobs::import_export::SchedulerAcquireError::Closed => {
+            ApiError::ServiceUnavailable("daemon shutdown has started".to_string())
+        }
+        crate::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
+            ApiError::Conflict(
+                "password maintenance exceeds a fixed dynamic import/export scheduler budget"
+                    .to_string(),
+            )
+        }
+    }
+}
+
 async fn reset_instance_password_inner(
     state: AppState,
     instance_id: String,
@@ -167,17 +187,7 @@ async fn reset_instance_password_inner(
             },
         ))
         .await
-        .map_err(|error| match error {
-            crate::jobs::import_export::SchedulerAcquireError::Closed => {
-                ApiError::ServiceUnavailable("daemon shutdown has started".to_string())
-            }
-            crate::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
-                ApiError::Conflict(
-                    "password maintenance exceeds a fixed dynamic import/export scheduler budget"
-                        .to_string(),
-                )
-            }
-        })?;
+        .map_err(password_scheduler_error)?;
     validate_password(metadata.protocol, &new_password)?;
     if metadata.deployment_mode == crate::placement::DeploymentMode::Shared {
         return super::shared::reset_password(&state, metadata, new_password).await;
@@ -272,7 +282,7 @@ async fn reset_instance_password_inner(
     );
     delete_managed_container(&state, metadata.protocol, &metadata.instance_id).await?;
     super::route_fence::fence(&state, &metadata.instance_id).await;
-    let result = reset_password(
+    let recreation = match reset_password(
         &state,
         &metadata,
         &paths,
@@ -280,22 +290,12 @@ async fn reset_instance_password_inner(
         &new_spec,
         &new_password,
     )
-    .await;
-
-    if let Err(error) = result {
-        return rollback_or_fail(
-            &state,
-            &metadata,
-            &paths,
-            &credential_data_path,
-            &old_spec,
-            &previous,
-            error,
-        )
-        .await;
-    }
-
-    if let Err(error) = attest_password_reset_target(&state, &metadata).await {
+    .await
+    {
+        Ok(()) => attest_password_reset_target(&state, &metadata).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = recreation {
         return rollback_or_fail(
             &state,
             &metadata,
@@ -428,7 +428,7 @@ async fn require_resettable_instance(
             .wait_until_ready(
                 metadata.protocol,
                 &metadata.instance_id,
-                Duration::from_secs(10),
+                CURRENT_CREDENTIAL_READINESS_TIMEOUT,
             )
             .await
             .map_err(|error| {
@@ -478,18 +478,7 @@ async fn capture_previous_credential(
     capture_maintenance_credential(state, metadata, &mut previous).await?;
     let environment_keys = credential_environment_keys(metadata.protocol);
     if previous.environment.is_none() && !environment_keys.is_empty() {
-        for key in environment_keys {
-            let value = state
-                .docker
-                .container_environment_value(metadata.protocol, &metadata.instance_id, key)
-                .await
-                .map_err(docker_error)?
-                .filter(|value| !value.expose_secret().is_empty());
-            if value.is_some() {
-                previous.environment = value;
-                break;
-            }
-        }
+        previous.environment = first_container_secret(state, metadata, environment_keys).await?;
         if previous.environment.is_none() && metadata.protocol != Protocol::Postgres {
             return Err(ApiError::Conflict(format!(
                 "the current {} credential is unavailable from the managed container; the instance cannot be safely rolled back",

@@ -1,6 +1,8 @@
 use serde::Serialize;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+const MAX_LIST_LIMIT: u32 = 1000;
+
 /// Recovery classification is advice, never permission to clear quarantine.
 /// Known codes are assigned at the decision point, not inferred from messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +121,7 @@ pub(crate) async fn list(
     .bind(id)
     .bind(history)
     .bind(before)
-    .bind(limit.clamp(1, 1000))
+    .bind(limit.clamp(1, MAX_LIST_LIMIT))
     .fetch_all(pool)
     .await?;
     rows.into_iter()

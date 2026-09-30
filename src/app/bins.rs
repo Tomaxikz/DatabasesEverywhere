@@ -52,6 +52,11 @@ static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!(env!("SOCKET_BRIDGE_PAYLOAD_PAT
 static SOCKET_BRIDGE_BIN: &[u8] = &[];
 static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+const FUSEQUOTA_MODE: u32 = 0o500;
+const SOCKET_BRIDGE_MODE: u32 = 0o555;
+const PERMISSION_BITS: u32 = 0o777;
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+
 pub fn embedded_fusequota_available() -> bool {
     !FUSEQUOTA_BIN.is_empty()
         && !FUSEQUOTA_VERSION.trim().is_empty()
@@ -71,21 +76,15 @@ pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Erro
             "embedded fusequota binary is not available for this target",
         ));
     }
-
-    let _lock = BIN_LOCK.lock().await;
-    let runtime_root = runtime_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        install_embedded_helper(
-            &runtime_root,
-            "fusequota",
-            FUSEQUOTA_VERSION,
-            FUSEQUOTA_SHA256,
-            FUSEQUOTA_BIN,
-            0o500,
-        )
-    })
+    install_embedded_helper_serialized(
+        runtime_root,
+        "fusequota",
+        FUSEQUOTA_VERSION,
+        FUSEQUOTA_SHA256,
+        FUSEQUOTA_BIN,
+        FUSEQUOTA_MODE,
+    )
     .await
-    .map_err(Error::other)?
 }
 
 pub async fn get_socket_bridge_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
@@ -95,17 +94,35 @@ pub async fn get_socket_bridge_bin_path(runtime_root: &Path) -> Result<PathBuf, 
             "embedded socket bridge binary is not available for this target",
         ));
     }
+    install_embedded_helper_serialized(
+        runtime_root,
+        "dbev-socket-bridge",
+        SOCKET_BRIDGE_VERSION,
+        SOCKET_BRIDGE_SHA256,
+        SOCKET_BRIDGE_BIN,
+        SOCKET_BRIDGE_MODE,
+    )
+    .await
+}
 
+async fn install_embedded_helper_serialized(
+    runtime_root: &Path,
+    helper_name: &'static str,
+    version: &'static str,
+    expected_sha256: &'static str,
+    compressed_payload: &'static [u8],
+    executable_mode: u32,
+) -> Result<PathBuf, Error> {
     let _lock = BIN_LOCK.lock().await;
     let runtime_root = runtime_root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         install_embedded_helper(
             &runtime_root,
-            "dbev-socket-bridge",
-            SOCKET_BRIDGE_VERSION,
-            SOCKET_BRIDGE_SHA256,
-            SOCKET_BRIDGE_BIN,
-            0o555,
+            helper_name,
+            version,
+            expected_sha256,
+            compressed_payload,
+            executable_mode,
         )
     })
     .await
@@ -160,21 +177,26 @@ fn install_embedded_helper(
 }
 
 fn create_private_helper_dir(path: &Path) -> Result<(), Error> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
+    match fs::DirBuilder::new()
+        .mode(PRIVATE_DIRECTORY_MODE)
+        .create(path)
+    {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
 }
 
+fn directory_metadata(directory: &impl std::os::fd::AsFd) -> Result<fs::Metadata, Error> {
+    let descriptor = directory
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(Error::other)?;
+    File::from(descriptor).metadata()
+}
+
 fn verify_private_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> Result<(), Error> {
-    let metadata = File::from(
-        directory
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(Error::other)?,
-    )
-    .metadata()?;
+    let metadata = directory_metadata(directory)?;
     let expected_uid = rustix::process::geteuid().as_raw();
     if !metadata.is_dir() || metadata.uid() != expected_uid {
         return Err(Error::new(
@@ -187,17 +209,8 @@ fn verify_private_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> 
     }
 
     rustix::fs::fchmod(directory, Mode::RWXU).map_err(Error::other)?;
-    let mode = File::from(
-        directory
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(Error::other)?,
-    )
-    .metadata()?
-    .permissions()
-    .mode()
-        & 0o777;
-    if mode != 0o700 {
+    let mode = directory_metadata(directory)?.permissions().mode() & PERMISSION_BITS;
+    if mode != PRIVATE_DIRECTORY_MODE {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             format!(
@@ -233,7 +246,7 @@ fn verify_helper_file(
 ) -> Result<(), Error> {
     let metadata = file.metadata()?;
     let expected_uid = rustix::process::geteuid().as_raw();
-    let mode = metadata.permissions().mode() & 0o777;
+    let mode = metadata.permissions().mode() & PERMISSION_BITS;
     if !metadata.is_file() || metadata.uid() != expected_uid || mode != executable_mode {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -278,8 +291,11 @@ fn install_helper_atomically(
             .map_err(Error::other)?;
         Ok(())
     })();
-    if let Err(error) = write_result {
+    let remove_temporary = || {
         let _ = rustix::fs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
+    };
+    if let Err(error) = write_result {
+        remove_temporary();
         return Err(error);
     }
     drop(temporary);
@@ -292,11 +308,9 @@ fn install_helper_atomically(
         RenameFlags::NOREPLACE,
     ) {
         Ok(()) => rustix::fs::fsync(directory).map_err(Error::other)?,
-        Err(rustix::io::Errno::EXIST) => {
-            let _ = rustix::fs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
-        }
+        Err(rustix::io::Errno::EXIST) => remove_temporary(),
         Err(error) => {
-            let _ = rustix::fs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
+            remove_temporary();
             return Err(Error::other(error));
         }
     }

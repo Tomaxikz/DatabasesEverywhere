@@ -153,7 +153,7 @@ async fn purge_paths(
             deleted_backups
         );
     }
-    let mut purge_paths = vec![
+    let mut removable_paths = vec![
         paths.data,
         paths.logs,
         paths.sockets,
@@ -164,7 +164,7 @@ async fn purge_paths(
         paths.runtime_config,
         crate::api::artifacts::instance_spool_root(state, instance_id),
     ];
-    let retained_volumes = retained_instance_volume_paths(&purge_paths[0])
+    let retained_volumes = retained_instance_volume_paths(&removable_paths[0])
         .await
         .map_err(|error| {
             ApiError::Runtime(format!(
@@ -174,16 +174,16 @@ async fn purge_paths(
     // Retained major-upgrade/restore volumes can themselves be Btrfs
     // subvolumes or ZFS datasets. Remove their native quota object before the
     // generic filesystem cleanup; `remove_dir_all` cannot delete those roots.
-    for retained_volume in &retained_volumes {
-        if let Some(disk_limiter) = &disk_limiter {
+    if let Some(disk_limiter) = &disk_limiter {
+        for retained_volume in &retained_volumes {
             disk_limiter
                 .purge_instance_data(retained_volume)
                 .await
                 .map_err(|error| ApiError::Runtime(error.to_string()))?;
         }
     }
-    purge_paths.extend(retained_volumes);
-    for path in purge_paths {
+    removable_paths.extend(retained_volumes);
+    for path in removable_paths {
         remove_path_if_exists(&path).await?;
     }
     Ok(())

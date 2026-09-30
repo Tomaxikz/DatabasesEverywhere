@@ -19,6 +19,9 @@ const MAX_REMOTE_IMPORT_OPERATION_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 // succeeding only to fail deterministically during target staging.
 const MAX_REMOTE_IMPORT_STAGED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_BACKUP_CATALOG_BYTES: u64 = 1024 * 1024;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const MIN_SECRET_LEN: usize = 32;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {
@@ -244,32 +247,21 @@ fn validate_backups(config: &Config) -> Result<(), ConfigValidationError> {
 }
 
 fn validate_s3_backup(s3: &crate::config::BackupS3Config) -> Result<(), ConfigValidationError> {
-    let bucket = s3.bucket.trim();
-    if bucket.len() < 3
-        || bucket.len() > 63
-        || bucket.starts_with('.')
-        || bucket.starts_with('-')
-        || bucket.ends_with('.')
-        || bucket.ends_with('-')
-        || !bucket.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-        })
-    {
+    if !is_valid_s3_bucket_name(s3.bucket.trim()) {
         return invalid_backup(
             "storage.s3.bucket",
             "must be a valid lowercase S3 bucket name",
         );
     }
-    if s3.region.trim().is_empty()
-        || !s3
-            .region
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    let region_has_valid_characters = s3
+        .region
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if s3.region.trim().is_empty() || !region_has_valid_characters {
         return invalid_backup("storage.s3.region", "contains unsupported characters");
     }
     validate_s3_prefix(&s3.prefix)?;
-    if s3.request_timeout_seconds == 0 || s3.request_timeout_seconds > 24 * 60 * 60 {
+    if s3.request_timeout_seconds == 0 || s3.request_timeout_seconds > SECONDS_PER_DAY {
         return invalid_backup(
             "storage.s3.request_timeout_seconds",
             "must be between 1 and 86400",
@@ -285,29 +277,46 @@ fn validate_s3_backup(s3: &crate::config::BackupS3Config) -> Result<(), ConfigVa
         );
     }
     if !s3.endpoint.trim().is_empty() {
-        let endpoint = reqwest::Url::parse(s3.endpoint.trim()).map_err(|_| {
-            ConfigValidationError::InvalidBackupConfig {
-                field: "storage.s3.endpoint",
-                message: "must be a full HTTP(S) URL".to_string(),
-            }
+        validate_s3_endpoint(s3.endpoint.trim(), s3.allow_http)?;
+    }
+    Ok(())
+}
+
+fn is_valid_s3_bucket_name(bucket: &str) -> bool {
+    let has_valid_characters = bucket.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+    });
+    (3..=63).contains(&bucket.len())
+        && !bucket.starts_with('.')
+        && !bucket.starts_with('-')
+        && !bucket.ends_with('.')
+        && !bucket.ends_with('-')
+        && has_valid_characters
+}
+
+fn validate_s3_endpoint(endpoint: &str, allow_http: bool) -> Result<(), ConfigValidationError> {
+    let endpoint =
+        reqwest::Url::parse(endpoint).map_err(|_| ConfigValidationError::InvalidBackupConfig {
+            field: "storage.s3.endpoint",
+            message: "must be a full HTTP(S) URL".to_string(),
         })?;
-        if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && s3.allow_http) {
-            return invalid_backup(
-                "storage.s3.endpoint",
-                "must use HTTPS unless allow_http is explicitly enabled",
-            );
-        }
-        if endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return invalid_backup(
-                "storage.s3.endpoint",
-                "must have a host and may not contain credentials, a query, or a fragment",
-            );
-        }
+    let scheme_allowed =
+        endpoint.scheme() == "https" || (endpoint.scheme() == "http" && allow_http);
+    if !scheme_allowed {
+        return invalid_backup(
+            "storage.s3.endpoint",
+            "must use HTTPS unless allow_http is explicitly enabled",
+        );
+    }
+    let has_extra_parts = !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some();
+    if endpoint.host_str().is_none() || has_extra_parts {
+        return invalid_backup(
+            "storage.s3.endpoint",
+            "must have a host and may not contain credentials, a query, or a fragment",
+        );
     }
     Ok(())
 }
@@ -341,7 +350,7 @@ fn validate_kopia_backup(
     if !kopia.config_file.trim().is_empty() {
         validate_absolute_path("backups.storage.kopia.config_file", &kopia.config_file)?;
     }
-    if kopia.operation_timeout_seconds == 0 || kopia.operation_timeout_seconds > 24 * 60 * 60 {
+    if kopia.operation_timeout_seconds == 0 || kopia.operation_timeout_seconds > SECONDS_PER_DAY {
         return invalid_backup(
             "storage.kopia.operation_timeout_seconds",
             "must be between 1 and 86400",
@@ -367,7 +376,7 @@ fn validate_allocation(
         ("max_memory_mib", allocation.max_memory_mib),
         ("max_disk_mib", allocation.max_disk_mib),
     ] {
-        if value.is_some_and(|value| value == 0 || value.checked_mul(1024 * 1024).is_none()) {
+        if value.is_some_and(|value| value == 0 || value.checked_mul(BYTES_PER_MIB).is_none()) {
             return Err(ConfigValidationError::InvalidAllocationLimit { field });
         }
     }
@@ -375,7 +384,7 @@ fn validate_allocation(
         ("reserved_memory_mib", allocation.reserved_memory_mib),
         ("reserved_disk_mib", allocation.reserved_disk_mib),
     ] {
-        if value.checked_mul(1024 * 1024).is_none() {
+        if value.checked_mul(BYTES_PER_MIB).is_none() {
             return Err(ConfigValidationError::InvalidAllocationLimit { field });
         }
     }
@@ -386,7 +395,7 @@ fn validate_api_token(token: &str) -> Result<(), ConfigValidationError> {
     if token.trim().is_empty() {
         return Err(ConfigValidationError::EmptyApiToken);
     }
-    if token.trim().len() < 32 {
+    if token.trim().len() < MIN_SECRET_LEN {
         return Err(ConfigValidationError::WeakApiToken);
     }
     if looks_like_placeholder(token) {
@@ -399,7 +408,7 @@ fn validate_jwt_signing_key(key: &str, api_token: &str) -> Result<(), ConfigVali
     if key.trim().is_empty() {
         return Err(ConfigValidationError::EmptyJwtSigningKey);
     }
-    if key.trim().len() < 32 {
+    if key.trim().len() < MIN_SECRET_LEN {
         return Err(ConfigValidationError::WeakJwtSigningKey);
     }
     if looks_like_placeholder(key) {
@@ -412,16 +421,22 @@ fn validate_jwt_signing_key(key: &str, api_token: &str) -> Result<(), ConfigVali
 }
 
 fn looks_like_placeholder(secret: &str) -> bool {
+    const PLACEHOLDER_MARKERS: [&str; 5] = [
+        "change-me",
+        "changeme",
+        "replace_with",
+        "replace-with",
+        "generated-by-panel",
+    ];
     let normalized = secret.trim().to_ascii_lowercase();
-    normalized.contains("change-me")
-        || normalized.contains("changeme")
-        || normalized.contains("replace_with")
-        || normalized.contains("replace-with")
-        || normalized.contains("generated-by-panel")
-        || normalized
-            .as_bytes()
-            .first()
-            .is_some_and(|first| normalized.bytes().all(|byte| byte == *first))
+    let contains_marker = PLACEHOLDER_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let is_single_repeated_byte = normalized
+        .as_bytes()
+        .first()
+        .is_some_and(|first| normalized.bytes().all(|byte| byte == *first));
+    contains_marker || is_single_repeated_byte
 }
 
 fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigValidationError> {
@@ -462,13 +477,8 @@ fn validate_images(images: &crate::config::ImageConfig) -> Result<(), ConfigVali
 
 fn validate_image_reference(field: &'static str, image: &str) -> Result<(), ConfigValidationError> {
     let image = image.trim();
-    if image.is_empty() || image.chars().any(char::is_whitespace) {
-        return Err(ConfigValidationError::InvalidImageReference {
-            field,
-            image: image.to_string(),
-        });
-    }
-    if is_pinned_image_reference(image) {
+    let is_well_formed = !image.is_empty() && !image.chars().any(char::is_whitespace);
+    if is_well_formed && is_pinned_image_reference(image) {
         return Ok(());
     }
     Err(ConfigValidationError::InvalidImageReference {
@@ -543,12 +553,7 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
     let binary = disk.fuse_quota_binary();
     if !binary.eq_ignore_ascii_case("embedded") {
         validate_absolute_path("disk.fuse_quota_binary", binary)?;
-        let digest = disk.fuse_quota_binary_sha256.trim();
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !is_lowercase_sha256_hex(disk.fuse_quota_binary_sha256.trim()) {
             return Err(ConfigValidationError::InvalidFuseQuotaBinarySha256);
         }
     }
@@ -613,6 +618,13 @@ fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidatio
         });
     }
     Ok(())
+}
+
+fn is_lowercase_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_listener(

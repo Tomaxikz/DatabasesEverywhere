@@ -123,41 +123,15 @@ pub(crate) async fn validate_remote_source(
 
     match protocol {
         Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql | Protocol::Clickhouse => {
-            require_present("source.database", database.as_deref())?;
-            require_present("source.username", username.as_deref())?;
-            let password = request.password.as_ref().ok_or_else(|| {
-                ApiError::BadRequest("remote SQL import requires source.password".to_string())
-            })?;
-            validate_line_safe_secret("source.password", password)?;
-            if protocol == Protocol::Clickhouse
-                && !database
-                    .as_deref()
-                    .is_some_and(|value| portable_identifier(value, 128))
-            {
-                return Err(ApiError::BadRequest(
-                    "clickhouse source.database must be at most 128 bytes and use only ascii letters, digits, underscore, or dash"
-                        .to_string(),
-                ));
-            }
-            if matches!(protocol, Protocol::Mariadb | Protocol::Mysql)
-                && database
-                    .as_deref()
-                    .is_some_and(|database| !mysql_database_name(database))
-            {
-                return Err(ApiError::BadRequest(format!(
-                    "{} source.database must contain at most 64 characters",
-                    protocol.as_str()
-                )));
-            }
-            if request.database_index.is_some()
-                || request.api_key.is_some()
-                || authentication_database.is_some()
-            {
-                return Err(ApiError::BadRequest(format!(
-                    "remote {} import contains credentials for a different database protocol",
-                    protocol.as_str()
-                )));
-            }
+            validate_sql_source(
+                protocol,
+                database.as_deref(),
+                username.as_deref(),
+                request.password.as_ref(),
+                authentication_database.as_deref(),
+                request.database_index,
+                request.api_key.as_ref(),
+            )?;
         }
         Protocol::Mongodb => {
             let database = database.as_deref().ok_or_else(|| {
@@ -237,6 +211,46 @@ pub(crate) async fn validate_remote_source(
         database_index: request.database_index.unwrap_or_default(),
         api_key: request.api_key,
     })
+}
+
+fn validate_sql_source(
+    protocol: Protocol,
+    database: Option<&str>,
+    username: Option<&str>,
+    password: Option<&SecretString>,
+    authentication_database: Option<&str>,
+    database_index: Option<u32>,
+    api_key: Option<&SecretString>,
+) -> Result<(), ApiError> {
+    require_present("source.database", database)?;
+    require_present("source.username", username)?;
+    let password = password.ok_or_else(|| {
+        ApiError::BadRequest("remote SQL import requires source.password".to_string())
+    })?;
+    validate_line_safe_secret("source.password", password)?;
+    if protocol == Protocol::Clickhouse
+        && !database.is_some_and(|value| portable_identifier(value, 128))
+    {
+        return Err(ApiError::BadRequest(
+            "clickhouse source.database must be at most 128 bytes and use only ascii letters, digits, underscore, or dash"
+                .to_string(),
+        ));
+    }
+    if matches!(protocol, Protocol::Mariadb | Protocol::Mysql)
+        && database.is_some_and(|database| !mysql_database_name(database))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{} source.database must contain at most 64 characters",
+            protocol.as_str()
+        )));
+    }
+    if database_index.is_some() || api_key.is_some() || authentication_database.is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "remote {} import contains credentials for a different database protocol",
+            protocol.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_secret_size(field: &str, value: Option<&SecretString>) -> Result<(), ApiError> {
@@ -434,106 +448,17 @@ pub(crate) async fn acquire_logical_dump(
         .iter()
         .map(|output_name| root.join(output_name))
         .collect::<Vec<_>>();
-    let helper_result = logical::run_helper(
+    let helper = LogicalDumpHelper {
         state,
         protocol,
         source,
         selection,
         target_username,
-        &root,
-        &output_names,
-    )
-    .await;
-    let credential_cleanup = remove_credential_files(&root).await;
-    if let Err(error) = helper_result {
-        if let Err(cleanup_error) = credential_cleanup {
-            tracing::warn!(
-                path = %root.display(),
-                error = %cleanup_error,
-                "failed to remove remote import credentials after helper failure"
-            );
-        }
+        target_database,
+    };
+    if let Err(error) = helper.stage(&root, &output_names, &outputs).await {
         staging.cleanup().await;
         return Err(error);
-    }
-    if let Err(error) = credential_cleanup {
-        staging.cleanup().await;
-        return Err(error);
-    }
-    if matches!(protocol, Protocol::Mariadb | Protocol::Mysql) {
-        let output = &outputs[0];
-        let Some(source_database) = source.database.as_deref() else {
-            staging.cleanup().await;
-            return Err(ApiError::BadRequest(format!(
-                "{} remote import requires a source database",
-                protocol.as_str()
-            )));
-        };
-        if let Err(error) = mysql_sql::rewrite_mysql_schema_qualifiers(
-            output,
-            source_database,
-            target_database,
-            state.config.security.remote_import.max_staged_bytes,
-            std::time::Duration::from_secs(
-                state
-                    .config
-                    .security
-                    .remote_import
-                    .operation_timeout_seconds,
-            ),
-        )
-        .await
-        {
-            staging.cleanup().await;
-            return Err(error);
-        }
-    }
-    if protocol == Protocol::Clickhouse {
-        let output = &outputs[0];
-        let Some(source_database) = source.database.as_deref() else {
-            staging.cleanup().await;
-            return Err(ApiError::BadRequest(
-                "clickhouse remote import requires a source database".to_string(),
-            ));
-        };
-        if let Err(error) = mysql_sql::rewrite_clickhouse_schema(
-            output,
-            source_database,
-            target_database,
-            state.config.security.remote_import.max_staged_bytes,
-            std::time::Duration::from_secs(
-                state
-                    .config
-                    .security
-                    .remote_import
-                    .operation_timeout_seconds,
-            ),
-        )
-        .await
-        {
-            staging.cleanup().await;
-            return Err(error);
-        }
-    }
-    let max_staged_bytes = state.config.security.remote_import.max_staged_bytes;
-    let mut total_staged_bytes = 0_u64;
-    for output in &outputs {
-        let staged_bytes = match validate_staged_file(output, max_staged_bytes).await {
-            Ok(staged_bytes) => staged_bytes,
-            Err(error) => {
-                staging.cleanup().await;
-                return Err(error);
-            }
-        };
-        total_staged_bytes = match total_staged_bytes.checked_add(staged_bytes) {
-            Some(total) if total <= max_staged_bytes => total,
-            _ => {
-                staging.cleanup().await;
-                return Err(ApiError::BadRequest(format!(
-                    "remote database dumps exceed the node staging limit of {max_staged_bytes} bytes"
-                )));
-            }
-        };
     }
     Ok(StagedRemoteDump {
         paths: outputs,
@@ -541,6 +466,111 @@ pub(crate) async fn acquire_logical_dump(
         staging,
         _permit: permit,
     })
+}
+
+struct LogicalDumpHelper<'a> {
+    state: &'a AppState,
+    protocol: Protocol,
+    source: &'a RemoteImportSource,
+    selection: &'a ImportExportSelection,
+    target_username: &'a str,
+    target_database: &'a str,
+}
+
+impl LogicalDumpHelper<'_> {
+    async fn stage(
+        &self,
+        root: &Path,
+        output_names: &[String],
+        outputs: &[PathBuf],
+    ) -> Result<(), ApiError> {
+        let helper_result = logical::run_helper(
+            self.state,
+            self.protocol,
+            self.source,
+            self.selection,
+            self.target_username,
+            root,
+            output_names,
+        )
+        .await;
+        let credential_cleanup = remove_credential_files(root).await;
+        if let Err(error) = helper_result {
+            if let Err(cleanup_error) = credential_cleanup {
+                tracing::warn!(
+                    path = %root.display(),
+                    error = %cleanup_error,
+                    "failed to remove remote import credentials after helper failure"
+                );
+            }
+            return Err(error);
+        }
+        credential_cleanup?;
+        self.rewrite_schema_qualifiers(outputs).await?;
+        validate_total_staged_size(
+            outputs,
+            self.state.config.security.remote_import.max_staged_bytes,
+        )
+        .await
+    }
+
+    async fn rewrite_schema_qualifiers(&self, outputs: &[PathBuf]) -> Result<(), ApiError> {
+        let remote_import = &self.state.config.security.remote_import;
+        let timeout = std::time::Duration::from_secs(remote_import.operation_timeout_seconds);
+        match self.protocol {
+            Protocol::Mariadb | Protocol::Mysql => {
+                let Some(source_database) = self.source.database.as_deref() else {
+                    return Err(ApiError::BadRequest(format!(
+                        "{} remote import requires a source database",
+                        self.protocol.as_str()
+                    )));
+                };
+                mysql_sql::rewrite_mysql_schema_qualifiers(
+                    &outputs[0],
+                    source_database,
+                    self.target_database,
+                    remote_import.max_staged_bytes,
+                    timeout,
+                )
+                .await
+            }
+            Protocol::Clickhouse => {
+                let Some(source_database) = self.source.database.as_deref() else {
+                    return Err(ApiError::BadRequest(
+                        "clickhouse remote import requires a source database".to_string(),
+                    ));
+                };
+                mysql_sql::rewrite_clickhouse_schema(
+                    &outputs[0],
+                    source_database,
+                    self.target_database,
+                    remote_import.max_staged_bytes,
+                    timeout,
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+async fn validate_total_staged_size(
+    outputs: &[PathBuf],
+    max_staged_bytes: u64,
+) -> Result<(), ApiError> {
+    let mut total_staged_bytes = 0_u64;
+    for output in outputs {
+        let staged_bytes = validate_staged_file(output, max_staged_bytes).await?;
+        total_staged_bytes = match total_staged_bytes.checked_add(staged_bytes) {
+            Some(total) if total <= max_staged_bytes => total,
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "remote database dumps exceed the node staging limit of {max_staged_bytes} bytes"
+                )));
+            }
+        };
+    }
+    Ok(())
 }
 
 mod logical;
@@ -638,115 +668,141 @@ pub(crate) async fn cleanup_stale_import_secrets(
             break;
         }
 
-        let job_path = entry.path();
         if !is_generated_import_job(&entry.file_name()) {
             summary.skipped_entries += 1;
             continue;
         }
-        let metadata = match tokio::fs::symlink_metadata(&job_path).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                summary.errors += 1;
-                tracing::warn!(
-                    path = %job_path.display(),
-                    %error,
-                    "failed to inspect stale remote import job directory"
-                );
-                continue;
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            summary.skipped_entries += 1;
-            tracing::warn!(
-                path = %job_path.display(),
-                "skipping a symlinked or non-directory remote import job entry"
-            );
-            continue;
-        }
-        summary.job_directories += 1;
-
-        let manifest_path = job_path.join("recovery-manifest.json");
-        let has_recovery_manifest = match tokio::fs::symlink_metadata(&manifest_path).await {
-            Ok(manifest_metadata)
-                if manifest_metadata.is_file() && !manifest_metadata.file_type().is_symlink() =>
-            {
-                true
-            }
-            Ok(_) => {
-                summary.errors += 1;
-                summary.skipped_entries += 1;
-                tracing::warn!(
-                    path = %manifest_path.display(),
-                    "refusing to remove a remote import staging directory with a non-regular recovery manifest"
-                );
-                true
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => {
-                summary.errors += 1;
-                tracing::warn!(
-                    path = %manifest_path.display(),
-                    %error,
-                    "failed to inspect a remote import recovery manifest"
-                );
-                true
-            }
-        };
-
-        if remove_orphaned_staging && !has_recovery_manifest {
-            match tokio::fs::remove_dir_all(&job_path).await {
-                Ok(()) => summary.removed_directories += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    summary.errors += 1;
-                    tracing::warn!(
-                        path = %job_path.display(),
-                        %error,
-                        "failed to remove orphaned remote import staging directory"
-                    );
-                }
-            }
-            continue;
-        }
-
-        for name in REMOTE_CREDENTIAL_FILES {
-            let credential_path = job_path.join(name);
-            let credential_metadata = match tokio::fs::symlink_metadata(&credential_path).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    summary.errors += 1;
-                    tracing::warn!(
-                        path = %credential_path.display(),
-                        %error,
-                        "failed to inspect a stale remote import credential file"
-                    );
-                    continue;
-                }
-            };
-            if credential_metadata.file_type().is_symlink() || !credential_metadata.is_file() {
-                summary.skipped_entries += 1;
-                tracing::warn!(
-                    path = %credential_path.display(),
-                    "skipping a symlinked or non-regular remote import credential entry"
-                );
-                continue;
-            }
-            match tokio::fs::remove_file(&credential_path).await {
-                Ok(()) => summary.removed_files += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    summary.errors += 1;
-                    tracing::warn!(
-                        path = %credential_path.display(),
-                        %error,
-                        "failed to remove a stale remote import credential file"
-                    );
-                }
-            }
-        }
+        cleanup_stale_job_directory(&entry.path(), remove_orphaned_staging, &mut summary).await;
     }
     summary
+}
+
+async fn cleanup_stale_job_directory(
+    job_path: &Path,
+    remove_orphaned_staging: bool,
+    summary: &mut StaleRemoteCredentialCleanup,
+) {
+    let metadata = match tokio::fs::symlink_metadata(job_path).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            summary.errors += 1;
+            tracing::warn!(
+                path = %job_path.display(),
+                %error,
+                "failed to inspect stale remote import job directory"
+            );
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        summary.skipped_entries += 1;
+        tracing::warn!(
+            path = %job_path.display(),
+            "skipping a symlinked or non-directory remote import job entry"
+        );
+        return;
+    }
+    summary.job_directories += 1;
+
+    let has_recovery_manifest = inspect_recovery_manifest(job_path, summary).await;
+    if remove_orphaned_staging && !has_recovery_manifest {
+        remove_orphaned_staging_directory(job_path, summary).await;
+        return;
+    }
+
+    for name in REMOTE_CREDENTIAL_FILES {
+        remove_stale_credential_file(&job_path.join(name), summary).await;
+    }
+}
+
+async fn inspect_recovery_manifest(
+    job_path: &Path,
+    summary: &mut StaleRemoteCredentialCleanup,
+) -> bool {
+    let manifest_path = job_path.join("recovery-manifest.json");
+    match tokio::fs::symlink_metadata(&manifest_path).await {
+        Ok(manifest_metadata)
+            if manifest_metadata.is_file() && !manifest_metadata.file_type().is_symlink() =>
+        {
+            true
+        }
+        Ok(_) => {
+            summary.errors += 1;
+            summary.skipped_entries += 1;
+            tracing::warn!(
+                path = %manifest_path.display(),
+                "refusing to remove a remote import staging directory with a non-regular recovery manifest"
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            summary.errors += 1;
+            tracing::warn!(
+                path = %manifest_path.display(),
+                %error,
+                "failed to inspect a remote import recovery manifest"
+            );
+            true
+        }
+    }
+}
+
+async fn remove_orphaned_staging_directory(
+    job_path: &Path,
+    summary: &mut StaleRemoteCredentialCleanup,
+) {
+    match tokio::fs::remove_dir_all(job_path).await {
+        Ok(()) => summary.removed_directories += 1,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            summary.errors += 1;
+            tracing::warn!(
+                path = %job_path.display(),
+                %error,
+                "failed to remove orphaned remote import staging directory"
+            );
+        }
+    }
+}
+
+async fn remove_stale_credential_file(
+    credential_path: &Path,
+    summary: &mut StaleRemoteCredentialCleanup,
+) {
+    let credential_metadata = match tokio::fs::symlink_metadata(credential_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            summary.errors += 1;
+            tracing::warn!(
+                path = %credential_path.display(),
+                %error,
+                "failed to inspect a stale remote import credential file"
+            );
+            return;
+        }
+    };
+    if credential_metadata.file_type().is_symlink() || !credential_metadata.is_file() {
+        summary.skipped_entries += 1;
+        tracing::warn!(
+            path = %credential_path.display(),
+            "skipping a symlinked or non-regular remote import credential entry"
+        );
+        return;
+    }
+    match tokio::fs::remove_file(credential_path).await {
+        Ok(()) => summary.removed_files += 1,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            summary.errors += 1;
+            tracing::warn!(
+                path = %credential_path.display(),
+                %error,
+                "failed to remove a stale remote import credential file"
+            );
+        }
+    }
 }
 
 fn is_generated_import_job(name: &std::ffi::OsStr) -> bool {
@@ -840,10 +896,7 @@ pub(crate) async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(
     use tokio::io::AsyncWriteExt;
 
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    {
-        options.mode(0o600);
-    }
+    options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(path).await.map_err(|error| {
         ApiError::Runtime(format!(
             "failed to create protected import credential file: {error}"

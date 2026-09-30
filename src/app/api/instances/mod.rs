@@ -105,6 +105,7 @@ pub(crate) use purge::{
 };
 
 const IMAGE_UPDATE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(180);
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn reconcile_instance(
     State(state): State<AppState>,
@@ -171,7 +172,7 @@ pub async fn update_instance_image(
 ) -> ApiResult<UpdateInstanceImageResponse> {
     auth.require_scope(scopes::INSTANCES_WRITE)?;
     let image = validate_image(&request.image)?.to_string();
-    let _operation = state.instance_locks.lock(&instance_id).await;
+    let operation = state.instance_locks.lock(&instance_id).await;
     let metadata = state
         .instances
         .get(&instance_id)
@@ -213,7 +214,7 @@ pub async fn update_instance_image(
         })?;
     update_instance_image_locked(
         state,
-        _operation,
+        operation,
         metadata,
         current_image,
         image,
@@ -427,9 +428,7 @@ async fn resize_instance(
     } else {
         None
     };
-    let effective_disk_limiter =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
+    let effective_disk_limiter = persisted_disk_limiter(state, &metadata);
     if let Some(paths) = paths.as_ref() {
         effective_disk_limiter
             .check_method_change(&metadata.limits.disk_enforcement_method)
@@ -457,7 +456,7 @@ async fn resize_instance(
             .await
         {
             Ok(()) => {}
-            Err(error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch { .. }) => {
+            Err(error @ DockerError::DiskBindSourceMismatch { .. }) => {
                 return Err(ApiError::Conflict(error.to_string()));
             }
             Err(error) => return Err(docker_error(error)),
@@ -586,11 +585,9 @@ async fn rollback_instance_limits(
     }
     if disk_changed
         && let Some(paths) = paths
-        && let Err(error) =
-            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-                .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
-                .update_instance_limit(&metadata.instance_id, &paths.data, previous.disk_mib)
-                .await
+        && let Err(error) = persisted_disk_limiter(state, metadata)
+            .update_instance_limit(&metadata.instance_id, &paths.data, previous.disk_mib)
+            .await
     {
         failures.push(format!("disk rollback failed: {error}"));
     }
@@ -603,14 +600,13 @@ async fn rollback_disk_limit(
     paths: &InstancePaths,
     disk_mib: u64,
 ) -> String {
-    let failures =
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
-            .update_instance_limit(&metadata.instance_id, &paths.data, disk_mib)
-            .await
-            .err()
-            .map(|error| vec![format!("disk rollback failed: {error}")])
-            .unwrap_or_default();
+    let mut failures = Vec::new();
+    if let Err(error) = persisted_disk_limiter(state, metadata)
+        .update_instance_limit(&metadata.instance_id, &paths.data, disk_mib)
+        .await
+    {
+        failures.push(format!("disk rollback failed: {error}"));
+    }
     report_limit_rollback(&metadata.instance_id, failures)
 }
 
@@ -711,72 +707,10 @@ pub(crate) async fn change_instance_state(
             ))
         })?;
     }
+    reject_quarantined_start(&metadata, action)?;
     let mut metadata_changed = false;
-    if metadata.status == InstanceStatus::Quarantined
-        && matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
-    {
-        return Err(ApiError::Conflict(
-            "instance is quarantined for fail-closed safety; inspect job history and logs, then repair, recover, or delete it before attempting to start it"
-                .to_string(),
-        ));
-    }
-    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-        let disk_limiter =
-            DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-                .for_persisted_protocol(
-                    metadata.protocol,
-                    &metadata.limits.disk_enforcement_method,
-                );
-        disk_limiter
-            .check_method_change(&metadata.limits.disk_enforcement_method)
-            .map_err(|error| ApiError::Conflict(error.to_string()))?;
-        check_disk_method(&disk_limiter, &metadata)?;
-        let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        let expected_data_source = disk_limiter
-            .container_data_path(&paths.data)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        match state
-            .docker
-            .verify_data_bind(
-                metadata.protocol,
-                &metadata.instance_id,
-                &expected_data_source,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch { .. }) => {
-                return Err(ApiError::Conflict(format!(
-                    "{error}; repair/recreate the managed container before starting it"
-                )));
-            }
-            Err(error) => return Err(docker_error(error)),
-        }
-        let scanner_required = crate::disk::soft::SoftDiskLimiter::enforcement_required(
-            state.config.disk.mode,
-            metadata.protocol,
-        ) || (metadata.protocol == Protocol::Qdrant
-            && metadata.limits.disk_enforcement_method == "fuse_quota");
-        if scanner_required {
-            let snapshot = state
-                .soft_disk_limiter
-                .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
-                    instance_id: metadata.instance_id.clone(),
-                    created_at: metadata.created_at.clone(),
-                    protocol: metadata.protocol,
-                    data_path: paths.data,
-                    limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
-                    durable_blocked: metadata.disk_limit_blocked,
-                })
-                .await
-                .map_err(ApiError::Conflict)?;
-            if metadata.disk_limit_blocked && !snapshot.blocked {
-                metadata.disk_limit_blocked = false;
-                metadata.updated_at = now_rfc3339();
-                metadata_changed = true;
-            }
-        }
+    if starts_runtime(action) {
+        metadata_changed = precheck_dedicated_start(state, &mut metadata).await?;
     }
     let desired_state = match action {
         LifecycleAction::Start | LifecycleAction::Restart => DesiredInstanceState::Running,
@@ -845,6 +779,90 @@ pub(crate) async fn change_instance_state(
     })?
 }
 
+fn starts_runtime(action: LifecycleAction) -> bool {
+    matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
+}
+
+fn reject_quarantined_start(
+    metadata: &InstanceMetadata,
+    action: LifecycleAction,
+) -> Result<(), ApiError> {
+    if metadata.status == InstanceStatus::Quarantined && starts_runtime(action) {
+        return Err(ApiError::Conflict(
+            "instance is quarantined for fail-closed safety; inspect job history and logs, then repair, recover, or delete it before attempting to start it"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_disk_limiter(state: &AppState, metadata: &InstanceMetadata) -> DiskLimiter {
+    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+        .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
+}
+
+fn soft_scanner_required(state: &AppState, metadata: &InstanceMetadata) -> bool {
+    crate::disk::soft::SoftDiskLimiter::enforcement_required(
+        state.config.disk.mode,
+        metadata.protocol,
+    ) || (metadata.protocol == Protocol::Qdrant
+        && metadata.limits.disk_enforcement_method == "fuse_quota")
+}
+
+async fn precheck_dedicated_start(
+    state: &AppState,
+    metadata: &mut InstanceMetadata,
+) -> Result<bool, ApiError> {
+    let disk_limiter = persisted_disk_limiter(state, metadata);
+    disk_limiter
+        .check_method_change(&metadata.limits.disk_enforcement_method)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    check_disk_method(&disk_limiter, metadata)?;
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let expected_data_source = disk_limiter
+        .container_data_path(&paths.data)
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    match state
+        .docker
+        .verify_data_bind(
+            metadata.protocol,
+            &metadata.instance_id,
+            &expected_data_source,
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(error @ DockerError::DiskBindSourceMismatch { .. }) => {
+            return Err(ApiError::Conflict(format!(
+                "{error}; repair/recreate the managed container before starting it"
+            )));
+        }
+        Err(error) => return Err(docker_error(error)),
+    }
+    if !soft_scanner_required(state, metadata) {
+        return Ok(false);
+    }
+    let snapshot = state
+        .soft_disk_limiter
+        .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+            instance_id: metadata.instance_id.clone(),
+            created_at: metadata.created_at.clone(),
+            protocol: metadata.protocol,
+            data_path: paths.data,
+            limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
+            durable_blocked: metadata.disk_limit_blocked,
+        })
+        .await
+        .map_err(ApiError::Conflict)?;
+    if metadata.disk_limit_blocked && !snapshot.blocked {
+        metadata.disk_limit_blocked = false;
+        metadata.updated_at = now_rfc3339();
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn check_disk_method(limiter: &DiskLimiter, metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if crate::config::DiskLimitMode::from_persisted_method(&metadata.limits.disk_enforcement_method)
         == Some(limiter.mode())
@@ -874,14 +892,7 @@ pub(crate) async fn change_instance_state_locked(
         return shared::change_state(state, metadata, action).await;
     }
 
-    if metadata.status == InstanceStatus::Quarantined
-        && matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
-    {
-        return Err(ApiError::Conflict(
-            "instance is quarantined for fail-closed safety; inspect job history and logs, then repair, recover, or delete it before attempting to start it"
-                .to_string(),
-        ));
-    }
+    reject_quarantined_start(&metadata, action)?;
 
     let inspection = state
         .docker
@@ -895,216 +906,32 @@ pub(crate) async fn change_instance_state_locked(
         LifecycleAction::Kill => inspection.status == DockerContainerStatus::Running,
     };
 
+    let starting = starts_runtime(action);
     let mut startup_readiness_failed = false;
-    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
+    if starting {
         route_fence::fence(state, &metadata.instance_id).await;
     }
     let operation_result: Result<(), ApiError> = async {
         if should_call_docker {
-            if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-                let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-                    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-                let disk_limiter = DiskLimiter::with_fuse_root(
-                    state.config.disk.clone(),
-                    state.config.paths.fuse_root(),
-                )
-                .for_persisted_protocol(
-                    metadata.protocol,
-                    &metadata.limits.disk_enforcement_method,
-                );
-                disk_limiter
-                    .check_method_change(&metadata.limits.disk_enforcement_method)
-                    .map_err(|error| ApiError::Conflict(error.to_string()))?;
-                check_disk_method(&disk_limiter, &metadata)?;
-                let expected_data_source = disk_limiter
-                    .container_data_path(&paths.data)
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-                match state
+            if starting {
+                prepare_dedicated_start(state, &mut metadata).await?;
+            }
+            let refresh_console = starting
+                && !state
                     .docker
-                    .verify_data_bind(
-                        metadata.protocol,
-                        &metadata.instance_id,
-                        &expected_data_source,
-                    )
+                    .log_policy_is_current(metadata.protocol, &metadata.instance_id)
                     .await
-                {
-                    Ok(()) => {}
-                    Err(
-                        error @ crate::runtime::docker::DockerError::DiskBindSourceMismatch {
-                            ..
-                        },
-                    ) => {
-                        return Err(ApiError::Conflict(error.to_string()));
-                    }
-                    Err(error) => return Err(docker_error(error)),
-                }
-                let scanner_required = crate::disk::soft::SoftDiskLimiter::enforcement_required(
-                    state.config.disk.mode,
-                    metadata.protocol,
-                ) || (metadata.protocol == Protocol::Qdrant
-                    && metadata.limits.disk_enforcement_method == "fuse_quota");
-                if scanner_required {
-                    let snapshot = state
-                        .soft_disk_limiter
-                        .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
-                            instance_id: metadata.instance_id.clone(),
-                            created_at: metadata.created_at.clone(),
-                            protocol: metadata.protocol,
-                            data_path: paths.data.clone(),
-                            limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
-                            durable_blocked: metadata.disk_limit_blocked,
-                        })
-                        .await
-                        .map_err(ApiError::Conflict)?;
-                    if metadata.disk_limit_blocked && !snapshot.blocked {
-                        metadata.disk_limit_blocked = false;
-                        metadata.updated_at = now_rfc3339();
-                        state
-                            .manager
-                            .upsert(metadata.clone())
-                            .await
-                            .map_err(|error| {
-                                ApiError::Runtime(format!(
-                                    "failed to clear recovered disk-limit block: {error}"
-                                ))
-                            })?;
-                    }
-                }
-                disk_limiter
-                    .apply_instance_limit(
-                        &metadata.instance_id,
-                        &paths.data,
-                        metadata.limits.disk_mib,
-                    )
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-            }
-            let refresh_console = matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
-                && !state.docker.log_policy_is_current(metadata.protocol, &metadata.instance_id).await.map_err(docker_error)?;
+                    .map_err(docker_error)?;
             if refresh_console {
-                let image = state.docker.container_recreation_image(metadata.protocol, &metadata.instance_id).await.map_err(docker_error)?
-                    .ok_or_else(|| ApiError::Conflict("console-policy repair cannot preserve the installed image; update the image explicitly first".into()))?;
-                metadata = normal_image_update::update_instance_image_normal(state.clone(), metadata.clone(), image.clone(), image, None).await?.instance;
-            } else { match action {
-                LifecycleAction::Start => {
-                    state
-                        .docker
-                        .start(metadata.protocol, &metadata.instance_id)
-                        .await
-                }
-                LifecycleAction::Stop => {
-                    state
-                        .docker
-                        .stop(metadata.protocol, &metadata.instance_id)
-                        .await
-                }
-                LifecycleAction::Restart => {
-                    state
-                        .docker
-                        .restart(metadata.protocol, &metadata.instance_id)
-                        .await
-                }
-                LifecycleAction::Kill => {
-                    state
-                        .docker
-                        .kill(metadata.protocol, &metadata.instance_id)
-                        .await
-                }
+                metadata = recreate_with_current_console_policy(state, &metadata).await?;
+            } else {
+                run_lifecycle_command(state, &metadata, action).await?;
             }
-            .map_err(docker_error)?; }
         }
 
-        if matches!(action, LifecycleAction::Start | LifecycleAction::Restart) {
-            if let Err(error) = state
-                .docker
-                .wait_until_ready(
-                    metadata.protocol,
-                    &metadata.instance_id,
-                    Duration::from_secs(120),
-                )
-                .await
-            {
-                startup_readiness_failed = true;
-                return Err(docker_error(error));
-            }
-            if metadata.protocol == Protocol::Postgres {
-                let Some(password) = metadata.tenant_password.as_deref() else {
-                    startup_readiness_failed = true;
-                    return Err(ApiError::Conflict(
-                        "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
-                    ));
-                };
-                let Some(admin_password) = metadata.postgres_admin_password.as_deref() else {
-                    startup_readiness_failed = true;
-                    return Err(ApiError::Conflict(
-                        "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before starting it".to_string(),
-                    ));
-                };
-                if let Err(error) = harden_postgres_instance_auth(
-                    state,
-                    &metadata.instance_id,
-                    &metadata.database.name,
-                    &metadata.database.username,
-                    password,
-                    admin_password,
-                )
-                .await
-                {
-                    startup_readiness_failed = true;
-                    return Err(error);
-                }
-            }
-            if metadata.protocol == Protocol::Mysql {
-                let Some(password) = metadata.tenant_password.as_deref() else {
-                    startup_readiness_failed = true;
-                    return Err(ApiError::Conflict(
-                        "the encrypted MySQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
-                    ));
-                };
-                let Some(root_password) = metadata.mysql_root_password.as_deref() else {
-                    startup_readiness_failed = true;
-                    return Err(ApiError::Conflict(
-                        "the encrypted MySQL maintenance credential is missing; recreate this legacy instance before starting it".to_string(),
-                    ));
-                };
-                if let Err(error) = harden_mysql_tenant_auth(
-                    state,
-                    &metadata.instance_id,
-                    &metadata.database.username,
-                    password,
-                    root_password,
-                )
-                .await
-                {
-                    startup_readiness_failed = true;
-                    return Err(error);
-                }
-            }
-            if let Err(error) = verify_resp_credential(state, &metadata).await {
-                startup_readiness_failed = true;
-                return Err(error);
-            }
-            let compatibility = crate::compatibility::probe_instance_compatibility(
-                &state.manager,
-                &state.docker,
-                &metadata,
-                false,
-            )
-            .await
-            .map_err(|error| {
-                startup_readiness_failed = true;
-                ApiError::Runtime(format!(
-                    "database compatibility attestation failed during activation: {error}"
-                ))
-            })?;
-            if !compatibility.compatible {
-                startup_readiness_failed = true;
-                return Err(ApiError::Conflict(
-                    compatibility
-                        .diagnostic
-                        .unwrap_or_else(|| "database engine version is unsupported".to_string()),
-                ));
-            }
+        if starting && let Err(error) = verify_startup_readiness(state, &metadata).await {
+            startup_readiness_failed = true;
+            return Err(error);
         }
         Ok(())
     }
@@ -1164,6 +991,202 @@ pub(crate) async fn change_instance_state_locked(
     }
 
     Ok(ApiResponse::ok(metadata))
+}
+
+async fn prepare_dedicated_start(
+    state: &AppState,
+    metadata: &mut InstanceMetadata,
+) -> Result<(), ApiError> {
+    let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let disk_limiter = persisted_disk_limiter(state, metadata);
+    disk_limiter
+        .check_method_change(&metadata.limits.disk_enforcement_method)
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    check_disk_method(&disk_limiter, metadata)?;
+    let expected_data_source = disk_limiter
+        .container_data_path(&paths.data)
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    match state
+        .docker
+        .verify_data_bind(
+            metadata.protocol,
+            &metadata.instance_id,
+            &expected_data_source,
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(error @ DockerError::DiskBindSourceMismatch { .. }) => {
+            return Err(ApiError::Conflict(error.to_string()));
+        }
+        Err(error) => return Err(docker_error(error)),
+    }
+    if soft_scanner_required(state, metadata) {
+        let snapshot = state
+            .soft_disk_limiter
+            .ensure_start_allowed(&crate::disk::soft::SoftDiskTarget {
+                instance_id: metadata.instance_id.clone(),
+                created_at: metadata.created_at.clone(),
+                protocol: metadata.protocol,
+                data_path: paths.data.clone(),
+                limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
+                durable_blocked: metadata.disk_limit_blocked,
+            })
+            .await
+            .map_err(ApiError::Conflict)?;
+        if metadata.disk_limit_blocked && !snapshot.blocked {
+            metadata.disk_limit_blocked = false;
+            metadata.updated_at = now_rfc3339();
+            state
+                .manager
+                .upsert(metadata.clone())
+                .await
+                .map_err(|error| {
+                    ApiError::Runtime(format!(
+                        "failed to clear recovered disk-limit block: {error}"
+                    ))
+                })?;
+        }
+    }
+    disk_limiter
+        .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    Ok(())
+}
+
+async fn recreate_with_current_console_policy(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<InstanceMetadata, ApiError> {
+    let image = state
+        .docker
+        .container_recreation_image(metadata.protocol, &metadata.instance_id)
+        .await
+        .map_err(docker_error)?
+        .ok_or_else(|| {
+            ApiError::Conflict(
+                "console-policy repair cannot preserve the installed image; update the image explicitly first".into(),
+            )
+        })?;
+    let response = normal_image_update::update_instance_image_normal(
+        state.clone(),
+        metadata.clone(),
+        image.clone(),
+        image,
+        None,
+    )
+    .await?;
+    Ok(response.instance)
+}
+
+async fn run_lifecycle_command(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    action: LifecycleAction,
+) -> Result<(), ApiError> {
+    let docker = &state.docker;
+    let protocol = metadata.protocol;
+    let instance_id = metadata.instance_id.as_str();
+    match action {
+        LifecycleAction::Start => docker.start(protocol, instance_id).await,
+        LifecycleAction::Stop => docker.stop(protocol, instance_id).await,
+        LifecycleAction::Restart => docker.restart(protocol, instance_id).await,
+        LifecycleAction::Kill => docker.kill(protocol, instance_id).await,
+    }
+    .map_err(docker_error)?;
+    Ok(())
+}
+
+async fn verify_startup_readiness(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    state
+        .docker
+        .wait_until_ready(
+            metadata.protocol,
+            &metadata.instance_id,
+            STARTUP_READINESS_TIMEOUT,
+        )
+        .await
+        .map_err(docker_error)?;
+    if metadata.protocol == Protocol::Postgres {
+        harden_postgres_on_start(state, metadata).await?;
+    }
+    if metadata.protocol == Protocol::Mysql {
+        harden_mysql_on_start(state, metadata).await?;
+    }
+    verify_resp_credential(state, metadata).await?;
+    let compatibility = crate::compatibility::probe_instance_compatibility(
+        &state.manager,
+        &state.docker,
+        metadata,
+        false,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::Runtime(format!(
+            "database compatibility attestation failed during activation: {error}"
+        ))
+    })?;
+    if !compatibility.compatible {
+        return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
+            || "database engine version is unsupported".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+async fn harden_postgres_on_start(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let Some(password) = metadata.tenant_password.as_deref() else {
+        return Err(ApiError::Conflict(
+            "the encrypted PostgreSQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
+        ));
+    };
+    let Some(admin_password) = metadata.postgres_admin_password.as_deref() else {
+        return Err(ApiError::Conflict(
+            "the encrypted PostgreSQL administrator credential is missing; restart the daemon to migrate this legacy instance before starting it".to_string(),
+        ));
+    };
+    harden_postgres_instance_auth(
+        state,
+        &metadata.instance_id,
+        &metadata.database.name,
+        &metadata.database.username,
+        password,
+        admin_password,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn harden_mysql_on_start(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let Some(password) = metadata.tenant_password.as_deref() else {
+        return Err(ApiError::Conflict(
+            "the encrypted MySQL tenant credential is missing; reset or recreate this legacy instance before starting it".to_string(),
+        ));
+    };
+    let Some(root_password) = metadata.mysql_root_password.as_deref() else {
+        return Err(ApiError::Conflict(
+            "the encrypted MySQL maintenance credential is missing; recreate this legacy instance before starting it".to_string(),
+        ));
+    };
+    harden_mysql_tenant_auth(
+        state,
+        &metadata.instance_id,
+        &metadata.database.username,
+        password,
+        root_password,
+    )
+    .await
 }
 
 async fn rollback_runtime_state(

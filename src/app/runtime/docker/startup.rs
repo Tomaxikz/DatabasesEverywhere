@@ -3,6 +3,8 @@ use bollard::models::{ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum}
 use super::{DockerError, DockerRuntime};
 use crate::shared::protocol::Protocol;
 
+const AUTOMATIC_STARTUP_ATTEMPT_BUDGET: i64 = 2;
+
 pub(super) fn no_restarts() -> RestartPolicy {
     RestartPolicy {
         name: Some(RestartPolicyNameEnum::NO),
@@ -28,16 +30,16 @@ impl DockerRuntime {
     /// Automatic boot recovery has a durable two-attempt budget. Explicit API
     /// starts and restore/rollback operations remain possible after repair.
     pub(crate) async fn check_autostart(&self, runtime_id: &str) -> Result<(), DockerError> {
-        if let Some(pool) = &self.startup_history {
-            let attempts: Option<i64> = sqlx::query_scalar(
-                "SELECT startup_attempts FROM engine_runtimes WHERE runtime_id = ?",
-            )
-            .bind(runtime_id)
-            .fetch_optional(pool)
-            .await?;
-            if attempts.is_some_and(|attempts| attempts >= 2) {
-                return Err(DockerError::AutostartBlocked(runtime_id.to_string()));
-            }
+        let Some(pool) = &self.startup_history else {
+            return Ok(());
+        };
+        let attempts: Option<i64> =
+            sqlx::query_scalar("SELECT startup_attempts FROM engine_runtimes WHERE runtime_id = ?")
+                .bind(runtime_id)
+                .fetch_optional(pool)
+                .await?;
+        if attempts.is_some_and(|attempts| attempts >= AUTOMATIC_STARTUP_ATTEMPT_BUDGET) {
+            return Err(DockerError::AutostartBlocked(runtime_id.to_string()));
         }
         Ok(())
     }

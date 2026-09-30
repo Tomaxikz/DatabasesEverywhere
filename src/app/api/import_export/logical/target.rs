@@ -123,26 +123,41 @@ pub(super) async fn fence_import_target(
         ));
     }
     if metadata.deployment_mode == DeploymentMode::Shared {
-        let runtime = shared_runtime(state, metadata).await?;
-        let target = shared_tenant(metadata);
-        crate::placement::tenant::fence(&state.docker, &runtime, target)
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to terminate and fence the shared tenant before rollback: {error}"
-                ))
-            })?;
-        // The gateway route remains fenced. Re-enable only the database role so
-        // DBE can apply the tenant-scoped rollback with the tenant credential.
-        crate::placement::tenant::unfence(&state.docker, &runtime, target)
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to enable the fenced shared tenant for rollback: {error}"
-                ))
-            })?;
-        return Ok(());
+        return fence_shared_tenant_for_rollback(state, metadata).await;
     }
+    restart_dedicated_target_for_rollback(state, metadata, operation_timeout).await
+}
+
+async fn fence_shared_tenant_for_rollback(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let runtime = shared_runtime(state, metadata).await?;
+    let target = shared_tenant(metadata);
+    crate::placement::tenant::fence(&state.docker, &runtime, target)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to terminate and fence the shared tenant before rollback: {error}"
+            ))
+        })?;
+    // The gateway route remains fenced. Re-enable only the database role so
+    // DBE can apply the tenant-scoped rollback with the tenant credential.
+    crate::placement::tenant::unfence(&state.docker, &runtime, target)
+        .await
+        .map_err(|error| {
+            ApiError::Runtime(format!(
+                "failed to enable the fenced shared tenant for rollback: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+async fn restart_dedicated_target_for_rollback(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    operation_timeout: Option<Duration>,
+) -> Result<(), ApiError> {
     // A Docker transport/attach failure can leave the command running even after its client future
     // is gone. A confirmed stop is the process-generation fence: rollback is only safe after the
     // old database process is dead and a fresh one has reached startup readiness.
@@ -228,19 +243,14 @@ pub(crate) async fn quarantine_uncertain_import(
         "an import lost durable commit or rollback certainty; removed gateway routes and quarantined the target"
     );
 
-    match (runtime_result, persistence_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (runtime, persistence) => {
-            let mut failures = Vec::new();
-            if let Err(error) = runtime {
-                failures.push(error);
-            }
-            if let Err(error) = persistence {
-                failures.push(error);
-            }
-            Err(ApiError::Runtime(failures.join("; ")))
-        }
+    let failures: Vec<String> = [runtime_result.err(), persistence_result.err()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
     }
+    Err(ApiError::Runtime(failures.join("; ")))
 }
 
 async fn stop_import_target(

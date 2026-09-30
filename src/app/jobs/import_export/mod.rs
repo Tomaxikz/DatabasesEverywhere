@@ -33,6 +33,10 @@ const MAX_DATA_ARCHIVE_DEPTH: usize = 64;
 const DATA_ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CACHED_JOBS: usize = 2_048;
 const MAX_PERSISTED_COMPLETED_JOBS: u32 = 10_000;
+const JOB_EVENT_CHANNEL_CAPACITY: usize = 256;
+const MAX_LISTED_JOBS: u32 = 500;
+const ARCHIVE_GZIP_LEVEL: u32 = 3;
+const ARCHIVE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 struct ArchiveLimits {
@@ -115,6 +119,10 @@ impl ImportExportStatus {
             value => Err(JobParseError::UnknownStatus(value.to_string())),
         }
     }
+
+    fn is_completed(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +179,7 @@ impl ImportExportJobs {
         repository: Option<ImportExportJobRepository>,
         artifacts: &crate::config::ArtifactConfig,
     ) -> Self {
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(JOB_EVENT_CHANNEL_CAPACITY);
         let scheduler_config = &artifacts.import_export_scheduler;
         let capacity = SchedulerCapacity::detect(
             scheduler_config,
@@ -226,10 +234,9 @@ impl ImportExportJobs {
             return Err(JobAdmissionError::ShuttingDown);
         }
         let instance = admitted.entry(instance_id.to_string()).or_default();
-        if instance.exclusive
-            || (exclusive && instance.count > 0)
-            || instance.count >= self.max_admitted_jobs_per_instance
-        {
+        let blocked_by_exclusivity = instance.exclusive || (exclusive && instance.count > 0);
+        let at_instance_limit = instance.count >= self.max_admitted_jobs_per_instance;
+        if blocked_by_exclusivity || at_instance_limit {
             return Err(JobAdmissionError::InstanceCapacity);
         }
         instance.count += 1;
@@ -334,7 +341,7 @@ impl ImportExportJobs {
             .cloned()
             .collect();
         jobs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
-        jobs.truncate(limit.clamp(1, 500) as usize);
+        jobs.truncate(limit.clamp(1, MAX_LISTED_JOBS) as usize);
         Ok(jobs)
     }
 
@@ -416,15 +423,9 @@ impl ImportExportJobs {
         if let Some(repository) = &self.repository {
             repository.update_status(&job).await?;
         }
-        let mut cache = self.inner.write().await;
-        cache.insert(job.job_id.clone(), job.clone());
-        prune_job_cache(&mut cache);
-        drop(cache);
-        self.publish(job);
-        if matches!(
-            status,
-            ImportExportStatus::Succeeded | ImportExportStatus::Failed
-        ) && let Some(repository) = &self.repository
+        self.cache_durable_job(job).await;
+        if status.is_completed()
+            && let Some(repository) = &self.repository
             && let Err(error) = repository
                 .prune_completed(MAX_PERSISTED_COMPLETED_JOBS)
                 .await
@@ -433,6 +434,7 @@ impl ImportExportJobs {
         }
         Ok(())
     }
+
     fn publish(&self, job: ImportExportJob) {
         if self.events.receiver_count() > 0 {
             let _ = self.events.send(job);
@@ -469,12 +471,7 @@ fn prune_job_cache(cache: &mut HashMap<String, ImportExportJob>) {
     }
     let mut completed = cache
         .values()
-        .filter(|job| {
-            matches!(
-                job.status,
-                ImportExportStatus::Succeeded | ImportExportStatus::Failed
-            )
-        })
+        .filter(|job| job.status.is_completed())
         .map(|job| (job.updated_at.clone(), job.job_id.clone()))
         .collect::<Vec<_>>();
     completed.sort_unstable();
@@ -561,7 +558,7 @@ fn create_bounded_archive_blocking(
     let result = (|| {
         let encoder = GzEncoder::new(
             BoundedWriter::new(file, max_output_bytes),
-            Compression::new(3),
+            Compression::new(ARCHIVE_GZIP_LEVEL),
         );
         let mut builder = Builder::new(encoder);
         builder.follow_symlinks(false);
@@ -805,7 +802,7 @@ fn copy_archive_entry<R: Read, W: Write>(
     limits: ArchiveLimits,
 ) -> Result<(), ImportExportError> {
     let mut remaining = expected_size;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; ARCHIVE_COPY_BUFFER_BYTES];
     while remaining > 0 {
         validate_archive_limits(started, 0, expected_size - remaining, limits)?;
         let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());

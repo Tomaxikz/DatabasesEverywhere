@@ -116,18 +116,17 @@ impl DockerRuntime {
     /// quota smaller than the currently configured burst, so this must happen
     /// before a downward CPU-limit update.
     pub(super) async fn clear_cpu_burst(&self, protocol: Protocol, instance_id: &str) {
-        match self
+        if let Err(error) = self
             .set_cpu_burst_policy(protocol, instance_id, CpuBurstMode::Disabled)
             .await
         {
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
+            tracing::warn!(
                 event = "cpu_burst_policy_clear_failed",
                 instance_id,
                 protocol = %protocol,
                 %error,
                 "could not clear CPU burst credit before updating the CPU quota"
-            ),
+            );
         }
     }
 
@@ -143,30 +142,27 @@ impl DockerRuntime {
             };
             let pid = generation.pid;
             let container_id = generation.container_id.clone();
-            let result =
+            let outcome =
                 tokio::task::spawn_blocking(move || apply_cpu_burst(pid, &container_id, mode))
                     .await
-                    .map_err(|error| DockerError::CpuBurstPolicy {
-                        instance_id: instance_id.to_string(),
-                        reason: format!("CPU cgroup worker failed: {error}"),
+                    .map_err(|error| {
+                        burst_policy_error(
+                            instance_id,
+                            format!("CPU cgroup worker failed: {error}"),
+                        )
                     })?;
-            let result = match result {
-                Ok(result) => result,
+            let status = match outcome {
+                Ok(status) => status,
                 Err(CpuBurstError::ProcessGone) => continue,
-                Err(error) => {
-                    return Err(DockerError::CpuBurstPolicy {
-                        instance_id: instance_id.to_string(),
-                        reason: error.to_string(),
-                    });
-                }
+                Err(error) => return Err(burst_policy_error(instance_id, error.to_string())),
             };
-            if self
+            let generation_unchanged = self
                 .process_generation(protocol, instance_id)
                 .await?
                 .as_ref()
-                == Some(&generation)
-            {
-                return Ok(result);
+                == Some(&generation);
+            if generation_unchanged {
+                return Ok(status);
             }
         }
         Ok(CpuBurstPolicyStatus::Inactive)
@@ -200,9 +196,11 @@ impl DockerRuntime {
         let started_at = state
             .started_at
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| DockerError::CpuBurstPolicy {
-                instance_id: instance_id.to_string(),
-                reason: "running container did not report its start generation".to_string(),
+            .ok_or_else(|| {
+                burst_policy_error(
+                    instance_id,
+                    "running container did not report its start generation".to_string(),
+                )
             })?;
         Ok(Some(ManagedProcessGeneration {
             container_id,
@@ -210,6 +208,32 @@ impl DockerRuntime {
             started_at,
         }))
     }
+}
+
+fn burst_policy_error(instance_id: &str, reason: String) -> DockerError {
+    DockerError::CpuBurstPolicy {
+        instance_id: instance_id.to_string(),
+        reason,
+    }
+}
+
+fn io_error<'a>(
+    operation: &'static str,
+    path: &'a Path,
+) -> impl FnOnce(std::io::Error) -> CpuBurstError + 'a {
+    move |source| CpuBurstError::Io {
+        operation,
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn invalid_metadata(path: &Path, problem: &str) -> CpuBurstError {
+    CpuBurstError::InvalidMetadata(format!("{} {problem}", path.display()))
+}
+
+fn control_file_open_flags() -> i32 {
+    (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32
 }
 
 fn apply_cpu_burst(
@@ -226,24 +250,14 @@ fn apply_cpu_burst(
                 cgroups
             }
             Err(source) if source.kind() == ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(CpuBurstError::Io {
-                    operation: "read",
-                    path: cgroup_path.display().to_string(),
-                    source,
-                });
-            }
+            Err(source) => return Err(io_error("read", &cgroup_path)(source)),
         };
         if !cgroup_matches_container(&cgroups, container_id) {
             continue;
         }
         let mountinfo_path = Path::new(mountinfo);
         let mountinfo =
-            std::fs::read_to_string(mountinfo_path).map_err(|source| CpuBurstError::Io {
-                operation: "read",
-                path: mountinfo_path.display().to_string(),
-                source,
-            })?;
+            std::fs::read_to_string(mountinfo_path).map_err(io_error("read", mountinfo_path))?;
         return apply_cpu_burst_from_metadata(&cgroups, &mountinfo, mode);
     }
     if process_entry_found {
@@ -309,61 +323,25 @@ fn configure_control(
     directory: &Path,
     mode: CpuBurstMode,
 ) -> Result<Option<bool>, CpuBurstError> {
-    let (quota_path, period_path, burst_path) = match kind {
-        CgroupKind::Unified => (
-            directory.join("cpu.max"),
-            None,
-            directory.join("cpu.max.burst"),
-        ),
-        CgroupKind::LegacyCpu => (
-            directory.join("cpu.cfs_quota_us"),
-            Some(directory.join("cpu.cfs_period_us")),
-            directory.join("cpu.cfs_burst_us"),
-        ),
+    let burst_path = match kind {
+        CgroupKind::Unified => directory.join("cpu.max.burst"),
+        CgroupKind::LegacyCpu => directory.join("cpu.cfs_burst_us"),
     };
     let Some(current_burst) = read_optional_control_u64(&burst_path)? else {
         return Ok(None);
     };
     let desired = match mode {
         CpuBurstMode::Disabled => 0,
-        CpuBurstMode::FullQuota => match kind {
-            CgroupKind::Unified => {
-                let Some(value) = read_optional_control(&quota_path)? else {
-                    return Ok(None);
-                };
-                parse_v2_quota(&value, &quota_path)?
-            }
-            CgroupKind::LegacyCpu => {
-                let Some(value) = read_optional_control(&quota_path)? else {
-                    return Ok(None);
-                };
-                let quota = value.trim().parse::<i64>().map_err(|_| {
-                    CpuBurstError::InvalidMetadata(format!(
-                        "{} did not contain an integer quota",
-                        quota_path.display()
-                    ))
-                })?;
-                if quota <= 0 {
-                    return Ok(None);
-                }
-                let period_path = period_path.as_ref().expect("legacy CPU period path exists");
-                let Some(period) = read_optional_control_u64(period_path)? else {
-                    return Ok(None);
-                };
-                if period == 0 {
-                    return Err(CpuBurstError::InvalidMetadata(format!(
-                        "{} contained a zero period",
-                        period_path.display()
-                    )));
-                }
-                u64::try_from(quota).map_err(|_| {
-                    CpuBurstError::InvalidMetadata(format!(
-                        "{} contained an invalid quota",
-                        quota_path.display()
-                    ))
-                })?
-            }
-        },
+        CpuBurstMode::FullQuota => {
+            let quota = match kind {
+                CgroupKind::Unified => unified_quota(directory)?,
+                CgroupKind::LegacyCpu => legacy_cpu_quota(directory)?,
+            };
+            let Some(quota) = quota else {
+                return Ok(None);
+            };
+            quota
+        }
     };
     if current_burst == desired {
         return Ok(Some(false));
@@ -378,44 +356,61 @@ fn configure_control(
     Ok(Some(true))
 }
 
+fn unified_quota(directory: &Path) -> Result<Option<u64>, CpuBurstError> {
+    let quota_path = directory.join("cpu.max");
+    let Some(value) = read_optional_control(&quota_path)? else {
+        return Ok(None);
+    };
+    parse_v2_quota(&value, &quota_path).map(Some)
+}
+
+fn legacy_cpu_quota(directory: &Path) -> Result<Option<u64>, CpuBurstError> {
+    let quota_path = directory.join("cpu.cfs_quota_us");
+    let period_path = directory.join("cpu.cfs_period_us");
+    let Some(value) = read_optional_control(&quota_path)? else {
+        return Ok(None);
+    };
+    let quota = value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| invalid_metadata(&quota_path, "did not contain an integer quota"))?;
+    if quota <= 0 {
+        return Ok(None);
+    }
+    let Some(period) = read_optional_control_u64(&period_path)? else {
+        return Ok(None);
+    };
+    if period == 0 {
+        return Err(invalid_metadata(&period_path, "contained a zero period"));
+    }
+    u64::try_from(quota)
+        .map(Some)
+        .map_err(|_| invalid_metadata(&quota_path, "contained an invalid quota"))
+}
+
 fn parse_v2_quota(value: &str, path: &Path) -> Result<u64, CpuBurstError> {
     let mut fields = value.split_whitespace();
     let quota = fields
         .next()
-        .ok_or_else(|| CpuBurstError::InvalidMetadata(format!("{} was empty", path.display())))?;
-    let period = fields
+        .ok_or_else(|| invalid_metadata(path, "was empty"))?;
+    let has_positive_period = fields
         .next()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            CpuBurstError::InvalidMetadata(format!(
-                "{} did not contain a positive period",
-                path.display()
-            ))
-        })?;
-    if fields.next().is_some() {
-        return Err(CpuBurstError::InvalidMetadata(format!(
-            "{} contained unexpected fields",
-            path.display()
-        )));
+        .is_some_and(|period| period > 0);
+    if !has_positive_period {
+        return Err(invalid_metadata(path, "did not contain a positive period"));
     }
-    let _ = period;
+    if fields.next().is_some() {
+        return Err(invalid_metadata(path, "contained unexpected fields"));
+    }
     if quota == "max" {
-        return Err(CpuBurstError::InvalidMetadata(format!(
-            "{} did not contain a bounded quota",
-            path.display()
-        )));
+        return Err(invalid_metadata(path, "did not contain a bounded quota"));
     }
     quota
         .parse::<u64>()
         .ok()
         .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            CpuBurstError::InvalidMetadata(format!(
-                "{} did not contain a positive quota",
-                path.display()
-            ))
-        })
+        .ok_or_else(|| invalid_metadata(path, "did not contain a positive quota"))
 }
 
 fn parse_cgroup_mounts(mountinfo: &str) -> Result<Vec<CgroupMount>, CpuBurstError> {
@@ -492,47 +487,34 @@ fn read_optional_control_u64(path: &Path) -> Result<Option<u64>, CpuBurstError> 
     let Some(value) = read_optional_control(path)? else {
         return Ok(None);
     };
-    value.trim().parse::<u64>().map(Some).map_err(|_| {
-        CpuBurstError::InvalidMetadata(format!(
-            "{} did not contain an unsigned integer",
-            path.display()
-        ))
-    })
+    value
+        .trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| invalid_metadata(path, "did not contain an unsigned integer"))
 }
 
 fn read_optional_control(path: &Path) -> Result<Option<String>, CpuBurstError> {
     let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32);
+    options.read(true).custom_flags(control_file_open_flags());
     let file = match options.open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(CpuBurstError::Io {
-                operation: "open",
-                path: path.display().to_string(),
-                source,
-            });
-        }
+        Err(source) => return Err(io_error("open", path)(source)),
     };
     let mut bytes = Vec::new();
     file.take(MAX_CONTROL_FILE_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|source| CpuBurstError::Io {
-            operation: "read",
-            path: path.display().to_string(),
-            source,
-        })?;
+        .map_err(io_error("read", path))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONTROL_FILE_BYTES {
-        return Err(CpuBurstError::InvalidMetadata(format!(
-            "{} exceeded {MAX_CONTROL_FILE_BYTES} bytes",
-            path.display()
-        )));
+        return Err(invalid_metadata(
+            path,
+            &format!("exceeded {MAX_CONTROL_FILE_BYTES} bytes"),
+        ));
     }
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|_| CpuBurstError::InvalidMetadata(format!("{} was not UTF-8", path.display())))
+        .map_err(|_| invalid_metadata(path, "was not UTF-8"))
 }
 
 fn write_control(path: &Path, value: u64) -> Result<(), CpuBurstError> {
@@ -540,18 +522,10 @@ fn write_control(path: &Path, value: u64) -> Result<(), CpuBurstError> {
     options
         .write(true)
         .truncate(true)
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32);
-    let mut file = options.open(path).map_err(|source| CpuBurstError::Io {
-        operation: "open",
-        path: path.display().to_string(),
-        source,
-    })?;
+        .custom_flags(control_file_open_flags());
+    let mut file = options.open(path).map_err(io_error("open", path))?;
     file.write_all(value.to_string().as_bytes())
-        .map_err(|source| CpuBurstError::Io {
-            operation: "write",
-            path: path.display().to_string(),
-            source,
-        })
+        .map_err(io_error("write", path))
 }
 
 #[cfg(test)]

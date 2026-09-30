@@ -4,6 +4,8 @@ use bollard::{models::MountPoint, query_parameters::ListContainersOptionsBuilder
 
 use super::DockerRuntime;
 
+const MAX_INVENTORIED_CONTAINERS: usize = 4096;
+
 impl DockerRuntime {
     /// Include stopped and foreign containers: their mounts must survive too.
     /// An incomplete inventory must never authorize host mount cleanup.
@@ -15,7 +17,7 @@ impl DockerRuntime {
             ))
             .await?;
         anyhow::ensure!(
-            containers.len() <= 4096,
+            containers.len() <= MAX_INVENTORIED_CONTAINERS,
             "container mount inventory limit exceeded"
         );
         let mut sources = Vec::new();

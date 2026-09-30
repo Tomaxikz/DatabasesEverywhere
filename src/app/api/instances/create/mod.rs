@@ -57,6 +57,10 @@ pub(crate) use mysql_hardening::{
     harden_mysql_accounts, harden_mysql_tenant_auth, verify_mysql_root_auth,
 };
 
+const DATABASE_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+const READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const FAILURE_LOG_SUMMARY_MAX_CHARS: usize = 4_000;
+
 pub async fn create_instance_from_request(
     state: &AppState,
     mut request: CreateInstanceRequest,
@@ -160,55 +164,27 @@ pub(crate) async fn enforce_node_allocation_policy(
     let allocated = crate::placement::policy::sum_runtime_limits(
         runtimes.iter().map(|runtime| &runtime.limits),
     );
-    let allocated_cpu_cores = check_cpu.then_some(allocated.cpu_cores);
-    let allocated_memory_bytes = check_memory.then_some(mib_to_bytes(allocated.memory_mib));
-    let allocated_disk_bytes = check_disk.then_some(mib_to_bytes(allocated.disk_mib));
     let volumes_root = state.config.paths.volumes_root();
     let (host_cpu_cores, host_memory, host_disk) = tokio::join!(
-        async {
-            if check_cpu {
-                read_host_cpu_cores().await.map(Some)
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if check_memory {
-                read_host_memory().await.map(Some)
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if check_disk {
-                read_host_disk(&volumes_root).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        },
+        sample_host_if(check_cpu, read_host_cpu_cores()),
+        sample_host_if(check_memory, read_host_memory()),
+        sample_host_if(check_disk, read_host_disk(&volumes_root)),
     );
 
-    if let (Some(allocated), Some(total)) = (
-        allocated_cpu_cores,
-        host_cpu_cores.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to sample host CPU for allocation admission: {error}"
-            ))
-        })?,
-    ) {
-        enforce_cpu_allocation(allocated, previous_cpu_cores, requested.cpu_cores, total)?;
+    let host_cpu_cores = host_cpu_cores.map_err(|error| host_sample_error("CPU", error))?;
+    if let Some(host_cores) = host_cpu_cores {
+        enforce_cpu_allocation(
+            allocated.cpu_cores,
+            previous_cpu_cores,
+            requested.cpu_cores,
+            host_cores,
+        )?;
     }
-    if let (Some(allocated), Some(host)) = (
-        allocated_memory_bytes,
-        host_memory.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to sample host memory for allocation admission: {error}"
-            ))
-        })?,
-    ) {
+    let host_memory = host_memory.map_err(|error| host_sample_error("memory", error))?;
+    if let Some(host) = host_memory {
         enforce_resource_allocation(
             "memory",
-            allocated,
+            mib_to_bytes(allocated.memory_mib),
             previous_memory_bytes,
             requested_memory_bytes,
             allocation.memory_allocation_cap_bytes(host.total_bytes),
@@ -216,17 +192,11 @@ pub(crate) async fn enforce_node_allocation_policy(
             allocation.reserved_memory_bytes(),
         )?;
     }
-    if let (Some(allocated), Some(host)) = (
-        allocated_disk_bytes,
-        host_disk.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to sample host disk for allocation admission: {error}"
-            ))
-        })?,
-    ) {
+    let host_disk = host_disk.map_err(|error| host_sample_error("disk", error))?;
+    if let Some(host) = host_disk {
         enforce_resource_allocation(
             "disk",
-            allocated,
+            mib_to_bytes(allocated.disk_mib),
             previous_disk_bytes,
             requested_disk_bytes,
             allocation.disk_allocation_cap_bytes(host.total_bytes),
@@ -236,6 +206,22 @@ pub(crate) async fn enforce_node_allocation_policy(
     }
 
     Ok(())
+}
+
+async fn sample_host_if<T>(
+    enabled: bool,
+    sample: impl Future<Output = Result<T, std::io::Error>>,
+) -> Result<Option<T>, std::io::Error> {
+    if !enabled {
+        return Ok(None);
+    }
+    sample.await.map(Some)
+}
+
+fn host_sample_error(resource: &str, error: std::io::Error) -> ApiError {
+    ApiError::Runtime(format!(
+        "failed to sample host {resource} for allocation admission: {error}"
+    ))
 }
 
 fn enforce_cpu_allocation(
@@ -384,7 +370,7 @@ where
     }
     if let Err(error) = state
         .docker
-        .wait_until_ready(protocol, instance_id, Duration::from_secs(120))
+        .wait_until_ready(protocol, instance_id, DATABASE_READINESS_TIMEOUT)
         .await
     {
         return Err(ContainerLaunchError::AfterCreate(
@@ -437,7 +423,7 @@ pub(crate) async fn provision_mysql_tenant_user(
         state,
         instance_id,
         &root_password_secret,
-        Duration::from_secs(120),
+        DATABASE_READINESS_TIMEOUT,
     )
     .await?;
     let sql = databases::mysql::provision::tenant_user_sql(database, username);
@@ -553,7 +539,7 @@ async fn wait_for_mariadb_localhost(state: &AppState, instance_id: &str) -> Resu
         Protocol::Mariadb,
         instance_id,
         "test \"$(cat /proc/1/comm)\" = mariadbd || exit 1; root_password=\"${DBE_MARIADB_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}\"; MYSQL_PWD=\"$root_password\" mariadb --protocol=socket --socket=/run/mysqld/mysqld.sock -hlocalhost -u root -N -B -e 'SELECT 1' >/dev/null",
-        Duration::from_secs(120),
+        DATABASE_READINESS_TIMEOUT,
     )
     .await
 }
@@ -576,7 +562,7 @@ async fn wait_for_shell_command(
             Ok(_) => return Ok(()),
             Err(error) => {
                 last_error = error.to_string();
-                sleep(Duration::from_secs(1)).await;
+                sleep(READINESS_RETRY_INTERVAL).await;
             }
         }
     }
@@ -905,7 +891,10 @@ pub(crate) async fn docker_error_with_logs(
     let logs = match state.docker.logs(protocol, instance_id, None).await {
         Ok(output) => {
             let combined = format!("{}{}", output.stdout, output.stderr);
-            summarize_failure_logs(&redaction::redact_connection_url(&combined), 4_000)
+            summarize_failure_logs(
+                &redaction::redact_connection_url(&combined),
+                FAILURE_LOG_SUMMARY_MAX_CHARS,
+            )
         }
         Err(log_error) => format!("failed to read container logs: {log_error}"),
     };

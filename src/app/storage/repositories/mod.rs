@@ -18,6 +18,9 @@ pub use protected_secrets::{
     DaemonInstanceLoad, ProtectedSecretField, ProtectedSecretIncident, ProtectedSecretRepair,
 };
 
+const SHA1_HEX_LEN: usize = 40;
+const SHA256_HEX_LEN: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct InstanceRepository {
     pool: SqlitePool,
@@ -64,18 +67,7 @@ impl InstanceRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let metadata_json: String = row.try_get("metadata_json")?;
-                let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-                self.load_placement(&mut metadata, &row)?;
-                self.load_desired_state(&mut metadata, &row)?;
-                self.load_disk_block(&mut metadata, &row)?;
-                self.load_route_auth(&mut metadata, &row)?;
-                validate_metadata_schema(&metadata)?;
-                Ok(metadata)
-            })
-            .collect()
+        rows.iter().map(|row| self.metadata_from_row(row)).collect()
     }
 
     pub async fn get(
@@ -112,14 +104,21 @@ impl InstanceRepository {
             return Ok(None);
         };
 
+        self.metadata_from_row(&row).map(Some)
+    }
+
+    fn metadata_from_row(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<InstanceMetadata, RepositoryError> {
         let metadata_json: String = row.try_get("metadata_json")?;
         let mut metadata = serde_json::from_str::<InstanceMetadata>(&metadata_json)?;
-        self.load_placement(&mut metadata, &row)?;
-        self.load_desired_state(&mut metadata, &row)?;
-        self.load_disk_block(&mut metadata, &row)?;
-        self.load_route_auth(&mut metadata, &row)?;
+        self.load_placement(&mut metadata, row)?;
+        self.load_desired_state(&mut metadata, row)?;
+        self.load_disk_block(&mut metadata, row)?;
+        self.load_route_auth(&mut metadata, row)?;
         validate_metadata_schema(&metadata)?;
-        Ok(Some(metadata))
+        Ok(metadata)
     }
 
     pub async fn upsert(&self, metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
@@ -395,15 +394,7 @@ impl InstanceRepository {
         .execute(&mut *transaction)
         .await?;
 
-        if !preserve_route_auth
-            && (metadata.mariadb_native_password_sha1_stage2.is_some()
-                || metadata.mariadb_root_password.is_some()
-                || metadata.mysql_native_password_sha1_stage2.is_some()
-                || metadata.mysql_root_password.is_some()
-                || metadata.mongodb_root_password.is_some()
-                || metadata.postgres_admin_password.is_some()
-                || metadata.tenant_password.is_some())
-        {
+        if !preserve_route_auth && has_route_auth(metadata) {
             sqlx::query(
                 r#"
                 INSERT INTO instance_route_auth (
@@ -602,15 +593,7 @@ impl InstanceRepository {
             return Ok(0);
         }
         let mut rewritten = 0;
-        for metadata in metadata.iter().filter(|metadata| {
-            metadata.mariadb_native_password_sha1_stage2.is_some()
-                || metadata.mariadb_root_password.is_some()
-                || metadata.mysql_native_password_sha1_stage2.is_some()
-                || metadata.mysql_root_password.is_some()
-                || metadata.mongodb_root_password.is_some()
-                || metadata.postgres_admin_password.is_some()
-                || metadata.tenant_password.is_some()
-        }) {
+        for metadata in metadata.iter().filter(|metadata| has_route_auth(metadata)) {
             self.upsert(metadata).await?;
             rewritten += 1;
         }
@@ -747,6 +730,16 @@ impl From<&BackendEndpoint> for BackendColumns {
     }
 }
 
+fn has_route_auth(metadata: &InstanceMetadata) -> bool {
+    metadata.mariadb_native_password_sha1_stage2.is_some()
+        || metadata.mariadb_root_password.is_some()
+        || metadata.mysql_native_password_sha1_stage2.is_some()
+        || metadata.mysql_root_password.is_some()
+        || metadata.mongodb_root_password.is_some()
+        || metadata.postgres_admin_password.is_some()
+        || metadata.tenant_password.is_some()
+}
+
 fn validate_metadata_schema(metadata: &InstanceMetadata) -> Result<(), RepositoryError> {
     if metadata.schema_version == SCHEMA_VERSION {
         Ok(())
@@ -778,7 +771,10 @@ fn validate_secret_recovery(metadata: &InstanceMetadata) -> Result<(), Repositor
             if protected_secret_missing(metadata.mariadb_root_password.as_deref()) {
                 missing.push("mariadb_root_password");
             }
-            if !valid_hex_secret(metadata.mariadb_native_password_sha1_stage2.as_deref(), 40) {
+            if !valid_hex_secret(
+                metadata.mariadb_native_password_sha1_stage2.as_deref(),
+                SHA1_HEX_LEN,
+            ) {
                 missing.push("mariadb_native_password_sha1_stage2");
             }
         }
@@ -786,7 +782,10 @@ fn validate_secret_recovery(metadata: &InstanceMetadata) -> Result<(), Repositor
             if protected_secret_missing(metadata.mysql_root_password.as_deref()) {
                 missing.push("mysql_root_password");
             }
-            if !valid_hex_secret(metadata.mysql_native_password_sha1_stage2.as_deref(), 40) {
+            if !valid_hex_secret(
+                metadata.mysql_native_password_sha1_stage2.as_deref(),
+                SHA1_HEX_LEN,
+            ) {
                 missing.push("mysql_native_password_sha1_stage2");
             }
         }
@@ -796,7 +795,7 @@ fn validate_secret_recovery(metadata: &InstanceMetadata) -> Result<(), Repositor
             }
         }
         Protocol::Qdrant => {
-            if !valid_hex_secret(metadata.route_key_sha256.as_deref(), 64) {
+            if !valid_hex_secret(metadata.route_key_sha256.as_deref(), SHA256_HEX_LEN) {
                 missing.push("route_key_sha256");
             }
         }

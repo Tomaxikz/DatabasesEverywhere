@@ -22,6 +22,21 @@ const GATEWAY_AUTH_PLUGIN: &str = NATIVE_PASSWORD_PLUGIN;
 const AUTH_SEED_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const OK_STATUS_AUTOCOMMIT: [u8; 2] = [0x02, 0x00];
 
+const MAX_PACKET_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+const MAX_WIRE_PAYLOAD_LEN: usize = 0x00ff_ffff;
+const SSL_REQUEST_LEN: usize = 32;
+const HANDSHAKE_RESPONSE_PREFIX_LEN: usize = 4 + 4 + 1 + 23;
+const HANDSHAKE_RESERVED_BYTES: [u8; 23] = [0; 23];
+const PROTOCOL_VERSION_10: u8 = 10;
+const UTF8MB4_GENERAL_CI: u8 = 45;
+const ER_ACCESS_DENIED_ERROR: u16 = 1045;
+const OK_PACKET_HEADER: u8 = 0x00;
+const ERR_PACKET_HEADER: u8 = 0xff;
+const AUTH_SWITCH_REQUEST_HEADER: u8 = 0xfe;
+const AUTH_MORE_DATA_HEADER: u8 = 0x01;
+const GATEWAY_AUTH_SEED_LEN: usize = 20;
+const AUTH_SEED_PART_1_LEN: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayFlavor {
     Mysql,
@@ -124,7 +139,7 @@ where
 /// 32-byte SSLRequest packet. It is not a full HandshakeResponse and must not
 /// be parsed for a username or authentication token.
 pub fn is_ssl_request(payload: &[u8]) -> Result<bool, MariadbProxyError> {
-    if payload.len() != 32 {
+    if payload.len() != SSL_REQUEST_LEN {
         return Ok(false);
     }
     Ok(read_u32_le(payload, 0)? & CLIENT_SSL != 0)
@@ -134,7 +149,7 @@ pub async fn read_packet<S>(stream: &mut S) -> Result<MysqlPacket, MariadbProxyE
 where
     S: AsyncRead + Unpin,
 {
-    read_packet_limited(stream, 16 * 1024 * 1024).await
+    read_packet_limited(stream, MAX_PACKET_PAYLOAD_LEN).await
 }
 
 pub async fn read_packet_limited<S>(
@@ -147,7 +162,7 @@ where
     let mut header = [0_u8; 4];
     stream.read_exact(&mut header).await?;
     let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
-    if len > max_payload_size.min(16 * 1024 * 1024) {
+    if len > max_payload_size.min(MAX_PACKET_PAYLOAD_LEN) {
         return Err(MariadbProxyError::PacketTooLarge);
     }
     let mut payload = vec![0_u8; len];
@@ -163,7 +178,7 @@ pub async fn write_packet(
     sequence: u8,
     payload: &[u8],
 ) -> Result<(), MariadbProxyError> {
-    if payload.len() > 0x00ff_ffff {
+    if payload.len() > MAX_WIRE_PAYLOAD_LEN {
         return Err(MariadbProxyError::PacketTooLarge);
     }
     let len = payload.len() as u32;
@@ -179,7 +194,7 @@ pub fn parse_client_handshake_response(payload: &[u8]) -> Result<MariadbRoute, M
     }
 
     let capabilities = read_u32_le(payload, 0)?;
-    let mut offset = 4 + 4 + 1 + 23;
+    let mut offset = HANDSHAKE_RESPONSE_PREFIX_LEN;
 
     let username = read_null_string(payload, &mut offset)?;
     if username.is_empty() {
@@ -212,14 +227,14 @@ pub fn parse_client_handshake_response(payload: &[u8]) -> Result<MariadbRoute, M
 }
 
 pub fn parse_backend_handshake(payload: &[u8]) -> Result<BackendHandshake, MariadbProxyError> {
-    if payload.len() < 34 || payload[0] != 10 {
+    if payload.len() < 34 || payload[0] != PROTOCOL_VERSION_10 {
         return Err(MariadbProxyError::MalformedPacket);
     }
 
     let mut offset = 1;
     let _server_version = read_null_string(payload, &mut offset)?;
     offset += 4;
-    let part_1 = take(payload, &mut offset, 8)?.to_vec();
+    let part_1 = take(payload, &mut offset, AUTH_SEED_PART_1_LEN)?.to_vec();
     offset += 1;
     let lower_capabilities = read_u16_le(payload, offset)? as u32;
     offset += 2;
@@ -241,14 +256,12 @@ pub fn parse_backend_handshake(payload: &[u8]) -> Result<BackendHandshake, Maria
     offset += 1 + 10;
 
     let mut seed = part_1;
-    let part_2_len = auth_data_len.saturating_sub(8).max(13);
+    let part_2_len = auth_data_len.saturating_sub(AUTH_SEED_PART_1_LEN).max(13);
     if offset < payload.len() {
         let remaining = payload.len() - offset;
         let read_len = remaining.min(part_2_len);
         seed.extend_from_slice(take(payload, &mut offset, read_len)?);
-        while seed.last() == Some(&0) {
-            seed.pop();
-        }
+        trim_trailing_nuls(&mut seed);
     }
 
     let auth_plugin = if capabilities & CLIENT_PLUGIN_AUTH != 0 && offset < payload.len() {
@@ -311,11 +324,11 @@ pub fn backend_handshake_response(
 
     let mut payload = Vec::new();
     payload.extend_from_slice(&capabilities.to_le_bytes());
-    payload.extend_from_slice(&16_777_216_u32.to_le_bytes());
+    payload.extend_from_slice(&(MAX_PACKET_PAYLOAD_LEN as u32).to_le_bytes());
     // Queries are tunneled without transcoding, so the backend must use the
     // character set selected by the client, not the greeting's default.
     payload.push(route.character_set);
-    payload.extend_from_slice(&[0_u8; 23]);
+    payload.extend_from_slice(&HANDSHAKE_RESERVED_BYTES);
     payload.extend_from_slice(route.username.as_bytes());
     payload.push(0);
     payload.push(auth_response.len() as u8);
@@ -354,12 +367,16 @@ pub fn backend_auth_switch_response(
 pub fn caching_sha2_continuation(
     payload: &[u8],
 ) -> Result<Option<CachingSha2Continuation>, MariadbProxyError> {
-    if payload.first() != Some(&0x01) {
+    if payload.first() != Some(&AUTH_MORE_DATA_HEADER) {
         return Ok(None);
     }
     match payload {
-        [0x01, 0x03] => Ok(Some(CachingSha2Continuation::FastAuthenticationComplete)),
-        [0x01, 0x04] => Ok(Some(CachingSha2Continuation::FullAuthenticationRequired)),
+        [AUTH_MORE_DATA_HEADER, 0x03] => {
+            Ok(Some(CachingSha2Continuation::FastAuthenticationComplete))
+        }
+        [AUTH_MORE_DATA_HEADER, 0x04] => {
+            Ok(Some(CachingSha2Continuation::FullAuthenticationRequired))
+        }
         _ => Err(MariadbProxyError::MalformedPacket),
     }
 }
@@ -376,31 +393,29 @@ pub fn caching_sha2_plaintext_password(password: &str) -> Result<Vec<u8>, Mariad
 
 pub fn error_packet(message: &str) -> Vec<u8> {
     let mut payload = Vec::new();
-    payload.push(0xff);
-    payload.extend_from_slice(&1045_u16.to_le_bytes());
+    payload.push(ERR_PACKET_HEADER);
+    payload.extend_from_slice(&ER_ACCESS_DENIED_ERROR.to_le_bytes());
     payload.extend_from_slice(b"#28000");
     payload.extend_from_slice(message.as_bytes());
     payload
 }
 
 pub fn packet_is_ok(payload: &[u8]) -> bool {
-    payload.first() == Some(&0x00)
+    payload.first() == Some(&OK_PACKET_HEADER)
 }
 
 pub fn packet_is_error(payload: &[u8]) -> bool {
-    payload.first() == Some(&0xff)
+    payload.first() == Some(&ERR_PACKET_HEADER)
 }
 
 pub fn auth_switch_request(payload: &[u8]) -> Option<BackendHandshake> {
-    if payload.first() != Some(&0xfe) {
+    if payload.first() != Some(&AUTH_SWITCH_REQUEST_HEADER) {
         return None;
     }
     let mut offset = 1;
     let plugin = read_null_string(payload, &mut offset).ok()?;
     let mut seed = payload.get(offset..)?.to_vec();
-    while seed.last() == Some(&0) {
-        seed.pop();
-    }
+    trim_trailing_nuls(&mut seed);
     if seed.is_empty() {
         return None;
     }
@@ -428,11 +443,7 @@ pub fn native_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
     challenge.update(stage_2);
     let stage_3 = challenge.finalize();
 
-    stage_1
-        .iter()
-        .zip(stage_3.iter())
-        .map(|(left, right)| left ^ right)
-        .collect()
+    xor_bytes(&stage_1, &stage_3)
 }
 
 pub fn caching_sha2_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
@@ -445,11 +456,7 @@ pub fn caching_sha2_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
     let mut challenge = Sha256::new();
     challenge.update(stage_3);
     challenge.update(seed);
-    stage_1
-        .iter()
-        .zip(challenge.finalize())
-        .map(|(left, right)| left ^ right)
-        .collect()
+    xor_bytes(&stage_1, &challenge.finalize())
 }
 
 pub fn derive_native_backend_token(
@@ -464,31 +471,36 @@ pub fn derive_native_backend_token(
     }
 
     let gateway_challenge = native_password_challenge(gateway_seed, &stage_2);
-    let stage_1: Vec<u8> = client_token
-        .iter()
-        .zip(gateway_challenge.iter())
-        .map(|(left, right)| left ^ right)
-        .collect();
+    let stage_1 = xor_bytes(client_token, &gateway_challenge);
     let derived_stage_2 = Sha1::digest(&stage_1);
     if derived_stage_2[..].ct_eq(&stage_2).unwrap_u8() != 1 {
         return Err(MariadbProxyError::AuthenticationFailed);
     }
 
     let backend_challenge = native_password_challenge(backend_seed, &stage_2);
-    Ok(stage_1
-        .iter()
-        .zip(backend_challenge.iter())
-        .map(|(left, right)| left ^ right)
-        .collect())
+    Ok(xor_bytes(&stage_1, &backend_challenge))
 }
 
-pub fn new_gateway_auth_seed() -> [u8; 20] {
+fn xor_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left ^ right)
+        .collect()
+}
+
+fn trim_trailing_nuls(bytes: &mut Vec<u8>) {
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+}
+
+pub fn new_gateway_auth_seed() -> [u8; GATEWAY_AUTH_SEED_LEN] {
     let left = uuid::Uuid::new_v4();
     let right = uuid::Uuid::new_v4();
-    let mut random = [0_u8; 20];
+    let mut random = [0_u8; GATEWAY_AUTH_SEED_LEN];
     random[..16].copy_from_slice(left.as_bytes());
     random[16..].copy_from_slice(&right.as_bytes()[..4]);
-    let mut seed = [0_u8; 20];
+    let mut seed = [0_u8; GATEWAY_AUTH_SEED_LEN];
     for (output, input) in seed.iter_mut().zip(random) {
         *output = AUTH_SEED_ALPHABET[usize::from(input) % AUTH_SEED_ALPHABET.len()];
     }
@@ -500,11 +512,11 @@ fn gateway_handshake_payload(
     flavor: GatewayFlavor,
     tls_available: bool,
 ) -> Result<Vec<u8>, MariadbProxyError> {
-    if gateway_seed.len() < 20 {
+    if gateway_seed.len() < GATEWAY_AUTH_SEED_LEN {
         return Err(MariadbProxyError::MalformedPacket);
     }
-    let seed_1 = &gateway_seed[..8];
-    let seed_2 = &gateway_seed[8..20];
+    let seed_1 = &gateway_seed[..AUTH_SEED_PART_1_LEN];
+    let seed_2 = &gateway_seed[AUTH_SEED_PART_1_LEN..GATEWAY_AUTH_SEED_LEN];
     let mut capabilities = CLIENT_LONG_PASSWORD
         | CLIENT_LONG_FLAG
         | CLIENT_PROTOCOL_41
@@ -516,14 +528,14 @@ fn gateway_handshake_payload(
     }
 
     let mut payload = Vec::new();
-    payload.push(10);
+    payload.push(PROTOCOL_VERSION_10);
     payload.extend_from_slice(flavor.server_version().as_bytes());
     payload.push(0);
     payload.extend_from_slice(&GATEWAY_CONNECTION_ID.to_le_bytes());
     payload.extend_from_slice(seed_1);
     payload.push(0);
     payload.extend_from_slice(&(capabilities as u16).to_le_bytes());
-    payload.push(45);
+    payload.push(UTF8MB4_GENERAL_CI);
     payload.extend_from_slice(&OK_STATUS_AUTOCOMMIT);
     payload.extend_from_slice(&((capabilities >> 16) as u16).to_le_bytes());
     payload.push((seed_1.len() + seed_2.len() + 1) as u8);

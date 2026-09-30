@@ -17,6 +17,8 @@ const NONCE_LEN: usize = 12;
 const PREFIX: &str = "dbev1";
 const FINGERPRINT_PREFIX: &str = "dbevh1";
 const KEY_FILE_NAME: &str = "metadata.key";
+const PRIVATE_DIR_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -150,28 +152,20 @@ fn create_key(path: &Path) -> Result<[u8; KEY_LEN], SecretStoreError> {
     rng.fill(&mut key)
         .map_err(|_| SecretStoreError::Crypto("failed to generate metadata key".into()))?;
 
+    let write_error = |source| SecretStoreError::WriteKey {
+        path: path.to_path_buf(),
+        source,
+    };
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(PRIVATE_FILE_MODE);
     }
-    let mut file = options
-        .open(path)
-        .map_err(|source| SecretStoreError::WriteKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let mut file = options.open(path).map_err(write_error)?;
     file.write_all(URL_SAFE_NO_PAD.encode(key).as_bytes())
-        .map_err(|source| SecretStoreError::WriteKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.sync_all()
-        .map_err(|source| SecretStoreError::WriteKey {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        .map_err(write_error)?;
+    file.sync_all().map_err(write_error)?;
     harden_file(path)?;
     Ok(key)
 }
@@ -188,29 +182,21 @@ fn decode_key(path: &Path, encoded: &str) -> Result<[u8; KEY_LEN], SecretStoreEr
 }
 
 fn harden_dir(path: &Path) -> Result<(), SecretStoreError> {
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            SecretStoreError::SetPermissions {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    }
-    Ok(())
+    set_mode(path, PRIVATE_DIR_MODE)
 }
 
 fn harden_file(path: &Path) -> Result<(), SecretStoreError> {
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            SecretStoreError::SetPermissions {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    }
-    Ok(())
+    set_mode(path, PRIVATE_FILE_MODE)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<(), SecretStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+        SecretStoreError::SetPermissions {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 #[derive(Debug, thiserror::Error)]

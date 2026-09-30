@@ -72,6 +72,10 @@ pub struct InstanceMetadata {
     pub updated_at: String,
 }
 
+fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
 impl fmt::Debug for InstanceMetadata {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -88,44 +92,29 @@ impl fmt::Debug for InstanceMetadata {
             .field("backend", &self.backend)
             .field("runtime", &self.runtime)
             .field("database", &self.database)
-            .field(
-                "route_key_sha256",
-                &self.route_key_sha256.as_ref().map(|_| "<redacted>"),
-            )
+            .field("route_key_sha256", &redacted(&self.route_key_sha256))
             .field(
                 "mariadb_native_password_sha1_stage2",
-                &self
-                    .mariadb_native_password_sha1_stage2
-                    .as_ref()
-                    .map(|_| "<redacted>"),
+                &redacted(&self.mariadb_native_password_sha1_stage2),
             )
             .field(
                 "mariadb_root_password",
-                &self.mariadb_root_password.as_ref().map(|_| "<redacted>"),
+                &redacted(&self.mariadb_root_password),
             )
             .field(
                 "mysql_native_password_sha1_stage2",
-                &self
-                    .mysql_native_password_sha1_stage2
-                    .as_ref()
-                    .map(|_| "<redacted>"),
+                &redacted(&self.mysql_native_password_sha1_stage2),
             )
-            .field(
-                "mysql_root_password",
-                &self.mysql_root_password.as_ref().map(|_| "<redacted>"),
-            )
+            .field("mysql_root_password", &redacted(&self.mysql_root_password))
             .field(
                 "mongodb_root_password",
-                &self.mongodb_root_password.as_ref().map(|_| "<redacted>"),
+                &redacted(&self.mongodb_root_password),
             )
             .field(
                 "postgres_admin_password",
-                &self.postgres_admin_password.as_ref().map(|_| "<redacted>"),
+                &redacted(&self.postgres_admin_password),
             )
-            .field(
-                "tenant_password",
-                &self.tenant_password.as_ref().map(|_| "<redacted>"),
-            )
+            .field("tenant_password", &redacted(&self.tenant_password))
             .field("limits", &self.limits)
             .field("image", &self.image)
             .field("database_version", &self.database_version)

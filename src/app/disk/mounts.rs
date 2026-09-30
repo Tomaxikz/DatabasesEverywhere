@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use super::DiskLimitError;
 use crate::shared::cgroup::unescape_mountinfo;
 
+const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
+const MOUNTPOINT_FIELD: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountInfo {
     pub mountpoint: PathBuf,
@@ -18,7 +21,7 @@ pub(super) fn find_mount(path: &Path) -> Result<MountInfo, DiskLimitError> {
             path: path.display().to_string(),
             source,
         })?;
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(DiskLimitError::Io)?;
+    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).map_err(DiskLimitError::Io)?;
     find_mount_in(&path, &mountinfo).ok_or(DiskLimitError::MountpointNotFound(path))
 }
 
@@ -36,58 +39,54 @@ pub(super) fn is_mountpoint(path: &Path) -> Result<bool, DiskLimitError> {
         .components()
         .filter(|component| !matches!(component, std::path::Component::CurDir))
         .collect::<PathBuf>();
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(DiskLimitError::Io)?;
+    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).map_err(DiskLimitError::Io)?;
     Ok(is_mountpoint_in(&path, &mountinfo))
 }
 
 fn is_mountpoint_in(path: &Path, mountinfo: &str) -> bool {
     mountinfo.lines().any(|line| {
-        let Some((before_sep, _)) = line.split_once(" - ") else {
+        let Some((before_separator, _)) = line.split_once(" - ") else {
             return false;
         };
-        before_sep
+        before_separator
             .split_whitespace()
-            .nth(4)
+            .nth(MOUNTPOINT_FIELD)
             .is_some_and(|mountpoint| Path::new(&unescape_mountinfo(mountpoint)) == path)
     })
 }
 
 fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
-    let mut best = None;
-    for line in mountinfo.lines() {
-        let Some((before_sep, after_sep)) = line.split_once(" - ") else {
-            continue;
-        };
-        let Some(mountpoint) = before_sep.split_whitespace().nth(4) else {
-            continue;
-        };
-        let mut after_parts = after_sep.split_whitespace();
-        let Some(fstype) = after_parts.next() else {
-            continue;
-        };
-        let source = after_parts.next().unwrap_or("-").to_string();
-        let options = after_parts
-            .next()
-            .unwrap_or_default()
-            .split(',')
-            .filter(|option| !option.is_empty())
-            .map(ToString::to_string)
-            .collect();
-        let mountpoint = PathBuf::from(unescape_mountinfo(mountpoint));
-        if path.starts_with(&mountpoint)
-            && best.as_ref().is_none_or(|current: &MountInfo| {
-                mountpoint.as_os_str().len() > current.mountpoint.as_os_str().len()
-            })
-        {
-            best = Some(MountInfo {
-                mountpoint,
-                fstype: fstype.to_string(),
-                source,
-                options,
-            });
+    let mut best: Option<MountInfo> = None;
+    for mount in mountinfo.lines().filter_map(parse_mountinfo_line) {
+        let is_more_specific = best.as_ref().is_none_or(|current| {
+            mount.mountpoint.as_os_str().len() > current.mountpoint.as_os_str().len()
+        });
+        if path.starts_with(&mount.mountpoint) && is_more_specific {
+            best = Some(mount);
         }
     }
     best
+}
+
+fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
+    let (before_separator, after_separator) = line.split_once(" - ")?;
+    let mountpoint = before_separator.split_whitespace().nth(MOUNTPOINT_FIELD)?;
+    let mut filesystem_fields = after_separator.split_whitespace();
+    let fstype = filesystem_fields.next()?;
+    let source = filesystem_fields.next().unwrap_or("-").to_string();
+    let options = filesystem_fields
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|option| !option.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    Some(MountInfo {
+        mountpoint: PathBuf::from(unescape_mountinfo(mountpoint)),
+        fstype: fstype.to_string(),
+        source,
+        options,
+    })
 }
 
 #[cfg(test)]

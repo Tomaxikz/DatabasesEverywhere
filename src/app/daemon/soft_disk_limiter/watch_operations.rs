@@ -211,43 +211,13 @@ impl WatchOperationQueue {
             return None;
         }
 
-        let operation = if let Some((target_id, retired)) =
-            self.pending_removals
-                .iter()
-                .find_map(|(target_id, pending)| {
-                    pending
-                        .tokens
-                        .first()
-                        .map(|token| (target_id, token.clone()))
-                }) {
-            WatchOperation::Unregister {
-                target_id: target_id.clone(),
-                retired,
-            }
-        } else if let Some((target_id, desired)) =
-            self.desired.iter().find(|(target_id, desired)| {
-                let already_applied = self
-                    .applied
-                    .get(*target_id)
-                    .is_some_and(|applied| applied == &desired.fingerprint);
-                let retry_delayed =
-                    self.failed_until
-                        .get(*target_id)
-                        .is_some_and(|(fingerprint, retry_at)| {
-                            fingerprint == &desired.fingerprint && *retry_at > now
-                        });
-                !already_applied && !retry_delayed
-            })
-        {
-            WatchOperation::Register {
-                target_id: target_id.clone(),
-                desired: desired.clone(),
-            }
-        } else if self.retry_requested {
-            WatchOperation::RetryDegraded
-        } else {
-            return None;
-        };
+        let operation = self
+            .next_unregister()
+            .or_else(|| self.next_registration(now))
+            .or_else(|| {
+                self.retry_requested
+                    .then_some(WatchOperation::RetryDegraded)
+            })?;
 
         self.active = Some(ActiveOperation {
             operation: operation.clone(),
@@ -255,6 +225,38 @@ impl WatchOperationQueue {
             stall_reported: false,
         });
         Some(operation)
+    }
+
+    fn next_unregister(&self) -> Option<WatchOperation> {
+        self.pending_removals
+            .iter()
+            .find_map(|(target_id, pending)| {
+                let retired = pending.tokens.first()?;
+                Some(WatchOperation::Unregister {
+                    target_id: target_id.clone(),
+                    retired: retired.clone(),
+                })
+            })
+    }
+
+    fn next_registration(&self, now: Duration) -> Option<WatchOperation> {
+        let (target_id, desired) = self.desired.iter().find(|(target_id, desired)| {
+            let already_applied = self
+                .applied
+                .get(*target_id)
+                .is_some_and(|applied| applied == &desired.fingerprint);
+            let retry_delayed =
+                self.failed_until
+                    .get(*target_id)
+                    .is_some_and(|(fingerprint, retry_at)| {
+                        fingerprint == &desired.fingerprint && *retry_at > now
+                    });
+            !already_applied && !retry_delayed
+        })?;
+        Some(WatchOperation::Register {
+            target_id: target_id.clone(),
+            desired: desired.clone(),
+        })
     }
 
     pub(super) fn complete(
@@ -279,28 +281,32 @@ impl WatchOperationQueue {
                     .get(target_id)
                     .is_some_and(|current| current == desired);
                 let retirement_pending = self.pending_removals.contains_key(target_id);
-                if still_desired && succeeded && !retirement_pending {
-                    self.applied
-                        .insert(target_id.clone(), desired.fingerprint.clone());
-                    self.failed_until.remove(target_id);
-                } else if still_desired && !retirement_pending {
-                    self.failed_until.insert(
-                        target_id.clone(),
-                        (desired.fingerprint.clone(), now.saturating_add(retry_delay)),
-                    );
+                if still_desired && !retirement_pending {
+                    if succeeded {
+                        self.applied
+                            .insert(target_id.clone(), desired.fingerprint.clone());
+                        self.failed_until.remove(target_id);
+                    } else {
+                        self.failed_until.insert(
+                            target_id.clone(),
+                            (desired.fingerprint.clone(), now.saturating_add(retry_delay)),
+                        );
+                    }
                 }
             }
             WatchOperation::Unregister { target_id, retired } => {
-                let remove_entry = if let Some(pending) = self.pending_removals.get_mut(target_id) {
-                    if let Some(position) = pending.tokens.iter().position(|token| token == retired)
-                    {
-                        pending.tokens.remove(position);
-                    }
-                    pending.is_empty()
-                } else {
-                    false
-                };
-                if remove_entry {
+                let fully_retired =
+                    self.pending_removals
+                        .get_mut(target_id)
+                        .is_some_and(|pending| {
+                            if let Some(position) =
+                                pending.tokens.iter().position(|token| token == retired)
+                            {
+                                pending.tokens.remove(position);
+                            }
+                            pending.is_empty()
+                        });
+                if fully_retired {
                     self.pending_removals.remove(target_id);
                 }
             }

@@ -1,8 +1,10 @@
 const SECRET_MARKERS: &[&str] = &["PASSWORD", "TOKEN", "SECRET", "KEY"];
+const REDACTED: &str = "[redacted]";
+const URL_SCHEME_SEPARATOR: &str = "://";
 
 pub fn redact_value(key: &str, value: &str) -> String {
     if is_secret_key(key) {
-        "[redacted]".to_string()
+        REDACTED.to_string()
     } else {
         value.to_string()
     }
@@ -44,7 +46,7 @@ pub fn redact_exact_secrets(value: &str, secrets: &[String]) -> String {
     secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     for secret in secrets {
-        redacted = redacted.replace(secret, "[redacted]");
+        redacted = redacted.replace(secret, REDACTED);
     }
     redacted
 }
@@ -53,8 +55,8 @@ fn redact_url_credentials(value: &str) -> String {
     let mut redacted = String::with_capacity(value.len());
     let mut cursor = 0;
 
-    while let Some(relative_scheme_end) = value[cursor..].find("://") {
-        let scheme_end = cursor + relative_scheme_end + 3;
+    while let Some(relative_scheme_end) = value[cursor..].find(URL_SCHEME_SEPARATOR) {
+        let scheme_end = cursor + relative_scheme_end + URL_SCHEME_SEPARATOR.len();
         redacted.push_str(&value[cursor..scheme_end]);
 
         let authority = &value[scheme_end..];
@@ -65,16 +67,15 @@ fn redact_url_credentials(value: &str) -> String {
             })
             .unwrap_or(authority.len());
         let authority = &authority[..authority_end];
-        let Some(at) = authority.rfind('@') else {
+        let credentials_end = authority
+            .rfind('@')
+            .filter(|&at| authority[..at].contains(':'));
+        let Some(at) = credentials_end else {
             cursor = scheme_end;
             continue;
         };
-        if !authority[..at].contains(':') {
-            cursor = scheme_end;
-            continue;
-        }
 
-        redacted.push_str("[redacted]");
+        redacted.push_str(REDACTED);
         cursor = scheme_end + at;
     }
 
@@ -114,7 +115,7 @@ fn redact_secrets(value: &str) -> String {
     let mut cursor = 0;
     for (start, end) in replacements {
         redacted.push_str(&value[cursor..start]);
-        redacted.push_str("[redacted]");
+        redacted.push_str(REDACTED);
         cursor = end;
     }
     redacted.push_str(&value[cursor..]);

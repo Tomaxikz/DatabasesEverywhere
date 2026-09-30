@@ -7,6 +7,11 @@ use crate::shared::protocol::Protocol;
 
 pub const MAX_CATALOG_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_LAST_ERROR_BYTES: usize = 16 * 1024;
+const MAX_TOKEN_BYTES: usize = 128;
+const MAX_FILENAME_BYTES: usize = 255;
+const SHA256_HEX_LEN: usize = 64;
+const MAX_ACTIVE_LIST_LIMIT: u32 = 500;
+const MAX_SCAN_LIMIT: u32 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportUploadState {
@@ -363,7 +368,7 @@ impl ImportUploadRepository {
             "#,
         )
         .bind(instance_id)
-        .bind(i64::from(limit.clamp(1, 500)))
+        .bind(i64::from(limit.clamp(1, MAX_ACTIVE_LIST_LIMIT)))
         .fetch_all(&self.pool)
         .await?;
 
@@ -694,7 +699,7 @@ impl ImportUploadRepository {
             "#,
         )
         .bind(after_upload_id)
-        .bind(i64::from(limit.clamp(1, 1_000)))
+        .bind(i64::from(limit.clamp(1, MAX_SCAN_LIMIT)))
         .fetch_all(&self.pool)
         .await?;
 
@@ -719,7 +724,7 @@ impl ImportUploadRepository {
             "#,
         )
         .bind(after_upload_id)
-        .bind(i64::from(limit.clamp(1, 1_000)))
+        .bind(i64::from(limit.clamp(1, MAX_SCAN_LIMIT)))
         .fetch_all(&self.pool)
         .await?;
 
@@ -750,7 +755,7 @@ impl ImportUploadRepository {
         .bind(after_upload_id)
         .bind(now)
         .bind(i64::from(minimum_age_seconds))
-        .bind(i64::from(limit.clamp(1, 1_000)))
+        .bind(i64::from(limit.clamp(1, MAX_SCAN_LIMIT)))
         .fetch_all(&self.pool)
         .await?;
 
@@ -776,7 +781,7 @@ impl ImportUploadRepository {
             "#,
         )
         .bind(now)
-        .bind(i64::from(limit.clamp(1, 1_000)))
+        .bind(i64::from(limit.clamp(1, MAX_SCAN_LIMIT)))
         .fetch_all(&self.pool)
         .await?;
 
@@ -934,13 +939,12 @@ fn validate_upload(upload: &ImportUpload) -> Result<(), ImportUploadValidationEr
     Ok(())
 }
 
+fn is_safe_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
 fn validate_token(field: &'static str, value: &str) -> Result<(), ImportUploadValidationError> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+    if value.is_empty() || value.len() > MAX_TOKEN_BYTES || !value.bytes().all(is_safe_name_byte) {
         return Err(ImportUploadValidationError::InvalidToken { field });
     }
     Ok(())
@@ -948,7 +952,7 @@ fn validate_token(field: &'static str, value: &str) -> Result<(), ImportUploadVa
 
 fn validate_filename(value: &str) -> Result<(), ImportUploadValidationError> {
     if value.is_empty()
-        || value.len() > 255
+        || value.len() > MAX_FILENAME_BYTES
         || matches!(value, "." | "..")
         || value.chars().any(|character| {
             character == '/' || character == '\\' || character == '\0' || character.is_control()
@@ -961,11 +965,9 @@ fn validate_filename(value: &str) -> Result<(), ImportUploadValidationError> {
 
 fn validate_stored_filename(value: &str) -> Result<(), ImportUploadValidationError> {
     if value.is_empty()
-        || value.len() > 255
+        || value.len() > MAX_FILENAME_BYTES
         || matches!(value, "." | "..")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !value.bytes().all(is_safe_name_byte)
     {
         return Err(ImportUploadValidationError::InvalidStoredFilename);
     }
@@ -973,7 +975,7 @@ fn validate_stored_filename(value: &str) -> Result<(), ImportUploadValidationErr
 }
 
 fn validate_sha256(value: &str) -> Result<(), ImportUploadValidationError> {
-    if value.len() != 64
+    if value.len() != SHA256_HEX_LEN
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))

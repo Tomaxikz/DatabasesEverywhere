@@ -30,8 +30,8 @@ mod lifecycle;
 mod maintenance;
 
 use lifecycle::{
-    SharedLifecycleError, check_power_state, limits_match, placement_error, route_was_open,
-    same_shared_identity, target,
+    SharedLifecycleError, check_power_state, completion_report, limits_match, mark_quarantined,
+    placement_error, route_was_open, same_shared_identity, target,
 };
 pub(crate) use maintenance::delete_empty_pool;
 use maintenance::{clear_caches, drain_tenant_sessions, maintain_pool_after_delete};
@@ -131,9 +131,8 @@ pub(super) async fn change_state(
         .await
         .map_err(docker_error)?;
     let pool_running = inspection.status == DockerContainerStatus::Running;
-    if matches!(action, LifecycleAction::Start | LifecycleAction::Restart)
-        && (!pool_running || runtime.status != EngineRuntimeStatus::Running)
-    {
+    let starting = matches!(action, LifecycleAction::Start | LifecycleAction::Restart);
+    if starting && (!pool_running || runtime.status != EngineRuntimeStatus::Running) {
         return Err(ApiError::Conflict(
             "the shared database runtime is not running; repair the pool before starting tenants"
                 .to_string(),
@@ -145,7 +144,6 @@ pub(super) async fn change_state(
         &previous,
         state.instances.routes_fenced(&metadata.instance_id).await,
     );
-    let starting = matches!(action, LifecycleAction::Start | LifecycleAction::Restart);
     drain_tenant_sessions(state, &metadata.instance_id).await?;
 
     let database = metadata.database.name.clone();
@@ -196,15 +194,10 @@ pub(super) async fn change_state(
         });
     }
 
-    metadata.desired_state = if starting {
-        DesiredInstanceState::Running
+    (metadata.desired_state, metadata.status) = if starting {
+        (DesiredInstanceState::Running, InstanceStatus::Running)
     } else {
-        DesiredInstanceState::Stopped
-    };
-    metadata.status = if starting {
-        InstanceStatus::Running
-    } else {
-        InstanceStatus::Stopped
+        (DesiredInstanceState::Stopped, InstanceStatus::Stopped)
     };
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
@@ -232,9 +225,7 @@ pub(super) async fn change_state(
                 )));
             }
             Ok(Some(mut persisted)) => {
-                persisted.status = InstanceStatus::Quarantined;
-                persisted.desired_state = DesiredInstanceState::Stopped;
-                persisted.updated_at = now_rfc3339();
+                mark_quarantined(&mut persisted);
                 route_fence::fence(state, &metadata.instance_id).await;
                 let quarantine = state
                     .manager
@@ -245,10 +236,7 @@ pub(super) async fn change_state(
                     .await;
                 return Err(ApiError::Runtime(format!(
                     "shared tenant lifecycle changed engine access, but durable state is ambiguous after {error}; tenant remained fenced and quarantine persistence: {}",
-                    quarantine
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "completed".to_string())
+                    completion_report(quarantine)
                 )));
             }
             Ok(None) | Err(_) => {
@@ -400,16 +388,14 @@ pub(crate) async fn recover_deleting(state: &AppState) -> usize {
         let Some(current) = state.instances.get(&instance_id).await else {
             continue;
         };
-        if !same_shared_identity(&snapshot, &current) || current.status != InstanceStatus::Deleting
-        {
+        if !is_same_deleting_tenant(&snapshot, &current) {
             continue;
         }
         let _runtime_operation = state.instance_locks.lock(&runtime_id).await;
         let Some(current) = state.instances.get(&instance_id).await else {
             continue;
         };
-        if !same_shared_identity(&snapshot, &current) || current.status != InstanceStatus::Deleting
-        {
+        if !is_same_deleting_tenant(&snapshot, &current) {
             continue;
         }
         let runtime = match load_runtime(state, &current).await {
@@ -444,6 +430,10 @@ pub(crate) async fn recover_deleting(state: &AppState) -> usize {
         }
     }
     recovered
+}
+
+fn is_same_deleting_tenant(snapshot: &InstanceMetadata, current: &InstanceMetadata) -> bool {
+    same_shared_identity(snapshot, current) && current.status == InstanceStatus::Deleting
 }
 
 pub(super) async fn resize(
@@ -492,13 +482,13 @@ pub(super) async fn resize(
         ));
     }
     let disk_shrinks = requested.disk_mib < previous_limits.disk_mib;
-    let disk_changes = requested.disk_mib != previous_limits.disk_mib;
-    let disk_mutation = disk_changes;
+    let disk_mutation = requested.disk_mib != previous_limits.disk_mib;
     let was_open = route_was_open(
         &metadata,
         state.instances.routes_fenced(&metadata.instance_id).await,
     );
-    let measured_usage = if disk_mutation {
+    let mut measured_usage = None;
+    if disk_mutation {
         drain_tenant_sessions(state, &metadata.instance_id).await?;
         tenant::fence(&state.docker, &previous_runtime, target(&metadata))
             .await
@@ -532,13 +522,9 @@ pub(super) async fn resize(
                     "cannot shrink the shared tenant to {requested_bytes} bytes because it currently uses {used_bytes} bytes; access restore: {restored}"
                 )));
             }
-            Some(used_bytes)
-        } else {
-            None
+            measured_usage = Some(used_bytes);
         }
-    } else {
-        None
-    };
+    }
 
     if disk_mutation {
         let disk = match tenant::disk::set_limit(
@@ -602,6 +588,16 @@ pub(super) async fn resize(
         requested.disk_enforcement_method = previous_limits.disk_enforcement_method.clone();
     }
 
+    let rollback_this_resize = || {
+        rollback_resize(
+            state,
+            &metadata,
+            &previous_runtime,
+            &previous_limits,
+            was_open,
+            &creation,
+        )
+    };
     let runtime = match state
         .placements
         .resize(&metadata.instance_id, &requested)
@@ -616,30 +612,14 @@ pub(super) async fn resize(
                         Ok(Some(runtime)) => runtime,
                         Ok(None) => {
                             route_fence::fence(state, &metadata.instance_id).await;
-                            let rollback = rollback_resize(
-                                state,
-                                &metadata,
-                                &previous_runtime,
-                                &previous_limits,
-                                was_open,
-                                &creation,
-                            )
-                            .await;
+                            let rollback = rollback_this_resize().await;
                             return Err(ApiError::Runtime(format!(
                                 "shared resize committed but its physical runtime is missing; rollback: {rollback}"
                             )));
                         }
                         Err(read_error) => {
                             route_fence::fence(state, &metadata.instance_id).await;
-                            let rollback = rollback_resize(
-                                state,
-                                &metadata,
-                                &previous_runtime,
-                                &previous_limits,
-                                was_open,
-                                &creation,
-                            )
-                            .await;
+                            let rollback = rollback_this_resize().await;
                             return Err(ApiError::Runtime(format!(
                                 "shared resize committed but its physical runtime could not be reloaded ({read_error}); rollback: {rollback}"
                             )));
@@ -654,30 +634,14 @@ pub(super) async fn resize(
                     runtime
                 }
                 Ok(Some(persisted)) if limits_match(&persisted.limits, &previous_limits) => {
-                    let rollback = rollback_resize(
-                        state,
-                        &metadata,
-                        &previous_runtime,
-                        &previous_limits,
-                        was_open,
-                        &creation,
-                    )
-                    .await;
+                    let rollback = rollback_this_resize().await;
                     return Err(ApiError::Runtime(format!(
                         "shared resize was not committed: {error}; quota rollback: {rollback}"
                     )));
                 }
                 persisted => {
                     route_fence::fence(state, &metadata.instance_id).await;
-                    let rollback = rollback_resize(
-                        state,
-                        &metadata,
-                        &previous_runtime,
-                        &previous_limits,
-                        was_open,
-                        &creation,
-                    )
-                    .await;
+                    let rollback = rollback_this_resize().await;
                     return Err(ApiError::Runtime(format!(
                         "shared resize commit could not be classified after {error}; durable tenant state: {}; rollback: {rollback}",
                         match persisted {
@@ -706,15 +670,7 @@ pub(super) async fn resize(
     }
     .await;
     if let Err(error) = apply {
-        let rollback = rollback_resize(
-            state,
-            &metadata,
-            &previous_runtime,
-            &previous_limits,
-            was_open,
-            &creation,
-        )
-        .await;
+        let rollback = rollback_this_resize().await;
         return Err(ApiError::Runtime(format!(
             "shared tenant limit update failed: {error}; rollback: {rollback}"
         )));
@@ -752,15 +708,7 @@ pub(super) async fn resize(
     };
     if let Err(error) = persist_result {
         route_fence::fence(state, &metadata.instance_id).await;
-        let rollback = rollback_resize(
-            state,
-            &metadata,
-            &previous_runtime,
-            &previous_limits,
-            was_open,
-            &creation,
-        )
-        .await;
+        let rollback = rollback_this_resize().await;
         return Err(ApiError::Runtime(format!(
             "shared tenant limits were applied, but their final metadata could not be persisted ({error}); rollback: {rollback}"
         )));
@@ -768,15 +716,7 @@ pub(super) async fn resize(
     if disk_mutation && was_open {
         let restored = restore_access(state, &runtime, &updated, true).await;
         if restored != "completed" {
-            let rollback = rollback_resize(
-                state,
-                &metadata,
-                &previous_runtime,
-                &previous_limits,
-                was_open,
-                &creation,
-            )
-            .await;
+            let rollback = rollback_this_resize().await;
             return Err(ApiError::Runtime(format!(
                 "shared tenant limits were updated, but access could not be restored ({restored}); rollback: {rollback}"
             )));
@@ -878,9 +818,7 @@ pub(super) async fn reset_password(
                 .await;
             }
             Ok(Some(mut persisted)) => {
-                persisted.status = InstanceStatus::Quarantined;
-                persisted.desired_state = DesiredInstanceState::Stopped;
-                persisted.updated_at = now_rfc3339();
+                mark_quarantined(&mut persisted);
                 let quarantine = state
                     .manager
                     .quarantine(
@@ -890,10 +828,7 @@ pub(super) async fn reset_password(
                     .await;
                 return Err(ApiError::Runtime(format!(
                     "shared password rotation completed, but durable credential state is ambiguous after {error}; tenant remained fenced and quarantine persistence: {}",
-                    quarantine
-                        .err()
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "completed".to_string())
+                    completion_report(quarantine)
                 )));
             }
             Ok(None) | Err(_) => {
@@ -927,9 +862,7 @@ pub(super) async fn recover_lifecycle_panic(state: &AppState, instance_id: &str)
     route_fence::fence(state, instance_id).await;
     match state.manager.get_persisted(instance_id).await {
         Ok(Some(mut metadata)) => {
-            metadata.status = InstanceStatus::Quarantined;
-            metadata.desired_state = DesiredInstanceState::Stopped;
-            metadata.updated_at = now_rfc3339();
+            mark_quarantined(&mut metadata);
             match state
                 .manager
                 .quarantine(
@@ -1250,9 +1183,7 @@ async fn restore_access(
                 return report;
             }
             let mut quarantined = restored;
-            quarantined.status = InstanceStatus::Quarantined;
-            quarantined.desired_state = DesiredInstanceState::Stopped;
-            quarantined.updated_at = now_rfc3339();
+            mark_quarantined(&mut quarantined);
             let persisted = state
                 .manager
                 .quarantine(
@@ -1262,10 +1193,7 @@ async fn restore_access(
                 .await;
             let report = format!(
                 "failed ({error}); tenant remained fenced and quarantine persistence: {}",
-                persisted
-                    .err()
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "completed".to_string())
+                completion_report(persisted)
             );
             tracing::error!(
                 event = "audit shared_tenant_power_rollback_failed",
@@ -1413,9 +1341,7 @@ async fn rollback_password(
     };
     if let Err(rollback_error) = verified {
         let mut quarantined = previous.clone();
-        quarantined.status = InstanceStatus::Quarantined;
-        quarantined.desired_state = DesiredInstanceState::Stopped;
-        quarantined.updated_at = now_rfc3339();
+        mark_quarantined(&mut quarantined);
         let persist = state
             .manager
             .quarantine(
@@ -1425,10 +1351,7 @@ async fn rollback_password(
             .await;
         return Err(ApiError::Runtime(format!(
             "shared password reset failed ({original_error}) and rollback failed ({rollback_error}); tenant was fenced and quarantine persistence: {}",
-            persist
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "completed".to_string())
+            completion_report(persist)
         )));
     }
     state.instances.upsert(previous.clone()).await;

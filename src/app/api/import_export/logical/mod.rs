@@ -61,13 +61,10 @@ pub(super) async fn import_instance_source(
                 Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
             ) =>
         {
-            let staging = match upload_staging {
-                Some(UploadStagingBudget::Logical { budget, .. }) => *budget,
-                _ => {
-                    return Err(ApiError::Runtime(
-                        "logical upload staging was unavailable".to_string(),
-                    ));
-                }
+            let Some(UploadStagingBudget::Logical { budget, .. }) = upload_staging else {
+                return Err(ApiError::Runtime(
+                    "logical upload staging was unavailable".to_string(),
+                ));
             };
             import_logical(
                 state,
@@ -75,103 +72,83 @@ pub(super) async fn import_instance_source(
                 path,
                 options,
                 options.source_database.as_deref(),
-                LogicalStagingLimits::upload(staging),
+                LogicalStagingLimits::upload(*budget),
             )
             .await
         }
-        ImportSourceOptions::Upload { path, .. } => match metadata.protocol {
-            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => {
-                let max_extracted_bytes = match upload_staging {
-                    Some(UploadStagingBudget::Physical {
-                        extracted_bytes, ..
-                    }) => *extracted_bytes,
-                    _ => {
-                        return Err(ApiError::Runtime(
-                            "physical upload staging was unavailable".to_string(),
-                        ));
-                    }
-                };
-                import_physical_archive(
-                    state,
-                    instance_id,
-                    metadata.protocol,
-                    path,
-                    max_extracted_bytes,
-                )
-                .await
-            }
-            protocol => {
-                let staging = match upload_staging {
-                    Some(UploadStagingBudget::Logical { budget, .. }) => *budget,
-                    _ => {
-                        return Err(ApiError::Runtime(
-                            "logical upload staging was unavailable".to_string(),
-                        ));
-                    }
-                };
-                import_logical_dump(
-                    state,
-                    &metadata,
-                    protocol,
-                    path,
-                    options,
-                    LogicalImportControls {
-                        source_database: options.source_database.as_deref(),
-                        max_prepared_bytes: Some(staging.prepared_bytes),
-                        ..LogicalImportControls::default()
-                    },
-                )
-                .await
-            }
-        },
+        ImportSourceOptions::Upload { path, .. } => {
+            let Some(UploadStagingBudget::Physical {
+                extracted_bytes, ..
+            }) = upload_staging
+            else {
+                return Err(ApiError::Runtime(
+                    "physical upload staging was unavailable".to_string(),
+                ));
+            };
+            import_physical_archive(
+                state,
+                instance_id,
+                metadata.protocol,
+                path,
+                *extracted_bytes,
+            )
+            .await
+        }
         ImportSourceOptions::Remote(source) => {
-            if metadata.status != InstanceStatus::Running {
-                return Err(ApiError::BadRequest(format!(
-                    "remote import requires a running target instance (status={:?})",
-                    metadata.status
-                )));
-            }
-            match metadata.protocol {
-                Protocol::Redis => import_redis(state, instance_id, source, options.mode).await,
-                Protocol::Valkey => import_valkey(state, instance_id, source, options.mode).await,
-                Protocol::Qdrant => {
-                    import_qdrant(state, instance_id, source, &options.selection, options.mode)
-                        .await
-                }
-                protocol => {
-                    let staged = acquire_logical_dump(
-                        state,
-                        protocol,
-                        source,
-                        &options.selection,
-                        &metadata.database.username,
-                        &metadata.database.name,
-                    )
-                    .await?;
-                    let artifact_paths = staged
-                        .paths
-                        .iter()
-                        .map(PathBuf::as_path)
-                        .collect::<Vec<_>>();
-                    let result = import_logical_batch(
-                        state,
-                        &metadata,
-                        &artifact_paths,
-                        options,
-                        staged.source_database.as_deref(),
-                        LogicalStagingLimits::remote(
-                            state.config.security.remote_import.max_staged_bytes,
-                        ),
-                    )
-                    .await;
-                    staged.cleanup().await;
-                    result
-                }
-            }
+            import_remote_source(state, instance_id, &metadata, source, options).await
         }
         ImportSourceOptions::RemoteRequest(_) => Err(ApiError::Runtime(
             "remote import source was not validated".to_string(),
         )),
+    }
+}
+
+async fn import_remote_source(
+    state: &AppState,
+    instance_id: &str,
+    metadata: &InstanceMetadata,
+    source: &RemoteImportSource,
+    options: &ImportOptions,
+) -> Result<(), ApiError> {
+    if metadata.status != InstanceStatus::Running {
+        return Err(ApiError::BadRequest(format!(
+            "remote import requires a running target instance (status={:?})",
+            metadata.status
+        )));
+    }
+    match metadata.protocol {
+        Protocol::Redis => import_redis(state, instance_id, source, options.mode).await,
+        Protocol::Valkey => import_valkey(state, instance_id, source, options.mode).await,
+        Protocol::Qdrant => {
+            import_qdrant(state, instance_id, source, &options.selection, options.mode).await
+        }
+        protocol => {
+            let staged = acquire_logical_dump(
+                state,
+                protocol,
+                source,
+                &options.selection,
+                &metadata.database.username,
+                &metadata.database.name,
+            )
+            .await?;
+            let artifact_paths = staged
+                .paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let result = import_logical_batch(
+                state,
+                metadata,
+                &artifact_paths,
+                options,
+                staged.source_database.as_deref(),
+                LogicalStagingLimits::remote(state.config.security.remote_import.max_staged_bytes),
+            )
+            .await;
+            staged.cleanup().await;
+            result
+        }
     }
 }
 
@@ -355,58 +332,13 @@ async fn import_logical_batch(
             }
         }
     }
-    let prepared_source_bytes = prepared.iter().try_fold(0_u64, |total, artifact| {
-        total
-            .checked_add(artifact.prepared_source_bytes)
-            .ok_or_else(|| ApiError::BadRequest("prepared import size overflowed".to_string()))
-    });
-    let prepared_source_bytes = match prepared_source_bytes {
-        Ok(total) => total,
+    let (retained_source_bytes, rollback_limit) = match rollback_staging_budget(staging, &prepared)
+    {
+        Ok(budget) => budget,
         Err(error) => {
             cleanup_prepared_logical_imports(state, metadata, &prepared).await;
             return Err(error);
         }
-    };
-    let retained_source_bytes = match staging.remote_staged_limit {
-        Some(limit) => {
-            let mut total = 0_u64;
-            for artifact in &prepared {
-                let Some(source_bytes) = artifact.staged_source_bytes else {
-                    cleanup_prepared_logical_imports(state, metadata, &prepared).await;
-                    return Err(ApiError::Runtime(
-                        "remote import source staging accounting was unavailable".to_string(),
-                    ));
-                };
-                total = match total.checked_add(source_bytes) {
-                    Some(total) if total <= limit => total,
-                    _ => {
-                        cleanup_prepared_logical_imports(state, metadata, &prepared).await;
-                        return Err(ApiError::BadRequest(format!(
-                            "remote import sources exceed the configured staging limit of {limit} bytes"
-                        )));
-                    }
-                };
-            }
-            total
-        }
-        None => prepared_source_bytes,
-    };
-    let remaining_combined_bytes = match staging.max_combined_bytes {
-        Some(limit) => match limit.checked_sub(retained_source_bytes) {
-            Some(remaining) if remaining > 0 => Some(remaining),
-            _ => {
-                cleanup_prepared_logical_imports(state, metadata, &prepared).await;
-                return Err(ApiError::BadRequest(format!(
-                    "prepared import data leaves no room in the configured {limit}-byte staging budget for rollback"
-                )));
-            }
-        },
-        None => None,
-    };
-    let rollback_limit = match (staging.max_rollback_bytes, remaining_combined_bytes) {
-        (Some(rollback), Some(remaining)) => Some(rollback.min(remaining)),
-        (Some(rollback), None) => Some(rollback),
-        (None, remaining) => remaining,
     };
 
     if let Err(error) = fence_import_target(state, metadata, remote_exec_timeout).await {
@@ -511,29 +443,11 @@ async fn import_logical_batch(
     let primary =
         apply_prepared_logical_imports(state, metadata, &prepared, apply_options.mode).await;
     cleanup_prepared_logical_imports(state, metadata, &prepared).await;
-    if primary.is_ok() {
-        if let Err(error) = commit_recovery_manifest(&recovery_manifest).await {
-            let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
-            return Err(ApiError::Runtime(format!(
-                "{} import was applied, but its recovery commit marker could not be removed: {error}; target was failed closed{}; rollback data and manifest were retained for review",
-                metadata.protocol.as_str(),
-                quarantine_suffix(&quarantine)
-            )));
-        }
-        if let Err(error) = restore_import_target_route(state, metadata).await {
-            let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
-            return Err(ApiError::Runtime(format!(
-                "{} import committed, but the target route could not be restored: {error}; target was failed closed{}",
-                metadata.protocol.as_str(),
-                quarantine_suffix(&quarantine)
-            )));
-        }
-        cleanup_path(&rollback_path).await;
-        return Ok(());
-    }
-
     let primary = match primary {
-        Ok(()) => unreachable!(),
+        Ok(()) => {
+            return commit_logical_import(state, metadata, &recovery_manifest, &rollback_path)
+                .await;
+        }
         Err(primary) => primary,
     };
     if primary.helper_uncertain() {
@@ -612,6 +526,87 @@ async fn import_logical_batch(
             )))
         }
     }
+}
+
+fn rollback_staging_budget(
+    staging: LogicalStagingLimits,
+    prepared: &[PreparedLogicalImport],
+) -> Result<(u64, Option<u64>), ApiError> {
+    let prepared_source_bytes = prepared.iter().try_fold(0_u64, |total, artifact| {
+        total
+            .checked_add(artifact.prepared_source_bytes)
+            .ok_or_else(|| ApiError::BadRequest("prepared import size overflowed".to_string()))
+    })?;
+    let retained_source_bytes = match staging.remote_staged_limit {
+        Some(limit) => remote_staged_source_bytes(prepared, limit)?,
+        None => prepared_source_bytes,
+    };
+    let remaining_combined_bytes = match staging.max_combined_bytes {
+        Some(limit) => match limit.checked_sub(retained_source_bytes) {
+            Some(remaining) if remaining > 0 => Some(remaining),
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "prepared import data leaves no room in the configured {limit}-byte staging budget for rollback"
+                )));
+            }
+        },
+        None => None,
+    };
+    let rollback_limit = match (staging.max_rollback_bytes, remaining_combined_bytes) {
+        (Some(rollback), Some(remaining)) => Some(rollback.min(remaining)),
+        (Some(rollback), None) => Some(rollback),
+        (None, remaining) => remaining,
+    };
+    Ok((retained_source_bytes, rollback_limit))
+}
+
+fn remote_staged_source_bytes(
+    prepared: &[PreparedLogicalImport],
+    limit: u64,
+) -> Result<u64, ApiError> {
+    let mut total = 0_u64;
+    for artifact in prepared {
+        let Some(source_bytes) = artifact.staged_source_bytes else {
+            return Err(ApiError::Runtime(
+                "remote import source staging accounting was unavailable".to_string(),
+            ));
+        };
+        total = match total.checked_add(source_bytes) {
+            Some(total) if total <= limit => total,
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "remote import sources exceed the configured staging limit of {limit} bytes"
+                )));
+            }
+        };
+    }
+    Ok(total)
+}
+
+async fn commit_logical_import(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    recovery_manifest: &FsPath,
+    rollback_path: &FsPath,
+) -> Result<(), ApiError> {
+    if let Err(error) = commit_recovery_manifest(recovery_manifest).await {
+        let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
+        return Err(ApiError::Runtime(format!(
+            "{} import was applied, but its recovery commit marker could not be removed: {error}; target was failed closed{}; rollback data and manifest were retained for review",
+            metadata.protocol.as_str(),
+            quarantine_suffix(&quarantine)
+        )));
+    }
+    if let Err(error) = restore_import_target_route(state, metadata).await {
+        let quarantine = quarantine_uncertain_import(state, &metadata.instance_id).await;
+        return Err(ApiError::Runtime(format!(
+            "{} import committed, but the target route could not be restored: {error}; target was failed closed{}",
+            metadata.protocol.as_str(),
+            quarantine_suffix(&quarantine)
+        )));
+    }
+    cleanup_path(rollback_path).await;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -902,10 +897,9 @@ async fn prepare_logical_import(
         }
         check_import_file_size(&host_temp).await?
     };
+    let owns_host_temp = !controls.reuse_staged_artifact;
     if prepared_source_bytes > max_prepared_bytes {
-        if !controls.reuse_staged_artifact {
-            cleanup_path(&host_temp).await;
-        }
+        discard_owned_temp(&host_temp, owns_host_temp).await;
         return Err(ApiError::BadRequest(format!(
             "prepared import source is {prepared_source_bytes} bytes; configured limit is {max_prepared_bytes} bytes"
         )));
@@ -922,9 +916,7 @@ async fn prepare_logical_import(
         match super::postgres_dump::wrapper_lines(&host_temp, prepared_source_bytes).await {
             Ok(lines) => lines,
             Err(error) => {
-                if !controls.reuse_staged_artifact {
-                    cleanup_path(&host_temp).await;
-                }
+                discard_owned_temp(&host_temp, owns_host_temp).await;
                 return Err(error);
             }
         }
@@ -933,48 +925,17 @@ async fn prepare_logical_import(
     };
     let shared_restore = metadata.deployment_mode == DeploymentMode::Shared;
     let expected_sha256 = if shared_restore {
-        use super::inspection::shared_import::{
-            SharedImportLayout, SharedImportRequest, validate_shared_import,
-        };
-        let approval = match validate_shared_import(
-            &host_temp,
-            SharedImportRequest {
+        Some(
+            inspect_shared_import_digest(
+                &host_temp,
+                owns_host_temp,
+                metadata,
                 protocol,
-                target_database: &metadata.database.name,
-                source_database: controls.source_database,
-                layout: SharedImportLayout::LogicalDump,
-                archive_format: Some(if protocol == Protocol::Mongodb {
-                    "gzip"
-                } else {
-                    "plain"
-                }),
+                controls.source_database,
                 postgres_wrapper_lines,
-            },
+            )
+            .await?,
         )
-        .await
-        {
-            Ok(approval) => approval,
-            Err(error) => {
-                if !controls.reuse_staged_artifact {
-                    cleanup_path(&host_temp).await;
-                }
-                return Err(ApiError::BadRequest(format!(
-                    "shared import was rejected ({:?}): {error}",
-                    error.reason
-                )));
-            }
-        };
-        if !approval.requires_isolated_staging || !approval.restore_as_tenant {
-            if !controls.reuse_staged_artifact {
-                cleanup_path(&host_temp).await;
-            }
-            return Err(ApiError::Runtime(
-                "shared import inspection did not require isolated tenant restore".to_string(),
-            ));
-        }
-        Some(parse_sha256(&approval.sha256).ok_or_else(|| {
-            ApiError::Runtime("shared import inspection returned an invalid digest".to_string())
-        })?)
     } else {
         None
     };
@@ -993,9 +954,7 @@ async fn prepare_logical_import(
     ) {
         Ok(script) => script,
         Err(error) => {
-            if !controls.reuse_staged_artifact {
-                cleanup_path(&host_temp).await;
-            }
+            discard_owned_temp(&host_temp, owns_host_temp).await;
             return Err(error);
         }
     };
@@ -1004,11 +963,11 @@ async fn prepare_logical_import(
         &host_temp,
         prepared_source_bytes,
         expected_sha256,
-        !controls.reuse_staged_artifact,
+        owns_host_temp,
     )
     .await?;
     let staged_source_bytes = if controls.remove_uploaded_source_limit.is_some() {
-        if !controls.reuse_staged_artifact {
+        if owns_host_temp {
             return Err(ApiError::Runtime(
                 "remote import source accounting requires a staged source artifact".to_string(),
             ));
@@ -1020,7 +979,7 @@ async fn prepare_logical_import(
     Ok(PreparedLogicalImport {
         protocol,
         host_temp,
-        owns_host_temp: !controls.reuse_staged_artifact,
+        owns_host_temp,
         script,
         exec_timeout: controls.exec_timeout,
         database_definition_in_dump: controls.database_definition_in_dump,
@@ -1029,5 +988,60 @@ async fn prepare_logical_import(
         pinned_input,
         staged_source_bytes,
         target: PreparedTarget::new(metadata),
+    })
+}
+
+async fn discard_owned_temp(host_temp: &FsPath, owns_host_temp: bool) {
+    if owns_host_temp {
+        cleanup_path(host_temp).await;
+    }
+}
+
+async fn inspect_shared_import_digest(
+    host_temp: &FsPath,
+    owns_host_temp: bool,
+    metadata: &InstanceMetadata,
+    protocol: Protocol,
+    source_database: Option<&str>,
+    postgres_wrapper_lines: Option<(u64, u64)>,
+) -> Result<[u8; 32], ApiError> {
+    use super::inspection::shared_import::{
+        SharedImportLayout, SharedImportRequest, validate_shared_import,
+    };
+    let archive_format = if protocol == Protocol::Mongodb {
+        "gzip"
+    } else {
+        "plain"
+    };
+    let approval = match validate_shared_import(
+        host_temp,
+        SharedImportRequest {
+            protocol,
+            target_database: &metadata.database.name,
+            source_database,
+            layout: SharedImportLayout::LogicalDump,
+            archive_format: Some(archive_format),
+            postgres_wrapper_lines,
+        },
+    )
+    .await
+    {
+        Ok(approval) => approval,
+        Err(error) => {
+            discard_owned_temp(host_temp, owns_host_temp).await;
+            return Err(ApiError::BadRequest(format!(
+                "shared import was rejected ({:?}): {error}",
+                error.reason
+            )));
+        }
+    };
+    if !approval.requires_isolated_staging || !approval.restore_as_tenant {
+        discard_owned_temp(host_temp, owns_host_temp).await;
+        return Err(ApiError::Runtime(
+            "shared import inspection did not require isolated tenant restore".to_string(),
+        ));
+    }
+    parse_sha256(&approval.sha256).ok_or_else(|| {
+        ApiError::Runtime("shared import inspection returned an invalid digest".to_string())
     })
 }

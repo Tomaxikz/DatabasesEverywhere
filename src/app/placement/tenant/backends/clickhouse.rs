@@ -7,10 +7,10 @@ use super::super::{
 };
 use super::{TenantBackend, TenantOperation};
 use crate::{
-    databases,
+    databases::{self, clickhouse::docker::INTERNAL_ADMIN_USERNAME},
     placement::{EngineRuntime, policy},
     runtime::docker::{CommandOutput, DockerRuntime},
-    shared::{protocol::Protocol, shell::sh_quote},
+    shared::{limits::InstanceLimits, protocol::Protocol, shell::sh_quote},
 };
 
 pub(super) struct Clickhouse;
@@ -37,21 +37,13 @@ impl TenantBackend for Clickhouse {
                     clickhouse_password_sql(
                         docker,
                         runtime,
-                        databases::clickhouse::docker::INTERNAL_ADMIN_USERNAME,
+                        INTERNAL_ADMIN_USERNAME,
                         admin,
                         &create,
                         password,
                     )
                     .await?;
-                    clickhouse_sql(
-                        docker,
-                        runtime,
-                        &databases::clickhouse::provision::tenant_quota_sql(
-                            target.username,
-                            policy::clickhouse_quota(limits),
-                        ),
-                    )
-                    .await?;
+                    clickhouse_sql(docker, runtime, &quota_sql(target, limits)).await?;
                 }
                 TenantOperation::Fence => {
                     clickhouse_sql(
@@ -85,22 +77,14 @@ impl TenantBackend for Clickhouse {
                     .await?;
                 }
                 TenantOperation::SetQuota { limits } => {
-                    clickhouse_sql(
-                        docker,
-                        runtime,
-                        &databases::clickhouse::provision::tenant_quota_sql(
-                            target.username,
-                            policy::clickhouse_quota(limits),
-                        ),
-                    )
-                    .await?;
+                    clickhouse_sql(docker, runtime, &quota_sql(target, limits)).await?;
                 }
                 TenantOperation::RotatePassword { password } => {
                     let admin = admin_secret(runtime)?;
                     clickhouse_password_sql(
                         docker,
                         runtime,
-                        databases::clickhouse::docker::INTERNAL_ADMIN_USERNAME,
+                        INTERNAL_ADMIN_USERNAME,
                         admin,
                         &databases::clickhouse::provision::reset_tenant_password_sql(
                             target.username,
@@ -146,6 +130,13 @@ impl TenantBackend for Clickhouse {
             .await
         })
     }
+}
+
+fn quota_sql(target: TenantTarget<'_>, limits: &InstanceLimits) -> String {
+    databases::clickhouse::provision::tenant_quota_sql(
+        target.username,
+        policy::clickhouse_quota(limits),
+    )
 }
 
 async fn clickhouse_password_sql(

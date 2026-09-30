@@ -126,14 +126,7 @@ impl RouteResolver {
 
     pub(crate) async fn resolve_redis(&self, username: &str) -> Option<ResolvedRoute> {
         let target = self.store.resolve_redis(username).await?;
-        self.resolve_target(
-            target.instance_id,
-            target.instance_generation,
-            target.endpoint,
-            target.connection_limit,
-            target.route_revision,
-        )
-        .await
+        self.open_route(target).await
     }
 
     pub(crate) async fn resolve_redis_password(
@@ -141,29 +134,13 @@ impl RouteResolver {
         password_sha256: &str,
     ) -> Option<(String, ResolvedRoute)> {
         let (username, target) = self.store.resolve_redis_password(password_sha256).await?;
-        Some((
-            username,
-            self.resolve_target(
-                target.instance_id,
-                target.instance_generation,
-                target.endpoint,
-                target.connection_limit,
-                target.route_revision,
-            )
-            .await?,
-        ))
+        let route = self.open_route(target).await?;
+        Some((username, route))
     }
 
     pub(crate) async fn resolve_valkey(&self, username: &str) -> Option<ResolvedRoute> {
         let target = self.store.resolve_valkey(username).await?;
-        self.resolve_target(
-            target.instance_id,
-            target.instance_generation,
-            target.endpoint,
-            target.connection_limit,
-            target.route_revision,
-        )
-        .await
+        self.open_route(target).await
     }
 
     pub(crate) async fn resolve_valkey_password(
@@ -171,17 +148,8 @@ impl RouteResolver {
         password_sha256: &str,
     ) -> Option<(String, ResolvedRoute)> {
         let (username, target) = self.store.resolve_valkey_password(password_sha256).await?;
-        Some((
-            username,
-            self.resolve_target(
-                target.instance_id,
-                target.instance_generation,
-                target.endpoint,
-                target.connection_limit,
-                target.route_revision,
-            )
-            .await?,
-        ))
+        let route = self.open_route(target).await?;
+        Some((username, route))
     }
 
     pub(crate) async fn resolve_mariadb(
@@ -240,14 +208,7 @@ impl RouteResolver {
         {
             return None;
         }
-        self.resolve_target(
-            current.instance_id,
-            current.instance_generation,
-            current.endpoint,
-            current.connection_limit,
-            current.route_revision,
-        )
-        .await
+        self.open_route(current).await
     }
 
     pub(crate) async fn resolve_clickhouse(
@@ -270,6 +231,14 @@ impl RouteResolver {
 
     pub(crate) async fn resolve_qdrant(&self, route_key_sha256: &str) -> Option<ResolvedRoute> {
         let target = self.store.resolve_qdrant(route_key_sha256).await?;
+        self.open_route(target).await
+    }
+
+    pub(crate) fn qdrant_route_fingerprint(&self, api_key: &str) -> String {
+        self.qdrant_route_key.fingerprint(api_key)
+    }
+
+    async fn open_route(&self, target: RouteTarget) -> Option<ResolvedRoute> {
         self.resolve_target(
             target.instance_id,
             target.instance_generation,
@@ -278,10 +247,6 @@ impl RouteResolver {
             target.route_revision,
         )
         .await
-    }
-
-    pub(crate) fn qdrant_route_fingerprint(&self, api_key: &str) -> String {
-        self.qdrant_route_key.fingerprint(api_key)
     }
 
     async fn resolve_target(
@@ -348,13 +313,7 @@ impl RouteResolver {
     ) -> DatabaseRouteResolution<ResolvedRoute> {
         match resolution {
             DatabaseRouteResolution::Found { database, target } => self
-                .resolve_target(
-                    target.instance_id,
-                    target.instance_generation,
-                    target.endpoint,
-                    target.connection_limit,
-                    target.route_revision,
-                )
+                .open_route(target)
                 .await
                 .map_or(DatabaseRouteResolution::NotFound, |target| {
                     DatabaseRouteResolution::Found { database, target }

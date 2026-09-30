@@ -51,16 +51,13 @@ where
             Ok(peer) => peer.ip(),
             Err(error) => return Box::pin(async move { Err(error) }),
         };
-        let permit = match self.limiter.try_acquire(peer_ip) {
-            Some(permit) => permit,
-            None => {
-                return Box::pin(async {
-                    Err(io::Error::new(
-                        ErrorKind::WouldBlock,
-                        "API connection admission capacity reached",
-                    ))
-                });
-            }
+        let Some(permit) = self.limiter.try_acquire(peer_ip) else {
+            return Box::pin(async {
+                Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "API connection admission capacity reached",
+                ))
+            });
         };
         let accepted = self.inner.accept(stream, service);
         Box::pin(async move {

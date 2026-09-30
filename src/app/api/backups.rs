@@ -34,6 +34,12 @@ use crate::{
     shared::{ids::validate_instance_id, limits::mib_to_bytes, protocol::Protocol, time::now_unix},
 };
 
+const DEFAULT_BROWSE_LIMIT: usize = 25;
+const MAX_BROWSE_LIMIT: usize = 100;
+const MAX_BROWSE_OBJECT_ID_BYTES: usize = 1024;
+const PHYSICAL_BACKUP_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
 #[derive(Debug, Serialize)]
 pub struct BackupStatusResponse {
     pub enabled: bool,
@@ -222,8 +228,8 @@ pub async fn browse_instance_backup(
 ) -> ApiResult<BackupContentsResponse> {
     auth.require_scope(scopes::BACKUPS_READ)?;
     let metadata = require_instance(&state, &instance_id).await?;
-    let limit = query.limit.unwrap_or(25);
-    if limit == 0 || limit > 100 {
+    let limit = query.limit.unwrap_or(DEFAULT_BROWSE_LIMIT);
+    if limit == 0 || limit > MAX_BROWSE_LIMIT {
         return Err(ApiError::BadRequest(
             "limit must be between 1 and 100".to_string(),
         ));
@@ -231,7 +237,7 @@ pub async fn browse_instance_backup(
     if query
         .object
         .as_ref()
-        .is_some_and(|object| object.len() > 1024)
+        .is_some_and(|object| object.len() > MAX_BROWSE_OBJECT_ID_BYTES)
     {
         return Err(ApiError::BadRequest(
             "object is longer than 1024 bytes".to_string(),
@@ -616,7 +622,7 @@ async fn run_backup(
         crate::api::import_export::jobs::measure_export_bytes(&state, &metadata).await?
     } else {
         mib_to_bytes(metadata.limits.disk_mib)
-            .saturating_add(64 * 1024 * 1024)
+            .saturating_add(PHYSICAL_BACKUP_HEADROOM_BYTES)
             .clamp(1, crate::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
     };
     let _output_capacity = match state
@@ -630,56 +636,20 @@ async fn run_backup(
             return Err(error);
         }
     };
-    if let Some(catalog) = catalog.as_deref()
-        && let Err(error) = bundle.write_catalog(catalog).await
-    {
-        bundle.cleanup().await;
-        return Err(store_error(error));
-    }
-
-    let result = match layout {
-        BackupLayout::Physical => {
-            create_physical_archive(&state, &metadata, &bundle.archive, output_capacity).await
-        }
-        BackupLayout::Logical => {
-            crate::api::import_export::logical::create_shared_backup(
-                &state,
-                &metadata,
-                bundle.archive.clone(),
-                output_capacity,
-            )
-            .await
-        }
-    };
-    if let Err(error) = result {
-        bundle.cleanup().await;
-        return Err(error);
-    }
-    let manifest = match build_manifest(
-        backup_id.clone(),
-        instance_id.clone(),
-        metadata.protocol,
+    let committed = write_and_commit_bundle(
+        &state,
+        &storage,
+        &bundle,
+        &metadata,
+        &instance_id,
+        &backup_id,
         layout,
-        &bundle.archive,
-        catalog.is_some(),
+        catalog.as_deref(),
+        output_capacity,
     )
-    .await
-    {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            bundle.cleanup().await;
-            return Err(store_error(error));
-        }
-    };
-    if let Err(error) = bundle.write_metadata(&manifest).await {
-        bundle.cleanup().await;
-        return Err(store_error(error));
-    }
-    if let Err(error) = storage.commit(&bundle, &manifest).await {
-        bundle.cleanup().await;
-        return Err(store_error(error));
-    }
+    .await;
     bundle.cleanup().await;
+    let manifest = committed?;
     if let Err(error) = prune_instance_backups(&state, &storage, &instance_id).await {
         tracing::warn!(
             event = "audit backup_retention_failed",
@@ -699,6 +669,56 @@ async fn run_backup(
         catalog = manifest.catalog_available,
     );
     Ok(BackupAttempt::Completed(backup_info(manifest)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_and_commit_bundle(
+    state: &AppState,
+    storage: &BackupStorage,
+    bundle: &BackupBundle,
+    metadata: &InstanceMetadata,
+    instance_id: &str,
+    backup_id: &str,
+    layout: BackupLayout,
+    catalog: Option<&[u8]>,
+    output_capacity: u64,
+) -> Result<StoredBackup, ApiError> {
+    if let Some(catalog) = catalog {
+        bundle.write_catalog(catalog).await.map_err(store_error)?;
+    }
+    match layout {
+        BackupLayout::Physical => {
+            create_physical_archive(state, metadata, &bundle.archive, output_capacity).await?
+        }
+        BackupLayout::Logical => {
+            crate::api::import_export::logical::create_shared_backup(
+                state,
+                metadata,
+                bundle.archive.clone(),
+                output_capacity,
+            )
+            .await?
+        }
+    }
+    let manifest = build_manifest(
+        backup_id.to_string(),
+        instance_id.to_string(),
+        metadata.protocol,
+        layout,
+        &bundle.archive,
+        catalog.is_some(),
+    )
+    .await
+    .map_err(store_error)?;
+    bundle
+        .write_metadata(&manifest)
+        .await
+        .map_err(store_error)?;
+    storage
+        .commit(bundle, &manifest)
+        .await
+        .map_err(store_error)?;
+    Ok(manifest)
 }
 
 async fn create_physical_archive(
@@ -893,7 +913,7 @@ async fn prune_instance_backups(
         .config
         .backups
         .retention_max_age_days
-        .saturating_mul(24 * 60 * 60);
+        .saturating_mul(SECONDS_PER_DAY);
     let now = now_unix();
     let mut backups = storage.list(instance_id).await.map_err(store_error)?;
     backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));

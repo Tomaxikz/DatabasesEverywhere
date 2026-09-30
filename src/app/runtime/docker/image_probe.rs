@@ -2,6 +2,15 @@ use super::*;
 use bollard::query_parameters::{LogsOptionsBuilder, WaitContainerOptions};
 use futures::TryStreamExt;
 
+const PROBE_LABEL: &str = "dbev.image-version-probe";
+const PROBE_NAME_PREFIX: &str = "dbev-version-";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+const PROBE_MEMORY_BYTES: i64 = 256 * 1024 * 1024;
+const PROBE_NANO_CPUS: i64 = 250_000_000;
+const PROBE_PIDS_LIMIT: i64 = 32;
+
 impl DockerRuntime {
     /// Called once before API startup, when this daemon owns no live probes.
     pub(crate) async fn cleanup_version_probes(&self) -> Result<usize, String> {
@@ -9,11 +18,11 @@ impl DockerRuntime {
             .node_id
             .as_deref()
             .ok_or("node identity is unavailable")?;
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
             let filters: HashMap<String, Vec<String>> = HashMap::from([(
                 "label".into(),
                 vec![
-                    "dbev.image-version-probe=true".into(),
+                    format!("{PROBE_LABEL}=true"),
                     format!("{NODE_LABEL}={node}"),
                 ],
             )]);
@@ -30,32 +39,17 @@ impl DockerRuntime {
             let mut removed = 0;
             for container in containers {
                 let labels = container.labels.unwrap_or_default();
-                if labels.get("dbev.image-version-probe").map(String::as_str) != Some("true")
-                    || labels.get(NODE_LABEL).map(String::as_str) != Some(node)
-                    || !container.names.as_ref().is_some_and(|names| {
-                        names.iter().any(|name| {
-                            name.trim_start_matches('/')
-                                .strip_prefix("dbev-version-")
-                                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-                        })
-                    })
-                {
+                if !is_owned_version_probe(&labels, container.names.as_deref(), node) {
                     continue;
                 }
-                if let Some(id) = container.id {
-                    self.docker
-                        .remove_container(
-                            &id,
-                            Some(RemoveContainerOptions {
-                                force: true,
-                                v: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    removed += 1;
-                }
+                let Some(id) = container.id else {
+                    continue;
+                };
+                self.docker
+                    .remove_container(&id, Some(probe_removal_options()))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                removed += 1;
             }
             Ok(removed)
         })
@@ -77,7 +71,7 @@ impl DockerRuntime {
             .map_err(|error| error.to_string())?
             .id
             .ok_or("image has no immutable identity")?;
-        let name = format!("dbev-version-{}", uuid::Uuid::new_v4().simple());
+        let name = format!("{PROBE_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let body = probe_body(
             protocol,
             &image_id,
@@ -94,7 +88,7 @@ impl DockerRuntime {
             .await
             .map_err(|error| error.to_string())?;
         let id = created.id;
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let result = tokio::time::timeout(PROBE_TIMEOUT, async {
             self.docker
                 .start_container(&id, None::<StartContainerOptions>)
                 .await
@@ -117,7 +111,7 @@ impl DockerRuntime {
             let mut output = String::new();
             while let Some(chunk) = logs.try_next().await.map_err(|error| error.to_string())? {
                 let chunk = chunk.to_string();
-                if output.len().saturating_add(chunk.len()) > 64 * 1024 {
+                if output.len().saturating_add(chunk.len()) > MAX_PROBE_OUTPUT_BYTES {
                     return Err("version output exceeded its limit".into());
                 }
                 output.push_str(&chunk);
@@ -132,15 +126,9 @@ impl DockerRuntime {
         .map_err(|_| "image version probe timed out".to_string())
         .and_then(|result| result);
         let cleanup = tokio::time::timeout(
-            Duration::from_secs(15),
-            self.docker.remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    v: true,
-                    ..Default::default()
-                }),
-            ),
+            PROBE_REMOVAL_TIMEOUT,
+            self.docker
+                .remove_container(&id, Some(probe_removal_options())),
         )
         .await
         .map_err(|_| "version probe cleanup timed out".to_string())?;
@@ -148,6 +136,30 @@ impl DockerRuntime {
             return Err(format!("version probe cleanup failed: {error}"));
         }
         result.map(|version| (image_id, version))
+    }
+}
+
+fn is_owned_version_probe(
+    labels: &HashMap<String, String>,
+    names: Option<&[String]>,
+    node: &str,
+) -> bool {
+    labels.get(PROBE_LABEL).map(String::as_str) == Some("true")
+        && labels.get(NODE_LABEL).map(String::as_str) == Some(node)
+        && names.is_some_and(|names| names.iter().any(|name| is_version_probe_name(name)))
+}
+
+fn is_version_probe_name(name: &str) -> bool {
+    name.trim_start_matches('/')
+        .strip_prefix(PROBE_NAME_PREFIX)
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+fn probe_removal_options() -> RemoveContainerOptions {
+    RemoveContainerOptions {
+        force: true,
+        v: true,
+        ..Default::default()
     }
 }
 
@@ -162,7 +174,20 @@ fn probe_body(
     policy.read_only_rootfs = true;
     policy.drop_all_capabilities = true;
     policy.no_new_privileges = true;
-    policy.pids_limit = 32;
+    policy.pids_limit = PROBE_PIDS_LIMIT;
+    let mut host_config = HostConfig {
+        log_config: Some(super::container_config::log_config(engine)),
+        network_mode: Some("none".into()),
+        readonly_rootfs: Some(true),
+        cap_drop: Some(vec!["ALL".into()]),
+        security_opt: Some(vec!["no-new-privileges".into()]),
+        memory: Some(PROBE_MEMORY_BYTES),
+        memory_swap: Some(PROBE_MEMORY_BYTES),
+        nano_cpus: Some(PROBE_NANO_CPUS),
+        pids_limit: Some(PROBE_PIDS_LIMIT),
+        ..Default::default()
+    };
+    policy.apply(&mut host_config);
     ContainerCreateBody {
         image: Some(image.into()),
         entrypoint: Some(vec!["sh".into(), "-c".into()]),
@@ -170,25 +195,10 @@ fn probe_body(
             crate::compatibility::database_version_script(protocol).into(),
         ]),
         labels: Some(HashMap::from([
-            ("dbev.image-version-probe".into(), "true".into()),
+            (PROBE_LABEL.into(), "true".into()),
             (NODE_LABEL.into(), node_id.unwrap_or("").into()),
         ])),
-        host_config: Some({
-            let mut host = HostConfig {
-                log_config: Some(super::container_config::log_config(engine)),
-                network_mode: Some("none".into()),
-                readonly_rootfs: Some(true),
-                cap_drop: Some(vec!["ALL".into()]),
-                security_opt: Some(vec!["no-new-privileges".into()]),
-                memory: Some(256 * 1024 * 1024),
-                memory_swap: Some(256 * 1024 * 1024),
-                nano_cpus: Some(250_000_000),
-                pids_limit: Some(32),
-                ..Default::default()
-            };
-            policy.apply(&mut host);
-            host
-        }),
+        host_config: Some(host_config),
         ..Default::default()
     }
 }

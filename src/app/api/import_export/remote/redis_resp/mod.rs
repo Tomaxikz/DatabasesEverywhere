@@ -14,6 +14,7 @@ use tokio_rustls::{
 use super::security::ResolvedRemoteEndpoint;
 
 const RELAY_BUFFER_BYTES: usize = 64 * 1024;
+const RESTORE_SERIALIZED_VALUE_ARGUMENT_INDEX: usize = 3;
 
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -348,20 +349,13 @@ impl RespConnection {
 
         let source_timeout = self.read_timeout;
         let source_deadline = Instant::now() + source_timeout;
-        let serialized_length = match timeout_at(
+        let serialized_length = timeout_at(
             source_deadline,
             self.read_streaming_bulk_length("DUMP", max_serialized_length),
         )
         .await
-        {
-            Ok(result) => result.map_err(RedisRelayError::Source)?,
-            Err(_) => {
-                return Err(RedisRelayError::Source(RedisRespError::Timeout {
-                    operation: "read",
-                    timeout: source_timeout,
-                }));
-            }
-        };
+        .map_err(|_| source_read_timeout(source_timeout))?
+        .map_err(RedisRelayError::Source)?;
         let Some(serialized_length) = serialized_length else {
             return Ok(false);
         };
@@ -380,9 +374,10 @@ impl RespConnection {
             b"REPLACE".len(),
             b"ABSTTL".len(),
         ];
+        let argument_count = if use_absolute_ttl { 6 } else { 5 };
         target
             .validate_restore_command_size(
-                &argument_lengths[..if use_absolute_ttl { 6 } else { 5 }],
+                &argument_lengths[..argument_count],
                 serialized_length,
                 max_serialized_length,
             )
@@ -390,72 +385,40 @@ impl RespConnection {
 
         let target_timeout = target.write_timeout;
         let target_deadline = Instant::now() + target_timeout;
-        match timeout_at(
+        timeout_at(
             target_deadline,
             target.write_restore_prefix(key, ttl.as_bytes(), serialized_length, use_absolute_ttl),
         )
         .await
-        {
-            Ok(result) => result.map_err(RedisRelayError::Target)?,
-            Err(_) => {
-                return Err(RedisRelayError::Target(RedisRespError::Timeout {
-                    operation: "write",
-                    timeout: target_timeout,
-                }));
-            }
-        }
+        .map_err(|_| target_write_timeout(target_timeout))?
+        .map_err(RedisRelayError::Target)?;
 
         let mut buffer = [0_u8; RELAY_BUFFER_BYTES];
         let mut remaining = serialized_length;
         while remaining > 0 {
             let chunk_length = remaining.min(buffer.len());
-            match timeout_at(
+            timeout_at(
                 source_deadline,
                 self.io.read_exact(&mut buffer[..chunk_length]),
             )
             .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    return Err(RedisRelayError::Source(map_unexpected_eof(error)));
-                }
-                Err(_) => {
-                    return Err(RedisRelayError::Source(RedisRespError::Timeout {
-                        operation: "read",
-                        timeout: source_timeout,
-                    }));
-                }
-            }
-            match timeout_at(
+            .map_err(|_| source_read_timeout(source_timeout))?
+            .map_err(|error| RedisRelayError::Source(map_unexpected_eof(error)))?;
+            timeout_at(
                 target_deadline,
                 target.io.write_all(&buffer[..chunk_length]),
             )
             .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(RedisRelayError::Target(RedisRespError::Io(error)));
-                }
-                Err(_) => {
-                    return Err(RedisRelayError::Target(RedisRespError::Timeout {
-                        operation: "write",
-                        timeout: target_timeout,
-                    }));
-                }
-            }
+            .map_err(|_| target_write_timeout(target_timeout))?
+            .map_err(|error| RedisRelayError::Target(RedisRespError::Io(error)))?;
             remaining -= chunk_length;
         }
 
-        match timeout_at(source_deadline, self.read_crlf()).await {
-            Ok(result) => result.map_err(RedisRelayError::Source)?,
-            Err(_) => {
-                return Err(RedisRelayError::Source(RedisRespError::Timeout {
-                    operation: "read",
-                    timeout: source_timeout,
-                }));
-            }
-        }
-        match timeout_at(target_deadline, async {
+        timeout_at(source_deadline, self.read_crlf())
+            .await
+            .map_err(|_| source_read_timeout(source_timeout))?
+            .map_err(RedisRelayError::Source)?;
+        timeout_at(target_deadline, async {
             if use_absolute_ttl {
                 target
                     .io
@@ -467,18 +430,8 @@ impl RespConnection {
             target.io.flush().await
         })
         .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(RedisRelayError::Target(RedisRespError::Io(error)));
-            }
-            Err(_) => {
-                return Err(RedisRelayError::Target(RedisRespError::Timeout {
-                    operation: "write",
-                    timeout: target_timeout,
-                }));
-            }
-        }
+        .map_err(|_| target_write_timeout(target_timeout))?
+        .map_err(|error| RedisRelayError::Target(RedisRespError::Io(error)))?;
 
         target
             .read_expected_simple_response("RESTORE", b"OK")
@@ -585,11 +538,9 @@ impl RespConnection {
                 limit: max_serialized_length,
             });
         }
-        if argument_lengths
-            .iter()
-            .enumerate()
-            .any(|(index, length)| index != 3 && *length > self.limits.max_bulk_len)
-        {
+        if argument_lengths.iter().enumerate().any(|(index, length)| {
+            index != RESTORE_SERIALIZED_VALUE_ARGUMENT_INDEX && *length > self.limits.max_bulk_len
+        }) {
             return Err(RedisRespError::LimitExceeded {
                 limit_name: "outbound bulk length",
                 limit: self.limits.max_bulk_len,
@@ -951,6 +902,20 @@ impl ParseBudget {
                 })?;
         Ok(())
     }
+}
+
+fn source_read_timeout(timeout: Duration) -> RedisRelayError {
+    RedisRelayError::Source(RedisRespError::Timeout {
+        operation: "read",
+        timeout,
+    })
+}
+
+fn target_write_timeout(timeout: Duration) -> RedisRelayError {
+    RedisRelayError::Target(RedisRespError::Timeout {
+        operation: "write",
+        timeout,
+    })
 }
 
 fn tls_connector() -> TlsConnector {

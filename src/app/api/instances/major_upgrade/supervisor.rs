@@ -2,6 +2,8 @@ use super::rollback::upgrade_temp_instance_id;
 use super::*;
 use futures::FutureExt;
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 pub(in crate::api::instances) async fn run_upgrade_supervisor(
     state: AppState,
     operation: tokio::sync::OwnedMutexGuard<()>,
@@ -66,34 +68,7 @@ fn spawn_upgrade_supervisor(
         let result = match result {
             Ok(result) => result,
             Err(_) => {
-                let quarantine_metadata = state
-                    .manager
-                    .get_persisted(&recovery_instance_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .or(state.instances.get(&recovery_instance_id).await)
-                    .unwrap_or(recovery_metadata);
-                let quarantine = quarantine_image_update(
-                    &state,
-                    &quarantine_metadata,
-                    "major-upgrade worker panicked while runtime or volume state may be uncertain",
-                )
-                .await;
-                tracing::error!(
-                    instance_id = %recovery_instance_id,
-                    protocol = %quarantine_metadata.protocol,
-                    quarantine_complete = quarantine.is_ok(),
-                    "major-upgrade worker panicked; the target was fenced and quarantined"
-                );
-                Err(fail_image_update_runtime(
-                    &state,
-                    &recovery_instance_id,
-                    format!(
-                        "the major-upgrade worker stopped unexpectedly; {}",
-                        image_quarantine_summary(&quarantine)
-                    ),
-                ))
+                Err(quarantine_after_panic(&state, &recovery_instance_id, recovery_metadata).await)
             }
         };
 
@@ -102,6 +77,41 @@ fn spawn_upgrade_supervisor(
         drop(admission);
         result
     })
+}
+
+async fn quarantine_after_panic(
+    state: &AppState,
+    instance_id: &str,
+    fallback_metadata: InstanceMetadata,
+) -> ApiError {
+    let quarantine_metadata = state
+        .manager
+        .get_persisted(instance_id)
+        .await
+        .ok()
+        .flatten()
+        .or(state.instances.get(instance_id).await)
+        .unwrap_or(fallback_metadata);
+    let quarantine = quarantine_image_update(
+        state,
+        &quarantine_metadata,
+        "major-upgrade worker panicked while runtime or volume state may be uncertain",
+    )
+    .await;
+    tracing::error!(
+        %instance_id,
+        protocol = %quarantine_metadata.protocol,
+        quarantine_complete = quarantine.is_ok(),
+        "major-upgrade worker panicked; the target was fenced and quarantined"
+    );
+    fail_image_update_runtime(
+        state,
+        instance_id,
+        format!(
+            "the major-upgrade worker stopped unexpectedly; {}",
+            image_quarantine_summary(&quarantine)
+        ),
+    )
 }
 
 pub(in crate::api::instances) fn spawn_upgrade_task<F, T>(future: F) -> tokio::task::JoinHandle<T>
@@ -125,7 +135,7 @@ async fn acquire_upgrade_resources(
     let staged_capacity_bytes = metadata
         .limits
         .disk_mib
-        .checked_mul(1024 * 1024)
+        .checked_mul(BYTES_PER_MIB)
         .filter(|bytes| *bytes > 0)
         .ok_or_else(|| {
             fail_image_update_runtime(

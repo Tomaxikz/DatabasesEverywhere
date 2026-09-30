@@ -69,19 +69,13 @@ pub(super) async fn create(
         ));
     };
     if runtime.status != EngineRuntimeStatus::Running {
-        cleanup_failed_tenant(
+        return Err(abandon_tenant(
             state,
             &runtime,
-            &request.instance_id,
-            &request.database,
-            &request.username,
-        )
-        .await;
-        return Err(fail(
-            state,
-            &request.instance_id,
+            &request,
             "the selected shared runtime stopped accepting tenants",
-        ));
+        )
+        .await);
     }
 
     if let Err(error) =
@@ -110,19 +104,13 @@ pub(super) async fn create(
     )
     .await
     {
-        cleanup_failed_tenant(
+        return Err(abandon_tenant(
             state,
             &runtime,
-            &request.instance_id,
-            &request.database,
-            &request.username,
-        )
-        .await;
-        return Err(fail(
-            state,
-            &request.instance_id,
+            &request,
             format!("shared tenant storage preparation failed: {error}"),
-        ));
+        )
+        .await);
     }
     if let Err(error) = tenant::create(
         &state.docker,
@@ -133,15 +121,7 @@ pub(super) async fn create(
     )
     .await
     {
-        cleanup_failed_tenant(
-            state,
-            &runtime,
-            &request.instance_id,
-            &request.database,
-            &request.username,
-        )
-        .await;
-        return Err(fail(state, &request.instance_id, error));
+        return Err(abandon_tenant(state, &runtime, &request, error).await);
     }
     let disk = match tenant::disk::set_limit(
         &state.config,
@@ -154,19 +134,13 @@ pub(super) async fn create(
     {
         Ok(disk) => disk,
         Err(error) => {
-            cleanup_failed_tenant(
+            return Err(abandon_tenant(
                 state,
                 &runtime,
-                &request.instance_id,
-                &request.database,
-                &request.username,
-            )
-            .await;
-            return Err(fail(
-                state,
-                &request.instance_id,
+                &request,
                 format!("shared tenant disk limit failed: {error}"),
-            ));
+            )
+            .await);
         }
     };
     tenant_limits.disk_enforced = disk.enforced;
@@ -176,19 +150,13 @@ pub(super) async fn create(
         .mark_provisioned(&request.instance_id)
         .await
     {
-        cleanup_failed_tenant(
+        return Err(abandon_tenant(
             state,
             &runtime,
-            &request.instance_id,
-            &request.database,
-            &request.username,
-        )
-        .await;
-        return Err(fail(
-            state,
-            &request.instance_id,
+            &request,
             format!("failed to persist shared tenant provisioning: {error}"),
-        ));
+        )
+        .await);
     }
 
     let metadata = build_shared_metadata(state, &request, &runtime, tenant_limits, &runtime.image);
@@ -205,19 +173,13 @@ pub(super) async fn create(
                 );
             }
             Ok(None) => {
-                cleanup_failed_tenant(
+                return Err(abandon_tenant(
                     state,
                     &runtime,
-                    &metadata.instance_id,
-                    &metadata.database.name,
-                    &metadata.database.username,
-                )
-                .await;
-                return Err(fail(
-                    state,
-                    &metadata.instance_id,
+                    &request,
                     format!("failed to persist shared tenant metadata: {error}"),
-                ));
+                )
+                .await);
             }
             persisted => {
                 let containment = crate::api::instances::containment::contain_locked(
@@ -232,11 +194,7 @@ pub(super) async fn create(
                     &metadata.instance_id,
                     format!(
                         "shared tenant metadata commit became ambiguous after {error}; durable state: {}; pool containment: {}",
-                        match persisted {
-                            Ok(Some(_)) => "unexpected",
-                            Ok(None) => "missing",
-                            Err(_) => "unreadable",
-                        },
+                        describe_durable_state(&persisted),
                         containment.summary(),
                     ),
                 ));
@@ -311,6 +269,31 @@ pub(super) async fn create(
     Ok(metadata)
 }
 
+async fn abandon_tenant(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    request: &CreateInstanceRequest,
+    error: impl std::fmt::Display,
+) -> ApiError {
+    cleanup_failed_tenant(
+        state,
+        runtime,
+        &request.instance_id,
+        &request.database,
+        &request.username,
+    )
+    .await;
+    fail(state, &request.instance_id, error)
+}
+
+fn describe_durable_state<T, E>(persisted: &Result<Option<T>, E>) -> &'static str {
+    match persisted {
+        Ok(Some(_)) => "unexpected",
+        Ok(None) => "missing",
+        Err(_) => "unreadable",
+    }
+}
+
 pub(crate) async fn claim_runtime(
     state: &AppState,
     request: &CreateInstanceRequest,
@@ -325,54 +308,66 @@ pub(crate) async fn claim_runtime(
         .pool_id
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("shared deployment requires pool_id".into()))?;
-    if let Some(candidate) = state
+    let Some(candidate) = state
         .placements
         .get(pool_id)
         .await
         .map_err(placement_error)?
-    {
-        let operation = state.instance_locks.lock(&candidate.runtime_id).await;
-        let runtime = state.placements.get(&candidate.runtime_id).await.map_err(placement_error)?
-            .ok_or_else(|| ApiError::Conflict("shared_pool_unavailable: the server pool disappeared; retry after reconciliation".into()))?;
-        if runtime.owner.as_ref() != Some(owner) || runtime.protocol != request.protocol {
-            return Err(ApiError::Conflict(
-                "shared_pool_owner_mismatch: pool ownership does not match".into(),
-            ));
-        }
-        if runtime.deployment_mode != DeploymentMode::Shared
-            || runtime.pending_image.is_some()
-            || runtime.desired_state != DesiredInstanceState::Running
-            || runtime.status != EngineRuntimeStatus::Running
-        {
-            return Err(ApiError::Conflict("shared_pool_unavailable: the server pool is not running; repair or start it before adding databases".into()));
-        }
-        if request.image.is_some() && runtime.image != image {
-            return Err(ApiError::Conflict("shared_pool_image_mismatch: use the existing pool image or migrate/upgrade it explicitly".into()));
-        }
-        tenant_limits.cpu_cores = runtime.limits.cpu_cores;
-        tenant_limits.memory_mib = runtime.limits.memory_mib;
-        state
-            .placements
-            .check_tenant_identity(&runtime.runtime_id, &request.database, &request.username)
-            .await
-            .map_err(placement_error)?;
-        let runtime = state
-            .placements
-            .reserve(ReserveTenant {
-                owner: owner.clone(),
-                instance_id: &request.instance_id,
-                runtime_id: &runtime.runtime_id,
-                database: &request.database,
-                username: &request.username,
-                limits: tenant_limits,
-            })
-            .await
-            .map_err(placement_error)?;
-        return Ok((runtime, operation));
+    else {
+        return Err(ApiError::Conflict(
+            "shared_pool_missing: create the selected pool before adding databases".into(),
+        ));
+    };
+    let operation = state.instance_locks.lock(&candidate.runtime_id).await;
+    let runtime = state
+        .placements
+        .get(&candidate.runtime_id)
+        .await
+        .map_err(placement_error)?
+        .ok_or_else(|| {
+            ApiError::Conflict(
+                "shared_pool_unavailable: the server pool disappeared; retry after reconciliation"
+                    .into(),
+            )
+        })?;
+    if runtime.owner.as_ref() != Some(owner) || runtime.protocol != request.protocol {
+        return Err(ApiError::Conflict(
+            "shared_pool_owner_mismatch: pool ownership does not match".into(),
+        ));
     }
-    Err(ApiError::Conflict(
-        "shared_pool_missing: create the selected pool before adding databases".into(),
-    ))
+    if !accepts_new_tenants(&runtime) {
+        return Err(ApiError::Conflict("shared_pool_unavailable: the server pool is not running; repair or start it before adding databases".into()));
+    }
+    if request.image.is_some() && runtime.image != image {
+        return Err(ApiError::Conflict("shared_pool_image_mismatch: use the existing pool image or migrate/upgrade it explicitly".into()));
+    }
+    tenant_limits.cpu_cores = runtime.limits.cpu_cores;
+    tenant_limits.memory_mib = runtime.limits.memory_mib;
+    state
+        .placements
+        .check_tenant_identity(&runtime.runtime_id, &request.database, &request.username)
+        .await
+        .map_err(placement_error)?;
+    let reserved_runtime = state
+        .placements
+        .reserve(ReserveTenant {
+            owner: owner.clone(),
+            instance_id: &request.instance_id,
+            runtime_id: &runtime.runtime_id,
+            database: &request.database,
+            username: &request.username,
+            limits: tenant_limits,
+        })
+        .await
+        .map_err(placement_error)?;
+    Ok((reserved_runtime, operation))
+}
+
+fn accepts_new_tenants(runtime: &EngineRuntime) -> bool {
+    runtime.deployment_mode == DeploymentMode::Shared
+        && runtime.pending_image.is_none()
+        && runtime.desired_state == DesiredInstanceState::Running
+        && runtime.status == EngineRuntimeStatus::Running
 }
 
 pub(crate) fn build_shared_metadata(
@@ -566,7 +561,9 @@ async fn release_claim(state: &AppState, runtime: &EngineRuntime, instance_id: &
             let containment = crate::api::instances::containment::contain_locked(
                 state,
                 runtime,
-                "failed tenant creation released capacity but its shared runtime could not be reloaded", Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain))
+                "failed tenant creation released capacity but its shared runtime could not be reloaded",
+                Some(crate::storage::quarantine::QuarantineKind::MetadataUncertain),
+            )
             .await;
             tracing::error!(
                 event = "audit shared_runtime_limit_cleanup_failed",

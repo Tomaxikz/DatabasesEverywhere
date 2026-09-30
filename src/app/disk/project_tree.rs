@@ -1,6 +1,24 @@
 use std::path::Path;
 
-use super::DiskLimitError;
+use super::{
+    DiskLimitError,
+    project_id::{ProjectIdClaim, ProjectIdState},
+    real_directory_exists,
+};
+
+pub(super) async fn release_claimed_tree(
+    root: &Path,
+    claim: ProjectIdClaim,
+) -> Result<(), DiskLimitError> {
+    if !real_directory_exists(root)? {
+        return Ok(());
+    }
+    match claim.state {
+        ProjectIdState::Pending => rollback_pending(root, claim.id).await,
+        ProjectIdState::Active => clear(root, claim.id).await,
+        ProjectIdState::Released => unreachable!("released claims return above"),
+    }
+}
 
 pub(super) async fn assign(root: &Path, project_id: u32) -> Result<(), DiskLimitError> {
     run(root, project_id, ProjectAction::Assign).await
@@ -18,21 +36,20 @@ pub(super) async fn rollback_pending(root: &Path, project_id: u32) -> Result<(),
 }
 
 pub(super) async fn verify_root(root: &Path, project_id: u32) -> Result<(), DiskLimitError> {
-    let root = root.to_path_buf();
-    let display_root = root.display().to_string();
-    tokio::task::spawn_blocking(move || platform::verify_root(&root, project_id))
-        .await
-        .map_err(|error| DiskLimitError::Task(error.to_string()))?
-        .map_err(|source| DiskLimitError::PathIo {
-            path: display_root,
-            source,
-        })
+    run_blocking(root, move |root| platform::verify_root(root, project_id)).await
 }
 
 async fn run(root: &Path, project_id: u32, action: ProjectAction) -> Result<(), DiskLimitError> {
+    run_blocking(root, move |root| platform::set(root, project_id, action)).await
+}
+
+async fn run_blocking(
+    root: &Path,
+    operation: impl FnOnce(&Path) -> Result<(), std::io::Error> + Send + 'static,
+) -> Result<(), DiskLimitError> {
     let root = root.to_path_buf();
     let display_root = root.display().to_string();
-    tokio::task::spawn_blocking(move || platform::set(&root, project_id, action))
+    tokio::task::spawn_blocking(move || operation(&root))
         .await
         .map_err(|error| DiskLimitError::Task(error.to_string()))?
         .map_err(|source| DiskLimitError::PathIo {
@@ -68,6 +85,7 @@ mod platform {
 
     const MAX_DEPTH: usize = 128;
     const MAX_RECONCILE_PASSES: usize = 8;
+    const DIRECTORY_BUFFER_BYTES: usize = 16 * 1024;
     const FS_XFLAG_PROJINHERIT: u32 = 0x0000_0200;
     const FS_IOC_FSGETXATTR: rustix::ioctl::Opcode = opcode::read::<Fsxattr>(b'X', 31);
     const FS_IOC_FSSETXATTR: rustix::ioctl::Opcode = opcode::write::<Fsxattr>(b'X', 32);
@@ -315,18 +333,15 @@ mod platform {
         let root_stat = fstat(&root_fd)
             .map_err(std::io::Error::from)
             .map_err(|source| at(root, source))?;
-        let root_identity = (root_stat.st_dev as u64, root_stat.st_ino as u64);
-        let mut seen_directories = HashSet::new();
-        let mut stable = true;
-        walk_node(
-            &root_fd,
-            root,
-            root_stat.st_dev as u64,
-            0,
-            &mut seen_directories,
-            &mut stable,
+        let root_identity = file_identity(&root_stat);
+        let mut walk = TreeWalk {
+            root_device: root_stat.st_dev as u64,
+            seen_directories: HashSet::new(),
+            stable: true,
             visitor,
-        )?;
+        };
+        walk.walk_node(&root_fd, root, 0)?;
+        let mut stable = walk.stable;
 
         // Reopen only to validate that the caller's root name still selects
         // the pinned inode. No mutation is ever performed through this second
@@ -334,7 +349,7 @@ mod platform {
         match open_root(root) {
             Ok(current) => {
                 let stat = fstat(current).map_err(std::io::Error::from)?;
-                stable &= (stat.st_dev as u64, stat.st_ino as u64) == root_identity;
+                stable &= file_identity(&stat) == root_identity;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => stable = false,
             Err(error) => return Err(error),
@@ -392,92 +407,101 @@ mod platform {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk_node(
-        fd: &OwnedFd,
-        path: &Path,
+    #[allow(clippy::unnecessary_cast)]
+    fn file_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+        (stat.st_dev as u64, stat.st_ino as u64)
+    }
+
+    struct TreeWalk<'a, V> {
         root_device: u64,
-        depth: usize,
-        seen_directories: &mut HashSet<(u64, u64)>,
-        stable: &mut bool,
-        visitor: &mut impl Visitor,
-    ) -> Result<(), std::io::Error> {
-        if depth > MAX_DEPTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("project quota tree exceeds {MAX_DEPTH} directory levels"),
-            ));
-        }
-        let stat = fstat(fd)
-            .map_err(std::io::Error::from)
-            .map_err(|source| at(path, source))?;
-        if stat.st_dev as u64 != root_device {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "project quota tree crosses a filesystem boundary at {}",
-                    path.display()
-                ),
-            ));
+        seen_directories: HashSet<(u64, u64)>,
+        stable: bool,
+        visitor: &'a mut V,
+    }
+
+    impl<V: Visitor> TreeWalk<'_, V> {
+        fn walk_node(
+            &mut self,
+            fd: &OwnedFd,
+            path: &Path,
+            depth: usize,
+        ) -> Result<(), std::io::Error> {
+            if depth > MAX_DEPTH {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("project quota tree exceeds {MAX_DEPTH} directory levels"),
+                ));
+            }
+            let stat = fstat(fd)
+                .map_err(std::io::Error::from)
+                .map_err(|source| at(path, source))?;
+            if stat.st_dev as u64 != self.root_device {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "project quota tree crosses a filesystem boundary at {}",
+                        path.display()
+                    ),
+                ));
+            }
+
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => {
+                    if !self.seen_directories.insert(file_identity(&stat)) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "project quota tree contains a repeated directory at {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    self.walk_directory(fd, path, depth)
+                }
+                FileType::RegularFile => self
+                    .visitor
+                    .enter(fd.as_fd(), path, false)
+                    .map_err(|source| at(path, source)),
+                FileType::Symlink => Err(invalid_entry(path, "a symbolic link")),
+                _ => Err(invalid_entry(path, "a special file")),
+            }
         }
 
-        match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Directory => {
-                if !seen_directories.insert((stat.st_dev as u64, stat.st_ino as u64)) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "project quota tree contains a repeated directory at {}",
-                            path.display()
-                        ),
-                    ));
-                }
-                visitor
-                    .enter(fd.as_fd(), path, true)
+        fn walk_directory(
+            &mut self,
+            fd: &OwnedFd,
+            path: &Path,
+            depth: usize,
+        ) -> Result<(), std::io::Error> {
+            self.visitor
+                .enter(fd.as_fd(), path, true)
+                .map_err(|source| at(path, source))?;
+            let mut buffer = Vec::with_capacity(DIRECTORY_BUFFER_BYTES);
+            let mut entries = RawDir::new(fd, buffer.spare_capacity_mut());
+            while let Some(entry) = entries.next() {
+                let entry = entry
+                    .map_err(std::io::Error::from)
                     .map_err(|source| at(path, source))?;
-                let mut buffer = Vec::with_capacity(16 * 1024);
-                let mut entries = RawDir::new(fd, buffer.spare_capacity_mut());
-                while let Some(entry) = entries.next() {
-                    let entry = entry
-                        .map_err(std::io::Error::from)
-                        .map_err(|source| at(path, source))?;
-                    let name = entry.file_name().to_owned();
-                    if matches!(name.to_bytes(), b"." | b"..") {
-                        continue;
-                    }
-                    let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
-                    let Some(child) = open_child(fd, &name, &child_path)? else {
-                        *stable = false;
-                        continue;
-                    };
-                    let child_stat = fstat(&child)
-                        .map_err(std::io::Error::from)
-                        .map_err(|source| at(&child_path, source))?;
-                    let child_identity = (child_stat.st_dev as u64, child_stat.st_ino as u64);
-                    walk_node(
-                        &child,
-                        &child_path,
-                        root_device,
-                        depth + 1,
-                        seen_directories,
-                        stable,
-                        visitor,
-                    )?;
-                    *stable &= entry_still_names(fd, &name, child_identity, &child_path)?;
+                let name = entry.file_name().to_owned();
+                if matches!(name.to_bytes(), b"." | b"..") {
+                    continue;
                 }
-                visitor
-                    .leave_directory(fd.as_fd(), path)
-                    .map_err(|source| at(path, source))?;
+                let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
+                let Some(child) = open_child(fd, &name, &child_path)? else {
+                    self.stable = false;
+                    continue;
+                };
+                let child_stat = fstat(&child)
+                    .map_err(std::io::Error::from)
+                    .map_err(|source| at(&child_path, source))?;
+                let child_identity = file_identity(&child_stat);
+                self.walk_node(&child, &child_path, depth + 1)?;
+                self.stable &= entry_still_names(fd, &name, child_identity, &child_path)?;
             }
-            FileType::RegularFile => visitor
-                .enter(fd.as_fd(), path, false)
-                .map_err(|source| at(path, source))?,
-            FileType::Symlink => {
-                return Err(invalid_entry(path, "a symbolic link"));
-            }
-            _ => return Err(invalid_entry(path, "a special file")),
+            self.visitor
+                .leave_directory(fd.as_fd(), path)
+                .map_err(|source| at(path, source))
         }
-        Ok(())
     }
 
     fn open_child(

@@ -6,6 +6,7 @@ pub(super) const INSTALL_PATH: &str = "/usr/local/bin/dbev";
 const MEMORY_OVERCOMMIT_SYSCTL_PATH: &str = "/etc/sysctl.d/99-dbev-memory.conf";
 const MEMORY_OVERCOMMIT_PROC_PATH: &str = "/proc/sys/vm/overcommit_memory";
 const SERVICE_UNIT: &str = "databases-everywhere.service";
+const ROOTFUL_PODMAN_SOCKET: &str = "/run/podman/podman.sock";
 
 pub(crate) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     require_root()?;
@@ -118,13 +119,17 @@ fn rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {
         .and_then(crate::runtime::docker::rootless_uid_from_socket)
 }
 
+fn uses_rootful_podman_socket(config: &crate::config::DaemonConfig) -> bool {
+    config
+        .configured_socket_path()
+        .is_none_or(|socket| socket == ROOTFUL_PODMAN_SOCKET)
+}
+
 fn prepare_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
     if config.engine != DaemonEngine::Podman {
         return Ok(());
     }
-    if config.configured_socket_path().is_none()
-        || config.configured_socket_path() == Some("/run/podman/podman.sock")
-    {
+    if uses_rootful_podman_socket(config) {
         run_setup_command("systemctl", &["enable", "--now", "podman.socket"])?;
         println!("enabled rootful Podman API socket");
         return Ok(());
@@ -362,67 +367,69 @@ pub(super) fn require_root() -> anyhow::Result<()> {
 
 pub(super) fn install_current_binary(destination: &Path) -> anyhow::Result<()> {
     let current = std::env::current_exe().context("failed to resolve current executable")?;
-    if current != destination {
-        use rustix::fs::{FileType, Mode, OFlags};
-
-        let source_fd = rustix::fs::open(
-            &current,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)
-        .with_context(|| format!("failed to open current executable {}", current.display()))?;
-        let source_stat = rustix::fs::fstat(&source_fd)
-            .map_err(std::io::Error::from)
-            .with_context(|| {
-                format!("failed to inspect current executable {}", current.display())
-            })?;
-        if FileType::from_raw_mode(source_stat.st_mode) != FileType::RegularFile {
-            anyhow::bail!(
-                "current executable {} must be a real regular file",
-                current.display()
-            );
-        }
-        let mut source = fs::File::from(source_fd);
-        replace_setup_file(destination, 0o755, "installed daemon binary", |target| {
-            std::io::copy(&mut source, target).map(|_| ())
-        })
-        .with_context(|| {
-            format!(
-                "failed to install {} to {}",
-                current.display(),
-                destination.display()
-            )
-        })?;
+    if current == destination {
+        verify_binary_installed_in_place(destination)
     } else {
-        use std::os::unix::fs::MetadataExt;
-
-        validate_replace_target(destination, "installed daemon binary")?;
-        validate_setup_parent(
-            destination
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("installed daemon path has no parent"))?,
-            "installed daemon binary",
-        )?;
-        if fs::symlink_metadata(destination)?.uid() != 0 {
-            anyhow::bail!("installed daemon binary must be owned by root");
-        }
-        set_mode(destination, 0o755)?;
+        copy_executable_to(&current, destination)
     }
-    Ok(())
+}
+
+fn copy_executable_to(current: &Path, destination: &Path) -> anyhow::Result<()> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    let source_fd = rustix::fs::open(
+        current,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("failed to open current executable {}", current.display()))?;
+    let source_stat = rustix::fs::fstat(&source_fd)
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("failed to inspect current executable {}", current.display()))?;
+    if FileType::from_raw_mode(source_stat.st_mode) != FileType::RegularFile {
+        anyhow::bail!(
+            "current executable {} must be a real regular file",
+            current.display()
+        );
+    }
+    let mut source = fs::File::from(source_fd);
+    replace_setup_file(destination, 0o755, "installed daemon binary", |target| {
+        std::io::copy(&mut source, target).map(|_| ())
+    })
+    .with_context(|| {
+        format!(
+            "failed to install {} to {}",
+            current.display(),
+            destination.display()
+        )
+    })
+}
+
+fn verify_binary_installed_in_place(destination: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    validate_replace_target(destination, "installed daemon binary")?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed daemon path has no parent"))?;
+    validate_setup_parent(parent, "installed daemon binary")?;
+    if fs::symlink_metadata(destination)?.uid() != 0 {
+        anyhow::bail!("installed daemon binary must be owned by root");
+    }
+    set_mode(destination, 0o755)
 }
 
 pub(super) fn require_existing_config(config_path: &Path) -> anyhow::Result<()> {
-    if config_path.exists() {
-        load_config(config_path)
-            .with_context(|| format!("failed to load config {}", config_path.display()))?;
-        Ok(())
-    } else {
+    if !config_path.exists() {
         anyhow::bail!(
             "config {} does not exist; create it before running --setup",
             config_path.display()
-        )
+        );
     }
+    load_config(config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    Ok(())
 }
 
 pub(super) fn secure_config_file(config_path: &Path) -> anyhow::Result<()> {
@@ -490,10 +497,7 @@ pub(super) fn remove_old_sudoers() -> anyhow::Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
     }
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) => return Err(error).context("failed to inspect existing sudoers file"),
-    };
+    let contents = fs::read_to_string(path).context("failed to inspect existing sudoers file")?;
     if !contents.starts_with("# Managed by DatabasesEverywhere --setup.\n") {
         anyhow::bail!(
             "refusing to remove unmanaged sudoers file {SUDOERS_PATH}; review it manually"
@@ -535,9 +539,7 @@ pub(super) fn systemd_service_contents(
             Some(uid) => format!(
                 "After=user@{uid}.service\nRequires=user@{uid}.service\nRequiresMountsFor=/run/user/{uid}"
             ),
-            None if daemon.configured_socket_path().is_none()
-                || daemon.configured_socket_path() == Some("/run/podman/podman.sock") =>
-            {
+            None if uses_rootful_podman_socket(daemon) => {
                 "After=podman.socket\nRequires=podman.socket\nPartOf=podman.socket".to_string()
             }
             None => "After=network.target".to_string(),
@@ -707,11 +709,9 @@ pub(super) fn run_setup_command(program: &str, args: &[&str]) -> anyhow::Result<
 }
 
 pub(super) fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("failed to chmod {:o} {}", mode, path.display()))?;
-    }
-    let _ = (path, mode);
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to chmod {:o} {}", mode, path.display()))?;
     Ok(())
 }

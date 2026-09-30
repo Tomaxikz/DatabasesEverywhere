@@ -33,30 +33,30 @@ impl RedisRoute {
         consumed: usize,
         resolved_username: &str,
     ) -> Result<Vec<u8>, RedisParseError> {
-        if self
+        let has_explicit_username = self
             .username
             .as_deref()
-            .is_some_and(|username| !username.eq_ignore_ascii_case("default"))
-            || resolved_username.is_empty()
+            .is_some_and(|username| !username.eq_ignore_ascii_case("default"));
+        let resolved_username_is_invalid = resolved_username.is_empty()
             || resolved_username.as_bytes().contains(&b'\r')
-            || resolved_username.as_bytes().contains(&b'\n')
-            || consumed > original.len()
-        {
+            || resolved_username.as_bytes().contains(&b'\n');
+        if has_explicit_username || resolved_username_is_invalid || consumed > original.len() {
             return Err(RedisParseError::Unsupported);
         }
         let (mut args, parsed) = parse_resp_array(&original[..consumed])?;
         if parsed != consumed || args.is_empty() {
             return Err(RedisParseError::Unsupported);
         }
+        let username_arg = resolved_username.as_bytes().to_vec();
         if args[0].eq_ignore_ascii_case(b"AUTH") {
             match args.len() {
-                2 => args.insert(1, resolved_username.as_bytes().to_vec()),
-                3 => args[1] = resolved_username.as_bytes().to_vec(),
+                2 => args.insert(1, username_arg),
+                3 => args[1] = username_arg,
                 _ => return Err(RedisParseError::Unsupported),
             }
         } else if args[0].eq_ignore_ascii_case(b"HELLO") {
             let auth = hello_auth_index(&args)?;
-            args[auth + 1] = resolved_username.as_bytes().to_vec();
+            args[auth + 1] = username_arg;
         } else {
             return Err(RedisParseError::Unsupported);
         }
@@ -176,17 +176,19 @@ pub fn password_route_sha256(password: &[u8]) -> String {
 
 fn serialize_resp_array(args: &[Vec<u8>]) -> Vec<u8> {
     let mut output = Vec::new();
-    output.extend_from_slice(b"*");
-    output.extend_from_slice(args.len().to_string().as_bytes());
-    output.extend_from_slice(b"\r\n");
+    push_resp_length_line(&mut output, b'*', args.len());
     for argument in args {
-        output.extend_from_slice(b"$");
-        output.extend_from_slice(argument.len().to_string().as_bytes());
-        output.extend_from_slice(b"\r\n");
+        push_resp_length_line(&mut output, b'$', argument.len());
         output.extend_from_slice(argument);
         output.extend_from_slice(b"\r\n");
     }
     output
+}
+
+fn push_resp_length_line(output: &mut Vec<u8>, marker: u8, len: usize) {
+    output.push(marker);
+    output.extend_from_slice(len.to_string().as_bytes());
+    output.extend_from_slice(b"\r\n");
 }
 
 fn parse_resp_array(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, usize), RedisParseError> {

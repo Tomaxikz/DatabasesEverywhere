@@ -1,9 +1,6 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
 };
 
 use super::{
@@ -17,6 +14,10 @@ use super::{
 const IMPORT_WORKER_QUEUED: u8 = 0;
 const IMPORT_WORKER_RUNNING: u8 = 1;
 const IMPORT_WORKER_FINISHED: u8 = 2;
+const BEGIN_RETRY_BASE_DELAY_MS: u64 = 50;
+const BEGIN_RETRY_MAX_BACKOFF_EXPONENT: u32 = 5;
+const TERMINAL_RETRY_BASE_DELAY_MS: u64 = 100;
+const TERMINAL_RETRY_MAX_BACKOFF_EXPONENT: u32 = 4;
 
 pub(super) fn spawn_export_supervisor(
     state: AppState,
@@ -246,26 +247,40 @@ async fn finish_import_setup(
     let failure = PublicDiagnostic::from_api_error("import preparation", &error).message;
     let persisted = update_job_result(state, job_id, Err(error), None).await;
     if let Some(upload_id) = upload_id {
-        if persisted {
-            super::uploads::finish_upload_import_job(
-                state,
-                instance_id,
-                upload_id,
-                job_id,
-                false,
-                Some(&failure),
-            )
-            .await;
-        } else {
-            block_uncertain_upload(
-                state,
-                instance_id,
-                upload_id,
-                job_id,
-                "import preparation failed but its terminal job status could not be recorded; the upload is blocked",
-            )
-            .await;
-        }
+        release_upload_of_unstarted_import(
+            state,
+            instance_id,
+            upload_id,
+            job_id,
+            persisted,
+            &failure,
+            "import preparation failed but its terminal job status could not be recorded; the upload is blocked",
+        )
+        .await;
+    }
+}
+
+async fn release_upload_of_unstarted_import(
+    state: &AppState,
+    instance_id: &str,
+    upload_id: &str,
+    job_id: &str,
+    terminal_status_persisted: bool,
+    failure: &str,
+    blocked_reason: &str,
+) {
+    if terminal_status_persisted {
+        super::uploads::finish_upload_import_job(
+            state,
+            instance_id,
+            upload_id,
+            job_id,
+            false,
+            Some(failure),
+        )
+        .await;
+    } else {
+        block_uncertain_upload(state, instance_id, upload_id, job_id, blocked_reason).await;
     }
 }
 
@@ -399,26 +414,16 @@ async fn recover_import_worker(
 
     if !may_have_mutated {
         if let Some(upload_id) = upload_id {
-            if terminal_persisted {
-                super::uploads::finish_upload_import_job(
-                    state,
-                    instance_id,
-                    upload_id,
-                    job_id,
-                    false,
-                    Some("the import worker stopped before the import began"),
-                )
-                .await;
-            } else {
-                block_uncertain_upload(
-                    state,
-                    instance_id,
-                    upload_id,
-                    job_id,
-                    "the import worker stopped before the import began but its terminal job status could not be recorded; the upload is blocked",
-                )
-                .await;
-            }
+            release_upload_of_unstarted_import(
+                state,
+                instance_id,
+                upload_id,
+                job_id,
+                terminal_persisted,
+                "the import worker stopped before the import began",
+                "the import worker stopped before the import began but its terminal job status could not be recorded; the upload is blocked",
+            )
+            .await;
         }
         return;
     }
@@ -535,23 +540,7 @@ async fn begin_import_export_job(state: &AppState, job_id: &str) -> JobBeginOutc
     let mut attempt = 0_u32;
     loop {
         if !state.import_export_jobs.is_accepting() {
-            let diagnostic = PublicDiagnostic::public(
-                "shutdown",
-                "daemon shutdown began before the queued job started",
-            );
-            return if save_terminal_job_status(
-                state,
-                job_id,
-                ImportExportStatus::Failed,
-                None,
-                Some(diagnostic.to_storage_string()),
-            )
-            .await
-            {
-                JobBeginOutcome::Closed
-            } else {
-                JobBeginOutcome::Uncertain
-            };
+            return close_job_for_shutdown(state, job_id).await;
         }
         match state
             .import_export_jobs
@@ -562,12 +551,34 @@ async fn begin_import_export_job(state: &AppState, job_id: &str) -> JobBeginOutc
             Err(error) => {
                 attempt = attempt.saturating_add(1);
                 tracing::warn!(%job_id, %error, attempt, "retrying durable running status before import/export execution");
-                let delay_ms = 50_u64
-                    .saturating_mul(1_u64 << attempt.saturating_sub(1).min(5))
-                    .min(1_000);
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(capped_retry_delay(
+                    BEGIN_RETRY_BASE_DELAY_MS,
+                    attempt,
+                    BEGIN_RETRY_MAX_BACKOFF_EXPONENT,
+                ))
+                .await;
             }
         }
+    }
+}
+
+async fn close_job_for_shutdown(state: &AppState, job_id: &str) -> JobBeginOutcome {
+    let diagnostic = PublicDiagnostic::public(
+        "shutdown",
+        "daemon shutdown began before the queued job started",
+    );
+    let closed = save_terminal_job_status(
+        state,
+        job_id,
+        ImportExportStatus::Failed,
+        None,
+        Some(diagnostic.to_storage_string()),
+    )
+    .await;
+    if closed {
+        JobBeginOutcome::Closed
+    } else {
+        JobBeginOutcome::Uncertain
     }
 }
 
@@ -625,10 +636,12 @@ async fn save_terminal_job_status(
                 if state.import_export_jobs.is_accepting() || attempt < SHUTDOWN_ATTEMPTS =>
             {
                 tracing::warn!(%job_id, %storage_error, attempt, "retrying terminal import/export job persistence");
-                let delay_ms = 100_u64
-                    .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
-                    .min(1_000);
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(capped_retry_delay(
+                    TERMINAL_RETRY_BASE_DELAY_MS,
+                    attempt,
+                    TERMINAL_RETRY_MAX_BACKOFF_EXPONENT,
+                ))
+                .await;
             }
             Err(storage_error) => {
                 tracing::error!(%job_id, %storage_error, attempt, "import/export operation completed but its terminal status could not be persisted");

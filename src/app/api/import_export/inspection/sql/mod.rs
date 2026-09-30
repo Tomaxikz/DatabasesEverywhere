@@ -10,7 +10,9 @@ use super::{
 mod shared;
 
 pub(crate) use shared::validate_shared_mysql_command;
-pub(super) use shared::{SharedSqlError, SharedSqlIssue, validate_shared_sql_reader};
+pub(super) use shared::{
+    SharedSqlError, SharedSqlIssue, SharedSqlReport, validate_shared_sql_reader,
+};
 
 #[derive(Debug, Clone)]
 enum SqlToken {
@@ -207,11 +209,7 @@ impl<R: Read> SqlLexer<R> {
             if byte == b'\n' {
                 break;
             }
-            if comment.len() < MAX_CAPTURED_COMMENT_BYTES {
-                comment.push(byte.to_ascii_lowercase());
-            } else {
-                truncated = true;
-            }
+            capture_comment_byte(&mut comment, byte, &mut truncated);
         }
         Ok(SqlComment {
             bytes: comment,
@@ -243,11 +241,7 @@ impl<R: Read> SqlLexer<R> {
                 }
                 continue;
             }
-            if comment.len() < MAX_CAPTURED_COMMENT_BYTES {
-                comment.push(byte.to_ascii_lowercase());
-            } else {
-                truncated = true;
-            }
+            capture_comment_byte(&mut comment, byte, &mut truncated);
         }
         Err(InspectionError::Invalid(
             "SQL dump has an unterminated comment",
@@ -365,6 +359,14 @@ impl<R: Read> SqlLexer<R> {
                 line.push(byte);
             }
         }
+    }
+}
+
+fn capture_comment_byte(comment: &mut Vec<u8>, byte: u8, truncated: &mut bool) {
+    if comment.len() < MAX_CAPTURED_COMMENT_BYTES {
+        comment.push(byte.to_ascii_lowercase());
+    } else {
+        *truncated = true;
     }
 }
 
@@ -524,10 +526,7 @@ fn parse_create_table(tokens: &[SqlToken]) -> Option<(Option<String>, String)> {
     if !take_word(tokens, &mut index, "TABLE") {
         return None;
     }
-    if take_word(tokens, &mut index, "IF") {
-        let _ = take_word(tokens, &mut index, "NOT");
-        let _ = take_word(tokens, &mut index, "EXISTS");
-    }
+    skip_if_not_exists(tokens, &mut index);
     let _ = take_word(tokens, &mut index, "ONLY");
     parse_qualified_identifier(tokens, index)
 }
@@ -561,16 +560,20 @@ fn parse_namespace(tokens: &[SqlToken]) -> Option<String> {
         if !(take_word(tokens, &mut index, "SCHEMA") || take_word(tokens, &mut index, "DATABASE")) {
             return None;
         }
-        if take_word(tokens, &mut index, "IF") {
-            let _ = take_word(tokens, &mut index, "NOT");
-            let _ = take_word(tokens, &mut index, "EXISTS");
-        }
+        skip_if_not_exists(tokens, &mut index);
         return identifier_at(tokens, index).map(str::to_string);
     }
     if take_word(tokens, &mut index, "USE") {
         return identifier_at(tokens, index).map(str::to_string);
     }
     None
+}
+
+fn skip_if_not_exists(tokens: &[SqlToken], index: &mut usize) {
+    if take_word(tokens, index, "IF") {
+        let _ = take_word(tokens, index, "NOT");
+        let _ = take_word(tokens, index, "EXISTS");
+    }
 }
 
 fn parse_qualified_identifier(

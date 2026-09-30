@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     io::{BufRead, BufReader, Read, Seek},
     path::Path,
     time::Instant,
@@ -11,7 +12,7 @@ use super::{
     MAX_SOURCE_BYTES, detect_archive_format, inspect_mongodb_wrapper,
     mongodb::MongoSharedIssue,
     open_regular_no_follow, scan_sql_source, sha256_reader,
-    sql::{SharedSqlError, SharedSqlIssue, validate_shared_sql_reader},
+    sql::{SharedSqlError, SharedSqlIssue, SharedSqlReport, validate_shared_sql_reader},
 };
 use crate::shared::protocol::Protocol;
 
@@ -135,19 +136,6 @@ fn validate_request(
             "physical data-directory restores are never allowed on a shared database engine",
         ));
     }
-    if !matches!(
-        protocol,
-        Protocol::Postgres
-            | Protocol::Mariadb
-            | Protocol::Mysql
-            | Protocol::Mongodb
-            | Protocol::Clickhouse
-    ) {
-        return Err(SharedImportPolicyError::reject(
-            SharedImportRejection::UnsupportedProtocol,
-            format!("{protocol} does not support shared-engine imports"),
-        ));
-    }
     let max_database_bytes = match protocol {
         Protocol::Postgres | Protocol::Mongodb => 63,
         Protocol::Mariadb | Protocol::Mysql => 64,
@@ -210,55 +198,26 @@ fn validate_blocking(
         }
     }
 
-    let (statements_checked, namespaces_checked, objects_checked) = if protocol == Protocol::Mongodb
-    {
+    let checked = if protocol == Protocol::Mongodb {
         let catalog = inspect_mongodb_wrapper(&mut source, detected, deadline)
             .map_err(map_inspection_error)?;
         validate_mongodb_catalog(&catalog, source_database.unwrap_or(target_database))?;
-        (0, catalog.databases, catalog.collections)
-    } else if let Some(lines) = postgres_wrapper_lines {
-        if protocol != Protocol::Postgres || detected != DumpArchiveFormat::Plain {
-            return Err(SharedImportPolicyError::reject(
-                SharedImportRejection::MalformedDump,
-                "PostgreSQL wrapper filtering requires one prepared plain SQL dump",
-            ));
+        CheckedContent {
+            statements: 0,
+            namespaces: catalog.databases,
+            objects: catalog.collections,
         }
-        source
-            .rewind()
-            .map_err(InspectionError::from)
-            .map_err(map_inspection_error)?;
-        let bounded = BoundedReader::new(&mut source, MAX_INSPECTED_BYTES, deadline);
-        let filtered = OmitLines::new(BufReader::new(bounded), lines)?;
-        let report = validate_shared_sql_reader(filtered, protocol, target_database)
-            .map_err(map_sql_error)?;
-        (report.statements_checked, report.namespaces, 0)
-    } else {
-        let mut report = None;
-        let mut validate = |reader: &mut dyn std::io::Read| {
-            let checked = validate_shared_sql_reader(reader, protocol, target_database)?;
-            if report.replace(checked).is_some() {
-                return Err(SharedSqlError::Rejected {
-                    issue: SharedSqlIssue::AmbiguousStatement,
-                    message: "archive contains multiple SQL dump payloads".to_string(),
-                });
-            }
-            Ok(())
-        };
-        scan_sql_source::<SharedSqlError, _>(
+    } else if let Some(lines) = postgres_wrapper_lines {
+        validate_postgres_wrapped_dump(
             &mut source,
             detected,
             protocol,
+            target_database,
             deadline,
-            &mut validate,
-        )
-        .map_err(map_sql_error)?;
-        let report = report.ok_or_else(|| {
-            SharedImportPolicyError::reject(
-                SharedImportRejection::MalformedDump,
-                "shared import contains no SQL dump payload",
-            )
-        })?;
-        (report.statements_checked, report.namespaces, 0)
+            lines,
+        )?
+    } else {
+        validate_sql_dump(&mut source, detected, protocol, target_database, deadline)?
     };
 
     Ok(SharedImportApproval {
@@ -267,12 +226,82 @@ fn validate_blocking(
         sha256,
         source_size_bytes: source_size,
         detected_archive_format: detected,
-        statements_checked,
-        namespaces_checked,
-        objects_checked,
+        statements_checked: checked.statements,
+        namespaces_checked: checked.namespaces,
+        objects_checked: checked.objects,
         requires_isolated_staging: true,
         restore_as_tenant: true,
     })
+}
+
+struct CheckedContent {
+    statements: usize,
+    namespaces: Vec<String>,
+    objects: usize,
+}
+
+impl From<SharedSqlReport> for CheckedContent {
+    fn from(report: SharedSqlReport) -> Self {
+        Self {
+            statements: report.statements_checked,
+            namespaces: report.namespaces,
+            objects: 0,
+        }
+    }
+}
+
+fn validate_postgres_wrapped_dump(
+    source: &mut File,
+    detected: DumpArchiveFormat,
+    protocol: Protocol,
+    target_database: &str,
+    deadline: Instant,
+    wrapper_lines: (u64, u64),
+) -> Result<CheckedContent, SharedImportPolicyError> {
+    if protocol != Protocol::Postgres || detected != DumpArchiveFormat::Plain {
+        return Err(SharedImportPolicyError::reject(
+            SharedImportRejection::MalformedDump,
+            "PostgreSQL wrapper filtering requires one prepared plain SQL dump",
+        ));
+    }
+    source
+        .rewind()
+        .map_err(InspectionError::from)
+        .map_err(map_inspection_error)?;
+    let bounded = BoundedReader::new(source, MAX_INSPECTED_BYTES, deadline);
+    let filtered = OmitLines::new(BufReader::new(bounded), wrapper_lines)?;
+    let report =
+        validate_shared_sql_reader(filtered, protocol, target_database).map_err(map_sql_error)?;
+    Ok(report.into())
+}
+
+fn validate_sql_dump(
+    source: &mut File,
+    detected: DumpArchiveFormat,
+    protocol: Protocol,
+    target_database: &str,
+    deadline: Instant,
+) -> Result<CheckedContent, SharedImportPolicyError> {
+    let mut report = None;
+    let mut validate = |reader: &mut dyn Read| {
+        let checked = validate_shared_sql_reader(reader, protocol, target_database)?;
+        if report.replace(checked).is_some() {
+            return Err(SharedSqlError::Rejected {
+                issue: SharedSqlIssue::AmbiguousStatement,
+                message: "archive contains multiple SQL dump payloads".to_string(),
+            });
+        }
+        Ok(())
+    };
+    scan_sql_source::<SharedSqlError, _>(source, detected, protocol, deadline, &mut validate)
+        .map_err(map_sql_error)?;
+    let report = report.ok_or_else(|| {
+        SharedImportPolicyError::reject(
+            SharedImportRejection::MalformedDump,
+            "shared import contains no SQL dump payload",
+        )
+    })?;
+    Ok(report.into())
 }
 
 struct OmitLines<R> {
@@ -402,14 +431,12 @@ fn map_inspection_error(error: InspectionError) -> SharedImportPolicyError {
             let unsafe_archive = ["archive", "path", "link", "device", "special entry"]
                 .into_iter()
                 .any(|needle| message.contains(needle));
-            SharedImportPolicyError::reject(
-                if unsafe_archive {
-                    SharedImportRejection::UnsafeArchive
-                } else {
-                    SharedImportRejection::MalformedDump
-                },
-                message,
-            )
+            let reason = if unsafe_archive {
+                SharedImportRejection::UnsafeArchive
+            } else {
+                SharedImportRejection::MalformedDump
+            };
+            SharedImportPolicyError::reject(reason, message)
         }
         InspectionError::Limit(message) => {
             SharedImportPolicyError::reject(SharedImportRejection::ResourceLimit, message)

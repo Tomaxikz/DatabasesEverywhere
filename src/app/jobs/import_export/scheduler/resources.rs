@@ -5,6 +5,8 @@ pub(super) use crate::shared::cgroup::{
     membership_path as cgroup_path, safe_relative_path as safe_cgroup_relative_path,
 };
 
+const V1_UNLIMITED_MEMORY_BYTES: u64 = 1 << 60;
+
 #[derive(Debug)]
 pub(super) struct HostResourceProvider;
 
@@ -57,16 +59,13 @@ impl<T> CgroupReading<T> {
 fn host_resource_sample() -> SchedulerResourceSample {
     let host_memory = host_available_memory_mib();
     let host_cpu = std::thread::available_parallelism().ok().map(usize::from);
-    let cgroups = match std::fs::read_to_string("/proc/self/cgroup") {
-        Ok(value) => value,
-        Err(_) => {
-            return SchedulerResourceSample {
-                available_memory_mib: None,
-                cpu_units: None,
-                memory_valid: false,
-                cpu_valid: false,
-            };
-        }
+    let Ok(cgroups) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return SchedulerResourceSample {
+            available_memory_mib: None,
+            cpu_units: None,
+            memory_valid: false,
+            cpu_valid: false,
+        };
     };
 
     resource_sample_from_cgroups(
@@ -234,12 +233,11 @@ fn read_memory_hierarchy(
             Err(_) => return CgroupReading::invalid(),
         };
         let limit_text = limit.trim();
-        if limit_text == "max"
-            || numeric_unlimited
-                && limit_text
-                    .parse::<u64>()
-                    .is_ok_and(|limit| limit >= (1_u64 << 60))
-        {
+        let is_numeric_unlimited = numeric_unlimited
+            && limit_text
+                .parse::<u64>()
+                .is_ok_and(|limit| limit >= V1_UNLIMITED_MEMORY_BYTES);
+        if limit_text == "max" || is_numeric_unlimited {
             if !stable_control_value(&limit_path, limit_text) {
                 return CgroupReading::invalid();
             }
@@ -320,7 +318,7 @@ pub(super) fn parse_cgroup_memory_available_mib(
         return None;
     }
     let limit = limit.trim().parse::<u64>().ok()?;
-    if numeric_unlimited && limit >= (1_u64 << 60) {
+    if numeric_unlimited && limit >= V1_UNLIMITED_MEMORY_BYTES {
         return None;
     }
     let usage = usage.trim().parse::<u64>().ok()?;

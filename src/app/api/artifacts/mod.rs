@@ -56,6 +56,7 @@ const MAX_CONSUMED_DOWNLOAD_TICKETS: usize = 16_384;
 const MAX_ACTIVE_DOWNLOADS: usize = 128;
 const MAX_ACTIVE_DOWNLOADS_PER_PEER: usize = 32;
 const DOWNLOAD_STREAM_BUFFER_BYTES: usize = 128 * 1024;
+const HASH_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadKind {
@@ -526,38 +527,24 @@ async fn download(
     peer: Option<SocketAddr>,
 ) -> Result<Response, ApiError> {
     let claims = validate_download_token(state, token)?;
-    if claims.kind != kind.as_str()
-        || claims.instance_id != instance_id
-        || claims.artifact != artifact_id
-    {
+    if !claims.matches_request(kind, instance_id, artifact_id) {
         return Err(ApiError::Unauthorized);
     }
     let permit = state.artifact_downloads.admit_download(peer)?;
-    if claims.single_use
-        && !state
+    if claims.single_use {
+        let first_use = state
             .artifact_downloads
             .consume(&claims.jti, claims.exp)
-            .await
-    {
-        return Err(ApiError::Unauthorized);
+            .await;
+        if !first_use {
+            return Err(ApiError::Unauthorized);
+        }
     }
-    let (path, cleanup, backup) = match kind {
-        DownloadKind::Artifact => {
-            let artifact =
-                downloadable_artifact_path(state, &claims.artifact, &claims.instance_id).await?;
-            let cleanup = artifact.one_use.then(|| artifact.path.clone());
-            (artifact.path, cleanup, None)
-        }
-        DownloadKind::Backup => {
-            let backup = crate::api::backups::prepare_backup_download(
-                state,
-                &claims.instance_id,
-                &claims.artifact,
-            )
-            .await?;
-            (backup.path.clone(), None, Some(backup))
-        }
-    };
+    let DownloadSource {
+        path,
+        cleanup,
+        backup,
+    } = resolve_download_source(state, &claims, kind).await?;
     let file = match File::open(&path).await {
         Ok(file) => file,
         Err(error) => {
@@ -598,6 +585,52 @@ async fn download(
         body,
     )
         .into_response())
+}
+
+struct DownloadSource {
+    path: PathBuf,
+    cleanup: Option<PathBuf>,
+    backup: Option<crate::backups::MaterializedBackup>,
+}
+
+async fn resolve_download_source(
+    state: &AppState,
+    claims: &DownloadClaims,
+    kind: DownloadKind,
+) -> Result<DownloadSource, ApiError> {
+    match kind {
+        DownloadKind::Artifact => {
+            let artifact =
+                downloadable_artifact_path(state, &claims.artifact, &claims.instance_id).await?;
+            let cleanup = artifact.one_use.then(|| artifact.path.clone());
+            Ok(DownloadSource {
+                path: artifact.path,
+                cleanup,
+                backup: None,
+            })
+        }
+        DownloadKind::Backup => {
+            let backup = crate::api::backups::prepare_backup_download(
+                state,
+                &claims.instance_id,
+                &claims.artifact,
+            )
+            .await?;
+            Ok(DownloadSource {
+                path: backup.path.clone(),
+                cleanup: None,
+                backup: Some(backup),
+            })
+        }
+    }
+}
+
+impl DownloadClaims {
+    fn matches_request(&self, kind: DownloadKind, instance_id: &str, artifact_id: &str) -> bool {
+        self.kind == kind.as_str()
+            && self.instance_id == instance_id
+            && self.artifact == artifact_id
+    }
 }
 
 fn validate_download_token(state: &AppState, token: &str) -> Result<DownloadClaims, ApiError> {
@@ -803,25 +836,27 @@ async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
 
     let hash = tokio::task::spawn_blocking({
         let path = path.clone();
-        move || {
-            let mut file = std::fs::File::open(&path)?;
-            let mut buffer = [0_u8; 64 * 1024];
-            let mut hasher = Sha256::new();
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            Ok::<_, std::io::Error>(crate::shared::hex::encode_lower(&hasher.finalize()))
-        }
+        move || sha256_file_blocking(&path)
     })
     .await
     .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?
     .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?;
     write_checksum_sidecar(&path, &metadata, &hash).await;
     Ok(hash)
+}
+
+fn sha256_file_blocking(path: &FsPath) -> Result<String, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0_u8; HASH_READ_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::shared::hex::encode_lower(&hasher.finalize()))
 }
 
 fn checksum_sidecar_path(path: &FsPath) -> Option<PathBuf> {
@@ -883,25 +918,26 @@ async fn write_checksum_sidecar(path: &FsPath, metadata: &std::fs::Metadata, has
         "sha256 {hash}\nsize {}\nmodified_unix_nanos {modified}\n",
         metadata.len()
     );
-    if let Err(error) = tokio::task::spawn_blocking(move || {
+    let written = tokio::task::spawn_blocking(move || {
         crate::shared::files::atomic_write_private(&sidecar, content.as_bytes())
     })
     .await
     .map_err(std::io::Error::other)
-    .and_then(|result| result)
-    {
+    .and_then(|result| result);
+    if let Err(error) = written {
         tracing::debug!(%error, path = %path.display(), "failed to write checksum sidecar");
     }
 }
 
 async fn remove_checksum_sidecar(path: &FsPath) {
-    if let Some(sidecar) = checksum_sidecar_path(path) {
-        match tokio::fs::remove_file(sidecar).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::debug!(%error, path = %path.display(), "failed to delete checksum sidecar")
-            }
+    let Some(sidecar) = checksum_sidecar_path(path) else {
+        return;
+    };
+    match tokio::fs::remove_file(sidecar).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "failed to delete checksum sidecar")
         }
     }
 }

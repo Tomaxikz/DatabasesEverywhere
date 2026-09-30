@@ -16,6 +16,9 @@ use crate::{
 };
 
 pub(crate) const MAX_PASSWORD_CHARACTERS: usize = 4 * 1024;
+const MAX_IDENTIFIER_LENGTH: usize = 63;
+const MAX_DISK_MIB: u64 = u64::MAX / (1024 * 1024);
+const HEAVY_ENGINE_MIN_MIB: u64 = 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,33 +77,7 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
         ));
     }
     if request.deployment_mode == DeploymentMode::Shared {
-        let server_id = request
-            .server_id
-            .as_deref()
-            .ok_or_else(|| ApiError::BadRequest("shared deployment requires server_id".into()))?;
-        crate::placement::PoolOwner {
-            panel_id: "panel".into(),
-            server_id: server_id.into(),
-        }
-        .check()
-        .map_err(ApiError::BadRequest)?;
-        let limits = request.limits.as_ref().ok_or_else(|| {
-            ApiError::BadRequest("shared deployment requires limits.disk_mib".into())
-        })?;
-        if limits.disk_mib == 0
-            || limits.disk_mib > u64::MAX / (1024 * 1024)
-            || limits.cpu_cores != 0.0
-            || limits.memory_mib != 0
-        {
-            return Err(ApiError::BadRequest(
-                "shared limits accept only a positive disk_mib; CPU and memory belong to the pool"
-                    .into(),
-            ));
-        }
-        let pool_id = request.pool_id.as_deref().ok_or_else(|| {
-            ApiError::BadRequest("shared deployment requires pool_id; create the pool first".into())
-        })?;
-        validate_instance_id(pool_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        validate_shared_placement(request)?;
     } else if request.pool_id.is_some() {
         return Err(ApiError::BadRequest(
             "pool_id is only valid for shared deployment".into(),
@@ -120,6 +97,36 @@ pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), Ap
             })?;
         DestructiveActionPolicy::authorize("stale resource purge", confirmation)?;
     }
+    Ok(())
+}
+
+fn validate_shared_placement(request: &CreateInstanceRequest) -> Result<(), ApiError> {
+    let server_id = request
+        .server_id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("shared deployment requires server_id".into()))?;
+    crate::placement::PoolOwner {
+        panel_id: "panel".into(),
+        server_id: server_id.into(),
+    }
+    .check()
+    .map_err(ApiError::BadRequest)?;
+    let limits = request
+        .limits
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("shared deployment requires limits.disk_mib".into()))?;
+    let disk_only = limits.cpu_cores == 0.0 && limits.memory_mib == 0;
+    let disk_in_range = limits.disk_mib != 0 && limits.disk_mib <= MAX_DISK_MIB;
+    if !disk_in_range || !disk_only {
+        return Err(ApiError::BadRequest(
+            "shared limits accept only a positive disk_mib; CPU and memory belong to the pool"
+                .into(),
+        ));
+    }
+    let pool_id = request.pool_id.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("shared deployment requires pool_id; create the pool first".into())
+    })?;
+    validate_instance_id(pool_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
     Ok(())
 }
 
@@ -212,7 +219,7 @@ fn is_reserved_shared_db(protocol: Protocol, database: &str) -> bool {
 }
 
 fn validate_database_identifier(kind: &str, value: &str) -> Result<(), ApiError> {
-    if value.trim() != value || value.is_empty() || value.len() > 63 {
+    if value.trim() != value || value.is_empty() || value.len() > MAX_IDENTIFIER_LENGTH {
         return Err(ApiError::BadRequest(format!(
             "{kind} must be 1-63 characters with no surrounding whitespace"
         )));
@@ -249,29 +256,20 @@ pub fn validate_protocol_limits(
     protocol: Protocol,
     limits: &LimitsRequest,
 ) -> Result<(), ApiError> {
-    if protocol == Protocol::Mongodb {
-        if limits.memory_mib < 1024 {
-            return Err(ApiError::BadRequest(
-                "mongodb memory_mib must be at least 1024".to_string(),
-            ));
-        }
-        if limits.disk_mib < 1024 {
-            return Err(ApiError::BadRequest(
-                "mongodb disk_mib must be at least 1024".to_string(),
-            ));
-        }
+    let engine = match protocol {
+        Protocol::Mongodb => "mongodb",
+        Protocol::Clickhouse => "clickhouse",
+        _ => return Ok(()),
+    };
+    if limits.memory_mib < HEAVY_ENGINE_MIN_MIB {
+        return Err(ApiError::BadRequest(format!(
+            "{engine} memory_mib must be at least {HEAVY_ENGINE_MIN_MIB}"
+        )));
     }
-    if protocol == Protocol::Clickhouse {
-        if limits.memory_mib < 1024 {
-            return Err(ApiError::BadRequest(
-                "clickhouse memory_mib must be at least 1024".to_string(),
-            ));
-        }
-        if limits.disk_mib < 1024 {
-            return Err(ApiError::BadRequest(
-                "clickhouse disk_mib must be at least 1024".to_string(),
-            ));
-        }
+    if limits.disk_mib < HEAVY_ENGINE_MIN_MIB {
+        return Err(ApiError::BadRequest(format!(
+            "{engine} disk_mib must be at least {HEAVY_ENGINE_MIN_MIB}"
+        )));
     }
     Ok(())
 }

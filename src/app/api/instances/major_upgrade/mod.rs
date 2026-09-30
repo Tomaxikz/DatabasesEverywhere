@@ -15,7 +15,9 @@ pub(super) use rollback::{MajorUpgradeRollbackLocation, classify_upgrade_rollbac
 #[cfg(test)]
 pub(super) use staging::replacement_check_command;
 pub(super) use staging::{MajorUpgradeCommitResolution, classify_upgrade_commit};
-use staging::{commit_staged_replacement, resolve_upgrade_commit, stage_replacement};
+use staging::{
+    StagedMajorUpgrade, commit_staged_replacement, resolve_upgrade_commit, stage_replacement,
+};
 pub(super) use supervisor::run_upgrade_supervisor;
 #[cfg(test)]
 pub(super) use supervisor::spawn_upgrade_task;
@@ -180,54 +182,8 @@ async fn run_major_upgrade(
         )
         .await);
     }
-    let cutover_result: Result<(), ApiError> = async {
-        DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
-            .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
-            .purge_instance_data(&paths.data)
-            .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        commit_staged_replacement(state, &metadata, &paths, &staged, &image, &password).await?;
-        metadata.backend = backend_endpoint(state, metadata.protocol, &metadata.instance_id)?;
-        metadata.runtime.network_mode = "none".to_string();
-        harden_upgrade_target(state, &metadata, &password).await?;
-        if metadata.protocol == Protocol::Mariadb {
-            metadata.mariadb_native_password_sha1_stage2 = Some(
-                crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
-            );
-        }
-        if metadata.protocol == Protocol::Mysql {
-            metadata.mysql_native_password_sha1_stage2 = Some(
-                crate::protocols::mariadb::native_password_sha1_stage2_hex(&password),
-            );
-        }
-        metadata.tenant_password = Some(password.clone());
-        state.install_progress.stage(
-            &metadata.instance_id,
-            "compatibility",
-            "attesting migrated database engine",
-        );
-        let compatibility = crate::compatibility::probe_instance_compatibility(
-            &state.manager,
-            &state.docker,
-            &metadata,
-            true,
-        )
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "migrated database compatibility probe failed: {error}"
-            ))
-        })?;
-        if !compatibility.compatible {
-            return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
-                || "migrated database version is unsupported".to_string(),
-            )));
-        }
-        metadata.status = InstanceStatus::Running;
-        metadata.updated_at = now_rfc3339();
-        Ok(())
-    }
-    .await;
+    let cutover_result =
+        cut_over_to_replacement(state, &mut metadata, &paths, &staged, &image, &password).await;
     if let Err(error) = cutover_result {
         return Err(rollback_failed_upgrade(
             state,
@@ -241,70 +197,15 @@ async fn run_major_upgrade(
         .await);
     }
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
-        let commit_error = error.to_string();
-        match resolve_upgrade_commit(state, &previous_metadata, &metadata).await {
-            MajorUpgradeCommitResolution::Committed => {
-                // `InstanceManager` updates the route store only after the
-                // repository returns `Ok`. Rebuild that in-memory side of the
-                // commit after verifying SQLite contains the intended row.
-                state.instances.upsert(metadata.clone()).await;
-                tracing::warn!(
-                    event = "audit instance_major_upgrade_commit_ack_lost",
-                    instance_id = %metadata.instance_id,
-                    protocol = %metadata.protocol,
-                    error = %commit_error,
-                    "major-upgrade metadata was durably committed despite a failed commit acknowledgement"
-                );
-            }
-            MajorUpgradeCommitResolution::NotCommitted => {
-                let rollback_error = rollback_major_upgrade(
-                    rollback,
-                    state,
-                    &old_volume_backup,
-                    MajorUpgradeRollbackLocation::OldVolumeBackup,
-                )
-                .await
-                .err()
-                .map(|rollback_error| rollback_error.to_string());
-                let message = if let Some(rollback_error) = rollback_error {
-                    let quarantine = quarantine_image_update(
-                        state,
-                        &previous_metadata,
-                        "major-upgrade metadata was not committed and rollback failed",
-                    )
-                    .await;
-                    format!(
-                        "failed to persist major-upgrade metadata ({commit_error}); rollback also failed ({rollback_error}); {}",
-                        image_quarantine_summary(&quarantine)
-                    )
-                } else {
-                    format!(
-                        "failed to persist major-upgrade metadata ({commit_error}); durable metadata was unchanged and the old container was restored"
-                    )
-                };
-                return Err(fail_image_update_runtime(
-                    state,
-                    &metadata.instance_id,
-                    message,
-                ));
-            }
-            MajorUpgradeCommitResolution::Uncertain(reason) => {
-                let quarantine = quarantine_image_update(
-                    state,
-                    &previous_metadata,
-                    "major-upgrade metadata commit could not be classified",
-                )
-                .await;
-                return Err(fail_image_update_runtime(
-                    state,
-                    &metadata.instance_id,
-                    format!(
-                        "major-upgrade runtime cutover completed, but metadata persistence returned {commit_error} and durable commit state is uncertain ({reason}); {}; the old volume backup was retained",
-                        image_quarantine_summary(&quarantine)
-                    ),
-                ));
-            }
-        }
+        recover_upgrade_commit_failure(
+            state,
+            &previous_metadata,
+            &metadata,
+            rollback,
+            &old_volume_backup,
+            error.to_string(),
+        )
+        .await?;
     }
     state
         .instance_runtime_cache
@@ -330,20 +231,155 @@ async fn run_major_upgrade(
         image,
         recreated: true,
         strategy: ImageUpdateStrategy::MajorUpgradeMigration,
-        warnings: {
-            let mut warnings = precheck.warnings;
-            warnings.extend([
-                "major upgrade used export/import migration instead of reusing the old data volume"
-                    .to_string(),
-                "old volume backup was kept on disk for manual rollback until the admin removes it"
-                    .to_string(),
-            ]);
-            warnings
-        },
+        warnings: major_upgrade_warnings(precheck.warnings),
         export_artifact_id: export_artifact
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_string),
         old_volume_backup_retained: true,
     })
+}
+
+fn major_upgrade_warnings(precheck_warnings: Vec<String>) -> Vec<String> {
+    let mut warnings = precheck_warnings;
+    warnings.extend([
+        "major upgrade used export/import migration instead of reusing the old data volume"
+            .to_string(),
+        "old volume backup was kept on disk for manual rollback until the admin removes it"
+            .to_string(),
+    ]);
+    warnings
+}
+
+async fn cut_over_to_replacement(
+    state: &AppState,
+    metadata: &mut InstanceMetadata,
+    paths: &InstancePaths,
+    staged: &StagedMajorUpgrade,
+    image: &str,
+    password: &str,
+) -> Result<(), ApiError> {
+    DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
+        .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
+        .purge_instance_data(&paths.data)
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    commit_staged_replacement(state, metadata, paths, staged, image, password).await?;
+    metadata.backend = backend_endpoint(state, metadata.protocol, &metadata.instance_id)?;
+    metadata.runtime.network_mode = "none".to_string();
+    harden_upgrade_target(state, metadata, password).await?;
+    refresh_native_password_verifier(metadata, password);
+    metadata.tenant_password = Some(password.to_string());
+    state.install_progress.stage(
+        &metadata.instance_id,
+        "compatibility",
+        "attesting migrated database engine",
+    );
+    let compatibility = crate::compatibility::probe_instance_compatibility(
+        &state.manager,
+        &state.docker,
+        metadata,
+        true,
+    )
+    .await
+    .map_err(|error| {
+        ApiError::Runtime(format!(
+            "migrated database compatibility probe failed: {error}"
+        ))
+    })?;
+    if !compatibility.compatible {
+        return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
+            || "migrated database version is unsupported".to_string(),
+        )));
+    }
+    metadata.status = InstanceStatus::Running;
+    metadata.updated_at = now_rfc3339();
+    Ok(())
+}
+
+fn refresh_native_password_verifier(metadata: &mut InstanceMetadata, password: &str) {
+    if metadata.protocol == Protocol::Mariadb {
+        metadata.mariadb_native_password_sha1_stage2 = Some(
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+        );
+    }
+    if metadata.protocol == Protocol::Mysql {
+        metadata.mysql_native_password_sha1_stage2 = Some(
+            crate::protocols::mariadb::native_password_sha1_stage2_hex(password),
+        );
+    }
+}
+
+async fn recover_upgrade_commit_failure(
+    state: &AppState,
+    previous_metadata: &InstanceMetadata,
+    metadata: &InstanceMetadata,
+    rollback: MajorUpgradeRollback,
+    old_volume_backup: &std::path::Path,
+    commit_error: String,
+) -> Result<(), ApiError> {
+    match resolve_upgrade_commit(state, previous_metadata, metadata).await {
+        MajorUpgradeCommitResolution::Committed => {
+            // `InstanceManager` updates the route store only after the
+            // repository returns `Ok`. Rebuild that in-memory side of the
+            // commit after verifying SQLite contains the intended row.
+            state.instances.upsert(metadata.clone()).await;
+            tracing::warn!(
+                event = "audit instance_major_upgrade_commit_ack_lost",
+                instance_id = %metadata.instance_id,
+                protocol = %metadata.protocol,
+                error = %commit_error,
+                "major-upgrade metadata was durably committed despite a failed commit acknowledgement"
+            );
+            Ok(())
+        }
+        MajorUpgradeCommitResolution::NotCommitted => {
+            let rollback_error = rollback_major_upgrade(
+                rollback,
+                state,
+                old_volume_backup,
+                MajorUpgradeRollbackLocation::OldVolumeBackup,
+            )
+            .await
+            .err()
+            .map(|rollback_error| rollback_error.to_string());
+            let message = if let Some(rollback_error) = rollback_error {
+                let quarantine = quarantine_image_update(
+                    state,
+                    previous_metadata,
+                    "major-upgrade metadata was not committed and rollback failed",
+                )
+                .await;
+                format!(
+                    "failed to persist major-upgrade metadata ({commit_error}); rollback also failed ({rollback_error}); {}",
+                    image_quarantine_summary(&quarantine)
+                )
+            } else {
+                format!(
+                    "failed to persist major-upgrade metadata ({commit_error}); durable metadata was unchanged and the old container was restored"
+                )
+            };
+            Err(fail_image_update_runtime(
+                state,
+                &metadata.instance_id,
+                message,
+            ))
+        }
+        MajorUpgradeCommitResolution::Uncertain(reason) => {
+            let quarantine = quarantine_image_update(
+                state,
+                previous_metadata,
+                "major-upgrade metadata commit could not be classified",
+            )
+            .await;
+            Err(fail_image_update_runtime(
+                state,
+                &metadata.instance_id,
+                format!(
+                    "major-upgrade runtime cutover completed, but metadata persistence returned {commit_error} and durable commit state is uncertain ({reason}); {}; the old volume backup was retained",
+                    image_quarantine_summary(&quarantine)
+                ),
+            ))
+        }
+    }
 }

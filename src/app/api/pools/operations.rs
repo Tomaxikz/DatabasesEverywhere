@@ -97,26 +97,7 @@ pub(crate) async fn create(
     instances::spawn_owned_mutation_task(async move {
         let _mutation = mutation;
         let _permit = permit;
-        let result = async {
-            let mut admission = Some(state.instance_locks.lock_creation().await);
-            if state
-                .placements
-                .server_pool(pool.protocol, &pool.owner)
-                .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?
-                .is_some()
-            {
-                return Err(ApiError::Conflict(
-                    "this server already owns a pool for this engine".into(),
-                ));
-            }
-            instances::create::enforce_node_allocation_policy(&state, &pool.limits.limits(), None)
-                .await?;
-            super::provision::provision_pool(&state, &pool, &id, &mut admission).await?;
-            Ok::<_, ApiError>(())
-        }
-        .await;
-        match result {
+        match create_pool(&state, &pool, &id).await {
             Ok(()) => state
                 .install_progress
                 .complete(&id, "database pool is ready"),
@@ -134,6 +115,23 @@ pub(crate) async fn create(
         },
         status_url,
     ))
+}
+
+async fn create_pool(state: &AppState, pool: &PoolSpec, runtime_id: &str) -> Result<(), ApiError> {
+    let mut admission = Some(state.instance_locks.lock_creation().await);
+    let existing_pool = state
+        .placements
+        .server_pool(pool.protocol, &pool.owner)
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    if existing_pool.is_some() {
+        return Err(ApiError::Conflict(
+            "this server already owns a pool for this engine".into(),
+        ));
+    }
+    instances::create::enforce_node_allocation_policy(state, &pool.limits.limits(), None).await?;
+    super::provision::provision_pool(state, pool, runtime_id, &mut admission).await?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -158,12 +156,7 @@ async fn pool_status(state: &AppState, runtime_id: String) -> ApiResult<PoolStat
     let status = match super::load(state, &runtime_id).await {
         Ok(pool) => pool.status.as_str().to_string(),
         Err(ApiError::NotFound) => match progress.as_ref() {
-            Some(progress) => match progress.status {
-                InstallProgressStatus::Running => "creating",
-                InstallProgressStatus::Failed => "failed",
-                InstallProgressStatus::Completed => "running",
-            }
-            .into(),
+            Some(progress) => pool_status_from_progress(progress).into(),
             None => return Err(ApiError::NotFound),
         },
         Err(error) => return Err(error),
@@ -173,6 +166,14 @@ async fn pool_status(state: &AppState, runtime_id: String) -> ApiResult<PoolStat
         status,
         progress,
     }))
+}
+
+fn pool_status_from_progress(progress: &InstallProgress) -> &'static str {
+    match progress.status {
+        InstallProgressStatus::Running => "creating",
+        InstallProgressStatus::Failed => "failed",
+        InstallProgressStatus::Completed => "running",
+    }
 }
 
 #[derive(Deserialize)]
@@ -246,13 +247,12 @@ pub(crate) async fn delete(
     instances::spawn_owned_mutation_task(async move {
         let _guard = guard;
         super::load(&state, &runtime_id).await?;
-        if state
+        let tenant_count = state
             .placements
             .tenant_count(&runtime_id)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?
-            != 0
-        {
+            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        if tenant_count != 0 {
             return Err(ApiError::Conflict(
                 "pool is not empty; delete or migrate its databases first".into(),
             ));

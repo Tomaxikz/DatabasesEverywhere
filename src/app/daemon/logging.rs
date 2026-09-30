@@ -23,6 +23,7 @@ const LOG_ARCHIVES: usize = 4;
 const LOG_QUEUE_LINES: usize = 2048;
 const LOG_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const LOG_EVENTS_PER_SECOND: u32 = 250;
+const LOG_FILE_NAME: &str = "dbev.log";
 
 struct LogWindow {
     started: Instant,
@@ -106,7 +107,7 @@ pub(super) fn init_logging(config: &Config) -> anyhow::Result<WorkerGuard> {
         .try_init()
         .context("failed to initialize logging")?;
     tracing::info!(
-        path = %directory.join("dbev.log").display(),
+        path = %directory.join(LOG_FILE_NAME).display(),
         max_file_bytes = LOG_BYTES,
         retained_files = LOG_ARCHIVES + 1,
         write_buffer_bytes = LOG_WRITE_BUFFER_BYTES,
@@ -129,15 +130,15 @@ struct RollingLog {
 
 impl RollingLog {
     fn new(directory: &Path, max_bytes: u64) -> io::Result<Self> {
+        if max_bytes == 0 {
+            return Err(io::Error::other("log size limit must be positive"));
+        }
         let mut writer = Self {
             directory: directory.to_owned(),
             file: None,
             bytes: 0,
             max_bytes,
         };
-        if max_bytes == 0 {
-            return Err(io::Error::other("log size limit must be positive"));
-        }
         writer.check_paths()?;
         writer.open()?;
         Ok(writer)
@@ -145,9 +146,9 @@ impl RollingLog {
 
     fn path(&self, index: usize) -> PathBuf {
         self.directory.join(if index == 0 {
-            "dbev.log".to_owned()
+            LOG_FILE_NAME.to_owned()
         } else {
-            format!("dbev.log.{index}")
+            format!("{LOG_FILE_NAME}.{index}")
         })
     }
 
@@ -183,19 +184,18 @@ impl RollingLog {
         // BufWriter alone would silently ignore them and lose pending records.
         self.flush()?;
         self.file.take();
-        match fs::remove_file(self.path(LOG_ARCHIVES)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        ignore_not_found(fs::remove_file(self.path(LOG_ARCHIVES)))?;
         for index in (0..LOG_ARCHIVES).rev() {
-            match fs::rename(self.path(index), self.path(index + 1)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            ignore_not_found(fs::rename(self.path(index), self.path(index + 1)))?;
         }
         self.open()
+    }
+}
+
+fn ignore_not_found(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 

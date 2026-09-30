@@ -3,6 +3,10 @@ use std::collections::{HashMap, HashSet};
 use super::{Capabilities, CollectError, EngineTotals};
 use crate::monitoring::OperationCounts;
 
+const MICROS_PER_SECOND: u128 = 1_000_000;
+const PICOS_PER_MICRO: u128 = 1_000_000;
+const MICROSECOND_DIGITS: usize = 6;
+
 pub(crate) fn mysql_prepare_sql() -> &'static str {
     r#"SET SESSION max_execution_time = 3000;
 UPDATE performance_schema.setup_consumers
@@ -218,14 +222,18 @@ fn parse_flag(value: &str) -> Result<bool, CollectError> {
 fn parse_u64(value: &str) -> Result<u64, CollectError> {
     value
         .parse::<u128>()
-        .map(|value| value.min(u64::MAX as u128) as u64)
+        .map(saturating_u64)
         .map_err(|_| CollectError::InvalidOutput)
+}
+
+fn saturating_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }
 
 fn parse_picoseconds_micros(value: &str) -> Result<u64, CollectError> {
     value
         .parse::<u128>()
-        .map(|value| (value / 1_000_000).min(u64::MAX as u128) as u64)
+        .map(|picos| saturating_u64(picos / PICOS_PER_MICRO))
         .map_err(|_| CollectError::InvalidOutput)
 }
 
@@ -240,7 +248,7 @@ fn parse_seconds_micros(value: &str) -> Result<u64, CollectError> {
         if !seconds.is_finite() || seconds < 0.0 {
             return Err(CollectError::InvalidOutput);
         }
-        return Ok((seconds * 1_000_000.0).min(u64::MAX as f64) as u64);
+        return Ok((seconds * MICROS_PER_SECOND as f64).min(u64::MAX as f64) as u64);
     }
 
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
@@ -251,16 +259,17 @@ fn parse_seconds_micros(value: &str) -> Result<u64, CollectError> {
         return Err(CollectError::InvalidOutput);
     }
     let mut micros = 0_u128;
-    for byte in fraction.bytes().take(6) {
+    for byte in fraction.bytes().take(MICROSECOND_DIGITS) {
         micros = micros * 10 + u128::from(byte - b'0');
     }
-    for _ in fraction.len().min(6)..6 {
+    for _ in fraction.len().min(MICROSECOND_DIGITS)..MICROSECOND_DIGITS {
         micros *= 10;
     }
-    Ok(whole
-        .saturating_mul(1_000_000)
-        .saturating_add(micros)
-        .min(u64::MAX as u128) as u64)
+    Ok(saturating_u64(
+        whole
+            .saturating_mul(MICROS_PER_SECOND)
+            .saturating_add(micros),
+    ))
 }
 
 #[cfg(test)]

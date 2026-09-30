@@ -2,6 +2,8 @@ use futures::FutureExt;
 
 use super::*;
 
+const RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
 async fn lock_shared_runtime(
     state: &AppState,
     migration: &DeploymentMigration,
@@ -140,14 +142,11 @@ pub(super) async fn recover_failure(state: &AppState, migration_id: &str) -> Res
     let _shared_runtime = lock_shared_runtime(state, &migration).await?;
     if migration.cutover_committed || migration.stage.crossed_cutover() {
         if migration.stage != MigrationStage::CleanupPending {
-            migration = advance(
+            migration = advance_with_failure(
                 state,
                 migration,
                 MigrationStage::CleanupPending,
-                MigrationPatch {
-                    failure: Some(MigrationFailure::PostCutoverFailure),
-                    ..MigrationPatch::default()
-                },
+                MigrationFailure::PostCutoverFailure,
             )
             .await?;
         }
@@ -157,27 +156,21 @@ pub(super) async fn recover_failure(state: &AppState, migration_id: &str) -> Res
         migration.stage,
         MigrationStage::Requested | MigrationStage::Preflight
     ) {
-        advance(
+        advance_with_failure(
             state,
             migration,
             MigrationStage::Failed,
-            MigrationPatch {
-                failure: Some(MigrationFailure::PreflightFailed),
-                ..MigrationPatch::default()
-            },
+            MigrationFailure::PreflightFailed,
         )
         .await?;
         return Ok(());
     }
     if migration.stage != MigrationStage::RollingBack {
-        migration = advance(
+        migration = advance_with_failure(
             state,
             migration,
             MigrationStage::RollingBack,
-            MigrationPatch {
-                failure: Some(MigrationFailure::PreCutoverFailure),
-                ..MigrationPatch::default()
-            },
+            MigrationFailure::PreCutoverFailure,
         )
         .await?;
     }
@@ -244,16 +237,7 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
     } else {
         MigrationFailure::RolledBackBeforeCutover
     };
-    advance(
-        state,
-        migration,
-        MigrationStage::Failed,
-        MigrationPatch {
-            failure: Some(failure),
-            ..MigrationPatch::default()
-        },
-    )
-    .await?;
+    advance_with_failure(state, migration, MigrationStage::Failed, failure).await?;
     // Boot recovery pins routes so ordinary metadata refreshes cannot reopen
     // them. Clear that pin only after the rollback is durable and the source
     // credential was verified above.
@@ -306,16 +290,7 @@ async fn rollback_shared_target(
             .release(&temp_id)
             .await
             .map_err(runtime_error)?;
-        if let Some(updated) = state
-            .placements
-            .get(&runtime.runtime_id)
-            .await
-            .map_err(runtime_error)?
-        {
-            runtime_ops::apply_limits(&state.docker, &state.config, &state.placements, &updated)
-                .await
-                .map_err(ApiError::Runtime)?;
-        }
+        reapply_runtime_limits(state, &runtime.runtime_id).await?;
     }
     crate::api::instances::purge_shared_tenant_paths(state, &temp_id).await
 }
@@ -405,14 +380,11 @@ async fn finish_forward_cleanup(
     .await
     {
         let summary = "committed target could not be verified; source retained for manual recovery";
-        let _ = advance(
+        let _ = advance_with_failure(
             state,
             migration,
             MigrationStage::ManualIntervention,
-            MigrationPatch {
-                failure: Some(MigrationFailure::TargetVerificationFailed),
-                ..MigrationPatch::default()
-            },
+            MigrationFailure::TargetVerificationFailed,
         )
         .await;
         tracing::error!(
@@ -422,13 +394,7 @@ async fn finish_forward_cleanup(
         );
         return Err(ApiError::Runtime(summary.to_string()));
     }
-    migration = advance(
-        state,
-        migration,
-        MigrationStage::CleaningSource,
-        MigrationPatch::default(),
-    )
-    .await?;
+    migration = advance_to(state, migration, MigrationStage::CleaningSource).await?;
     if let Some(source_runtime) = state
         .placements
         .get(&migration.source_runtime_id)
@@ -443,13 +409,7 @@ async fn finish_forward_cleanup(
             }
         }
     }
-    advance(
-        state,
-        migration,
-        MigrationStage::Completed,
-        MigrationPatch::default(),
-    )
-    .await?;
+    advance_to(state, migration, MigrationStage::Completed).await?;
     // Keep a boot-pinned route closed until source retirement and the terminal
     // migration record are both durable. The target credential was verified
     // before cleanup, so it is now safe to publish.
@@ -513,16 +473,21 @@ pub(super) async fn retire_shared_source(
         .release(&reservation_id)
         .await
         .map_err(runtime_error)?;
-    if let Some(updated) = state
+    reapply_runtime_limits(state, &runtime.runtime_id).await
+}
+
+async fn reapply_runtime_limits(state: &AppState, runtime_id: &str) -> Result<(), ApiError> {
+    let Some(updated) = state
         .placements
-        .get(&runtime.runtime_id)
+        .get(runtime_id)
         .await
         .map_err(runtime_error)?
-    {
-        runtime_ops::apply_limits(&state.docker, &state.config, &state.placements, &updated)
-            .await
-            .map_err(ApiError::Runtime)?;
-    }
+    else {
+        return Ok(());
+    };
+    runtime_ops::apply_limits(&state.docker, &state.config, &state.placements, &updated)
+        .await
+        .map_err(ApiError::Runtime)?;
     Ok(())
 }
 
@@ -595,7 +560,7 @@ async fn ensure_runtime_ready(state: &AppState, runtime: &EngineRuntime) -> Resu
         .wait_until_ready(
             runtime.protocol,
             &runtime.runtime_id,
-            Duration::from_secs(180),
+            RECOVERY_READY_TIMEOUT,
         )
         .await
         .map_err(runtime_error)?;

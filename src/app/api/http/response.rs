@@ -241,26 +241,28 @@ where
     type Rejection = ApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        if !request.headers().contains_key(header::CONTENT_TYPE) {
-            let declared_body = request
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length > 0)
-                || request.headers().contains_key(header::TRANSFER_ENCODING);
-            if declared_body {
-                return Err(ApiError::from_rejection(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "expected Content-Type: application/json".to_string(),
-                ));
-            }
-            return Ok(Self(None));
+        if request.headers().contains_key(header::CONTENT_TYPE) {
+            return ApiJson::<T>::from_request(request, state)
+                .await
+                .map(|ApiJson(value)| Self(Some(value)));
         }
-        ApiJson::<T>::from_request(request, state)
-            .await
-            .map(|ApiJson(value)| Self(Some(value)))
+        if declares_body(request.headers()) {
+            return Err(ApiError::from_rejection(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected Content-Type: application/json".to_string(),
+            ));
+        }
+        Ok(Self(None))
     }
+}
+
+fn declares_body(headers: &axum::http::HeaderMap) -> bool {
+    let has_nonzero_content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > 0);
+    has_nonzero_content_length || headers.contains_key(header::TRANSFER_ENCODING)
 }
 
 /// Path and query wrappers keep all extractor failures in the same JSON envelope.

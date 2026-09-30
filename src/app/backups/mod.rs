@@ -22,6 +22,7 @@ const PHYSICAL_SUFFIX: &str = ".physical.tar.gz";
 const LOGICAL_SUFFIX: &str = ".logical.dump";
 const CATALOG_SUFFIX: &str = ".catalog.json";
 const METADATA_SUFFIX: &str = ".metadata.json";
+const HASH_BUFFER_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,14 +53,14 @@ impl StoredBackup {
         validate_instance_id(expected_instance_id)
             .map_err(|error| BackupStoreError::Corrupt(error.to_string()))?;
         validate_backup_id(&self.backup_id)?;
-        let created_at = OffsetDateTime::parse(&self.created_at, &Rfc3339);
+        let created_at_is_consistent = matches!(
+            OffsetDateTime::parse(&self.created_at, &Rfc3339),
+            Ok(created_at) if created_at.unix_timestamp() == self.created_at_unix
+        );
         if self.schema_version != BACKUP_MANIFEST_SCHEMA_VERSION
             || self.instance_id != expected_instance_id
             || !is_sha256(&self.sha256)
-            || !matches!(
-                created_at,
-                Ok(created_at) if created_at.unix_timestamp() == self.created_at_unix
-            )
+            || !created_at_is_consistent
         {
             return Err(BackupStoreError::Corrupt(format!(
                 "backup metadata for {} is invalid",
@@ -415,7 +416,7 @@ pub async fn sha256_file(path: &Path) -> Result<String, BackupStoreError> {
         use std::io::Read;
 
         let mut file = std::fs::File::open(&path)?;
-        let mut buffer = [0_u8; 128 * 1024];
+        let mut buffer = [0_u8; HASH_BUFFER_BYTES];
         let mut hasher = Sha256::new();
         loop {
             let read = file.read(&mut buffer)?;

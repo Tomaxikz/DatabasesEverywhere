@@ -185,13 +185,13 @@ impl LocalBackupDriver {
         let path = self
             .instance_root(instance_id)?
             .join(catalog_file_name(backup_id));
-        let path_for_read = path.clone();
-        match tokio::task::spawn_blocking(move || {
-            read_bounded_private_file(&path_for_read, max_bytes)
-        })
-        .await
-        .map_err(|error| BackupStoreError::Runtime(format!("catalog read task failed: {error}")))?
-        {
+        let read_result =
+            tokio::task::spawn_blocking(move || read_bounded_private_file(&path, max_bytes))
+                .await
+                .map_err(|error| {
+                    BackupStoreError::Runtime(format!("catalog read task failed: {error}"))
+                })?;
+        match read_result {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(io_error("read backup catalog", source)),

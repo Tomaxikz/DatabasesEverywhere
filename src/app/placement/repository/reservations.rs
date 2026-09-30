@@ -146,7 +146,7 @@ impl PlacementRepository {
         .await?
         .ok_or_else(|| PlacementRepositoryError::RuntimeNotFound(runtime_id.to_string()))?;
         let protocol = parse_protocol(row.try_get("protocol")?)?;
-        let tenant_disk = i64_to_u64(
+        let root_charged_tenant_disk = i64_to_u64(
             row.try_get("root_charged_disk_mib")?,
             "root_charged_disk_mib",
         )?;
@@ -156,7 +156,7 @@ impl PlacementRepository {
         let spill = crate::placement::policy::root_spill_mib(protocol, all_tenant_disk)
             .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         overhead
-            .checked_add(tenant_disk)
+            .checked_add(root_charged_tenant_disk)
             .and_then(|disk| disk.checked_add(spill))
             .ok_or_else(|| {
                 PlacementRepositoryError::InvalidReservation(

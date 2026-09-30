@@ -32,11 +32,14 @@ pub use detection::{DiskModeDetection, FilesystemInspection, detect_disk_mode};
 use host_quota::{HostQuotaChange, set_host_quota};
 use host_quota::{displayed_privileged_command, privileged_command};
 
-fn native_project_quota_fs(fstype: &str, options: &[String]) -> Option<NativeProjectQuotaFs> {
-    let enabled = options
+pub(super) fn has_project_quota_option(options: &[String]) -> bool {
+    options
         .iter()
-        .any(|option| matches!(option.as_str(), "prjquota" | "pquota"));
-    if !enabled {
+        .any(|option| matches!(option.as_str(), "prjquota" | "pquota"))
+}
+
+fn native_project_quota_fs(fstype: &str, options: &[String]) -> Option<NativeProjectQuotaFs> {
+    if !has_project_quota_option(options) {
         return None;
     }
     match fstype {
@@ -253,15 +256,7 @@ impl DiskLimiter {
     ) -> Result<DiskEnforcement, DiskLimitError> {
         match self.config.mode {
             DiskLimitMode::FuseQuota => {
-                let mount_path = fuse_quota::apply_with_root(
-                    data_path,
-                    self.fuse_root.as_deref(),
-                    disk_mib,
-                    self.config.fuse_quota_binary(),
-                    &self.config.fuse_quota_binary_sha256,
-                    self.config.fuse_quota_rescan_interval_seconds,
-                )
-                .await?;
+                let mount_path = self.apply_fuse_limit(data_path, disk_mib).await?;
                 Ok(DiskEnforcement {
                     enforced: true,
                     method: DiskLimitMode::FuseQuota.method().to_string(),
@@ -327,6 +322,14 @@ impl DiskLimiter {
         data_path: &Path,
         disk_mib: u64,
     ) -> Result<PathBuf, DiskLimitError> {
+        self.apply_fuse_limit(data_path, disk_mib).await
+    }
+
+    async fn apply_fuse_limit(
+        &self,
+        data_path: &Path,
+        disk_mib: u64,
+    ) -> Result<PathBuf, DiskLimitError> {
         fuse_quota::apply_with_root(
             data_path,
             self.fuse_root.as_deref(),
@@ -360,16 +363,9 @@ impl DiskLimiter {
         disk_mib: u64,
     ) -> Result<(), DiskLimitError> {
         match self.config.mode {
-            DiskLimitMode::FuseQuota => fuse_quota::apply_with_root(
-                data_path,
-                self.fuse_root.as_deref(),
-                disk_mib,
-                self.config.fuse_quota_binary(),
-                &self.config.fuse_quota_binary_sha256,
-                self.config.fuse_quota_rescan_interval_seconds,
-            )
-            .await
-            .map(|_| ()),
+            DiskLimitMode::FuseQuota => {
+                self.apply_fuse_limit(data_path, disk_mib).await.map(|_| ())
+            }
             DiskLimitMode::ProjectQuota => set_host_quota(
                 runtime_id,
                 data_path,
@@ -621,13 +617,12 @@ impl DiskLimiter {
     }
 
     pub async fn purge_instance_data(&self, data_path: &Path) -> Result<(), DiskLimitError> {
-        if self.config.mode == DiskLimitMode::FuseQuota {
-            return self.teardown_instance_mount(data_path).await;
+        match self.config.mode {
+            DiskLimitMode::FuseQuota => return self.teardown_instance_mount(data_path).await,
+            DiskLimitMode::SoftScanner => return Ok(()),
+            DiskLimitMode::ProjectQuota => {}
         }
-        if self.config.mode == DiskLimitMode::SoftScanner {
-            return Ok(());
-        }
-        if self.config.mode != DiskLimitMode::ProjectQuota || !data_path.exists() {
+        if !data_path.exists() {
             return Ok(());
         }
 
@@ -715,34 +710,52 @@ fn check_project_quota_restore(data_path: &Path, fstype: &str) -> Result<(), Dis
 }
 
 fn canonical_path(path: &Path) -> Result<PathBuf, DiskLimitError> {
-    path.canonicalize()
-        .map_err(|source| DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source,
-        })
+    path.canonicalize().map_err(path_io_error(path))
+}
+
+pub(super) fn path_io_error(path: &Path) -> impl FnOnce(std::io::Error) -> DiskLimitError + '_ {
+    move |source| DiskLimitError::PathIo {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn invalid_path_input(path: &Path, message: &'static str) -> DiskLimitError {
+    path_io_error(path)(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
 }
 
 pub(super) fn real_directory_exists(path: &Path) -> Result<bool, DiskLimitError> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(DiskLimitError::PathIo {
-                path: path.display().to_string(),
-                source,
-            });
-        }
+        Err(source) => return Err(path_io_error(path)(source)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "quota path must be a real directory",
-            ),
-        });
+        return Err(invalid_path_input(
+            path,
+            "quota path must be a real directory",
+        ));
     }
     Ok(true)
+}
+
+fn remove_empty_data_directory(path: &Path) -> Result<(), DiskLimitError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(path).map_err(path_io_error(path))?;
+    let has_entries = entries
+        .next()
+        .transpose()
+        .map_err(path_io_error(path))?
+        .is_some();
+    if has_entries {
+        return Err(DiskLimitError::DataPathNotEmpty(path.to_path_buf()));
+    }
+    std::fs::remove_dir(path).map_err(path_io_error(path))
 }
 
 fn require_native_project_quota(path: &Path) -> Result<NativeProjectQuota, DiskLimitError> {
@@ -783,57 +796,40 @@ fn require_native_project_quota_for_remove(
 }
 
 fn resolve_missing_path(path: &Path) -> Result<(PathBuf, PathBuf), DiskLimitError> {
+    const NO_EXISTING_ANCESTOR: &str = "missing quota path has no existing ancestor";
+
     if !path.is_absolute() {
-        return Err(DiskLimitError::PathIo {
-            path: path.display().to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "missing quota path must be absolute",
-            ),
-        });
+        return Err(invalid_path_input(
+            path,
+            "missing quota path must be absolute",
+        ));
     }
 
     let mut ancestor = path;
-    let mut suffix = Vec::<OsString>::new();
+    let mut missing_components = Vec::<OsString>::new();
     let existing_ancestor = loop {
         match ancestor.canonicalize() {
             Ok(existing) => break existing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = ancestor.file_name().ok_or_else(|| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "missing quota path has no existing ancestor",
-                    ),
-                })?;
+                let name = ancestor
+                    .file_name()
+                    .ok_or_else(|| invalid_path_input(path, NO_EXISTING_ANCESTOR))?;
                 if name == "." || name == ".." {
-                    return Err(DiskLimitError::PathIo {
-                        path: path.display().to_string(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "missing quota path must not contain dot components",
-                        ),
-                    });
+                    return Err(invalid_path_input(
+                        path,
+                        "missing quota path must not contain dot components",
+                    ));
                 }
-                suffix.push(name.to_os_string());
-                ancestor = ancestor.parent().ok_or_else(|| DiskLimitError::PathIo {
-                    path: path.display().to_string(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "missing quota path has no existing ancestor",
-                    ),
-                })?;
+                missing_components.push(name.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| invalid_path_input(path, NO_EXISTING_ANCESTOR))?;
             }
-            Err(source) => {
-                return Err(DiskLimitError::PathIo {
-                    path: ancestor.display().to_string(),
-                    source,
-                });
-            }
+            Err(source) => return Err(path_io_error(ancestor)(source)),
         }
     };
     let mut resolved_path = existing_ancestor.clone();
-    for component in suffix.into_iter().rev() {
+    for component in missing_components.into_iter().rev() {
         resolved_path.push(component);
     }
     Ok((resolved_path, existing_ancestor))

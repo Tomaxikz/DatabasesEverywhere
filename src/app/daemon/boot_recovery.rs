@@ -5,42 +5,61 @@ pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result
     futures::stream::iter(runtimes)
         .map(|runtime| async move {
             let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
-            if let Err(error) = state
+            let Err(error) = state
                 .docker
                 .disable_restarts(runtime.protocol, &runtime.runtime_id)
                 .await
-            {
-                tracing::error!(runtime_id = %runtime.runtime_id, %error,
-                    "could not disable engine restarts; stopping this container before boot recovery");
-                if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
-                    crate::placement::containment::contain_locked(
-                        state, &runtime, "engine restart policy could not be repaired", Some(crate::storage::quarantine::QuarantineKind::SecurityAttestation)).await;
-                    return;
-                }
-                if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
-                    crate::instances::sessions::fence(
-                        &state.instances, &state.gateway_supervisor.tenant_sessions(),
-                        &metadata.instance_id,
-                    ).await;
-                    metadata.status = InstanceStatus::Failed;
-                    metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-                    if let Err(error) = state.manager.upsert_fenced(metadata).await {
-                        tracing::error!(runtime_id = %runtime.runtime_id, %error,
-                            "could not persist stopped intent after restart-policy repair failed");
-                    }
-                }
-                if let Err(error) = state.docker.stop(runtime.protocol, &runtime.runtime_id).await
-                    && !error.is_not_found() && !error.is_not_running()
-                {
-                    tracing::error!(runtime_id = %runtime.runtime_id, %error,
-                        "could not stop container after restart-policy repair failed");
-                }
-            }
+            else {
+                return;
+            };
+            tracing::error!(runtime_id = %runtime.runtime_id, %error,
+                "could not disable engine restarts; stopping this container before boot recovery");
+            contain_runtime_without_restart_policy(state, &runtime).await;
         })
         .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
     Ok(())
+}
+
+async fn contain_runtime_without_restart_policy(
+    state: &AppState,
+    runtime: &crate::placement::EngineRuntime,
+) {
+    if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
+        crate::placement::containment::contain_locked(
+            state,
+            runtime,
+            "engine restart policy could not be repaired",
+            Some(crate::storage::quarantine::QuarantineKind::SecurityAttestation),
+        )
+        .await;
+        return;
+    }
+    if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
+        crate::instances::sessions::fence(
+            &state.instances,
+            &state.gateway_supervisor.tenant_sessions(),
+            &metadata.instance_id,
+        )
+        .await;
+        metadata.status = InstanceStatus::Failed;
+        metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        if let Err(error) = state.manager.upsert_fenced(metadata).await {
+            tracing::error!(runtime_id = %runtime.runtime_id, %error,
+                "could not persist stopped intent after restart-policy repair failed");
+        }
+    }
+    if let Err(error) = state
+        .docker
+        .stop(runtime.protocol, &runtime.runtime_id)
+        .await
+        && !error.is_not_found()
+        && !error.is_not_running()
+    {
+        tracing::error!(runtime_id = %runtime.runtime_id, %error,
+            "could not stop container after restart-policy repair failed");
+    }
 }
 
 async fn cleanup_old_console_logs(state: &AppState) {
@@ -51,23 +70,25 @@ async fn cleanup_old_console_logs(state: &AppState) {
             return;
         }
     };
-    for runtime in runtimes
+    let clickhouse_runtimes = runtimes
         .into_iter()
-        .filter(|runtime| runtime.protocol == Protocol::Clickhouse)
-    {
+        .filter(|runtime| runtime.protocol == Protocol::Clickhouse);
+    for runtime in clickhouse_runtimes {
         let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
         let Ok(Some(current)) = state.placements.get(&runtime.runtime_id).await else {
             continue;
         };
-        if current.status != crate::placement::EngineRuntimeStatus::Running
-            || !matches!(
-                state
-                    .docker
-                    .log_policy_is_current(current.protocol, &current.runtime_id)
-                    .await,
-                Ok(true)
-            )
-        {
+        if current.status != crate::placement::EngineRuntimeStatus::Running {
+            continue;
+        }
+        let log_policy_is_current = matches!(
+            state
+                .docker
+                .log_policy_is_current(current.protocol, &current.runtime_id)
+                .await,
+            Ok(true)
+        );
+        if !log_policy_is_current {
             continue;
         }
         let Ok(paths) = InstancePaths::new(&state.config.paths, &current.runtime_id) else {
@@ -513,14 +534,12 @@ pub(super) fn workspace_instance_id(name: &std::ffi::OsStr) -> Option<String> {
 
     let name = name.to_str()?;
     let value = name.strip_prefix(PREFIX)?;
-    if value.len() <= UUID_LENGTH
-        || value.as_bytes().get(value.len() - UUID_LENGTH - 1) != Some(&b'-')
-    {
+    let separator = value.len().checked_sub(UUID_LENGTH + 1)?;
+    if value.as_bytes().get(separator) != Some(&b'-') {
         return None;
     }
-    let split = value.len() - UUID_LENGTH - 1;
-    let instance_id = &value[..split];
-    let uuid = &value[split + 1..];
+    let instance_id = &value[..separator];
+    let uuid = &value[separator + 1..];
     let parsed = uuid::Uuid::parse_str(uuid).ok()?;
     if parsed.hyphenated().to_string() != uuid {
         return None;
@@ -566,41 +585,8 @@ pub(super) async fn quarantine_import_manifests(
     let mut quarantined = 0_usize;
     let mut seen_instances = std::collections::HashSet::new();
     for path in manifests {
-        let manifest_path = path.clone();
-        let contents = tokio::task::spawn_blocking(move || {
-            crate::shared::files::read_bounded_private_file(&manifest_path, MAX_MANIFEST_BYTES)
-        })
-        .await
-        .with_context(|| format!("failed to join recovery manifest read {}", path.display()))?
-        .with_context(|| format!("failed to read recovery manifest {}", path.display()))?;
-        let identity: RetainedImportRecoveryIdentity = serde_json::from_slice(&contents)
-            .with_context(|| format!("invalid recovery manifest {}", path.display()))?;
-        if identity.schema_version != 1
-            || !matches!(
-                identity.recovery_kind.as_str(),
-                "logical_remote_import"
-                    | "redis_remote_import"
-                    | "valkey_remote_import"
-                    | "qdrant_remote_import"
-            )
-        {
-            anyhow::bail!(
-                "unsupported recovery manifest schema or kind in {}",
-                path.display()
-            );
-        }
-        crate::shared::ids::validate_instance_id(&identity.instance_id)
-            .with_context(|| format!("unsafe instance id in {}", path.display()))?;
-        let manifest_protocol = identity
-            .protocol
-            .parse::<Protocol>()
-            .with_context(|| format!("invalid protocol in {}", path.display()))?;
-        if !recovery_matches_protocol(&identity.recovery_kind, manifest_protocol) {
-            anyhow::bail!(
-                "recovery kind and protocol do not match in {}",
-                path.display()
-            );
-        }
+        let (identity, manifest_protocol) =
+            read_recovery_identity(&path, MAX_MANIFEST_BYTES).await?;
         tracing::error!(
             event = "audit retained_import_recovery_manifest",
             path = %path.display(),
@@ -656,6 +642,47 @@ pub(super) async fn quarantine_import_manifests(
         }
     }
     Ok(quarantined)
+}
+
+async fn read_recovery_identity(
+    path: &Path,
+    max_manifest_bytes: u64,
+) -> anyhow::Result<(RetainedImportRecoveryIdentity, Protocol)> {
+    let manifest_path = path.to_path_buf();
+    let contents = tokio::task::spawn_blocking(move || {
+        crate::shared::files::read_bounded_private_file(&manifest_path, max_manifest_bytes)
+    })
+    .await
+    .with_context(|| format!("failed to join recovery manifest read {}", path.display()))?
+    .with_context(|| format!("failed to read recovery manifest {}", path.display()))?;
+    let identity: RetainedImportRecoveryIdentity = serde_json::from_slice(&contents)
+        .with_context(|| format!("invalid recovery manifest {}", path.display()))?;
+    let supported_kind = matches!(
+        identity.recovery_kind.as_str(),
+        "logical_remote_import"
+            | "redis_remote_import"
+            | "valkey_remote_import"
+            | "qdrant_remote_import"
+    );
+    if identity.schema_version != 1 || !supported_kind {
+        anyhow::bail!(
+            "unsupported recovery manifest schema or kind in {}",
+            path.display()
+        );
+    }
+    crate::shared::ids::validate_instance_id(&identity.instance_id)
+        .with_context(|| format!("unsafe instance id in {}", path.display()))?;
+    let manifest_protocol = identity
+        .protocol
+        .parse::<Protocol>()
+        .with_context(|| format!("invalid protocol in {}", path.display()))?;
+    if !recovery_matches_protocol(&identity.recovery_kind, manifest_protocol) {
+        anyhow::bail!(
+            "recovery kind and protocol do not match in {}",
+            path.display()
+        );
+    }
+    Ok((identity, manifest_protocol))
 }
 
 pub(super) async fn collect_logical_manifests(

@@ -1,5 +1,7 @@
 use super::*;
 
+const SOURCE_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub(super) async fn quiesce_upgrade_source(
     state: &AppState,
     metadata: &InstanceMetadata,
@@ -27,41 +29,11 @@ async fn verify_upgrade_source(
         .wait_until_ready(
             metadata.protocol,
             &metadata.instance_id,
-            Duration::from_secs(180),
+            SOURCE_READINESS_TIMEOUT,
         )
         .await
         .map_err(docker_error)?;
-    if metadata.protocol == Protocol::Postgres {
-        harden_postgres_instance_auth(
-            state,
-            &metadata.instance_id,
-            &metadata.database.name,
-            &metadata.database.username,
-            password,
-            metadata.postgres_admin_password.as_deref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted PostgreSQL administrator credential is missing before major-upgrade export"
-                        .to_string(),
-                )
-            })?,
-        )
-        .await?;
-    }
-    if metadata.protocol == Protocol::Mysql {
-        harden_mysql_tenant_auth(
-            state,
-            &metadata.instance_id,
-            &metadata.database.username,
-            password,
-            metadata.mysql_root_password.as_deref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted MySQL maintenance credential is missing before major-upgrade export"
-                        .to_string(),
-                )
-            })?,
-        )
-        .await?;
-    }
+    harden_upgrade_credentials(state, metadata, password, "before major-upgrade export").await?;
     let compatibility = crate::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
@@ -87,6 +59,15 @@ pub(super) async fn harden_upgrade_target(
     metadata: &InstanceMetadata,
     password: &str,
 ) -> Result<(), ApiError> {
+    harden_upgrade_credentials(state, metadata, password, "after major-upgrade cutover").await
+}
+
+async fn harden_upgrade_credentials(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    password: &str,
+    phase: &str,
+) -> Result<(), ApiError> {
     if metadata.protocol == Protocol::Postgres {
         harden_postgres_instance_auth(
             state,
@@ -95,10 +76,9 @@ pub(super) async fn harden_upgrade_target(
             &metadata.database.username,
             password,
             metadata.postgres_admin_password.as_deref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted PostgreSQL administrator credential is missing after major-upgrade cutover"
-                        .to_string(),
-                )
+                ApiError::Conflict(format!(
+                    "the encrypted PostgreSQL administrator credential is missing {phase}"
+                ))
             })?,
         )
         .await?;
@@ -110,10 +90,9 @@ pub(super) async fn harden_upgrade_target(
             &metadata.database.username,
             password,
             metadata.mysql_root_password.as_deref().ok_or_else(|| {
-                ApiError::Conflict(
-                    "the encrypted MySQL maintenance credential is missing after major-upgrade cutover"
-                        .to_string(),
-                )
+                ApiError::Conflict(format!(
+                    "the encrypted MySQL maintenance credential is missing {phase}"
+                ))
             })?,
         )
         .await?;

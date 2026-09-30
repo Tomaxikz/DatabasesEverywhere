@@ -12,6 +12,7 @@ pub(crate) const MAX_WIRE_MESSAGE_BYTES: usize = 48_000_000;
 // Authentication parsing is buffered; authenticated traffic uses the streaming
 // gateway and its separate wire-message limit above.
 const MAX_BUFFERED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MESSAGE_HEADER_LEN: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MongodbRoute {
@@ -80,7 +81,7 @@ where
     let mut len_bytes = [0_u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = i32::from_le_bytes(len_bytes);
-    if len < 16 {
+    if len < MESSAGE_HEADER_LEN as i32 {
         return Err(MongodbProxyError::MalformedMessage);
     }
     let len = len as usize;
@@ -95,9 +96,10 @@ where
 
     let request_id = i32::from_le_bytes(raw[4..8].try_into().unwrap());
     let op_code = i32::from_le_bytes(raw[12..16].try_into().unwrap());
+    let payload = &raw[MESSAGE_HEADER_LEN..];
     let body = match op_code {
-        OP_MSG => Some(parse_op_msg_body(&raw[16..])?),
-        OP_QUERY => Some(parse_op_query_body(&raw[16..])?),
+        OP_MSG => Some(parse_op_msg_body(payload)?),
+        OP_QUERY => Some(parse_op_query_body(payload)?),
         _ => None,
     };
 
@@ -156,7 +158,7 @@ pub async fn write_op_msg_response(
     payload.push(0);
     payload.extend_from_slice(&bson::to_vec(&body)?);
 
-    let len = 16 + payload.len();
+    let len = MESSAGE_HEADER_LEN + payload.len();
     let mut message = Vec::with_capacity(len);
     message.extend_from_slice(&(len as i32).to_le_bytes());
     message.extend_from_slice(&1_i32.to_le_bytes());
@@ -173,7 +175,7 @@ async fn write_op_reply_response(
     body: Document,
 ) -> Result<(), MongodbProxyError> {
     let doc_bytes = bson::to_vec(&body)?;
-    let len = 16 + 20 + doc_bytes.len();
+    let len = MESSAGE_HEADER_LEN + 20 + doc_bytes.len();
     let mut message = Vec::with_capacity(len);
     message.extend_from_slice(&(len as i32).to_le_bytes());
     message.extend_from_slice(&1_i32.to_le_bytes());
@@ -210,7 +212,7 @@ pub fn parse_sasl_start_route(message: &MongoMessage) -> Result<MongodbRoute, Mo
         .body
         .as_ref()
         .ok_or(MongodbProxyError::MalformedMessage)?;
-    if !matches!(body.get("saslStart"), Some(Bson::Int32(1) | Bson::Int64(1))) {
+    if !is_enabled_flag(body.get("saslStart")) {
         return Err(MongodbProxyError::MalformedMessage);
     }
 
@@ -355,10 +357,7 @@ fn parse_op_query_body(payload: &[u8]) -> Result<Document, MongodbProxyError> {
 fn parse_speculative_route(
     speculative: &Document,
 ) -> Result<Option<MongodbRoute>, MongodbProxyError> {
-    if !matches!(
-        speculative.get("saslStart"),
-        Some(Bson::Int32(1) | Bson::Int64(1))
-    ) {
+    if !is_enabled_flag(speculative.get("saslStart")) {
         return Ok(None);
     }
     if !matches!(
@@ -385,14 +384,16 @@ pub fn validate_sasl_continue(
         .body
         .as_ref()
         .ok_or(MongodbProxyError::MalformedMessage)?;
-    if !matches!(
-        body.get("saslContinue"),
-        Some(Bson::Int32(1) | Bson::Int64(1))
-    ) || body.get_str("$db").ok() != Some(route.database.as_str())
-    {
+    let is_continue = is_enabled_flag(body.get("saslContinue"));
+    let same_database = body.get_str("$db").ok() == Some(route.database.as_str());
+    if !is_continue || !same_database {
         return Err(MongodbProxyError::AuthIdentityChanged);
     }
     Ok(())
+}
+
+fn is_enabled_flag(value: Option<&Bson>) -> bool {
+    matches!(value, Some(Bson::Int32(1) | Bson::Int64(1)))
 }
 
 pub fn auth_reply_state(
@@ -436,7 +437,7 @@ fn command_succeeded(body: &Document) -> Result<bool, MongodbProxyError> {
 
 pub(crate) fn encode_command(body: Document) -> Result<Vec<u8>, MongodbProxyError> {
     let body = bson::to_vec(&body)?;
-    let len = 16_usize
+    let len = MESSAGE_HEADER_LEN
         .checked_add(5)
         .and_then(|len| len.checked_add(body.len()))
         .ok_or(MongodbProxyError::MessageTooLarge)?;

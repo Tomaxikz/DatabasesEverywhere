@@ -70,8 +70,11 @@ pub(crate) async fn bootstrap_root(
     Ok(())
 }
 
+const LOCALHOST_READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCALHOST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 async fn wait_for_localhost(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + LOCALHOST_READINESS_TIMEOUT;
     let mut last_error = String::new();
     while tokio::time::Instant::now() < deadline {
         match state
@@ -92,7 +95,7 @@ async fn wait_for_localhost(state: &AppState, instance_id: &str) -> Result<(), A
             Ok(_) => return Ok(()),
             Err(error) => {
                 last_error = error.to_string();
-                sleep(Duration::from_secs(1)).await;
+                sleep(LOCALHOST_RETRY_INTERVAL).await;
             }
         }
     }

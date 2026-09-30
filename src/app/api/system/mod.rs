@@ -119,18 +119,17 @@ fn deployment_capabilities(config: &crate::config::Config) -> Vec<DeploymentCapa
     Protocol::ALL
         .into_iter()
         .map(|protocol| {
+            let supports_shared = DeploymentMode::Shared.supports(protocol);
             let mut modes = vec![DeploymentMode::Dedicated];
-            if DeploymentMode::Shared.supports(protocol) {
+            if supports_shared {
                 modes.push(DeploymentMode::Shared);
             }
             DeploymentCapability {
                 protocol,
                 enabled: config.protocol_enabled(protocol),
                 modes,
-                shared_pool_scope: DeploymentMode::Shared
-                    .supports(protocol)
-                    .then_some("server"),
-                server_private_pools: DeploymentMode::Shared.supports(protocol),
+                shared_pool_scope: supports_shared.then_some("server"),
+                server_private_pools: supports_shared,
             }
         })
         .collect()
@@ -185,29 +184,8 @@ pub async fn scheduler_recommendation(
         .unwrap_or("postgres")
         .parse::<crate::shared::protocol::Protocol>()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let export = match query.action.as_deref().unwrap_or("import") {
-        "import" => false,
-        "export" => true,
-        _ => {
-            return Err(ApiError::BadRequest(
-                "action must be import or export".to_string(),
-            ));
-        }
-    };
-    let wipe = match query.mode.as_deref().unwrap_or("merge") {
-        "merge" => false,
-        "wipe" if !export => true,
-        "wipe" => {
-            return Err(ApiError::BadRequest(
-                "mode=wipe is valid only for imports".to_string(),
-            ));
-        }
-        _ => {
-            return Err(ApiError::BadRequest(
-                "mode must be merge or wipe".to_string(),
-            ));
-        }
-    };
+    let export = parse_is_export(query.action.as_deref())?;
+    let wipe = parse_is_wipe(query.mode.as_deref(), export)?;
     let size_bytes = query
         .size_bytes
         .unwrap_or(state.config.artifacts.import_upload_max_bytes);
@@ -272,6 +250,29 @@ pub async fn scheduler_recommendation(
             max_queued_jobs_per_instance: config.max_queued_jobs_per_instance,
         },
     ))
+}
+
+fn parse_is_export(action: Option<&str>) -> Result<bool, ApiError> {
+    match action.unwrap_or("import") {
+        "import" => Ok(false),
+        "export" => Ok(true),
+        _ => Err(ApiError::BadRequest(
+            "action must be import or export".to_string(),
+        )),
+    }
+}
+
+fn parse_is_wipe(mode: Option<&str>, export: bool) -> Result<bool, ApiError> {
+    match mode.unwrap_or("merge") {
+        "merge" => Ok(false),
+        "wipe" if !export => Ok(true),
+        "wipe" => Err(ApiError::BadRequest(
+            "mode=wipe is valid only for imports".to_string(),
+        )),
+        _ => Err(ApiError::BadRequest(
+            "mode must be merge or wipe".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use crate::{
 };
 
 const MAX_HELLO_MESSAGES: usize = 8;
+const AUTHENTICATION_FAILED_CODE: i32 = 18;
 
 pub(super) async fn handle_mongodb_client(
     client: TcpStream,
@@ -24,11 +25,12 @@ pub(super) async fn handle_mongodb_client(
             for _ in 0..MAX_HELLO_MESSAGES {
                 let message =
                     mongodb::read_message_limited(&mut client, MAX_ROUTING_HANDSHAKE_BYTES).await?;
-                let route = match if mongodb::is_hello(&message) {
+                let parsed_route = if mongodb::is_hello(&message) {
                     mongodb::parse_hello_speculative_route(&message)
                 } else {
                     mongodb::parse_sasl_start_route(&message).map(Some)
-                } {
+                };
+                let route = match parsed_route {
                     Ok(None) => {
                         backend_hello = Some(message.raw.clone());
                         mongodb::write_response(
@@ -44,7 +46,7 @@ pub(super) async fn handle_mongodb_client(
                         mongodb::write_response(
                             &mut client,
                             &message,
-                            mongodb::command_error(&error.to_string(), 18),
+                            mongodb::command_error(&error.to_string(), AUTHENTICATION_FAILED_CODE),
                         )
                         .await?;
                         return Err(error.into());
@@ -57,7 +59,7 @@ pub(super) async fn handle_mongodb_client(
                     mongodb::write_response(
                         &mut client,
                         &message,
-                        mongodb::command_error("Authentication failed", 18),
+                        mongodb::command_error("Authentication failed", AUTHENTICATION_FAILED_CODE),
                     )
                     .await?;
                     return Err(ListenerError::RouteNotFound);
@@ -127,7 +129,10 @@ async fn authenticate_mongodb(
                     mongodb::write_response(
                         &mut client,
                         &next,
-                        mongodb::command_error("Authentication identity changed", 18),
+                        mongodb::command_error(
+                            "Authentication identity changed",
+                            AUTHENTICATION_FAILED_CODE,
+                        ),
                     )
                     .await?;
                     return Err(mongodb::MongodbProxyError::AuthIdentityChanged.into());
@@ -145,7 +150,10 @@ async fn authenticate_mongodb(
                     mongodb::write_response(
                         &mut client,
                         &request,
-                        mongodb::command_error("Authentication route changed", 18),
+                        mongodb::command_error(
+                            "Authentication route changed",
+                            AUTHENTICATION_FAILED_CODE,
+                        ),
                     )
                     .await?;
                     return Err(ListenerError::RouteNotFound);
@@ -165,7 +173,7 @@ async fn authenticate_mongodb(
                     mongodb::write_response(
                         &mut client,
                         &next,
-                        mongodb::command_error(&error.to_string(), 18),
+                        mongodb::command_error(&error.to_string(), AUTHENTICATION_FAILED_CODE),
                     )
                     .await?;
                     return Err(error.into());

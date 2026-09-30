@@ -133,9 +133,7 @@ pub async fn run() -> anyhow::Result<()> {
 /// Restrict default permissions before the process creates logs, state, or
 /// runtime files. Explicitly requested modes can still be tightened further.
 pub fn set_safe_umask() {
-    {
-        use rustix::fs::Mode;
+    use rustix::fs::Mode;
 
-        rustix::process::umask(Mode::RWXG | Mode::RWXO);
-    }
+    rustix::process::umask(Mode::RWXG | Mode::RWXO);
 }

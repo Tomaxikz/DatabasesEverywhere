@@ -96,6 +96,27 @@ async fn advance<'a>(
         .map_err(migration_error)
 }
 
+async fn advance_to(
+    state: &AppState,
+    migration: DeploymentMigration,
+    stage: MigrationStage,
+) -> Result<DeploymentMigration, ApiError> {
+    advance(state, migration, stage, MigrationPatch::default()).await
+}
+
+async fn advance_with_failure(
+    state: &AppState,
+    migration: DeploymentMigration,
+    stage: MigrationStage,
+    failure: MigrationFailure,
+) -> Result<DeploymentMigration, ApiError> {
+    let patch = MigrationPatch {
+        failure: Some(failure),
+        ..MigrationPatch::default()
+    };
+    advance(state, migration, stage, patch).await
+}
+
 mod copy;
 mod recovery;
 mod support;

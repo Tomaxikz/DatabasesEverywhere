@@ -156,10 +156,7 @@ pub(crate) async fn stream_logs(
     };
     let mut stdout = LogRedactor::default();
     let mut stderr = LogRedactor::default();
-    let mut heartbeat = interval_at(
-        Instant::now() + Duration::from_secs(30),
-        Duration::from_secs(30),
-    );
+    let mut heartbeat = interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut awaiting_pong = false;
     let expiration = sleep_until(deadline);
@@ -191,7 +188,16 @@ pub(crate) async fn stream_logs(
                     close_unresponsive_socket(&mut socket).await;
                     break;
                 }
-                if send_message_before(&mut socket, Message::Ping(b"dbe-heartbeat".as_slice().into()), deadline).await.is_err() { break; }
+                if send_message_before(
+                    &mut socket,
+                    Message::Ping(b"dbe-heartbeat".as_slice().into()),
+                    deadline,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
                 awaiting_pong = true;
                 continue;
             }
@@ -224,7 +230,7 @@ pub(crate) async fn stream_logs(
                 "a log record exceeded the safe redaction limit; reconnect with a smaller tail",
             ));
         }
-        if send_text(
+        let stdout_sent = send_text(
             &mut socket,
             &state,
             &target,
@@ -233,20 +239,21 @@ pub(crate) async fn stream_logs(
             &out,
             deadline,
         )
-        .await
-        .is_err()
-            || send_text(
-                &mut socket,
-                &state,
-                &target,
-                &mut sequence,
-                LogStream::Stderr,
-                &err,
-                deadline,
-            )
-            .await
-            .is_err()
-        {
+        .await;
+        if stdout_sent.is_err() {
+            break;
+        }
+        let stderr_sent = send_text(
+            &mut socket,
+            &state,
+            &target,
+            &mut sequence,
+            LogStream::Stderr,
+            &err,
+            deadline,
+        )
+        .await;
+        if stderr_sent.is_err() {
             break;
         }
         if ended {

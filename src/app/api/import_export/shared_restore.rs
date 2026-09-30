@@ -23,6 +23,7 @@ use crate::{
 };
 
 const SHARED_HELPER_WORK_MARGIN_BYTES: u64 = 1024 * 1024;
+const PROTECTED_CLICKHOUSE_DATABASES: [&str; 3] = ["system", "information_schema", "dbe_control"];
 
 /// Only this daemon-generated wipe uses the pool administrator. The dump is
 /// still inspected, pinned and replayed as the restricted tenant by `run`.
@@ -42,14 +43,15 @@ pub(super) async fn wipe_clickhouse(
         .get_reservation(&metadata.instance_id)
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    if !wipe_target_matches(metadata, &runtime, reservation.as_ref())
-        || !state.instances.routes_fenced(&metadata.instance_id).await
-        || state
-            .gateway_supervisor
-            .tenant_sessions()
-            .active(&metadata.instance_id)
-            != 0
-    {
+    let tenant_is_fenced_and_drained =
+        wipe_target_matches(metadata, &runtime, reservation.as_ref())
+            && state.instances.routes_fenced(&metadata.instance_id).await
+            && state
+                .gateway_supervisor
+                .tenant_sessions()
+                .active(&metadata.instance_id)
+                == 0;
+    if !tenant_is_fenced_and_drained {
         return Err(ApiError::Conflict("shared ClickHouse wipe requires a fenced, drained tenant with matching ownership and reservation".into()).into());
     }
     let identity = state
@@ -57,13 +59,13 @@ pub(super) async fn wipe_clickhouse(
         .verified_compatibility_identity(Protocol::Clickhouse, metadata.runtime_id())
         .await
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
-    if !identity
+    let container_matches_attestation = identity
         .as_ref()
         .zip(runtime.compatibility.as_ref())
         .is_some_and(|(live, attested)| {
             live.id == attested.container_id && live.image_id == attested.image_id
-        })
-    {
+        });
+    if !container_matches_attestation {
         return Err(ApiError::Conflict(
             "shared wipe container no longer matches its attested identity".into(),
         )
@@ -145,7 +147,7 @@ fn wipe_target_matches(
         && runtime.runtime_id == metadata.runtime_id()
         && metadata.owner.is_some()
         && metadata.owner == runtime.owner
-        && !["system", "information_schema", "dbe_control"]
+        && !PROTECTED_CLICKHOUSE_DATABASES
             .iter()
             .any(|name| metadata.database.name.eq_ignore_ascii_case(name))
         && reservation.is_some_and(|reservation| {
@@ -335,29 +337,27 @@ fn tenant_environment(
             )));
         }
     };
-    let mut environment = environment
-        .iter()
-        .filter_map(|(key, value)| {
-            let normalized = key.to_ascii_uppercase();
-            if normalized.contains("ROOT") || normalized.contains("ADMIN") {
-                return Some(Err(ApiError::Conflict(
-                    "shared restore refused an administrator credential".to_string(),
-                )));
-            }
-            if *key == database_key {
-                return None;
-            }
-            Some(Ok(DockerEnv {
-                key: (*key).to_string(),
-                value: SecretString::from(value.expose_secret().to_string()),
-            }))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    environment.push(DockerEnv {
+    let mut helper_environment = Vec::new();
+    for (key, value) in environment {
+        let normalized_key = key.to_ascii_uppercase();
+        if normalized_key.contains("ROOT") || normalized_key.contains("ADMIN") {
+            return Err(ApiError::Conflict(
+                "shared restore refused an administrator credential".to_string(),
+            ));
+        }
+        if *key == database_key {
+            continue;
+        }
+        helper_environment.push(DockerEnv {
+            key: (*key).to_string(),
+            value: SecretString::from(value.expose_secret().to_string()),
+        });
+    }
+    helper_environment.push(DockerEnv {
         key: database_key.to_string(),
         value: SecretString::from(database.to_string()),
     });
-    Ok(environment)
+    Ok(helper_environment)
 }
 
 pub(super) struct PinnedInput {

@@ -5,6 +5,7 @@ use super::super::{
 
 pub const PASSWORD_B64_PLACEHOLDER: &str = "__DBEV_PASSWORD_B64__";
 pub const AUTH_STRING_B64_PLACEHOLDER: &str = "__DBEV_AUTH_STRING_B64__";
+const MAX_AUTH_PLUGIN_NAME_BYTES: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MysqlProvisionError {
@@ -118,12 +119,12 @@ pub fn restore_tenant_auth_sql(
     username: &str,
     plugin: &str,
 ) -> Result<String, MysqlProvisionError> {
-    if plugin.is_empty()
-        || plugin.len() > 64
-        || !plugin
+    let plugin_name_is_safe = !plugin.is_empty()
+        && plugin.len() <= MAX_AUTH_PLUGIN_NAME_BYTES
+        && plugin
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !plugin_name_is_safe {
         return Err(MysqlProvisionError::InvalidAuthenticationPlugin);
     }
     let account = format!("{}@'%'", quote_identifier(username));

@@ -34,6 +34,9 @@ const MAX_REDIS_CONTROL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIS_VALUE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_REDIS_DUMP_OVERHEAD_BYTES: usize = 1024 * 1024;
 const MAX_REDIS_DUMP_BYTES: usize = MAX_REDIS_VALUE_BYTES + MAX_REDIS_DUMP_OVERHEAD_BYTES;
+const MAX_REDIS_ACL_FILE_BYTES: u64 = 1024 * 1024;
+const PRIVATE_TARGET_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_VALKEY_COMPATIBLE_REDIS_VERSION: (u32, u32) = (7, 2);
 
 #[derive(Serialize)]
 struct RedisRecoveryManifest<'a> {
@@ -277,15 +280,7 @@ async fn import_resp(
             )
             .await
             {
-                let quarantine =
-                    crate::api::import_export::quarantine_uncertain_import(state, instance_id)
-                        .await;
-                let quarantine = match quarantine {
-                    Ok(()) => "target was stopped and quarantined".to_string(),
-                    Err(error) => format!(
-                        "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
-                    ),
-                };
+                let quarantine = quarantine_target(state, instance_id).await;
                 return Err(ApiError::Runtime(format!(
                     "{target_protocol} import was applied, but its recovery commit marker could not be removed: {error}; {quarantine}; rollback staging was retained at {}",
                     staging.display()
@@ -310,17 +305,7 @@ async fn import_resp(
                     )
                     .await
                     {
-                        let quarantine = crate::api::import_export::quarantine_uncertain_import(
-                            state,
-                            instance_id,
-                        )
-                        .await;
-                        let quarantine = match quarantine {
-                            Ok(()) => "target was stopped and quarantined".to_string(),
-                            Err(error) => format!(
-                                "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
-                            ),
-                        };
+                        let quarantine = quarantine_target(state, instance_id).await;
                         return Err(ApiError::Runtime(format!(
                             "{target_protocol} remote import failed: {primary_error}; rollback succeeded, but recovery metadata could not be committed: {commit_error}; {quarantine}; staging was retained at {}",
                             staging.display()
@@ -330,15 +315,7 @@ async fn import_resp(
                     Err(primary_error)
                 }
                 Err(rollback_error) => {
-                    let quarantine =
-                        crate::api::import_export::quarantine_uncertain_import(state, instance_id)
-                            .await;
-                    let quarantine = match quarantine {
-                        Ok(()) => "target was stopped and quarantined".to_string(),
-                        Err(error) => format!(
-                            "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
-                        ),
-                    };
+                    let quarantine = quarantine_target(state, instance_id).await;
                     Err(ApiError::Runtime(format!(
                         "{target_protocol} remote import failed: {primary_error}; rollback failed: {rollback_error}; {quarantine}; rollback archive retained at {}",
                         rollback.display()
@@ -346,6 +323,15 @@ async fn import_resp(
                 }
             }
         }
+    }
+}
+
+async fn quarantine_target(state: &AppState, instance_id: &str) -> String {
+    match crate::api::import_export::quarantine_uncertain_import(state, instance_id).await {
+        Ok(()) => "target was stopped and quarantined".to_string(),
+        Err(error) => format!(
+            "gateway routes were removed and the target was quarantined in memory, but complete shutdown/persistence reported: {error}"
+        ),
     }
 }
 
@@ -596,7 +582,7 @@ async fn start_private_redis(
             })?;
         let readiness_timeout = remaining_redis_timeout(
             deadline,
-            Duration::from_secs(120),
+            PRIVATE_TARGET_READINESS_TIMEOUT,
             "private target readiness",
         )?;
         state
@@ -617,7 +603,10 @@ async fn read_acl_file(path: &Path) -> Result<Vec<u8>, ApiError> {
     let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
         ApiError::Runtime(format!("failed to inspect managed RESP ACL file: {error}"))
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_REDIS_ACL_FILE_BYTES
+    {
         return Err(ApiError::Runtime(
             "managed RESP ACL path is not a safe regular file".to_string(),
         ));
@@ -809,7 +798,8 @@ fn check_redis_versions(
                     ));
                 }
                 RespServerFamily::Redis
-                    if source.version.0 > 7 || (source.version.0 == 7 && source.version.1 > 2) =>
+                    if (source.version.0, source.version.1)
+                        > MAX_VALKEY_COMPATIBLE_REDIS_VERSION =>
                 {
                     return Err(ApiError::BadRequest(
                         "Valkey accepts Redis OSS persistence data only through version 7.2; use a Redis 7.2-or-older source or database-specific migration tooling"

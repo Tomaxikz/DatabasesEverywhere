@@ -56,17 +56,14 @@ impl Default for Config {
             jwt_signing_key: String::new(),
             remote: String::new(),
             tls: TlsConfig::default(),
-            postgres: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::POSTGRES)),
-            mariadb: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::MARIADB)),
-            mysql: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MYSQL)),
-            redis: ListenerConfig::enabled(format!("127.0.0.1:{}", ports::REDIS)),
-            valkey: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::VALKEY)),
-            mongodb: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::MONGODB)),
-            clickhouse: ClickhouseConfig::disabled(
-                format!("127.0.0.1:{}", ports::CLICKHOUSE),
-                format!("127.0.0.1:{}", ports::CLICKHOUSE_HTTP),
-            ),
-            qdrant: ListenerConfig::disabled(format!("127.0.0.1:{}", ports::QDRANT)),
+            postgres: ListenerConfig::enabled(loopback_bind(ports::POSTGRES)),
+            mariadb: ListenerConfig::enabled(loopback_bind(ports::MARIADB)),
+            mysql: ListenerConfig::disabled(loopback_bind(ports::MYSQL)),
+            redis: ListenerConfig::enabled(loopback_bind(ports::REDIS)),
+            valkey: ListenerConfig::disabled(loopback_bind(ports::VALKEY)),
+            mongodb: ListenerConfig::disabled(loopback_bind(ports::MONGODB)),
+            clickhouse: ClickhouseConfig::default(),
+            qdrant: ListenerConfig::disabled(loopback_bind(ports::QDRANT)),
             api: ApiConfig::default(),
             security: SecurityConfig::default(),
             artifacts: ArtifactConfig::default(),
@@ -78,6 +75,10 @@ impl Default for Config {
             paths: PathConfig::default(),
         }
     }
+}
+
+fn loopback_bind(port: u16) -> String {
+    format!("127.0.0.1:{port}")
 }
 
 /// One immutable configuration and its shared resources for a daemon run.
@@ -238,8 +239,8 @@ impl ClickhouseConfig {
 impl Default for ClickhouseConfig {
     fn default() -> Self {
         Self::disabled(
-            format!("127.0.0.1:{}", ports::CLICKHOUSE),
-            format!("127.0.0.1:{}", ports::CLICKHOUSE_HTTP),
+            loopback_bind(ports::CLICKHOUSE),
+            loopback_bind(ports::CLICKHOUSE_HTTP),
         )
     }
 }
@@ -412,46 +413,55 @@ pub(crate) fn normalize_remote_import_host(value: &str) -> Option<String> {
     }
 
     let host = value.strip_suffix('.').unwrap_or(value);
-    if host.is_empty()
-        || host.len() > 253
-        || !host.is_ascii()
-        || host.bytes().any(|byte| byte.is_ascii_control())
-        || host
-            .bytes()
-            .any(|byte| matches!(byte, b'/' | b'\\' | b':' | b'@' | b'#' | b'?' | b'[' | b']'))
-    {
+    if !is_plausible_dns_name(host) {
         return None;
     }
 
-    if host.split('.').any(|label| {
-        label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
+    if !host.split('.').all(is_valid_dns_label) {
         return None;
     }
 
     // libc resolvers accept several legacy numeric IPv4 spellings such as
     // `2130706433`, `127.1`, and `0x7f.0.0.1`. Reject numeric-looking names so
     // they cannot bypass the canonical IpAddr classification in the caller.
-    let numeric_notation = host.split('.').all(|label| {
-        label.bytes().all(|byte| byte.is_ascii_digit())
-            || label
-                .strip_prefix("0x")
-                .or_else(|| label.strip_prefix("0X"))
-                .is_some_and(|digits| {
-                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-    });
+    let numeric_notation = host.split('.').all(is_numeric_ipv4_label);
     if numeric_notation {
         return None;
     }
 
     Some(host.to_ascii_lowercase())
+}
+
+const MAX_DNS_NAME_LEN: usize = 253;
+const MAX_DNS_LABEL_LEN: usize = 63;
+
+fn is_plausible_dns_name(host: &str) -> bool {
+    let has_forbidden_byte = host.bytes().any(|byte| {
+        byte.is_ascii_control()
+            || matches!(byte, b'/' | b'\\' | b':' | b'@' | b'#' | b'?' | b'[' | b']')
+    });
+    !host.is_empty() && host.len() <= MAX_DNS_NAME_LEN && host.is_ascii() && !has_forbidden_byte
+}
+
+fn is_valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= MAX_DNS_LABEL_LEN
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn is_numeric_ipv4_label(label: &str) -> bool {
+    let is_decimal = label.bytes().all(|byte| byte.is_ascii_digit());
+    let is_hexadecimal = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    is_decimal || is_hexadecimal
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

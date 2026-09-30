@@ -28,6 +28,10 @@ pub(crate) fn sum_runtime_limits<'a>(
 const ROOT_SPILL_DIVISOR: u64 = 20;
 const ROOT_SPILL_CAP_MIB: u64 = 8 * 1024;
 const SHARED_CLICKHOUSE_QUERIES_PER_HOUR: u64 = 20_000;
+const MEMORY_MIB_PER_CONNECTION: u64 = 32;
+const MIN_CONNECTIONS: u64 = 4;
+const MAX_CONNECTIONS: u64 = 100;
+const STATEMENT_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 
 /// Engine-global disk overhead, separate from tenant data allowances.
 /// PostgreSQL needs WAL/checkpoint headroom; ClickHouse includes bounded query history.
@@ -48,12 +52,7 @@ pub(crate) const fn root_spill_mib(protocol: Protocol, tenant_disk_mib: u64) -> 
     if engine_disk_overhead(protocol).is_none() {
         return None;
     }
-    let rounded = tenant_disk_mib / ROOT_SPILL_DIVISOR
-        + if tenant_disk_mib.is_multiple_of(ROOT_SPILL_DIVISOR) {
-            0
-        } else {
-            1
-        };
+    let rounded = tenant_disk_mib.div_ceil(ROOT_SPILL_DIVISOR);
     Some(if rounded < ROOT_SPILL_CAP_MIB {
         rounded
     } else {
@@ -81,8 +80,8 @@ pub(crate) fn runtime_id(protocol: Protocol) -> String {
 }
 
 pub(crate) fn max_connections(limits: &InstanceLimits) -> u32 {
-    let memory_bound = limits.memory_mib / 32;
-    u32::try_from(memory_bound.clamp(4, 100)).unwrap_or(100)
+    let memory_bound = limits.memory_mib / MEMORY_MIB_PER_CONNECTION;
+    u32::try_from(memory_bound.clamp(MIN_CONNECTIONS, MAX_CONNECTIONS)).unwrap_or(100)
 }
 
 pub(crate) fn postgres_quota(
@@ -90,7 +89,7 @@ pub(crate) fn postgres_quota(
 ) -> crate::databases::postgres::provision::TenantQuota {
     crate::databases::postgres::provision::TenantQuota {
         max_connections: max_connections(limits),
-        statement_timeout_ms: 15 * 60 * 1_000,
+        statement_timeout_ms: STATEMENT_TIMEOUT_MS,
         lock_timeout_ms: 30 * 1_000,
         idle_transaction_timeout_ms: 5 * 60 * 1_000,
         temp_file_limit_kib: limits.memory_mib.saturating_mul(1024),
@@ -116,7 +115,7 @@ pub(crate) fn mariadb_quota(
         max_updates_per_hour: 0,
         max_connections_per_hour: 0,
         max_connections: max_connections(limits),
-        max_statement_millis: 15 * 60 * 1_000,
+        max_statement_millis: STATEMENT_TIMEOUT_MS,
     }
 }
 

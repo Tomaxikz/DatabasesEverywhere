@@ -14,6 +14,8 @@ use crate::{
     protocols::postgres,
 };
 
+const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;
+
 pub(super) async fn handle_postgres_client(
     client: TcpStream,
     resolver: RouteResolver,
@@ -168,7 +170,7 @@ pub(super) async fn handle_postgres_client(
 async fn postgres_wants_direct_tls(client: &TcpStream) -> Result<bool, std::io::Error> {
     let mut first = [0_u8; 1];
     let read = client.peek(&mut first).await?;
-    Ok(read == 1 && first[0] == 0x16)
+    Ok(read == 1 && first[0] == TLS_HANDSHAKE_RECORD_TYPE)
 }
 
 async fn read_postgres_startup<S>(client: &mut S) -> Result<Vec<u8>, ListenerError>

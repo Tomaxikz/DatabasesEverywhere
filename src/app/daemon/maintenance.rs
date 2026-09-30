@@ -1,6 +1,12 @@
 use super::*;
 
 const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
+const CROSS_DEVICE_LINK_ERRNO: i32 = 18;
+const NO_SPACE_ERRNO: i32 = 28;
+const LINUX_QUOTA_EXCEEDED_ERRNO: i32 = 122;
+const BSD_QUOTA_EXCEEDED_ERRNO: i32 = 69;
+const DISK_TEST_CHUNK_BYTES: usize = 1024 * 1024;
+const DISK_TEST_PROGRESS_INTERVAL_MIB: u64 = 8;
 
 pub(crate) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
@@ -330,22 +336,14 @@ pub(super) fn migrate_path_action(action: &PathMigrationAction, force: bool) -> 
 }
 
 pub(super) fn migrate_directory(from: &Path, to: &Path, force: bool) -> anyhow::Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create migration target {}", parent.display()))?;
-    }
+    create_target_parent(to)?;
     if to.exists() {
-        if !force {
-            anyhow::bail!(
-                "refusing to overwrite existing migration target {}; pass --force to replace",
-                to.display()
-            );
-        }
+        require_force_to_replace(to, force)?;
         fs::remove_dir_all(to).with_context(|| format!("failed to replace {}", to.display()))?;
     }
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(18) => {
+        Err(error) if error.raw_os_error() == Some(CROSS_DEVICE_LINK_ERRNO) => {
             copy_directory_tree(from, to)?;
             fs::remove_dir_all(from)
                 .with_context(|| format!("failed to remove migrated source {}", from.display()))
@@ -353,6 +351,24 @@ pub(super) fn migrate_directory(from: &Path, to: &Path, force: bool) -> anyhow::
         Err(error) => Err(error)
             .with_context(|| format!("failed to move {} to {}", from.display(), to.display())),
     }
+}
+
+fn create_target_parent(to: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create migration target {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn require_force_to_replace(to: &Path, force: bool) -> anyhow::Result<()> {
+    if !force {
+        anyhow::bail!(
+            "refusing to overwrite existing migration target {}; pass --force to replace",
+            to.display()
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn migrate_dir(from: &Path, to: &Path, force: bool) -> anyhow::Result<()> {
@@ -409,22 +425,14 @@ pub(super) fn copy_directory_tree(from: &Path, to: &Path) -> anyhow::Result<()> 
 }
 
 pub(super) fn migrate_file(from: &Path, to: &Path, force: bool) -> anyhow::Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create migration target {}", parent.display()))?;
-    }
+    create_target_parent(to)?;
     if to.exists() {
-        if !force {
-            anyhow::bail!(
-                "refusing to overwrite existing migration target {}; pass --force to replace",
-                to.display()
-            );
-        }
+        require_force_to_replace(to, force)?;
         fs::remove_file(to).with_context(|| format!("failed to replace {}", to.display()))?;
     }
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(18) => {
+        Err(error) if error.raw_os_error() == Some(CROSS_DEVICE_LINK_ERRNO) => {
             fs::copy(from, to).with_context(|| {
                 format!("failed to copy {} to {}", from.display(), to.display())
             })?;
@@ -437,22 +445,14 @@ pub(super) fn migrate_file(from: &Path, to: &Path, force: bool) -> anyhow::Resul
 }
 
 pub(super) fn migrate_symlink(from: &Path, to: &Path, force: bool) -> anyhow::Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create migration target {}", parent.display()))?;
-    }
+    create_target_parent(to)?;
     if to.exists() || fs::symlink_metadata(to).is_ok() {
-        if !force {
-            anyhow::bail!(
-                "refusing to overwrite existing migration target {}; pass --force to replace",
-                to.display()
-            );
-        }
+        require_force_to_replace(to, force)?;
         remove_replace_target(to)?;
     }
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(18) => {
+        Err(error) if error.raw_os_error() == Some(CROSS_DEVICE_LINK_ERRNO) => {
             copy_symlink(from, to)?;
             fs::remove_file(from)
                 .with_context(|| format!("failed to remove migrated source {}", from.display()))
@@ -568,7 +568,7 @@ pub(super) async fn run_disk_test(
         .open(&target)
         .await
         .with_context(|| format!("failed to open disk test file {}", target.display()))?;
-    let mut chunk = vec![0; 1024 * 1024];
+    let mut chunk = vec![0; DISK_TEST_CHUNK_BYTES];
     let mut seed = 0xD8E5_0001_u64;
 
     println!(
@@ -581,7 +581,7 @@ pub(super) async fn run_disk_test(
         fill_probe_chunk(&mut chunk, &mut seed);
         match file.write_all(&chunk).await {
             Ok(_) => {
-                if written_mib == 0 || (written_mib + 1) % 8 == 0 {
+                if written_mib == 0 || (written_mib + 1) % DISK_TEST_PROGRESS_INTERVAL_MIB == 0 {
                     println!("disk test wrote {}MiB", written_mib + 1);
                 }
             }
@@ -614,7 +614,10 @@ pub(super) fn fill_probe_chunk(chunk: &mut [u8], seed: &mut u64) {
 }
 
 pub(super) fn is_quota_like_error(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(28) | Some(122) | Some(69))
+    matches!(
+        error.raw_os_error(),
+        Some(NO_SPACE_ERRNO) | Some(LINUX_QUOTA_EXCEEDED_ERRNO) | Some(BSD_QUOTA_EXCEEDED_ERRNO)
+    )
 }
 
 pub(super) async fn cleanup_disk_test_path(limiter: &DiskLimiter, test_path: &Path) {

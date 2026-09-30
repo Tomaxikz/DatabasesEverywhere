@@ -50,7 +50,7 @@ pub(crate) async fn begin_attestation(
         )
     })?;
     let identity = required_identity(docker, metadata).await?;
-    let (mut current, cache_warning) = match manager
+    let (cached_as_current, cache_warning) = match manager
         .hardening_is_current(metadata, &identity, revision)
         .await
     {
@@ -61,9 +61,7 @@ pub(crate) async fn begin_attestation(
     // The SQLite lookup above is an await point. Re-read Docker before a
     // cached proof is allowed to skip live hardening.
     let confirmed = required_identity(docker, metadata).await?;
-    if confirmed != identity {
-        current = false;
-    }
+    let current = cached_as_current && confirmed == identity;
     if current {
         tracing::info!(
             event = "audit auth_hardening_attestation_reused",
@@ -95,7 +93,7 @@ pub(crate) async fn complete_attestation(
         return Err(AuthHardeningCompletionError::ContainerChanged);
     }
     ensure_generation(docker, metadata, &generation.identity).await?;
-    let storage = manager
+    let recorded = manager
         .record_hardening_attestation(metadata, &generation.identity, generation.revision)
         .await
         .map_err(|error| AuthHardeningCompletionError::Storage(error.to_string()));
@@ -103,7 +101,7 @@ pub(crate) async fn complete_attestation(
     // is identity-bound, but the caller must not publish a route to the new
     // generation as if the old process had been hardened.
     ensure_generation(docker, metadata, &generation.identity).await?;
-    storage?;
+    recorded?;
     tracing::info!(
         event = "audit auth_hardening_attested",
         instance_id = %metadata.instance_id,

@@ -82,12 +82,9 @@ impl BackgroundServices {
             active_gateway_connections = gateway_supervisor.active_connections(),
             "API listener stopped; shutting down daemon-owned background tasks"
         );
-        soft_disk_limits.abort();
-        let _ = soft_disk_limits.await;
-        one_use_export_sweeper.abort();
-        let _ = one_use_export_sweeper.await;
-        import_upload_sweeper.abort();
-        let _ = import_upload_sweeper.await;
+        abort_and_wait(soft_disk_limits).await;
+        abort_and_wait(one_use_export_sweeper).await;
+        abort_and_wait(import_upload_sweeper).await;
         let (
             jobs_drained,
             creations_drained,
@@ -161,6 +158,11 @@ impl BackgroundServices {
 
         Ok(())
     }
+}
+
+async fn abort_and_wait(task: JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
 }
 
 async fn drain_daemon_task(

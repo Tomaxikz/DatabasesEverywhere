@@ -4,11 +4,12 @@ use crate::{
         normalize_database_version,
     },
     instances::{manager::InstanceManager, metadata::InstanceMetadata},
-    runtime::docker::DockerRuntime,
+    runtime::docker::{DockerRuntime, ManagedContainerCompatibilityIdentity},
     storage::repositories::CompatibilityAttestation,
 };
 
 const COMPATIBILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_VERSION_LENGTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompatibilityProbeOutcome {
@@ -80,11 +81,7 @@ pub(crate) async fn probe_instance_compatibility(
     metadata: &InstanceMetadata,
     force: bool,
 ) -> Result<CompatibilityProbeOutcome, CompatibilityProbeError> {
-    let mut identity = docker
-        .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
-        .await
-        .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
-        .ok_or(CompatibilityProbeError::ContainerMissing)?;
+    let mut identity = required_identity(docker, metadata).await?;
 
     if !force
         && let Some(attestation) = manager
@@ -96,11 +93,7 @@ pub(crate) async fn probe_instance_compatibility(
         && attestation.image_id == identity.image_id
         && attestation.probe_revision == COMPATIBILITY_PROBE_REVISION
     {
-        let confirmed = docker
-            .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
-            .await
-            .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
-            .ok_or(CompatibilityProbeError::ContainerMissing)?;
+        let confirmed = required_identity(docker, metadata).await?;
         if confirmed == identity {
             tracing::debug!(
                 event = "audit compatibility_attestation_reused",
@@ -135,14 +128,10 @@ pub(crate) async fn probe_instance_compatibility(
         .map_err(|error| CompatibilityProbeError::Probe(error.to_string()))?;
     let version = normalize_database_version(metadata.protocol, &output.stdout)
         .ok_or(CompatibilityProbeError::Unparseable)?;
-    if version.len() > 128 || version.chars().any(char::is_control) {
+    if version.len() > MAX_VERSION_LENGTH || version.chars().any(char::is_control) {
         return Err(CompatibilityProbeError::Unparseable);
     }
-    let confirmed_identity = docker
-        .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
-        .await
-        .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
-        .ok_or(CompatibilityProbeError::ContainerMissing)?;
+    let confirmed_identity = required_identity(docker, metadata).await?;
     if confirmed_identity != identity {
         return Err(CompatibilityProbeError::ContainerChanged);
     }
@@ -164,11 +153,7 @@ pub(crate) async fn probe_instance_compatibility(
         })
         .await
         .map_err(|error| CompatibilityProbeError::Storage(error.to_string()))?;
-    let recorded_identity = docker
-        .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
-        .await
-        .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
-        .ok_or(CompatibilityProbeError::ContainerMissing)?;
+    let recorded_identity = required_identity(docker, metadata).await?;
     if recorded_identity != identity {
         return Err(CompatibilityProbeError::ContainerChanged);
     }
@@ -189,4 +174,15 @@ pub(crate) async fn probe_instance_compatibility(
         diagnostic,
         reused: false,
     })
+}
+
+async fn required_identity(
+    docker: &DockerRuntime,
+    metadata: &InstanceMetadata,
+) -> Result<ManagedContainerCompatibilityIdentity, CompatibilityProbeError> {
+    docker
+        .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
+        .await
+        .map_err(|error| CompatibilityProbeError::Runtime(error.to_string()))?
+        .ok_or(CompatibilityProbeError::ContainerMissing)
 }

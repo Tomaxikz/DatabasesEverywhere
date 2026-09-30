@@ -77,16 +77,12 @@ impl InstancePaths {
 
     pub async fn clear_socket_dir(&self) -> Result<(), InstancePathError> {
         let sockets = self.sockets.clone();
-        tokio::task::spawn_blocking(move || clear_dir_contents(&sockets))
-            .await
-            .map_err(|error| InstancePathError::Task(error.to_string()))?
+        run_blocking(move || clear_dir_contents(&sockets)).await
     }
 
     pub async fn socket_dir_status(&self) -> Result<RuntimePathStatus, InstancePathError> {
         let sockets = self.sockets.clone();
-        tokio::task::spawn_blocking(move || dir_status(&sockets))
-            .await
-            .map_err(|error| InstancePathError::Task(error.to_string()))?
+        run_blocking(move || dir_status(&sockets)).await
     }
 
     pub async fn apply_container_owner(&self) -> Result<(), InstancePathError> {
@@ -98,17 +94,7 @@ impl InstancePaths {
             self.sockets.clone(),
             self.artifacts.clone(),
         ];
-        tokio::task::spawn_blocking(move || {
-            for path in paths {
-                chown_recursive(&path, owner).map_err(|source| InstancePathError::Chown {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| InstancePathError::Task(error.to_string()))?
+        chown_paths_in_background(paths, owner).await
     }
 
     /// Makes only the paths mounted into rootless Podman containers belong to
@@ -123,110 +109,83 @@ impl InstancePaths {
             self.sockets.clone(),
             self.runtime_config.clone(),
         ];
-        let owner = HostOwner { uid, gid };
-        tokio::task::spawn_blocking(move || {
-            for path in paths {
-                chown_recursive(&path, owner).map_err(|source| InstancePathError::Chown {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| InstancePathError::Task(error.to_string()))?
+        chown_paths_in_background(paths, HostOwner { uid, gid }).await
     }
 
     /// Reapply the persistent data directory's existing owner after a
     /// physical restore has created replacement entries as the daemon user.
     pub async fn restore_data_owner(&self) -> Result<(), InstancePathError> {
         let owner = self.data_owner().await?;
-        let data = self.data.clone();
-        tokio::task::spawn_blocking(move || {
-            chown_recursive(&data, owner).map_err(|source| InstancePathError::Chown {
-                path: data.display().to_string(),
-                source,
-            })
-        })
-        .await
-        .map_err(|error| InstancePathError::Task(error.to_string()))?
+        chown_paths_in_background(vec![self.data.clone()], owner).await
     }
 
     pub async fn set_rootless_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
         if uid == 0 {
             return Err(InstancePathError::InvalidRuntimeOwner);
         }
-        let data = self.data.clone();
-        tokio::task::spawn_blocking(move || {
-            chown_recursive(&data, HostOwner { uid, gid }).map_err(|source| {
-                InstancePathError::Chown {
-                    path: data.display().to_string(),
-                    source,
-                }
-            })
-        })
-        .await
-        .map_err(|error| InstancePathError::Task(error.to_string()))?
+        chown_paths_in_background(vec![self.data.clone()], HostOwner { uid, gid }).await
     }
 
     pub async fn apply_socket_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
-        let sockets = self.sockets.clone();
-        let owner = HostOwner { uid, gid };
-        tokio::task::spawn_blocking(move || {
-            chown_recursive(&sockets, owner).map_err(|source| InstancePathError::Chown {
-                path: sockets.display().to_string(),
-                source,
-            })
-        })
-        .await
-        .map_err(|error| InstancePathError::Task(error.to_string()))?
+        chown_paths_in_background(vec![self.sockets.clone()], HostOwner { uid, gid }).await
     }
 
     async fn desired_container_owner(&self) -> Result<Option<HostOwner>, InstancePathError> {
-        if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
+        if let Some(owner) = container_owner_from_env() {
             return Ok(Some(owner));
         }
-
-        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
-            InstancePathError::ReadMetadata {
-                path: self.data.display().to_string(),
-                source,
-            }
-        })?;
-
-        use std::os::unix::fs::MetadataExt;
-
-        Ok(default_owner_for(metadata.uid(), metadata.gid()))
+        let (uid, gid) = self.data_uid_gid().await?;
+        Ok(default_owner_for(uid, gid))
     }
 
     async fn data_owner(&self) -> Result<HostOwner, InstancePathError> {
-        if let Some(owner) = owner_from_env("DBE_CONTAINER_UID", "DBE_CONTAINER_GID") {
+        if let Some(owner) = container_owner_from_env() {
             return Ok(owner);
         }
-
-        let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
-            InstancePathError::ReadMetadata {
-                path: self.data.display().to_string(),
-                source,
-            }
-        })?;
-        use std::os::unix::fs::MetadataExt;
-
-        Ok(existing_owner_for(metadata.uid(), metadata.gid()))
+        let (uid, gid) = self.data_uid_gid().await?;
+        Ok(existing_owner_for(uid, gid))
     }
 
     pub async fn container_user(&self) -> Result<String, InstancePathError> {
+        let (uid, gid) = self.data_uid_gid().await?;
+        Ok(format!("{uid}:{gid}"))
+    }
+
+    async fn data_uid_gid(&self) -> Result<(u32, u32), InstancePathError> {
+        use std::os::unix::fs::MetadataExt;
+
         let metadata = tokio::fs::metadata(&self.data).await.map_err(|source| {
             InstancePathError::ReadMetadata {
                 path: self.data.display().to_string(),
                 source,
             }
         })?;
-
-        use std::os::unix::fs::MetadataExt;
-
-        Ok(format!("{}:{}", metadata.uid(), metadata.gid()))
+        Ok((metadata.uid(), metadata.gid()))
     }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    task: impl FnOnce() -> Result<T, InstancePathError> + Send + 'static,
+) -> Result<T, InstancePathError> {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| InstancePathError::Task(error.to_string()))?
+}
+
+async fn chown_paths_in_background(
+    paths: Vec<PathBuf>,
+    owner: HostOwner,
+) -> Result<(), InstancePathError> {
+    run_blocking(move || {
+        for path in paths {
+            chown_recursive(&path, owner).map_err(|source| InstancePathError::Chown {
+                path: path.display().to_string(),
+                source,
+            })?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn root(field: &'static str, value: &str) -> Result<PathBuf, InstancePathError> {
@@ -242,19 +201,14 @@ fn root(field: &'static str, value: &str) -> Result<PathBuf, InstancePathError> 
 }
 
 fn child(root: &Path, instance_id: &str) -> Result<PathBuf, InstancePathError> {
-    let path = root.join("instances").join(instance_id);
-    if path.starts_with(root) {
-        Ok(path)
-    } else {
-        Err(InstancePathError::EscapesRoot {
-            path: path.display().to_string(),
-            root: root.display().to_string(),
-        })
-    }
+    contained_in_root(root, root.join("instances").join(instance_id))
 }
 
 fn child_direct(root: &Path, instance_id: &str) -> Result<PathBuf, InstancePathError> {
-    let path = root.join(instance_id);
+    contained_in_root(root, root.join(instance_id))
+}
+
+fn contained_in_root(root: &Path, path: PathBuf) -> Result<PathBuf, InstancePathError> {
     if path.starts_with(root) {
         Ok(path)
     } else {
@@ -363,6 +317,13 @@ fn dir_status(path: &Path) -> Result<RuntimePathStatus, InstancePathError> {
 
 const DEFAULT_CONTAINER_UID: u32 = 1000;
 const DEFAULT_CONTAINER_GID: u32 = 1000;
+
+const CONTAINER_UID_ENV: &str = "DBE_CONTAINER_UID";
+const CONTAINER_GID_ENV: &str = "DBE_CONTAINER_GID";
+
+fn container_owner_from_env() -> Option<HostOwner> {
+    owner_from_env(CONTAINER_UID_ENV, CONTAINER_GID_ENV)
+}
 
 fn owner_from_env(uid_key: &str, gid_key: &str) -> Option<HostOwner> {
     let uid = std::env::var(uid_key).ok()?.parse::<u32>().ok()?;

@@ -32,7 +32,11 @@ const TAG_CATALOG: &str = "dbev-catalog";
 const TAG_LAYOUT: &str = "dbev-layout";
 const MAX_COMMAND_STDOUT: u64 = 8 * 1024 * 1024;
 const MAX_COMMAND_STDERR: u64 = 128 * 1024;
+const MAX_QUIET_COMMAND_STDOUT: u64 = 64 * 1024;
 const MAX_LISTED_SNAPSHOTS: usize = 10_000;
+const GROUP_OR_OTHER_WRITE_BITS: u32 = 0o022;
+const ANY_EXECUTE_BITS: u32 = 0o111;
+const STICKY_BIT: u32 = 0o1000;
 
 #[derive(Clone)]
 pub struct KopiaBackupDriver {
@@ -190,7 +194,7 @@ impl KopiaBackupDriver {
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
         check_instance_id(instance_id)?;
         let snapshots = self
-            .list_manifests(&[format!("{TAG_INSTANCE}:{instance_id}")], false)
+            .list_manifests(&[instance_tag(instance_id)], false)
             .await?;
         snapshots
             .into_iter()
@@ -215,7 +219,7 @@ impl KopiaBackupDriver {
     pub async fn delete_instance(&self, instance_id: &str) -> Result<usize, BackupStoreError> {
         check_instance_id(instance_id)?;
         let snapshots = self
-            .list_manifests(&[format!("{TAG_INSTANCE}:{instance_id}")], true)
+            .list_manifests(&[instance_tag(instance_id)], true)
             .await?;
         let count = snapshots.len();
         for snapshot in snapshots {
@@ -233,7 +237,7 @@ impl KopiaBackupDriver {
                     OsString::from(snapshot_id),
                     OsString::from("--delete"),
                 ],
-                64 * 1024,
+                MAX_QUIET_COMMAND_STDOUT,
             )
             .await?;
         ensure_success("delete snapshot", &output)
@@ -284,14 +288,14 @@ impl KopiaBackupDriver {
         )
         .await?;
         let read_path = destination.clone();
-        let result =
+        let read_task =
             tokio::task::spawn_blocking(move || read_bounded_private_file(&read_path, max_bytes))
                 .await;
         remove_file_if_exists(&destination).await;
-        let result = result.map_err(|error| {
+        let read_result = read_task.map_err(|error| {
             BackupStoreError::Runtime(format!("catalog read task failed: {error}"))
         })?;
-        result
+        read_result
             .map(Some)
             .map_err(|source| io_error("read restored Kopia catalog", source))
     }
@@ -306,7 +310,7 @@ impl KopiaBackupDriver {
         let mut snapshots = self
             .list_manifests(
                 &[
-                    format!("{TAG_INSTANCE}:{instance_id}"),
+                    instance_tag(instance_id),
                     format!("{TAG_BACKUP}:{backup_id}"),
                 ],
                 false,
@@ -364,17 +368,14 @@ impl KopiaBackupDriver {
         object_path: &str,
         destination: &Path,
     ) -> Result<(), BackupStoreError> {
-        let output = match self
-            .run(restore_arguments(object_path, destination), 64 * 1024)
+        let restored = self
+            .run(
+                restore_arguments(object_path, destination),
+                MAX_QUIET_COMMAND_STDOUT,
+            )
             .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                remove_file_if_exists(destination).await;
-                return Err(error);
-            }
-        };
-        if let Err(error) = ensure_success("restore object", &output) {
+            .and_then(|output| ensure_success("restore object", &output));
+        if let Err(error) = restored {
             remove_file_if_exists(destination).await;
             return Err(error);
         }
@@ -449,9 +450,20 @@ fn restore_arguments(object_path: &str, destination: &Path) -> Vec<OsString> {
     ]
 }
 
+fn instance_tag(instance_id: &str) -> String {
+    format!("{TAG_INSTANCE}:{instance_id}")
+}
+
+fn layout_tag_value(layout: BackupLayout) -> &'static str {
+    match layout {
+        BackupLayout::Physical => "physical",
+        BackupLayout::Logical => "logical",
+    }
+}
+
 fn manifest_tags(manifest: &StoredBackup) -> Vec<String> {
     vec![
-        format!("{TAG_INSTANCE}:{}", manifest.instance_id),
+        instance_tag(&manifest.instance_id),
         format!("{TAG_BACKUP}:{}", manifest.backup_id),
         format!("{TAG_SIZE}:{}", manifest.size_bytes),
         format!("{TAG_SHA256}:{}", manifest.sha256),
@@ -459,13 +471,7 @@ fn manifest_tags(manifest: &StoredBackup) -> Vec<String> {
         format!("{TAG_CREATED_AT}:{}", manifest.created_at.replace(':', "_")),
         format!("{TAG_PROTOCOL}:{}", manifest.protocol.as_str()),
         format!("{TAG_CATALOG}:{}", manifest.catalog_available),
-        format!(
-            "{TAG_LAYOUT}:{}",
-            match manifest.layout {
-                BackupLayout::Physical => "physical",
-                BackupLayout::Logical => "logical",
-            }
-        ),
+        format!("{TAG_LAYOUT}:{}", layout_tag_value(manifest.layout)),
     ]
 }
 
@@ -568,12 +574,13 @@ fn validate_trusted_file(
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|source| io_error(format!("inspect {label}"), source))?;
     let expected_uid = rustix::process::geteuid().as_raw();
+    let is_trusted_owner = |uid: u32| uid == 0 || uid == expected_uid;
     let mode = metadata.permissions().mode();
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || (metadata.uid() != 0 && metadata.uid() != expected_uid)
-        || mode & 0o022 != 0
-        || (executable && mode & 0o111 == 0)
+        || !is_trusted_owner(metadata.uid())
+        || mode & GROUP_OR_OTHER_WRITE_BITS != 0
+        || (executable && mode & ANY_EXECUTE_BITS == 0)
     {
         return Err(BackupStoreError::InvalidConfiguration(format!(
             "{label} {} must be a root/daemon-owned real file not writable by group or others{}",
@@ -589,11 +596,11 @@ fn validate_trusted_file(
         let metadata = std::fs::symlink_metadata(ancestor)
             .map_err(|source| io_error(format!("inspect {label} ancestor"), source))?;
         let mode = metadata.permissions().mode();
-        let sticky_root = metadata.uid() == 0 && mode & 0o1000 != 0;
+        let sticky_root = metadata.uid() == 0 && mode & STICKY_BIT != 0;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != expected_uid)
-            || (mode & 0o022 != 0 && !sticky_root)
+            || !is_trusted_owner(metadata.uid())
+            || (mode & GROUP_OR_OTHER_WRITE_BITS != 0 && !sticky_root)
         {
             return Err(BackupStoreError::InvalidConfiguration(format!(
                 "{label} ancestor {} is not trusted",

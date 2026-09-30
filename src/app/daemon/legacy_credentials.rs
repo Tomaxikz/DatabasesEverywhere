@@ -12,17 +12,11 @@ use crate::{
 /// The owned container and persisted verifier must agree; never guess/reset keys.
 pub(super) async fn recover(state: &AppState) -> anyhow::Result<()> {
     for mut metadata in state.instances.list().await {
-        if metadata.deployment_mode != DeploymentMode::Dedicated
-            || !matches!(metadata.protocol, Protocol::Qdrant | Protocol::Mariadb)
-            || metadata
-                .tenant_password
-                .as_ref()
-                .is_some_and(|secret| !secret.is_empty())
-        {
+        if !needs_credential_recovery(&metadata) {
             continue;
         }
         let _operation = state.instance_locks.lock(&metadata.instance_id).await;
-        let candidate = match candidate(state, &metadata).await {
+        let candidate = match container_credential_candidate(state, &metadata).await {
             Ok(Some(candidate)) => candidate,
             Ok(None) => continue,
             Err(_) => {
@@ -58,7 +52,17 @@ pub(super) async fn recover(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn candidate(
+fn needs_credential_recovery(metadata: &InstanceMetadata) -> bool {
+    let has_tenant_password = metadata
+        .tenant_password
+        .as_ref()
+        .is_some_and(|secret| !secret.is_empty());
+    metadata.deployment_mode == DeploymentMode::Dedicated
+        && matches!(metadata.protocol, Protocol::Qdrant | Protocol::Mariadb)
+        && !has_tenant_password
+}
+
+async fn container_credential_candidate(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> anyhow::Result<Option<SecretString>> {

@@ -1,12 +1,12 @@
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
 
 use crate::{
     instances::metadata::InstanceMetadata,
     placement::{DeploymentMode, PlacementError},
-    shared::{protocol::Protocol, time::now_rfc3339},
+    shared::{backend::BackendEndpoint, protocol::Protocol, time::now_rfc3339},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,9 +315,31 @@ impl DeploymentMigrationRepository {
             }
             return Err(error.into());
         }
-        self.get(&migration_id)
+        self.get_existing(&migration_id).await
+    }
+
+    async fn get_existing(
+        &self,
+        migration_id: &str,
+    ) -> Result<DeploymentMigration, DeploymentMigrationError> {
+        self.get(migration_id)
             .await?
-            .ok_or(DeploymentMigrationError::NotFound(migration_id))
+            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))
+    }
+
+    async fn get_at_revision(
+        &self,
+        migration_id: &str,
+        expected_revision: u64,
+    ) -> Result<DeploymentMigration, DeploymentMigrationError> {
+        let current = self.get_existing(migration_id).await?;
+        if current.revision != expected_revision {
+            return Err(DeploymentMigrationError::StaleRevision {
+                expected: expected_revision,
+                actual: current.revision,
+            });
+        }
+        Ok(current)
     }
 
     pub async fn get(
@@ -371,15 +393,8 @@ impl DeploymentMigrationRepository {
         patch: MigrationPatch<'_>,
     ) -> Result<DeploymentMigration, DeploymentMigrationError> {
         let current = self
-            .get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))?;
-        if current.revision != expected_revision {
-            return Err(DeploymentMigrationError::StaleRevision {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
+            .get_at_revision(migration_id, expected_revision)
+            .await?;
         if !current.stage.allows(next) {
             return Err(DeploymentMigrationError::InvalidTransition {
                 from: current.stage,
@@ -445,9 +460,7 @@ impl DeploymentMigrationRepository {
                 actual,
             });
         }
-        self.get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))
+        self.get_existing(migration_id).await
     }
 
     /// Atomically moves a provisional shared-pool reservation onto the public
@@ -466,38 +479,20 @@ impl DeploymentMigrationRepository {
             return Err(DeploymentMigrationError::InvalidCutoverTarget);
         }
         let current = self
-            .get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))?;
-        if current.revision != expected_revision {
-            return Err(DeploymentMigrationError::StaleRevision {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.stage != MigrationStage::CutoverPending
-            || current.source_mode != DeploymentMode::Dedicated
-            || current.target_mode != DeploymentMode::Shared
-            || current.instance_id != target.instance_id
-            || current.protocol != target.protocol
-            || current.target_runtime_id.as_deref() != Some(target.runtime_id())
-            || !current.source_fenced
-        {
+            .get_at_revision(migration_id, expected_revision)
+            .await?;
+        if !cutover_is_ready(
+            &current,
+            DeploymentMode::Dedicated,
+            DeploymentMode::Shared,
+            target,
+        ) {
             return Err(DeploymentMigrationError::CutoverNotReady);
         }
         let metadata_json = serde_json::to_string(target)?;
         let limits_json = serde_json::to_string(&target.limits)?;
-        let (backend_kind, socket_path, backend_host, backend_port) = match &target.backend {
-            crate::shared::backend::BackendEndpoint::UnixSocket { socket_path } => {
-                ("unix_socket", Some(socket_path.as_str()), None, None)
-            }
-            crate::shared::backend::BackendEndpoint::DockerTcp { host, port } => (
-                "docker_tcp",
-                None,
-                Some(host.as_str()),
-                Some(i64::from(*port)),
-            ),
-        };
+        let (backend_kind, socket_path, backend_host, backend_port) =
+            backend_columns(&target.backend);
         let next_revision = expected_revision
             .checked_add(1)
             .ok_or(DeploymentMigrationError::RevisionOverflow)?;
@@ -584,34 +579,17 @@ impl DeploymentMigrationRepository {
         .execute(&mut *transaction)
         .await?;
 
-        let migration = sqlx::query(
-            r#"
-            UPDATE deployment_migrations
-            SET stage = 'cutover_committed', revision = ?1,
-                cutover_committed = 1, failure_code = NULL,
-                failure_message = NULL, updated_at = ?2
-            WHERE migration_id = ?3 AND revision = ?4
-              AND stage = 'cutover_pending' AND source_fenced = 1
-              AND target_runtime_id = ?5
-            "#,
+        mark_cutover_committed(
+            &mut transaction,
+            migration_id,
+            expected_revision,
+            next_revision,
+            &now,
+            target.runtime_id(),
         )
-        .bind(u64_to_i64(next_revision)?)
-        .bind(&now)
-        .bind(migration_id)
-        .bind(u64_to_i64(expected_revision)?)
-        .bind(target.runtime_id())
-        .execute(&mut *transaction)
         .await?;
-        if migration.rows_affected() != 1 {
-            return Err(DeploymentMigrationError::StaleRevision {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
         transaction.commit().await?;
-        self.get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))
+        self.get_existing(migration_id).await
     }
 
     /// Atomically makes a prepared dedicated runtime authoritative and removes
@@ -630,39 +608,21 @@ impl DeploymentMigrationRepository {
             return Err(DeploymentMigrationError::InvalidCutoverTarget);
         }
         let current = self
-            .get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))?;
-        if current.revision != expected_revision {
-            return Err(DeploymentMigrationError::StaleRevision {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.stage != MigrationStage::CutoverPending
-            || current.source_mode != DeploymentMode::Shared
-            || current.target_mode != DeploymentMode::Dedicated
-            || current.instance_id != target.instance_id
-            || current.protocol != target.protocol
-            || current.target_runtime_id.as_deref() != Some(target.runtime_id())
-            || !current.source_fenced
-        {
+            .get_at_revision(migration_id, expected_revision)
+            .await?;
+        if !cutover_is_ready(
+            &current,
+            DeploymentMode::Shared,
+            DeploymentMode::Dedicated,
+            target,
+        ) {
             return Err(DeploymentMigrationError::CutoverNotReady);
         }
 
         let metadata_json = serde_json::to_string(target)?;
         let limits_json = serde_json::to_string(&target.limits)?;
-        let (backend_kind, socket_path, backend_host, backend_port) = match &target.backend {
-            crate::shared::backend::BackendEndpoint::UnixSocket { socket_path } => {
-                ("unix_socket", Some(socket_path.as_str()), None, None)
-            }
-            crate::shared::backend::BackendEndpoint::DockerTcp { host, port } => (
-                "docker_tcp",
-                None,
-                Some(host.as_str()),
-                Some(i64::from(*port)),
-            ),
-        };
+        let (backend_kind, socket_path, backend_host, backend_port) =
+            backend_columns(&target.backend);
         let next_revision = expected_revision
             .checked_add(1)
             .ok_or(DeploymentMigrationError::RevisionOverflow)?;
@@ -751,34 +711,17 @@ impl DeploymentMigrationRepository {
             ));
         }
 
-        let migration = sqlx::query(
-            r#"
-            UPDATE deployment_migrations
-            SET stage = 'cutover_committed', revision = ?1,
-                cutover_committed = 1, failure_code = NULL,
-                failure_message = NULL, updated_at = ?2
-            WHERE migration_id = ?3 AND revision = ?4
-              AND stage = 'cutover_pending' AND source_fenced = 1
-              AND target_runtime_id = ?5
-            "#,
+        mark_cutover_committed(
+            &mut transaction,
+            migration_id,
+            expected_revision,
+            next_revision,
+            &now,
+            target.runtime_id(),
         )
-        .bind(u64_to_i64(next_revision)?)
-        .bind(&now)
-        .bind(migration_id)
-        .bind(u64_to_i64(expected_revision)?)
-        .bind(target.runtime_id())
-        .execute(&mut *transaction)
         .await?;
-        if migration.rows_affected() != 1 {
-            return Err(DeploymentMigrationError::StaleRevision {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
         transaction.commit().await?;
-        self.get(migration_id)
-            .await?
-            .ok_or_else(|| DeploymentMigrationError::NotFound(migration_id.to_string()))
+        self.get_existing(migration_id).await
     }
 
     pub async fn recover_unfinished(
@@ -790,10 +733,19 @@ impl DeploymentMigrationRepository {
                 summary.already_pending += 1;
                 continue;
             };
-            let failure = match next {
-                MigrationStage::Failed => MigrationFailure::RestartBeforeMutation,
-                MigrationStage::RollingBack => MigrationFailure::RestartBeforeCutover,
-                MigrationStage::CleanupPending => MigrationFailure::RestartAfterCutover,
+            let (failure, recovered_count) = match next {
+                MigrationStage::Failed => (
+                    MigrationFailure::RestartBeforeMutation,
+                    &mut summary.failed_before_mutation,
+                ),
+                MigrationStage::RollingBack => (
+                    MigrationFailure::RestartBeforeCutover,
+                    &mut summary.rollback_pending,
+                ),
+                MigrationStage::CleanupPending => (
+                    MigrationFailure::RestartAfterCutover,
+                    &mut summary.cleanup_pending,
+                ),
                 _ => {
                     return Err(DeploymentMigrationError::InvalidValue(
                         "recovery_stage",
@@ -811,20 +763,76 @@ impl DeploymentMigrationRepository {
                 },
             )
             .await?;
-            match next {
-                MigrationStage::Failed => summary.failed_before_mutation += 1,
-                MigrationStage::RollingBack => summary.rollback_pending += 1,
-                MigrationStage::CleanupPending => summary.cleanup_pending += 1,
-                _ => {
-                    return Err(DeploymentMigrationError::InvalidValue(
-                        "recovery_stage",
-                        next.as_str().to_string(),
-                    ));
-                }
-            }
+            *recovered_count += 1;
         }
         Ok(summary)
     }
+}
+
+fn cutover_is_ready(
+    current: &DeploymentMigration,
+    source_mode: DeploymentMode,
+    target_mode: DeploymentMode,
+    target: &InstanceMetadata,
+) -> bool {
+    current.stage == MigrationStage::CutoverPending
+        && current.source_mode == source_mode
+        && current.target_mode == target_mode
+        && current.instance_id == target.instance_id
+        && current.protocol == target.protocol
+        && current.target_runtime_id.as_deref() == Some(target.runtime_id())
+        && current.source_fenced
+}
+
+type BackendColumns<'a> = (&'static str, Option<&'a str>, Option<&'a str>, Option<i64>);
+
+fn backend_columns(backend: &BackendEndpoint) -> BackendColumns<'_> {
+    match backend {
+        BackendEndpoint::UnixSocket { socket_path } => {
+            ("unix_socket", Some(socket_path.as_str()), None, None)
+        }
+        BackendEndpoint::DockerTcp { host, port } => (
+            "docker_tcp",
+            None,
+            Some(host.as_str()),
+            Some(i64::from(*port)),
+        ),
+    }
+}
+
+async fn mark_cutover_committed(
+    connection: &mut SqliteConnection,
+    migration_id: &str,
+    expected_revision: u64,
+    next_revision: u64,
+    now: &str,
+    target_runtime_id: &str,
+) -> Result<(), DeploymentMigrationError> {
+    let migration = sqlx::query(
+        r#"
+            UPDATE deployment_migrations
+            SET stage = 'cutover_committed', revision = ?1,
+                cutover_committed = 1, failure_code = NULL,
+                failure_message = NULL, updated_at = ?2
+            WHERE migration_id = ?3 AND revision = ?4
+              AND stage = 'cutover_pending' AND source_fenced = 1
+              AND target_runtime_id = ?5
+            "#,
+    )
+    .bind(u64_to_i64(next_revision)?)
+    .bind(now)
+    .bind(migration_id)
+    .bind(u64_to_i64(expected_revision)?)
+    .bind(target_runtime_id)
+    .execute(&mut *connection)
+    .await?;
+    if migration.rows_affected() != 1 {
+        return Err(DeploymentMigrationError::StaleRevision {
+            expected: expected_revision,
+            actual: expected_revision,
+        });
+    }
+    Ok(())
 }
 
 fn read_migration(row: &SqliteRow) -> Result<DeploymentMigration, DeploymentMigrationError> {

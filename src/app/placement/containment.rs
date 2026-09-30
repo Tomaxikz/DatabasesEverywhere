@@ -12,6 +12,7 @@ use crate::{
     runtime::docker::DockerContainerStatus,
     shared::time::now_rfc3339,
     state::AppState,
+    storage::quarantine::QuarantineKind,
 };
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,7 +48,7 @@ pub(crate) async fn contain_locked(
     state: &AppState,
     snapshot: &EngineRuntime,
     reason: &str,
-    kind: Option<crate::storage::quarantine::QuarantineKind>,
+    kind: Option<QuarantineKind>,
 ) -> ContainmentReport {
     let tenant_ids = tenant_ids(state, &snapshot.runtime_id).await;
     for instance_id in &tenant_ids {
@@ -122,65 +123,102 @@ async fn persist_quarantine(
     state: &AppState,
     snapshot: &EngineRuntime,
     tenant_ids: &[String],
-    kind: Option<crate::storage::quarantine::QuarantineKind>,
+    kind: Option<QuarantineKind>,
     report: &mut ContainmentReport,
 ) -> bool {
-    let mut persisted = false;
-    match state.placements.get(&snapshot.runtime_id).await {
-        Ok(Some(mut runtime))
+    let persisted = persist_runtime_quarantine(state, snapshot, kind, report).await;
+    persist_tenant_quarantines(state, snapshot, tenant_ids, kind, report).await;
+    persisted
+}
+
+async fn persist_runtime_quarantine(
+    state: &AppState,
+    snapshot: &EngineRuntime,
+    kind: Option<QuarantineKind>,
+    report: &mut ContainmentReport,
+) -> bool {
+    let mut runtime = match state.placements.get(&snapshot.runtime_id).await {
+        Ok(Some(runtime))
             if runtime.deployment_mode == DeploymentMode::Shared
                 && runtime.protocol == snapshot.protocol
                 && runtime.created_at == snapshot.created_at =>
         {
-            runtime.status = EngineRuntimeStatus::Quarantined;
-            runtime.updated_at = now_rfc3339();
-            let saved = match kind {
-                Some(kind) => state.placements.save_quarantined(&runtime, kind).await,
-                None => state.placements.save(&runtime).await,
-            };
-            persisted = match saved {
-                Ok(()) => true,
-                Err(error) => {
-                    let recorded = match kind {
-                        Some(kind) => state
-                            .placements
-                            .quarantine_recorded(&runtime, kind)
-                            .await
-                            .unwrap_or(false),
-                        None => true,
-                    };
-                    let confirmed = recorded
-                        && state
-                            .placements
-                            .get(&snapshot.runtime_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|stored| {
-                                stored.status == EngineRuntimeStatus::Quarantined
-                                    && stored.protocol == snapshot.protocol
-                                    && stored.created_at == snapshot.created_at
-                            });
-                    if !confirmed {
-                        report
-                            .errors
-                            .push(format!("failed to persist runtime quarantine: {error}"));
-                    }
-                    confirmed
-                }
-            };
+            runtime
         }
-        Ok(Some(_)) => report
+        Ok(Some(_)) => {
+            report
+                .errors
+                .push("runtime identity changed before quarantine persistence".to_string());
+            return false;
+        }
+        Ok(None) => {
+            report
+                .errors
+                .push("runtime disappeared before quarantine persistence".to_string());
+            return false;
+        }
+        Err(error) => {
+            report
+                .errors
+                .push(format!("failed to load runtime for quarantine: {error}"));
+            return false;
+        }
+    };
+    runtime.status = EngineRuntimeStatus::Quarantined;
+    runtime.updated_at = now_rfc3339();
+    let saved = match kind {
+        Some(kind) => state.placements.save_quarantined(&runtime, kind).await,
+        None => state.placements.save(&runtime).await,
+    };
+    let Err(error) = saved else {
+        return true;
+    };
+    let confirmed = quarantine_confirmed_after_failed_save(state, snapshot, &runtime, kind).await;
+    if !confirmed {
+        report
             .errors
-            .push("runtime identity changed before quarantine persistence".to_string()),
-        Ok(None) => report
-            .errors
-            .push("runtime disappeared before quarantine persistence".to_string()),
-        Err(error) => report
-            .errors
-            .push(format!("failed to load runtime for quarantine: {error}")),
+            .push(format!("failed to persist runtime quarantine: {error}"));
     }
+    confirmed
+}
 
+async fn quarantine_confirmed_after_failed_save(
+    state: &AppState,
+    snapshot: &EngineRuntime,
+    runtime: &EngineRuntime,
+    kind: Option<QuarantineKind>,
+) -> bool {
+    let recorded = match kind {
+        Some(kind) => state
+            .placements
+            .quarantine_recorded(runtime, kind)
+            .await
+            .unwrap_or(false),
+        None => true,
+    };
+    if !recorded {
+        return false;
+    }
+    state
+        .placements
+        .get(&snapshot.runtime_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|stored| {
+            stored.status == EngineRuntimeStatus::Quarantined
+                && stored.protocol == snapshot.protocol
+                && stored.created_at == snapshot.created_at
+        })
+}
+
+async fn persist_tenant_quarantines(
+    state: &AppState,
+    snapshot: &EngineRuntime,
+    tenant_ids: &[String],
+    kind: Option<QuarantineKind>,
+    report: &mut ContainmentReport,
+) {
     for instance_id in tenant_ids {
         let mut metadata = match state.manager.get_persisted(instance_id).await {
             Ok(Some(metadata))
@@ -214,7 +252,6 @@ async fn persist_quarantine(
             ));
         }
     }
-    persisted
 }
 
 pub(crate) async fn stop_pool(state: &AppState, runtime: &EngineRuntime) -> Result<(), String> {

@@ -41,11 +41,7 @@ pub(crate) async fn provision_pool(
     // cleanup prevents an early event from reviving a failed pool from a stale
     // snapshot.
     let runtime_operation = state.instance_locks.lock(&runtime_id).await;
-    let admin_password = format!(
-        "dbe-pool-{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    let admin_password = generate_admin_password();
     let paths = InstancePaths::new(&state.config.paths, &runtime_id)
         .map_err(|error| ApiError::Runtime(error.to_string()))?;
     // Resolve every fallible identity value before creating the pool's
@@ -158,57 +154,7 @@ pub(crate) async fn provision_pool(
         created_at: now.clone(),
         updated_at: now,
     };
-    if let Err(error) = state.placements.save(&runtime).await {
-        let save_error = placement_error(error);
-        match state.placements.get(&runtime_id).await {
-            Ok(Some(persisted)) if same_initial_runtime(&persisted, &runtime) => {
-                tracing::warn!(
-                    event = "audit shared_runtime_create_commit_ack_lost",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    "initial shared runtime placement was committed despite a lost SQLite acknowledgement"
-                );
-            }
-            Ok(None) => {
-                return Err(cleanup_unpersisted_runtime(
-                    state,
-                    &paths,
-                    protocol,
-                    &runtime.limits.disk_enforcement_method,
-                    save_error,
-                )
-                .await);
-            }
-            Ok(Some(_)) => {
-                tracing::error!(
-                    event = "audit shared_runtime_create_commit_ambiguous",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    durable_state = "mismatched",
-                    "retained provisional shared runtime paths because placement persistence became ambiguous"
-                );
-                return Err(ApiError::Runtime(format!(
-                    "initial shared runtime placement returned {save_error}, but runtime {runtime_id} contains different durable state; retained its physical state for boot recovery"
-                )));
-            }
-            Err(read_error) => {
-                tracing::error!(
-                    event = "audit shared_runtime_create_commit_ambiguous",
-                    runtime_id = %runtime_id,
-                    %protocol,
-                    error = %save_error,
-                    durable_state = "unreadable",
-                    durable_read_error = %read_error,
-                    "retained provisional shared runtime paths because placement persistence became ambiguous"
-                );
-                return Err(ApiError::Runtime(format!(
-                    "initial shared runtime placement returned {save_error}, and durable state for runtime {runtime_id} could not be read ({read_error}); retained its physical state for boot recovery"
-                )));
-            }
-        }
-    }
+    persist_initial_runtime(state, &runtime, &paths).await?;
     drop(creation.take());
 
     state.install_progress.stage(
@@ -280,6 +226,74 @@ pub(crate) async fn provision_pool(
         max_tenants = runtime.max_tenants,
     );
     Ok((runtime, runtime_operation))
+}
+
+fn generate_admin_password() -> String {
+    format!(
+        "dbe-pool-{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+async fn persist_initial_runtime(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    paths: &InstancePaths,
+) -> Result<(), ApiError> {
+    let Err(error) = state.placements.save(runtime).await else {
+        return Ok(());
+    };
+    let save_error = placement_error(error);
+    let runtime_id = &runtime.runtime_id;
+    let protocol = runtime.protocol;
+    match state.placements.get(runtime_id).await {
+        Ok(Some(persisted)) if same_initial_runtime(&persisted, runtime) => {
+            tracing::warn!(
+                event = "audit shared_runtime_create_commit_ack_lost",
+                runtime_id = %runtime_id,
+                %protocol,
+                error = %save_error,
+                "initial shared runtime placement was committed despite a lost SQLite acknowledgement"
+            );
+            Ok(())
+        }
+        Ok(None) => Err(cleanup_unpersisted_runtime(
+            state,
+            paths,
+            protocol,
+            &runtime.limits.disk_enforcement_method,
+            save_error,
+        )
+        .await),
+        Ok(Some(_)) => {
+            tracing::error!(
+                event = "audit shared_runtime_create_commit_ambiguous",
+                runtime_id = %runtime_id,
+                %protocol,
+                error = %save_error,
+                durable_state = "mismatched",
+                "retained provisional shared runtime paths because placement persistence became ambiguous"
+            );
+            Err(ApiError::Runtime(format!(
+                "initial shared runtime placement returned {save_error}, but runtime {runtime_id} contains different durable state; retained its physical state for boot recovery"
+            )))
+        }
+        Err(read_error) => {
+            tracing::error!(
+                event = "audit shared_runtime_create_commit_ambiguous",
+                runtime_id = %runtime_id,
+                %protocol,
+                error = %save_error,
+                durable_state = "unreadable",
+                durable_read_error = %read_error,
+                "retained provisional shared runtime paths because placement persistence became ambiguous"
+            );
+            Err(ApiError::Runtime(format!(
+                "initial shared runtime placement returned {save_error}, and durable state for runtime {runtime_id} could not be read ({read_error}); retained its physical state for boot recovery"
+            )))
+        }
+    }
 }
 
 async fn cleanup_unpersisted_runtime(

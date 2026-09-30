@@ -109,21 +109,17 @@ pub(super) async fn prime(state: &AppState) -> usize {
             // Native hard quotas already reject writes in the kernel and do
             // not need telemetry before a route can open. Prime only the soft
             // guards whose safety depends on a successful catalog query.
-            match sample_runtime(state, tenants.clone(), false).await {
-                Ok(()) => false,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "shared tenant storage could not be measured before gateway startup"
-                    );
-                    match sample_group_runtime(&tenants) {
-                        Some(runtime_id) => {
-                            fence_unmeasured_runtime(state, &runtime_id, &error).await > 0
-                        }
-                        None => false,
-                    }
-                }
-            }
+            let Err(error) = sample_runtime(state, tenants.clone(), false).await else {
+                return false;
+            };
+            tracing::error!(
+                %error,
+                "shared tenant storage could not be measured before gateway startup"
+            );
+            let Some(runtime_id) = sample_group_runtime(&tenants) else {
+                return false;
+            };
+            fence_unmeasured_runtime(state, &runtime_id, &error).await > 0
         })
         .buffer_unordered(SAMPLE_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -305,16 +301,13 @@ async fn refresh_hard_usage(
         .get(runtime.runtime_id.as_str())
         .await
         .map_err(|error| format!("failed to recheck shared runtime identity: {error}"))?;
-    if !current
+    let tenant_unchanged = current
         .as_ref()
-        .is_some_and(|metadata| same_hard_identity(metadata, snapshot))
-        || !current_runtime.as_ref().is_some_and(|candidate| {
-            candidate.runtime_id == runtime.runtime_id
-                && candidate.created_at == runtime.created_at
-                && candidate.protocol == runtime.protocol
-                && candidate.deployment_mode == DeploymentMode::Shared
-        })
-    {
+        .is_some_and(|metadata| same_hard_identity(metadata, snapshot));
+    let runtime_unchanged = current_runtime
+        .as_ref()
+        .is_some_and(|candidate| same_shared_runtime(candidate, runtime));
+    if !tenant_unchanged || !runtime_unchanged {
         return Err("shared tenant identity changed during disk sampling".to_string());
     }
 
@@ -347,6 +340,13 @@ fn same_hard_identity(current: &InstanceMetadata, snapshot: &InstanceMetadata) -
         && current.database.username == snapshot.database.username
 }
 
+fn same_shared_runtime(candidate: &EngineRuntime, runtime: &EngineRuntime) -> bool {
+    candidate.runtime_id == runtime.runtime_id
+        && candidate.created_at == runtime.created_at
+        && candidate.protocol == runtime.protocol
+        && candidate.deployment_mode == DeploymentMode::Shared
+}
+
 async fn store_sample(state: &AppState, metadata: &InstanceMetadata, used_bytes: u64) {
     state
         .resource_cache
@@ -374,7 +374,7 @@ fn check_sample_count(runtime_id: &str, expected: usize, actual: usize) -> Resul
 /// stale recovery decision.
 async fn enforce_quota_locked(state: &AppState, snapshot: InstanceMetadata, used_bytes: u64) {
     let runtime_id = snapshot.runtime_id().to_string();
-    let Some(mut metadata) = state.instances.get(&snapshot.instance_id).await else {
+    let Some(metadata) = state.instances.get(&snapshot.instance_id).await else {
         return;
     };
     if metadata.deployment_mode != DeploymentMode::Shared
@@ -408,94 +408,117 @@ async fn enforce_quota_locked(state: &AppState, snapshot: InstanceMetadata, used
     else {
         return;
     };
+
+    if should_block {
+        block_over_quota_tenant(state, &runtime, metadata, used_bytes, limit_bytes).await;
+    } else {
+        recover_under_quota_tenant(state, &runtime, metadata, used_bytes, recovery_bytes).await;
+    }
+}
+
+async fn block_over_quota_tenant(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    mut metadata: InstanceMetadata,
+    used_bytes: u64,
+    limit_bytes: u64,
+) {
+    let runtime_id = metadata.runtime_id().to_string();
     let target = TenantTarget {
         database: &metadata.database.name,
         username: &metadata.database.username,
     };
-
-    if should_block && !metadata.disk_limit_blocked {
-        crate::api::instances::route_fence::fence(state, &metadata.instance_id).await;
-        if let Err(error) = tenant::fence(&state.docker, &runtime, target).await {
-            tracing::error!(
-                event = "audit shared_tenant_disk_engine_fence_failed",
-                instance_id = %metadata.instance_id,
-                %runtime_id,
-                %error,
-                "gateway access remains fenced"
-            );
-        }
-        metadata.disk_limit_blocked = true;
-        metadata.updated_at = now_rfc3339();
-        if let Err(error) = state.manager.upsert(metadata.clone()).await {
-            // Keep the blocked fact in memory even when durable storage is
-            // temporarily unavailable. The explicit route fence remains the
-            // authority, and a later low-usage sample can now recover instead
-            // of leaving this process permanently stuck closed.
-            state.instances.upsert_fenced(metadata.clone()).await;
-            tracing::error!(
-                event = "audit shared_tenant_disk_block_persist_failed",
-                instance_id = %metadata.instance_id,
-                %runtime_id,
-                %error,
-                "tenant remains fenced in memory and at the engine"
-            );
-            return;
-        }
-        tracing::warn!(
-            event = "audit shared_tenant_disk_limit_reached",
+    crate::api::instances::route_fence::fence(state, &metadata.instance_id).await;
+    if let Err(error) = tenant::fence(&state.docker, runtime, target).await {
+        tracing::error!(
+            event = "audit shared_tenant_disk_engine_fence_failed",
             instance_id = %metadata.instance_id,
             %runtime_id,
-            used_bytes,
-            limit_bytes,
-            "tenant access was fenced without stopping the shared runtime"
+            %error,
+            "gateway access remains fenced"
+        );
+    }
+    metadata.disk_limit_blocked = true;
+    metadata.updated_at = now_rfc3339();
+    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+        // Keep the blocked fact in memory even when durable storage is
+        // temporarily unavailable. The explicit route fence remains the
+        // authority, and a later low-usage sample can now recover instead
+        // of leaving this process permanently stuck closed.
+        state.instances.upsert_fenced(metadata.clone()).await;
+        tracing::error!(
+            event = "audit shared_tenant_disk_block_persist_failed",
+            instance_id = %metadata.instance_id,
+            %runtime_id,
+            %error,
+            "tenant remains fenced in memory and at the engine"
         );
         return;
     }
+    tracing::warn!(
+        event = "audit shared_tenant_disk_limit_reached",
+        instance_id = %metadata.instance_id,
+        %runtime_id,
+        used_bytes,
+        limit_bytes,
+        "tenant access was fenced without stopping the shared runtime"
+    );
+}
 
-    if !should_block && metadata.disk_limit_blocked {
-        if metadata.status == InstanceStatus::Running
-            && metadata.desired_state == DesiredInstanceState::Running
-        {
-            let opened = match metadata.tenant_password.as_deref() {
-                Some(password) => tenant::open_verified(&state.docker, &runtime, target, password)
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => Err("the encrypted tenant credential is missing".to_string()),
-            };
-            if let Err(error) = opened {
-                tracing::warn!(
-                    event = "audit shared_tenant_disk_recovery_deferred",
-                    instance_id = %metadata.instance_id,
-                    %runtime_id,
-                    %error,
-                );
-                return;
-            }
-        }
-        metadata.disk_limit_blocked = false;
-        metadata.updated_at = now_rfc3339();
-        if let Err(error) = state.manager.upsert(metadata.clone()).await {
-            let _ = tenant::fence(&state.docker, &runtime, target).await;
-            crate::api::instances::route_fence::fence(state, &metadata.instance_id).await;
-            metadata.disk_limit_blocked = true;
-            state.instances.upsert_fenced(metadata.clone()).await;
-            tracing::error!(
-                event = "audit shared_tenant_disk_recovery_persist_failed",
+async fn recover_under_quota_tenant(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    mut metadata: InstanceMetadata,
+    used_bytes: u64,
+    recovery_bytes: u64,
+) {
+    let runtime_id = metadata.runtime_id().to_string();
+    let target = TenantTarget {
+        database: &metadata.database.name,
+        username: &metadata.database.username,
+    };
+    let should_be_open = metadata.status == InstanceStatus::Running
+        && metadata.desired_state == DesiredInstanceState::Running;
+    if should_be_open {
+        let opened = match metadata.tenant_password.as_deref() {
+            Some(password) => tenant::open_verified(&state.docker, runtime, target, password)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("the encrypted tenant credential is missing".to_string()),
+        };
+        if let Err(error) = opened {
+            tracing::warn!(
+                event = "audit shared_tenant_disk_recovery_deferred",
                 instance_id = %metadata.instance_id,
                 %runtime_id,
                 %error,
-                "rolled engine access back to fenced"
             );
             return;
         }
-        tracing::info!(
-            event = "audit shared_tenant_disk_limit_recovered",
+    }
+    metadata.disk_limit_blocked = false;
+    metadata.updated_at = now_rfc3339();
+    if let Err(error) = state.manager.upsert(metadata.clone()).await {
+        let _ = tenant::fence(&state.docker, runtime, target).await;
+        crate::api::instances::route_fence::fence(state, &metadata.instance_id).await;
+        metadata.disk_limit_blocked = true;
+        state.instances.upsert_fenced(metadata.clone()).await;
+        tracing::error!(
+            event = "audit shared_tenant_disk_recovery_persist_failed",
             instance_id = %metadata.instance_id,
             %runtime_id,
-            used_bytes,
-            recovery_bytes,
+            %error,
+            "rolled engine access back to fenced"
         );
+        return;
     }
+    tracing::info!(
+        event = "audit shared_tenant_disk_limit_recovered",
+        instance_id = %metadata.instance_id,
+        %runtime_id,
+        used_bytes,
+        recovery_bytes,
+    );
 }
 
 fn sample_group_runtime(tenants: &[InstanceMetadata]) -> Option<String> {

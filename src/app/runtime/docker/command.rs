@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use bollard::{
     container::LogOutput,
@@ -17,6 +17,7 @@ const DOCKER_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DOCKER_EXEC_RECOVERY_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCKER_EXEC_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const DOCKER_EXEC_SHORT_RECOVERY_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_FAILURE_OUTPUT_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Copy)]
 struct ExecPolicy {
@@ -54,6 +55,15 @@ impl CommandOutput {
         Self {
             stdout: String::new(),
             stderr: String::new(),
+        }
+    }
+
+    pub(super) fn failure_output(&self) -> &str {
+        let stderr = self.stderr.trim();
+        if stderr.is_empty() {
+            self.stdout.trim()
+        } else {
+            stderr
         }
     }
 }
@@ -114,7 +124,7 @@ impl DockerRuntime {
         self.exec_logged(
             protocol,
             instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            shell_command(script),
             None,
             ExecPolicy {
                 log_failure: false,
@@ -268,7 +278,7 @@ impl DockerRuntime {
         self.exec_logged(
             protocol,
             instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            shell_command(script),
             Some(environment),
             policy,
         )
@@ -283,20 +293,11 @@ impl DockerRuntime {
         environment: Option<Vec<String>>,
         policy: ExecPolicy,
     ) -> Result<CommandOutput, DockerError> {
-        let secret_values = environment
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|entry| entry.split_once('=').map(|(_, value)| value.to_string()))
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>();
+        let secret_values = environment_secret_values(environment.as_deref().unwrap_or_default());
         let name = self
             .required_managed_container_id(protocol, instance_id)
             .await?;
-        let operation = command
-            .first()
-            .map(|program| format!("{program} [arguments redacted]"))
-            .unwrap_or_else(|| "[empty command]".to_string());
+        let operation = redacted_operation(&command);
         let exec = self
             .docker
             .create_exec(
@@ -320,51 +321,35 @@ impl DockerRuntime {
         {
             Ok(result) => result?,
             Err(_) => {
-                self.recover_timed_out_exec(protocol, instance_id, &name, &operation, policy)
-                    .await?;
-                return Err(DockerError::ExecTimedOut {
-                    container: name,
-                    operation,
-                    timeout_seconds: policy.timeout.as_secs(),
-                });
+                return Err(self
+                    .timed_out_exec_error(protocol, instance_id, name, operation, policy)
+                    .await);
             }
         };
 
         let mut stdout = CappedExecOutput::default();
         let mut stderr = CappedExecOutput::default();
-        match started {
-            StartExecResults::Attached { mut output, .. } => {
-                let drain = async {
-                    while let Some(chunk) = output.next().await {
-                        match chunk? {
-                            LogOutput::StdOut { message } => stdout.append(&message),
-                            LogOutput::StdErr { message } => stderr.append(&message),
-                            LogOutput::Console { message } => stdout.append(&message),
-                            LogOutput::StdIn { .. } => {}
+        if let StartExecResults::Attached { mut output, .. } = started {
+            let drain = async {
+                while let Some(chunk) = output.next().await {
+                    match chunk? {
+                        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                            stdout.append(&message)
                         }
-                    }
-                    Ok::<(), BollardError>(())
-                };
-                match tokio::time::timeout_at(deadline, drain).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        self.recover_timed_out_exec(
-                            protocol,
-                            instance_id,
-                            &name,
-                            &operation,
-                            policy,
-                        )
-                        .await?;
-                        return Err(DockerError::ExecTimedOut {
-                            container: name,
-                            operation,
-                            timeout_seconds: policy.timeout.as_secs(),
-                        });
+                        LogOutput::StdErr { message } => stderr.append(&message),
+                        LogOutput::StdIn { .. } => {}
                     }
                 }
+                Ok::<(), BollardError>(())
+            };
+            match tokio::time::timeout_at(deadline, drain).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(self
+                        .timed_out_exec_error(protocol, instance_id, name, operation, policy)
+                        .await);
+                }
             }
-            StartExecResults::Detached => {}
         }
 
         let inspect = self.docker.inspect_exec(&exec.id).await?;
@@ -377,29 +362,44 @@ impl DockerRuntime {
             stderr: redaction::redact_exact_secrets(&stderr.into_string(), &secret_values),
         };
         if exit_code == 0 {
-            Ok(output)
-        } else {
-            let failure_output = if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            };
-            let failure_output = truncate_log_tail(failure_output, 4_000);
-            if policy.log_failure {
-                tracing::warn!(
-                    container = %name,
-                    %operation,
-                    exit_code,
-                    %failure_output,
-                    "docker exec failed"
-                );
-            }
-            Err(DockerError::ExecFailed {
-                container: name,
-                operation,
+            return Ok(output);
+        }
+        let failure_output = truncate_log_tail(output.failure_output(), MAX_FAILURE_OUTPUT_CHARS);
+        if policy.log_failure {
+            tracing::warn!(
+                container = %name,
+                %operation,
                 exit_code,
-                failure_output,
-            })
+                %failure_output,
+                "docker exec failed"
+            );
+        }
+        Err(DockerError::ExecFailed {
+            container: name,
+            operation,
+            exit_code,
+            failure_output,
+        })
+    }
+
+    async fn timed_out_exec_error(
+        &self,
+        protocol: Protocol,
+        instance_id: &str,
+        container: String,
+        operation: String,
+        policy: ExecPolicy,
+    ) -> DockerError {
+        if let Err(recovery_error) = self
+            .recover_timed_out_exec(protocol, instance_id, &container, &operation, policy)
+            .await
+        {
+            return recovery_error;
+        }
+        DockerError::ExecTimedOut {
+            container,
+            operation,
+            timeout_seconds: policy.timeout.as_secs(),
         }
     }
 
@@ -490,8 +490,10 @@ impl DockerRuntime {
         readiness_timeout: Duration,
     ) -> Result<(), DockerError> {
         self.disable_restarts(protocol, instance_id).await?;
-        match tokio::time::timeout(
-            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
+        bounded_recovery_step(
+            container,
+            operation,
+            "container kill",
             self.docker.kill_container(
                 container,
                 Some(KillContainerOptions {
@@ -499,49 +501,19 @@ impl DockerRuntime {
                 }),
             ),
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => {
-                return Err(exec_recovery_error(container, operation, source));
-            }
-            Err(_) => {
-                return Err(exec_recovery_error(
-                    container,
-                    operation,
-                    format!(
-                        "container kill exceeded {} seconds",
-                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
-                    ),
-                ));
-            }
-        }
+        .await?;
 
         // Kill the hung command even when restart admission is exhausted.
         // Charge recovery before starting, and never reset it on daemon boot.
         self.note_start(instance_id, true).await?;
-        match tokio::time::timeout(
-            DOCKER_EXEC_RECOVERY_STEP_TIMEOUT,
+        bounded_recovery_step(
+            container,
+            operation,
+            "container restart",
             self.docker
                 .start_container(container, None::<StartContainerOptions>),
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => {
-                return Err(exec_recovery_error(container, operation, source));
-            }
-            Err(_) => {
-                return Err(exec_recovery_error(
-                    container,
-                    operation,
-                    format!(
-                        "container restart exceeded {} seconds",
-                        DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
-                    ),
-                ));
-            }
-        }
+        .await?;
 
         Box::pin(self.wait_until_ready(protocol, instance_id, readiness_timeout))
             .await
@@ -560,12 +532,8 @@ impl DockerRuntime {
         instance_id: &str,
         script: &str,
     ) -> Result<CommandOutput, DockerError> {
-        self.exec(
-            protocol,
-            instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-        )
-        .await
+        self.exec(protocol, instance_id, shell_command(script))
+            .await
     }
 
     pub async fn exec_shell_with_timeout(
@@ -575,13 +543,47 @@ impl DockerRuntime {
         script: &str,
         timeout: Duration,
     ) -> Result<CommandOutput, DockerError> {
-        self.exec_with_timeout(
-            protocol,
-            instance_id,
-            vec!["sh".to_string(), "-c".to_string(), script.to_string()],
-            timeout,
-        )
-        .await
+        self.exec_with_timeout(protocol, instance_id, shell_command(script), timeout)
+            .await
+    }
+}
+
+pub(super) fn shell_command(script: &str) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+}
+
+fn environment_secret_values(environment: &[String]) -> Vec<String> {
+    environment
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(_, value)| value.to_string()))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn redacted_operation(command: &[String]) -> String {
+    command
+        .first()
+        .map(|program| format!("{program} [arguments redacted]"))
+        .unwrap_or_else(|| "[empty command]".to_string())
+}
+
+async fn bounded_recovery_step(
+    container: &str,
+    operation: &str,
+    step: &str,
+    action: impl Future<Output = Result<(), BollardError>>,
+) -> Result<(), DockerError> {
+    match tokio::time::timeout(DOCKER_EXEC_RECOVERY_STEP_TIMEOUT, action).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source)) => Err(exec_recovery_error(container, operation, source)),
+        Err(_) => Err(exec_recovery_error(
+            container,
+            operation,
+            format!(
+                "{step} exceeded {} seconds",
+                DOCKER_EXEC_RECOVERY_STEP_TIMEOUT.as_secs()
+            ),
+        )),
     }
 }
 

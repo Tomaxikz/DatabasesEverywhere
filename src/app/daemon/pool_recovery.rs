@@ -20,6 +20,11 @@ use crate::{
     state::AppState,
 };
 
+const POOL_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_RECOVERY_MANIFESTS: usize = 1024;
+const MAX_RECOVERY_ROOT_ENTRIES: usize = 4096;
+const MAX_RECOVERY_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 /// Called synchronously at boot before the API or gateway workers exist. The
 /// daemon lock excludes offline writers; the pool lock spans the whole attempt.
 pub(super) async fn recover_dead_pools(state: &AppState) -> anyhow::Result<RecoverySummary> {
@@ -96,37 +101,9 @@ pub(super) async fn recover_dead_pools(state: &AppState) -> anyhow::Result<Recov
         if let Err(error) = result {
             summary.failed += 1;
             if was_quarantined {
-                let containment = contain_locked(
-                    state,
-                    &runtime,
-                    "automatic boot recovery failed",
-                    Some(crate::storage::quarantine::QuarantineKind::RecoveryFailed),
-                )
-                .await;
-                tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error, containment = %containment.summary());
-                ensure!(
-                    containment.contained(),
-                    "could not contain failed recovery of {id}"
-                );
+                contain_failed_recovery(state, &runtime, &error).await?;
             } else {
-                tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error,
-                    "pool retry failed; lifecycle failure policy keeps it down");
-                crate::placement::containment::stop_pool(state, &runtime)
-                    .await
-                    .map_err(anyhow::Error::msg)
-                    .context("could not verify shutdown after automatic pool retry")?;
-                let stored = state
-                    .placements
-                    .get(id)
-                    .await?
-                    .context("failed retry lost its durable pool")?;
-                ensure!(
-                    stored.created_at == runtime.created_at
-                        && (stored.status == EngineRuntimeStatus::Quarantined
-                            || (stored.status == EngineRuntimeStatus::Failed
-                                && stored.desired_state == DesiredInstanceState::Stopped)),
-                    "failed recovery did not persist a safe inactive state for {id}"
-                );
+                stop_failed_retry(state, &runtime, &error).await?;
             }
             continue;
         }
@@ -149,6 +126,54 @@ pub(super) async fn recover_dead_pools(state: &AppState) -> anyhow::Result<Recov
         "automatic shared pool recovery finished"
     );
     Ok(summary)
+}
+
+async fn contain_failed_recovery(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let id = &runtime.runtime_id;
+    let containment = contain_locked(
+        state,
+        runtime,
+        "automatic boot recovery failed",
+        Some(crate::storage::quarantine::QuarantineKind::RecoveryFailed),
+    )
+    .await;
+    tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error, containment = %containment.summary());
+    ensure!(
+        containment.contained(),
+        "could not contain failed recovery of {id}"
+    );
+    Ok(())
+}
+
+async fn stop_failed_retry(
+    state: &AppState,
+    runtime: &EngineRuntime,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let id = &runtime.runtime_id;
+    tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error,
+        "pool retry failed; lifecycle failure policy keeps it down");
+    crate::placement::containment::stop_pool(state, runtime)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("could not verify shutdown after automatic pool retry")?;
+    let stored = state
+        .placements
+        .get(id)
+        .await?
+        .context("failed retry lost its durable pool")?;
+    let safely_inactive = stored.status == EngineRuntimeStatus::Quarantined
+        || (stored.status == EngineRuntimeStatus::Failed
+            && stored.desired_state == DesiredInstanceState::Stopped);
+    ensure!(
+        stored.created_at == runtime.created_at && safely_inactive,
+        "failed recovery did not persist a safe inactive state for {id}"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -408,7 +433,7 @@ async fn recover_locked(
         .wait_until_ready(
             runtime.protocol,
             &runtime.runtime_id,
-            Duration::from_secs(180),
+            POOL_RECOVERY_READY_TIMEOUT,
         )
         .await?;
     lifecycle::attest_runtime_locked(state, &mut runtime)
@@ -483,21 +508,21 @@ async fn retained_recovery_targets(
     super::boot_recovery::collect_logical_manifests(
         &tmp.join("import-export"),
         &mut manifests,
-        1024,
-        4096,
+        MAX_RECOVERY_MANIFESTS,
+        MAX_RECOVERY_ROOT_ENTRIES,
     )
     .await?;
     super::boot_recovery::collect_remote_manifests(
         &tmp.join("remote-import"),
         &mut manifests,
-        1024,
-        4096,
+        MAX_RECOVERY_MANIFESTS,
+        MAX_RECOVERY_ROOT_ENTRIES,
     )
     .await?;
     let mut blocked = HashSet::new();
     for path in manifests {
         let bytes = tokio::task::spawn_blocking(move || {
-            crate::shared::files::read_bounded_private_file(&path, 1024 * 1024)
+            crate::shared::files::read_bounded_private_file(&path, MAX_RECOVERY_MANIFEST_BYTES)
         })
         .await??;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, digest::Output};
 use uuid::Uuid;
 
 use super::{MAX_OBJECTS, MAX_SCHEMA_BYTES, ManifestError};
@@ -11,6 +11,9 @@ const SCHEMA_VERSION: &[u8] = b"dbev-tenant-schema-v2";
 const DATA_VERSION: &[u8] = b"dbev-tenant-data-v2";
 const ROW_VERSION: &[u8] = b"dbev-tenant-row-v2";
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_OBJECT_KEY_BYTES: usize = 4_096;
+const DIGEST_WORDS: usize = 4;
+const DIGEST_TSV_FIELDS: usize = 1 + 2 * DIGEST_WORDS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ManifestChallenge(pub [u8; 32]);
@@ -119,17 +122,19 @@ impl MultisetDigest {
             ));
         }
         let fields = line.trim().split('\t').collect::<Vec<_>>();
-        if fields.len() != 9 {
+        if fields.len() != DIGEST_TSV_FIELDS {
             return Err(ManifestError::InvalidCatalog(
                 "invalid content digest shape",
             ));
         }
         let count = parse_u64(fields[0], "invalid content row count")?;
-        let mut sums = [0_u64; 4];
-        let mut xors = [0_u64; 4];
-        for index in 0..4 {
-            sums[index] = parse_u64(fields[index + 1], "invalid content digest sum")?;
-            xors[index] = parse_word(fields[index + 5])?;
+        let sum_fields = &fields[1..=DIGEST_WORDS];
+        let xor_fields = &fields[1 + DIGEST_WORDS..];
+        let mut sums = [0_u64; DIGEST_WORDS];
+        let mut xors = [0_u64; DIGEST_WORDS];
+        for index in 0..DIGEST_WORDS {
+            sums[index] = parse_u64(sum_fields[index], "invalid content digest sum")?;
+            xors[index] = parse_word(xor_fields[index])?;
         }
         Ok(Self { count, sums, xors })
     }
@@ -203,46 +208,9 @@ pub(super) fn finish(
     reject_duplicate_keys(collected.schema.iter().map(|record| record.key.as_slice()))?;
     reject_duplicate_keys(collected.data.iter().map(|record| record.key.as_slice()))?;
 
-    let schema_bytes = collected.schema.iter().try_fold(0_usize, |total, record| {
-        total
-            .checked_add(record.key.len())
-            .and_then(|value| value.checked_add(record.value.len()))
-            .ok_or(ManifestError::SchemaLimit(MAX_SCHEMA_BYTES))
-    })?;
-    if schema_bytes > MAX_SCHEMA_BYTES {
-        return Err(ManifestError::SchemaLimit(MAX_SCHEMA_BYTES));
-    }
-
-    let mut schema_hasher = Sha256::new();
-    schema_hasher.update(SCHEMA_VERSION);
-    hash_field(&mut schema_hasher, protocol.as_str().as_bytes());
-    schema_hasher.update((collected.schema.len() as u64).to_be_bytes());
-    for record in &collected.schema {
-        hash_field(&mut schema_hasher, &record.key);
-        hash_field(&mut schema_hasher, &record.value);
-    }
-    let schema_digest = schema_hasher.finalize();
-
-    let mut row_count = 0_u64;
-    let mut data_hasher = Sha256::new();
-    data_hasher.update(DATA_VERSION);
-    hash_field(&mut data_hasher, protocol.as_str().as_bytes());
-    data_hasher.update(challenge.0);
-    data_hasher.update((collected.data.len() as u64).to_be_bytes());
-    for record in &collected.data {
-        row_count = row_count
-            .checked_add(record.digest.count)
-            .ok_or(ManifestError::RowCountOverflow)?;
-        hash_field(&mut data_hasher, &record.key);
-        data_hasher.update(record.digest.count.to_be_bytes());
-        for word in record.digest.sums {
-            data_hasher.update(word.to_be_bytes());
-        }
-        for word in record.digest.xors {
-            data_hasher.update(word.to_be_bytes());
-        }
-    }
-    let data_digest = data_hasher.finalize();
+    check_schema_size(&collected.schema)?;
+    let schema_digest = schema_digest(protocol, &collected.schema);
+    let (row_count, data_digest) = data_digest(protocol, challenge, &collected.data)?;
 
     let mut manifest_hasher = Sha256::new();
     manifest_hasher.update(MANIFEST_VERSION);
@@ -262,8 +230,60 @@ pub(super) fn finish(
     })
 }
 
+fn check_schema_size(schema: &[SchemaRecord]) -> Result<(), ManifestError> {
+    let schema_bytes = schema.iter().try_fold(0_usize, |total, record| {
+        total
+            .checked_add(record.key.len())
+            .and_then(|value| value.checked_add(record.value.len()))
+            .ok_or(ManifestError::SchemaLimit(MAX_SCHEMA_BYTES))
+    })?;
+    if schema_bytes > MAX_SCHEMA_BYTES {
+        return Err(ManifestError::SchemaLimit(MAX_SCHEMA_BYTES));
+    }
+    Ok(())
+}
+
+fn schema_digest(protocol: Protocol, schema: &[SchemaRecord]) -> Output<Sha256> {
+    let mut hasher = Sha256::new();
+    hasher.update(SCHEMA_VERSION);
+    hash_field(&mut hasher, protocol.as_str().as_bytes());
+    hasher.update((schema.len() as u64).to_be_bytes());
+    for record in schema {
+        hash_field(&mut hasher, &record.key);
+        hash_field(&mut hasher, &record.value);
+    }
+    hasher.finalize()
+}
+
+fn data_digest(
+    protocol: Protocol,
+    challenge: ManifestChallenge,
+    data: &[DataRecord],
+) -> Result<(u64, Output<Sha256>), ManifestError> {
+    let mut row_count = 0_u64;
+    let mut hasher = Sha256::new();
+    hasher.update(DATA_VERSION);
+    hash_field(&mut hasher, protocol.as_str().as_bytes());
+    hasher.update(challenge.0);
+    hasher.update((data.len() as u64).to_be_bytes());
+    for record in data {
+        row_count = row_count
+            .checked_add(record.digest.count)
+            .ok_or(ManifestError::RowCountOverflow)?;
+        hash_field(&mut hasher, &record.key);
+        hasher.update(record.digest.count.to_be_bytes());
+        for word in record.digest.sums {
+            hasher.update(word.to_be_bytes());
+        }
+        for word in record.digest.xors {
+            hasher.update(word.to_be_bytes());
+        }
+    }
+    Ok((row_count, hasher.finalize()))
+}
+
 fn validate_record(key: &[u8], value: &[u8]) -> Result<(), ManifestError> {
-    if key.is_empty() || key.len() > 4_096 {
+    if key.is_empty() || key.len() > MAX_OBJECT_KEY_BYTES {
         return Err(ManifestError::InvalidCatalog("invalid manifest object key"));
     }
     if value.len() > MAX_RECORD_BYTES {

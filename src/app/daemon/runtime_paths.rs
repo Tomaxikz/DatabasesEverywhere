@@ -27,32 +27,30 @@ pub(super) async fn prepare_instance_paths(
             runtime_sockets = %paths.sockets.display(),
             "daemon boot bind-mount ownership applied for rootless Podman"
         );
+    } else if let Some((uid, gid)) = docker
+        .configured_container_user(protocol, instance_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|user| parse_container_user(&user))
+    {
+        tracing::info!(
+            instance_id,
+            protocol = %protocol,
+            uid,
+            gid,
+            runtime_sockets = %paths.sockets.display(),
+            "daemon boot runtime socket directory ownership applied from existing container user"
+        );
+        paths.apply_socket_owner(uid, gid).await?;
     } else {
-        if let Some((uid, gid)) = docker
-            .configured_container_user(protocol, instance_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|user| parse_container_user(&user))
-        {
-            tracing::info!(
-                instance_id,
-                protocol = %protocol,
-                uid,
-                gid,
-                runtime_sockets = %paths.sockets.display(),
-                "daemon boot runtime socket directory ownership applied from existing container user"
-            );
-            paths.apply_socket_owner(uid, gid).await?;
-        } else {
-            tracing::info!(
-                instance_id,
-                protocol = %protocol,
-                runtime_sockets = %paths.sockets.display(),
-                "daemon boot runtime socket directory ownership falling back to data path owner heuristic"
-            );
-            paths.apply_container_owner().await?;
-        }
+        tracing::info!(
+            instance_id,
+            protocol = %protocol,
+            runtime_sockets = %paths.sockets.display(),
+            "daemon boot runtime socket directory ownership falling back to data path owner heuristic"
+        );
+        paths.apply_container_owner().await?;
     }
     let socket_status = paths.socket_dir_status().await?;
     tracing::info!(
@@ -214,7 +212,7 @@ pub(super) async fn prepare_runtime_dirs(
 pub(super) fn create_runtime_dirs(path: &Path) -> anyhow::Result<()> {
     use std::path::Component;
 
-    use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+    use rustix::fs::{Mode, OFlags, open};
 
     if !path.is_absolute() || path == Path::new("/") {
         anyhow::bail!(
@@ -241,42 +239,52 @@ pub(super) fn create_runtime_dirs(path: &Path) -> anyhow::Result<()> {
             }
         };
         traversed.push(name);
-        let child = match openat(&directory, name, flags, Mode::empty()) {
-            Ok(child) => child,
-            Err(rustix::io::Errno::NOENT) => {
-                match mkdirat(&directory, name, Mode::RWXU) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => {
-                        return Err(std::io::Error::from(error)).with_context(|| {
-                            format!(
-                                "failed to create runtime directory component {}",
-                                traversed.display()
-                            )
-                        });
-                    }
-                }
-                openat(&directory, name, flags, Mode::empty())
-                    .map_err(std::io::Error::from)
-                    .with_context(|| {
-                        format!(
-                            "failed to securely open newly created runtime directory component {}",
-                            traversed.display()
-                        )
-                    })?
-            }
-            Err(error) => {
-                return Err(std::io::Error::from(error)).with_context(|| {
-                    format!(
-                        "runtime directory component {} must be a real directory, not a symlink",
-                        traversed.display()
-                    )
-                });
-            }
-        };
+        let child = open_or_create_dir_component(&directory, name, flags, &traversed)?;
         validate_runtime_dir(&child, &traversed, daemon_uid)?;
         directory = child;
     }
     Ok(())
+}
+
+fn open_or_create_dir_component(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    flags: rustix::fs::OFlags,
+    traversed: &Path,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, mkdirat, openat};
+
+    match openat(directory, name, flags, Mode::empty()) {
+        Ok(child) => return Ok(child),
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(std::io::Error::from(error)).with_context(|| {
+                format!(
+                    "runtime directory component {} must be a real directory, not a symlink",
+                    traversed.display()
+                )
+            });
+        }
+    }
+    match mkdirat(directory, name, Mode::RWXU) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => {
+            return Err(std::io::Error::from(error)).with_context(|| {
+                format!(
+                    "failed to create runtime directory component {}",
+                    traversed.display()
+                )
+            });
+        }
+    }
+    openat(directory, name, flags, Mode::empty())
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "failed to securely open newly created runtime directory component {}",
+                traversed.display()
+            )
+        })
 }
 
 pub(super) fn validate_runtime_dir(
@@ -302,9 +310,7 @@ pub(super) fn validate_runtime_dir(
         );
     }
     let mode = stat.st_mode;
-    let writable_by_others = mode & 0o022 != 0;
-    let protected_sticky_directory = owner == 0 && mode & 0o1000 != 0;
-    if writable_by_others && !protected_sticky_directory {
+    if is_writable_by_untrusted_users(owner, mode) {
         anyhow::bail!(
             "runtime path component {} is writable by group or others (mode {:04o})",
             path.display(),
@@ -312,6 +318,12 @@ pub(super) fn validate_runtime_dir(
         );
     }
     Ok(())
+}
+
+fn is_writable_by_untrusted_users(owner: u32, mode: u32) -> bool {
+    let writable_by_others = mode & 0o022 != 0;
+    let protected_sticky_directory = owner == 0 && mode & 0o1000 != 0;
+    writable_by_others && !protected_sticky_directory
 }
 
 pub(super) fn validate_runtime_ancestors(path: &Path, include_target: bool) -> anyhow::Result<()> {
@@ -359,9 +371,7 @@ pub(super) fn validate_runtime_ancestors(path: &Path, include_target: bool) -> a
         }
 
         let mode = metadata.permissions().mode();
-        let writable_by_others = mode & 0o022 != 0;
-        let protected_sticky_directory = owner == 0 && mode & 0o1000 != 0;
-        if writable_by_others && !protected_sticky_directory {
+        if is_writable_by_untrusted_users(owner, mode) {
             anyhow::bail!(
                 "runtime path ancestor {} for {} is writable by group or others (mode {:04o})",
                 ancestor.display(),
@@ -457,6 +467,7 @@ pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLoc
             locks_root.display()
         )
     })?;
+    let lock_path = locks_root.join(DAEMON_LOCK_FILE);
     let lock_fd = rustix::fs::openat(
         &directory,
         DAEMON_LOCK_FILE,
@@ -467,7 +478,7 @@ pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLoc
     .with_context(|| {
         format!(
             "failed to securely open daemon lock {}",
-            locks_root.join(DAEMON_LOCK_FILE).display()
+            lock_path.display()
         )
     })?;
 
@@ -479,7 +490,7 @@ pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLoc
     {
         anyhow::bail!(
             "daemon lock {} must be a regular, singly-linked file owned by uid {expected_uid}",
-            locks_root.join(DAEMON_LOCK_FILE).display()
+            lock_path.display()
         );
     }
     rustix::fs::fchmod(&lock_fd, Mode::RUSR | Mode::WUSR)
@@ -489,10 +500,7 @@ pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLoc
     match rustix::fs::flock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {}
         Err(rustix::io::Errno::WOULDBLOCK) => {
-            anyhow::bail!(
-                "another dbev daemon already owns {}",
-                locks_root.join(DAEMON_LOCK_FILE).display()
-            );
+            anyhow::bail!("another dbev daemon already owns {}", lock_path.display());
         }
         Err(error) => {
             return Err(std::io::Error::from(error))

@@ -10,6 +10,9 @@ use sqlx::{
 
 use super::migrations;
 
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_POOL_CONNECTIONS: u32 = 5;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteStorageError {
     #[error("failed to create sqlite parent directory {path}: {source}")]
@@ -55,11 +58,11 @@ pub async fn connect(data_root: &Path) -> Result<SqlitePool, SqliteStorageError>
         .synchronous(SqliteSynchronous::Normal)
         // Bound writer admission, including BEGIN IMMEDIATE. Keep concurrent
         // WAL readers; read/modify/write transactions acquire the writer first.
-        .busy_timeout(Duration::from_secs(5))
+        .busy_timeout(BUSY_TIMEOUT)
         .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(MAX_POOL_CONNECTIONS)
         .connect_with(options)
         .await?;
     migrations::run(&pool).await?;

@@ -28,6 +28,11 @@ const MAX_MULTIPART_PARTS: u64 = 10_000;
 const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024_u64.pow(4);
 const MAX_LISTED_OBJECT_KEYS: usize = 100_000;
 const MAX_LIST_PAGES: usize = 1_024;
+const LIST_PAGE_MAX_KEYS: &str = "1000";
+const MAX_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+const RETRY_BASE_DELAY_MILLIS: u64 = 200;
+const MAX_RETRY_BACKOFF_EXPONENT: usize = 4;
+const METADATA_KEY_SUFFIX: &str = ".metadata.json";
 
 #[derive(Clone)]
 pub struct S3BackupDriver {
@@ -114,7 +119,9 @@ impl S3BackupDriver {
         let timeout = Duration::from_secs(config.request_timeout_seconds);
         let client = reqwest::Client::builder()
             .timeout(timeout)
-            .connect_timeout(Duration::from_secs(timeout.as_secs().min(30)))
+            .connect_timeout(Duration::from_secs(
+                timeout.as_secs().min(MAX_CONNECT_TIMEOUT_SECONDS),
+            ))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
@@ -200,7 +207,7 @@ impl S3BackupDriver {
         let keys = self.list_keys(&prefix).await?;
         let mut backups = Vec::new();
         for key in keys {
-            if !key.ends_with(".metadata.json") {
+            if !key.ends_with(METADATA_KEY_SUFFIX) {
                 continue;
             }
             match self.get_manifest_by_key(instance_id, &key).await {
@@ -270,11 +277,11 @@ impl S3BackupDriver {
         let mut keys = self.list_keys(&prefix).await?;
         let published = keys
             .iter()
-            .filter(|key| key.ends_with(".metadata.json"))
+            .filter(|key| key.ends_with(METADATA_KEY_SUFFIX))
             .count();
         // Hide published entries first, then remove archives, catalogs, and
         // any crash-orphaned objects that never received metadata.
-        keys.sort_by_key(|key| !key.ends_with(".metadata.json"));
+        keys.sort_by_key(|key| !key.ends_with(METADATA_KEY_SUFFIX));
         for key in keys {
             self.delete_object(&key, true).await?;
         }
@@ -520,16 +527,7 @@ impl S3BackupDriver {
         upload_id: &str,
         parts: &[MultipartPart],
     ) -> Result<(), BackupStoreError> {
-        let mut body = String::from("<CompleteMultipartUpload>");
-        for part in parts {
-            body.push_str("<Part><PartNumber>");
-            body.push_str(&part.part_number.to_string());
-            body.push_str("</PartNumber><ETag>");
-            body.push_str(&xml_escape(&part.etag));
-            body.push_str("</ETag></Part>");
-        }
-        body.push_str("</CompleteMultipartUpload>");
-        let body = body.into_bytes();
+        let body = complete_multipart_body(parts).into_bytes();
         let query = vec![("uploadId".to_string(), upload_id.to_string())];
         let payload_hash = hex_sha256(&body);
         let response = self
@@ -670,10 +668,7 @@ impl S3BackupDriver {
         }
 
         let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        {
-            options.mode(0o600);
-        }
+        options.write(true).create_new(true).mode(0o600);
         let mut file = options
             .open(destination)
             .await
@@ -791,6 +786,11 @@ impl S3BackupDriver {
         let mut pages = 0_usize;
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.request_timeout_seconds);
+        let deadline_exceeded = |_| {
+            BackupStoreError::Remote(
+                "S3 list objects exceeded its overall request deadline".to_string(),
+            )
+        };
         loop {
             pages += 1;
             if pages > MAX_LIST_PAGES {
@@ -798,32 +798,16 @@ impl S3BackupDriver {
                     "S3 list objects exceeded its {MAX_LIST_PAGES}-page safety limit"
                 )));
             }
-            let mut query = vec![
-                ("encoding-type".to_string(), "url".to_string()),
-                ("list-type".to_string(), "2".to_string()),
-                ("max-keys".to_string(), "1000".to_string()),
-                ("prefix".to_string(), prefix.to_string()),
-            ];
-            if let Some(token) = continuation.as_ref() {
-                query.push(("continuation-token".to_string(), token.clone()));
-            }
+            let query = list_objects_query(prefix, continuation.as_deref());
             let response = tokio::time::timeout_at(deadline, self.list_with_retry(&query))
                 .await
-                .map_err(|_| {
-                    BackupStoreError::Remote(
-                        "S3 list objects exceeded its overall request deadline".to_string(),
-                    )
-                })??;
+                .map_err(deadline_exceeded)??;
             let body = tokio::time::timeout_at(
                 deadline,
                 response_bytes_bounded(response, MAX_LIST_BYTES, "list objects"),
             )
             .await
-            .map_err(|_| {
-                BackupStoreError::Remote(
-                    "S3 list objects exceeded its overall request deadline".to_string(),
-                )
-            })??;
+            .map_err(deadline_exceeded)??;
             let xml = std::str::from_utf8(&body).map_err(|_| {
                 BackupStoreError::Corrupt("S3 list response was not UTF-8 XML".to_string())
             })?;
@@ -1029,28 +1013,22 @@ impl S3BackupDriver {
 
 impl S3Endpoint {
     fn new(config: &BackupS3Config) -> Result<Self, BackupStoreError> {
-        let mut base = if config.endpoint.trim().is_empty() {
-            if config.path_style {
-                Url::parse(&format!(
-                    "https://s3.{}.amazonaws.com/",
-                    config.region.trim()
-                ))
-            } else {
-                Url::parse(&format!(
-                    "https://{}.s3.{}.amazonaws.com/",
-                    config.bucket.trim(),
-                    config.region.trim()
-                ))
-            }
+        let custom_endpoint = config.endpoint.trim();
+        let region = config.region.trim();
+        let bucket = config.bucket.trim();
+        let mut base = if !custom_endpoint.is_empty() {
+            Url::parse(custom_endpoint)
+        } else if config.path_style {
+            Url::parse(&format!("https://s3.{region}.amazonaws.com/"))
         } else {
-            Url::parse(config.endpoint.trim())
+            Url::parse(&format!("https://{bucket}.s3.{region}.amazonaws.com/"))
         }
         .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
-        if !config.path_style && !config.endpoint.trim().is_empty() {
+        if !config.path_style && !custom_endpoint.is_empty() {
             let host = base.host_str().ok_or_else(|| {
                 BackupStoreError::InvalidConfiguration("S3 endpoint has no host".to_string())
             })?;
-            let virtual_host = format!("{}.{}", config.bucket.trim(), host);
+            let virtual_host = format!("{bucket}.{host}");
             base.set_host(Some(&virtual_host)).map_err(|_| {
                 BackupStoreError::InvalidConfiguration(
                     "failed to construct virtual-hosted S3 endpoint".to_string(),
@@ -1112,20 +1090,19 @@ impl S3Endpoint {
 }
 
 fn credentials(config: &BackupS3Config) -> Result<S3Credentials, BackupStoreError> {
-    let configured_access = config.access_key_id.trim();
-    let configured_secret = config.secret_access_key.expose().trim();
-    let access_key_id = if configured_access.is_empty() {
-        std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default()
-    } else {
-        configured_access.to_string()
+    let configured_or_env = |configured: &str, variable: &str| {
+        let value = if configured.is_empty() {
+            std::env::var(variable).unwrap_or_default()
+        } else {
+            configured.to_string()
+        };
+        value.trim().to_string()
     };
-    let secret_access_key = if configured_secret.is_empty() {
-        std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default()
-    } else {
-        configured_secret.to_string()
-    };
-    let access_key_id = access_key_id.trim().to_string();
-    let secret_access_key = secret_access_key.trim().to_string();
+    let access_key_id = configured_or_env(config.access_key_id.trim(), "AWS_ACCESS_KEY_ID");
+    let secret_access_key = configured_or_env(
+        config.secret_access_key.expose().trim(),
+        "AWS_SECRET_ACCESS_KEY",
+    );
     if access_key_id.is_empty() || secret_access_key.is_empty() {
         return Err(BackupStoreError::InvalidConfiguration(
             "S3 requires access_key_id/secret_access_key or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
@@ -1145,6 +1122,19 @@ fn credentials(config: &BackupS3Config) -> Result<S3Credentials, BackupStoreErro
         secret_access_key,
         session_token,
     })
+}
+
+fn list_objects_query(prefix: &str, continuation: Option<&str>) -> Vec<(String, String)> {
+    let mut query = vec![
+        ("encoding-type".to_string(), "url".to_string()),
+        ("list-type".to_string(), "2".to_string()),
+        ("max-keys".to_string(), LIST_PAGE_MAX_KEYS.to_string()),
+        ("prefix".to_string(), prefix.to_string()),
+    ];
+    if let Some(token) = continuation {
+        query.push(("continuation-token".to_string(), token.to_string()));
+    }
+    query
 }
 
 fn canonical_query(query: &[(String, String)]) -> String {
@@ -1212,6 +1202,19 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+fn complete_multipart_body(parts: &[MultipartPart]) -> String {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for part in parts {
+        body.push_str("<Part><PartNumber>");
+        body.push_str(&part.part_number.to_string());
+        body.push_str("</PartNumber><ETag>");
+        body.push_str(&xml_escape(&part.etag));
+        body.push_str("</ETag></Part>");
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     encode_lower(&Sha256::digest(bytes))
 }
@@ -1247,26 +1250,22 @@ fn xml_unescape(value: &str) -> String {
 
 fn percent_decode(value: &str) -> Result<String, BackupStoreError> {
     let bytes = value.as_bytes();
+    let hex_digit_at = |position: usize| bytes.get(position).copied().and_then(nibble);
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err(BackupStoreError::Corrupt(
-                    "S3 returned an invalid percent-encoded object key".to_string(),
-                ));
-            }
-            let Some((high, low)) = nibble(bytes[index + 1]).zip(nibble(bytes[index + 2])) else {
-                return Err(BackupStoreError::Corrupt(
-                    "S3 returned an invalid percent-encoded object key".to_string(),
-                ));
-            };
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
+        if bytes[index] != b'%' {
             decoded.push(bytes[index]);
             index += 1;
+            continue;
         }
+        let (Some(high), Some(low)) = (hex_digit_at(index + 1), hex_digit_at(index + 2)) else {
+            return Err(BackupStoreError::Corrupt(
+                "S3 returned an invalid percent-encoded object key".to_string(),
+            ));
+        };
+        decoded.push((high << 4) | low);
+        index += 3;
     }
     String::from_utf8(decoded)
         .map_err(|_| BackupStoreError::Corrupt("S3 returned a non-UTF-8 object key".to_string()))
@@ -1306,8 +1305,8 @@ fn retryable_error(error: &reqwest::Error) -> bool {
 }
 
 async fn retry_delay(attempt: usize) {
-    let factor = 1_u64 << u32::try_from(attempt.min(4)).unwrap_or(4);
-    tokio::time::sleep(Duration::from_millis(200 * factor)).await;
+    let factor = 1_u64 << attempt.min(MAX_RETRY_BACKOFF_EXPONENT);
+    tokio::time::sleep(Duration::from_millis(RETRY_BASE_DELAY_MILLIS * factor)).await;
 }
 
 fn multipart_part_size(size: u64) -> u64 {

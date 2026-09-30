@@ -17,6 +17,8 @@ use crate::{
 
 mod worker;
 
+const TARGET_POOL_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartDeploymentMigrationRequest {
@@ -88,12 +90,11 @@ pub async fn start_deployment_migration(
             ApiError::BadRequest("shared target requires pool_id; create the pool first".into())
         })?;
         target_pool_guard = Some(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                state.instance_locks.lock(id),
-            )
-            .await
-            .map_err(|_| ApiError::Conflict("target pool is busy; retry the migration".into()))?,
+            tokio::time::timeout(TARGET_POOL_LOCK_TIMEOUT, state.instance_locks.lock(id))
+                .await
+                .map_err(|_| {
+                    ApiError::Conflict("target pool is busy; retry the migration".into())
+                })?,
         );
         let pool = crate::api::pools::load(&state, id).await?;
         if pool.owner != metadata.owner
@@ -111,20 +112,19 @@ pub async fn start_deployment_migration(
             "dedicated target cannot select a pool".into(),
         ));
     }
-    let target_limits = request
-        .limits
-        .as_ref()
-        .map(|limits| {
-            if request.target_mode != DeploymentMode::Dedicated {
-                return Err(ApiError::BadRequest(
-                    "limits is only valid for a dedicated migration target".into(),
-                ));
-            }
+    let target_limits = match &request.limits {
+        None => None,
+        Some(_) if request.target_mode != DeploymentMode::Dedicated => {
+            return Err(ApiError::BadRequest(
+                "limits is only valid for a dedicated migration target".into(),
+            ));
+        }
+        Some(limits) => {
             crate::api::instances::requests::validate_limits(limits)?;
             crate::api::instances::requests::validate_protocol_limits(metadata.protocol, limits)?;
-            Ok(crate::api::instances::requests::limits_from_request(limits))
-        })
-        .transpose()?;
+            Some(crate::api::instances::requests::limits_from_request(limits))
+        }
+    };
 
     let mutation = state
         .daemon_shutdown
@@ -246,21 +246,29 @@ async fn validate_source(
                 "source placement runtime is missing; reconcile it first".to_string(),
             )
         })?;
-    if (metadata.deployment_mode == DeploymentMode::Shared
-        && (metadata.owner.is_none() || runtime.owner != metadata.owner))
-        || runtime.protocol != metadata.protocol
-        || runtime.deployment_mode != metadata.deployment_mode
-        || !matches!(
-            runtime.status,
-            EngineRuntimeStatus::Running | EngineRuntimeStatus::Booting
-        )
-    {
+    if !source_runtime_is_live_match(metadata, &runtime) {
         return Err(ApiError::Conflict(
             "source placement is not a live matching runtime; reconcile it before migration"
                 .to_string(),
         ));
     }
     Ok(())
+}
+
+fn source_runtime_is_live_match(
+    metadata: &crate::instances::metadata::InstanceMetadata,
+    runtime: &crate::placement::EngineRuntime,
+) -> bool {
+    let owner_matches = metadata.deployment_mode != DeploymentMode::Shared
+        || (metadata.owner.is_some() && runtime.owner == metadata.owner);
+    let runtime_is_live = matches!(
+        runtime.status,
+        EngineRuntimeStatus::Running | EngineRuntimeStatus::Booting
+    );
+    owner_matches
+        && runtime.protocol == metadata.protocol
+        && runtime.deployment_mode == metadata.deployment_mode
+        && runtime_is_live
 }
 
 fn migration_source_is_live(

@@ -8,7 +8,9 @@ use crate::{
     },
     instances::metadata::DesiredInstanceState,
     jobs::import_export::ImportExportJobPermit,
-    placement::{EngineRuntime, EngineRuntimeStatus, TenantReservationState, lifecycle},
+    placement::{
+        DeploymentMigration, EngineRuntime, EngineRuntimeStatus, TenantReservationState, lifecycle,
+    },
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -82,11 +84,10 @@ impl PoolGuard {
             .list_active()
             .await
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
-        if active.iter().any(|job| {
-            job.source_runtime_id == runtime_id
-                || job.target_runtime_id.as_deref() == Some(runtime_id)
-                || job.target_pool_id.as_deref() == Some(runtime_id)
-        }) {
+        if active
+            .iter()
+            .any(|migration| migration_involves_runtime(migration, runtime_id))
+        {
             return Err(ApiError::Conflict(
                 "pool has an active database migration".into(),
             ));
@@ -118,20 +119,29 @@ impl PoolGuard {
     }
 }
 
-pub(super) async fn change(
-    state: &AppState,
-    runtime_id: &str,
-    action: LifecycleAction,
-) -> Result<(), ApiError> {
-    let (mut pool, guard) = PoolGuard::acquire(state, runtime_id).await?;
-    if pool.pending_image.is_some()
+fn migration_involves_runtime(migration: &DeploymentMigration, runtime_id: &str) -> bool {
+    migration.source_runtime_id == runtime_id
+        || migration.target_runtime_id.as_deref() == Some(runtime_id)
+        || migration.target_pool_id.as_deref() == Some(runtime_id)
+}
+
+fn power_operation_blocked(pool: &EngineRuntime) -> bool {
+    pool.pending_image.is_some()
         || matches!(
             pool.status,
             EngineRuntimeStatus::Quarantined
                 | EngineRuntimeStatus::Deleting
                 | EngineRuntimeStatus::Creating
         )
-    {
+}
+
+pub(super) async fn change(
+    state: &AppState,
+    runtime_id: &str,
+    action: LifecycleAction,
+) -> Result<(), ApiError> {
+    let (mut pool, guard) = PoolGuard::acquire(state, runtime_id).await?;
+    if power_operation_blocked(&pool) {
         return Err(ApiError::Conflict(
             "pool is not eligible for a power operation".into(),
         ));
@@ -141,43 +151,22 @@ pub(super) async fn change(
         let _guard = guard;
         match action {
             LifecycleAction::Start | LifecycleAction::Restart => {
-                if action == LifecycleAction::Start
-                    && pool.status == EngineRuntimeStatus::Running
-                    && pool.desired_state == DesiredInstanceState::Running
-                {
+                let already_running = pool.status == EngineRuntimeStatus::Running
+                    && pool.desired_state == DesiredInstanceState::Running;
+                if action == LifecycleAction::Start && already_running {
                     return Ok(());
                 }
                 pool.desired_state = DesiredInstanceState::Running;
-                if !super::image::refresh_logging_locked(&state, &mut pool).await? {
-                lifecycle::activate_locked(&state, &mut pool, action == LifecycleAction::Restart)
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                let recreated = super::image::refresh_logging_locked(&state, &mut pool).await?;
+                if !recreated {
+                    let restart = action == LifecycleAction::Restart;
+                    lifecycle::activate_locked(&state, &mut pool, restart)
+                        .await
+                        .map_err(|error| ApiError::Runtime(error.to_string()))?;
                 }
             }
             LifecycleAction::Stop | LifecycleAction::Kill => {
-                pool.desired_state = DesiredInstanceState::Stopped;
-                lifecycle::fence_runtime(&state, &pool.runtime_id).await;
-                lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-                let stopped = if action == LifecycleAction::Kill {
-                    state.docker.kill(pool.protocol, &pool.runtime_id).await
-                } else {
-                    state.docker.stop(pool.protocol, &pool.runtime_id).await
-                };
-                if let Err(error) = stopped
-                    && !error.is_not_found()
-                    && !error.is_not_running()
-                {
-                    instances::containment::contain_locked(&state, &pool, "pool stop failed", Some(crate::storage::quarantine::QuarantineKind::ShutdownUnconfirmed)).await;
-                    return Err(ApiError::Runtime(error.to_string()));
-                }
-                pool.status = EngineRuntimeStatus::Stopped;
-                pool.updated_at = crate::shared::time::now_rfc3339();
-                lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
-                    .await
-                    .map_err(|error| ApiError::Runtime(error.to_string()))?;
-                lifecycle::clear_runtime_caches(&state, &pool.runtime_id).await;
+                stop_locked(&state, &mut pool, action).await?;
             }
         }
         tracing::info!(event = "audit pool_power", runtime_id = %pool.runtime_id, owner = ?pool.owner, ?action);
@@ -185,4 +174,41 @@ pub(super) async fn change(
     })
     .await
     .map_err(|error| ApiError::Runtime(error.to_string()))?
+}
+
+async fn stop_locked(
+    state: &AppState,
+    pool: &mut EngineRuntime,
+    action: LifecycleAction,
+) -> Result<(), ApiError> {
+    pool.desired_state = DesiredInstanceState::Stopped;
+    lifecycle::fence_runtime(state, &pool.runtime_id).await;
+    lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let stopped = if action == LifecycleAction::Kill {
+        state.docker.kill(pool.protocol, &pool.runtime_id).await
+    } else {
+        state.docker.stop(pool.protocol, &pool.runtime_id).await
+    };
+    if let Err(error) = stopped
+        && !error.is_not_found()
+        && !error.is_not_running()
+    {
+        instances::containment::contain_locked(
+            state,
+            pool,
+            "pool stop failed",
+            Some(crate::storage::quarantine::QuarantineKind::ShutdownUnconfirmed),
+        )
+        .await;
+        return Err(ApiError::Runtime(error.to_string()));
+    }
+    pool.status = EngineRuntimeStatus::Stopped;
+    pool.updated_at = crate::shared::time::now_rfc3339();
+    lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
+        .await
+        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    lifecycle::clear_runtime_caches(state, &pool.runtime_id).await;
+    Ok(())
 }

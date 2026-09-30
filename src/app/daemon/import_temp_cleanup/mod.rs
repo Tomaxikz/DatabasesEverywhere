@@ -32,6 +32,24 @@ pub(super) struct ImportTempCleanupSummary {
     pub skipped_entries: usize,
 }
 
+impl ImportTempCleanupSummary {
+    fn count_file_removal(&mut self, removed: bool) {
+        if removed {
+            self.removed_files += 1;
+        } else {
+            self.skipped_entries += 1;
+        }
+    }
+
+    fn count_directory_removal(&mut self, removed: bool) {
+        if removed {
+            self.removed_directories += 1;
+        } else {
+            self.skipped_entries += 1;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RootEntry {
     path: PathBuf,
@@ -81,12 +99,10 @@ pub(super) async fn cleanup_shared_restore_sandboxes(
         .context("failed to join shared restore sandbox cleanup")?
 }
 
-fn cleanup_shared_restore_root(root: &Path) -> anyhow::Result<ImportTempCleanupSummary> {
+fn staging_root_exists(root: &Path) -> anyhow::Result<bool> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(ImportTempCleanupSummary::default());
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to inspect staging root {}", root.display()));
@@ -95,6 +111,13 @@ fn cleanup_shared_restore_root(root: &Path) -> anyhow::Result<ImportTempCleanupS
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("logical import staging root must be a real directory");
     }
+    Ok(true)
+}
+
+fn cleanup_shared_restore_root(root: &Path) -> anyhow::Result<ImportTempCleanupSummary> {
+    if !staging_root_exists(root)? {
+        return Ok(ImportTempCleanupSummary::default());
+    }
 
     let entries = collect_root_entries(root, MAX_ROOT_ENTRIES)?;
     let mut summary = ImportTempCleanupSummary {
@@ -102,20 +125,15 @@ fn cleanup_shared_restore_root(root: &Path) -> anyhow::Result<ImportTempCleanupS
         ..ImportTempCleanupSummary::default()
     };
     for entry in entries {
-        if !is_shared_restore_sandbox(&entry.name) {
-            summary.skipped_entries += 1;
-            continue;
-        }
-        if !entry.file_type.is_dir() || entry.file_type.is_symlink() {
+        let is_sandbox_directory = is_shared_restore_sandbox(&entry.name)
+            && entry.file_type.is_dir()
+            && !entry.file_type.is_symlink();
+        if !is_sandbox_directory {
             summary.skipped_entries += 1;
             continue;
         }
         validate_shared_restore_sandbox(&entry.path)?;
-        if remove_allowed_dir(&entry, MAX_TREE_ENTRIES)? {
-            summary.removed_directories += 1;
-        } else {
-            summary.skipped_entries += 1;
-        }
+        summary.count_directory_removal(remove_allowed_dir(&entry, MAX_TREE_ENTRIES)?);
     }
     Ok(summary)
 }
@@ -162,18 +180,8 @@ fn cleanup_root(
     max_root_entries: usize,
     max_tree_entries: usize,
 ) -> anyhow::Result<ImportTempCleanupSummary> {
-    let root_metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(ImportTempCleanupSummary::default());
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to inspect staging root {}", root.display()));
-        }
-    };
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        bail!("logical import staging root must be a real directory");
+    if !staging_root_exists(root)? {
+        return Ok(ImportTempCleanupSummary::default());
     }
 
     let entries = collect_root_entries(root, max_root_entries)?;
@@ -197,25 +205,13 @@ fn cleanup_root(
     for entry in entries {
         match &entry.kind {
             EntryKind::ImportFile | EntryKind::ExportFile | EntryKind::AtomicManifestTemporary => {
-                if remove_allowlisted_file(&entry)? {
-                    summary.removed_files += 1;
-                } else {
-                    summary.skipped_entries += 1;
-                }
+                summary.count_file_removal(remove_allowlisted_file(&entry)?);
             }
             EntryKind::RollbackFile if !protected_rollbacks.contains(&entry.name) => {
-                if remove_allowlisted_file(&entry)? {
-                    summary.removed_files += 1;
-                } else {
-                    summary.skipped_entries += 1;
-                }
+                summary.count_file_removal(remove_allowlisted_file(&entry)?);
             }
             EntryKind::UnarchiveDirectory => {
-                if remove_allowed_dir(&entry, max_tree_entries)? {
-                    summary.removed_directories += 1;
-                } else {
-                    summary.skipped_entries += 1;
-                }
+                summary.count_directory_removal(remove_allowed_dir(&entry, max_tree_entries)?);
             }
             EntryKind::Manifest { .. } | EntryKind::RollbackFile | EntryKind::Unknown => {
                 summary.skipped_entries += 1
@@ -242,23 +238,15 @@ fn collect_root_entries(root: &Path, max_entries: usize) -> anyhow::Result<Vec<R
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("failed to inspect staging entry {}", path.display()))?;
-        let name = match entry.file_name().to_str() {
-            Some(name) => name.to_string(),
-            None => {
-                entries.push(RootEntry {
-                    path,
-                    name: String::new(),
-                    file_type: metadata.file_type(),
-                    kind: EntryKind::Unknown,
-                });
-                continue;
-            }
+        let (name, kind) = match entry.file_name().to_str() {
+            Some(name) => (name.to_string(), classify_entry(name)),
+            None => (String::new(), EntryKind::Unknown),
         };
         entries.push(RootEntry {
             path,
-            kind: classify_entry(&name),
             name,
             file_type: metadata.file_type(),
+            kind,
         });
     }
     Ok(entries)

@@ -85,32 +85,30 @@ pub(crate) fn decide(phase: Phase, error: &anyhow::Error) -> Decision {
     {
         return Decision::KeepDown;
     }
-    if matches!(phase, Phase::SocketDirectory | Phase::HostedConfig) {
-        let errno = error
-            .downcast_ref::<rustix::io::Errno>()
-            .map(|e| e.raw_os_error())
-            .or_else(|| {
-                error
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(|e| e.raw_os_error())
-            });
-        if matches!(
-            errno,
-            Some(
-                libc::ENOENT
-                    | libc::EACCES
-                    | libc::EPERM
-                    | libc::ENOSPC
-                    | libc::EDQUOT
-                    | libc::EROFS
-            )
-        ) {
-            return Decision::KeepDown;
-        }
+    if matches!(phase, Phase::SocketDirectory | Phase::HostedConfig)
+        && errno_allows_keep_down(raw_os_error(error))
+    {
+        return Decision::KeepDown;
     }
     // Unknown errors, symlinks/non-directories, mismatched socket binds and
     // isolation failures are never downgraded just because their text looks benign.
     Decision::Quarantine
+}
+
+fn raw_os_error(error: &anyhow::Error) -> Option<i32> {
+    if let Some(errno) = error.downcast_ref::<rustix::io::Errno>() {
+        return Some(errno.raw_os_error());
+    }
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(|io_error| io_error.raw_os_error())
+}
+
+fn errno_allows_keep_down(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(libc::ENOENT | libc::EACCES | libc::EPERM | libc::ENOSPC | libc::EDQUOT | libc::EROFS)
+    )
 }
 
 pub(crate) async fn handle(

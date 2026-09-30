@@ -3,6 +3,8 @@
 use super::{files::*, *};
 use crate::instances::credentials::logical_import_env;
 
+const MAX_SIMPLE_IDENTIFIER_BYTES: usize = 128;
+
 pub(super) async fn validate_import_source(
     _state: &AppState,
     target_protocol: Protocol,
@@ -272,9 +274,7 @@ pub(super) fn ensure_full_selection(
 pub(super) fn validate_sql_object_name(protocol: Protocol, value: &str) -> Result<(), ApiError> {
     let parts: Vec<_> = value.split('.').collect();
     let valid = match protocol {
-        Protocol::Postgres => (1..=2).contains(&parts.len()),
-        Protocol::Mariadb => (1..=2).contains(&parts.len()),
-        Protocol::Mysql => (1..=2).contains(&parts.len()),
+        Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql => (1..=2).contains(&parts.len()),
         _ => false,
     } && parts
         .iter()
@@ -301,7 +301,7 @@ pub(super) fn validate_simple_identifier(kind: &str, value: &str) -> Result<(), 
 
 pub(super) fn simple_identifier(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 128
+        && value.len() <= MAX_SIMPLE_IDENTIFIER_BYTES
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
@@ -328,53 +328,46 @@ pub(super) fn postgres_dump_selection_args(
 pub(super) fn mariadb_selection_args(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
-    if selection.mode == SelectionMode::Full {
-        return Ok(" -- \"$MARIADB_DATABASE\"".to_string());
-    }
-    let mut args = String::new();
-    for item in &selection.exclude {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
-        args.push_str(&format!(" --ignore-table=\"$MARIADB_DATABASE.{table}\""));
-    }
-    args.push_str(" -- \"$MARIADB_DATABASE\"");
-    for item in &selection.include {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
-        args.push(' ');
-        args.push_str(&sh_quote(table));
-    }
-    Ok(args)
+    Ok(mysql_family_dump_selection_args(
+        selection,
+        "MARIADB_DATABASE",
+    ))
 }
 
 pub(super) fn mysql_local_dump_selection_args(
     selection: &ImportExportSelection,
 ) -> Result<String, ApiError> {
+    Ok(mysql_family_dump_selection_args(
+        selection,
+        "MYSQL_DATABASE",
+    ))
+}
+
+fn mysql_family_dump_selection_args(
+    selection: &ImportExportSelection,
+    database_variable: &str,
+) -> String {
+    let database_argument = format!(" -- \"${database_variable}\"");
     if selection.mode == SelectionMode::Full {
-        return Ok(" -- \"$MYSQL_DATABASE\"".to_string());
+        return database_argument;
     }
     let mut args = String::new();
     for item in &selection.exclude {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
-        args.push_str(&format!(" --ignore-table=\"$MYSQL_DATABASE.{table}\""));
+        let table = unqualified_table_name(item);
+        args.push_str(&format!(" --ignore-table=\"${database_variable}.{table}\""));
     }
-    args.push_str(" -- \"$MYSQL_DATABASE\"");
+    args.push_str(&database_argument);
     for item in &selection.include {
-        let table = item
-            .rsplit_once('.')
-            .map(|(_, table)| table)
-            .unwrap_or(item);
         args.push(' ');
-        args.push_str(&sh_quote(table));
+        args.push_str(&sh_quote(unqualified_table_name(item)));
     }
-    Ok(args)
+    args
+}
+
+fn unqualified_table_name(item: &str) -> &str {
+    item.rsplit_once('.')
+        .map(|(_, table)| table)
+        .unwrap_or(item)
 }
 
 pub(super) fn mongodb_dump_selection_args(
@@ -1135,12 +1128,7 @@ PGPASSWORD="$DBE_POSTGRES_PASSWORD" psql \
             )
         }
         Protocol::Mariadb if database_definition_in_dump => {
-            let connection_args = match connection {
-                ImportConnection::LocalSocket => {
-                    "--protocol=socket \\\n  --socket=/run/mysqld/mysqld.sock"
-                }
-                ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
-            };
+            let connection_args = mariadb_connection_args(connection);
             format!(
                 r#"set -eu
 mariadb \
@@ -1153,12 +1141,7 @@ mariadb \
             )
         }
         Protocol::Mariadb => {
-            let connection_args = match connection {
-                ImportConnection::LocalSocket => {
-                    "--protocol=socket \\\n  --socket=/run/mysqld/mysqld.sock"
-                }
-                ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
-            };
+            let connection_args = mariadb_connection_args(connection);
             format!(
                 r#"set -eu
 mariadb \
@@ -1173,12 +1156,7 @@ mariadb \
         }
         Protocol::Mysql if database_definition_in_dump => {
             mysql_root_password(metadata)?;
-            let connection_args = match connection {
-                ImportConnection::LocalSocket => {
-                    "--protocol=socket \\\n  --socket=/var/run/mysqld/mysqld.sock"
-                }
-                ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
-            };
+            let connection_args = mysql_connection_args(connection);
             format!(
                 r#"set -eu
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
@@ -1192,12 +1170,7 @@ MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql \
         Protocol::Mysql => {
             logical_import_env(metadata, false)
                 .map_err(|error| ApiError::Conflict(error.to_string()))?;
-            let connection_args = match connection {
-                ImportConnection::LocalSocket => {
-                    "--protocol=socket \\\n  --socket=/var/run/mysqld/mysqld.sock"
-                }
-                ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
-            };
+            let connection_args = mysql_connection_args(connection);
             format!(
                 r#"set -eu
 MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql \
@@ -1270,4 +1243,20 @@ clickhouse-client \
         }
     };
     Ok(script)
+}
+
+fn mariadb_connection_args(connection: ImportConnection) -> &'static str {
+    match connection {
+        ImportConnection::LocalSocket => "--protocol=socket \\\n  --socket=/run/mysqld/mysqld.sock",
+        ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
+    }
+}
+
+fn mysql_connection_args(connection: ImportConnection) -> &'static str {
+    match connection {
+        ImportConnection::LocalSocket => {
+            "--protocol=socket \\\n  --socket=/var/run/mysqld/mysqld.sock"
+        }
+        ImportConnection::PoolLoopback => "--protocol=TCP \\\n  --host=127.0.0.1",
+    }
 }

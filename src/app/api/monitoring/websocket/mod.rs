@@ -67,6 +67,12 @@ const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 16 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 const MONITORING_BATCH_TARGET_BYTES: usize = 12 * 1024;
 const MONITORING_SNAPSHOT_TTL: Duration = Duration::from_millis(400);
+const MONITORING_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const CLOSE_FRAME_TIMEOUT: Duration = Duration::from_secs(1);
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const BATCH_ENVELOPE_BYTES: usize = 256;
 
 pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket
@@ -104,7 +110,7 @@ async fn stream_monitoring(
 ) {
     let _monitor = state.resource_cache.register_monitor();
     let mut shutdown = state.daemon_shutdown.subscribe();
-    let mut ticker = interval(Duration::from_secs(1));
+    let mut ticker = interval(MONITORING_TICK_INTERVAL);
     // Monitoring snapshots are current state, not an event backlog. If a send
     // is delayed, skip missed ticks instead of emitting catch-up bursts.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -150,17 +156,10 @@ async fn stream_monitoring(
                         break;
                     }
                 };
-                let mut failed = false;
-                for batch in batches {
-                    if send_monitoring_batch(&mut socket, &batch, expiration_deadline)
-                        .await
-                        .is_err()
-                    {
-                        failed = true;
-                        break;
-                    }
-                }
-                if failed {
+                if send_monitoring_batches(&mut socket, &batches, expiration_deadline)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -380,59 +379,40 @@ impl<'a> AuthorizedMonitoring<'a> {
             .collect::<Vec<_>>();
         let batch_count =
             (instance_batches.len() + progress_batches.len() + removed_batches.len()).max(1) as u32;
+        let progress_reset = progress.reset;
+        let new_batch =
+            |batch_index: usize,
+             instances: Vec<&'a MonitoringInstance>,
+             install_progress: Vec<&'a InstallProgress>,
+             install_progress_removed: Vec<String>| MonitoringBatch {
+                r#type: "stats",
+                progress_reset,
+                install_progress_removed,
+                sequence,
+                sampled_at_unix,
+                batch_index: batch_index as u32,
+                batch_count,
+                instances,
+                install_progress,
+            };
         let mut batches = Vec::with_capacity(batch_count as usize);
 
         for instances in instance_batches {
-            batches.push(MonitoringBatch {
-                r#type: "stats",
-                progress_reset: progress.reset,
-                install_progress_removed: Vec::new(),
-                sequence,
-                sampled_at_unix,
-                batch_index: batches.len() as u32,
-                batch_count,
-                instances,
-                install_progress: Vec::new(),
-            });
+            batches.push(new_batch(batches.len(), instances, Vec::new(), Vec::new()));
         }
         for install_progress in progress_batches {
-            batches.push(MonitoringBatch {
-                r#type: "stats",
-                progress_reset: progress.reset,
-                install_progress_removed: Vec::new(),
-                sequence,
-                sampled_at_unix,
-                batch_index: batches.len() as u32,
-                batch_count,
-                instances: Vec::new(),
+            batches.push(new_batch(
+                batches.len(),
+                Vec::new(),
                 install_progress,
-            });
+                Vec::new(),
+            ));
         }
         for removed in removed_batches {
-            batches.push(MonitoringBatch {
-                r#type: "stats",
-                sequence,
-                sampled_at_unix,
-                batch_index: batches.len() as u32,
-                batch_count,
-                instances: Vec::new(),
-                install_progress: Vec::new(),
-                progress_reset: progress.reset,
-                install_progress_removed: removed,
-            });
+            batches.push(new_batch(batches.len(), Vec::new(), Vec::new(), removed));
         }
         if batches.is_empty() {
-            batches.push(MonitoringBatch {
-                r#type: "stats",
-                progress_reset: progress.reset,
-                install_progress_removed: Vec::new(),
-                sequence,
-                sampled_at_unix,
-                batch_index: 0,
-                batch_count: 1,
-                instances: Vec::new(),
-                install_progress: Vec::new(),
-            });
+            batches.push(new_batch(0, Vec::new(), Vec::new(), Vec::new()));
         }
         Ok(batches)
     }
@@ -441,12 +421,12 @@ impl<'a> AuthorizedMonitoring<'a> {
 fn chunk_serialized<T: Serialize>(items: Vec<&T>) -> Result<Vec<Vec<&T>>, serde_json::Error> {
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
-    let mut bytes = 256_usize;
+    let mut bytes = BATCH_ENVELOPE_BYTES;
     for item in items {
         let item_bytes = serde_json::to_vec(item)?.len().saturating_add(1);
         if !chunk.is_empty() && bytes.saturating_add(item_bytes) > MONITORING_BATCH_TARGET_BYTES {
             chunks.push(std::mem::take(&mut chunk));
-            bytes = 256;
+            bytes = BATCH_ENVELOPE_BYTES;
         }
         bytes = bytes.saturating_add(item_bytes);
         chunk.push(item);
@@ -718,7 +698,7 @@ async fn stream_import_export(
         return;
     }
 
-    let heartbeat_period = Duration::from_secs(30);
+    let heartbeat_period = HEARTBEAT_INTERVAL;
     let mut heartbeat = interval_at(Instant::now() + heartbeat_period, heartbeat_period);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let expiration = sleep_until(expiration_deadline);
@@ -772,20 +752,7 @@ async fn stream_import_export(
                         if !job_matches_access(&job, &instance_id, &query, &claims) {
                             continue;
                         }
-                        let Ok(job) = complete_before(
-                            expiration_deadline,
-                            public_job_update(&state, job, &claims),
-                        )
-                        .await
-                        else {
-                            close_expired_socket(&mut socket).await;
-                            break;
-                        };
-                        let event = ImportExportJobEvent {
-                            r#type: "import_export_job",
-                            job,
-                        };
-                        if send_json_before(&mut socket, &event, expiration_deadline)
+                        if send_job_event(&mut socket, &state, job, &claims, expiration_deadline)
                             .await
                             .is_err()
                         {
@@ -797,34 +764,17 @@ async fn stream_import_export(
                             close_replaced_socket(&mut socket).await;
                             break;
                         }
-                        let event = ImportExportLaggedEvent {
-                            r#type: "import_export_lagged",
+                        let resynced = resync_after_lag(
+                            &mut socket,
+                            &state,
+                            &instance_id,
+                            &query,
+                            &claims,
                             skipped,
-                        };
-                        if send_json_before(&mut socket, &event, expiration_deadline)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        let Ok(snapshot) = complete_before(
                             expiration_deadline,
-                            import_export_snapshot(
-                                &state,
-                                &instance_id,
-                                &query,
-                                &claims,
-                            ),
                         )
-                        .await
-                        else {
-                            close_expired_socket(&mut socket).await;
-                            break;
-                        };
-                        if send_json_before(&mut socket, &snapshot, expiration_deadline)
-                            .await
-                            .is_err()
-                        {
+                        .await;
+                        if resynced.is_err() {
                             break;
                         }
                     }
@@ -833,6 +783,50 @@ async fn stream_import_export(
             }
         }
     }
+}
+
+async fn send_job_event(
+    socket: &mut WebSocket,
+    state: &AppState,
+    job: ImportExportJob,
+    claims: &Claims,
+    deadline: Instant,
+) -> Result<(), ()> {
+    let Ok(job) = complete_before(deadline, public_job_update(state, job, claims)).await else {
+        close_expired_socket(socket).await;
+        return Err(());
+    };
+    let event = ImportExportJobEvent {
+        r#type: "import_export_job",
+        job,
+    };
+    send_json_before(socket, &event, deadline).await
+}
+
+async fn resync_after_lag(
+    socket: &mut WebSocket,
+    state: &AppState,
+    instance_id: &str,
+    query: &ImportExportQuery,
+    claims: &Claims,
+    skipped: u64,
+    deadline: Instant,
+) -> Result<(), ()> {
+    let event = ImportExportLaggedEvent {
+        r#type: "import_export_lagged",
+        skipped,
+    };
+    send_json_before(socket, &event, deadline).await?;
+    let Ok(snapshot) = complete_before(
+        deadline,
+        import_export_snapshot(state, instance_id, query, claims),
+    )
+    .await
+    else {
+        close_expired_socket(socket).await;
+        return Err(());
+    };
+    send_json_before(socket, &snapshot, deadline).await
 }
 
 async fn import_export_snapshot(
@@ -983,7 +977,7 @@ async fn close_socket(socket: &mut WebSocket, reason: &'static str) {
 }
 
 async fn close_socket_with_code(socket: &mut WebSocket, code: u16, reason: &'static str) {
-    let close_deadline = Instant::now() + Duration::from_secs(1);
+    let close_deadline = Instant::now() + CLOSE_FRAME_TIMEOUT;
     let _ = send_message_before(
         socket,
         Message::Close(Some(CloseFrame {
@@ -1012,6 +1006,17 @@ pub(crate) async fn send_json_before<T: Serialize>(
         tracing::warn!(%error, "failed to serialize websocket payload");
     })?;
     send_message_before(socket, Message::Text(payload.into()), deadline).await
+}
+
+async fn send_monitoring_batches(
+    socket: &mut WebSocket,
+    batches: &[MonitoringBatch<'_>],
+    deadline: Instant,
+) -> Result<(), ()> {
+    for batch in batches {
+        send_monitoring_batch(socket, batch, deadline).await?;
+    }
+    Ok(())
 }
 
 async fn send_monitoring_batch(
@@ -1044,7 +1049,7 @@ pub(crate) async fn send_message_before(
     if now >= deadline {
         return Err(());
     }
-    let send_deadline = deadline.min(now + Duration::from_secs(5));
+    let send_deadline = deadline.min(now + SEND_TIMEOUT);
     timeout_at(send_deadline, socket.send(message))
         .await
         .map_err(|_| ())?
@@ -1059,7 +1064,7 @@ where
     if now >= deadline {
         return Err(());
     }
-    let operation_deadline = deadline.min(now + Duration::from_secs(15));
+    let operation_deadline = deadline.min(now + OPERATION_TIMEOUT);
     timeout_at(operation_deadline, future).await.map_err(|_| ())
 }
 

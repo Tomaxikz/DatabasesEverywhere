@@ -33,10 +33,7 @@ impl DockerRuntime {
         let (container_parent, container_file_name) = container_file_parts(container_path)?;
         let metadata = tokio::fs::symlink_metadata(host_path)
             .await
-            .map_err(|source| DockerError::FileTransferIo {
-                path: host_path.display().to_string(),
-                source,
-            })?;
+            .map_err(file_transfer_io_error(host_path))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(DockerError::InvalidTransferSource {
                 path: host_path.display().to_string(),
@@ -57,14 +54,11 @@ impl DockerRuntime {
             .and_then(numeric_container_user)
             .unwrap_or((0, 0));
 
-        let file = tokio::fs::File::open(host_path).await.map_err(|source| {
-            DockerError::FileTransferIo {
-                path: host_path.display().to_string(),
-                source,
-            }
-        })?;
+        let file = tokio::fs::File::open(host_path)
+            .await
+            .map_err(file_transfer_io_error(host_path))?;
         let header = transfer_tar_header(&container_file_name, metadata.len(), uid, gid)?;
-        let trailer_len = tar_padding(metadata.len()) + 1024;
+        let trailer_len = tar_padding(metadata.len()) + TAR_END_OF_ARCHIVE_BYTES;
         let stream = stream::once(async move { Ok::<Bytes, IoError>(header) })
             .chain(ReaderStream::new(tokio::io::AsyncReadExt::take(
                 file,
@@ -74,33 +68,25 @@ impl DockerRuntime {
                 Ok::<Bytes, IoError>(Bytes::from(vec![0_u8; trailer_len]))
             }));
 
-        match tokio::time::timeout(
-            FILE_TRANSFER_TIMEOUT,
-            self.docker.upload_to_container(
-                &container,
-                Some(
-                    UploadToContainerOptionsBuilder::default()
-                        .path(&container_parent)
-                        .no_overwrite_dir_non_dir("true")
-                        .copy_uidgid("true")
-                        .build(),
-                ),
-                body_try_stream(stream),
+        let upload = self.docker.upload_to_container(
+            &container,
+            Some(
+                UploadToContainerOptionsBuilder::default()
+                    .path(&container_parent)
+                    .no_overwrite_dir_non_dir("true")
+                    .copy_uidgid("true")
+                    .build(),
             ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => {
-                return Err(DockerError::FileTransferTimedOut {
-                    direction: "upload",
-                    path: host_path.display().to_string(),
-                    timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
-                });
-            }
+            body_try_stream(stream),
+        );
+        match tokio::time::timeout(FILE_TRANSFER_TIMEOUT, upload).await {
+            Ok(result) => Ok(result?),
+            Err(_) => Err(DockerError::FileTransferTimedOut {
+                direction: "upload",
+                path: host_path.display().to_string(),
+                timeout_seconds: FILE_TRANSFER_TIMEOUT.as_secs(),
+            }),
         }
-        Ok(())
     }
 
     pub async fn download_file(
@@ -180,6 +166,17 @@ impl DockerRuntime {
     }
 }
 
+const TAR_BLOCK_BYTES: u64 = 512;
+const TAR_END_OF_ARCHIVE_BYTES: usize = 1024;
+const DOWNLOAD_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+fn file_transfer_io_error(path: &Path) -> impl FnOnce(IoError) -> DockerError + '_ {
+    move |source| DockerError::FileTransferIo {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
 pub(super) fn container_mounts(spec: &DockerInstanceSpec) -> Vec<bollard::models::Mount> {
     let mut mounts = vec![bind_mount(&spec.data_path, &spec.data_target, false)];
     mounts.extend(
@@ -207,17 +204,10 @@ pub(super) async fn ensure_bind_mount_sources(
 pub(super) async fn ensure_bind_mount_dir(path: &std::path::Path) -> Result<(), DockerError> {
     tokio::fs::create_dir_all(path)
         .await
-        .map_err(|source| DockerError::MountSourceIo {
-            path: path.display().to_string(),
-            source,
-        })?;
-    let metadata =
-        tokio::fs::symlink_metadata(path)
-            .await
-            .map_err(|source| DockerError::MountSourceIo {
-                path: path.display().to_string(),
-                source,
-            })?;
+        .map_err(mount_source_io_error(path))?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(mount_source_io_error(path))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(DockerError::InvalidMountSource {
             path: path.display().to_string(),
@@ -228,13 +218,9 @@ pub(super) async fn ensure_bind_mount_dir(path: &std::path::Path) -> Result<(), 
 }
 
 pub(super) async fn ensure_bind_mount_file(path: &std::path::Path) -> Result<(), DockerError> {
-    let metadata =
-        tokio::fs::symlink_metadata(path)
-            .await
-            .map_err(|source| DockerError::MountSourceIo {
-                path: path.display().to_string(),
-                source,
-            })?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(mount_source_io_error(path))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(DockerError::InvalidMountSource {
             path: path.display().to_string(),
@@ -242,6 +228,13 @@ pub(super) async fn ensure_bind_mount_file(path: &std::path::Path) -> Result<(),
         });
     }
     Ok(())
+}
+
+fn mount_source_io_error(path: &Path) -> impl FnOnce(IoError) -> DockerError + '_ {
+    move |source| DockerError::MountSourceIo {
+        path: path.display().to_string(),
+        source,
+    }
 }
 
 pub(super) fn container_file_parts(container_path: &str) -> Result<(String, String), DockerError> {
@@ -297,7 +290,7 @@ pub(super) fn transfer_tar_header(
 }
 
 pub(super) fn tar_padding(size: u64) -> usize {
-    ((512 - (size % 512)) % 512) as usize
+    ((TAR_BLOCK_BYTES - (size % TAR_BLOCK_BYTES)) % TAR_BLOCK_BYTES) as usize
 }
 
 pub(super) fn stream_with_deadline<S>(
@@ -450,7 +443,7 @@ pub(super) fn copy_download_entry<R: Read, W: Write>(
     deadline: Instant,
 ) -> Result<u64, IoError> {
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; DOWNLOAD_COPY_BUFFER_BYTES];
     loop {
         ensure_file_transfer_deadline(deadline)?;
         let read = reader.read(&mut buffer)?;

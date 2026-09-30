@@ -10,6 +10,8 @@ use std::{fmt, future::Future, future::poll_fn, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
+use crate::shared::hex::encode_lower;
+
 const API_KEY_HEADER: &str = "api-key";
 const MAX_CONCURRENT_STREAMS: u32 = 128;
 const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
@@ -33,13 +35,7 @@ impl QdrantRouteKey {
 
     pub fn fingerprint(&self, api_key: &str) -> String {
         let tag = hmac::sign(&self.key, api_key.as_bytes());
-        let mut encoded = String::with_capacity(tag.as_ref().len() * 2);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in tag.as_ref() {
-            encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
-        }
-        encoded
+        encode_lower(tag.as_ref())
     }
 }
 
@@ -100,6 +96,13 @@ fn outbound_stream_error(error: h2::Error) -> QdrantProxyError {
         }
     } else {
         QdrantProxyError::H2(error)
+    }
+}
+
+fn peer_reset_error(reset: Result<h2::Reason, h2::Error>) -> QdrantProxyError {
+    match reset {
+        Ok(reason) => QdrantProxyError::StreamReset { reason },
+        Err(error) => outbound_stream_error(error),
     }
 }
 
@@ -258,14 +261,7 @@ async fn forward_body(
         let chunk = tokio::select! {
             biased;
             reset = poll_fn(|context| outgoing.poll_reset(context)) => {
-                let reason = match reset {
-                    Ok(reason) => reason,
-                    Err(error) if error.is_reset() => {
-                        error.reason().unwrap_or(h2::Reason::CANCEL)
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                return Err(QdrantProxyError::StreamReset { reason });
+                return Err(peer_reset_error(reset));
             }
             chunk = incoming.data() => chunk,
         };
@@ -283,14 +279,7 @@ async fn forward_body(
     let trailers = tokio::select! {
         biased;
         reset = poll_fn(|context| outgoing.poll_reset(context)) => {
-            let reason = match reset {
-                Ok(reason) => reason,
-                Err(error) if error.is_reset() => {
-                    error.reason().unwrap_or(h2::Reason::CANCEL)
-                }
-                Err(error) => return Err(error.into()),
-            };
-            return Err(QdrantProxyError::StreamReset { reason });
+            return Err(peer_reset_error(reset));
         }
         trailers = incoming.trailers() => trailers?,
     };

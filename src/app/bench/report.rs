@@ -11,6 +11,8 @@ use super::metrics::{
     BenchmarkReport, HttpPhaseReport, RequestSample, ResourcePeak, ResourceSample,
 };
 
+const TERMINAL_RULE_WIDTH: usize = 120;
+
 pub(super) struct ReportPaths {
     pub directory: PathBuf,
     pub json: PathBuf,
@@ -161,8 +163,20 @@ fn terminal_colors_enabled() -> bool {
 fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -> String {
     let colors = TerminalColors { enabled: color };
     let mut output = String::new();
-    let wide_rule = "=".repeat(120);
-    let thin_rule = "-".repeat(120);
+    let thin_rule = "-".repeat(TERMINAL_RULE_WIDTH);
+    terminal_summary(&mut output, &colors, report);
+    terminal_http_section(&mut output, &colors, report, &thin_rule);
+    terminal_instances_section(&mut output, &colors, report, &thin_rule);
+    terminal_resources_section(&mut output, &colors, report, &thin_rule);
+    terminal_jobs_section(&mut output, &colors, report, &thin_rule);
+    terminal_recommendation_section(&mut output, &colors, report, &thin_rule);
+    terminal_diagnostics_section(&mut output, &colors, report, &thin_rule);
+    terminal_files_section(&mut output, &colors, paths, &thin_rule);
+    output
+}
+
+fn terminal_summary(output: &mut String, colors: &TerminalColors, report: &BenchmarkReport) {
+    let wide_rule = "=".repeat(TERMINAL_RULE_WIDTH);
     let status_color = match report.status.as_str() {
         "completed" => TerminalColor::Green,
         "completed_with_warnings" => TerminalColor::Yellow,
@@ -201,25 +215,7 @@ fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -
             .as_deref()
             .unwrap_or("unknown")
     );
-    let load_shape = if let Some(minutes) = report.options.concurrent_duration_minutes {
-        match report.options.timed_requests_per_minute {
-            Some(requests) => format!(
-                "{minutes} minute rate-aware bursts, {requests}/{} requests per 60s, concurrency {}",
-                report.environment.configured_api_rate_limit_per_minute, report.options.concurrency
-            ),
-            None => format!(
-                "{minutes} minute unthrottled load, concurrency {}",
-                report.options.concurrency
-            ),
-        }
-    } else {
-        format!(
-            "{} requests, concurrency {}",
-            report.options.concurrent_requests.unwrap_or_default(),
-            report.options.concurrency
-        )
-    };
-    let _ = writeln!(output, "  {:<15} {load_shape}", "Load");
+    let _ = writeln!(output, "  {:<15} {}", "Load", load_shape(report));
     let _ = writeln!(
         output,
         "  {:<15} {}/min ({})",
@@ -237,207 +233,278 @@ fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -
         "Instances",
         report.environment.selected_instances.len()
     );
+}
 
-    terminal_section(&mut output, &colors, "HTTP & WEBSOCKET", &thin_rule);
+fn load_shape(report: &BenchmarkReport) -> String {
+    let Some(minutes) = report.options.concurrent_duration_minutes else {
+        return format!(
+            "{} requests, concurrency {}",
+            report.options.concurrent_requests.unwrap_or_default(),
+            report.options.concurrency
+        );
+    };
+    match report.options.timed_requests_per_minute {
+        Some(requests) => format!(
+            "{minutes} minute rate-aware bursts, {requests}/{} requests per 60s, concurrency {}",
+            report.environment.configured_api_rate_limit_per_minute, report.options.concurrency
+        ),
+        None => format!(
+            "{minutes} minute unthrottled load, concurrency {}",
+            report.options.concurrency
+        ),
+    }
+}
+
+fn terminal_http_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    terminal_section(output, colors, "HTTP & WEBSOCKET", thin_rule);
     let _ = writeln!(
         output,
         "  {:<24} {:>15} {:>11} {:>10} {:>12} {:>8} {:>10} {:>10} {:>10}",
         "PHASE", "SUCCESS", "OFFERED/s", "OK/s", "ACTIVE OK/s", "429 %", "P50", "P95", "P99"
     );
     let _ = writeln!(output, "  {}", ".".repeat(118));
+    let is_concurrent = |phase: &&HttpPhaseReport| phase.name.starts_with("http_concurrent");
     for phase in report
         .http_phases
         .iter()
-        .filter(|phase| !phase.name.starts_with("http_concurrent"))
+        .filter(|phase| !is_concurrent(phase))
     {
-        terminal_http_row(&mut output, &colors, phase);
+        terminal_http_row(output, colors, phase);
     }
     if let Some(websocket) = &report.websocket {
-        terminal_http_row(&mut output, &colors, &websocket.token_mint);
-        terminal_http_row(&mut output, &colors, &websocket.handshake);
+        terminal_http_row(output, colors, &websocket.token_mint);
+        terminal_http_row(output, colors, &websocket.handshake);
     }
-    for phase in report
-        .http_phases
-        .iter()
-        .filter(|phase| phase.name.starts_with("http_concurrent"))
-    {
-        terminal_http_row(&mut output, &colors, phase);
+    for phase in report.http_phases.iter().filter(is_concurrent) {
+        terminal_http_row(output, colors, phase);
     }
+}
 
-    if !report.environment.selected_instances.is_empty() {
-        terminal_section(&mut output, &colors, "SELECTED INSTANCES", &thin_rule);
-        let _ = writeln!(
-            output,
-            "  {:<36} {:<12} {:<12} {:<12}",
-            "INSTANCE", "PROTOCOL", "INITIAL", "FINAL"
-        );
-        let _ = writeln!(output, "  {}", ".".repeat(78));
-        for instance in &report.environment.selected_instances {
-            let final_status = instance.final_status.as_deref().unwrap_or("unknown");
-            let final_color = if final_status == "running" {
-                TerminalColor::Green
-            } else {
-                TerminalColor::Yellow
-            };
-            let _ = writeln!(
-                output,
-                "  {:<36} {:<12} {:<12} {}",
-                truncate(&instance.instance_id, 36),
-                instance.protocol,
-                instance.initial_status,
-                colors.paint(final_color, &format!("{final_status:<12}"))
-            );
-        }
+fn terminal_instances_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    if report.environment.selected_instances.is_empty() {
+        return;
     }
-
-    if let Some(resources) = &report.resources {
-        terminal_section(&mut output, &colors, "PEAK CPU & RAM", &thin_rule);
-        let _ = writeln!(output, "  {:<24} {:>14} {:>16}", "SCOPE", "CPU", "RAM");
-        let _ = writeln!(output, "  {}", ".".repeat(58));
-        terminal_resource_row(
-            &mut output,
-            "daemon",
-            resources.overall_peak.daemon_cpu_percent,
-            resources.overall_peak.daemon_rss_bytes,
-        );
-        terminal_resource_row(
-            &mut output,
-            "benchmark client",
-            resources.overall_peak.benchmark_cpu_percent,
-            resources.overall_peak.benchmark_rss_bytes,
-        );
-        if resources.peak_by_instance.is_empty() {
-            terminal_resource_row(
-                &mut output,
-                "database containers",
-                resources.overall_peak.instance_cpu_percent,
-                resources.overall_peak.instance_memory_bytes,
-            );
+    terminal_section(output, colors, "SELECTED INSTANCES", thin_rule);
+    let _ = writeln!(
+        output,
+        "  {:<36} {:<12} {:<12} {:<12}",
+        "INSTANCE", "PROTOCOL", "INITIAL", "FINAL"
+    );
+    let _ = writeln!(output, "  {}", ".".repeat(78));
+    for instance in &report.environment.selected_instances {
+        let final_status = instance.final_status.as_deref().unwrap_or("unknown");
+        let final_color = if final_status == "running" {
+            TerminalColor::Green
         } else {
-            for (instance_id, peak) in &resources.peak_by_instance {
-                terminal_resource_row(
-                    &mut output,
-                    &format!("{} ({})", truncate(instance_id, 18), peak.protocol),
-                    peak.peak_cpu_percent,
-                    peak.peak_memory_bytes,
-                );
-            }
-        }
-        let sampling_note = if resources.peak_by_instance.len() > 1 {
-            format!(
-                ", container telemetry round-robin across {} instances",
-                resources.peak_by_instance.len()
-            )
-        } else {
-            String::new()
+            TerminalColor::Yellow
         };
         let _ = writeln!(
             output,
-            "\n  samples: {} process ticks, {} failed container reads{}",
-            grouped_usize(resources.sample_count),
-            grouped_usize(resources.failed_instance_samples),
-            sampling_note
+            "  {:<36} {:<12} {:<12} {}",
+            truncate(&instance.instance_id, 36),
+            instance.protocol,
+            instance.initial_status,
+            colors.paint(final_color, &format!("{final_status:<12}"))
         );
     }
+}
 
-    if !report.jobs.is_empty() {
-        terminal_section(&mut output, &colors, "IMPORT & EXPORT", &thin_rule);
+fn terminal_resources_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    let Some(resources) = &report.resources else {
+        return;
+    };
+    terminal_section(output, colors, "PEAK CPU & RAM", thin_rule);
+    let _ = writeln!(output, "  {:<24} {:>14} {:>16}", "SCOPE", "CPU", "RAM");
+    let _ = writeln!(output, "  {}", ".".repeat(58));
+    terminal_resource_row(
+        output,
+        "daemon",
+        resources.overall_peak.daemon_cpu_percent,
+        resources.overall_peak.daemon_rss_bytes,
+    );
+    terminal_resource_row(
+        output,
+        "benchmark client",
+        resources.overall_peak.benchmark_cpu_percent,
+        resources.overall_peak.benchmark_rss_bytes,
+    );
+    if resources.peak_by_instance.is_empty() {
+        terminal_resource_row(
+            output,
+            "database containers",
+            resources.overall_peak.instance_cpu_percent,
+            resources.overall_peak.instance_memory_bytes,
+        );
+    } else {
+        for (instance_id, peak) in &resources.peak_by_instance {
+            terminal_resource_row(
+                output,
+                &format!("{} ({})", truncate(instance_id, 18), peak.protocol),
+                peak.peak_cpu_percent,
+                peak.peak_memory_bytes,
+            );
+        }
+    }
+    let sampling_note = if resources.peak_by_instance.len() > 1 {
+        format!(
+            ", container telemetry round-robin across {} instances",
+            resources.peak_by_instance.len()
+        )
+    } else {
+        String::new()
+    };
+    let _ = writeln!(
+        output,
+        "\n  samples: {} process ticks, {} failed container reads{}",
+        grouped_usize(resources.sample_count),
+        grouped_usize(resources.failed_instance_samples),
+        sampling_note
+    );
+}
+
+fn terminal_jobs_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    if report.jobs.is_empty() {
+        return;
+    }
+    terminal_section(output, colors, "IMPORT & EXPORT", thin_rule);
+    let _ = writeln!(
+        output,
+        "  {:<12} {:<14} {:>12} {:>14} {:>14}",
+        "ACTION", "STATUS", "DURATION", "SIZE", "THROUGHPUT"
+    );
+    let _ = writeln!(output, "  {}", ".".repeat(72));
+    for job in &report.jobs {
+        let job_color = if job.status == "succeeded" {
+            TerminalColor::Green
+        } else {
+            TerminalColor::Red
+        };
         let _ = writeln!(
             output,
-            "  {:<12} {:<14} {:>12} {:>14} {:>14}",
-            "ACTION", "STATUS", "DURATION", "SIZE", "THROUGHPUT"
+            "  {:<12} {} {:>12} {:>14} {:>14}",
+            job.action,
+            colors.paint(job_color, &format!("{:<14}", job.status)),
+            format_elapsed(job.total_duration_ms),
+            job.artifact_size_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "n/a".to_string()),
+            job.throughput_mib_per_second
+                .map(|value| format!("{value:.2} MiB/s"))
+                .unwrap_or_else(|| "n/a".to_string())
         );
-        let _ = writeln!(output, "  {}", ".".repeat(72));
-        for job in &report.jobs {
-            let job_color = if job.status == "succeeded" {
-                TerminalColor::Green
-            } else {
-                TerminalColor::Red
-            };
-            let _ = writeln!(
-                output,
-                "  {:<12} {} {:>12} {:>14} {:>14}",
-                job.action,
-                colors.paint(job_color, &format!("{:<14}", job.status)),
-                format_elapsed(job.total_duration_ms),
-                job.artifact_size_bytes
-                    .map(human_bytes)
-                    .unwrap_or_else(|| "n/a".to_string()),
-                job.throughput_mib_per_second
-                    .map(|value| format!("{value:.2} MiB/s"))
-                    .unwrap_or_else(|| "n/a".to_string())
-            );
-        }
     }
+}
 
-    if let Some(recommendation) = &report.manual_active_jobs_recommendation {
-        terminal_section(
-            &mut output,
-            &colors,
-            "MANUAL ACTIVE-JOB RECOMMENDATION",
-            &thin_rule,
-        );
-        let _ = writeln!(output, "  {:<24} {}", "Method", recommendation.method);
-        let _ = writeln!(output, "  {:<24} {}", "Status", recommendation.status);
-        if let Some(reason) = &recommendation.unavailable_reason {
-            let _ = writeln!(output, "  {:<24} {reason}", "Unavailable");
-        }
-        if let Some(capacity) = &recommendation.scheduler_capacity {
-            let _ = writeln!(
-                output,
-                "  {:<24} {} (active ceiling {}, memory {} MiB, I/O {} MiB, CPU units {})",
-                "Scheduler model",
-                capacity.mode,
-                capacity.max_active_jobs,
-                capacity.memory_budget_mib,
-                capacity.io_budget_mib,
-                capacity.cpu_units
-            );
-        }
-        if recommendation.configured_max_upload_worst_case.is_some()
-            || recommendation.representative_exported_dump.is_some()
-        {
-            let _ = writeln!(
-                output,
-                "\n  {:<34} {:>12} {:>9} {:>9} {:>9} {:>11}",
-                "WORKLOAD", "INPUT", "MEM MAX", "I/O MAX", "CPU MAX", "RECOMMEND"
-            );
-            let _ = writeln!(output, "  {}", ".".repeat(92));
-            if let Some(workload) = &recommendation.configured_max_upload_worst_case {
-                final_recommendation_row(&mut output, workload);
-            }
-            if let Some(workload) = &recommendation.representative_exported_dump {
-                final_recommendation_row(&mut output, workload);
-            }
-        }
-        if let Some(reason) = &recommendation.representative_unavailable_reason {
-            let _ = writeln!(output, "\n  Representative estimate unavailable: {reason}");
-        }
+fn terminal_recommendation_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    let Some(recommendation) = &report.manual_active_jobs_recommendation else {
+        return;
+    };
+    terminal_section(
+        output,
+        colors,
+        "MANUAL ACTIVE-JOB RECOMMENDATION",
+        thin_rule,
+    );
+    let _ = writeln!(output, "  {:<24} {}", "Method", recommendation.method);
+    let _ = writeln!(output, "  {:<24} {}", "Status", recommendation.status);
+    if let Some(reason) = &recommendation.unavailable_reason {
+        let _ = writeln!(output, "  {:<24} {reason}", "Unavailable");
+    }
+    if let Some(capacity) = &recommendation.scheduler_capacity {
         let _ = writeln!(
             output,
-            "\n  Model only: no concurrent saturation test was performed and configuration was not changed."
+            "  {:<24} {} (active ceiling {}, memory {} MiB, I/O {} MiB, CPU units {})",
+            "Scheduler model",
+            capacity.mode,
+            capacity.max_active_jobs,
+            capacity.memory_budget_mib,
+            capacity.io_budget_mib,
+            capacity.cpu_units
         );
     }
-
-    if !report.warnings.is_empty() || !report.errors.is_empty() {
-        terminal_section(&mut output, &colors, "DIAGNOSTICS", &thin_rule);
-        for error in &report.errors {
-            let _ = writeln!(
-                output,
-                "  {} {error}",
-                colors.paint(TerminalColor::Red, "x")
-            );
+    if recommendation.configured_max_upload_worst_case.is_some()
+        || recommendation.representative_exported_dump.is_some()
+    {
+        let _ = writeln!(
+            output,
+            "\n  {:<34} {:>12} {:>9} {:>9} {:>9} {:>11}",
+            "WORKLOAD", "INPUT", "MEM MAX", "I/O MAX", "CPU MAX", "RECOMMEND"
+        );
+        let _ = writeln!(output, "  {}", ".".repeat(92));
+        if let Some(workload) = &recommendation.configured_max_upload_worst_case {
+            final_recommendation_row(output, workload);
         }
-        for warning in &report.warnings {
-            let _ = writeln!(
-                output,
-                "  {} {warning}",
-                colors.paint(TerminalColor::Yellow, "!")
-            );
+        if let Some(workload) = &recommendation.representative_exported_dump {
+            final_recommendation_row(output, workload);
         }
     }
+    if let Some(reason) = &recommendation.representative_unavailable_reason {
+        let _ = writeln!(output, "\n  Representative estimate unavailable: {reason}");
+    }
+    let _ = writeln!(
+        output,
+        "\n  Model only: no concurrent saturation test was performed and configuration was not changed."
+    );
+}
 
-    terminal_section(&mut output, &colors, "REPORT FILES", &thin_rule);
+fn terminal_diagnostics_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    report: &BenchmarkReport,
+    thin_rule: &str,
+) {
+    if report.warnings.is_empty() && report.errors.is_empty() {
+        return;
+    }
+    terminal_section(output, colors, "DIAGNOSTICS", thin_rule);
+    for error in &report.errors {
+        let _ = writeln!(
+            output,
+            "  {} {error}",
+            colors.paint(TerminalColor::Red, "x")
+        );
+    }
+    for warning in &report.warnings {
+        let _ = writeln!(
+            output,
+            "  {} {warning}",
+            colors.paint(TerminalColor::Yellow, "!")
+        );
+    }
+}
+
+fn terminal_files_section(
+    output: &mut String,
+    colors: &TerminalColors,
+    paths: &ReportPaths,
+    thin_rule: &str,
+) {
+    terminal_section(output, colors, "REPORT FILES", thin_rule);
     let _ = writeln!(output, "  {:<18} {}", "JSON", paths.json.display());
     let _ = writeln!(output, "  {:<18} {}", "Markdown", paths.markdown.display());
     let _ = writeln!(
@@ -458,7 +525,6 @@ fn terminal_report(report: &BenchmarkReport, paths: &ReportPaths, color: bool) -
         "Diagnostics",
         paths.diagnostics.display()
     );
-    output
 }
 
 fn terminal_section(output: &mut String, colors: &TerminalColors, title: &str, rule: &str) {
@@ -616,6 +682,17 @@ fn format_latency(value: Option<f64>) -> String {
 
 fn markdown_report(report: &BenchmarkReport) -> String {
     let mut output = String::new();
+    markdown_summary(&mut output, report);
+    markdown_instances_section(&mut output, report);
+    markdown_http_section(&mut output, report);
+    markdown_jobs_section(&mut output, report);
+    markdown_recommendation_section(&mut output, report);
+    markdown_resources_section(&mut output, report);
+    markdown_diagnostics_section(&mut output, report);
+    output
+}
+
+fn markdown_summary(output: &mut String, report: &BenchmarkReport) {
     let _ = writeln!(output, "# DatabasesEverywhere benchmark\n");
     let _ = writeln!(output, "- Status: `{}`", report.status);
     let _ = writeln!(output, "- Benchmark ID: `{}`", report.benchmark_id);
@@ -681,25 +758,31 @@ fn markdown_report(report: &BenchmarkReport) -> String {
             target.final_status.as_deref().unwrap_or("unknown")
         );
     }
-    if !report.environment.selected_instances.is_empty() {
-        let _ = writeln!(output, "\n## Selected running instances\n");
+}
+
+fn markdown_instances_section(output: &mut String, report: &BenchmarkReport) {
+    if report.environment.selected_instances.is_empty() {
+        return;
+    }
+    let _ = writeln!(output, "\n## Selected running instances\n");
+    let _ = writeln!(
+        output,
+        "| Instance | Protocol | Initial status | Final status |"
+    );
+    let _ = writeln!(output, "| --- | --- | --- | --- |");
+    for target in &report.environment.selected_instances {
         let _ = writeln!(
             output,
-            "| Instance | Protocol | Initial status | Final status |"
+            "| `{}` | {} | {} | {} |",
+            target.instance_id,
+            target.protocol,
+            target.initial_status,
+            target.final_status.as_deref().unwrap_or("unknown")
         );
-        let _ = writeln!(output, "| --- | --- | --- | --- |");
-        for target in &report.environment.selected_instances {
-            let _ = writeln!(
-                output,
-                "| `{}` | {} | {} | {} |",
-                target.instance_id,
-                target.protocol,
-                target.initial_status,
-                target.final_status.as_deref().unwrap_or("unknown")
-            );
-        }
     }
+}
 
+fn markdown_http_section(output: &mut String, report: &BenchmarkReport) {
     let _ = writeln!(output, "\n## HTTP results\n");
     let _ = writeln!(
         output,
@@ -714,18 +797,18 @@ fn markdown_report(report: &BenchmarkReport) -> String {
         .iter()
         .filter(|phase| !phase.name.starts_with("http_concurrent"))
     {
-        write_http_row(&mut output, phase);
+        write_http_row(output, phase);
     }
     if let Some(websocket) = &report.websocket {
-        write_http_row(&mut output, &websocket.token_mint);
-        write_http_row(&mut output, &websocket.handshake);
+        write_http_row(output, &websocket.token_mint);
+        write_http_row(output, &websocket.handshake);
     }
     for phase in report
         .http_phases
         .iter()
         .filter(|phase| phase.name.starts_with("http_concurrent"))
     {
-        write_http_row(&mut output, phase);
+        write_http_row(output, phase);
     }
     for phase in report.http_phases.iter().chain(
         report
@@ -753,156 +836,167 @@ fn markdown_report(report: &BenchmarkReport) -> String {
             );
         }
     }
+}
 
-    if !report.jobs.is_empty() {
-        let _ = writeln!(output, "\n## Import/export results\n");
+fn markdown_jobs_section(output: &mut String, report: &BenchmarkReport) {
+    if report.jobs.is_empty() {
+        return;
+    }
+    let _ = writeln!(output, "\n## Import/export results\n");
+    let _ = writeln!(
+        output,
+        "| Action | Status | Size | Enqueue HTTP ms | Running seen ms | Server elapsed ms | Wall ms | MiB/s | Job ID |"
+    );
+    let _ = writeln!(
+        output,
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    );
+    for job in &report.jobs {
         let _ = writeln!(
             output,
-            "| Action | Status | Size | Enqueue HTTP ms | Running seen ms | Server elapsed ms | Wall ms | MiB/s | Job ID |"
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {} | `{}` |",
+            job.action,
+            job.status,
+            job.artifact_size_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "n/a".to_string()),
+            format_optional_f64(job.queue_latency_ms),
+            format_optional_f64(job.running_observed_after_ms),
+            format_optional_f64(job.server_duration_ms),
+            job.total_duration_ms,
+            format_optional_f64(job.throughput_mib_per_second),
+            job.job_id.as_deref().unwrap_or("n/a")
+        );
+        if let Some(error) = &job.error {
+            let _ = writeln!(output, "\n`{}` error: {}\n", job.action, error);
+        }
+    }
+}
+
+fn markdown_recommendation_section(output: &mut String, report: &BenchmarkReport) {
+    let Some(recommendation) = &report.manual_active_jobs_recommendation else {
+        return;
+    };
+    let _ = writeln!(output, "\n## Manual active-job recommendation\n");
+    let _ = writeln!(output, "- Method: `{}`", recommendation.method);
+    let _ = writeln!(output, "- Status: `{}`", recommendation.status);
+    let _ = writeln!(
+        output,
+        "- Daemon identity verified: `{}` (configured `{}`, server `{}`)",
+        recommendation.identity_verified,
+        recommendation.configured_node_uuid,
+        recommendation
+            .server_node_uuid
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    if let Some(reason) = &recommendation.unavailable_reason {
+        let _ = writeln!(output, "- Unavailable reason: {reason}");
+    }
+    if let Some(capacity) = &recommendation.scheduler_capacity {
+        let _ = writeln!(
+            output,
+            "- Scheduler capacity used by the model: mode `{}`, active ceiling `{}`, memory `{}` MiB, I/O `{}` MiB, CPU units `{}`.",
+            capacity.mode,
+            capacity.max_active_jobs,
+            capacity.memory_budget_mib,
+            capacity.io_budget_mib,
+            capacity.cpu_units
+        );
+    }
+    if let (Some(global), Some(per_instance)) = (
+        recommendation.max_queued_jobs,
+        recommendation.max_queued_jobs_per_instance,
+    ) {
+        let _ = writeln!(
+            output,
+            "- Queue admission limits: `{global}` node-wide, `{per_instance}` per instance."
+        );
+    }
+    if recommendation.configured_max_upload_worst_case.is_some()
+        || recommendation.representative_exported_dump.is_some()
+    {
+        let _ = writeln!(
+            output,
+            "\n| Workload | Protocol | Mode | Compressed | Input | Estimated RAM MiB | Estimated I/O MiB | CPU units | RAM ceiling | I/O ceiling | CPU ceiling | Active ceiling | Recommended `manual_max_active_jobs` |"
         );
         let _ = writeln!(
             output,
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         );
-        for job in &report.jobs {
+        if let Some(workload) = &recommendation.configured_max_upload_worst_case {
+            write_recommendation_row(output, workload);
+        }
+        if let Some(workload) = &recommendation.representative_exported_dump {
+            write_recommendation_row(output, workload);
+        }
+    }
+    if let Some(reason) = &recommendation.representative_unavailable_reason {
+        let _ = writeln!(output, "\n- Representative estimate unavailable: {reason}");
+    }
+    if !recommendation.caveats.is_empty() {
+        let _ = writeln!(output, "\n### Recommendation caveats\n");
+        for caveat in &recommendation.caveats {
+            let _ = writeln!(output, "- {caveat}");
+        }
+    }
+    let _ = writeln!(
+        output,
+        "\nThe benchmark did not modify daemon configuration."
+    );
+}
+
+fn markdown_resources_section(output: &mut String, report: &BenchmarkReport) {
+    let Some(resources) = &report.resources else {
+        return;
+    };
+    let _ = writeln!(output, "\n## Peak resources\n");
+    let _ = writeln!(
+        output,
+        "CPU percentages use 100% per fully occupied CPU core. {} samples were collected.",
+        resources.sample_count
+    );
+    let _ = writeln!(
+        output,
+        "\n| Phase | Daemon CPU | Daemon RAM | Bench CPU | Bench RAM | Instance CPU | Instance RAM |"
+    );
+    let _ = writeln!(output, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    write_resource_row(output, "overall", &resources.overall_peak);
+    for (phase, peak) in &resources.peak_by_phase {
+        write_resource_row(output, phase, peak);
+    }
+    if resources.failed_instance_samples > 0 {
+        let _ = writeln!(
+            output,
+            "\nInstance sampling failed {} times, including expected gaps while a physical import stopped the container.",
+            resources.failed_instance_samples
+        );
+    }
+    if !resources.peak_by_instance.is_empty() {
+        let _ = writeln!(output, "\n### Per-instance container peaks\n");
+        let _ = writeln!(
+            output,
+            "| Instance | Protocol | Samples (ok/attempted) | Peak CPU | Peak RAM |"
+        );
+        let _ = writeln!(output, "| --- | --- | ---: | ---: | ---: |");
+        for (instance_id, peak) in &resources.peak_by_instance {
             let _ = writeln!(
                 output,
-                "| {} | {} | {} | {} | {} | {} | {:.2} | {} | `{}` |",
-                job.action,
-                job.status,
-                job.artifact_size_bytes
+                "| `{}` | {} | {}/{} | {} | {} |",
+                instance_id,
+                peak.protocol,
+                peak.successful_samples,
+                peak.attempted_samples,
+                format_percent(peak.peak_cpu_percent),
+                peak.peak_memory_bytes
                     .map(human_bytes)
-                    .unwrap_or_else(|| "n/a".to_string()),
-                format_optional_f64(job.queue_latency_ms),
-                format_optional_f64(job.running_observed_after_ms),
-                format_optional_f64(job.server_duration_ms),
-                job.total_duration_ms,
-                format_optional_f64(job.throughput_mib_per_second),
-                job.job_id.as_deref().unwrap_or("n/a")
+                    .unwrap_or_else(|| "n/a".to_string())
             );
-            if let Some(error) = &job.error {
-                let _ = writeln!(output, "\n`{}` error: {}\n", job.action, error);
-            }
         }
     }
+}
 
-    if let Some(recommendation) = &report.manual_active_jobs_recommendation {
-        let _ = writeln!(output, "\n## Manual active-job recommendation\n");
-        let _ = writeln!(output, "- Method: `{}`", recommendation.method);
-        let _ = writeln!(output, "- Status: `{}`", recommendation.status);
-        let _ = writeln!(
-            output,
-            "- Daemon identity verified: `{}` (configured `{}`, server `{}`)",
-            recommendation.identity_verified,
-            recommendation.configured_node_uuid,
-            recommendation
-                .server_node_uuid
-                .as_deref()
-                .unwrap_or("unknown")
-        );
-        if let Some(reason) = &recommendation.unavailable_reason {
-            let _ = writeln!(output, "- Unavailable reason: {reason}");
-        }
-        if let Some(capacity) = &recommendation.scheduler_capacity {
-            let _ = writeln!(
-                output,
-                "- Scheduler capacity used by the model: mode `{}`, active ceiling `{}`, memory `{}` MiB, I/O `{}` MiB, CPU units `{}`.",
-                capacity.mode,
-                capacity.max_active_jobs,
-                capacity.memory_budget_mib,
-                capacity.io_budget_mib,
-                capacity.cpu_units
-            );
-        }
-        if let (Some(global), Some(per_instance)) = (
-            recommendation.max_queued_jobs,
-            recommendation.max_queued_jobs_per_instance,
-        ) {
-            let _ = writeln!(
-                output,
-                "- Queue admission limits: `{global}` node-wide, `{per_instance}` per instance."
-            );
-        }
-        if recommendation.configured_max_upload_worst_case.is_some()
-            || recommendation.representative_exported_dump.is_some()
-        {
-            let _ = writeln!(
-                output,
-                "\n| Workload | Protocol | Mode | Compressed | Input | Estimated RAM MiB | Estimated I/O MiB | CPU units | RAM ceiling | I/O ceiling | CPU ceiling | Active ceiling | Recommended `manual_max_active_jobs` |"
-            );
-            let _ = writeln!(
-                output,
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-            );
-            if let Some(workload) = &recommendation.configured_max_upload_worst_case {
-                write_recommendation_row(&mut output, workload);
-            }
-            if let Some(workload) = &recommendation.representative_exported_dump {
-                write_recommendation_row(&mut output, workload);
-            }
-        }
-        if let Some(reason) = &recommendation.representative_unavailable_reason {
-            let _ = writeln!(output, "\n- Representative estimate unavailable: {reason}");
-        }
-        if !recommendation.caveats.is_empty() {
-            let _ = writeln!(output, "\n### Recommendation caveats\n");
-            for caveat in &recommendation.caveats {
-                let _ = writeln!(output, "- {caveat}");
-            }
-        }
-        let _ = writeln!(
-            output,
-            "\nThe benchmark did not modify daemon configuration."
-        );
-    }
-
-    if let Some(resources) = &report.resources {
-        let _ = writeln!(output, "\n## Peak resources\n");
-        let _ = writeln!(
-            output,
-            "CPU percentages use 100% per fully occupied CPU core. {} samples were collected.",
-            resources.sample_count
-        );
-        let _ = writeln!(
-            output,
-            "\n| Phase | Daemon CPU | Daemon RAM | Bench CPU | Bench RAM | Instance CPU | Instance RAM |"
-        );
-        let _ = writeln!(output, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
-        write_resource_row(&mut output, "overall", &resources.overall_peak);
-        for (phase, peak) in &resources.peak_by_phase {
-            write_resource_row(&mut output, phase, peak);
-        }
-        if resources.failed_instance_samples > 0 {
-            let _ = writeln!(
-                output,
-                "\nInstance sampling failed {} times, including expected gaps while a physical import stopped the container.",
-                resources.failed_instance_samples
-            );
-        }
-        if !resources.peak_by_instance.is_empty() {
-            let _ = writeln!(output, "\n### Per-instance container peaks\n");
-            let _ = writeln!(
-                output,
-                "| Instance | Protocol | Samples (ok/attempted) | Peak CPU | Peak RAM |"
-            );
-            let _ = writeln!(output, "| --- | --- | ---: | ---: | ---: |");
-            for (instance_id, peak) in &resources.peak_by_instance {
-                let _ = writeln!(
-                    output,
-                    "| `{}` | {} | {}/{} | {} | {} |",
-                    instance_id,
-                    peak.protocol,
-                    peak.successful_samples,
-                    peak.attempted_samples,
-                    format_percent(peak.peak_cpu_percent),
-                    peak.peak_memory_bytes
-                        .map(human_bytes)
-                        .unwrap_or_else(|| "n/a".to_string())
-                );
-            }
-        }
-    }
-
+fn markdown_diagnostics_section(output: &mut String, report: &BenchmarkReport) {
     if !report.warnings.is_empty() {
         let _ = writeln!(output, "\n## Warnings\n");
         for warning in &report.warnings {
@@ -915,7 +1009,6 @@ fn markdown_report(report: &BenchmarkReport) -> String {
             let _ = writeln!(output, "- {error}");
         }
     }
-    output
 }
 
 fn write_recommendation_row(

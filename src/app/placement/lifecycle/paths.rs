@@ -103,26 +103,31 @@ fn socket_owner(
         ensure!(owner.0 != 0, "rootless Podman host uid must not be 0");
         owner
     } else {
-        let user = configured_user.unwrap_or("0:0").trim();
-        let user = if user.is_empty() || user == "root" {
-            "0:0"
-        } else {
-            user
-        };
-        let (uid, gid) = user.split_once(':').unwrap_or((user, user));
-        let gid = if gid.is_empty() { uid } else { gid };
-        (
-            uid.parse::<u32>()
-                .context("pool container uid must be numeric")?,
-            gid.parse::<u32>()
-                .context("pool container gid must be numeric")?,
-        )
+        parse_container_user(configured_user)?
     };
     ensure!(
         uid != u32::MAX && gid != u32::MAX,
         "invalid pool socket owner"
     );
     Ok(HostOwner { uid, gid })
+}
+
+fn parse_container_user(configured_user: Option<&str>) -> anyhow::Result<(u32, u32)> {
+    const ROOT_USER: &str = "0:0";
+    let user = configured_user.unwrap_or(ROOT_USER).trim();
+    let user = if user.is_empty() || user == "root" {
+        ROOT_USER
+    } else {
+        user
+    };
+    let (uid, gid) = user.split_once(':').unwrap_or((user, user));
+    let gid = if gid.is_empty() { uid } else { gid };
+    Ok((
+        uid.parse::<u32>()
+            .context("pool container uid must be numeric")?,
+        gid.parse::<u32>()
+            .context("pool container gid must be numeric")?,
+    ))
 }
 
 fn ensure_socket_directory(path: &Path, owner: HostOwner) -> anyhow::Result<()> {
