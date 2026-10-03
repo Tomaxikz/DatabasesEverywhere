@@ -6,6 +6,7 @@ pub mod mysql;
 #[cfg(test)]
 mod mysql_wire_integration;
 pub mod postgres;
+pub mod protocol;
 pub mod qdrant;
 pub(crate) mod resp;
 

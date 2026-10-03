@@ -138,9 +138,9 @@ impl ResourceCache {
             .acquire()
             .await
             .map_err(|_| IoError::other("disk scan limiter closed"))?;
-        crate::instance::disk::usage::scan_directory(
+        crate::server::disk::usage::scan_directory(
             path,
-            crate::instance::disk::usage::ScanLimits {
+            crate::server::disk::usage::ScanLimits {
                 timeout: budget,
                 ..Default::default()
             },

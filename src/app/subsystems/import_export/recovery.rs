@@ -3,12 +3,12 @@ use serde::Deserialize;
 
 use crate::{
     auth::scopes,
-    instance::jobs::import_export::ImportExportStatus,
     routes::http::{
         policy::{ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy},
         response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::jobs::import_export::ImportExportStatus,
     subsystems::import_export::{
         ImportExportJobResponse, ImportOptions, queue_import_instance, replay_failed_job,
     },

@@ -10,26 +10,27 @@ use tokio::time::sleep;
 
 use crate::{
     auth::scopes,
-    instance::backup::{
-        BackupBundle, BackupLayout, BackupStorage, BackupStoreError, MaterializedBackup,
-        StoredBackup, build_manifest,
-        catalog::{BackupCatalog, BackupCatalogColumn},
-        new_backup_id, prepare_private_dir,
-    },
-    instance::jobs::import_export::{
-        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError, JobEstimateInput,
-        JobResourceCost, SchedulerAcquireError, create_bounded_archive_with_policy,
-    },
-    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-    instance::placement::DeploymentMode,
+    databases::protocol::Protocol,
     routes::http::{
         diagnostics::PublicDiagnostic,
         policy::{ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy},
         response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::backup::{
+        BackupBundle, BackupLayout, BackupStorage, BackupStoreError, MaterializedBackup,
+        StoredBackup, build_manifest,
+        catalog::{BackupCatalog, BackupCatalogColumn},
+        new_backup_id, prepare_private_dir,
+    },
+    server::jobs::import_export::{
+        DataArchiveSourcePolicy, ImportExportJobPermit, JobAdmissionError, JobEstimateInput,
+        JobResourceCost, SchedulerAcquireError, create_bounded_archive_with_policy,
+    },
+    server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
+    server::placement::DeploymentMode,
     subsystems::artifacts::DeleteArtifactResponse,
-    utils::{ids::validate_instance_id, limits::mib_to_bytes, protocol::Protocol, time::now_unix},
+    utils::{ids::validate_instance_id, limits::mib_to_bytes, time::now_unix},
 };
 
 const DEFAULT_BROWSE_LIMIT: usize = 25;

@@ -8,9 +8,9 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    instance::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
-    instance::metadata::InstanceStatus,
     routes::http::{response::ApiError, router::AppState},
+    server::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
+    server::metadata::InstanceStatus,
     storage::import_uploads::{
         ImportUpload, ImportUploadState, ImportUploadStorageError, InterruptedImportDisposition,
     },
@@ -703,7 +703,7 @@ fn recovery_failed<T>(upload: &ImportUpload, phase: &'static str) -> Result<T, (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::protocol::Protocol;
+    use crate::databases::protocol::Protocol;
 
     fn upload() -> ImportUpload {
         ImportUpload {

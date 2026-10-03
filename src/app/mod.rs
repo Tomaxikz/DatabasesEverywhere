@@ -20,13 +20,13 @@ pub mod databases;
 #[cfg(target_os = "linux")]
 pub mod gateway;
 #[cfg(target_os = "linux")]
-pub mod instance;
-#[cfg(target_os = "linux")]
 pub mod io;
 #[cfg(target_os = "linux")]
 pub mod routes;
 #[cfg(target_os = "linux")]
 pub mod runtime;
+#[cfg(target_os = "linux")]
+pub mod server;
 #[cfg(target_os = "linux")]
 pub mod state;
 #[cfg(target_os = "linux")]

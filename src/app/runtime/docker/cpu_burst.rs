@@ -6,9 +6,9 @@ use std::{
 };
 
 use crate::{
+    databases::protocol::Protocol,
     io::cgroup::{membership_path, safe_relative_path, unescape_mountinfo},
     runtime::docker::{DockerError, DockerRuntime},
-    utils::protocol::Protocol,
 };
 
 const MAX_CONTROL_FILE_BYTES: u64 = 256;

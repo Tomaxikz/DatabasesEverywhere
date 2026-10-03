@@ -7,7 +7,7 @@ use crate::{
     databases::mongodb::transfer::{
         mongodb_database_pattern, mongodb_dump_selection_args, mongodb_restore_namespace_args,
     },
-    instance::{manager::InstanceManager, state::InstanceStore},
+    server::{manager::InstanceManager, state::InstanceStore},
     storage::{repositories::InstanceRepository, sqlite},
     subsystems::test_support,
     utils::shell::sh_quote,
@@ -46,7 +46,7 @@ pub(super) fn assert_failed_clickhouse_listing(script: &str) {
 
 #[test]
 fn clickhouse_export_and_wipe_cannot_hide_a_catalog_failure() {
-    let mut metadata = crate::instance::test_support::shared_metadata();
+    let mut metadata = crate::server::test_support::shared_metadata();
     metadata.protocol = Protocol::Clickhouse;
     assert_failed_clickhouse_listing(
         &export_script(
@@ -239,7 +239,7 @@ fn physical_upload_expansion_is_capped_by_the_instance_disk_limit() {
         );
         assert_eq!(
             physical_staging_bytes(protocol, u64::MAX / (1024 * 1024)).unwrap(),
-            Some(crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
+            Some(crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES)
         );
     }
     assert_eq!(
@@ -570,7 +570,7 @@ fn mongodb_namespace_pattern_escapes_literal_database_wildcards() {
 fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     use crate::utils::backend::BackendEndpoint;
 
-    let mut metadata = crate::instance::test_support::metadata("inst_mysql_1", Protocol::Mysql);
+    let mut metadata = crate::server::test_support::metadata("inst_mysql_1", Protocol::Mysql);
     metadata.public.port = 3308;
     metadata.backend = BackendEndpoint::UnixSocket {
         socket_path: "/run/dbev/sockets/inst_mysql_1/mysqld.sock".to_string(),
@@ -745,7 +745,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(mariadb_rollback_export.contains("--databases"));
 
     let mut shared_mysql = metadata.clone();
-    shared_mysql.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    shared_mysql.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     shared_mysql.runtime_id = "pool_mysql_1".to_string();
     assert_eq!(
         logical_exec_recovery(&metadata),
@@ -865,7 +865,7 @@ fn managed_logical_scripts_use_unix_sockets_and_scoped_credentials() {
     assert!(!mongodb_import.contains("internal-mongodb-password"));
 
     let mut shared_mongodb = mongodb.clone();
-    shared_mongodb.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    shared_mongodb.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     shared_mongodb.runtime_id = "pool_mongodb_1".to_string();
     let shared_mongodb_import = import_script(
         &shared_mongodb,

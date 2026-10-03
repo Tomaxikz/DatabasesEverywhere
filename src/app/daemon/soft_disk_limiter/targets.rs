@@ -16,7 +16,7 @@ pub(super) async fn sync_soft_disk_targets(
             metadata.status,
             InstanceStatus::Running | InstanceStatus::Booting
         );
-        if metadata.deployment_mode != crate::instance::placement::DeploymentMode::Dedicated
+        if metadata.deployment_mode != crate::server::placement::DeploymentMode::Dedicated
             || !active
             || !soft_monitoring_required(&metadata, state.config.disk.mode)
         {
@@ -46,13 +46,13 @@ pub(super) async fn sync_soft_disk_targets(
     match state.placements.list().await {
         Ok(runtimes) => {
             for runtime in runtimes.into_iter().filter(|runtime| {
-                runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+                runtime.deployment_mode == crate::server::placement::DeploymentMode::Shared
                     && matches!(
                         runtime.status,
-                        crate::instance::placement::EngineRuntimeStatus::Running
-                            | crate::instance::placement::EngineRuntimeStatus::Booting
+                        crate::server::placement::EngineRuntimeStatus::Running
+                            | crate::server::placement::EngineRuntimeStatus::Booting
                     )
-                    && crate::instance::disk::soft::SoftDiskLimiter::enforcement_required(
+                    && crate::server::disk::soft::SoftDiskLimiter::enforcement_required(
                         state.config.disk.mode,
                         runtime.protocol,
                     )
@@ -163,7 +163,7 @@ pub(super) fn observe_root_identity(
     context: &mut RootObservationContext<'_>,
     target_id: &str,
     completed_fingerprint: &str,
-    identity: crate::instance::disk::soft::planner::RootIdentity,
+    identity: crate::server::disk::soft::planner::RootIdentity,
     now: Duration,
 ) -> ObservationDisposition {
     let Some(target) = context.targets.get(target_id) else {

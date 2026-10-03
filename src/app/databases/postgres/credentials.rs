@@ -4,7 +4,7 @@ use crate::{
         MaintenanceAuthCheck, MaintenanceCredential, RecoverySecret, RotatedSecrets,
         TenantAuthHardening,
     },
-    instance::metadata::InstanceMetadata,
+    server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
 };
 

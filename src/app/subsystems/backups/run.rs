@@ -84,7 +84,7 @@ pub(super) async fn run_backup(
             .saturating_add(PHYSICAL_BACKUP_HEADROOM_BYTES)
             .clamp(
                 1,
-                crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+                crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
             )
     };
     let _output_capacity = match state
@@ -205,7 +205,7 @@ pub(super) async fn create_physical_archive(
         )
         .await?;
     }
-    let paths = crate::instance::paths::InstancePaths::new(&state.config.paths, instance_id)
+    let paths = crate::server::paths::InstancePaths::new(&state.config.paths, instance_id)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let archive_policy = if metadata.protocol == Protocol::Mysql {
         DataArchiveSourcePolicy::MysqlDataDirectory

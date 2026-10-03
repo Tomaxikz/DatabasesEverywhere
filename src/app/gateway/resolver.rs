@@ -1,7 +1,7 @@
 use crate::gateway::protocols::qdrant::QdrantRouteKey;
 use crate::{
-    instance::monitoring::ActivityCounter,
-    instance::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
+    server::monitoring::ActivityCounter,
+    server::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
     subsystems::monitoring::resources::{NetworkCounter, ResourceCache},
     utils::backend::BackendEndpoint,
 };
@@ -84,7 +84,7 @@ impl RouteResolver {
         let mut resolution = self.store.resolve_postgres(username, database).await;
         if matches!(resolution, DatabaseRouteResolution::NotFound)
             && should_retry_without_database(
-                crate::utils::protocol::Protocol::Postgres,
+                crate::databases::protocol::Protocol::Postgres,
                 username,
                 database,
             )
@@ -219,7 +219,7 @@ impl RouteResolver {
         let mut resolution = self.store.resolve_clickhouse(username, database).await;
         if matches!(resolution, DatabaseRouteResolution::NotFound)
             && should_retry_without_database(
-                crate::utils::protocol::Protocol::Clickhouse,
+                crate::databases::protocol::Protocol::Clickhouse,
                 username,
                 database,
             )
@@ -385,7 +385,7 @@ impl RouteResolver {
 /// application selects its real catalog. Keep those aliases in one resolver
 /// policy so native, HTTP, pooled, and future listener paths cannot diverge.
 fn should_retry_without_database(
-    protocol: crate::utils::protocol::Protocol,
+    protocol: crate::databases::protocol::Protocol,
     username: &str,
     database: Option<&str>,
 ) -> bool {
@@ -398,9 +398,9 @@ fn should_retry_without_database(
 mod tests {
     use super::*;
     use crate::{
-        instance::placement::DeploymentMode,
-        instance::{metadata::InstanceMetadata, test_support},
-        utils::protocol::Protocol,
+        databases::protocol::Protocol,
+        server::placement::DeploymentMode,
+        server::{metadata::InstanceMetadata, test_support},
     };
 
     #[test]
@@ -471,7 +471,7 @@ mod tests {
         metadata.runtime.container_name = "pool-mongo".to_string();
         metadata.database.name = "tenant_db".to_string();
         metadata.database.username = "tenant_user".to_string();
-        metadata.image = Some(crate::instance::metadata::InstanceImageStatus {
+        metadata.image = Some(crate::server::metadata::InstanceImageStatus {
             current: Some("mongo:8".to_string()),
             configured: "mongo:8".to_string(),
             update_available: false,

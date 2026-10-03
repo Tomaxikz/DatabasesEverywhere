@@ -49,11 +49,11 @@ pub(crate) enum LogTarget {
     Instance {
         instance_id: String,
         created_at: String,
-        protocol: crate::utils::protocol::Protocol,
+        protocol: crate::databases::protocol::Protocol,
     },
     Pool {
         grant: crate::auth::jwt::PoolGrant,
-        protocol: crate::utils::protocol::Protocol,
+        protocol: crate::databases::protocol::Protocol,
     },
 }
 
@@ -64,7 +64,7 @@ impl LogTarget {
             Self::Pool { grant, .. } => &grant.runtime_id,
         }
     }
-    fn protocol(&self) -> crate::utils::protocol::Protocol {
+    fn protocol(&self) -> crate::databases::protocol::Protocol {
         match self {
             Self::Instance { protocol, .. } => *protocol,
             Self::Pool { protocol, .. } => *protocol,

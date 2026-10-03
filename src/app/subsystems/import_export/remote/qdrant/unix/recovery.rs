@@ -59,7 +59,7 @@ pub(super) async fn write_recovery_manifest(
             })
             .collect(),
         target_aliases,
-        created_at: crate::instance::jobs::import_export::now_rfc3339(),
+        created_at: crate::server::jobs::import_export::now_rfc3339(),
     };
     let contents = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         ApiError::Runtime(format!(

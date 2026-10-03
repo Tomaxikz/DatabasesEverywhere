@@ -2,8 +2,9 @@ use crate::{
     databases::engine::{
         EngineCompatibility, EngineFamily, EngineInfo, JobCostProfile, SharedPoolProfile,
     },
-    instance::compatibility::EngineVersion,
-    utils::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
+    databases::protocol::Protocol,
+    server::compatibility::EngineVersion,
+    utils::backend::CONTAINER_SOCKET_DIRECTORY,
 };
 
 pub(crate) struct Clickhouse;

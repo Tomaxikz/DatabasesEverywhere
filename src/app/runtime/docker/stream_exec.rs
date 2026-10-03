@@ -24,8 +24,7 @@ use tokio::{
 
 use super::{DockerError, DockerRuntime, ExecRecovery, command::shell_command};
 use crate::{
-    io::files::sync_directory,
-    utils::{logs::summarize_failure_logs, protocol::Protocol},
+    databases::protocol::Protocol, io::files::sync_directory, utils::logs::summarize_failure_logs,
 };
 
 const EXEC_STREAM_BUFFER_BYTES: usize = 64 * 1024;

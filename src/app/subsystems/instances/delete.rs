@@ -22,7 +22,7 @@ pub async fn delete_instance(
     )?;
     deployment::ensure_no_active_migration(&state, &instance_id).await?;
 
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return shared::delete(&state, metadata, purge_authorization.reason()).await;
     }
 

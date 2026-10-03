@@ -16,7 +16,7 @@ mod watching;
 
 use super::*;
 use crate::{
-    instance::disk::soft::{
+    server::disk::soft::{
         HybridScanExecution, HybridScanRequest, PerformedScanKind, ScanOutcome,
         SoftDiskLimitExceeded, SoftDiskRuntime, SoftDiskTarget, StopOutcome,
         planner::{
@@ -25,7 +25,7 @@ use crate::{
         },
         watcher::{DirtyBatch, RegistrationStatus, SoftDiskWatcher},
     },
-    instance::metadata::DesiredInstanceState,
+    server::metadata::DesiredInstanceState,
 };
 use root_identity::{ObservationDisposition, RootIdentityTracker, watch_fingerprint};
 use scanning::*;

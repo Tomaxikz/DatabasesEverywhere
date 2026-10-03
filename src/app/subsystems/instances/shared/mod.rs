@@ -8,17 +8,17 @@ use super::{
     purge_runtime_paths, purge_shared_tenant_paths, route_fence,
 };
 use crate::{
-    instance::disk::DiskEnforcement,
-    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-    instance::placement::{
-        DeploymentMode, EngineRuntime, EngineRuntimeStatus, runtime as shared_runtime,
-        tenant::{self, TenantTarget},
-    },
     routes::http::{
         response::{ApiError, ApiResponse, ApiResult},
         router::AppState,
     },
     runtime::docker::DockerContainerStatus,
+    server::disk::DiskEnforcement,
+    server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
+    server::placement::{
+        DeploymentMode, EngineRuntime, EngineRuntimeStatus, runtime as shared_runtime,
+        tenant::{self, TenantTarget},
+    },
     utils::{
         limits::{InstanceLimits, mib_to_bytes},
         time::now_rfc3339,

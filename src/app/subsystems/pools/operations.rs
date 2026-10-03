@@ -1,17 +1,17 @@
 use crate::{
     auth::scopes,
-    instance::placement::{DeploymentMode, PoolLimits, PoolOwner, PoolSpec},
+    databases::protocol::Protocol,
     routes::http::{
         policy::{ApiRequestContext, DestructiveActionPolicy},
         response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::placement::{DeploymentMode, PoolLimits, PoolOwner, PoolSpec},
     subsystems::instances::{
         self,
         progress::{InstallProgress, InstallProgressStatus},
         requests::{CreateInstanceRequest, LimitsRequest},
     },
-    utils::protocol::Protocol,
 };
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,7 @@ pub(crate) async fn create(
             disk_mib: request.limits.disk_mib,
         },
     )?;
-    if crate::instance::placement::policy::engine_disk_overhead(request.protocol)
+    if crate::server::placement::policy::engine_disk_overhead(request.protocol)
         .is_none_or(|minimum| request.limits.disk_mib <= minimum)
     {
         return Err(ApiError::BadRequest(
@@ -78,7 +78,7 @@ pub(crate) async fn create(
         .daemon_shutdown
         .try_admit_background_mutation()
         .ok_or_else(|| ApiError::ServiceUnavailable("daemon is shutting down".into()))?;
-    let runtime_id = crate::instance::placement::policy::runtime_id(request.protocol);
+    let runtime_id = crate::server::placement::policy::runtime_id(request.protocol);
     let permit = state
         .install_progress
         .try_begin_creation(&runtime_id, request.protocol, &image)

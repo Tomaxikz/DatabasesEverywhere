@@ -21,7 +21,7 @@ pub(crate) async fn purge_shared_tenant_paths(
 
 pub(crate) async fn purge_runtime_paths(
     state: &AppState,
-    runtime: &crate::instance::placement::EngineRuntime,
+    runtime: &crate::server::placement::EngineRuntime,
 ) -> Result<(), ApiError> {
     purge_paths(
         state,
@@ -36,7 +36,7 @@ pub(crate) async fn purge_runtime_paths(
 /// cutover because their ownership does not move with the container.
 pub(crate) async fn purge_retired_runtime_paths(
     state: &AppState,
-    runtime: &crate::instance::placement::EngineRuntime,
+    runtime: &crate::server::placement::EngineRuntime,
 ) -> Result<(), ApiError> {
     purge_physical_paths(
         state,
@@ -49,7 +49,7 @@ pub(crate) async fn purge_retired_runtime_paths(
 pub(crate) async fn purge_provisional_runtime_paths(
     state: &AppState,
     runtime_id: &str,
-    protocol: crate::utils::protocol::Protocol,
+    protocol: crate::databases::protocol::Protocol,
     disk_enforcement_method: Option<&str>,
 ) -> Result<(), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, runtime_id)
@@ -77,10 +77,10 @@ async fn purge_physical_paths(
 
 fn provisional_cleanup_limiter(
     limiter: DiskLimiter,
-    protocol: crate::utils::protocol::Protocol,
+    protocol: crate::databases::protocol::Protocol,
     data_path: &std::path::Path,
     disk_enforcement_method: Option<&str>,
-) -> Result<DiskLimiter, crate::instance::disk::DiskLimitError> {
+) -> Result<DiskLimiter, crate::server::disk::DiskLimitError> {
     if let Some(method) = disk_enforcement_method {
         return Ok(limiter.for_persisted_method(method));
     }
@@ -93,7 +93,7 @@ fn provisional_cleanup_limiter(
 
 fn select_cleanup_limiter(
     limiter: DiskLimiter,
-    protocol: crate::utils::protocol::Protocol,
+    protocol: crate::databases::protocol::Protocol,
     has_fuse_mount: bool,
 ) -> DiskLimiter {
     if has_fuse_mount {
@@ -233,7 +233,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{DiskConfig, DiskLimitMode},
-        utils::protocol::Protocol,
+        databases::protocol::Protocol,
     };
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::instance::disk::DiskLimitError::PathIo { .. }
+            crate::server::disk::DiskLimitError::PathIo { .. }
         ));
     }
 }

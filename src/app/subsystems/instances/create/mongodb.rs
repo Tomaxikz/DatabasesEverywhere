@@ -6,8 +6,9 @@ use tokio::time::sleep;
 use super::{fail_bad_request, fail_runtime};
 use crate::{
     databases,
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
-    utils::{protocol::Protocol, shell::sh_quote},
+    utils::shell::sh_quote,
 };
 
 pub(crate) async fn provision_tenant(

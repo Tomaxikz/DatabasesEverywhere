@@ -3,9 +3,10 @@ use crate::{
         EngineCompatibility, EngineFamily, EngineInfo, JobCostProfile, SQL_JOB_COST,
         SharedPoolProfile,
     },
-    instance::auth_hardening::MYSQL_HARDENING_REVISION,
-    instance::compatibility::{EngineVersion, ProtocolCapabilities, distrib_version},
-    utils::{backend::MYSQL_SOCKET_DIRECTORY, protocol::Protocol},
+    databases::protocol::Protocol,
+    server::auth_hardening::MYSQL_HARDENING_REVISION,
+    server::compatibility::{EngineVersion, ProtocolCapabilities, distrib_version},
+    utils::backend::MYSQL_SOCKET_DIRECTORY,
 };
 
 pub(crate) struct Mysql;

@@ -303,7 +303,7 @@ pub enum DockerSecurityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime::docker::DockerEnv, utils::protocol::Protocol};
+    use crate::{databases::protocol::Protocol, runtime::docker::DockerEnv};
     use secrecy::SecretString;
 
     #[test]

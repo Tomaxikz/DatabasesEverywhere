@@ -1,8 +1,8 @@
 use super::*;
-use crate::{config::Config, instance::placement::ReserveTenant, utils::protocol::Protocol};
+use crate::{config::Config, databases::protocol::Protocol, server::placement::ReserveTenant};
 
 fn runtime() -> EngineRuntime {
-    let mut runtime = crate::instance::placement::test_support::runtime(
+    let mut runtime = crate::server::placement::test_support::runtime(
         "pool_recover",
         Protocol::Clickhouse,
         "clickhouse:25.3",
@@ -51,10 +51,10 @@ async fn configured_volume_scan_budget_supports_more_than_4096_entries() {
 fn recovery_accepts_an_attested_pinned_image_without_accepting_drift() {
     let mut pool = runtime();
     pool.database_version = Some("25.3.1.2".into());
-    pool.compatibility = Some(crate::instance::placement::RuntimeCompatibility {
+    pool.compatibility = Some(crate::server::placement::RuntimeCompatibility {
         container_id: "container-one".into(),
         image_id: "sha256:installed".into(),
-        probe_revision: crate::instance::compatibility::COMPATIBILITY_PROBE_REVISION,
+        probe_revision: crate::server::compatibility::COMPATIBILITY_PROBE_REVISION,
     });
     assert!(recovery_image_matches(
         &pool,
@@ -119,7 +119,7 @@ fn recovery_pool_gates_preserve_unrelated_quarantines_and_stopped_intent() {
 }
 
 fn tenant(pool: &EngineRuntime) -> InstanceMetadata {
-    let mut metadata = crate::instance::test_support::metadata("tenant_recover", pool.protocol);
+    let mut metadata = crate::server::test_support::metadata("tenant_recover", pool.protocol);
     metadata.owner = pool.owner.clone();
     metadata.deployment_mode = DeploymentMode::Shared;
     metadata.runtime_id = pool.runtime_id.clone();
@@ -352,7 +352,7 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
     let (state, dir, _db, pool) = fixture().await;
     let mut other = runtime();
     other.runtime_id = "pool_failed".into();
-    other.owner = Some(crate::instance::placement::test_support::owner(
+    other.owner = Some(crate::server::placement::test_support::owner(
         "other-server",
     ));
     other.status = EngineRuntimeStatus::Failed;

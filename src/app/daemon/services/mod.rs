@@ -315,7 +315,7 @@ mod tests {
         assert!(matches!(
             state.install_progress.try_begin_creation(
                 "test",
-                crate::utils::protocol::Protocol::Postgres,
+                crate::databases::protocol::Protocol::Postgres,
                 "postgres:test"
             ),
             Err(crate::subsystems::instances::progress::BeginCreationError::ShuttingDown),

@@ -4,9 +4,9 @@ use bollard::{models::EventMessage, query_parameters::EventsOptionsBuilder};
 use futures::{Stream, StreamExt};
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{DockerError, DockerRuntime},
     utils::constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
-    utils::protocol::Protocol,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

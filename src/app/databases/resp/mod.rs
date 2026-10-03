@@ -11,13 +11,11 @@ use std::path::{Path, PathBuf};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
+    databases::protocol::Protocol,
     gateway::protocols::redis::password_route_sha256,
     io::files::atomic_write_private,
     runtime::docker::{DockerInstanceSpec, DockerMount},
-    utils::{
-        backend::{CONTAINER_SOCKET_DIRECTORY, container_backend_socket_path},
-        protocol::Protocol,
-    },
+    utils::backend::{CONTAINER_SOCKET_DIRECTORY, container_backend_socket_path},
 };
 
 pub(crate) fn instance_spec(

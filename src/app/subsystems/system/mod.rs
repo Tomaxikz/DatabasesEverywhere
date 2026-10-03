@@ -11,11 +11,9 @@ use crate::routes::http::{
     router::AppState,
 };
 use crate::{
-    instance::placement::DeploymentMode,
-    utils::{
-        limits::{bytes_to_mib_ceil, mib_to_bytes},
-        protocol::Protocol,
-    },
+    databases::protocol::Protocol,
+    server::placement::DeploymentMode,
+    utils::limits::{bytes_to_mib_ceil, mib_to_bytes},
 };
 
 // API compatibility is versioned independently from the daemon binary release.
@@ -164,8 +162,8 @@ pub struct ImportExportSchedulerEstimateQuery {
 
 #[derive(Debug, Serialize)]
 pub struct ImportExportSchedulerRecommendationResponse {
-    pub scheduler: crate::instance::jobs::import_export::SchedulerSnapshot,
-    pub estimate: crate::instance::jobs::import_export::JobResourceCost,
+    pub scheduler: crate::server::jobs::import_export::SchedulerSnapshot,
+    pub estimate: crate::server::jobs::import_export::JobResourceCost,
     pub recommended_active_jobs: usize,
     pub admitted_jobs: usize,
     pub max_queued_jobs: usize,
@@ -182,22 +180,21 @@ pub async fn scheduler_recommendation(
         .protocol
         .as_deref()
         .unwrap_or("postgres")
-        .parse::<crate::utils::protocol::Protocol>()
+        .parse::<crate::databases::protocol::Protocol>()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let export = parse_is_export(query.action.as_deref())?;
     let wipe = parse_is_wipe(query.mode.as_deref(), export)?;
     let size_bytes = query
         .size_bytes
         .unwrap_or(state.config.artifacts.import_upload_max_bytes);
-    if size_bytes == 0 || size_bytes > crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES
-    {
+    if size_bytes == 0 || size_bytes > crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES {
         return Err(ApiError::BadRequest(format!(
             "size_bytes must be between 1 and {}",
-            crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES
+            crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES
         )));
     }
     let compressed = query.compressed.unwrap_or(false)
-        || crate::instance::jobs::import_export::protocol_uses_native_compression(protocol);
+        || crate::server::jobs::import_export::protocol_uses_native_compression(protocol);
     let target_disk_mib = query
         .target_disk_mib
         .unwrap_or_else(|| bytes_to_mib_ceil(size_bytes));
@@ -209,7 +206,7 @@ pub async fn scheduler_recommendation(
     let estimated_input_size_bytes = if export {
         size_bytes
     } else {
-        crate::instance::jobs::import_export::conservative_import_input_bytes(
+        crate::server::jobs::import_export::conservative_import_input_bytes(
             protocol,
             size_bytes,
             state
@@ -222,14 +219,14 @@ pub async fn scheduler_recommendation(
         )
     };
     let rollback_size_bytes =
-        if wipe && crate::instance::jobs::import_export::protocol_uses_logical_dumps(protocol) {
+        if wipe && crate::server::jobs::import_export::protocol_uses_logical_dumps(protocol) {
             mib_to_bytes(target_disk_mib)
                 .clamp(1, crate::subsystems::import_export::MAX_UNARCHIVED_BYTES)
         } else {
             0
         };
-    let estimate = crate::instance::jobs::import_export::JobResourceCost::estimate(
-        crate::instance::jobs::import_export::JobEstimateInput {
+    let estimate = crate::server::jobs::import_export::JobResourceCost::estimate(
+        crate::server::jobs::import_export::JobEstimateInput {
             protocol,
             input_size_bytes: estimated_input_size_bytes,
             rollback_size_bytes,
@@ -498,27 +495,27 @@ mod tests {
 
         let stages = strings(&schemas["DeploymentMigrationStage"]["enum"]);
         let expected_stages = [
-            crate::instance::placement::MigrationStage::Requested,
-            crate::instance::placement::MigrationStage::Preflight,
-            crate::instance::placement::MigrationStage::TargetPreparing,
-            crate::instance::placement::MigrationStage::TargetPrepared,
-            crate::instance::placement::MigrationStage::SourceFencing,
-            crate::instance::placement::MigrationStage::SourceFenced,
-            crate::instance::placement::MigrationStage::Exporting,
-            crate::instance::placement::MigrationStage::Exported,
-            crate::instance::placement::MigrationStage::Importing,
-            crate::instance::placement::MigrationStage::Imported,
-            crate::instance::placement::MigrationStage::Validating,
-            crate::instance::placement::MigrationStage::CutoverPending,
-            crate::instance::placement::MigrationStage::CutoverCommitted,
-            crate::instance::placement::MigrationStage::VerifyingCutover,
-            crate::instance::placement::MigrationStage::CleaningSource,
-            crate::instance::placement::MigrationStage::RollingBack,
-            crate::instance::placement::MigrationStage::CleanupPending,
-            crate::instance::placement::MigrationStage::ManualIntervention,
-            crate::instance::placement::MigrationStage::Completed,
-            crate::instance::placement::MigrationStage::Failed,
-            crate::instance::placement::MigrationStage::Cancelled,
+            crate::server::placement::MigrationStage::Requested,
+            crate::server::placement::MigrationStage::Preflight,
+            crate::server::placement::MigrationStage::TargetPreparing,
+            crate::server::placement::MigrationStage::TargetPrepared,
+            crate::server::placement::MigrationStage::SourceFencing,
+            crate::server::placement::MigrationStage::SourceFenced,
+            crate::server::placement::MigrationStage::Exporting,
+            crate::server::placement::MigrationStage::Exported,
+            crate::server::placement::MigrationStage::Importing,
+            crate::server::placement::MigrationStage::Imported,
+            crate::server::placement::MigrationStage::Validating,
+            crate::server::placement::MigrationStage::CutoverPending,
+            crate::server::placement::MigrationStage::CutoverCommitted,
+            crate::server::placement::MigrationStage::VerifyingCutover,
+            crate::server::placement::MigrationStage::CleaningSource,
+            crate::server::placement::MigrationStage::RollingBack,
+            crate::server::placement::MigrationStage::CleanupPending,
+            crate::server::placement::MigrationStage::ManualIntervention,
+            crate::server::placement::MigrationStage::Completed,
+            crate::server::placement::MigrationStage::Failed,
+            crate::server::placement::MigrationStage::Cancelled,
         ];
         assert_eq!(
             stages,
@@ -712,12 +709,12 @@ mod tests {
 
     #[test]
     fn scheduler_recommendation_distinguishes_admission_from_execution_waiters() {
-        let jobs = crate::instance::jobs::import_export::ImportExportJobs::default();
+        let jobs = crate::server::jobs::import_export::ImportExportJobs::default();
         let _admitted = jobs.try_admit("inst-waiting-on-lock").unwrap();
         let scheduler = jobs.scheduler_snapshot();
-        let estimate = crate::instance::jobs::import_export::JobResourceCost::estimate(
-            crate::instance::jobs::import_export::JobEstimateInput {
-                protocol: crate::utils::protocol::Protocol::Postgres,
+        let estimate = crate::server::jobs::import_export::JobResourceCost::estimate(
+            crate::server::jobs::import_export::JobEstimateInput {
+                protocol: crate::databases::protocol::Protocol::Postgres,
                 input_size_bytes: 1024,
                 rollback_size_bytes: 0,
                 wipe: false,

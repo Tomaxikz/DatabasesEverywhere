@@ -1,15 +1,16 @@
 use crate::{
     auth::scopes,
-    instance::disk::DiskLimiter,
-    instance::placement::{EngineRuntimeStatus, lifecycle},
-    instance::{metadata::DesiredInstanceState, paths::InstancePaths},
+    databases::protocol::Protocol,
     routes::http::{
         policy::{ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy},
         response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::disk::DiskLimiter,
+    server::placement::{EngineRuntimeStatus, lifecycle},
+    server::{metadata::DesiredInstanceState, paths::InstancePaths},
     subsystems::instances,
-    utils::{protocol::Protocol, time::now_rfc3339},
+    utils::time::now_rfc3339,
 };
 use axum::extract::State;
 use serde::Deserialize;
@@ -65,7 +66,7 @@ pub(crate) async fn update(
     Ok(response)
 }
 
-fn image_update_blocked(pool: &crate::instance::placement::EngineRuntime) -> bool {
+fn image_update_blocked(pool: &crate::server::placement::EngineRuntime) -> bool {
     let busy = matches!(
         pool.status,
         EngineRuntimeStatus::Creating | EngineRuntimeStatus::Deleting
@@ -79,7 +80,7 @@ fn image_update_blocked(pool: &crate::instance::placement::EngineRuntime) -> boo
 /// the same journal, readiness checks, tenant fencing, and failure handling.
 pub(crate) async fn replace_image_locked(
     state: &AppState,
-    pool: &mut crate::instance::placement::EngineRuntime,
+    pool: &mut crate::server::placement::EngineRuntime,
     image: String,
     previous_version: String,
     expected_image: Option<String>,
@@ -208,7 +209,7 @@ pub(crate) async fn replace_image_locked(
             .map_err(|error| ApiError::Runtime(error.to_string()))?;
         if was_running {
             let recovered =
-                crate::instance::placement::tenant::recovery::reconcile_runtime_tenants_locked(
+                crate::server::placement::tenant::recovery::reconcile_runtime_tenants_locked(
                     state, pool,
                 )
                 .await
@@ -249,7 +250,7 @@ pub(crate) async fn replace_image_locked(
 
 async fn remove_pool_container(
     state: &AppState,
-    pool: &crate::instance::placement::EngineRuntime,
+    pool: &crate::server::placement::EngineRuntime,
 ) -> Result<(), ApiError> {
     state
         .docker
@@ -308,7 +309,7 @@ pub(crate) async fn refresh_logging(state: &AppState, runtime_id: &str) -> Resul
 
 pub(super) async fn refresh_logging_locked(
     state: &AppState,
-    pool: &mut crate::instance::placement::EngineRuntime,
+    pool: &mut crate::server::placement::EngineRuntime,
 ) -> Result<bool, ApiError> {
     let runtime_id = pool.runtime_id.clone();
     if pool.pending_image.is_some()
@@ -329,7 +330,7 @@ pub(super) async fn refresh_logging_locked(
     let previous_version = match &pool.database_version {
         Some(version) => version.clone(),
         None => {
-            crate::instance::placement::runtime::probe_compatibility(&state.docker, pool)
+            crate::server::placement::runtime::probe_compatibility(&state.docker, pool)
                 .await
                 .map_err(ApiError::Runtime)?
                 .version
@@ -366,7 +367,7 @@ fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), Ap
 }
 
 fn numeric_version_components(protocol: Protocol, version: &str) -> Option<Vec<u64>> {
-    let normalized = crate::instance::compatibility::normalize_database_version(protocol, version)?;
+    let normalized = crate::server::compatibility::normalize_database_version(protocol, version)?;
     // Attested versions retain vendor/package suffixes. Compare all numeric
     // components (including ClickHouse's fourth), not the package build.
     let numeric = normalized.split(['-', ' ', '+']).next()?;
@@ -394,7 +395,7 @@ mod tests {
             (EngineRuntimeStatus::Deleting, DesiredInstanceState::Stopped),
             (EngineRuntimeStatus::Running, DesiredInstanceState::Stopped),
         ] {
-            let mut pool = crate::instance::placement::test_support::runtime(
+            let mut pool = crate::server::placement::test_support::runtime(
                 "pool",
                 Protocol::Postgres,
                 "postgres:18.4",

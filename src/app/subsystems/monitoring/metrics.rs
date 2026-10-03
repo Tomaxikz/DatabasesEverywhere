@@ -6,9 +6,9 @@ use axum::{
 
 use crate::{
     auth::scopes,
-    instance::jobs::import_export::ImportExportStatus,
+    databases::protocol::Protocol,
     routes::http::{policy::ApiRequestContext, response::ApiError, router::AppState},
-    utils::protocol::Protocol,
+    server::jobs::import_export::ImportExportStatus,
 };
 
 pub async fn metrics(

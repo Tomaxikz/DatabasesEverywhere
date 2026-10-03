@@ -1,6 +1,6 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    instance::placement::tenant::backends::{MongodbTenantBackend, TenantBackend},
+    server::placement::tenant::backends::{MongodbTenantBackend, TenantBackend},
     utils::shell::sh_quote,
 };
 

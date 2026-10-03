@@ -36,7 +36,7 @@ pub(super) async fn admit_logical_copy(
             // pipeline without falsely charging in-place rollback memory.
             rollback_size_bytes: 0,
             wipe: false,
-            compressed: crate::instance::jobs::import_export::protocol_uses_native_compression(
+            compressed: crate::server::jobs::import_export::protocol_uses_native_compression(
                 source.protocol,
             ),
             export: false,

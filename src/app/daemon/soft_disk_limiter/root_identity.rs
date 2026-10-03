@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::instance::disk::soft::planner::RootIdentity;
+use crate::server::disk::soft::planner::RootIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObservationDisposition {
@@ -98,7 +98,8 @@ mod tests {
     };
     use super::*;
     use crate::{
-        instance::disk::{
+        databases::protocol::Protocol,
+        server::disk::{
             soft::{
                 HybridScanExecution, PerformedScanKind, ScanOutcome, SoftDiskSnapshot,
                 SoftDiskTarget,
@@ -107,7 +108,6 @@ mod tests {
             },
             usage::DirectoryUsage,
         },
-        utils::protocol::Protocol,
     };
     use std::{
         path::PathBuf,

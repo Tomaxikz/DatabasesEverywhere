@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::{config::Config, utils::protocol::Protocol};
+use crate::{config::Config, databases::protocol::Protocol};
 
 use super::{
     http::BenchClient,

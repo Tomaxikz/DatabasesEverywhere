@@ -129,7 +129,7 @@ async fn acquire_upgrade_resources(
     metadata: &InstanceMetadata,
 ) -> Result<
     (
-        crate::instance::jobs::import_export::ExecutionPermit,
+        crate::server::jobs::import_export::ExecutionPermit,
         crate::subsystems::import_export::DiskCapacityReservation,
     ),
     ApiError,
@@ -148,8 +148,8 @@ async fn acquire_upgrade_resources(
         })?;
     let execution = state
         .import_export_jobs
-        .acquire_execution(crate::instance::jobs::import_export::JobResourceCost::estimate(
-            crate::instance::jobs::import_export::JobEstimateInput {
+        .acquire_execution(crate::server::jobs::import_export::JobResourceCost::estimate(
+            crate::server::jobs::import_export::JobEstimateInput {
                 protocol: metadata.protocol,
                 input_size_bytes: staged_capacity_bytes,
                 rollback_size_bytes: 0,
@@ -161,10 +161,10 @@ async fn acquire_upgrade_resources(
         .await
         .map_err(|error| {
             let error = match error {
-                crate::instance::jobs::import_export::SchedulerAcquireError::Closed => {
+                crate::server::jobs::import_export::SchedulerAcquireError::Closed => {
                     ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
                 }
-                crate::instance::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
+                crate::server::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
                     ApiError::Conflict(
                         "the major-upgrade migration exceeds a fixed dynamic import/export scheduler budget; increase the configured budget or reduce the instance allocation"
                             .to_string(),
@@ -193,18 +193,18 @@ async fn acquire_upgrade_resources(
 
 fn upgrade_admission_error(
     instance_id: &str,
-    error: crate::instance::jobs::import_export::JobAdmissionError,
+    error: crate::server::jobs::import_export::JobAdmissionError,
 ) -> ApiError {
     match error {
-        crate::instance::jobs::import_export::JobAdmissionError::GlobalCapacity => {
+        crate::server::jobs::import_export::JobAdmissionError::GlobalCapacity => {
             ApiError::RateLimited
         }
-        crate::instance::jobs::import_export::JobAdmissionError::InstanceCapacity => {
+        crate::server::jobs::import_export::JobAdmissionError::InstanceCapacity => {
             ApiError::Conflict(format!(
                 "instance {instance_id} already has a queued data operation"
             ))
         }
-        crate::instance::jobs::import_export::JobAdmissionError::ShuttingDown => {
+        crate::server::jobs::import_export::JobAdmissionError::ShuttingDown => {
             ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
         }
     }

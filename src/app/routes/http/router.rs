@@ -137,7 +137,7 @@ mod tests {
     use crate::{
         auth::api_token::ApiToken,
         config::Config,
-        instance::{manager::InstanceManager, state::InstanceStore},
+        server::{manager::InstanceManager, state::InstanceStore},
         storage::{repositories::InstanceRepository, sqlite},
         subsystems::test_support,
     };
@@ -310,7 +310,7 @@ mod tests {
             crate::storage::import_uploads::ImportUploadState::Ready
         );
         let upload_path =
-            crate::instance::paths::InstancePaths::new(&state.config.paths, "inst_upload")
+            crate::server::paths::InstancePaths::new(&state.config.paths, "inst_upload")
                 .unwrap()
                 .imports
                 .join(".uploads")
@@ -433,10 +433,10 @@ mod tests {
         (state, directory)
     }
 
-    fn upload_test_metadata(instance_id: &str) -> crate::instance::metadata::InstanceMetadata {
-        let mut metadata = crate::instance::test_support::metadata(
+    fn upload_test_metadata(instance_id: &str) -> crate::server::metadata::InstanceMetadata {
+        let mut metadata = crate::server::test_support::metadata(
             instance_id,
-            crate::utils::protocol::Protocol::Postgres,
+            crate::databases::protocol::Protocol::Postgres,
         );
         metadata.backend = crate::utils::backend::BackendEndpoint::UnixSocket {
             socket_path: format!("/run/dbev/sockets/{instance_id}/.s.PGSQL.5432"),

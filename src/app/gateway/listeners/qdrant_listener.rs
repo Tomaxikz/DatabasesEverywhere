@@ -422,8 +422,8 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
 mod tests {
     use super::*;
     use crate::{
-        instance::state::InstanceStore, subsystems::monitoring::resources::ResourceCache,
-        utils::protocol::Protocol,
+        databases::protocol::Protocol, server::state::InstanceStore,
+        subsystems::monitoring::resources::ResourceCache,
     };
 
     #[test]
@@ -584,11 +584,9 @@ mod tests {
         backend.await.unwrap();
     }
 
-    fn qdrant_metadata(
-        grpc_socket: &std::path::Path,
-    ) -> crate::instance::metadata::InstanceMetadata {
+    fn qdrant_metadata(grpc_socket: &std::path::Path) -> crate::server::metadata::InstanceMetadata {
         let mut metadata =
-            crate::instance::test_support::metadata("inst_qdrant_rest", Protocol::Qdrant);
+            crate::server::test_support::metadata("inst_qdrant_rest", Protocol::Qdrant);
         metadata.public.host = "db.example.test".to_string();
         metadata.public.port = 6334;
         metadata.backend = BackendEndpoint::UnixSocket {

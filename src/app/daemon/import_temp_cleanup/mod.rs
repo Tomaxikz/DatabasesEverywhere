@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
+use crate::databases::protocol::Protocol;
 use crate::io::files::sync_directory;
-use crate::utils::protocol::Protocol;
 
 const MAX_ROOT_ENTRIES: usize = 4096;
 const MAX_TREE_ENTRIES: usize = 4096;

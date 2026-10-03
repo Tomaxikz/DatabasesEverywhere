@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::scopes,
+    databases::protocol::Protocol,
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiJson, ApiResponse, ApiResult},
         router::AppState,
     },
     subsystems::instances::docker_error,
-    utils::{images::is_pinned_image_reference, protocol::Protocol},
+    utils::images::is_pinned_image_reference,
 };
 
 #[derive(Debug, Deserialize)]
@@ -100,7 +101,7 @@ mod tests {
     use crate::{
         auth::api_token::ApiToken,
         config::{Config, ImageAllowlistConfig},
-        instance::{manager::InstanceManager, state::InstanceStore},
+        server::{manager::InstanceManager, state::InstanceStore},
         storage::{repositories::InstanceRepository, sqlite},
         subsystems::test_support,
     };

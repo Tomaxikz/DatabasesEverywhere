@@ -56,6 +56,7 @@ use secrecy::ExposeSecret;
 
 use crate::{
     config::{DaemonConfig, DaemonEngine},
+    databases::protocol::Protocol,
     io::ownership::HostOwner,
     runtime::docker::container_config::{cpu_to_nano, disabled_healthcheck, mib_to_bytes},
     runtime::socket_bridge::supervisor_arguments,
@@ -66,7 +67,6 @@ use crate::{
         backend::SOCKET_BRIDGE_CONTAINER_PATH,
         ids::sanitize_docker_suffix,
         limits::{ResourceLimitError, validate_runtime_limits},
-        protocol::Protocol,
     },
 };
 

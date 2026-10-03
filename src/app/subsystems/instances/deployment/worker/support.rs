@@ -136,7 +136,7 @@ pub(super) fn runtime_error(error: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::protocol::Protocol;
+    use crate::databases::protocol::Protocol;
 
     #[test]
     fn dedicated_targets_bootstrap_with_the_durable_tenant_identity() {
@@ -147,7 +147,7 @@ mod tests {
             Protocol::Mongodb,
             Protocol::Clickhouse,
         ] {
-            let mut source = crate::instance::test_support::metadata("tenant", protocol);
+            let mut source = crate::server::test_support::metadata("tenant", protocol);
             source.deployment_mode = DeploymentMode::Shared;
             source.tenant_password = Some("current-tenant-password".to_string());
             let runtime = EngineRuntime::legacy_dedicated(

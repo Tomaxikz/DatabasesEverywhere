@@ -3,12 +3,12 @@ use crate::{
         jwt::{Claims, PoolGrant},
         scopes,
     },
-    instance::placement::EngineRuntime,
     routes::http::{
         policy::{ApiRequestContext, WebSocketRequestContext},
         response::{ApiError, ApiPath, ApiQuery, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::placement::EngineRuntime,
     subsystems::{
         instances::LogsQuery,
         monitoring::{
@@ -249,9 +249,9 @@ mod tests {
     use super::*;
     #[test]
     fn pool_grants_are_bound_to_owner_and_generation() {
-        let pool = crate::instance::placement::test_support::runtime(
+        let pool = crate::server::placement::test_support::runtime(
             "pool-one",
-            crate::utils::protocol::Protocol::Mysql,
+            crate::databases::protocol::Protocol::Mysql,
             "mysql:8.4",
         );
         let mut grant = PoolGrant {

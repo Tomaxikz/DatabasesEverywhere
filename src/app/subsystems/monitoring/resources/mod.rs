@@ -20,23 +20,24 @@ use tokio::{
 use crate::{
     auth::scopes,
     config::Config,
-    instance::disk::{
-        DiskLimiter,
-        soft::{SoftDiskSnapshot, SoftDiskTarget},
-    },
-    instance::monitoring::ActivityStore,
-    instance::placement::DeploymentMode,
-    instance::{
-        metadata::{InstanceMetadata, InstanceStatus},
-        paths::InstancePaths,
-    },
+    databases::protocol::Protocol,
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiPath, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::disk::{
+        DiskLimiter,
+        soft::{SoftDiskSnapshot, SoftDiskTarget},
+    },
+    server::monitoring::ActivityStore,
+    server::placement::DeploymentMode,
+    server::{
+        metadata::{InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     storage::activity::ActivityRepository,
-    utils::{limits::mib_to_bytes, protocol::Protocol},
+    utils::limits::mib_to_bytes,
 };
 
 use futures::{StreamExt, TryStreamExt};

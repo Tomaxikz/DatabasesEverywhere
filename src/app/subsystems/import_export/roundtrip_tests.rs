@@ -1,10 +1,10 @@
 //! Extends the existing disposable-engine matrix through production transfers.
 use crate::{
     config::Config,
-    instance::placement::{DeploymentMode, EngineRuntime, ReserveTenant},
-    instance::{metadata::InstanceMetadata, test_support::metadata},
     routes::http::router::AppState,
     runtime::docker::DockerRuntime,
+    server::placement::{DeploymentMode, EngineRuntime, ReserveTenant},
+    server::{metadata::InstanceMetadata, test_support::metadata},
     subsystems::{import_export::logical, test_support},
     utils::limits::InstanceLimits,
 };
@@ -22,7 +22,7 @@ pub(crate) async fn shared_roundtrip(
     data.docker = docker.clone();
     let state = AppState::new(data);
     let mut runtime = runtime.clone();
-    let attestation = crate::instance::placement::runtime::probe_compatibility(docker, &runtime)
+    let attestation = crate::server::placement::runtime::probe_compatibility(docker, &runtime)
         .await
         .unwrap();
     runtime.database_version = Some(attestation.version);

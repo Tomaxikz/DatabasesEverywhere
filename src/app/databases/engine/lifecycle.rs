@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use futures::future::{BoxFuture, FutureExt};
 use secrecy::SecretString;
 
-use crate::{instance::metadata::InstanceMetadata, runtime::docker::DockerInstanceSpec};
+use crate::{runtime::docker::DockerInstanceSpec, server::metadata::InstanceMetadata};
 
 use super::EngineInfo;
 

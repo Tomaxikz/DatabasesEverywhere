@@ -16,15 +16,16 @@ use super::{
     supervision::InPlaceResetContext,
 };
 use crate::{
+    databases::protocol::Protocol,
     databases::{
         self,
         engine::{LiveRotation, MaintenanceAuthCheck, MaintenanceCredential},
     },
-    instance::metadata::InstanceMetadata,
     routes::http::{response::ApiError, router::AppState},
     runtime::docker::{DockerError, ExecRecovery},
+    server::metadata::InstanceMetadata,
     subsystems::instances::docker_error,
-    utils::{protocol::Protocol, shell::sh_quote},
+    utils::shell::sh_quote,
 };
 
 const ADMIN_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

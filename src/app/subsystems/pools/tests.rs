@@ -1,16 +1,16 @@
 use crate::{
     auth::{jwt, scopes},
     config::Config,
-    instance::placement::{EngineRuntimeStatus, test_support::runtime},
+    databases::protocol::Protocol,
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiJson, ApiPath},
     },
+    server::placement::{EngineRuntimeStatus, test_support::runtime},
     subsystems::{
         monitoring::tokens::{IssueWsTokenRequest, issue_ws_token},
         test_support,
     },
-    utils::protocol::Protocol,
 };
 use axum::{
     extract::{FromRequestParts, State},
@@ -92,8 +92,8 @@ async fn issued_pool_tokens_bind_owner_generation_and_scope() {
 #[tokio::test]
 async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
     use crate::{
-        instance::metadata::InstanceStatus,
-        instance::placement::{DeploymentMode, ReserveTenant},
+        server::metadata::InstanceStatus,
+        server::placement::{DeploymentMode, ReserveTenant},
     };
     let (state, _dir) = test_support::database(Config::default()).await;
     let mut pool = runtime(
@@ -103,7 +103,7 @@ async fn failed_clickhouse_pool_tenants_remain_listable_without_disk_samples() {
     );
     pool.limits.disk_mib = 64 * 1024;
     state.placements.save(&pool).await.unwrap();
-    let mut tenant = crate::instance::test_support::metadata("oom-tenant", Protocol::Clickhouse);
+    let mut tenant = crate::server::test_support::metadata("oom-tenant", Protocol::Clickhouse);
     tenant.owner = pool.owner.clone();
     tenant.deployment_mode = DeploymentMode::Shared;
     tenant.runtime_id = pool.runtime_id.clone();
@@ -235,7 +235,7 @@ async fn pool_status_and_child_request_are_distinct_resources() {
 
 #[tokio::test]
 async fn pending_images_and_stopped_intent_survive_storage_and_block_route_recovery() {
-    use crate::instance::metadata::DesiredInstanceState;
+    use crate::server::metadata::DesiredInstanceState;
     let (state, _dir) = test_support::database(Config::default()).await;
     let mut pool = runtime("pending-pool", Protocol::Mysql, "mysql:8.4");
     pool.pending_image = Some("sha256:attested-image".into());
@@ -260,12 +260,11 @@ async fn pending_images_and_stopped_intent_survive_storage_and_block_route_recov
     ] {
         pool.pending_image = pending;
         pool.desired_state = desired;
-        let result =
-            crate::instance::placement::tenant::recovery::reconcile_runtime_tenants_locked(
-                &state, &pool,
-            )
-            .await
-            .unwrap();
+        let result = crate::server::placement::tenant::recovery::reconcile_runtime_tenants_locked(
+            &state, &pool,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.checked, 0);
     }
 }
@@ -275,7 +274,7 @@ async fn pool_mutations_reject_durable_migrations_even_before_target_provisionin
     let (state, _dir) = test_support::database(Config::default()).await;
     let pool = runtime("destination", Protocol::Mysql, "mysql:8.4");
     state.placements.save(&pool).await.unwrap();
-    let mut source = crate::instance::test_support::metadata("source", Protocol::Mysql);
+    let mut source = crate::server::test_support::metadata("source", Protocol::Mysql);
     source.owner = pool.owner.clone();
     state.manager.upsert(source.clone()).await.unwrap();
     state
@@ -283,7 +282,7 @@ async fn pool_mutations_reject_durable_migrations_even_before_target_provisionin
         .migrations()
         .start(
             &source,
-            crate::instance::placement::DeploymentMode::Shared,
+            crate::server::placement::DeploymentMode::Shared,
             Some(&pool.runtime_id),
             None,
         )

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::instance::disk::soft::watcher::RetiredWatch;
+use crate::server::disk::soft::watcher::RetiredWatch;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct DesiredWatch {
@@ -347,7 +347,7 @@ impl WatchOperationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instance::disk::soft::{
+    use crate::server::disk::soft::{
         planner::{HybridScanPlanner, PlannerConfig, ScanKind, TargetSpec},
         usage_tree::RootIdentity,
     };

@@ -3,15 +3,15 @@ use serde::Deserialize;
 
 use crate::{
     config::Config,
-    instance::placement::DeploymentMode,
+    databases::protocol::Protocol,
     routes::http::{
         policy::{DestructiveActionConfirmation, DestructiveActionPolicy},
         response::ApiError,
     },
+    server::placement::DeploymentMode,
     utils::{
         ids::validate_instance_id,
         limits::{InstanceLimits, validate_runtime_limits},
-        protocol::Protocol,
     },
 };
 
@@ -26,7 +26,7 @@ pub struct CreateInstanceRequest {
     pub server_id: Option<String>,
     pub pool_id: Option<String>,
     #[serde(skip)]
-    pub(crate) owner: Option<crate::instance::placement::PoolOwner>,
+    pub(crate) owner: Option<crate::server::placement::PoolOwner>,
     pub instance_id: String,
     pub protocol: Protocol,
     #[serde(default)]
@@ -105,7 +105,7 @@ fn validate_shared_placement(request: &CreateInstanceRequest) -> Result<(), ApiE
         .server_id
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("shared deployment requires server_id".into()))?;
-    crate::instance::placement::PoolOwner {
+    crate::server::placement::PoolOwner {
         panel_id: "panel".into(),
         server_id: server_id.into(),
     }

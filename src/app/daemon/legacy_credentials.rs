@@ -1,7 +1,7 @@
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
-    instance::metadata::InstanceMetadata, instance::placement::DeploymentMode, state::AppState,
+    server::metadata::InstanceMetadata, server::placement::DeploymentMode, state::AppState,
     utils::time::now_rfc3339,
 };
 
@@ -117,12 +117,12 @@ fn matches_saved_verifier(metadata: &InstanceMetadata, secret: &str, daemon_secr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::protocol::Protocol;
+    use crate::databases::protocol::Protocol;
     use sha2::{Digest, Sha256};
 
     #[test]
     fn qdrant_recovery_requires_matching_legacy_or_keyed_fingerprint() {
-        let mut metadata = crate::instance::test_support::metadata("legacy", Protocol::Qdrant);
+        let mut metadata = crate::server::test_support::metadata("legacy", Protocol::Qdrant);
         assert!(!matches_saved_verifier(&metadata, "secret", b"daemon"));
         for fingerprint in [
             crate::utils::hex::encode_lower(&Sha256::digest(b"secret")),
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn mariadb_recovery_requires_saved_tenant_verifier() {
-        let mut metadata = crate::instance::test_support::metadata("legacy", Protocol::Mariadb);
+        let mut metadata = crate::server::test_support::metadata("legacy", Protocol::Mariadb);
         metadata.mariadb_native_password_sha1_stage2 = None;
         assert!(!matches_saved_verifier(&metadata, "secret", b"daemon"));
         metadata.mariadb_native_password_sha1_stage2 =

@@ -8,9 +8,9 @@ pub(crate) use limits::resize_pool;
 pub(crate) use operations::{create, create_database, delete, power, status};
 
 use crate::{
-    instance::metadata::InstanceMetadata,
-    instance::placement::{DeploymentMode, EngineRuntime, TenantReservation},
     routes::http::{response::ApiError, router::AppState},
+    server::metadata::InstanceMetadata,
+    server::placement::{DeploymentMode, EngineRuntime, TenantReservation},
 };
 
 pub(crate) async fn load(state: &AppState, runtime_id: &str) -> Result<EngineRuntime, ApiError> {

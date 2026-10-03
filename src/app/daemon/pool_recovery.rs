@@ -3,16 +3,16 @@ use std::{collections::HashSet, path::Path, time::Duration};
 use anyhow::{Context, ensure};
 
 use crate::{
-    instance::placement::containment::contain_locked,
-    instance::placement::{
+    runtime::docker::DockerContainerStatus,
+    server::placement::containment::contain_locked,
+    server::placement::{
         DeploymentMode, EngineRuntime, EngineRuntimeStatus, TenantReservation,
         TenantReservationState, lifecycle, tenant,
     },
-    instance::{
+    server::{
         metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
         paths::InstancePaths,
     },
-    runtime::docker::DockerContainerStatus,
     state::AppState,
     utils::{
         backend::{BackendEndpoint, backend_socket_path},
@@ -157,7 +157,7 @@ async fn stop_failed_retry(
     let id = &runtime.runtime_id;
     tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error,
         "pool retry failed; lifecycle failure policy keeps it down");
-    crate::instance::placement::containment::stop_pool(state, runtime)
+    crate::server::placement::containment::stop_pool(state, runtime)
         .await
         .map_err(anyhow::Error::msg)
         .context("could not verify shutdown after automatic pool retry")?;
@@ -414,7 +414,7 @@ async fn recover_locked(
     );
     lifecycle::paths::prepare_socket_directory(state, &runtime).await?;
     lifecycle::paths::prepare_hosted_config(state, &runtime).await?;
-    crate::instance::placement::runtime::apply_limits(
+    crate::server::placement::runtime::apply_limits(
         &state.docker,
         &state.config,
         &state.placements,

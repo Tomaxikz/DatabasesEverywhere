@@ -2,12 +2,12 @@ use http::HeaderValue;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
-    subsystems::import_export::{
+    databases::protocol::Protocol,
+    server::jobs::import_export::selection::{
         ImportExportSelection, MAX_SELECTION_FIELDS_PER_ITEM, MAX_SELECTION_ITEMS, SelectionMode,
     },
-    utils::protocol::Protocol,
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
 };
 
 use super::EngineInfo;

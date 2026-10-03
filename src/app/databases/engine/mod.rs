@@ -27,8 +27,8 @@ pub(crate) use transfer::{
 };
 
 use crate::{
-    instance::compatibility::{EngineVersion, ProtocolCapabilities},
-    utils::protocol::Protocol,
+    databases::protocol::Protocol,
+    server::compatibility::{EngineVersion, ProtocolCapabilities},
 };
 
 use super::{

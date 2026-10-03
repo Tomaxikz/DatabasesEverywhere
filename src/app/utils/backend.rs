@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::utils::protocol::Protocol;
+use crate::databases::protocol::Protocol;
 
 pub const CONTAINER_SOCKET_DIRECTORY: &str = "/run/dbev";
 pub const POSTGRES_SOCKET_DIRECTORY: &str = "/var/run/postgresql";

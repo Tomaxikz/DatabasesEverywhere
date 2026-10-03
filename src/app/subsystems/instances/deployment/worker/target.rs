@@ -226,7 +226,7 @@ async fn drain_source_sessions(
     state: &AppState,
     source: &InstanceMetadata,
 ) -> Result<(), ApiError> {
-    let drained = crate::instance::sessions::fence_and_wait(
+    let drained = crate::server::sessions::fence_and_wait(
         &state.instances,
         &state.gateway_supervisor.tenant_sessions(),
         &source.instance_id,
@@ -393,7 +393,7 @@ pub(super) async fn run_shared_to_dedicated(
     drop(copied.execution);
 
     let mut final_metadata = target.metadata;
-    final_metadata.status = crate::instance::metadata::InstanceStatus::Running;
+    final_metadata.status = crate::server::metadata::InstanceStatus::Running;
     adopt_source_identity(&mut final_metadata, &source, password);
     tenant::verify_password(
         &state.docker,

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    utils::protocol::Protocol,
 };
 
 struct TenantBootstrap<'a> {

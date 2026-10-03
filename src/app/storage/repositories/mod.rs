@@ -3,8 +3,8 @@ use std::path::Path;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
-    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, SCHEMA_VERSION},
-    instance::placement::DeploymentMode,
+    server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, SCHEMA_VERSION},
+    server::placement::DeploymentMode,
     storage::secrets::{SecretStore, SecretStoreError},
     utils::backend::BackendEndpoint,
 };
@@ -486,11 +486,8 @@ impl InstanceRepository {
             .as_ref()
             .and_then(|version| version.current.as_deref());
         if let Some(version) = database_version
-            && crate::instance::compatibility::normalize_database_version(
-                metadata.protocol,
-                version,
-            )
-            .as_deref()
+            && crate::server::compatibility::normalize_database_version(metadata.protocol, version)
+                .as_deref()
                 != Some(version)
         {
             return Err(RepositoryError::InvalidDatabaseVersion {

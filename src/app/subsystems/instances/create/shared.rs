@@ -2,18 +2,18 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::resolve_image;
 use crate::{
-    instance::metadata::{
-        DatabaseIdentity, DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus,
-        InstanceMetadata, InstanceStatus, PublicEndpoint, SCHEMA_VERSION,
-    },
-    instance::placement::{
-        DeploymentMode, EngineRuntime, EngineRuntimeStatus, ReserveTenant,
-        runtime as shared_runtime,
-        tenant::{self, TenantTarget},
-    },
     routes::http::{
         response::{ApiError, placement_error},
         router::AppState,
+    },
+    server::metadata::{
+        DatabaseIdentity, DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus,
+        InstanceMetadata, InstanceStatus, PublicEndpoint, SCHEMA_VERSION,
+    },
+    server::placement::{
+        DeploymentMode, EngineRuntime, EngineRuntimeStatus, ReserveTenant,
+        runtime as shared_runtime,
+        tenant::{self, TenantTarget},
     },
     subsystems::instances::requests::CreateInstanceRequest,
     utils::{limits::InstanceLimits, time::now_rfc3339},

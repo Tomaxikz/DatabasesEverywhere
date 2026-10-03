@@ -275,7 +275,7 @@ async fn cut_over_to_replacement(
         "compatibility",
         "attesting migrated database engine",
     );
-    let compatibility = crate::instance::compatibility::probe_instance_compatibility(
+    let compatibility = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,

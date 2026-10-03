@@ -26,7 +26,7 @@ pub(super) async fn drain_tenant_sessions(
     state: &AppState,
     instance_id: &str,
 ) -> Result<(), ApiError> {
-    if crate::instance::sessions::fence_and_wait(
+    if crate::server::sessions::fence_and_wait(
         &state.instances,
         &state.gateway_supervisor.tenant_sessions(),
         instance_id,

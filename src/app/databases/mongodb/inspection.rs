@@ -5,9 +5,9 @@ use serde_json::Value;
 
 use crate::{
     databases::engine::EngineInspection,
-    instance::backup::catalog::{BackupCatalogColumn, BackupCatalogObject, object_id},
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
+    server::backup::catalog::{BackupCatalogColumn, BackupCatalogObject, object_id},
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
     utils::shell::sh_quote,
 };
 

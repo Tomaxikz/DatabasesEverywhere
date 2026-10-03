@@ -19,10 +19,10 @@ use tokio::sync::{Notify, watch};
 use crate::{
     auth::api_token::ApiToken,
     config::RuntimeConfig,
-    instance::jobs::import_export::ImportExportJobs,
-    instance::{manager::InstanceManager, state::InstanceStore},
     routes::http::policy::OriginPolicy,
     runtime::docker::DockerRuntime,
+    server::jobs::import_export::ImportExportJobs,
+    server::{manager::InstanceManager, state::InstanceStore},
 };
 
 #[derive(Clone)]
@@ -40,8 +40,8 @@ pub struct AppStateData {
     pub api_token: ApiToken,
     pub instances: InstanceStore,
     pub manager: InstanceManager,
-    pub placements: crate::instance::placement::PlacementRepository,
-    pub instance_locks: crate::instance::locks::InstanceLocks,
+    pub placements: crate::server::placement::PlacementRepository,
+    pub instance_locks: crate::server::locks::InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
     pub import_uploads: crate::subsystems::import_export::ImportUploadService,
@@ -49,7 +49,7 @@ pub struct AppStateData {
     pub install_progress: crate::subsystems::instances::progress::InstallProgressStore,
     pub artifact_downloads: crate::subsystems::artifacts::ArtifactDownloadTickets,
     pub resource_cache: crate::subsystems::monitoring::resources::ResourceCache,
-    pub soft_disk_limiter: crate::instance::disk::soft::SoftDiskLimiter,
+    pub soft_disk_limiter: crate::server::disk::soft::SoftDiskLimiter,
     pub monitoring_cache: crate::subsystems::monitoring::websocket::MonitoringSnapshotCache,
     pub instance_runtime_cache: crate::subsystems::instances::InstanceRuntimeInfoCache,
     pub daemon_shutdown: DaemonShutdown,

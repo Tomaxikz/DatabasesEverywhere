@@ -15,7 +15,7 @@ pub async fn update_instance_image(
         .await
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(&state, &instance_id).await?;
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return Err(ApiError::Conflict(
             "shared tenant images are managed by pool placement; migrate the tenant to a compatible pool instead of recreating its runtime"
                 .to_string(),

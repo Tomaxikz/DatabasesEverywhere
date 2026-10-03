@@ -43,13 +43,13 @@ impl Claims {
 #[serde(deny_unknown_fields)]
 pub struct PoolGrant {
     pub runtime_id: String,
-    pub owner: crate::instance::placement::PoolOwner,
+    pub owner: crate::server::placement::PoolOwner,
     pub created_at: String,
 }
 
 impl PoolGrant {
-    pub(crate) fn matches(&self, pool: &crate::instance::placement::EngineRuntime) -> bool {
-        pool.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+    pub(crate) fn matches(&self, pool: &crate::server::placement::EngineRuntime) -> bool {
+        pool.deployment_mode == crate::server::placement::DeploymentMode::Shared
             && pool.runtime_id == self.runtime_id
             && pool.created_at == self.created_at
             && pool.owner.as_ref() == Some(&self.owner)

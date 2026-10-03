@@ -4,7 +4,7 @@ pub(super) struct DownloadStream {
     pub(super) inner: ReaderStream<File>,
     pub(super) _permit: ArtifactDownloadPermit,
     pub(super) cleanup: Option<PathBuf>,
-    pub(super) _backup: Option<crate::instance::backup::MaterializedBackup>,
+    pub(super) _backup: Option<crate::server::backup::MaterializedBackup>,
 }
 
 #[derive(Debug)]

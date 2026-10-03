@@ -1,4 +1,4 @@
-use crate::{instance::disk::DiskLimiter, instance::paths::InstancePaths, state::AppState};
+use crate::{server::disk::DiskLimiter, server::paths::InstancePaths, state::AppState};
 
 /// Cleanup runs synchronously before routes and background jobs are published.
 pub(super) async fn cleanup(state: &AppState) {
@@ -21,7 +21,7 @@ async fn cleanup_inner(state: &AppState) -> anyhow::Result<()> {
         let paths = InstancePaths::new(&state.config.paths, &runtime.runtime_id)?;
         protected.push(limiter.legacy_fuse_container_path(&paths.data)?);
     }
-    let summary = crate::instance::disk::cleanup_unused_helpers(
+    let summary = crate::server::disk::cleanup_unused_helpers(
         std::path::Path::new(&state.config.paths.fuse_root()),
         &protected,
         &state.docker,

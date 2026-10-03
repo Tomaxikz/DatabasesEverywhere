@@ -19,11 +19,11 @@ const MONGODB_MAX_CSTRING_BYTES: usize = 1024;
 
 use super::{GatewayStream, ListenerError};
 use crate::{
+    databases::protocol::Protocol,
     gateway::protocols::{clickhouse, mariadb, redis},
     gateway::tunnel,
-    instance::monitoring::{ActivityCounter, OperationKind},
+    server::monitoring::{ActivityCounter, OperationKind},
     subsystems::import_export::inspection::validate_shared_mysql_command,
-    utils::protocol::Protocol,
 };
 
 const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;

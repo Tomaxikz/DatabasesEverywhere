@@ -1,24 +1,21 @@
 use super::*;
 use crate::{
-    instance::{metadata::InstanceDatabaseVersion, test_support},
+    databases::protocol::Protocol,
+    server::{metadata::InstanceDatabaseVersion, test_support},
     storage::{secrets::is_encrypted, sqlite},
-    utils::protocol::Protocol,
 };
 
 #[tokio::test]
 async fn shared_upsert_waits_for_writer_before_reading_recovery_state() {
-    use crate::instance::placement::{PlacementRepository, ReserveTenant};
+    use crate::server::placement::{PlacementRepository, ReserveTenant};
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();
     let repository = InstanceRepository::encrypted(pool.clone(), dir.path()).unwrap();
     let placements = PlacementRepository::new(pool.clone());
-    let runtime = crate::instance::placement::test_support::runtime(
-        "pool",
-        Protocol::Postgres,
-        "postgres:18",
-    );
+    let runtime =
+        crate::server::placement::test_support::runtime("pool", Protocol::Postgres, "postgres:18");
     placements.save(&runtime).await.unwrap();
     let mut metadata = sample_metadata();
     metadata.deployment_mode = DeploymentMode::Shared;

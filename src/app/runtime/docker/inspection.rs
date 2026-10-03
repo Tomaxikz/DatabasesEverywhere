@@ -11,12 +11,12 @@ use secrecy::SecretString;
 use tokio::time::{Instant, sleep};
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
         ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
     },
     utils::constants::docker::PROJECT_LABEL,
-    utils::protocol::Protocol,
 };
 
 const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);

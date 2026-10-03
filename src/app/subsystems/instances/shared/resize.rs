@@ -32,7 +32,7 @@ pub(in super::super) async fn resize(
         .checked_sub(previous_limits.disk_mib)
         .and_then(|value| value.checked_add(requested.disk_mib))
         .ok_or_else(|| ApiError::Conflict("shared_pool_full: disk reservation overflow".into()))?;
-    if crate::instance::placement::policy::pool_disk_mib(metadata.protocol, next_disk)
+    if crate::server::placement::policy::pool_disk_mib(metadata.protocol, next_disk)
         .is_none_or(|disk| disk > previous_runtime.limits.disk_mib)
     {
         return Err(ApiError::Conflict(

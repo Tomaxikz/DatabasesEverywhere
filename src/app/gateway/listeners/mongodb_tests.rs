@@ -6,15 +6,16 @@ use tokio::{
 
 use super::*;
 use crate::{
+    databases::protocol::Protocol,
     gateway::sessions::TenantSessions,
-    instance::placement::DeploymentMode,
-    instance::{
+    server::placement::DeploymentMode,
+    server::{
         metadata::{InstanceImageStatus, InstanceMetadata},
         state::InstanceStore,
         test_support,
     },
     subsystems::monitoring::resources::{NetworkCounter, ResourceCache},
-    utils::{backend::BackendEndpoint, protocol::Protocol},
+    utils::backend::BackendEndpoint,
 };
 
 #[tokio::test]

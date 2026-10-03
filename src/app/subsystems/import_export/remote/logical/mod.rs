@@ -6,16 +6,13 @@ use serde::Serialize;
 
 use crate::{
     databases::engine::RemoteDumpFlow,
+    databases::protocol::{Protocol, xml_escape},
     routes::http::response::ApiError,
     runtime::docker::{DockerError, ImportHelperNetwork, RemoteImportHelperSpec},
     subsystems::import_export::{
         CLICKHOUSE_ENGINE_AWK_PROGRAM, ImportExportSelection, SelectionMode,
     },
-    utils::{
-        ids::portable_identifier,
-        protocol::{Protocol, xml_escape},
-        shell::sh_quote,
-    },
+    utils::{ids::portable_identifier, shell::sh_quote},
 };
 
 use super::{RemoteImportSource, write_private_file};

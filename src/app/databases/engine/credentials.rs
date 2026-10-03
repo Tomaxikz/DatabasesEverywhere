@@ -1,4 +1,4 @@
-use crate::instance::metadata::InstanceMetadata;
+use crate::server::metadata::InstanceMetadata;
 
 use super::EngineInfo;
 

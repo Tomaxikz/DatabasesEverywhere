@@ -2,7 +2,7 @@
 
 use super::{archive::*, files::*, physical::*, protocol::*, *};
 
-use crate::{databases::engine::EngineFamily, instance::credentials::logical_export_env};
+use crate::{databases::engine::EngineFamily, server::credentials::logical_export_env};
 
 pub(super) mod prepared_support;
 

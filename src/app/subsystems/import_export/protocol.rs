@@ -1,7 +1,7 @@
 //! Engine-neutral import/export orchestration around per-engine transfer scripts.
 
 use super::{files::*, *};
-use crate::{databases::engine::LogicalImportRequest, instance::credentials::logical_import_env};
+use crate::{databases::engine::LogicalImportRequest, server::credentials::logical_import_env};
 
 pub(super) use crate::databases::engine::{ImportConnection, SelectionUse};
 

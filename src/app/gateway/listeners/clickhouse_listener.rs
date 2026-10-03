@@ -8,7 +8,7 @@ use super::{
 use crate::{
     gateway::protocols::clickhouse,
     gateway::{resolver::RouteResolver, tunnel},
-    instance::state::DatabaseRouteResolution,
+    server::state::DatabaseRouteResolution,
     utils::backend::BackendEndpoint,
 };
 

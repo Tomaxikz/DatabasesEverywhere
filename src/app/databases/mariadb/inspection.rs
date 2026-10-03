@@ -1,7 +1,7 @@
 use crate::{
     databases::{engine::EngineInspection, mysql::inspection as mysql},
-    instance::backup::catalog::BackupCatalogObject,
-    instance::metadata::InstanceMetadata,
+    server::backup::catalog::BackupCatalogObject,
+    server::metadata::InstanceMetadata,
 };
 
 use super::engine::Mariadb;

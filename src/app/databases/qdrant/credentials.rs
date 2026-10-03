@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     databases::engine::{CredentialRollback, EngineCredentials, RecoverySecret, RotatedSecrets},
     gateway::protocols::qdrant::route_key_fingerprint,
-    instance::metadata::InstanceMetadata,
+    server::metadata::InstanceMetadata,
 };
 
 use super::engine::Qdrant;

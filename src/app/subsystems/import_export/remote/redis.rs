@@ -10,14 +10,15 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::{
-    instance::jobs::import_export::create_bounded_archive,
-    instance::paths::InstancePaths,
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
+    server::jobs::import_export::create_bounded_archive,
+    server::paths::InstancePaths,
     subsystems::{
         import_export::{check_restore_layout, rollback_from_archive},
         instances::{LifecycleAction, change_instance_state_locked},
     },
-    utils::{backend::backend_socket_path, hex::encode_lower, protocol::Protocol},
+    utils::{backend::backend_socket_path, hex::encode_lower},
 };
 
 use super::{
@@ -336,7 +337,7 @@ async fn write_recovery_manifest(
         protocol: protocol.as_str(),
         import_mode: mode,
         rollback_file,
-        created_at: crate::instance::jobs::import_export::now_rfc3339(),
+        created_at: crate::server::jobs::import_export::now_rfc3339(),
     })
     .map_err(|error| {
         ApiError::Runtime(format!("failed to encode RESP recovery manifest: {error}"))

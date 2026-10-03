@@ -32,7 +32,7 @@ pub(super) async fn prepare_dedicated_start(
     if soft_scanner_required(state, metadata) {
         let snapshot = state
             .soft_disk_limiter
-            .ensure_start_allowed(&crate::instance::disk::soft::SoftDiskTarget {
+            .ensure_start_allowed(&crate::server::disk::soft::SoftDiskTarget {
                 instance_id: metadata.instance_id.clone(),
                 created_at: metadata.created_at.clone(),
                 protocol: metadata.protocol,
@@ -121,7 +121,7 @@ pub(super) async fn verify_startup_readiness(
         .map_err(docker_error)?;
     harden_on_start(state, metadata).await?;
     verify_resp_credential(state, metadata).await?;
-    let compatibility = crate::instance::compatibility::probe_instance_compatibility(
+    let compatibility = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,

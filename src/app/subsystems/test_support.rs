@@ -5,10 +5,10 @@ use sqlx::SqlitePool;
 use crate::{
     auth::api_token::ApiToken,
     config::Config,
-    instance::jobs::import_export::ImportExportJobs,
-    instance::{manager::InstanceManager, state::InstanceStore},
     routes::http::router::{AppState, AppStateData, DaemonShutdown},
     runtime::docker::DockerRuntime,
+    server::jobs::import_export::ImportExportJobs,
+    server::{manager::InstanceManager, state::InstanceStore},
 };
 
 /// Builds the common in-memory/offline API state used by handler tests.
@@ -28,8 +28,8 @@ pub(crate) fn state(
         api_token,
         instances,
         manager,
-        placements: crate::instance::placement::PlacementRepository::new(pool.clone()),
-        instance_locks: crate::instance::locks::InstanceLocks::default(),
+        placements: crate::server::placement::PlacementRepository::new(pool.clone()),
+        instance_locks: crate::server::locks::InstanceLocks::default(),
         docker: DockerRuntime::offline_for_tests(&Default::default(), false)
             .with_startup_history(pool.clone()),
         import_export_jobs: ImportExportJobs::default(),
@@ -49,7 +49,7 @@ pub(crate) fn state(
             ),
         artifact_downloads: crate::subsystems::artifacts::ArtifactDownloadTickets::default(),
         resource_cache: crate::subsystems::monitoring::resources::ResourceCache::default(),
-        soft_disk_limiter: crate::instance::disk::soft::SoftDiskLimiter::new(
+        soft_disk_limiter: crate::server::disk::soft::SoftDiskLimiter::new(
             config.disk.soft_scanner.clone(),
         ),
         monitoring_cache:

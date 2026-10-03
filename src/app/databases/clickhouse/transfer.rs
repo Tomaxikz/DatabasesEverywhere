@@ -3,11 +3,9 @@ use crate::{
         EngineTransfer, LogicalCredential, LogicalImportRequest, RemoteDumpFlow, SelectionUse,
         TransferError,
     },
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
-    subsystems::import_export::{
-        CLICKHOUSE_ENGINE_AWK_PROGRAM, ImportExportSelection, SelectionMode,
-    },
+    server::jobs::import_export::selection::{ImportExportSelection, SelectionMode},
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
     utils::{ids::portable_identifier, shell::sh_quote},
 };
 
@@ -252,4 +250,24 @@ clickhouse-client \
     --database "$CLICKHOUSE_DB" \
     --query "$drop IF EXISTS \`$table\` SYNC"
 done
+"#;
+
+pub(crate) const CLICKHOUSE_ENGINE_AWK_PROGRAM: &str = r#"
+/^[[:space:]]*ENGINE[[:space:]]*=/ {
+  candidate = $0
+  sub(/^[[:space:]]*ENGINE[[:space:]]*=[[:space:]]*/, "", candidate)
+  if (candidate !~ /^[A-Za-z][A-Za-z0-9_]*([[:space:](]|$)/) {
+    invalid = 1
+    next
+  }
+  sub(/[^A-Za-z0-9_].*$/, "", candidate)
+  engine = candidate
+  count++
+}
+END {
+  if (invalid || count != 1) {
+    exit 64
+  }
+  print engine
+}
 "#;

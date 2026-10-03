@@ -1,25 +1,25 @@
 use std::{collections::HashMap, process::Command};
 
 use crate::{
+    databases::protocol::Protocol,
     gateway::{
         listeners::{ListenerError, run_mariadb_listener, run_mysql_listener},
         resolver::RouteResolver,
         security::GatewayConnectionLimiter,
         supervisor::GatewaySupervisor,
     },
-    instance::state::InstanceStore,
-    utils::protocol::Protocol,
+    server::state::InstanceStore,
 };
 
 const DEFAULT_MARIADB_CLI_IMAGE: &str = "mariadb:11.4";
 
 pub(super) fn assert_engine_tenant_rows(
-    rows: HashMap<String, crate::instance::monitoring::EngineTotals>,
+    rows: HashMap<String, crate::server::monitoring::EngineTotals>,
     expected: &[&str],
 ) {
     for username in expected {
         let mut tenant = rows.clone();
-        crate::instance::monitoring::keep_tenant_rows(&mut tenant, [*username]);
+        crate::server::monitoring::keep_tenant_rows(&mut tenant, [*username]);
         assert_eq!(
             tenant.keys().map(String::as_str).collect::<Vec<_>>(),
             [*username],
@@ -28,7 +28,7 @@ pub(super) fn assert_engine_tenant_rows(
     }
 
     let mut tenants = rows;
-    crate::instance::monitoring::keep_tenant_rows(&mut tenants, expected.iter().copied());
+    crate::server::monitoring::keep_tenant_rows(&mut tenants, expected.iter().copied());
     let mut actual = tenants.keys().map(String::as_str).collect::<Vec<_>>();
     actual.sort_unstable();
     let mut expected = expected.to_vec();

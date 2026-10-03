@@ -8,11 +8,12 @@ use tokio::time::{Instant, sleep};
 use super::fail_runtime;
 use crate::{
     databases,
-    instance::metadata::{InstanceMetadata, InstanceStatus},
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
     runtime::docker::DockerError,
+    server::metadata::{InstanceMetadata, InstanceStatus},
     utils::constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
-    utils::{protocol::Protocol, shell::sh_quote},
+    utils::shell::sh_quote,
 };
 
 const MYSQL_AUTH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,7 +71,7 @@ pub(crate) async fn harden_mysql_tenant_auth(
             && metadata.mysql_root_password.as_deref() == Some(root_password)
     });
     let attestation = if let Some(metadata) = metadata.as_ref() {
-        match crate::instance::auth_hardening::begin_attestation(
+        match crate::server::auth_hardening::begin_attestation(
             &state.manager,
             &state.docker,
             metadata,
@@ -112,7 +113,7 @@ pub(crate) async fn harden_mysql_tenant_auth(
     )
     .await?;
     if let (Some(metadata), Some(attestation)) = (metadata.as_ref(), attestation.as_ref())
-        && let Err(error) = crate::instance::auth_hardening::complete_attestation(
+        && let Err(error) = crate::server::auth_hardening::complete_attestation(
             &state.manager,
             &state.docker,
             metadata,
@@ -387,7 +388,7 @@ pub(crate) async fn harden_mysql_accounts(state: &AppState) -> MysqlAuthHardenin
     let instances = state.manager.store().list().await;
     let outcomes = futures::stream::iter(instances.into_iter().filter(|metadata| {
         metadata.protocol == Protocol::Mysql
-            && metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+            && metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     }))
     .map(|snapshot| harden_mysql_account(state, snapshot))
     .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
@@ -408,7 +409,7 @@ async fn harden_mysql_account(
     if metadata.protocol != Protocol::Mysql || metadata.status != InstanceStatus::Running {
         return summary;
     }
-    let attestation = match crate::instance::auth_hardening::begin_attestation(
+    let attestation = match crate::server::auth_hardening::begin_attestation(
         &state.manager,
         &state.docker,
         &metadata,
@@ -520,7 +521,7 @@ async fn harden_mysql_account(
             "verified and encrypted current MySQL credentials"
         );
     }
-    if let Err(error) = crate::instance::auth_hardening::complete_attestation(
+    if let Err(error) = crate::server::auth_hardening::complete_attestation(
         &state.manager,
         &state.docker,
         &metadata,

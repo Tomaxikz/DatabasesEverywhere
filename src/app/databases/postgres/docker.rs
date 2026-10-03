@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use secrecy::SecretString;
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    utils::protocol::Protocol,
 };
 
 pub const INTERNAL_ADMIN_USERNAME: &str = "dbe_admin";

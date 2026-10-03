@@ -49,13 +49,13 @@ pub(super) async fn resize_instance(
         .await
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(state, instance_id).await?;
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated {
         validate_limits(&request)?;
         validate_protocol_limits(metadata.protocol, &request)?;
     }
     let limits = limits_from_request(&request);
     let previous_limits = metadata.limits.clone();
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return shared::resize(state, metadata, limits, creation)
             .await
             .map(ApiResponse::ok);
@@ -151,7 +151,7 @@ pub(super) async fn resize_instance(
             if let Some(paths) = paths.as_ref()
                 && state
                     .soft_disk_limiter
-                    .ensure_start_allowed(&crate::instance::disk::soft::SoftDiskTarget {
+                    .ensure_start_allowed(&crate::server::disk::soft::SoftDiskTarget {
                         instance_id: metadata.instance_id.clone(),
                         created_at: metadata.created_at.clone(),
                         protocol: metadata.protocol,

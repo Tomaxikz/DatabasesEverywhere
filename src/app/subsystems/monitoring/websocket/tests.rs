@@ -63,13 +63,13 @@ async fn small_read_buffer_accepts_full_frames_and_keeps_size_limit() {
 
 fn activity(instance_id: &str) -> TenantActivity {
     TenantActivity {
-        current: crate::instance::monitoring::ActivityCurrent {
+        current: crate::server::monitoring::ActivityCurrent {
             instance_id: instance_id.to_string(),
             stats_epoch: "epoch-test".to_string(),
             sampled_at_unix: 1,
-            accepted: crate::instance::monitoring::OperationCounts::default(),
+            accepted: crate::server::monitoring::OperationCounts::default(),
             operations_measured: false,
-            rejected: crate::instance::monitoring::OperationCounts::default(),
+            rejected: crate::server::monitoring::OperationCounts::default(),
             active_connections: 0,
             opened_connections: 0,
             rx_bytes: 0,
@@ -89,11 +89,11 @@ fn activity(instance_id: &str) -> TenantActivity {
 
 fn monitoring_instance(
     instance_id: impl Into<String>,
-    deployment_mode: crate::instance::placement::DeploymentMode,
+    deployment_mode: crate::server::placement::DeploymentMode,
     cpu_usage_percent: Option<f64>,
 ) -> MonitoringInstance {
     let instance_id = instance_id.into();
-    let shared = deployment_mode == crate::instance::placement::DeploymentMode::Shared;
+    let shared = deployment_mode == crate::server::placement::DeploymentMode::Shared;
     let runtime_id = if shared {
         "mysql_pool_one".to_string()
     } else {
@@ -162,7 +162,7 @@ fn monitoring_instance(
 fn monitoring_serializes_cpu_as_percentage_points_without_rescaling() {
     let instance = monitoring_instance(
         "inst_cpu",
-        crate::instance::placement::DeploymentMode::Dedicated,
+        crate::server::placement::DeploymentMode::Dedicated,
         Some(11.0),
     );
 
@@ -178,7 +178,7 @@ fn monitoring_serializes_cpu_as_percentage_points_without_rescaling() {
 fn shared_monitoring_omits_physical_pool_capacity() {
     let instance = monitoring_instance(
         "tenant_one",
-        crate::instance::placement::DeploymentMode::Shared,
+        crate::server::placement::DeploymentMode::Shared,
         None,
     );
 
@@ -205,7 +205,7 @@ fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
         .map(|index| {
             monitoring_instance(
                 format!("tenant-{index:04}"),
-                crate::instance::placement::DeploymentMode::Shared,
+                crate::server::placement::DeploymentMode::Shared,
                 None,
             )
         })
@@ -366,12 +366,12 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
         instances: vec![
             monitoring_instance(
                 "tenant_one",
-                crate::instance::placement::DeploymentMode::Dedicated,
+                crate::server::placement::DeploymentMode::Dedicated,
                 None,
             ),
             monitoring_instance(
                 "tenant_unrelated",
-                crate::instance::placement::DeploymentMode::Dedicated,
+                crate::server::placement::DeploymentMode::Dedicated,
                 None,
             ),
         ],
@@ -410,7 +410,7 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
 
 #[tokio::test]
 async fn selected_snapshot_candidates_exclude_unrelated_and_recreated_instances() {
-    let instances = crate::instance::state::InstanceStore::default();
+    let instances = crate::server::state::InstanceStore::default();
     instances
         .upsert(instance_metadata("allowed", "generation-a"))
         .await;
@@ -446,9 +446,9 @@ async fn selected_snapshot_candidates_exclude_unrelated_and_recreated_instances(
 }
 
 fn instance_metadata(instance_id: &str, generation: &str) -> InstanceMetadata {
-    let mut metadata = crate::instance::test_support::metadata(
+    let mut metadata = crate::server::test_support::metadata(
         instance_id,
-        crate::utils::protocol::Protocol::Mysql,
+        crate::databases::protocol::Protocol::Mysql,
     );
     metadata.backend = crate::utils::backend::BackendEndpoint::UnixSocket {
         socket_path: format!("/tmp/{instance_id}.sock"),
@@ -479,7 +479,7 @@ fn sample_job(job_id: &str, instance_id: &str) -> ImportExportJob {
 fn compact_monitoring_preserves_every_metric_without_duplicate_identity() {
     let instance = monitoring_instance(
         "tenant",
-        crate::instance::placement::DeploymentMode::Dedicated,
+        crate::server::placement::DeploymentMode::Dedicated,
         Some(11.0),
     );
     let mut expected_resources = serde_json::to_value(&instance.resources).unwrap();
@@ -515,7 +515,7 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
     let store = crate::subsystems::instances::progress::InstallProgressStore::default();
     store.begin(
         "tenant",
-        crate::utils::protocol::Protocol::Mysql,
+        crate::databases::protocol::Protocol::Mysql,
         "mysql:8.4",
     );
     store.complete("tenant", "finished");
@@ -550,11 +550,15 @@ fn progress_delta_batches_are_bounded_and_authorized() {
     let mut instances = Vec::new();
     for index in 0..300 {
         let id = format!("tenant-{index:04}");
-        store.begin(&id, crate::utils::protocol::Protocol::Mysql, "mysql:8.4");
+        store.begin(
+            &id,
+            crate::databases::protocol::Protocol::Mysql,
+            "mysql:8.4",
+        );
         store.complete(&id, "finished");
         instances.push(monitoring_instance(
             id,
-            crate::instance::placement::DeploymentMode::Shared,
+            crate::server::placement::DeploymentMode::Shared,
             None,
         ));
     }

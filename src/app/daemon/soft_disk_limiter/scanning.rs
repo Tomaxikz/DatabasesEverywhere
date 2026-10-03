@@ -189,7 +189,7 @@ pub(super) fn apply_soft_disk_scan(
     match completed.result {
         Ok(execution) => log_scan_outcome(&completed.target, execution.outcome),
         Err(error) => tracing::error!(
-            event = if crate::instance::disk::soft::SoftDiskLimiter::is_capacity_outage(&error) {
+            event = if crate::server::disk::soft::SoftDiskLimiter::is_capacity_outage(&error) {
                 "audit soft_disk_scanner_capacity_outage"
             } else {
                 "audit soft_disk_limit_scan_failed"

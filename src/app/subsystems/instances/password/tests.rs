@@ -303,13 +303,13 @@ fn uncertain_rotation_is_quarantined_and_stopped_for_boot() {
     assert_eq!(quarantined.status, InstanceStatus::Quarantined);
     assert_eq!(
         quarantined.desired_state,
-        crate::instance::metadata::DesiredInstanceState::Stopped
+        crate::server::metadata::DesiredInstanceState::Stopped
     );
 }
 
 #[tokio::test]
 async fn panic_recovery_keeps_the_instance_lock_until_recovery_finishes() {
-    let locks = crate::instance::locks::InstanceLocks::default();
+    let locks = crate::server::locks::InstanceLocks::default();
     let (recovery_started_tx, recovery_started_rx) = tokio::sync::oneshot::channel();
     let (release_recovery_tx, release_recovery_rx) = tokio::sync::oneshot::channel();
     let supervisor = tokio::spawn({
@@ -386,7 +386,7 @@ fn unreadable_durable_state_never_carries_stale_credentials_into_recovery() {
 }
 
 fn test_metadata(protocol: Protocol) -> InstanceMetadata {
-    let mut metadata = crate::instance::test_support::metadata("inst_password_test", protocol);
+    let mut metadata = crate::server::test_support::metadata("inst_password_test", protocol);
     metadata.public.port = 1234;
     metadata.backend = crate::utils::backend::BackendEndpoint::UnixSocket {
         socket_path: "/run/dbev/test.sock".to_string(),

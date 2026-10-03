@@ -7,7 +7,7 @@ use axum::{
 use serde::{Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 
-use crate::{databases::engine::TransferError, instance::placement::PlacementRepositoryError};
+use crate::{databases::engine::TransferError, server::placement::PlacementRepositoryError};
 
 const ERROR_ID_HEADER: &str = "x-error-id";
 

@@ -1,8 +1,8 @@
 use super::super::{FAIL_CLOSED_STOP_TIMEOUT, LOGICAL_ROLLBACK_READINESS_TIMEOUT};
 use crate::{
-    instance::metadata::{InstanceMetadata, InstanceStatus},
-    instance::placement::DeploymentMode,
     routes::http::{response::ApiError, router::AppState},
+    server::metadata::{InstanceMetadata, InstanceStatus},
+    server::placement::DeploymentMode,
     subsystems::import_export::remote::ImportMode,
 };
 use serde::Serialize;
@@ -10,8 +10,8 @@ use std::{path::Path as FsPath, time::Duration};
 
 fn shared_tenant(
     metadata: &InstanceMetadata,
-) -> crate::instance::placement::tenant::TenantTarget<'_> {
-    crate::instance::placement::tenant::TenantTarget {
+) -> crate::server::placement::tenant::TenantTarget<'_> {
+    crate::server::placement::tenant::TenantTarget {
         database: &metadata.database.name,
         username: &metadata.database.username,
     }
@@ -20,7 +20,7 @@ fn shared_tenant(
 async fn shared_runtime(
     state: &AppState,
     metadata: &InstanceMetadata,
-) -> Result<crate::instance::placement::EngineRuntime, ApiError> {
+) -> Result<crate::server::placement::EngineRuntime, ApiError> {
     state
         .placements
         .get(metadata.runtime_id())
@@ -42,7 +42,7 @@ pub(super) async fn check_shared_rollback_objects(
         return Ok(());
     }
     let runtime = shared_runtime(state, metadata).await?;
-    match crate::instance::placement::tenant::check_rollback_objects(
+    match crate::server::placement::tenant::check_rollback_objects(
         &state.docker,
         &runtime,
         shared_tenant(metadata),
@@ -50,7 +50,7 @@ pub(super) async fn check_shared_rollback_objects(
     .await
     {
         Ok(()) => Ok(()),
-        Err(error @ crate::instance::placement::tenant::TenantEngineError::RollbackGap { .. }) => {
+        Err(error @ crate::server::placement::tenant::TenantEngineError::RollbackGap { .. }) => {
             Err(ApiError::Conflict(error.to_string()))
         }
         Err(error) => Err(ApiError::Runtime(format!(
@@ -71,7 +71,7 @@ pub(super) async fn restore_import_target_route(
                     .to_string(),
             )
         })?;
-        crate::instance::placement::tenant::open_verified(
+        crate::server::placement::tenant::open_verified(
             &state.docker,
             &runtime,
             shared_tenant(metadata),
@@ -110,7 +110,7 @@ pub(super) async fn fence_import_target(
     metadata: &InstanceMetadata,
     operation_timeout: Option<Duration>,
 ) -> Result<(), ApiError> {
-    let drained = crate::instance::sessions::fence_and_wait(
+    let drained = crate::server::sessions::fence_and_wait(
         &state.instances,
         &state.gateway_supervisor.tenant_sessions(),
         &metadata.instance_id,
@@ -134,7 +134,7 @@ async fn fence_shared_tenant_for_rollback(
 ) -> Result<(), ApiError> {
     let runtime = shared_runtime(state, metadata).await?;
     let target = shared_tenant(metadata);
-    crate::instance::placement::tenant::fence(&state.docker, &runtime, target)
+    crate::server::placement::tenant::fence(&state.docker, &runtime, target)
         .await
         .map_err(|error| {
             ApiError::Runtime(format!(
@@ -143,7 +143,7 @@ async fn fence_shared_tenant_for_rollback(
         })?;
     // The gateway route remains fenced. Re-enable only the database role so
     // DBE can apply the tenant-scoped rollback with the tenant credential.
-    crate::instance::placement::tenant::unfence(&state.docker, &runtime, target)
+    crate::server::placement::tenant::unfence(&state.docker, &runtime, target)
         .await
         .map_err(|error| {
             ApiError::Runtime(format!(
@@ -204,8 +204,8 @@ pub(crate) async fn quarantine_uncertain_import(
         .await
         .ok_or(ApiError::NotFound)?;
     metadata.status = InstanceStatus::Quarantined;
-    metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
-    metadata.updated_at = crate::instance::jobs::import_export::now_rfc3339();
+    metadata.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
+    metadata.updated_at = crate::server::jobs::import_export::now_rfc3339();
 
     // Remove gateway routes synchronously in memory before any Docker or SQLite wait. Existing
     // connections are cut off by the stop/kill below; new connections can no longer resolve.
@@ -263,7 +263,7 @@ async fn stop_import_target(
         let runtime = shared_runtime(state, metadata)
             .await
             .map_err(|error| error.to_string())?;
-        return crate::instance::placement::tenant::fence(
+        return crate::server::placement::tenant::fence(
             &state.docker,
             &runtime,
             shared_tenant(metadata),
@@ -371,7 +371,7 @@ pub(super) async fn write_logical_recovery_manifest(
         protocol: metadata.protocol.as_str(),
         import_mode: mode,
         rollback_file,
-        created_at: crate::instance::jobs::import_export::now_rfc3339(),
+        created_at: crate::server::jobs::import_export::now_rfc3339(),
     })
     .map_err(|error| ApiError::Runtime(format!("failed to encode recovery manifest: {error}")))?;
     let path = path.to_path_buf();

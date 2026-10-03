@@ -7,7 +7,7 @@ pub(in super::super) async fn restore_disk_limits(
     disk_limiter: &DiskLimiter,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await.into_iter().filter(|metadata| {
-        metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+        metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     });
     let outcomes = futures::stream::iter(instances)
         .map(|metadata| async move {
@@ -81,10 +81,10 @@ pub(super) async fn reconcile_instance_disk_limit(
     config: &Config,
     docker: &DockerRuntime,
     disk_limiter: &DiskLimiter,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> anyhow::Result<(
     crate::config::DiskLimitMode,
-    crate::instance::disk::DiskEnforcement,
+    crate::server::disk::DiskEnforcement,
 )> {
     let paths = InstancePaths::new(&config.paths, &metadata.instance_id)
         .with_context(|| format!("failed to build paths for {}", metadata.instance_id))?;
@@ -144,7 +144,7 @@ pub(super) async fn reconcile_instance_disk_limit(
 
 pub(super) async fn stop_for_disk_runtime_recovery(
     docker: &DockerRuntime,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> anyhow::Result<()> {
     match docker.stop(metadata.protocol, &metadata.instance_id).await {
         Ok(_) => tracing::warn!(
@@ -166,14 +166,14 @@ pub(super) async fn stop_for_disk_runtime_recovery(
 }
 
 pub(in super::super) fn isolate_disk_failure(
-    metadata: &mut crate::instance::metadata::InstanceMetadata,
+    metadata: &mut crate::server::metadata::InstanceMetadata,
     stop_failed: bool,
 ) {
     // A Failed+desired-running instance is automatically retried later in the
     // same boot. Persist explicit stopped intent for every reconciliation or
     // bind-source failure so activation cannot immediately bypass the mode we
     // failed to establish.
-    metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+    metadata.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
     metadata.status = if metadata.status == InstanceStatus::Quarantined || stop_failed {
         InstanceStatus::Quarantined
     } else {
@@ -183,7 +183,7 @@ pub(in super::super) fn isolate_disk_failure(
 
 pub(super) async fn ensure_disk_mounted(
     docker: &DockerRuntime,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     paths: &InstancePaths,
     effective_limiter: &DiskLimiter,
 ) -> anyhow::Result<()> {

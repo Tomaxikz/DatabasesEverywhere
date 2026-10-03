@@ -4,6 +4,7 @@ use secrecy::SecretString;
 use tokio::time::sleep;
 
 use crate::{
+    databases::protocol::Protocol,
     databases::{
         self,
         engine::{
@@ -11,16 +12,16 @@ use crate::{
             RouteIdentity, TenantAuthStep,
         },
     },
-    instance::disk::DiskLimiter,
-    instance::{
+    routes::http::{policy::DestructiveActionPolicy, response::ApiError, router::AppState},
+    runtime::docker::{DockerImagePullProgress, DockerInstanceSpec, DockerRuntime, ExecRecovery},
+    server::disk::DiskLimiter,
+    server::{
         metadata::{
             DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
             RuntimeMetadata, SCHEMA_VERSION,
         },
         paths::InstancePaths,
     },
-    routes::http::{policy::DestructiveActionPolicy, response::ApiError, router::AppState},
-    runtime::docker::{DockerImagePullProgress, DockerInstanceSpec, DockerRuntime, ExecRecovery},
     subsystems::{
         instances::{
             docker_error,
@@ -36,7 +37,6 @@ use crate::{
         backend::BackendEndpoint,
         limits::{bytes_to_mib_ceil, mib_to_bytes},
         logs::summarize_failure_logs,
-        protocol::Protocol,
         redaction,
         shell::sh_quote,
         time::now_rfc3339,
@@ -86,7 +86,7 @@ pub async fn create_instance_from_request(
         request
             .server_id
             .as_ref()
-            .map(|server_id| crate::instance::placement::PoolOwner {
+            .map(|server_id| crate::server::placement::PoolOwner {
                 panel_id: state.config.token_id.clone(),
                 server_id: server_id.clone(),
             });
@@ -95,7 +95,7 @@ pub async fn create_instance_from_request(
     }
     validate_create_request(&request)?;
     validate_create_config(&state.config, &request)?;
-    if request.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+    if request.deployment_mode == crate::server::placement::DeploymentMode::Shared
         && !state.gateway_supervisor.is_ready()
     {
         return Err(ApiError::ServiceUnavailable(
@@ -104,7 +104,7 @@ pub async fn create_instance_from_request(
         ));
     }
     let _creation =
-        if request.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated {
+        if request.deployment_mode == crate::server::placement::DeploymentMode::Dedicated {
             Some(state.instance_locks.lock_creation().await)
         } else {
             None
@@ -117,7 +117,7 @@ pub async fn create_instance_from_request(
         .as_ref()
         .map(limits_from_request)
         .unwrap_or_default();
-    if request.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if request.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return shared::create(state, request).await;
     }
     enforce_node_allocation_policy(state, &requested_limits, None).await?;
@@ -136,11 +136,11 @@ pub(crate) async fn prepare_instance_container_user(
     docker: &DockerRuntime,
     paths: &InstancePaths,
     protocol: Protocol,
-) -> Result<String, crate::instance::paths::InstancePathError> {
+) -> Result<String, crate::server::paths::InstancePathError> {
     if let Some(user) = docker.rootless_podman_container_user(protocol) {
         let (uid, gid) = docker
             .rootless_podman_host_owner()
-            .ok_or(crate::instance::paths::InstancePathError::MissingRuntimeOwner)?;
+            .ok_or(crate::server::paths::InstancePathError::MissingRuntimeOwner)?;
         paths.apply_rootless_owner(uid, gid).await?;
         Ok(user.to_string())
     } else {

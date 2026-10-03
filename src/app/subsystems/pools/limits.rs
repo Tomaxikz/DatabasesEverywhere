@@ -2,20 +2,18 @@ use axum::extract::State;
 
 use crate::{
     auth::scopes,
-    instance::placement::{
-        DeploymentMode, EngineRuntime, EngineRuntimeStatus, PoolLimits, runtime,
-    },
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus, PoolLimits, runtime},
 };
 
 #[derive(serde::Serialize)]
 pub(crate) struct PoolConfig {
     pub runtime_id: String,
-    pub owner: crate::instance::placement::PoolOwner,
+    pub owner: crate::server::placement::PoolOwner,
     pub limits: PoolLimits,
 }
 
@@ -137,9 +135,9 @@ mod tests {
 
     #[test]
     fn live_resize_preserves_storage_and_reservations() {
-        let mut pool = crate::instance::placement::test_support::runtime(
+        let mut pool = crate::server::placement::test_support::runtime(
             "server-a",
-            crate::utils::protocol::Protocol::Postgres,
+            crate::databases::protocol::Protocol::Postgres,
             "postgres:18",
         );
         pool.reserved.tenants = 2;

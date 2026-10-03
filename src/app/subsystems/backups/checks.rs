@@ -118,8 +118,7 @@ pub(super) fn restore_input_bytes(layout: BackupLayout, stored_bytes: u64, disk_
     match layout {
         BackupLayout::Logical => stored_bytes.max(1),
         BackupLayout::Physical => stored_bytes.max(
-            mib_to_bytes(disk_mib)
-                .min(crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES),
+            mib_to_bytes(disk_mib).min(crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES),
         ),
     }
 }

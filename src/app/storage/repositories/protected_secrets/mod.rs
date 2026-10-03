@@ -5,7 +5,7 @@ use sqlx::Row;
 use subtle::ConstantTimeEq;
 
 use crate::{
-    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
+    server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
     storage::secrets::SecretStoreError,
     utils::time::now_rfc3339,
 };

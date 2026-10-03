@@ -4,8 +4,8 @@ use futures::future::{BoxFuture, FutureExt};
 
 use crate::{
     databases::engine::{DedicatedSpecInput, EngineLifecycle, SharedSpecInput},
-    instance::metadata::InstanceMetadata,
     runtime::docker::DockerInstanceSpec,
+    server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
 };
 

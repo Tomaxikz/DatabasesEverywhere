@@ -88,7 +88,7 @@ pub(crate) async fn harden_postgres_instance_auth(
             && metadata.postgres_admin_password.as_deref() == Some(admin_password)
     });
     let attestation = if let Some(metadata) = metadata.as_ref() {
-        match crate::instance::auth_hardening::begin_attestation(
+        match crate::server::auth_hardening::begin_attestation(
             &state.manager,
             &state.docker,
             metadata,
@@ -125,7 +125,7 @@ pub(crate) async fn harden_postgres_instance_auth(
     .await
     .map_err(|error| fail_runtime(state, instance_id, error))?;
     if let (Some(metadata), Some(attestation)) = (metadata.as_ref(), attestation.as_ref())
-        && let Err(error) = crate::instance::auth_hardening::complete_attestation(
+        && let Err(error) = crate::server::auth_hardening::complete_attestation(
             &state.manager,
             &state.docker,
             metadata,

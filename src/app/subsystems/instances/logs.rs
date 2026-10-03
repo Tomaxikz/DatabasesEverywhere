@@ -26,7 +26,7 @@ pub async fn instance_logs(
 }
 
 pub(crate) fn check_logs_available(metadata: &InstanceMetadata) -> Result<(), ApiError> {
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         Err(shared::reject_logs())
     } else {
         Ok(())

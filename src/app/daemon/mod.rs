@@ -22,19 +22,20 @@ use tokio::{io::AsyncWriteExt, net::TcpListener};
 use crate::{
     auth::api_token::ApiToken,
     config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
+    databases::protocol::Protocol,
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
         supervisor::GatewaySupervisor,
     },
-    instance::disk::DiskLimiter,
-    instance::jobs::import_export::ImportExportJobs,
-    instance::{
-        manager::InstanceManager, metadata::InstanceStatus, paths::InstancePaths, reconcile,
-        state::InstanceStore,
-    },
     routes::http::{response::ApiError, router::build_router},
     runtime::docker::{
         CpuBurstPolicyStatus, DockerContainerStatus, DockerRuntime, ManagedContainerEvent,
+    },
+    server::disk::DiskLimiter,
+    server::jobs::import_export::ImportExportJobs,
+    server::{
+        manager::InstanceManager, metadata::InstanceStatus, paths::InstancePaths, reconcile,
+        state::InstanceStore,
     },
     state::{AppState, AppStateData},
     storage::{
@@ -47,7 +48,7 @@ use crate::{
     utils::constants::{MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
     utils::{
         ids::validate_instance_id, images::has_sha256_digest, limits::mib_to_bytes,
-        logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
+        logs::truncate_log_tail, time::now_rfc3339,
     },
 };
 
@@ -70,8 +71,8 @@ pub(crate) mod setup;
 mod soft_disk_limiter;
 mod startup;
 
-use crate::instance::placement::lifecycle::*;
-use crate::instance::placement::tenant::recovery::*;
+use crate::server::placement::lifecycle::*;
+use crate::server::placement::tenant::recovery::*;
 use admission::ApiConnectionAcceptor;
 use boot_recovery::*;
 use container_events::*;

@@ -21,8 +21,9 @@ use serde::Deserialize;
 use crate::config::load::load_config;
 use crate::{
     config::{Config, load::ConfigLoadError},
+    databases::protocol::Protocol,
     runtime::docker::DockerRuntime,
-    utils::{ids::validate_instance_id, protocol::Protocol, time::now_rfc3339},
+    utils::{ids::validate_instance_id, time::now_rfc3339},
 };
 
 pub use self::args::BenchArgs;

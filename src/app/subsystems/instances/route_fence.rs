@@ -2,7 +2,7 @@ use crate::routes::http::router::AppState;
 
 pub(crate) async fn fence(state: &AppState, instance_id: &str) {
     let sessions = state.gateway_supervisor.tenant_sessions();
-    crate::instance::sessions::fence(&state.instances, &sessions, instance_id).await;
+    crate::server::sessions::fence(&state.instances, &sessions, instance_id).await;
 }
 
 pub(crate) async fn pin(state: &AppState, instance_id: &str) {

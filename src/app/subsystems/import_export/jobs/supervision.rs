@@ -457,7 +457,7 @@ pub(super) async fn block_uncertain_upload(
             job_id,
             crate::storage::import_uploads::InterruptedImportDisposition::Failed,
             reason,
-            &crate::instance::jobs::import_export::now_rfc3339(),
+            &crate::server::jobs::import_export::now_rfc3339(),
         )
         .await
     {
@@ -484,7 +484,7 @@ async fn claim_upload_for_job(
             instance_id,
             upload_id,
             job_id,
-            &crate::instance::jobs::import_export::now_rfc3339(),
+            &crate::server::jobs::import_export::now_rfc3339(),
         )
         .await
     {
@@ -505,7 +505,7 @@ async fn claim_upload_for_job(
                     upload_id,
                     job_id,
                     "upload claim acknowledgement was uncertain; submit the import again",
-                    &crate::instance::jobs::import_export::now_rfc3339(),
+                    &crate::server::jobs::import_export::now_rfc3339(),
                 )
                 .await
             {
@@ -652,7 +652,7 @@ async fn save_terminal_job_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{instance::jobs::import_export::ImportExportJobs, instance::locks::InstanceLocks};
+    use crate::{server::jobs::import_export::ImportExportJobs, server::locks::InstanceLocks};
     use tokio::sync::Notify;
 
     #[tokio::test]

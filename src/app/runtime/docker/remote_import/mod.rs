@@ -35,8 +35,9 @@ use super::{
     stream_exec::{encode_secrets, open_private_input, verify_private_input},
 };
 use crate::{
+    databases::protocol::Protocol,
     utils::constants::docker::{MANAGED_LABEL, NODE_LABEL},
-    utils::{logs::truncate_log_tail, protocol::Protocol, redaction},
+    utils::{logs::truncate_log_tail, redaction},
 };
 
 const HELPER_LABEL: &str = "databases-everywhere.remote-import-helper";

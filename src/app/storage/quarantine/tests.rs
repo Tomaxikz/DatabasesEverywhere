@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    instance::placement::{EngineRuntimeStatus, PlacementRepository},
-    instance::{metadata::InstanceStatus, test_support::metadata},
+    databases::protocol::Protocol,
+    server::placement::{EngineRuntimeStatus, PlacementRepository},
+    server::{metadata::InstanceStatus, test_support::metadata},
     storage::{repositories::InstanceRepository, sqlite},
-    utils::protocol::Protocol,
 };
 
 #[tokio::test]
@@ -87,7 +87,7 @@ async fn causes_accumulate_without_erasing_history_and_close_on_recovery_or_dele
     let dir = tempfile::tempdir().unwrap();
     let db = sqlite::connect(dir.path()).await.unwrap();
     let repository = PlacementRepository::new(db.clone());
-    let mut runtime = crate::instance::placement::test_support::runtime(
+    let mut runtime = crate::server::placement::test_support::runtime(
         "pool_history",
         Protocol::Postgres,
         "postgres:18.4",
@@ -202,7 +202,7 @@ async fn failed_metadata_or_journal_write_rolls_back_both() {
             .status,
         InstanceStatus::Running
     );
-    let store = crate::instance::state::InstanceStore::default();
+    let store = crate::server::state::InstanceStore::default();
     store
         .upsert(
             repository
@@ -212,7 +212,7 @@ async fn failed_metadata_or_journal_write_rolls_back_both() {
                 .unwrap(),
         )
         .await;
-    let manager = crate::instance::manager::InstanceManager::new(store.clone(), repository);
+    let manager = crate::server::manager::InstanceManager::new(store.clone(), repository);
     assert!(
         manager
             .quarantine(instance.clone(), QuarantineKind::MetadataUncertain)

@@ -1,6 +1,6 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    instance::placement::{
+    server::placement::{
         policy,
         tenant::backends::{PostgresTenantBackend, TenantBackend},
     },

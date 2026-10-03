@@ -9,11 +9,7 @@ use super::{docker_error, image_update_spec};
 use crate::{
     auth::scopes,
     databases::engine::CredentialRollback,
-    instance::disk::DiskLimiter,
-    instance::{
-        metadata::{InstanceMetadata, InstanceStatus},
-        paths::InstancePaths,
-    },
+    databases::protocol::Protocol,
     io::files::read_bounded_private_file,
     routes::http::{
         policy::ApiRequestContext,
@@ -21,13 +17,18 @@ use crate::{
         router::AppState,
     },
     runtime::docker::{DockerContainerStatus, DockerInstanceSpec},
+    server::disk::DiskLimiter,
+    server::{
+        metadata::{InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     subsystems::instances::{
         create::{
             launch_container_from_spec, prepare_instance_container_user, protocol_pids_limit,
         },
         requests::validate_database_password,
     },
-    utils::{protocol::Protocol, time::now_rfc3339},
+    utils::time::now_rfc3339,
 };
 
 #[cfg(test)]
@@ -129,20 +130,20 @@ pub async fn reset_instance_password(
 
 fn password_admission_error(
     instance_id: &str,
-    error: crate::instance::jobs::import_export::JobAdmissionError,
+    error: crate::server::jobs::import_export::JobAdmissionError,
 ) -> ApiError {
     match error {
-        crate::instance::jobs::import_export::JobAdmissionError::GlobalCapacity => {
+        crate::server::jobs::import_export::JobAdmissionError::GlobalCapacity => {
             ApiError::ServiceUnavailable(
                 "database maintenance queue is at capacity; retry later".to_string(),
             )
         }
-        crate::instance::jobs::import_export::JobAdmissionError::InstanceCapacity => {
+        crate::server::jobs::import_export::JobAdmissionError::InstanceCapacity => {
             ApiError::Conflict(format!(
                 "another database maintenance operation is already running for {instance_id}"
             ))
         }
-        crate::instance::jobs::import_export::JobAdmissionError::ShuttingDown => {
+        crate::server::jobs::import_export::JobAdmissionError::ShuttingDown => {
             ApiError::ServiceUnavailable(
                 "daemon shutdown has started; password resets are not accepted".to_string(),
             )
@@ -151,13 +152,13 @@ fn password_admission_error(
 }
 
 fn password_scheduler_error(
-    error: crate::instance::jobs::import_export::SchedulerAcquireError,
+    error: crate::server::jobs::import_export::SchedulerAcquireError,
 ) -> ApiError {
     match error {
-        crate::instance::jobs::import_export::SchedulerAcquireError::Closed => {
+        crate::server::jobs::import_export::SchedulerAcquireError::Closed => {
             ApiError::ServiceUnavailable("daemon shutdown has started".to_string())
         }
-        crate::instance::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
+        crate::server::jobs::import_export::SchedulerAcquireError::InsufficientCapacity => {
             ApiError::Conflict(
                 "password maintenance exceeds a fixed dynamic import/export scheduler budget"
                     .to_string(),
@@ -181,8 +182,8 @@ async fn reset_instance_password_inner(
     let _execution = state
         .import_export_jobs
         .acquire_execution(
-            crate::instance::jobs::import_export::JobResourceCost::estimate(
-                crate::instance::jobs::import_export::JobEstimateInput {
+            crate::server::jobs::import_export::JobResourceCost::estimate(
+                crate::server::jobs::import_export::JobEstimateInput {
                     protocol: metadata.protocol,
                     input_size_bytes: 1,
                     rollback_size_bytes: 0,
@@ -195,7 +196,7 @@ async fn reset_instance_password_inner(
         .await
         .map_err(password_scheduler_error)?;
     validate_password(metadata.protocol, &new_password)?;
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return super::shared::reset_password(&state, metadata, new_password).await;
     }
     require_resettable_instance(&state, &metadata).await?;
@@ -407,13 +408,13 @@ async fn require_resettable_instance(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<(), ApiError> {
-    if metadata.desired_state != crate::instance::metadata::DesiredInstanceState::Running {
+    if metadata.desired_state != crate::server::metadata::DesiredInstanceState::Running {
         return Err(ApiError::Conflict(
             "password reset requires the instance desired state to be running".to_string(),
         ));
     }
     let recoverable_failed_instance = metadata.status == InstanceStatus::Failed
-        && metadata.desired_state == crate::instance::metadata::DesiredInstanceState::Running;
+        && metadata.desired_state == crate::server::metadata::DesiredInstanceState::Running;
     if metadata.status != InstanceStatus::Running && !recoverable_failed_instance {
         return Err(ApiError::Conflict(format!(
             "password reset requires a running instance or a failed running instance awaiting credential recovery; current status is {}",
@@ -609,7 +610,7 @@ async fn attest_password_reset_target(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> Result<(), ApiError> {
-    let outcome = crate::instance::compatibility::probe_instance_compatibility(
+    let outcome = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    instance::monitoring::engine::backends::{EngineTelemetry, MariadbTelemetry},
-    instance::placement::{
+    server::monitoring::engine::backends::{EngineTelemetry, MariadbTelemetry},
+    server::placement::{
         policy,
         tenant::backends::{MysqlFlavor, TenantBackend},
     },

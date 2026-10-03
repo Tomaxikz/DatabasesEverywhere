@@ -1,4 +1,4 @@
-use crate::{instance::backup::catalog::BackupCatalogObject, instance::metadata::InstanceMetadata};
+use crate::{server::backup::catalog::BackupCatalogObject, server::metadata::InstanceMetadata};
 
 use super::EngineInfo;
 

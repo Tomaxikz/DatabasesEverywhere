@@ -5,21 +5,21 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::{migration_admission_error, migration_error};
 use crate::{
-    instance::jobs::import_export::{
-        ExecutionPermit, ImportExportJobPermit, JobEstimateInput, JobResourceCost,
-        SchedulerAcquireError,
-    },
-    instance::metadata::InstanceMetadata,
-    instance::placement::{
-        DeploymentMigration, DeploymentMode, EngineRuntime, EngineRuntimeStatus, MigrationFailure,
-        MigrationPatch, MigrationStage, runtime as runtime_ops,
-        tenant::{self, TenantTarget},
-    },
     routes::http::{
         response::ApiError,
         router::{AppState, MutationPermit},
     },
     runtime::docker::DockerContainerStatus,
+    server::jobs::import_export::{
+        ExecutionPermit, ImportExportJobPermit, JobEstimateInput, JobResourceCost,
+        SchedulerAcquireError,
+    },
+    server::metadata::InstanceMetadata,
+    server::placement::{
+        DeploymentMigration, DeploymentMode, EngineRuntime, EngineRuntimeStatus, MigrationFailure,
+        MigrationPatch, MigrationStage, runtime as runtime_ops,
+        tenant::{self, TenantTarget},
+    },
     subsystems::{
         import_export,
         instances::{

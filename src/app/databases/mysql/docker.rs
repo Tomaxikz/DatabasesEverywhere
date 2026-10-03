@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use secrecy::SecretString;
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    utils::protocol::Protocol,
 };
 
 #[allow(clippy::too_many_arguments)]

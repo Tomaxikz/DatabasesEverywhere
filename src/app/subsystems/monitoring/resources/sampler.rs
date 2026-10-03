@@ -17,8 +17,8 @@ use super::{
     cpu_percent_over_wall_time, mib_to_bytes,
 };
 use crate::{
-    instance::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
     runtime::docker::DockerRuntime,
+    server::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
 };
 
 const HOST_CPU_REFRESH_INTERVAL: Duration = Duration::from_millis(400);
@@ -327,9 +327,9 @@ pub(super) struct AllocationSummary {
 
 pub(super) fn summarize_allocations(
     instances: &[InstanceMetadata],
-    runtimes: &[crate::instance::placement::EngineRuntime],
+    runtimes: &[crate::server::placement::EngineRuntime],
 ) -> AllocationSummary {
-    let allocated = crate::instance::placement::policy::sum_runtime_limits(
+    let allocated = crate::server::placement::policy::sum_runtime_limits(
         runtimes.iter().map(|runtime| &runtime.limits),
     );
     let mut counts = NodeInstanceSummary::default();
@@ -503,7 +503,7 @@ async fn shared_runtime_disk_usage(
     let paths = InstancePaths::new(&state.config.paths, &runtime.runtime_id)
         .map_err(|error| error.to_string())?;
     let (root_bytes, sampled_at, source) = if runtime.limits.disk_enforced {
-        let root_bytes = crate::instance::disk::DiskLimiter::with_fuse_root(
+        let root_bytes = crate::server::disk::DiskLimiter::with_fuse_root(
             state.config.disk.clone(),
             state.config.paths.fuse_root(),
         )

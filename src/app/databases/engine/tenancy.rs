@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use super::EngineInfo;
 use crate::{
-    instance::monitoring::engine::backends::EngineTelemetry,
-    instance::placement::tenant::backends::TenantBackend,
+    server::monitoring::engine::backends::EngineTelemetry,
+    server::placement::tenant::backends::TenantBackend,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

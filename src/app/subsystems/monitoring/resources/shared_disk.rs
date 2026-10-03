@@ -5,8 +5,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::{AppState, CachedDiskUsage, DeploymentMode, InstanceMetadata, InstanceStatus};
 use crate::{
-    instance::metadata::DesiredInstanceState,
-    instance::placement::{
+    server::metadata::DesiredInstanceState,
+    server::placement::{
         EngineRuntime, EngineRuntimeStatus,
         tenant::{self, TenantTarget},
     },
@@ -24,7 +24,7 @@ pub(super) fn uses_soft_guard(deployment_mode: DeploymentMode, disk_enforced: bo
 }
 
 pub(super) async fn reported_disk_used_bytes<F, Fut>(
-    scanner: Option<&crate::instance::disk::soft::SoftDiskSnapshot>,
+    scanner: Option<&crate::server::disk::soft::SoftDiskSnapshot>,
     fallback: F,
 ) -> Result<u64, String>
 where
@@ -244,7 +244,7 @@ async fn sample_runtime(
 async fn load_runtime(
     state: &AppState,
     runtime_id: &str,
-    protocol: crate::utils::protocol::Protocol,
+    protocol: crate::databases::protocol::Protocol,
 ) -> Result<EngineRuntime, String> {
     let runtime = state
         .placements
@@ -622,14 +622,14 @@ mod tests {
     async fn stopped_pool_measurements_stay_strict_but_reporting_is_nullable() {
         use super::super::{ResourceView, resource_report};
         let (state, _dir) = crate::subsystems::test_support::database(Default::default()).await;
-        let mut runtime = crate::instance::placement::test_support::runtime(
+        let mut runtime = crate::server::placement::test_support::runtime(
             "pool-a",
-            crate::utils::protocol::Protocol::Mysql,
+            crate::databases::protocol::Protocol::Mysql,
             "mysql:8.4",
         );
         runtime.status = EngineRuntimeStatus::Failed;
         state.placements.save(&runtime).await.unwrap();
-        let mut tenant = crate::instance::test_support::shared_metadata();
+        let mut tenant = crate::server::test_support::shared_metadata();
         tenant.limits.disk_enforced = false;
         state.instances.upsert_fenced(tenant.clone()).await;
         assert!(usage(&state, &tenant).await.is_err());
@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn hard_tenant() -> InstanceMetadata {
-        let mut metadata = crate::instance::test_support::shared_metadata();
+        let mut metadata = crate::server::test_support::shared_metadata();
         metadata.limits = crate::utils::limits::InstanceLimits {
             cpu_cores: 1.0,
             memory_mib: 256,

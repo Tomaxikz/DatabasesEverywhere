@@ -7,6 +7,7 @@ use std::{
 
 use super::provision::shared_tenant_user_sql;
 use crate::{
+    databases::protocol::Protocol,
     databases::{
         mysql_wire_integration::{
             assert_engine_tenant_rows, run_jdbc_smoke, run_mariadb_cli, start_gateway,
@@ -15,8 +16,8 @@ use crate::{
         test_support::DockerContainer,
     },
     gateway::protocols::mariadb::native_password_sha1_stage2_hex,
-    instance::{state::InstanceStore, test_support},
-    utils::{backend::BackendEndpoint, protocol::Protocol},
+    server::{state::InstanceStore, test_support},
+    utils::backend::BackendEndpoint,
 };
 
 const DEFAULT_IMAGE: &str = "mariadb:12.3";
@@ -63,7 +64,7 @@ async fn mariadb_supported_version_routes_real_cli_jdbc_tls_and_hikari() {
     );
     assert_mariadb_engine_telemetry(&name);
     let version = query_mariadb(&name, ROOT_PASSWORD, "root", "mysql", "SELECT VERSION()");
-    crate::instance::compatibility::compatibility_profile(Protocol::Mariadb, &version)
+    crate::server::compatibility::compatibility_profile(Protocol::Mariadb, &version)
         .unwrap_or_else(|error| {
             panic!("{image} reported unsupported live version {version}: {error}")
         });
@@ -124,12 +125,12 @@ fn assert_mariadb_engine_telemetry(name: &str) {
         ROOT_PASSWORD,
         "root",
         "mysql",
-        crate::instance::monitoring::mariadb_prepare_sql(),
+        crate::server::monitoring::mariadb_prepare_sql(),
     );
     assert_success(&prepare, "prepare canonical MariaDB engine telemetry");
     let prepare_output =
         String::from_utf8(prepare.stdout).expect("MariaDB telemetry output is UTF-8");
-    crate::instance::monitoring::parse_mariadb_ready(&prepare_output)
+    crate::server::monitoring::parse_mariadb_ready(&prepare_output)
         .expect("confirm MariaDB telemetry accounting is ready");
 
     for (database, username, password) in [
@@ -147,12 +148,12 @@ fn assert_mariadb_engine_telemetry(name: &str) {
         ROOT_PASSWORD,
         "root",
         "mysql",
-        crate::instance::monitoring::mariadb_collect_sql(),
+        crate::server::monitoring::mariadb_collect_sql(),
     );
     assert_success(&collect, "collect canonical MariaDB engine telemetry");
     let collect_output =
         String::from_utf8(collect.stdout).expect("MariaDB telemetry output is UTF-8");
-    let rows = crate::instance::monitoring::parse_mariadb_rows(&collect_output)
+    let rows = crate::server::monitoring::parse_mariadb_rows(&collect_output)
         .expect("parse canonical MariaDB engine telemetry");
     assert_engine_tenant_rows(rows, &[TENANT, NEIGHBOR]);
 }

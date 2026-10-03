@@ -7,9 +7,9 @@ use crate::{
         EngineTransfer, LogicalCredential, LogicalImportRequest, RemoteDumpFlow, SelectionUse,
         TransferError,
     },
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
-    subsystems::import_export::{ImportExportSelection, SelectionMode},
+    server::jobs::import_export::selection::{ImportExportSelection, SelectionMode},
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
     utils::shell::sh_quote,
 };
 

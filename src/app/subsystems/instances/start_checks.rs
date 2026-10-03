@@ -23,7 +23,7 @@ pub(super) fn persisted_disk_limiter(state: &AppState, metadata: &InstanceMetada
 }
 
 pub(super) fn soft_scanner_required(state: &AppState, metadata: &InstanceMetadata) -> bool {
-    crate::instance::disk::soft::SoftDiskLimiter::enforcement_required(
+    crate::server::disk::soft::SoftDiskLimiter::enforcement_required(
         state.config.disk.mode,
         metadata.protocol,
     ) || (metadata.protocol == Protocol::Qdrant
@@ -66,7 +66,7 @@ pub(super) async fn precheck_dedicated_start(
     }
     let snapshot = state
         .soft_disk_limiter
-        .ensure_start_allowed(&crate::instance::disk::soft::SoftDiskTarget {
+        .ensure_start_allowed(&crate::server::disk::soft::SoftDiskTarget {
             instance_id: metadata.instance_id.clone(),
             created_at: metadata.created_at.clone(),
             protocol: metadata.protocol,

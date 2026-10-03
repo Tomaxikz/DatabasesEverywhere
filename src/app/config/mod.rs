@@ -40,8 +40,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    databases::protocol::Protocol,
     utils::constants::{defaults, ports},
-    utils::{limits::mib_to_bytes, protocol::Protocol},
+    utils::limits::mib_to_bytes,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

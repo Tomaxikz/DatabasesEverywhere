@@ -2,25 +2,16 @@ pub mod recovery;
 pub mod remote;
 
 use std::{
-    collections::HashMap,
     io::{Read, Write},
     path::{Component, Path as FsPath, PathBuf},
     time::{Duration, Instant},
 };
 
+pub(crate) use crate::databases::clickhouse::transfer::CLICKHOUSE_ENGINE_AWK_PROGRAM;
+pub use crate::server::jobs::import_export::selection::{ImportExportSelection, SelectionMode};
 use crate::{
     auth::scopes,
-    instance::jobs::import_export::{
-        ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
-        JobAdmissionError, JobEstimateInput, JobResourceCost, SchedulerAcquireError,
-        conservative_import_input_bytes, extract_bounded_archive, protocol_uses_logical_dumps,
-        protocol_uses_native_compression,
-    },
-    instance::placement::DeploymentMode,
-    instance::{
-        metadata::{InstanceMetadata, InstanceStatus},
-        paths::InstancePaths,
-    },
+    databases::protocol::Protocol,
     io::files::is_safe_flat_file_name,
     routes::http::{
         diagnostics::PublicDiagnostic,
@@ -29,6 +20,17 @@ use crate::{
         router::AppState,
     },
     runtime::docker::ExecRecovery,
+    server::jobs::import_export::{
+        ImportExportAction, ImportExportJob, ImportExportJobPermit, ImportExportStatus,
+        JobAdmissionError, JobEstimateInput, JobResourceCost, SchedulerAcquireError,
+        conservative_import_input_bytes, extract_bounded_archive, protocol_uses_logical_dumps,
+        protocol_uses_native_compression,
+    },
+    server::placement::DeploymentMode,
+    server::{
+        metadata::{InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     subsystems::{
         import_export::remote::{
             ImportMode, RemoteImportRequest, RemoteImportSource, RemoteJobAdmissionPermit,
@@ -37,18 +39,16 @@ use crate::{
         },
         instances::{LifecycleAction, change_instance_state_locked},
     },
-    utils::{limits::mib_to_bytes, protocol::Protocol},
+    utils::limits::mib_to_bytes,
 };
 use axum::extract::State;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES: u64 = 16 * 1024;
 const MAX_ARCHIVE_DEPTH: usize = 32;
 const ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
-pub(crate) const MAX_SELECTION_ITEMS: usize = 512;
-pub(crate) const MAX_SELECTION_FIELDS_PER_ITEM: usize = 512;
 const FAIL_CLOSED_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGICAL_ROLLBACK_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGICAL_STREAM_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -59,25 +59,6 @@ pub(super) fn logical_exec_recovery(metadata: &InstanceMetadata) -> ExecRecovery
         DeploymentMode::Shared => ExecRecovery::CallerHandles,
     }
 }
-pub(crate) const CLICKHOUSE_ENGINE_AWK_PROGRAM: &str = r#"
-/^[[:space:]]*ENGINE[[:space:]]*=/ {
-  candidate = $0
-  sub(/^[[:space:]]*ENGINE[[:space:]]*=[[:space:]]*/, "", candidate)
-  if (candidate !~ /^[A-Za-z][A-Za-z0-9_]*([[:space:](]|$)/) {
-    invalid = 1
-    next
-  }
-  sub(/[^A-Za-z0-9_].*$/, "", candidate)
-  engine = candidate
-  count++
-}
-END {
-  if (invalid || count != 1) {
-    exit 64
-  }
-  print engine
-}
-"#;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -111,46 +92,6 @@ pub enum ImportSource {
         source_database: Option<String>,
     },
     Remote(RemoteImportRequest),
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectionMode {
-    #[default]
-    Full,
-    Selective,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct ImportExportSelection {
-    pub mode: SelectionMode,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
-    #[serde(deserialize_with = "deserialize_selection_fields")]
-    pub fields: HashMap<String, Vec<String>>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SelectionFieldsInput {
-    Map(HashMap<String, Vec<String>>),
-    Sequence(Vec<serde::de::IgnoredAny>),
-}
-
-fn deserialize_selection_fields<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, Vec<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match SelectionFieldsInput::deserialize(deserializer)? {
-        SelectionFieldsInput::Map(fields) => Ok(fields),
-        SelectionFieldsInput::Sequence(fields) if fields.is_empty() => Ok(HashMap::new()),
-        SelectionFieldsInput::Sequence(_) => Err(D::Error::custom(
-            "selection.fields must be an object or an empty array",
-        )),
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -428,7 +369,7 @@ mod shared_security;
 mod upload_recovery;
 mod uploads;
 
-pub(crate) use crate::instance::disk::capacity::DiskCapacityReservation;
+pub(crate) use crate::server::disk::capacity::DiskCapacityReservation;
 pub(crate) use files::logical_staging_root;
 pub(crate) use jobs::{
     export_default_artifact, public_job_response, queue_import_instance, register_default_artifact,

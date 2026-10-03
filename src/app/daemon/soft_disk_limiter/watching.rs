@@ -3,11 +3,11 @@ use super::*;
 #[derive(Debug)]
 pub(super) enum WatchOperationResult {
     Registered {
-        registration: crate::instance::disk::soft::watcher::WatchRegistration,
-        root_identity: crate::instance::disk::soft::planner::RootIdentity,
+        registration: crate::server::disk::soft::watcher::WatchRegistration,
+        root_identity: crate::server::disk::soft::planner::RootIdentity,
     },
     Unregistered,
-    Retried(crate::instance::disk::soft::watcher::RetrySummary),
+    Retried(crate::server::disk::soft::watcher::RetrySummary),
 }
 
 #[derive(Debug)]
@@ -72,13 +72,13 @@ pub(super) fn dispatch_watch(
         let result = tokio::task::spawn_blocking(move || match &worker_operation {
             WatchOperation::Register { target_id, desired } => {
                 let opened_identity =
-                    crate::instance::disk::soft::usage_tree::root_identity(&desired.root)
+                    crate::server::disk::soft::usage_tree::root_identity(&desired.root)
                         .map_err(|error| format!("failed to identify watch root: {error}"))?;
                 let registration = watcher
                     .register(target_id, &desired.fingerprint, &desired.root)
                     .map_err(|error| error.to_string())?;
                 let root_identity =
-                    match crate::instance::disk::soft::usage_tree::root_identity(&desired.root) {
+                    match crate::server::disk::soft::usage_tree::root_identity(&desired.root) {
                         Ok(identity) => identity,
                         Err(error) => {
                             if let Some(retired) = watcher.retire(target_id) {

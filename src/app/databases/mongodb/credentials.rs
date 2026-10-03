@@ -3,7 +3,7 @@ use crate::{
         CredentialRollback, EngineCredentials, LiveRotation, LiveRotationScript,
         MaintenanceAuthCheck, MaintenanceCredential, RecoverySecret, RotatedSecrets,
     },
-    instance::metadata::InstanceMetadata,
+    server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
 };
 

@@ -1,6 +1,6 @@
 use sqlx::{Row, SqlitePool};
 
-use crate::instance::jobs::import_export::{
+use crate::server::jobs::import_export::{
     ImportExportAction, ImportExportJob, ImportExportStatus, JobParseError,
 };
 
@@ -260,7 +260,7 @@ pub enum ImportExportJobStorageError {
 mod tests {
     use super::*;
     use crate::{
-        instance::jobs::import_export::{ImportExportAction, ImportExportStatus},
+        server::jobs::import_export::{ImportExportAction, ImportExportStatus},
         storage::sqlite,
     };
 

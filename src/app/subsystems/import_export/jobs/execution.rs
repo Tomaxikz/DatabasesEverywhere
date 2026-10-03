@@ -147,7 +147,7 @@ async fn lock_job_target(
 }
 
 async fn reconcile_then_lock_runtime<F>(
-    locks: &crate::instance::locks::InstanceLocks,
+    locks: &crate::server::locks::InstanceLocks,
     reconcile: F,
 ) -> Result<(InstanceMetadata, Option<OwnedMutexGuard<()>>), ApiError>
 where
@@ -282,7 +282,7 @@ async fn acquire_physical_import_staging(
             let data_parent = physical_data_parent(state, instance_id)?;
             let extracted = mib_to_bytes(metadata.limits.disk_mib).clamp(
                 1,
-                crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+                crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
             );
             state
                 .import_uploads
@@ -420,11 +420,11 @@ fn estimate_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
 mod lock_tests {
     use super::*;
 
-    use crate::instance::test_support::shared_metadata;
+    use crate::server::test_support::shared_metadata;
 
     #[tokio::test]
     async fn shared_job_locks_runtime_only_after_reconcile_releases_it() {
-        let locks = crate::instance::locks::InstanceLocks::default();
+        let locks = crate::server::locks::InstanceLocks::default();
         let _tenant_operation = locks.lock("tenant-a").await;
         let reconcile_locks = locks.clone();
         let metadata = shared_metadata();

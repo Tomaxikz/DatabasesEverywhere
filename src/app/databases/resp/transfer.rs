@@ -2,8 +2,8 @@ use secrecy::SecretString;
 
 use crate::{
     databases::engine::{EngineInfo, EngineTransfer, SelectionUse, TransferError},
-    subsystems::import_export::ImportExportSelection,
-    utils::protocol::Protocol,
+    databases::protocol::Protocol,
+    server::jobs::import_export::selection::ImportExportSelection,
 };
 
 use super::engine::{Redis, Valkey};

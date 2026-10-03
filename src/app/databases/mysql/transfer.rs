@@ -3,10 +3,11 @@ use crate::{
         EngineInfo, EngineTransfer, ImportConnection, LogicalCredential, LogicalImportRequest,
         RemoteDumpFlow, SelectionUse, TransferError,
     },
-    instance::placement::DeploymentMode,
-    instance::{credentials::logical_import_env, metadata::InstanceMetadata},
-    subsystems::import_export::{ImportExportSelection, SelectionMode},
-    utils::{protocol::Protocol, shell::sh_quote},
+    databases::protocol::Protocol,
+    server::jobs::import_export::selection::{ImportExportSelection, SelectionMode},
+    server::placement::DeploymentMode,
+    server::{credentials::logical_import_env, metadata::InstanceMetadata},
+    utils::shell::sh_quote,
 };
 
 use super::engine::Mysql;

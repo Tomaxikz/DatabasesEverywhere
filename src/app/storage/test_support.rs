@@ -1,12 +1,13 @@
 use sqlx::SqlitePool;
 
 use crate::{
-    instance::metadata::{
+    databases::protocol::Protocol,
+    server::metadata::{
         DatabaseIdentity, DesiredInstanceState, InstanceStatus, PublicEndpoint, RuntimeKind,
         RuntimeMetadata,
     },
     storage::repositories::InstanceRepository,
-    utils::{backend::BackendEndpoint, protocol::Protocol},
+    utils::backend::BackendEndpoint,
 };
 
 /// Persists a complete dedicated instance through the production repository.
@@ -17,7 +18,7 @@ pub(crate) async fn seed_dedicated_instance(
     instance_id: &str,
     created_at: &str,
 ) {
-    let mut metadata = crate::instance::test_support::metadata(instance_id, Protocol::Postgres);
+    let mut metadata = crate::server::test_support::metadata(instance_id, Protocol::Postgres);
     metadata.runtime_id = instance_id.to_string();
     metadata.status = InstanceStatus::Stopped;
     metadata.desired_state = DesiredInstanceState::Stopped;

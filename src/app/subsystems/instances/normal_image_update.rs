@@ -177,7 +177,7 @@ pub(super) async fn update_instance_image_normal(
             "compatibility",
             "attesting replacement database engine",
         );
-        let compatibility = crate::instance::compatibility::probe_instance_compatibility(
+        let compatibility = crate::server::compatibility::probe_instance_compatibility(
             &state.manager,
             &state.docker,
             &metadata,

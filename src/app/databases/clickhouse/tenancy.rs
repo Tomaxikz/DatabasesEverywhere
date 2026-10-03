@@ -1,7 +1,7 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    instance::monitoring::engine::backends::{ClickhouseTelemetry, EngineTelemetry},
-    instance::placement::tenant::backends::{ClickhouseTenantBackend, TenantBackend},
+    server::monitoring::engine::backends::{ClickhouseTelemetry, EngineTelemetry},
+    server::placement::tenant::backends::{ClickhouseTenantBackend, TenantBackend},
     utils::{
         limits::{InstanceLimits, mib_to_bytes},
         shell::sh_quote,

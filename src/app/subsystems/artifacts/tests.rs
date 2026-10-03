@@ -2,12 +2,13 @@ use super::*;
 use crate::{
     auth::api_token::ApiToken,
     config::{Config, PathConfig},
-    instance::{
+    databases::protocol::Protocol,
+    server::{
         manager::InstanceManager, metadata::InstanceMetadata, state::InstanceStore, test_support,
     },
     storage::{repositories::InstanceRepository, sqlite},
     subsystems::test_support as api_test_support,
-    utils::{backend::BackendEndpoint, protocol::Protocol},
+    utils::backend::BackendEndpoint,
 };
 
 #[test]
@@ -288,11 +289,11 @@ async fn one_use_sweeper_removes_expired_output_but_preserves_active_export() {
     }
     state
         .import_export_jobs
-        .insert(crate::instance::jobs::import_export::ImportExportJob {
+        .insert(crate::server::jobs::import_export::ImportExportJob {
             job_id: "active-export".to_string(),
             instance_id: "inst_abc".to_string(),
-            action: crate::instance::jobs::import_export::ImportExportAction::Export,
-            status: crate::instance::jobs::import_export::ImportExportStatus::Running,
+            action: crate::server::jobs::import_export::ImportExportAction::Export,
+            status: crate::server::jobs::import_export::ImportExportStatus::Running,
             artifact_path: Some(active.display().to_string()),
             replay_options: None,
             error: None,

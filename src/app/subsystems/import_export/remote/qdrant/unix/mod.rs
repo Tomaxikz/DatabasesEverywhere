@@ -21,10 +21,11 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    instance::paths::InstancePaths,
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
+    server::paths::InstancePaths,
     subsystems::import_export::{ImportExportSelection, SelectionMode},
-    utils::{backend::SOCKET_BRIDGE_CONTAINER_PATH, protocol::Protocol, shell::sh_quote},
+    utils::{backend::SOCKET_BRIDGE_CONTAINER_PATH, shell::sh_quote},
 };
 
 use super::super::{

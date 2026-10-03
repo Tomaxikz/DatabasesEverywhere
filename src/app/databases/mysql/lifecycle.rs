@@ -3,8 +3,8 @@ use crate::{
         CredentialKind, DedicatedSpecInput, EngineInfo, EngineLifecycle, LifecycleFlow,
         LifecycleRejection, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
     },
-    instance::metadata::InstanceMetadata,
     runtime::docker::DockerInstanceSpec,
+    server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
 };
 

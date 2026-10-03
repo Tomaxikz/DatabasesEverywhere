@@ -4,10 +4,10 @@ pub(in super::super) async fn start_known_instances(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
-    instance_locks: &crate::instance::locks::InstanceLocks,
+    instance_locks: &crate::server::locks::InstanceLocks,
 ) -> anyhow::Result<()> {
     let instances = manager.store().list().await.into_iter().filter(|metadata| {
-        metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+        metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     });
     let outcomes = futures::stream::iter(instances)
         .map(|snapshot| async move {
@@ -67,7 +67,7 @@ pub(in super::super) async fn sync_cpu_burst_limits(
         .await
         .into_iter()
         .filter(|metadata| {
-            metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+            metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
                 && metadata.status == InstanceStatus::Running
         })
         .collect::<Vec<_>>();
@@ -126,8 +126,8 @@ pub(in super::super) async fn start_known_instance(
     config: &Config,
     manager: &InstanceManager,
     docker: &DockerRuntime,
-    instance_locks: &crate::instance::locks::InstanceLocks,
-    snapshot: crate::instance::metadata::InstanceMetadata,
+    instance_locks: &crate::server::locks::InstanceLocks,
+    snapshot: crate::server::metadata::InstanceMetadata,
 ) -> anyhow::Result<Option<InstanceStatus>> {
     let Some(snapshot_action) = managed_boot_action(snapshot.status, snapshot.desired_state) else {
         return Ok(None);
@@ -211,16 +211,16 @@ pub(in super::super) async fn start_known_instance(
                 "refused to activate an instance whose container data bind does not match the selected disk enforcement"
             );
         }
-        let scanner_required = crate::instance::disk::soft::SoftDiskLimiter::enforcement_required(
+        let scanner_required = crate::server::disk::soft::SoftDiskLimiter::enforcement_required(
             config.disk.mode,
             metadata.protocol,
         ) || (metadata.protocol.engine().fuse_quota_unsupported()
             && metadata.limits.disk_enforcement_method == "fuse_quota");
         if !disk_bind_blocked && scanner_required {
             let soft_limiter =
-                crate::instance::disk::soft::SoftDiskLimiter::new(config.disk.soft_scanner.clone());
+                crate::server::disk::soft::SoftDiskLimiter::new(config.disk.soft_scanner.clone());
             match soft_limiter
-                .ensure_start_allowed(&crate::instance::disk::soft::SoftDiskTarget {
+                .ensure_start_allowed(&crate::server::disk::soft::SoftDiskTarget {
                     instance_id: metadata.instance_id.clone(),
                     created_at: metadata.created_at.clone(),
                     protocol: metadata.protocol,
@@ -285,11 +285,11 @@ pub(in super::super) async fn start_known_instance(
 
     let mut reconciled = reconcile::reconcile_one(metadata, docker).await;
     if disk_bind_blocked {
-        reconciled.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+        reconciled.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
         reconciled.status = InstanceStatus::Failed;
         reconciled.updated_at = now_rfc3339();
     } else if disk_blocked {
-        reconciled.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+        reconciled.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
         reconciled.status = InstanceStatus::Stopped;
         reconciled.updated_at = now_rfc3339();
     } else if boot_failed {
@@ -303,7 +303,7 @@ pub(in super::super) async fn start_known_instance(
 
 pub(super) async fn activate_container_on_boot(
     docker: &DockerRuntime,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     action: ManagedBootAction,
 ) -> bool {
     let activation = match action {

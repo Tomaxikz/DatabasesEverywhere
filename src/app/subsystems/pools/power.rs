@@ -1,12 +1,12 @@
 use crate::{
-    instance::jobs::import_export::ImportExportJobPermit,
-    instance::metadata::DesiredInstanceState,
-    instance::placement::{
-        DeploymentMigration, EngineRuntime, EngineRuntimeStatus, TenantReservationState, lifecycle,
-    },
     routes::http::{
         response::ApiError,
         router::{AppState, MutationPermit},
+    },
+    server::jobs::import_export::ImportExportJobPermit,
+    server::metadata::DesiredInstanceState,
+    server::placement::{
+        DeploymentMigration, EngineRuntime, EngineRuntimeStatus, TenantReservationState, lifecycle,
     },
     subsystems::instances::{self, LifecycleAction},
 };

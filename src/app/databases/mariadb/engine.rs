@@ -3,8 +3,9 @@ use crate::{
         EngineCompatibility, EngineFamily, EngineInfo, JobCostProfile, SQL_JOB_COST,
         SharedPoolProfile,
     },
-    instance::compatibility::{EngineVersion, distrib_version},
-    utils::{backend::MARIADB_SOCKET_DIRECTORY, protocol::Protocol},
+    databases::protocol::Protocol,
+    server::compatibility::{EngineVersion, distrib_version},
+    utils::backend::MARIADB_SOCKET_DIRECTORY,
 };
 
 pub(crate) struct Mariadb;

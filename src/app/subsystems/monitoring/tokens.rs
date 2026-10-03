@@ -116,7 +116,7 @@ async fn pool_targets(
         .server_id
         .clone()
         .ok_or_else(|| ApiError::BadRequest("pool tokens require server_id".into()))?;
-    let owner = crate::instance::placement::PoolOwner {
+    let owner = crate::server::placement::PoolOwner {
         panel_id: state.config.token_id.clone(),
         server_id,
     };

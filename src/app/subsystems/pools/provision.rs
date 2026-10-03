@@ -1,32 +1,33 @@
 use crate::subsystems::instances::docker_error;
 use crate::{
     databases::engine::{LifecycleFlow, PostLaunchStep, SharedSpecInput},
-    instance::disk::DiskLimiter,
-    instance::placement::{
-        DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus,
-        RuntimeReservation, runtime as shared_runtime, tenant,
-    },
-    instance::{
-        metadata::{RuntimeKind, RuntimeMetadata},
-        paths::InstancePaths,
-    },
+    databases::protocol::Protocol,
     routes::http::{
         response::{ApiError, placement_error},
         router::AppState,
     },
     runtime::docker::DockerInstanceSpec,
+    server::disk::DiskLimiter,
+    server::placement::{
+        DeploymentMode, ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus,
+        RuntimeReservation, runtime as shared_runtime, tenant,
+    },
+    server::{
+        metadata::{RuntimeKind, RuntimeMetadata},
+        paths::InstancePaths,
+    },
     subsystems::instances::create::{
         backend_endpoint, launch_container_from_spec, prepare_instance_container_user,
         protocol_pids_limit,
     },
-    utils::{protocol::Protocol, time::now_rfc3339},
+    utils::time::now_rfc3339,
 };
 use secrecy::SecretString;
 use tokio::sync::OwnedMutexGuard;
 
 pub(crate) async fn provision_pool(
     state: &AppState,
-    pool: &crate::instance::placement::PoolSpec,
+    pool: &crate::server::placement::PoolSpec,
     runtime_id: &str,
     creation: &mut Option<OwnedMutexGuard<()>>,
 ) -> Result<(EngineRuntime, OwnedMutexGuard<()>), ApiError> {
@@ -128,7 +129,7 @@ pub(crate) async fn provision_pool(
     let now = now_rfc3339();
     let mut runtime = EngineRuntime {
         pending_image: None,
-        desired_state: crate::instance::metadata::DesiredInstanceState::Running,
+        desired_state: crate::server::metadata::DesiredInstanceState::Running,
         owner: Some(pool.owner.clone()),
         schema_version: ENGINE_RUNTIME_SCHEMA_VERSION,
         runtime_id: runtime_id.clone(),
@@ -405,7 +406,7 @@ mod tests {
     use super::*;
     use crate::utils::limits::InstanceLimits;
     fn initial_runtime() -> EngineRuntime {
-        let mut runtime = crate::instance::placement::test_support::runtime(
+        let mut runtime = crate::server::placement::test_support::runtime(
             "pool_postgres_initial",
             Protocol::Postgres,
             "postgres:18.4",
@@ -438,7 +439,7 @@ mod tests {
         assert!(!same_initial_runtime(&persisted, &expected));
         persisted = expected.clone();
         persisted.limits.disk_mib =
-            crate::instance::placement::policy::pool_disk_mib(Protocol::Postgres, 0).unwrap();
+            crate::server::placement::policy::pool_disk_mib(Protocol::Postgres, 0).unwrap();
         persisted.runtime.container_name.push_str("-different");
         assert!(!same_initial_runtime(&persisted, &expected));
     }

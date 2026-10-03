@@ -17,9 +17,9 @@ impl ManagedBootAction {
 
 pub(in super::super) fn managed_boot_action(
     status: InstanceStatus,
-    desired_state: crate::instance::metadata::DesiredInstanceState,
+    desired_state: crate::server::metadata::DesiredInstanceState,
 ) -> Option<ManagedBootAction> {
-    if desired_state == crate::instance::metadata::DesiredInstanceState::Stopped {
+    if desired_state == crate::server::metadata::DesiredInstanceState::Stopped {
         return None;
     }
     match status {

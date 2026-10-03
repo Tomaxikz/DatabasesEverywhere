@@ -1,7 +1,7 @@
 use crate::{
     databases::engine::{DedicatedSpecInput, EngineLifecycle, RouteIdentity},
+    databases::protocol::Protocol,
     runtime::docker::DockerInstanceSpec,
-    utils::protocol::Protocol,
 };
 
 use super::{

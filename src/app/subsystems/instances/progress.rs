@@ -11,9 +11,10 @@ use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::{
+    databases::protocol::Protocol,
     routes::http::{diagnostics::PublicDiagnostic, response::ApiError},
     runtime::docker::DockerImagePullProgress,
-    utils::{protocol::Protocol, time::now_rfc3339},
+    utils::time::now_rfc3339,
 };
 
 const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;

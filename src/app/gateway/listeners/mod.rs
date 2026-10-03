@@ -629,7 +629,7 @@ mod tests {
         supervisor.begin(1);
         supervisor.mark_ready();
         let resolver = RouteResolver::new(
-            crate::instance::state::InstanceStore::default(),
+            crate::server::state::InstanceStore::default(),
             crate::subsystems::monitoring::resources::ResourceCache::default(),
             crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"test"),
             supervisor.tenant_sessions(),

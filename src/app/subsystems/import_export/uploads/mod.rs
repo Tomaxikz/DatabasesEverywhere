@@ -18,9 +18,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
 
 use crate::{
-    instance::disk::capacity::{CapacityError, DiskCapacityService},
-    instance::paths::InstancePaths,
     routes::http::response::{ApiError, ApiJson, ApiPath, ApiResponse},
+    server::disk::capacity::{CapacityError, DiskCapacityService},
+    server::paths::InstancePaths,
     storage::import_uploads::{
         ImportUpload, ImportUploadAdmission, ImportUploadArchiveFormat, ImportUploadRepository,
         ImportUploadState, NewImportUpload,
@@ -194,7 +194,7 @@ pub(super) struct ImportStagingPermit {
     _reservation: DiskCapacityReservation,
 }
 
-pub(crate) use crate::instance::disk::capacity::DiskCapacityReservation;
+pub(crate) use crate::server::disk::capacity::DiskCapacityReservation;
 
 mod handlers;
 pub(crate) use handlers::*;

@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use super::ImportMode;
 use crate::{
-    instance::metadata::InstanceMetadata,
-    instance::placement::{
+    databases::protocol::Protocol,
+    routes::http::{response::ApiError, router::AppState},
+    server::metadata::InstanceMetadata,
+    server::placement::{
         DeploymentMode, EngineRuntimeStatus,
         tenant::{self, TenantTarget},
     },
-    routes::http::{response::ApiError, router::AppState},
-    utils::protocol::Protocol,
 };
 
 const MIB: u64 = 1024 * 1024;

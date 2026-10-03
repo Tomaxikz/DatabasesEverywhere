@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use secrecy::SecretString;
 
 use crate::{
+    databases::protocol::Protocol,
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    utils::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
+    utils::backend::CONTAINER_SOCKET_DIRECTORY,
 };
 
 pub struct MongodbAuth {

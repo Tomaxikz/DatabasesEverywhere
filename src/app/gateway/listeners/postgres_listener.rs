@@ -11,7 +11,7 @@ use super::{
 use crate::{
     gateway::protocols::postgres,
     gateway::{postgres_sessions, resolver::RouteResolver, tunnel},
-    instance::state::DatabaseRouteResolution,
+    server::state::DatabaseRouteResolution,
 };
 
 const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;

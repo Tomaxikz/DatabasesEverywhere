@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::{instance::test_support::shared_metadata, utils::protocol::Protocol};
+use crate::{databases::protocol::Protocol, server::test_support::shared_metadata};
 
 #[test]
 fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
@@ -14,8 +14,8 @@ fn runtime_identity_errors_identify_each_field_without_reassigning_ownership() {
         "owner",
         "both_owners_missing",
     ] {
-        let mut metadata = crate::instance::test_support::metadata("tenant-a", Protocol::Postgres);
-        let mut runtime = crate::instance::placement::test_support::runtime(
+        let mut metadata = crate::server::test_support::metadata("tenant-a", Protocol::Postgres);
+        let mut runtime = crate::server::placement::test_support::runtime(
             "pool-a",
             Protocol::Postgres,
             "postgres:18.4",

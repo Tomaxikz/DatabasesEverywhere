@@ -30,9 +30,9 @@ pub(super) async fn export_physical_archive(
         .saturating_add(PHYSICAL_ARCHIVE_HEADROOM_BYTES)
         .clamp(
             1,
-            crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+            crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
         );
-    let result = crate::instance::jobs::import_export::create_bounded_archive(
+    let result = crate::server::jobs::import_export::create_bounded_archive(
         paths.data,
         artifact_path,
         max_output_bytes,
@@ -200,7 +200,7 @@ pub(crate) async fn rollback_from_archive(
         paths,
         artifact_path,
         true,
-        crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+        crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: false,
         },
@@ -331,15 +331,15 @@ fn reject_shared_physical(metadata: &InstanceMetadata) -> Result<(), ApiError> {
 fn physical_disk_limiter(
     state: &AppState,
     metadata: &InstanceMetadata,
-) -> crate::instance::disk::DiskLimiter {
-    crate::instance::disk::DiskLimiter::with_fuse_root(
+) -> crate::server::disk::DiskLimiter {
+    crate::server::disk::DiskLimiter::with_fuse_root(
         state.config.disk.clone(),
         state.config.paths.fuse_root(),
     )
     .for_persisted_method(&metadata.limits.disk_enforcement_method)
 }
 
-fn needs_physical_mount_detach(limiter: &crate::instance::disk::DiskLimiter) -> bool {
+fn needs_physical_mount_detach(limiter: &crate::server::disk::DiskLimiter) -> bool {
     limiter.mode() == crate::config::DiskLimitMode::FuseQuota
 }
 
@@ -348,7 +348,7 @@ async fn recover_detached_runtime(
     metadata: &InstanceMetadata,
     paths: &InstancePaths,
     should_be_running: bool,
-    limiter: &crate::instance::disk::DiskLimiter,
+    limiter: &crate::server::disk::DiskLimiter,
 ) -> Result<(), ApiError> {
     if should_be_running {
         return change_instance_state_locked(state, &metadata.instance_id, LifecycleAction::Start)
@@ -546,7 +546,7 @@ async fn validate_replacement(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    crate::instance::disk::DiskLimiter::with_fuse_root(
+    crate::server::disk::DiskLimiter::with_fuse_root(
         state.config.disk.clone(),
         state.config.paths.fuse_root(),
     )
@@ -688,7 +688,7 @@ mod transaction_tests {
     async fn restored_resp_acl_uses_current_credentials_and_preserves_data() {
         for protocol in [Protocol::Redis, Protocol::Valkey] {
             let dir = tempfile::tempdir().unwrap();
-            let mut metadata = crate::instance::test_support::metadata("tenant", protocol);
+            let mut metadata = crate::server::test_support::metadata("tenant", protocol);
             metadata.tenant_password = Some("current-credential".to_string());
             std::fs::write(dir.path().join("users.acl"), b"archived credential").unwrap();
             std::fs::write(dir.path().join("dump.rdb"), b"database contents").unwrap();
@@ -716,7 +716,7 @@ mod transaction_tests {
             (crate::config::DiskLimitMode::ProjectQuota, false),
             (crate::config::DiskLimitMode::SoftScanner, false),
         ] {
-            let limiter = crate::instance::disk::DiskLimiter::new(crate::config::DiskConfig {
+            let limiter = crate::server::disk::DiskLimiter::new(crate::config::DiskConfig {
                 mode,
                 ..crate::config::DiskConfig::default()
             });

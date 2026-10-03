@@ -354,7 +354,7 @@ pub(super) async fn enrich_runtime_info(
     } else {
         classify_live_status(&metadata, inspection.as_ref())
     };
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return enrich_shared_runtime_info(state, metadata).await;
     }
     let configured = state
@@ -404,7 +404,7 @@ async fn enrich_shared_runtime_info(
 ) -> InstanceMetadata {
     match state.placements.get(metadata.runtime_id()).await {
         Ok(Some(runtime))
-            if runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+            if runtime.deployment_mode == crate::server::placement::DeploymentMode::Shared
                 && runtime.protocol == metadata.protocol =>
         {
             metadata.image = Some(InstanceImageStatus {
@@ -515,7 +515,7 @@ pub(super) async fn database_version(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> InstanceDatabaseVersion {
-    match crate::instance::compatibility::cached_compatibility(
+    match crate::server::compatibility::cached_compatibility(
         &state.manager,
         &state.docker,
         metadata,

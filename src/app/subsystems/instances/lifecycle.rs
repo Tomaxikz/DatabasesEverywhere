@@ -21,7 +21,7 @@ pub(crate) async fn change_instance_state(
         .await
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(state, instance_id).await?;
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         let worker_state = state.clone();
         let worker_instance_id = instance_id.to_string();
         let worker = spawn_owned_mutation_task(async move {
@@ -134,7 +134,7 @@ pub(crate) async fn change_instance_state_locked(
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(state, instance_id).await?;
 
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return shared::change_state(state, metadata, action).await;
     }
 

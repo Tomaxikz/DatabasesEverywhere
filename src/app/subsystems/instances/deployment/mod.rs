@@ -3,15 +3,15 @@ use serde::Deserialize;
 
 use crate::{
     auth::scopes,
-    instance::jobs::import_export::JobAdmissionError,
-    instance::metadata::{DesiredInstanceState, InstanceStatus},
-    instance::placement::{
-        DeploymentMigration, DeploymentMigrationError, DeploymentMode, EngineRuntimeStatus,
-    },
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         router::AppState,
+    },
+    server::jobs::import_export::JobAdmissionError,
+    server::metadata::{DesiredInstanceState, InstanceStatus},
+    server::placement::{
+        DeploymentMigration, DeploymentMigrationError, DeploymentMode, EngineRuntimeStatus,
     },
 };
 
@@ -61,7 +61,7 @@ pub async fn start_deployment_migration(
     validate_source(&state, &metadata, request.target_mode).await?;
     let previous_owner = metadata.owner.clone();
     if let Some(server_id) = &request.server_id {
-        let owner = crate::instance::placement::PoolOwner {
+        let owner = crate::server::placement::PoolOwner {
             panel_id: state.config.token_id.clone(),
             server_id: server_id.clone(),
         };
@@ -211,7 +211,7 @@ pub async fn get_deployment_migration(
 
 async fn validate_source(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     target_mode: DeploymentMode,
 ) -> Result<(), ApiError> {
     target_mode
@@ -261,8 +261,8 @@ async fn validate_source(
 }
 
 fn source_runtime_is_live_match(
-    metadata: &crate::instance::metadata::InstanceMetadata,
-    runtime: &crate::instance::placement::EngineRuntime,
+    metadata: &crate::server::metadata::InstanceMetadata,
+    runtime: &crate::server::placement::EngineRuntime,
 ) -> bool {
     let owner_matches = metadata.deployment_mode != DeploymentMode::Shared
         || (metadata.owner.is_some() && runtime.owner == metadata.owner);
@@ -310,7 +310,7 @@ pub(super) async fn ensure_no_active_migration(
     Ok(())
 }
 
-fn migration_blocks_mutation(stage: crate::instance::placement::MigrationStage) -> bool {
+fn migration_blocks_mutation(stage: crate::server::placement::MigrationStage) -> bool {
     !stage.is_terminal()
 }
 
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn unresolved_migrations_keep_lifecycle_mutations_blocked() {
-        use crate::instance::placement::MigrationStage;
+        use crate::server::placement::MigrationStage;
 
         for stage in [
             MigrationStage::RollingBack,

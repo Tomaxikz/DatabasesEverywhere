@@ -14,7 +14,7 @@ use super::{
     open_regular_no_follow, scan_sql_source, sha256_reader,
     sql::{SharedSqlError, SharedSqlIssue, SharedSqlReport, validate_shared_sql_reader},
 };
-use crate::utils::protocol::Protocol;
+use crate::databases::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -1,7 +1,7 @@
 use bollard::models::{ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum};
 
 use super::{DockerError, DockerRuntime};
-use crate::utils::protocol::Protocol;
+use crate::databases::protocol::Protocol;
 
 const AUTOMATIC_STARTUP_ATTEMPT_BUDGET: i64 = 2;
 

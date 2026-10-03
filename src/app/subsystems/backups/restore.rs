@@ -59,10 +59,10 @@ pub(super) async fn restore_backup(
     }
     let extracted_capacity = mib_to_bytes(metadata.limits.disk_mib).clamp(
         1,
-        crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+        crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
     );
     let physical_paths = if stored.layout == BackupLayout::Physical {
-        let paths = crate::instance::paths::InstancePaths::new(&state.config.paths, &instance_id)
+        let paths = crate::server::paths::InstancePaths::new(&state.config.paths, &instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
         crate::subsystems::import_export::check_restore_layout(&state, &metadata, &paths)?;
         Some(paths)

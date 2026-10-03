@@ -46,7 +46,7 @@ impl InstanceAuthorization {
 
     pub(super) async fn metadata(
         &self,
-        instances: &crate::instance::state::InstanceStore,
+        instances: &crate::server::state::InstanceStore,
     ) -> Vec<InstanceMetadata> {
         match self {
             Self::All => instances.list().await,

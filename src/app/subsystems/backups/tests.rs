@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn only_an_intentional_observed_stop_is_an_expected_backup_skip() {
-    let mut metadata = crate::instance::test_support::metadata("tenant", Protocol::Postgres);
+    let mut metadata = crate::server::test_support::metadata("tenant", Protocol::Postgres);
     for status in [
         InstanceStatus::Creating,
         InstanceStatus::Booting,
@@ -26,7 +26,7 @@ fn only_an_intentional_observed_stop_is_an_expected_backup_skip() {
 
 #[test]
 fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure() {
-    let mut metadata = crate::instance::test_support::metadata("tenant", Protocol::Postgres);
+    let mut metadata = crate::server::test_support::metadata("tenant", Protocol::Postgres);
     metadata.status = InstanceStatus::Stopped;
     metadata.desired_state = DesiredInstanceState::Stopped;
     let mut response = RunBackupResponse::default();
@@ -93,7 +93,7 @@ async fn an_empty_backup_pass_has_no_spurious_failures() {
 #[test]
 fn catalog_selection_is_bounded_and_object_scoped() {
     let catalog = BackupCatalog {
-        schema_version: crate::instance::backup::catalog::BACKUP_CATALOG_SCHEMA_VERSION,
+        schema_version: crate::server::backup::catalog::BACKUP_CATALOG_SCHEMA_VERSION,
         backup_id: "one.physical.tar.gz".to_string(),
         instance_id: "inst_one".to_string(),
         protocol: Protocol::Postgres,
@@ -102,7 +102,7 @@ fn catalog_selection_is_bounded_and_object_scoped() {
         consistency: "test".to_string(),
         truncated: false,
         warnings: Vec::new(),
-        objects: vec![crate::instance::backup::catalog::BackupCatalogObject {
+        objects: vec![crate::server::backup::catalog::BackupCatalogObject {
             id: "public.users".to_string(),
             namespace: "public".to_string(),
             name: "users".to_string(),

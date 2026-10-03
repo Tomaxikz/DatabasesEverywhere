@@ -410,7 +410,7 @@ pub(super) async fn enqueue_job(
                 ApiError::ServiceUnavailable("the daemon is shutting down".to_string())
             }
         })?;
-    let now = crate::instance::jobs::import_export::now_rfc3339();
+    let now = crate::server::jobs::import_export::now_rfc3339();
     let job = ImportExportJob {
         job_id: uuid::Uuid::new_v4().to_string(),
         instance_id,

@@ -8,14 +8,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    instance::{
+    databases::protocol::Protocol,
+    runtime::docker::{CommandOutput, DockerError, DockerRuntime, ExecRecovery},
+    server::{
         locks::InstanceLocks,
         manager::InstanceManager,
         metadata::{InstanceMetadata, InstanceStatus},
     },
-    runtime::docker::{CommandOutput, DockerError, DockerRuntime, ExecRecovery},
     utils::constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
-    utils::{protocol::Protocol, shell::sh_quote},
+    utils::shell::sh_quote,
 };
 
 const HARDENING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -406,7 +407,7 @@ pub async fn harden_on_boot(
     let instances = manager.store().list().await;
     let outcomes = futures::stream::iter(instances.into_iter().filter(|metadata| {
         metadata.protocol == Protocol::Postgres
-            && metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+            && metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     }))
     .map(|snapshot| harden_postgres(manager, docker, instance_locks, snapshot))
     .buffer_unordered(MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY)
@@ -430,7 +431,7 @@ async fn harden_postgres(
         return summary;
     }
     let attestation = if metadata.status == InstanceStatus::Running {
-        match crate::instance::auth_hardening::begin_attestation(manager, docker, &metadata).await {
+        match crate::server::auth_hardening::begin_attestation(manager, docker, &metadata).await {
             Ok(check) if check.current => {
                 summary.attestations_reused = 1;
                 return summary;
@@ -614,7 +615,7 @@ async fn harden_postgres(
         );
     }
     if let Some(attestation) = attestation.as_ref()
-        && let Err(error) = crate::instance::auth_hardening::complete_attestation(
+        && let Err(error) = crate::server::auth_hardening::complete_attestation(
             manager,
             docker,
             &metadata,
@@ -869,7 +870,7 @@ if test "$changed" = true; then printf 'hardened\n'; else printf 'already_harden
 mod tests {
     use super::*;
     use crate::{
-        instance::{metadata::DesiredInstanceState, state::InstanceStore, test_support},
+        server::{metadata::DesiredInstanceState, state::InstanceStore, test_support},
         utils::backend::BackendEndpoint,
     };
 
@@ -969,13 +970,13 @@ mod tests {
             store
                 .resolve_postgres("legacy_user", Some("legacy_db"))
                 .await,
-            crate::instance::state::DatabaseRouteResolution::NotFound
+            crate::server::state::DatabaseRouteResolution::NotFound
         ));
         assert!(matches!(
             store
                 .resolve_postgres("healthy_user", Some("healthy_db"))
                 .await,
-            crate::instance::state::DatabaseRouteResolution::Found { .. }
+            crate::server::state::DatabaseRouteResolution::Found { .. }
         ));
     }
 

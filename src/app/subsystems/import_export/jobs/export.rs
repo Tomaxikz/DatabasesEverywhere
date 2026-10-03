@@ -9,7 +9,7 @@ pub(super) async fn estimate_export_cost(
     options: &ExportOptions,
 ) -> JobResourceCost {
     let allocated_bytes = mib_to_bytes(metadata.limits.disk_mib)
-        .min(crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+        .min(crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
     let measured_bytes = if metadata.deployment_mode == DeploymentMode::Shared {
         measure_shared_database_bytes(state, metadata).await.ok()
     } else {
@@ -17,7 +17,7 @@ pub(super) async fn estimate_export_cost(
     };
     let input_size_bytes = measured_bytes.unwrap_or(allocated_bytes).clamp(
         1,
-        crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+        crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
     );
     JobResourceCost::estimate(JobEstimateInput {
         protocol: metadata.protocol,
@@ -138,17 +138,17 @@ pub(crate) async fn measure_shared_database_bytes(
     if runtime.deployment_mode != DeploymentMode::Shared
         || runtime.runtime_id != metadata.runtime_id()
         || runtime.protocol != metadata.protocol
-        || runtime.status != crate::instance::placement::EngineRuntimeStatus::Running
+        || runtime.status != crate::server::placement::EngineRuntimeStatus::Running
     {
         return Err(ApiError::ServiceUnavailable(
             "shared tenant size runtime is not an eligible running pool".to_string(),
         ));
     }
-    let target = crate::instance::placement::tenant::TenantTarget {
+    let target = crate::server::placement::tenant::TenantTarget {
         database: &metadata.database.name,
         username: &metadata.database.username,
     };
-    crate::instance::placement::tenant::measure_storage(&state.docker, &runtime, &[target])
+    crate::server::placement::tenant::measure_storage(&state.docker, &runtime, &[target])
         .await
         .map_err(|error| {
             ApiError::ServiceUnavailable(format!(
@@ -186,7 +186,7 @@ pub(super) async fn reserve_export_capacity(
             .saturating_add(PHYSICAL_EXPORT_HEADROOM_BYTES)
             .clamp(
                 1,
-                crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+                crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
             ),
         Some(logical_output_capacity) => {
             export_artifact_capacity_bytes(logical_output_capacity, options.archive_format)

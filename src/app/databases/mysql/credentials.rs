@@ -5,7 +5,7 @@ use crate::{
         TenantAuthHardening,
     },
     gateway::protocols::mariadb::native_password_sha1_stage2_hex,
-    instance::metadata::InstanceMetadata,
+    server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
 };
 

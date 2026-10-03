@@ -65,7 +65,7 @@ pub(super) fn mib_to_bytes(memory_mib: u64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::protocol::Protocol;
+    use crate::databases::protocol::Protocol;
 
     #[test]
     fn mariadb_readiness_uses_the_stable_internal_admin() {

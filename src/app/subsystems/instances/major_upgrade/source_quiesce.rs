@@ -34,7 +34,7 @@ async fn verify_upgrade_source(
         .await
         .map_err(docker_error)?;
     harden_upgrade_credentials(state, metadata, password, "before major-upgrade export").await?;
-    let compatibility = crate::instance::compatibility::probe_instance_compatibility(
+    let compatibility = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,

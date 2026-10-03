@@ -3,11 +3,11 @@ use super::super::{
     logical_exec_recovery, protocol::wipe_logical_target,
 };
 use crate::{
-    instance::placement::DeploymentMode,
-    instance::{credentials::logical_import_env, metadata::InstanceMetadata},
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
+    server::placement::DeploymentMode,
+    server::{credentials::logical_import_env, metadata::InstanceMetadata},
     subsystems::import_export::remote::ImportMode,
-    utils::protocol::Protocol,
 };
 use std::{
     path::{Path as FsPath, PathBuf},

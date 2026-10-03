@@ -1,10 +1,10 @@
 use crate::{
     databases::engine::EngineInspection,
-    instance::backup::catalog::{
+    server::backup::catalog::{
         BackupCatalogObject, ParsedColumn, decode_hex, parse_relational_schema,
     },
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
     utils::shell::sh_quote,
 };
 

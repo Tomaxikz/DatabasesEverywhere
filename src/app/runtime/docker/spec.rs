@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use secrecy::SecretString;
 
-use crate::{runtime::socket_bridge::SocketBridge, utils::protocol::Protocol};
+use crate::{databases::protocol::Protocol, runtime::socket_bridge::SocketBridge};
 
 #[derive(Debug, Clone)]
 pub struct DockerInstanceSpec {

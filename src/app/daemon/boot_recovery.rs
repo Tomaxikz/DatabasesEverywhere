@@ -24,10 +24,10 @@ pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result
 
 async fn contain_runtime_without_restart_policy(
     state: &AppState,
-    runtime: &crate::instance::placement::EngineRuntime,
+    runtime: &crate::server::placement::EngineRuntime,
 ) {
-    if runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
-        crate::instance::placement::containment::contain_locked(
+    if runtime.deployment_mode == crate::server::placement::DeploymentMode::Shared {
+        crate::server::placement::containment::contain_locked(
             state,
             runtime,
             "engine restart policy could not be repaired",
@@ -37,14 +37,14 @@ async fn contain_runtime_without_restart_policy(
         return;
     }
     if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
-        crate::instance::sessions::fence(
+        crate::server::sessions::fence(
             &state.instances,
             &state.gateway_supervisor.tenant_sessions(),
             &metadata.instance_id,
         )
         .await;
         metadata.status = InstanceStatus::Failed;
-        metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+        metadata.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
         if let Err(error) = state.manager.upsert_fenced(metadata).await {
             tracing::error!(runtime_id = %runtime.runtime_id, %error,
                 "could not persist stopped intent after restart-policy repair failed");
@@ -78,7 +78,7 @@ async fn cleanup_old_console_logs(state: &AppState) {
         let Ok(Some(current)) = state.placements.get(&runtime.runtime_id).await else {
             continue;
         };
-        if current.status != crate::instance::placement::EngineRuntimeStatus::Running {
+        if current.status != crate::server::placement::EngineRuntimeStatus::Running {
             continue;
         }
         let log_policy_is_current = matches!(
@@ -146,7 +146,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
         return;
     }
 
-    let compatibility = crate::instance::compatibility::sync_compatibility(&state).await;
+    let compatibility = crate::server::compatibility::sync_compatibility(&state).await;
     let shared_compatibility = sync_shared_compatibility(&state).await;
     cleanup_old_console_logs(&state).await;
     if compatibility.failed == 0 && shared_compatibility.failed == 0 {
@@ -413,8 +413,8 @@ pub(super) async fn quarantine_interrupted_jobs(
             continue;
         };
         metadata.status = InstanceStatus::Quarantined;
-        metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
-        metadata.updated_at = crate::instance::jobs::import_export::now_rfc3339();
+        metadata.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
+        metadata.updated_at = crate::server::jobs::import_export::now_rfc3339();
         manager
             .quarantine(
                 metadata.clone(),
@@ -503,7 +503,7 @@ pub(super) async fn quarantine_restore_workspaces(
             continue;
         };
         let already_safe = instance.status == InstanceStatus::Quarantined
-            && instance.desired_state == crate::instance::metadata::DesiredInstanceState::Stopped;
+            && instance.desired_state == crate::server::metadata::DesiredInstanceState::Stopped;
         if already_safe {
             // Preserve older causes, but also record this currently observed
             // rollback blocker even if the target was already quarantined.
@@ -516,8 +516,8 @@ pub(super) async fn quarantine_restore_workspaces(
             continue;
         }
         instance.status = InstanceStatus::Quarantined;
-        instance.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
-        instance.updated_at = crate::instance::jobs::import_export::now_rfc3339();
+        instance.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
+        instance.updated_at = crate::server::jobs::import_export::now_rfc3339();
         manager
             .quarantine(
                 instance,
@@ -621,8 +621,8 @@ pub(super) async fn quarantine_import_manifests(
         }
         if instance.status != InstanceStatus::Quarantined {
             instance.status = InstanceStatus::Quarantined;
-            instance.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
-            instance.updated_at = crate::instance::jobs::import_export::now_rfc3339();
+            instance.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
+            instance.updated_at = crate::server::jobs::import_export::now_rfc3339();
             manager
                 .quarantine(
                     instance,

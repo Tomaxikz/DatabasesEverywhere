@@ -13,13 +13,13 @@ use super::{
     files::{cleanup_path, prepare_private_dir},
 };
 use crate::{
-    instance::metadata::InstanceMetadata,
-    instance::placement::{DeploymentMode, EngineRuntimeStatus},
+    databases::protocol::Protocol,
     runtime::docker::{
         DockerEnv, IMPORT_HELPER_INPUT_PATH, ImportHelperInput, ImportHelperNetwork,
         RemoteImportHelperSpec,
     },
-    utils::protocol::Protocol,
+    server::metadata::InstanceMetadata,
+    server::placement::{DeploymentMode, EngineRuntimeStatus},
 };
 
 const SHARED_HELPER_WORK_MARGIN_BYTES: u64 = 1024 * 1024;
@@ -131,14 +131,14 @@ pub(super) async fn wipe_clickhouse(
 
 fn wipe_target_matches(
     metadata: &InstanceMetadata,
-    runtime: &crate::instance::placement::EngineRuntime,
-    reservation: Option<&crate::instance::placement::TenantReservation>,
+    runtime: &crate::server::placement::EngineRuntime,
+    reservation: Option<&crate::server::placement::TenantReservation>,
 ) -> bool {
     metadata.deployment_mode == DeploymentMode::Shared
         && !matches!(
             metadata.status,
-            crate::instance::metadata::InstanceStatus::Deleting
-                | crate::instance::metadata::InstanceStatus::Quarantined
+            crate::server::metadata::InstanceStatus::Deleting
+                | crate::server::metadata::InstanceStatus::Quarantined
         )
         && metadata.protocol.engine().shared_wipe_uses_admin_runtime()
         && runtime.deployment_mode == DeploymentMode::Shared
@@ -151,7 +151,7 @@ fn wipe_target_matches(
             .iter()
             .any(|name| metadata.database.name.eq_ignore_ascii_case(name))
         && reservation.is_some_and(|reservation| {
-            reservation.state == crate::instance::placement::TenantReservationState::Provisioned
+            reservation.state == crate::server::placement::TenantReservationState::Provisioned
                 && reservation.instance_id == metadata.instance_id
                 && reservation.runtime_id == runtime.runtime_id
                 && reservation.database == metadata.database.name
@@ -273,21 +273,21 @@ pub(super) async fn run(state: &AppState, request: RestoreRequest<'_>) -> Result
 async fn contain_helper(
     state: &AppState,
     metadata: &InstanceMetadata,
-    runtime: &crate::instance::placement::EngineRuntime,
+    runtime: &crate::server::placement::EngineRuntime,
 ) -> String {
     crate::subsystems::instances::route_fence::fence(state, &metadata.instance_id).await;
-    let target = crate::instance::placement::tenant::TenantTarget {
+    let target = crate::server::placement::tenant::TenantTarget {
         database: &metadata.database.name,
         username: &metadata.database.username,
     };
-    let fence_error =
-        match crate::instance::placement::tenant::fence(&state.docker, runtime, target).await {
-            Ok(()) => {
-                return "tenant sessions terminated and login fenced; rollback was blocked"
-                    .to_string();
-            }
-            Err(error) => error,
-        };
+    let fence_error = match crate::server::placement::tenant::fence(&state.docker, runtime, target)
+        .await
+    {
+        Ok(()) => {
+            return "tenant sessions terminated and login fenced; rollback was blocked".to_string();
+        }
+        Err(error) => error,
+    };
 
     // The import job retains the runtime operation lock. If a tenant-local
     // database fence cannot be confirmed, contain the complete pool through
@@ -553,8 +553,8 @@ mod tests {
     }
     #[test]
     fn privileged_wipe_requires_exact_tenant_reservation_and_pool_ownership() {
-        use crate::instance::placement::{TenantReservation, TenantReservationState, test_support};
-        let mut metadata = crate::instance::test_support::shared_metadata();
+        use crate::server::placement::{TenantReservation, TenantReservationState, test_support};
+        let mut metadata = crate::server::test_support::shared_metadata();
         metadata.protocol = Protocol::Clickhouse;
         let runtime = test_support::runtime(
             metadata.runtime_id(),

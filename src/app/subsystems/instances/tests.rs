@@ -4,7 +4,7 @@ use super::*;
 async fn cancelled_resize_waiter_does_not_leave_queued_work() {
     use crate::{
         auth::api_token::ApiToken,
-        instance::{manager::InstanceManager, state::InstanceStore},
+        server::{manager::InstanceManager, state::InstanceStore},
         storage::repositories::InstanceRepository,
     };
     use axum::extract::FromRequestParts;
@@ -101,7 +101,7 @@ async fn runtime_cache_invalidation_rejects_a_late_stale_publication() {
     let cache = InstanceRuntimeInfoCache::default();
     let stale_epoch = cache.epoch().await;
     cache.remove("inst_cache_race").await;
-    let image = crate::instance::metadata::InstanceImageStatus {
+    let image = crate::server::metadata::InstanceImageStatus {
         current: Some("postgres:16".to_string()),
         configured: "postgres:17".to_string(),
         update_available: true,
@@ -168,8 +168,7 @@ fn live_runtime_cannot_publish_a_durable_pre_ready_or_failed_state() {
 }
 
 fn sample_lifecycle_metadata() -> InstanceMetadata {
-    let mut metadata =
-        crate::instance::test_support::metadata("inst_lifecycle", Protocol::Postgres);
+    let mut metadata = crate::server::test_support::metadata("inst_lifecycle", Protocol::Postgres);
     metadata.backend = crate::utils::backend::BackendEndpoint::UnixSocket {
         socket_path: "/run/dbev/inst_lifecycle/.s.PGSQL.5432".to_string(),
     };
@@ -184,7 +183,7 @@ fn shared_pool_logs_are_never_available_through_any_api_transport() {
     let mut metadata = sample_lifecycle_metadata();
     assert!(check_logs_available(&metadata).is_ok());
 
-    metadata.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    metadata.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     metadata.runtime_id = "pool_postgres_test".to_string();
     let error = check_logs_available(&metadata).unwrap_err().to_string();
 

@@ -4,7 +4,7 @@ pub fn start_resource_sampler(state: AppState) {
     sampler::start(state.clone());
     shared_disk::start(state.clone());
     activity::start(state.clone());
-    crate::instance::monitoring::start_engine_activity_sampler(state.clone());
+    crate::server::monitoring::start_engine_activity_sampler(state.clone());
     start_disk_usage_sampler(state);
 }
 

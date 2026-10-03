@@ -7,10 +7,11 @@ use super::{
     listener_io::{MysqlTunnel, proxy_mysql_session},
 };
 use crate::{
+    databases::protocol::Protocol,
     gateway::protocols::mariadb,
     gateway::{resolver::RouteResolver, tunnel},
-    instance::state::DatabaseRouteResolution,
-    utils::{backend::BackendEndpoint, protocol::Protocol},
+    server::state::DatabaseRouteResolution,
+    utils::backend::BackendEndpoint,
 };
 
 pub(super) async fn handle_mariadb_client(

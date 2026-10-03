@@ -32,7 +32,7 @@ fn generic_disk_sampler_excludes_shared_pool_roots() {
     let limits = InstanceLimits::default();
     let dedicated = metadata_with_limits("dedicated", InstanceStatus::Running, limits.clone());
     let mut shared = metadata_with_limits("tenant", InstanceStatus::Running, limits.clone());
-    shared.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    shared.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     shared.runtime_id = "pool-a".to_string();
     let stopped = metadata_with_limits("stopped", InstanceStatus::Stopped, limits);
 
@@ -262,8 +262,8 @@ async fn scanner_snapshot_bypasses_the_fallback_disk_traversal() {
         atomic::{AtomicBool, Ordering},
     };
 
-    let snapshot = crate::instance::disk::soft::SoftDiskSnapshot {
-        usage: crate::instance::disk::usage::DirectoryUsage {
+    let snapshot = crate::server::disk::soft::SoftDiskSnapshot {
+        usage: crate::server::disk::usage::DirectoryUsage {
             logical_bytes: 321,
             physical_bytes: 654,
             entries: 1,
@@ -370,14 +370,14 @@ fn allocations_include_running_and_stopped_instances() {
     );
 
     let runtimes = [
-        crate::instance::placement::EngineRuntime::legacy_dedicated(
+        crate::server::placement::EngineRuntime::legacy_dedicated(
             &running,
-            crate::instance::placement::EngineRuntimeStatus::Running,
+            crate::server::placement::EngineRuntimeStatus::Running,
             "mysql:8.4".to_string(),
         ),
-        crate::instance::placement::EngineRuntime::legacy_dedicated(
+        crate::server::placement::EngineRuntime::legacy_dedicated(
             &stopped,
-            crate::instance::placement::EngineRuntimeStatus::Stopped,
+            crate::server::placement::EngineRuntimeStatus::Stopped,
             "mysql:8.4".to_string(),
         ),
     ];
@@ -412,11 +412,11 @@ fn allocations_include_an_unrouted_migration_target() {
 #[test]
 fn managed_usage_is_null_when_a_running_instance_lacks_a_sample() {
     let reports = vec![(
-        crate::instance::placement::DeploymentMode::Dedicated,
+        crate::server::placement::DeploymentMode::Dedicated,
         Ok(ResourceReport {
             instance_id: "inst_running".to_string(),
             runtime_id: "inst_running".to_string(),
-            deployment_mode: crate::instance::placement::DeploymentMode::Dedicated,
+            deployment_mode: crate::server::placement::DeploymentMode::Dedicated,
             scope: ResourceScope::DedicatedInstance,
             protocol: "mysql".to_string(),
             status: "running".to_string(),
@@ -468,14 +468,14 @@ fn shared_tenants_use_one_runtime_sample_target() {
         InstanceStatus::Running,
         InstanceLimits::default(),
     );
-    first.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    first.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     first.runtime_id = "mysql_pool_one".to_string();
     let mut second = metadata_with_limits(
         "tenant_two",
         InstanceStatus::Running,
         InstanceLimits::default(),
     );
-    second.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    second.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     second.runtime_id = "mysql_pool_one".to_string();
 
     let targets = sampler::runtime_targets(&[first, second], &[]);
@@ -516,7 +516,7 @@ fn running_shared_pool_is_sampled_when_all_tenants_are_stopped() {
         InstanceStatus::Stopped,
         InstanceLimits::default(),
     );
-    tenant.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    tenant.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     tenant.runtime_id = "mysql_pool_idle".to_string();
     let runtime = shared_runtime("mysql_pool_idle", Protocol::Mysql);
 
@@ -530,12 +530,9 @@ fn running_shared_pool_is_sampled_when_all_tenants_are_stopped() {
     );
 }
 
-fn shared_runtime(
-    runtime_id: &str,
-    protocol: Protocol,
-) -> crate::instance::placement::EngineRuntime {
+fn shared_runtime(runtime_id: &str, protocol: Protocol) -> crate::server::placement::EngineRuntime {
     let mut runtime =
-        crate::instance::placement::test_support::runtime(runtime_id, protocol, "test:latest");
+        crate::server::placement::test_support::runtime(runtime_id, protocol, "test:latest");
     runtime.backend = BackendEndpoint::UnixSocket {
         socket_path: format!("/run/{runtime_id}.sock"),
     };
@@ -553,7 +550,7 @@ fn admin_shared_reports_separate_tenant_and_pool_usage() {
     };
 
     let usage = runtime_report_usage(
-        crate::instance::placement::DeploymentMode::Shared,
+        crate::server::placement::DeploymentMode::Shared,
         "mysql_pool_one",
         512,
         Some(&stats),
@@ -585,7 +582,7 @@ fn dedicated_reports_keep_the_existing_runtime_usage_fields() {
     };
 
     let usage = runtime_report_usage(
-        crate::instance::placement::DeploymentMode::Dedicated,
+        crate::server::placement::DeploymentMode::Dedicated,
         "dedicated_one",
         512,
         Some(&stats),
@@ -603,7 +600,7 @@ fn dedicated_reports_keep_the_existing_runtime_usage_fields() {
 #[test]
 fn shared_report_missing_pool_capacity_returns_an_error() {
     let error = runtime_report_usage(
-        crate::instance::placement::DeploymentMode::Shared,
+        crate::server::placement::DeploymentMode::Shared,
         "missing_pool",
         512,
         None,
@@ -629,7 +626,7 @@ fn tenant_shared_reports_omit_physical_pool_usage() {
     };
 
     let usage = runtime_report_usage(
-        crate::instance::placement::DeploymentMode::Shared,
+        crate::server::placement::DeploymentMode::Shared,
         "mysql_pool_one",
         512,
         Some(&stats),
@@ -650,7 +647,7 @@ fn managed_usage_counts_one_shared_runtime_once() {
         .into_iter()
         .map(|instance_id| {
             (
-                crate::instance::placement::DeploymentMode::Shared,
+                crate::server::placement::DeploymentMode::Shared,
                 Ok(shared_resource_report(
                     instance_id,
                     "mysql_pool_one",
@@ -691,7 +688,7 @@ fn shared_resource_report(
     ResourceReport {
         instance_id: instance_id.to_string(),
         runtime_id: runtime_id.to_string(),
-        deployment_mode: crate::instance::placement::DeploymentMode::Shared,
+        deployment_mode: crate::server::placement::DeploymentMode::Shared,
         scope: ResourceScope::SharedTenant,
         protocol: "mysql".to_string(),
         status: "running".to_string(),
@@ -740,7 +737,7 @@ fn metadata_with_limits(
     status: InstanceStatus,
     limits: InstanceLimits,
 ) -> InstanceMetadata {
-    let mut metadata = crate::instance::test_support::metadata(instance_id, Protocol::Mysql);
+    let mut metadata = crate::server::test_support::metadata(instance_id, Protocol::Mysql);
     metadata.status = status;
     metadata.limits = limits;
     metadata.public.host = "127.0.0.1".to_string();

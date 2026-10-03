@@ -4,11 +4,12 @@ use tokio::time::MissedTickBehavior;
 
 use super::{NetworkCounter, ResourceCache};
 use crate::{
-    instance::monitoring::{ActivityBucket, ActivityCounter, ActivityCurrent},
+    databases::protocol::Protocol,
     routes::http::router::AppState,
+    server::monitoring::{ActivityBucket, ActivityCounter, ActivityCurrent},
     storage::activity::{ActivityRepository, ActivityStorageError},
     subsystems::monitoring::activity::gateway_ops_available,
-    utils::{protocol::Protocol, time::now_unix},
+    utils::time::now_unix,
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);

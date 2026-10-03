@@ -2,8 +2,9 @@ use crate::{
     databases::engine::{
         EngineCompatibility, EngineFamily, EngineInfo, JobCostProfile, PHYSICAL_JOB_COST,
     },
-    instance::compatibility::{EngineVersion, ProtocolCapabilities},
-    utils::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
+    databases::protocol::Protocol,
+    server::compatibility::{EngineVersion, ProtocolCapabilities},
+    utils::backend::CONTAINER_SOCKET_DIRECTORY,
 };
 
 pub(crate) struct Redis;

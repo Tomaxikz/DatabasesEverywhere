@@ -151,7 +151,7 @@ async fn expensive_upload_work_has_separate_small_global_limits() {
 
 #[tokio::test]
 async fn cancelled_inspection_waiter_does_not_release_worker_guards() {
-    let locks = crate::instance::locks::InstanceLocks::default();
+    let locks = crate::server::locks::InstanceLocks::default();
     let instance_operation = locks.lock("inst_inspection").await;
     let admission = Arc::new(Semaphore::new(1));
     let inspection_permit = admission.clone().try_acquire_owned().unwrap();
@@ -253,7 +253,7 @@ async fn cancelled_upload_waiter_keeps_guards_until_worker_commits() {
     let (repository, upload, directory, partial_path, final_path) = upload_worker_fixture().await;
     let admission = Arc::new(Semaphore::new(1));
     let admission_permit = admission.clone().try_acquire_owned().unwrap();
-    let locks = crate::instance::locks::InstanceLocks::default();
+    let locks = crate::server::locks::InstanceLocks::default();
     let instance_operation = locks.lock("inst").await;
     let disk_capacity = DiskCapacityService::default();
     let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
@@ -339,7 +339,7 @@ async fn panicking_upload_worker_durably_cleans_files_and_row() {
     let (repository, upload, directory, partial_path, final_path) = upload_worker_fixture().await;
     std::fs::write(&final_path, b"orphan").unwrap();
     let admission = Arc::new(Semaphore::new(1));
-    let locks = crate::instance::locks::InstanceLocks::default();
+    let locks = crate::server::locks::InstanceLocks::default();
     let disk_capacity = DiskCapacityService::default();
     let disk_reservation = disk_capacity.reserve(directory.path(), 3).await.unwrap();
     let guards = Arc::new(UploadWorkerGuards::new(
@@ -539,8 +539,8 @@ fn upload_summaries_never_decode_or_serialize_the_catalog() {
 async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrapper() {
     use crate::{
         auth::api_token::ApiToken,
-        instance::{manager::InstanceManager, state::InstanceStore},
         routes::http::router::build_router,
+        server::{manager::InstanceManager, state::InstanceStore},
         storage::repositories::InstanceRepository,
     };
     use axum::{
@@ -555,7 +555,7 @@ async fn catalog_routes_are_scoped_and_return_the_catalog_without_an_upload_wrap
         .unwrap();
     let instances = InstanceStore::default();
     for id in ["owner", "other"] {
-        let mut metadata = crate::instance::test_support::metadata(id, Protocol::Mysql);
+        let mut metadata = crate::server::test_support::metadata(id, Protocol::Mysql);
         metadata.database.username = format!("user_{id}");
         InstanceRepository::new(db.clone())
             .upsert(&metadata)

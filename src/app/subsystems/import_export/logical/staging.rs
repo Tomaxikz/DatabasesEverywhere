@@ -1,8 +1,8 @@
 use super::{super::MAX_UNARCHIVED_BYTES, prepared_support::staging_reservation_bytes};
 use crate::{
-    instance::metadata::InstanceMetadata,
+    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
-    utils::protocol::Protocol,
+    server::metadata::InstanceMetadata,
 };
 use std::path::Path as FsPath;
 
@@ -121,8 +121,7 @@ pub(in crate::subsystems::import_export) fn physical_staging_bytes(
     let instance_disk_bytes = disk_mib
         .checked_mul(BYTES_PER_MIB)
         .ok_or_else(|| ApiError::Runtime("instance disk limit overflowed".to_string()))?;
-    let bytes =
-        instance_disk_bytes.min(crate::instance::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
+    let bytes = instance_disk_bytes.min(crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES);
     if bytes == 0 {
         return Err(ApiError::Conflict(
             "physical upload import requires a nonzero extraction budget".to_string(),

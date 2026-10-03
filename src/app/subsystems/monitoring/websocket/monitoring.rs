@@ -207,7 +207,7 @@ pub(super) async fn monitoring_instance(
         },
         Err(_error) => {
             let shared =
-                metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared;
+                metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared;
             MonitoringInstance {
                 runtime_id: metadata.runtime_id().to_string(),
                 deployment_mode: metadata.deployment_mode,
@@ -378,7 +378,7 @@ pub(super) struct MonitoringInstance {
     #[serde(skip)]
     pub(super) instance_generation: String,
     pub(super) runtime_id: String,
-    pub(super) deployment_mode: crate::instance::placement::DeploymentMode,
+    pub(super) deployment_mode: crate::server::placement::DeploymentMode,
     pub(super) resource_scope: ResourceScope,
     pub(super) protocol: String,
     pub(super) status: String,

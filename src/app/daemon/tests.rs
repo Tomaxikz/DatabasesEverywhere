@@ -6,8 +6,8 @@ use std::{
 use super::*;
 use crate::{
     config::DaemonConfig,
-    instance::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
-    instance::{metadata::InstanceMetadata, test_support},
+    server::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
+    server::{metadata::InstanceMetadata, test_support},
     utils::backend::BackendEndpoint,
 };
 
@@ -145,7 +145,7 @@ async fn retained_physical_restore_workspace_quarantines_target() {
     assert_eq!(metadata.status, InstanceStatus::Quarantined);
     assert_eq!(
         metadata.desired_state,
-        crate::instance::metadata::DesiredInstanceState::Stopped
+        crate::server::metadata::DesiredInstanceState::Stopped
     );
 }
 
@@ -195,18 +195,18 @@ fn recovery_test_metadata() -> InstanceMetadata {
 async fn desired_stopped_instances_are_never_published_to_gateways() {
     let store = InstanceStore::default();
     let mut metadata = recovery_test_metadata();
-    metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+    metadata.desired_state = crate::server::metadata::DesiredInstanceState::Stopped;
     store.upsert(metadata.clone()).await;
     assert!(matches!(
         store.resolve_postgres("app", Some("app_db")).await,
-        crate::instance::state::DatabaseRouteResolution::NotFound
+        crate::server::state::DatabaseRouteResolution::NotFound
     ));
 
-    metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Running;
+    metadata.desired_state = crate::server::metadata::DesiredInstanceState::Running;
     store.upsert(metadata).await;
     assert!(matches!(
         store.resolve_postgres("app", Some("app_db")).await,
-        crate::instance::state::DatabaseRouteResolution::Found { .. }
+        crate::server::state::DatabaseRouteResolution::Found { .. }
     ));
 }
 
@@ -257,7 +257,7 @@ fn retained_valkey_recovery_manifests_are_protocol_bound() {
 
 #[test]
 fn daemon_boot_preserves_running_containers() {
-    use crate::instance::metadata::DesiredInstanceState;
+    use crate::server::metadata::DesiredInstanceState;
 
     assert_eq!(
         managed_boot_action(InstanceStatus::Running, DesiredInstanceState::Running),
@@ -295,8 +295,8 @@ fn daemon_boot_preserves_running_containers() {
 
 #[tokio::test]
 async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
-    use crate::instance::metadata::DesiredInstanceState;
-    use crate::instance::placement::{EngineRuntimeStatus, test_support as pools};
+    use crate::server::metadata::DesiredInstanceState;
+    use crate::server::placement::{EngineRuntimeStatus, test_support as pools};
 
     let (state, dir) = crate::subsystems::test_support::database(Config::default()).await;
     let mut metadata = test_support::metadata("blocked_boot", Protocol::Postgres);
@@ -344,7 +344,7 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
             .instances
             .resolve_postgres(&metadata.database.username, Some(&metadata.database.name))
             .await,
-        crate::instance::state::DatabaseRouteResolution::NotFound
+        crate::server::state::DatabaseRouteResolution::NotFound
     ));
 
     metadata.status = InstanceStatus::Stopped;
@@ -392,7 +392,7 @@ fn stale_qdrant_fuse_mount_does_not_trigger_container_recreation() {
 
 #[test]
 fn qdrant_fuse_migration_follows_durable_power_intent() {
-    use crate::instance::metadata::DesiredInstanceState;
+    use crate::server::metadata::DesiredInstanceState;
 
     assert_eq!(
         qdrant_migration_actions(
@@ -441,13 +441,13 @@ fn retained_qdrant_fuse_uses_truthful_mode_even_when_soft_is_selected() {
 #[test]
 fn disk_mode_transition_failure_is_durably_stopped() {
     let mut metadata = recovery_test_metadata();
-    metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Running;
+    metadata.desired_state = crate::server::metadata::DesiredInstanceState::Running;
 
     isolate_disk_failure(&mut metadata, false);
 
     assert_eq!(
         metadata.desired_state,
-        crate::instance::metadata::DesiredInstanceState::Stopped
+        crate::server::metadata::DesiredInstanceState::Stopped
     );
     assert_eq!(metadata.status, InstanceStatus::Failed);
 }
@@ -462,7 +462,7 @@ fn disk_reconciliation_never_downgrades_an_existing_quarantine() {
     assert_eq!(metadata.status, InstanceStatus::Quarantined);
     assert_eq!(
         metadata.desired_state,
-        crate::instance::metadata::DesiredInstanceState::Stopped
+        crate::server::metadata::DesiredInstanceState::Stopped
     );
 }
 
@@ -495,7 +495,7 @@ fn queued_soft_disk_decision_is_stale_after_a_limit_increase() {
     metadata.protocol = Protocol::Qdrant;
     metadata.limits.disk_mib = 100;
     metadata.limits.disk_enforcement_method = "soft_scanner".to_string();
-    let target = crate::instance::disk::soft::SoftDiskTarget {
+    let target = crate::server::disk::soft::SoftDiskTarget {
         instance_id: metadata.instance_id.clone(),
         created_at: metadata.created_at.clone(),
         protocol: metadata.protocol,

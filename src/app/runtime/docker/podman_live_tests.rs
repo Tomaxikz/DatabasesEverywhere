@@ -7,7 +7,7 @@ use secrecy::SecretString;
 use super::{
     DockerContainerStatus, DockerEnv, DockerInstanceSpec, DockerRuntime, ManagedContainerAction,
 };
-use crate::{config::DaemonEngine, utils::protocol::Protocol};
+use crate::{config::DaemonEngine, databases::protocol::Protocol};
 
 const DEFAULT_SMOKE_IMAGE: &str = "docker.io/library/alpine:3.21";
 

@@ -1,7 +1,7 @@
 use sqlx::Row;
 
 use super::{InstanceRepository, RepositoryError};
-use crate::instance::metadata::InstanceMetadata;
+use crate::server::metadata::InstanceMetadata;
 
 impl InstanceRepository {
     pub(crate) async fn hardening_is_current(

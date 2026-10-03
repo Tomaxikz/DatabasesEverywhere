@@ -240,7 +240,7 @@ pub(super) async fn reconcile_container_event(
         .get(&event.instance_id)
         .await?
         .is_some_and(|runtime| {
-            runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+            runtime.deployment_mode == crate::server::placement::DeploymentMode::Shared
         })
     {
         return reconcile_shared_event(state, event).await;
@@ -251,7 +251,7 @@ pub(super) async fn reconcile_container_event(
 
 pub(super) async fn reconcile_snapshot(state: &AppState) {
     let instances = state.instances.list().await.into_iter().filter(|metadata| {
-        metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+        metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     });
     let outcomes = futures::stream::iter(instances)
         .map(|metadata| async move {
@@ -283,7 +283,7 @@ pub(super) async fn reconcile_container_state(
     let Some(metadata) = state.instances.get(instance_id).await else {
         return Ok(());
     };
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         tracing::error!(
             event = "audit shared_tenant_container_reconcile_blocked",
             instance_id,
@@ -321,7 +321,7 @@ pub(super) async fn reconcile_container_state(
         return Ok(());
     }
 
-    if metadata.desired_state == crate::instance::metadata::DesiredInstanceState::Stopped {
+    if metadata.desired_state == crate::server::metadata::DesiredInstanceState::Stopped {
         return enforce_stopped_state(state, metadata, event).await;
     }
 
@@ -448,7 +448,7 @@ async fn invalidate_instance_caches(state: &AppState, instance_id: &str) {
 
 async fn stop_active_quarantined_instance(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> anyhow::Result<()> {
     match state
         .docker
@@ -476,7 +476,7 @@ async fn stop_active_quarantined_instance(
 
 async fn enforce_stopped_state(
     state: &AppState,
-    metadata: crate::instance::metadata::InstanceMetadata,
+    metadata: crate::server::metadata::InstanceMetadata,
     event: Option<ManagedContainerEvent>,
 ) -> anyhow::Result<()> {
     let previous_status = metadata.status;
@@ -499,7 +499,7 @@ async fn enforce_stopped_state(
 
 async fn container_activation_observed(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     event: Option<&ManagedContainerEvent>,
 ) -> anyhow::Result<bool> {
     if let Some(event) = event {
@@ -521,9 +521,9 @@ async fn container_activation_observed(
 
 async fn prepare_activated_instance(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> Option<String> {
-    crate::instance::sessions::fence(
+    crate::server::sessions::fence(
         &state.instances,
         &state.gateway_supervisor.tenant_sessions(),
         &metadata.instance_id,
@@ -559,9 +559,9 @@ fn is_active_container_status(status: DockerContainerStatus) -> bool {
 
 async fn probe_after_activation(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> Result<(), String> {
-    let outcome = crate::instance::compatibility::probe_instance_compatibility(
+    let outcome = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,
@@ -580,7 +580,7 @@ async fn probe_after_activation(
 
 async fn harden_instance_auth(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> Result<(), String> {
     match metadata.protocol.engine().tenant_auth_hardening() {
         TenantAuthHardening::Postgres => {

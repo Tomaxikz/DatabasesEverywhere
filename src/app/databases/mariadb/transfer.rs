@@ -8,9 +8,9 @@ use crate::{
             mysql_family_dump_selection_args, validate_mysql_family_remote_database,
         },
     },
-    instance::metadata::InstanceMetadata,
-    instance::placement::DeploymentMode,
-    subsystems::import_export::ImportExportSelection,
+    server::jobs::import_export::selection::ImportExportSelection,
+    server::metadata::InstanceMetadata,
+    server::placement::DeploymentMode,
 };
 
 use super::engine::Mariadb;

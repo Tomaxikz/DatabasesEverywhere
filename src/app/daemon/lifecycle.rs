@@ -58,14 +58,14 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         data_path = %config.paths.data,
         "disk limiter preflight ok"
     );
-    let backup_storage = crate::instance::backup::BackupStorage::from_config(&config)
+    let backup_storage = crate::server::backup::BackupStorage::from_config(&config)
         .context("failed to configure backup storage")?;
     backup_storage
         .preflight()
         .await
         .context("backup storage preflight failed")?;
     let backups_root = config.paths.backups_root();
-    if crate::instance::backup::cleanup_staging(Path::new(&backups_root))
+    if crate::server::backup::cleanup_staging(Path::new(&backups_root))
         .await
         .context("failed to clean incomplete backup staging")?
     {
@@ -73,7 +73,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     let tmp_root = config.paths.tmp_root();
     let removed_materialization_roots =
-        crate::instance::backup::cleanup_materializations(Path::new(&tmp_root))
+        crate::server::backup::cleanup_materializations(Path::new(&tmp_root))
             .await
             .context("failed to clean incomplete backup materializations")?;
     if removed_materialization_roots > 0 {
@@ -95,7 +95,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(path = %metadata_root, "sqlite metadata storage ready");
     let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
-    let placements = crate::instance::placement::PlacementRepository::encrypted(
+    let placements = crate::server::placement::PlacementRepository::encrypted(
         pool.clone(),
         Path::new(&metadata_root),
     )
@@ -126,7 +126,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let failed_jobs = job_repository
         .fail_unfinished(
             "daemon restarted before import/export job completed",
-            &crate::instance::jobs::import_export::now_rfc3339(),
+            &crate::server::jobs::import_export::now_rfc3339(),
         )
         .await
         .context("failed to reconcile import/export jobs")?;
@@ -258,7 +258,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .verify_startup(std::path::Path::new(&volumes_root))
         .await
         .context("failed to verify disk limiter support")?;
-    let instance_locks = crate::instance::locks::InstanceLocks::default();
+    let instance_locks = crate::server::locks::InstanceLocks::default();
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress =
         InstallProgressStore::with_creation_limit(config.daemon.limits.instance_creations);
@@ -285,7 +285,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             .with_activity_repository(crate::storage::activity::ActivityRepository::new(
                 pool.clone(),
             )),
-        soft_disk_limiter: crate::instance::disk::soft::SoftDiskLimiter::new(
+        soft_disk_limiter: crate::server::disk::soft::SoftDiskLimiter::new(
             config.disk.soft_scanner.clone(),
         ),
         monitoring_cache:

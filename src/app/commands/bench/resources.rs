@@ -11,7 +11,7 @@ use tokio::{
     time::{MissedTickBehavior, timeout},
 };
 
-use crate::{runtime::docker::DockerRuntime, utils::protocol::Protocol};
+use crate::{databases::protocol::Protocol, runtime::docker::DockerRuntime};
 
 use super::metrics::{ResourceSample, ResourceSummary};
 

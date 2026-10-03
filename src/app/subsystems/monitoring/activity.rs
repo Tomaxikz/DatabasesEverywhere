@@ -3,15 +3,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::scopes,
-    instance::monitoring::{ActivityBucket, ActivityCurrent},
-    instance::placement::DeploymentMode,
+    databases::protocol::Protocol,
     routes::http::{
         policy::ApiRequestContext,
         response::{ApiError, ApiPath, ApiQuery, ApiResponse, ApiResult},
         router::AppState,
     },
+    server::monitoring::{ActivityBucket, ActivityCurrent},
+    server::placement::DeploymentMode,
     storage::activity::MAX_HISTORY_ROWS,
-    utils::{protocol::Protocol, time::now_unix},
+    utils::time::now_unix,
 };
 
 const DEFAULT_HISTORY_ROWS: u16 = 240;
@@ -81,7 +82,7 @@ pub async fn history(
         .map_err(|error| ApiError::Runtime(format!("failed to load activity history: {error}")))?;
     Ok(ApiResponse::ok(ActivityHistory {
         instance_id,
-        bucket_seconds: crate::instance::monitoring::BUCKET_SECONDS,
+        bucket_seconds: crate::server::monitoring::BUCKET_SECONDS,
         max_buckets: MAX_HISTORY_ROWS,
         buckets,
     }))
@@ -99,7 +100,7 @@ fn history_limit(limit: Option<u16>) -> Result<u16, ApiError> {
 
 pub(crate) async fn tenant_activity(
     state: &AppState,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> TenantActivity {
     let current = state
         .resource_cache
@@ -150,7 +151,7 @@ pub(crate) fn gateway_ops_available(protocol: Protocol) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instance::monitoring::OperationCounts;
+    use crate::server::monitoring::OperationCounts;
     use axum::{extract::FromRequestParts, http::Request};
 
     fn current(cpu: Option<u64>, memory: Option<u64>) -> ActivityCurrent {

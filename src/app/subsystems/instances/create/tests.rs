@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     config::{Config, ImageAllowlistConfig, ImageConfig},
-    instance::state::InstanceStore,
+    server::state::InstanceStore,
     subsystems::test_support::database as test_state,
 };
 
@@ -36,7 +36,7 @@ async fn create_request_enforces_configured_and_allowlisted_images() {
 
 #[test]
 fn qdrant_creation_resolves_fuse_fallback_to_soft_scanner() {
-    let limiter = crate::instance::disk::DiskLimiter::new(crate::config::DiskConfig::default())
+    let limiter = crate::server::disk::DiskLimiter::new(crate::config::DiskConfig::default())
         .for_protocol(Protocol::Qdrant);
 
     assert_eq!(limiter.mode(), crate::config::DiskLimitMode::SoftScanner);
@@ -117,14 +117,14 @@ async fn redis_and_valkey_use_separate_route_namespaces() {
 async fn create_never_adopts_or_purges_an_existing_runtime_id() {
     let (state, _directory) = test_state(Config::default()).await;
     let runtime_id = "pool_postgres_reserved";
-    let runtime = crate::instance::placement::EngineRuntime::legacy_dedicated(
+    let runtime = crate::server::placement::EngineRuntime::legacy_dedicated(
         &sample_metadata(
             runtime_id,
             Protocol::Postgres,
             "existing_db",
             "existing_user",
         ),
-        crate::instance::placement::EngineRuntimeStatus::Running,
+        crate::server::placement::EngineRuntimeStatus::Running,
         "postgres:18.4".to_string(),
     );
     state.placements.save(&runtime).await.unwrap();
@@ -154,7 +154,7 @@ async fn shared_create_waits_for_boot_recovery() {
     })
     .await;
     let mut request = create_request(Protocol::Postgres);
-    request.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    request.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     request.server_id = Some("server-a".into());
     request.pool_id = Some("existing-pool".into());
     request.limits = Some(crate::subsystems::instances::requests::LimitsRequest {
@@ -178,7 +178,7 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
     config.allocation.prevent_disk_overallocation = false;
     let (state, _directory) = test_state(config).await;
     let mut request = create_request(Protocol::Postgres);
-    request.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    request.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     let image = resolve_image(&state, &request).unwrap();
     let limits = crate::utils::limits::InstanceLimits {
         cpu_cores: 0.1,
@@ -186,20 +186,20 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
         disk_mib: 256,
         ..Default::default()
     };
-    let mut runtime = crate::instance::placement::EngineRuntime::legacy_dedicated(
+    let mut runtime = crate::server::placement::EngineRuntime::legacy_dedicated(
         &sample_metadata(
             "pool_postgres_handoff",
             Protocol::Postgres,
             "pool_db",
             "pool_user",
         ),
-        crate::instance::placement::EngineRuntimeStatus::Running,
+        crate::server::placement::EngineRuntimeStatus::Running,
         image.clone(),
     );
-    runtime.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+    runtime.deployment_mode = crate::server::placement::DeploymentMode::Shared;
     runtime.max_tenants = 64;
     runtime.limits = crate::utils::limits::InstanceLimits::default();
-    runtime.owner = Some(crate::instance::placement::test_support::owner(
+    runtime.owner = Some(crate::server::placement::test_support::owner(
         "handoff-server",
     ));
     request.server_id = Some("handoff-server".into());
@@ -220,7 +220,7 @@ async fn shared_claim_keeps_pool_locked_through_caller_handoff() {
             .unwrap()
             .unwrap()
             .state,
-        crate::instance::placement::TenantReservationState::Reserved
+        crate::server::placement::TenantReservationState::Reserved
     );
     assert!(
         state
@@ -269,17 +269,17 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
     assert_eq!(failed.status, InstanceStatus::Failed);
     assert_eq!(
         failed.desired_state,
-        crate::instance::metadata::DesiredInstanceState::Running
+        crate::server::metadata::DesiredInstanceState::Running
     );
     assert!(matches!(
         store.resolve_mysql("legacy_user", Some("legacy_db")).await,
-        crate::instance::state::DatabaseRouteResolution::NotFound
+        crate::server::state::DatabaseRouteResolution::NotFound
     ));
     assert!(matches!(
         store
             .resolve_mysql("healthy_user", Some("healthy_db"))
             .await,
-        crate::instance::state::DatabaseRouteResolution::Found { .. }
+        crate::server::state::DatabaseRouteResolution::Found { .. }
     ));
 }
 
@@ -360,7 +360,7 @@ fn create_request(protocol: Protocol) -> CreateInstanceRequest {
         owner: None,
         instance_id: "inst_test_pg".to_string(),
         protocol,
-        deployment_mode: crate::instance::placement::DeploymentMode::Dedicated,
+        deployment_mode: crate::server::placement::DeploymentMode::Dedicated,
         database: "test_db".to_string(),
         username: "test_user".to_string(),
         password: "test-password".to_string(),
@@ -380,7 +380,7 @@ fn sample_metadata(
     database: &str,
     username: &str,
 ) -> InstanceMetadata {
-    let mut metadata = crate::instance::test_support::metadata(instance_id, protocol);
+    let mut metadata = crate::server::test_support::metadata(instance_id, protocol);
     metadata.public.host = "127.0.0.1".to_string();
     metadata.public.port = 5432;
     metadata.backend = BackendEndpoint::UnixSocket {
@@ -395,20 +395,20 @@ fn sample_metadata(
 async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool() {
     for protocol in Protocol::ALL
         .into_iter()
-        .filter(|protocol| crate::instance::placement::DeploymentMode::Shared.supports(*protocol))
+        .filter(|protocol| crate::server::placement::DeploymentMode::Shared.supports(*protocol))
     {
         for problem in ["stopped", "full", "image", "owner", "disk"] {
             let (state, _dir) = test_state(Config::default()).await;
-            let mut pool = crate::instance::placement::test_support::runtime(
+            let mut pool = crate::server::placement::test_support::runtime(
                 "existing-pool",
                 protocol,
                 "existing-image",
             );
-            pool.owner = Some(crate::instance::placement::test_support::owner("server-a"));
+            pool.owner = Some(crate::server::placement::test_support::owner("server-a"));
             pool.max_tenants = 1;
             pool.limits.disk_mib = 4096;
             if problem == "stopped" {
-                pool.status = crate::instance::placement::EngineRuntimeStatus::Stopped;
+                pool.status = crate::server::placement::EngineRuntimeStatus::Stopped;
             }
             state.placements.save(&pool).await.unwrap();
             let mut limits = crate::utils::limits::InstanceLimits {
@@ -418,7 +418,7 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
             if problem == "full" {
                 state
                     .placements
-                    .reserve(crate::instance::placement::ReserveTenant {
+                    .reserve(crate::server::placement::ReserveTenant {
                         owner: pool.owner.clone().unwrap(),
                         instance_id: "existing-tenant",
                         runtime_id: &pool.runtime_id,
@@ -433,10 +433,10 @@ async fn server_claim_never_substitutes_an_unavailable_full_or_incompatible_pool
             request.server_id = Some("server-a".into());
             request.pool_id = Some("existing-pool".into());
             request.owner = pool.owner.clone();
-            request.deployment_mode = crate::instance::placement::DeploymentMode::Shared;
+            request.deployment_mode = crate::server::placement::DeploymentMode::Shared;
             request.image = (problem == "image").then(|| "different-image".into());
             if problem == "owner" {
-                request.owner = Some(crate::instance::placement::test_support::owner(
+                request.owner = Some(crate::server::placement::test_support::owner(
                     "another-server",
                 ));
             }

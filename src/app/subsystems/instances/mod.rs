@@ -3,7 +3,7 @@ pub mod images;
 pub mod progress;
 pub mod requests;
 
-pub(crate) use crate::instance::placement::containment;
+pub(crate) use crate::server::placement::containment;
 mod deployment;
 pub(crate) mod major_upgrade;
 mod normal_image_update;
@@ -17,7 +17,7 @@ pub(crate) use shared::{
 };
 
 #[cfg(test)]
-use crate::instance::compatibility::normalize_database_version;
+use crate::server::compatibility::normalize_database_version;
 pub use runtime_info::{
     CreateInstanceAcceptedResponse, DeleteInstanceQuery, DeleteResponse, ImageUpdateStrategy,
     InstanceRuntimeInfoCache, InstanceStatusResponse, LogsQuery, LogsResponse, PowerRequest,
@@ -59,15 +59,7 @@ use tokio::{
 use crate::{
     auth::scopes,
     databases::engine::{CredentialKind, LifecycleFlow, PostLaunchStep, UpgradePrecheck},
-    instance::disk::DiskLimiter,
-    instance::{
-        metadata::{
-            DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus, InstanceMetadata,
-            InstanceStatus,
-        },
-        paths::InstancePaths,
-        reconcile,
-    },
+    databases::protocol::Protocol,
     routes::http::{
         diagnostics::PublicDiagnostic,
         policy::{ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy},
@@ -77,6 +69,15 @@ use crate::{
     runtime::docker::{
         DockerContainerStatus, DockerError, DockerInstanceInspection, DockerInstanceSpec,
         DockerRuntime,
+    },
+    server::disk::DiskLimiter,
+    server::{
+        metadata::{
+            DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus, InstanceMetadata,
+            InstanceStatus,
+        },
+        paths::InstancePaths,
+        reconcile,
     },
     subsystems::instances::{
         create::{
@@ -92,7 +93,7 @@ use crate::{
             validate_create_request, validate_limits, validate_protocol_limits,
         },
     },
-    utils::{limits::mib_to_bytes, protocol::Protocol, redaction, time::now_rfc3339},
+    utils::{limits::mib_to_bytes, redaction, time::now_rfc3339},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
@@ -143,7 +144,7 @@ pub(crate) async fn reconcile_instance_locked(
         .await
         .ok_or(ApiError::NotFound)?;
     deployment::ensure_no_active_migration(state, instance_id).await?;
-    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         return shared::reconcile(state, metadata).await;
     }
     let previous = metadata.status;

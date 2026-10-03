@@ -9,7 +9,7 @@ pub(super) struct AppStateSoftDiskRuntime {
 impl AppStateSoftDiskRuntime {
     fn target_is_current(
         &self,
-        metadata: &crate::instance::metadata::InstanceMetadata,
+        metadata: &crate::server::metadata::InstanceMetadata,
         target: &SoftDiskTarget,
     ) -> bool {
         is_current_target(metadata, target, self.state.config.disk.mode)
@@ -62,11 +62,11 @@ impl AppStateSoftDiskRuntime {
 }
 
 pub(in super::super) fn is_current_target(
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     target: &SoftDiskTarget,
     global_mode: crate::config::DiskLimitMode,
 ) -> bool {
-    metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+    metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
         && metadata.instance_id == target.instance_id
         && metadata.created_at == target.created_at
         && metadata.protocol == target.protocol
@@ -79,15 +79,13 @@ pub(in super::super) fn is_current_target(
 }
 
 pub(super) fn soft_monitoring_required(
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     global_mode: crate::config::DiskLimitMode,
 ) -> bool {
     let legacy_qdrant_fuse = metadata.protocol.engine().fuse_quota_unsupported()
         && metadata.limits.disk_enforcement_method == "fuse_quota";
-    crate::instance::disk::soft::SoftDiskLimiter::enforcement_required(
-        global_mode,
-        metadata.protocol,
-    ) || legacy_qdrant_fuse
+    crate::server::disk::soft::SoftDiskLimiter::enforcement_required(global_mode, metadata.protocol)
+        || legacy_qdrant_fuse
 }
 
 impl SoftDiskRuntime for AppStateSoftDiskRuntime {
@@ -95,7 +93,7 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         &'a self,
         target: &'a SoftDiskTarget,
         exceeded: &'a SoftDiskLimitExceeded,
-    ) -> crate::instance::disk::soft::RuntimeFuture<'a> {
+    ) -> crate::server::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
             let _operation = self.lock_unless_held(&target.instance_id).await;
             self.persist_disk_block(target, exceeded).await?;
@@ -107,7 +105,7 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         &'a self,
         target: &'a SoftDiskTarget,
         grace: Duration,
-    ) -> crate::instance::disk::soft::RuntimeFuture<'a> {
+    ) -> crate::server::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
             // Leave the exact stop deadline and SIGKILL fallback to the supervisor.
             let stopped = self
@@ -126,7 +124,7 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
     fn force_kill<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
-    ) -> crate::instance::disk::soft::RuntimeFuture<'a> {
+    ) -> crate::server::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
             let killed = self
                 .state
@@ -140,7 +138,7 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
     fn clear_disk_blocked<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
-    ) -> crate::instance::disk::soft::RuntimeFuture<'a> {
+    ) -> crate::server::disk::soft::RuntimeFuture<'a> {
         Box::pin(async move {
             let _operation = self.lock_unless_held(&target.instance_id).await;
             let Some(mut metadata) = self.state.instances.get(&target.instance_id).await else {
@@ -164,14 +162,14 @@ impl SoftDiskRuntime for AppStateSoftDiskRuntime {
         target: &'a SoftDiskTarget,
         exceeded: &'a SoftDiskLimitExceeded,
         grace: Duration,
-    ) -> crate::instance::disk::soft::StopRuntimeFuture<'a> {
+    ) -> crate::server::disk::soft::StopRuntimeFuture<'a> {
         Box::pin(async move {
             // Keep Start serialized through durable intent and runtime shutdown.
             let _operation = self.lock_unless_held(&target.instance_id).await;
             if !self.persist_disk_block(target, exceeded).await? {
                 return Ok(StopOutcome::SkippedStale);
             }
-            crate::instance::disk::soft::stop_with_kill_fallback(self, target, grace).await
+            crate::server::disk::soft::stop_with_kill_fallback(self, target, grace).await
         })
     }
 }

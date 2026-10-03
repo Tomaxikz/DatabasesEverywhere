@@ -11,7 +11,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
 use super::{CappedExecOutput, DockerError, DockerRuntime};
-use crate::utils::{logs::truncate_log_tail, protocol::Protocol, redaction};
+use crate::{
+    databases::protocol::Protocol,
+    utils::{logs::truncate_log_tail, redaction},
+};
 
 const DOCKER_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DOCKER_EXEC_RECOVERY_STEP_TIMEOUT: Duration = Duration::from_secs(30);

@@ -3,9 +3,10 @@ use crate::{
         EngineCompatibility, EngineFamily, EngineInfo, JobCostProfile, SQL_JOB_COST,
         SharedPoolProfile,
     },
-    instance::auth_hardening::POSTGRES_HARDENING_REVISION,
-    instance::compatibility::{EngineVersion, ProtocolCapabilities},
-    utils::{backend::POSTGRES_SOCKET_DIRECTORY, protocol::Protocol},
+    databases::protocol::Protocol,
+    server::auth_hardening::POSTGRES_HARDENING_REVISION,
+    server::compatibility::{EngineVersion, ProtocolCapabilities},
+    utils::backend::POSTGRES_SOCKET_DIRECTORY,
 };
 
 use super::docker::CONTROL_DATABASE;

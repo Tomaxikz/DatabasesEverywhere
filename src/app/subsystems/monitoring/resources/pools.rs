@@ -14,14 +14,14 @@ use super::{
 };
 use crate::{
     auth::scopes,
-    instance::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
     routes::http::{diagnostics::PublicDiagnostic, response::ApiPath},
+    server::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus},
     utils::limits::InstanceLimits,
 };
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SharedPoolReport {
-    pub owner: Option<crate::instance::placement::PoolOwner>,
+    pub owner: Option<crate::server::placement::PoolOwner>,
     pub runtime_id: String,
     pub protocol: Protocol,
     pub status: EngineRuntimeStatus,
@@ -641,7 +641,7 @@ mod tests {
     }
 
     async fn reserve_child(state: &AppState, pool: &EngineRuntime, id: &str) -> InstanceMetadata {
-        let mut metadata = crate::instance::test_support::metadata(id, pool.protocol);
+        let mut metadata = crate::server::test_support::metadata(id, pool.protocol);
         metadata.deployment_mode = DeploymentMode::Shared;
         metadata.runtime_id = pool.runtime_id.clone();
         metadata.owner = pool.owner.clone();
@@ -650,7 +650,7 @@ mod tests {
         metadata.limits.disk_mib = 128;
         state
             .placements
-            .reserve(crate::instance::placement::ReserveTenant {
+            .reserve(crate::server::placement::ReserveTenant {
                 owner: pool.owner.clone().unwrap(),
                 instance_id: id,
                 runtime_id: &pool.runtime_id,
@@ -686,7 +686,7 @@ mod tests {
             };
             config.paths.backups = directory.path().join("backups").display().to_string();
             let (state, _db) = crate::subsystems::test_support::database(config).await;
-            let mut pool = crate::instance::placement::test_support::runtime(
+            let mut pool = crate::server::placement::test_support::runtime(
                 "pool_read",
                 protocol,
                 "test-image",
@@ -746,7 +746,7 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let mut pool = crate::instance::placement::test_support::runtime(
+        let mut pool = crate::server::placement::test_support::runtime(
             "pool_read",
             Protocol::Postgres,
             "test-image",
@@ -814,14 +814,14 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let mut pool = crate::instance::placement::test_support::runtime(
+        let mut pool = crate::server::placement::test_support::runtime(
             "pool_read",
             Protocol::Postgres,
             "test-image",
         );
         pool.limits.disk_mib = 8192;
         state.placements.save(&pool).await.unwrap();
-        let mut source = crate::instance::test_support::metadata("source", pool.protocol);
+        let mut source = crate::server::test_support::metadata("source", pool.protocol);
         source.owner = pool.owner.clone();
         state.manager.upsert(source.clone()).await.unwrap();
         let migration = state

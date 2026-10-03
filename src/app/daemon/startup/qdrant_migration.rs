@@ -7,10 +7,10 @@ pub(super) async fn migrate_qdrant_storage(
     config: &Config,
     docker: &DockerRuntime,
     disk_limiter: &DiskLimiter,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     paths: &InstancePaths,
 ) -> anyhow::Result<bool> {
-    if metadata.desired_state == crate::instance::metadata::DesiredInstanceState::Running
+    if metadata.desired_state == crate::server::metadata::DesiredInstanceState::Running
         && let Err(error) = docker.check_autostart(&metadata.instance_id).await
     {
         tracing::warn!(instance_id = %metadata.instance_id, %error,
@@ -197,7 +197,7 @@ pub(super) async fn migrate_qdrant_storage(
 
 pub(super) async fn start_migrated_qdrant(
     docker: &DockerRuntime,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
 ) -> anyhow::Result<()> {
     docker
         .start(metadata.protocol, &metadata.instance_id)
@@ -214,13 +214,13 @@ pub(super) async fn start_migrated_qdrant(
 
 pub(in super::super) fn qdrant_migration_actions(
     observed: DockerContainerStatus,
-    desired: crate::instance::metadata::DesiredInstanceState,
+    desired: crate::server::metadata::DesiredInstanceState,
 ) -> (bool, bool) {
     let stop_existing = matches!(
         observed,
         DockerContainerStatus::Running | DockerContainerStatus::Starting
     );
-    let start_replacement = desired == crate::instance::metadata::DesiredInstanceState::Running;
+    let start_replacement = desired == crate::server::metadata::DesiredInstanceState::Running;
     (stop_existing, start_replacement)
 }
 
@@ -245,7 +245,7 @@ pub(in super::super) struct QdrantMigrationContainer<'a> {
 
 pub(in super::super) fn qdrant_migration_spec(
     config: &Config,
-    metadata: &crate::instance::metadata::InstanceMetadata,
+    metadata: &crate::server::metadata::InstanceMetadata,
     paths: &InstancePaths,
     container: QdrantMigrationContainer<'_>,
 ) -> crate::runtime::docker::DockerInstanceSpec {

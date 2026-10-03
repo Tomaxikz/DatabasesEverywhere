@@ -143,7 +143,7 @@ pub(super) async fn download(
 pub(super) struct DownloadSource {
     pub(super) path: PathBuf,
     pub(super) cleanup: Option<PathBuf>,
-    pub(super) backup: Option<crate::instance::backup::MaterializedBackup>,
+    pub(super) backup: Option<crate::server::backup::MaterializedBackup>,
 }
 
 pub(super) async fn resolve_download_source(

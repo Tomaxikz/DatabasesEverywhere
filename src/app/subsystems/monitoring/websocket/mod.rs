@@ -27,8 +27,6 @@ use crate::{
         jwt::{self, Claims},
         scopes,
     },
-    instance::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
-    instance::metadata::InstanceMetadata,
     routes::http::{
         diagnostics::PublicDiagnostic,
         limits::{WebSocketAdmissionError, WebSocketConnectionPermit},
@@ -36,6 +34,8 @@ use crate::{
         response::{ApiError, ApiPath, ApiQuery},
         router::AppState,
     },
+    server::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
+    server::metadata::InstanceMetadata,
     subsystems::{
         artifacts::{DownloadUrlResponse, artifact_download_url},
         import_export::{ImportExportJobResponse, public_job_response},

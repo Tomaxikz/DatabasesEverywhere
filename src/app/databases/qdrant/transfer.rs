@@ -5,8 +5,8 @@ use crate::{
         EngineTransfer, LogicalImportRequest, SelectionUse, TransferError,
         validate_header_safe_secret,
     },
-    instance::metadata::InstanceMetadata,
-    subsystems::import_export::ImportExportSelection,
+    server::jobs::import_export::selection::ImportExportSelection,
+    server::metadata::InstanceMetadata,
 };
 
 use super::engine::Qdrant;

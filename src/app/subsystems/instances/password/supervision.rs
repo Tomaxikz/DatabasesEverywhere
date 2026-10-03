@@ -19,18 +19,18 @@ use super::{
 };
 use crate::{
     databases::engine::{CredentialRollback, RotatedSecrets},
-    instance::{
-        locks::InstanceLocks,
-        metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-        paths::InstancePaths,
-    },
+    databases::protocol::Protocol,
     routes::http::{
         response::{ApiResponse, ApiResult},
         router::AppState,
     },
     runtime::docker::DockerInstanceSpec,
+    server::{
+        locks::InstanceLocks,
+        metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     subsystems::instances::create::launch_container_from_spec,
-    utils::protocol::Protocol,
 };
 
 pub(super) struct InPlaceResetContext<'a> {

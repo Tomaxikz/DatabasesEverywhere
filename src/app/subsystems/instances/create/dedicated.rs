@@ -14,16 +14,16 @@ pub(crate) struct DedicatedTarget {
 }
 
 impl DedicatedTarget {
-    pub(crate) fn runtime(&self) -> crate::instance::placement::EngineRuntime {
-        crate::instance::placement::EngineRuntime {
+    pub(crate) fn runtime(&self) -> crate::server::placement::EngineRuntime {
+        crate::server::placement::EngineRuntime {
             pending_image: None,
-            desired_state: crate::instance::metadata::DesiredInstanceState::Running,
+            desired_state: crate::server::metadata::DesiredInstanceState::Running,
             owner: self.metadata.owner.clone(),
-            schema_version: crate::instance::placement::ENGINE_RUNTIME_SCHEMA_VERSION,
+            schema_version: crate::server::placement::ENGINE_RUNTIME_SCHEMA_VERSION,
             runtime_id: self.metadata.instance_id.clone(),
             protocol: self.metadata.protocol,
-            deployment_mode: crate::instance::placement::DeploymentMode::Dedicated,
-            status: crate::instance::placement::EngineRuntimeStatus::Creating,
+            deployment_mode: crate::server::placement::DeploymentMode::Dedicated,
+            status: crate::server::placement::EngineRuntimeStatus::Creating,
             backend: self.metadata.backend.clone(),
             runtime: self.metadata.runtime.clone(),
             limits: self.metadata.limits.clone(),
@@ -32,7 +32,7 @@ impl DedicatedTarget {
             compatibility: None,
 
             max_tenants: 1,
-            reserved: crate::instance::placement::RuntimeReservation::default(),
+            reserved: crate::server::placement::RuntimeReservation::default(),
             admin_secret: maintenance_secret(&self.metadata).map(str::to_string),
             created_at: self.metadata.created_at.clone(),
             updated_at: self.metadata.updated_at.clone(),
@@ -173,11 +173,11 @@ pub(crate) async fn build(
         owner: request.owner.clone(),
         schema_version: SCHEMA_VERSION,
         instance_id: request.instance_id.clone(),
-        deployment_mode: crate::instance::placement::DeploymentMode::Dedicated,
+        deployment_mode: crate::server::placement::DeploymentMode::Dedicated,
         runtime_id: request.instance_id,
         protocol: request.protocol,
         status: InstanceStatus::Booting,
-        desired_state: crate::instance::metadata::DesiredInstanceState::Running,
+        desired_state: crate::server::metadata::DesiredInstanceState::Running,
         disk_limit_blocked: false,
         public: PublicEndpoint {
             host: request.public_host,
@@ -389,7 +389,7 @@ fn required_metadata_secret<'a>(secret: Option<&'a str>, name: &str) -> Result<&
 }
 
 pub(crate) async fn attest(state: &AppState, metadata: &InstanceMetadata) -> Result<(), ApiError> {
-    let compatibility = crate::instance::compatibility::probe_instance_compatibility(
+    let compatibility = crate::server::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,

@@ -15,10 +15,10 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::{
     databases::engine::RemoteDumpFlow,
+    databases::protocol::Protocol,
     io::files::ensure_private_dir,
     routes::http::{response::ApiError, router::AppState},
     subsystems::import_export::ImportExportSelection,
-    utils::protocol::Protocol,
 };
 
 pub(crate) use qdrant::{cleanup_stale_bridge, import_qdrant};
