@@ -1,11 +1,8 @@
 use secrecy::{ExposeSecret, SecretString};
-use sha2::{Digest, Sha256};
 
 use crate::{
-    instances::metadata::InstanceMetadata,
-    placement::DeploymentMode,
-    shared::{protocol::Protocol, time::now_rfc3339},
-    state::AppState,
+    instance::metadata::InstanceMetadata, instance::placement::DeploymentMode, state::AppState,
+    utils::time::now_rfc3339,
 };
 
 /// Recover only absent tenant secrets, before storage migration or image repair.
@@ -33,11 +30,12 @@ pub(super) async fn recover(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         metadata.tenant_password = Some(secret.to_owned());
-        if metadata.protocol == Protocol::Qdrant {
-            metadata.route_key_sha256 = Some(crate::protocols::qdrant::route_key_fingerprint(
-                state.config.websocket_jwt_secret(),
-                secret,
-            ));
+        if let Some(fingerprint) = metadata
+            .protocol
+            .engine()
+            .tenant_route_fingerprint(state.config.websocket_jwt_secret(), secret)
+        {
+            metadata.route_key_sha256 = Some(fingerprint);
         }
         metadata.updated_at = now_rfc3339();
         let id = metadata.instance_id.clone();
@@ -58,7 +56,11 @@ fn needs_credential_recovery(metadata: &InstanceMetadata) -> bool {
         .as_ref()
         .is_some_and(|secret| !secret.is_empty());
     metadata.deployment_mode == DeploymentMode::Dedicated
-        && matches!(metadata.protocol, Protocol::Qdrant | Protocol::Mariadb)
+        && !metadata
+            .protocol
+            .engine()
+            .legacy_recovery_env_keys()
+            .is_empty()
         && !has_tenant_password
 }
 
@@ -66,15 +68,15 @@ async fn container_credential_candidate(
     state: &AppState,
     metadata: &InstanceMetadata,
 ) -> anyhow::Result<Option<SecretString>> {
-    let keys: &[&str] = match metadata.protocol {
-        Protocol::Qdrant => &["QDRANT__SERVICE__API_KEY"],
-        Protocol::Mariadb => &["DBE_MARIADB_PASSWORD", "MARIADB_PASSWORD"],
-        _ => return Ok(None),
-    };
-    if metadata.protocol == Protocol::Mariadb {
+    let engine = metadata.protocol.engine();
+    let keys = engine.legacy_recovery_env_keys();
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    if let Some(user_key) = engine.legacy_recovery_username_env_key() {
         let user = state
             .docker
-            .legacy_environment_secret(metadata.protocol, &metadata.instance_id, "MARIADB_USER")
+            .legacy_environment_secret(metadata.protocol, &metadata.instance_id, user_key)
             .await?;
         anyhow::ensure!(
             user.as_ref()
@@ -106,38 +108,25 @@ fn matches_saved_verifier(metadata: &InstanceMetadata, secret: &str, daemon_secr
     if secret.is_empty() {
         return false;
     }
-    match metadata.protocol {
-        Protocol::Qdrant => {
-            let Some(saved) = &metadata.route_key_sha256 else {
-                return false;
-            };
-            let current = crate::protocols::qdrant::route_key_fingerprint(daemon_secret, secret);
-            let legacy = crate::shared::hex::encode_lower(&Sha256::digest(secret.as_bytes()));
-            saved == &current || saved == &legacy
-        }
-        Protocol::Mariadb => metadata
-            .mariadb_native_password_sha1_stage2
-            .as_ref()
-            .is_some_and(|saved| {
-                saved.eq_ignore_ascii_case(
-                    &crate::protocols::mariadb::native_password_sha1_stage2_hex(secret),
-                )
-            }),
-        _ => false,
-    }
+    metadata
+        .protocol
+        .engine()
+        .matches_legacy_verifier(metadata, secret, daemon_secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::protocol::Protocol;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn qdrant_recovery_requires_matching_legacy_or_keyed_fingerprint() {
-        let mut metadata = crate::instances::test_support::metadata("legacy", Protocol::Qdrant);
+        let mut metadata = crate::instance::test_support::metadata("legacy", Protocol::Qdrant);
         assert!(!matches_saved_verifier(&metadata, "secret", b"daemon"));
         for fingerprint in [
-            crate::shared::hex::encode_lower(&Sha256::digest(b"secret")),
-            crate::protocols::qdrant::route_key_fingerprint(b"daemon", "secret"),
+            crate::utils::hex::encode_lower(&Sha256::digest(b"secret")),
+            crate::gateway::protocols::qdrant::route_key_fingerprint(b"daemon", "secret"),
         ] {
             metadata.route_key_sha256 = Some(fingerprint);
             assert!(matches_saved_verifier(&metadata, "secret", b"daemon"));
@@ -148,12 +137,11 @@ mod tests {
 
     #[test]
     fn mariadb_recovery_requires_saved_tenant_verifier() {
-        let mut metadata = crate::instances::test_support::metadata("legacy", Protocol::Mariadb);
+        let mut metadata = crate::instance::test_support::metadata("legacy", Protocol::Mariadb);
         metadata.mariadb_native_password_sha1_stage2 = None;
         assert!(!matches_saved_verifier(&metadata, "secret", b"daemon"));
-        metadata.mariadb_native_password_sha1_stage2 = Some(
-            crate::protocols::mariadb::native_password_sha1_stage2_hex("secret"),
-        );
+        metadata.mariadb_native_password_sha1_stage2 =
+            Some(crate::gateway::protocols::mariadb::native_password_sha1_stage2_hex("secret"));
         assert!(matches_saved_verifier(&metadata, "secret", b"daemon"));
         assert!(!matches_saved_verifier(&metadata, "wrong", b"daemon"));
     }

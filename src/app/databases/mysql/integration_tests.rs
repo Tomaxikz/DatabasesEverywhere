@@ -16,9 +16,9 @@ use crate::databases::{
     test_support::DockerContainer,
 };
 use crate::{
-    instances::{state::InstanceStore, test_support},
-    protocols::mariadb::native_password_sha1_stage2_hex,
-    shared::{backend::BackendEndpoint, protocol::Protocol},
+    gateway::protocols::mariadb::native_password_sha1_stage2_hex,
+    instance::{state::InstanceStore, test_support},
+    utils::{backend::BackendEndpoint, protocol::Protocol},
 };
 
 const DEFAULT_IMAGE: &str = "mysql:8.4";
@@ -40,9 +40,10 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     let container = start_container(&name, socket_root.path(), &image);
     wait_until_ready(&name);
     let version = query_mysql(&name, ROOT_PASSWORD, "root", "mysql", "SELECT VERSION()");
-    crate::compatibility::compatibility_profile(Protocol::Mysql, &version).unwrap_or_else(
-        |error| panic!("{image} reported unsupported live version {version}: {error}"),
-    );
+    crate::instance::compatibility::compatibility_profile(Protocol::Mysql, &version)
+        .unwrap_or_else(|error| {
+            panic!("{image} reported unsupported live version {version}: {error}")
+        });
 
     let sql = materialize_password(shared_tenant_user_sql(DATABASE, TENANT), TENANT_PASSWORD);
     let provision = exec_with_input(
@@ -260,12 +261,12 @@ fn assert_mysql_engine_telemetry(name: &str) {
         ROOT_PASSWORD,
         "root",
         "mysql",
-        crate::monitoring::mysql_prepare_sql(),
+        crate::instance::monitoring::mysql_prepare_sql(),
     );
     assert_success(&prepare, "prepare canonical MySQL engine telemetry");
     let prepare_output =
         String::from_utf8(prepare.stdout).expect("MySQL telemetry output is UTF-8");
-    let capabilities = crate::monitoring::parse_mysql_capabilities(&prepare_output)
+    let capabilities = crate::instance::monitoring::parse_mysql_capabilities(&prepare_output)
         .expect("detect MySQL telemetry capabilities");
 
     for (database, username, password) in [
@@ -283,12 +284,12 @@ fn assert_mysql_engine_telemetry(name: &str) {
         ROOT_PASSWORD,
         "root",
         "mysql",
-        crate::monitoring::mysql_collect_sql(capabilities),
+        crate::instance::monitoring::mysql_collect_sql(capabilities),
     );
     assert_success(&collect, "collect canonical MySQL engine telemetry");
     let collect_output =
         String::from_utf8(collect.stdout).expect("MySQL telemetry output is UTF-8");
-    let rows = crate::monitoring::parse_mysql_rows(&collect_output, capabilities)
+    let rows = crate::instance::monitoring::parse_mysql_rows(&collect_output, capabilities)
         .expect("parse canonical MySQL engine telemetry");
     assert_engine_tenant_rows(rows, &[TENANT, NEIGHBOR]);
 }

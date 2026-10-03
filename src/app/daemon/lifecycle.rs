@@ -58,14 +58,14 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         data_path = %config.paths.data,
         "disk limiter preflight ok"
     );
-    let backup_storage = crate::backups::BackupStorage::from_config(&config)
+    let backup_storage = crate::instance::backup::BackupStorage::from_config(&config)
         .context("failed to configure backup storage")?;
     backup_storage
         .preflight()
         .await
         .context("backup storage preflight failed")?;
     let backups_root = config.paths.backups_root();
-    if crate::backups::cleanup_staging(Path::new(&backups_root))
+    if crate::instance::backup::cleanup_staging(Path::new(&backups_root))
         .await
         .context("failed to clean incomplete backup staging")?
     {
@@ -73,7 +73,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     }
     let tmp_root = config.paths.tmp_root();
     let removed_materialization_roots =
-        crate::backups::cleanup_materializations(Path::new(&tmp_root))
+        crate::instance::backup::cleanup_materializations(Path::new(&tmp_root))
             .await
             .context("failed to clean incomplete backup materializations")?;
     if removed_materialization_roots > 0 {
@@ -95,9 +95,11 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(path = %metadata_root, "sqlite metadata storage ready");
     let repository = InstanceRepository::encrypted(pool.clone(), Path::new(&metadata_root))
         .context("failed to initialize encrypted metadata secret storage")?;
-    let placements =
-        crate::placement::PlacementRepository::encrypted(pool.clone(), Path::new(&metadata_root))
-            .context("failed to initialize encrypted engine runtime storage")?;
+    let placements = crate::instance::placement::PlacementRepository::encrypted(
+        pool.clone(),
+        Path::new(&metadata_root),
+    )
+    .context("failed to initialize encrypted engine runtime storage")?;
     let migration_recovery = placements
         .migrations()
         .recover_unfinished()
@@ -124,7 +126,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let failed_jobs = job_repository
         .fail_unfinished(
             "daemon restarted before import/export job completed",
-            &crate::jobs::import_export::now_rfc3339(),
+            &crate::instance::jobs::import_export::now_rfc3339(),
         )
         .await
         .context("failed to reconcile import/export jobs")?;
@@ -148,7 +150,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             .max_queued_jobs_per_instance,
         "import/export scheduler initialized"
     );
-    let import_uploads = crate::api::import_export::ImportUploadService::with_limits(
+    let import_uploads = crate::subsystems::import_export::ImportUploadService::with_limits(
         ImportUploadRepository::new(pool.clone()),
         config.artifacts.import_upload_max_concurrent,
         scheduler_capacity.max_active_jobs,
@@ -256,7 +258,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .verify_startup(std::path::Path::new(&volumes_root))
         .await
         .context("failed to verify disk limiter support")?;
-    let instance_locks = crate::instances::locks::InstanceLocks::default();
+    let instance_locks = crate::instance::locks::InstanceLocks::default();
     let shutdown_jobs = import_export_jobs.clone();
     let install_progress =
         InstallProgressStore::with_creation_limit(config.daemon.limits.instance_creations);
@@ -264,7 +266,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     let state = AppState::new(AppStateData {
         config: config.clone(),
         config_path: config_path.clone(),
-        config_patches: crate::api::system::config::ConfigPatchCoordinator::default(),
+        config_patches: crate::subsystems::system::config::ConfigPatchCoordinator::default(),
         api_token: ApiToken::from_config(&config),
         instances: store.clone(),
         manager: manager.clone(),
@@ -273,21 +275,22 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         docker: docker.clone(),
         import_export_jobs: import_export_jobs.clone(),
         import_uploads: import_uploads.clone(),
-        api_rate_limiter: crate::api::http::limits::ApiRateLimiter::with_limits(
+        api_rate_limiter: crate::routes::http::limits::ApiRateLimiter::with_limits(
             config.security.api_rate_limit_per_minute,
             &config.daemon.limits,
         ),
         install_progress,
-        artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets::default(),
-        resource_cache: crate::api::monitoring::resources::ResourceCache::default()
+        artifact_downloads: crate::subsystems::artifacts::ArtifactDownloadTickets::default(),
+        resource_cache: crate::subsystems::monitoring::resources::ResourceCache::default()
             .with_activity_repository(crate::storage::activity::ActivityRepository::new(
                 pool.clone(),
             )),
-        soft_disk_limiter: crate::disk::soft::SoftDiskLimiter::new(
+        soft_disk_limiter: crate::instance::disk::soft::SoftDiskLimiter::new(
             config.disk.soft_scanner.clone(),
         ),
-        monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache::default(),
-        instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache::default(),
+        monitoring_cache:
+            crate::subsystems::monitoring::websocket::MonitoringSnapshotCache::default(),
+        instance_runtime_cache: crate::subsystems::instances::InstanceRuntimeInfoCache::default(),
         daemon_shutdown: crate::state::DaemonShutdown::default(),
     });
     disable_runtime_restarts(&state).await?;
@@ -302,7 +305,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     restore_shared_limits(&state, &disk_limiter)
         .await
         .context("failed to reapply shared pool limits before recovery")?;
-    crate::api::instances::recover_deployment_migrations(&state)
+    crate::subsystems::instances::recover_deployment_migrations(&state)
         .await
         .context(
             "failed to recover interrupted deployment migrations before shared pool reconciliation",
@@ -318,7 +321,8 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "finished interrupted shared tenant creation recovery"
         );
     }
-    let recovered_shared_deletions = crate::api::instances::recover_shared_deletions(&state).await;
+    let recovered_shared_deletions =
+        crate::subsystems::instances::recover_shared_deletions(&state).await;
     if recovered_shared_deletions > 0 {
         tracing::info!(
             recovered_shared_deletions,
@@ -369,7 +373,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     sync_shared_cpu_burst(&placements, &docker, &instance_locks)
         .await
         .context("failed to reconcile shared pool CPU burst policy")?;
-    let expired_one_use_exports = crate::api::artifacts::sweep_one_use_exports(&state)
+    let expired_one_use_exports = crate::subsystems::artifacts::sweep_one_use_exports(&state)
         .await
         .context("failed to reconcile one-use export spools")?;
     if expired_one_use_exports > 0 {
@@ -378,7 +382,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
             "expired one-use exports removed during startup"
         );
     }
-    let upload_recovery = crate::api::import_export::reconcile_import_uploads(&state)
+    let upload_recovery = crate::subsystems::import_export::reconcile_import_uploads(&state)
         .await
         .context("failed to reconcile temporary import uploads")?;
     if upload_recovery.examined > 0 || upload_recovery.failures > 0 {
@@ -449,11 +453,12 @@ async fn reconcile_remote_import_leftovers(
         }
     }
     let remote_import_tmp_root = PathBuf::from(config.paths.tmp_root());
-    let stale_credential_cleanup = crate::api::import_export::remote::cleanup_stale_import_secrets(
-        &remote_import_tmp_root,
-        helpers_reconciled,
-    )
-    .await;
+    let stale_credential_cleanup =
+        crate::subsystems::import_export::remote::cleanup_stale_import_secrets(
+            &remote_import_tmp_root,
+            helpers_reconciled,
+        )
+        .await;
     if stale_credential_cleanup.errors > 0 {
         tracing::warn!(
             scanned_entries = stale_credential_cleanup.scanned_entries,
@@ -486,13 +491,16 @@ async fn migrate_qdrant_fingerprints(
 ) -> anyhow::Result<usize> {
     let mut migrated = 0;
     for mut metadata in manager.store().list().await {
-        if metadata.protocol != crate::shared::protocol::Protocol::Qdrant {
-            continue;
-        }
         let Some(api_key) = metadata.tenant_password.as_deref() else {
             continue;
         };
-        let fingerprint = crate::protocols::qdrant::route_key_fingerprint(daemon_secret, api_key);
+        let Some(fingerprint) = metadata
+            .protocol
+            .engine()
+            .tenant_route_fingerprint(daemon_secret, api_key)
+        else {
+            continue;
+        };
         if metadata.route_key_sha256.as_deref() == Some(fingerprint.as_str()) {
             continue;
         }

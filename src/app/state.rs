@@ -17,11 +17,11 @@ use std::{
 use tokio::sync::{Notify, watch};
 
 use crate::{
-    api::http::policy::OriginPolicy,
     auth::api_token::ApiToken,
     config::RuntimeConfig,
-    instances::{manager::InstanceManager, state::InstanceStore},
-    jobs::import_export::ImportExportJobs,
+    instance::jobs::import_export::ImportExportJobs,
+    instance::{manager::InstanceManager, state::InstanceStore},
+    routes::http::policy::OriginPolicy,
     runtime::docker::DockerRuntime,
 };
 
@@ -36,22 +36,22 @@ pub struct AppState {
 pub struct AppStateData {
     pub config: Arc<RuntimeConfig>,
     pub config_path: PathBuf,
-    pub config_patches: crate::api::system::config::ConfigPatchCoordinator,
+    pub config_patches: crate::subsystems::system::config::ConfigPatchCoordinator,
     pub api_token: ApiToken,
     pub instances: InstanceStore,
     pub manager: InstanceManager,
-    pub placements: crate::placement::PlacementRepository,
-    pub instance_locks: crate::instances::locks::InstanceLocks,
+    pub placements: crate::instance::placement::PlacementRepository,
+    pub instance_locks: crate::instance::locks::InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
-    pub import_uploads: crate::api::import_export::ImportUploadService,
-    pub api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
-    pub install_progress: crate::api::instances::progress::InstallProgressStore,
-    pub artifact_downloads: crate::api::artifacts::ArtifactDownloadTickets,
-    pub resource_cache: crate::api::monitoring::resources::ResourceCache,
-    pub soft_disk_limiter: crate::disk::soft::SoftDiskLimiter,
-    pub monitoring_cache: crate::api::monitoring::websocket::MonitoringSnapshotCache,
-    pub instance_runtime_cache: crate::api::instances::InstanceRuntimeInfoCache,
+    pub import_uploads: crate::subsystems::import_export::ImportUploadService,
+    pub api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
+    pub install_progress: crate::subsystems::instances::progress::InstallProgressStore,
+    pub artifact_downloads: crate::subsystems::artifacts::ArtifactDownloadTickets,
+    pub resource_cache: crate::subsystems::monitoring::resources::ResourceCache,
+    pub soft_disk_limiter: crate::instance::disk::soft::SoftDiskLimiter,
+    pub monitoring_cache: crate::subsystems::monitoring::websocket::MonitoringSnapshotCache,
+    pub instance_runtime_cache: crate::subsystems::instances::InstanceRuntimeInfoCache,
     pub daemon_shutdown: DaemonShutdown,
 }
 
@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn compatibility_exports_share_the_same_shutdown_coordinator() {
         let shutdown = super::DaemonShutdown::default();
-        let http: crate::api::http::state::DaemonShutdown = shutdown.clone();
-        let router: crate::api::http::router::DaemonShutdown = http.clone();
+        let http: crate::routes::http::state::DaemonShutdown = shutdown.clone();
+        let router: crate::routes::http::router::DaemonShutdown = http.clone();
         let permit = router.try_admit_mutation().unwrap();
         assert_eq!(shutdown.active_mutation_count(), 1);
 
@@ -201,7 +201,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (state, _directory) = crate::api::test_support::database(settings).await;
+        let (state, _directory) = crate::subsystems::test_support::database(settings).await;
         let other = state.clone();
         assert!(Arc::ptr_eq(&state.config, &other.config));
         let first = state.gateway_supervisor.tenant_sessions().open("tenant-a");

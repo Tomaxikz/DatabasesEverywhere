@@ -1,7 +1,7 @@
 use sqlx::Row;
 
 use super::{InstanceRepository, RepositoryError};
-use crate::shared::protocol::Protocol;
+use crate::utils::protocol::Protocol;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompatibilityAttestation {
@@ -90,7 +90,7 @@ impl InstanceRepository {
         .bind(&attestation.version)
         .bind(attestation.compatible)
         .bind(&attestation.diagnostic)
-        .bind(crate::shared::time::now_rfc3339())
+        .bind(crate::utils::time::now_rfc3339())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -132,9 +132,9 @@ fn compatibility_from_row(
 mod tests {
     use super::*;
     use crate::{
-        instances::{metadata::InstanceMetadata, test_support},
-        shared::backend::BackendEndpoint,
+        instance::{metadata::InstanceMetadata, test_support},
         storage::sqlite,
+        utils::backend::BackendEndpoint,
     };
 
     #[tokio::test]

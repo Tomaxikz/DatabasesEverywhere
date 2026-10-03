@@ -1,4 +1,5 @@
 use super::*;
+use crate::databases::engine::TenantAuthHardening;
 use futures::FutureExt;
 use std::collections::HashSet;
 
@@ -238,7 +239,9 @@ pub(super) async fn reconcile_container_event(
         .placements
         .get(&event.instance_id)
         .await?
-        .is_some_and(|runtime| runtime.deployment_mode == crate::placement::DeploymentMode::Shared)
+        .is_some_and(|runtime| {
+            runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared
+        })
     {
         return reconcile_shared_event(state, event).await;
     }
@@ -247,10 +250,9 @@ pub(super) async fn reconcile_container_event(
 }
 
 pub(super) async fn reconcile_snapshot(state: &AppState) {
-    let instances =
-        state.instances.list().await.into_iter().filter(|metadata| {
-            metadata.deployment_mode == crate::placement::DeploymentMode::Dedicated
-        });
+    let instances = state.instances.list().await.into_iter().filter(|metadata| {
+        metadata.deployment_mode == crate::instance::placement::DeploymentMode::Dedicated
+    });
     let outcomes = futures::stream::iter(instances)
         .map(|metadata| async move {
             reconcile_container_state(state, &metadata.instance_id, None).await
@@ -281,7 +283,7 @@ pub(super) async fn reconcile_container_state(
     let Some(metadata) = state.instances.get(instance_id).await else {
         return Ok(());
     };
-    if metadata.deployment_mode == crate::placement::DeploymentMode::Shared {
+    if metadata.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
         tracing::error!(
             event = "audit shared_tenant_container_reconcile_blocked",
             instance_id,
@@ -319,7 +321,7 @@ pub(super) async fn reconcile_container_state(
         return Ok(());
     }
 
-    if metadata.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped {
+    if metadata.desired_state == crate::instance::metadata::DesiredInstanceState::Stopped {
         return enforce_stopped_state(state, metadata, event).await;
     }
 
@@ -446,7 +448,7 @@ async fn invalidate_instance_caches(state: &AppState, instance_id: &str) {
 
 async fn stop_active_quarantined_instance(
     state: &AppState,
-    metadata: &crate::instances::metadata::InstanceMetadata,
+    metadata: &crate::instance::metadata::InstanceMetadata,
 ) -> anyhow::Result<()> {
     match state
         .docker
@@ -474,7 +476,7 @@ async fn stop_active_quarantined_instance(
 
 async fn enforce_stopped_state(
     state: &AppState,
-    metadata: crate::instances::metadata::InstanceMetadata,
+    metadata: crate::instance::metadata::InstanceMetadata,
     event: Option<ManagedContainerEvent>,
 ) -> anyhow::Result<()> {
     let previous_status = metadata.status;
@@ -497,7 +499,7 @@ async fn enforce_stopped_state(
 
 async fn container_activation_observed(
     state: &AppState,
-    metadata: &crate::instances::metadata::InstanceMetadata,
+    metadata: &crate::instance::metadata::InstanceMetadata,
     event: Option<&ManagedContainerEvent>,
 ) -> anyhow::Result<bool> {
     if let Some(event) = event {
@@ -519,9 +521,9 @@ async fn container_activation_observed(
 
 async fn prepare_activated_instance(
     state: &AppState,
-    metadata: &crate::instances::metadata::InstanceMetadata,
+    metadata: &crate::instance::metadata::InstanceMetadata,
 ) -> Option<String> {
-    crate::instances::sessions::fence(
+    crate::instance::sessions::fence(
         &state.instances,
         &state.gateway_supervisor.tenant_sessions(),
         &metadata.instance_id,
@@ -557,9 +559,9 @@ fn is_active_container_status(status: DockerContainerStatus) -> bool {
 
 async fn probe_after_activation(
     state: &AppState,
-    metadata: &crate::instances::metadata::InstanceMetadata,
+    metadata: &crate::instance::metadata::InstanceMetadata,
 ) -> Result<(), String> {
-    let outcome = crate::compatibility::probe_instance_compatibility(
+    let outcome = crate::instance::compatibility::probe_instance_compatibility(
         &state.manager,
         &state.docker,
         metadata,
@@ -578,17 +580,17 @@ async fn probe_after_activation(
 
 async fn harden_instance_auth(
     state: &AppState,
-    metadata: &crate::instances::metadata::InstanceMetadata,
+    metadata: &crate::instance::metadata::InstanceMetadata,
 ) -> Result<(), String> {
-    match metadata.protocol {
-        Protocol::Postgres => {
+    match metadata.protocol.engine().tenant_auth_hardening() {
+        TenantAuthHardening::Postgres => {
             let password = metadata.tenant_password.as_deref().ok_or_else(|| {
                 "the encrypted PostgreSQL tenant credential is missing".to_string()
             })?;
             let admin_password = metadata.postgres_admin_password.as_deref().ok_or_else(|| {
                 "the encrypted PostgreSQL administrator credential is missing".to_string()
             })?;
-            crate::api::instances::create::harden_postgres_instance_auth(
+            crate::subsystems::instances::create::harden_postgres_instance_auth(
                 state,
                 &metadata.instance_id,
                 &metadata.database.name,
@@ -600,7 +602,7 @@ async fn harden_instance_auth(
             .map(|_| ())
             .map_err(|error| error.to_string())
         }
-        Protocol::Mysql => {
+        TenantAuthHardening::Mysql => {
             let password = metadata
                 .tenant_password
                 .as_deref()
@@ -608,7 +610,7 @@ async fn harden_instance_auth(
             let root_password = metadata.mysql_root_password.as_deref().ok_or_else(|| {
                 "the encrypted MySQL maintenance credential is missing".to_string()
             })?;
-            crate::api::instances::create::harden_mysql_tenant_auth(
+            crate::subsystems::instances::create::harden_mysql_tenant_auth(
                 state,
                 &metadata.instance_id,
                 &metadata.database.username,
@@ -618,7 +620,7 @@ async fn harden_instance_auth(
             .await
             .map_err(|error| error.to_string())
         }
-        _ => Ok(()),
+        TenantAuthHardening::None => Ok(()),
     }
 }
 

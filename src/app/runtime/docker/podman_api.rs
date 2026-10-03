@@ -4,7 +4,7 @@ use reqwest::{Client, Response, Url, redirect::Policy};
 use serde::Serialize;
 
 use super::{DockerError, container_config::mib_to_bytes};
-use crate::shared::{limits::validate_runtime_limits, redaction};
+use crate::utils::{limits::validate_runtime_limits, redaction};
 
 const API_VERSION: &str = "v4.0.0";
 const API_TIMEOUT: Duration = Duration::from_secs(120);
@@ -40,6 +40,7 @@ pub(super) async fn update_limits(
     let url = update_limits_url(container_name)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let client = Client::builder()
+        .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
         .no_proxy()
         .redirect(Policy::none())
         .timeout(API_TIMEOUT)

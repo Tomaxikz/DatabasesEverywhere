@@ -8,7 +8,7 @@ use bollard::models::HostConfig;
 use crate::{
     config::{DaemonConfig, DaemonEngine},
     runtime::socket_bridge::is_valid_bridge,
-    shared::backend::{CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH},
+    utils::backend::{CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH},
 };
 
 use super::{DockerInstanceSpec, engine::is_rootless_podman_socket};
@@ -131,14 +131,11 @@ impl DockerSecurityPolicy {
         if spec.socket_bridges.is_empty() {
             return Ok(());
         }
-        if !matches!(
-            spec.protocol,
-            crate::shared::protocol::Protocol::Clickhouse
-                | crate::shared::protocol::Protocol::Qdrant
-        ) || spec
-            .socket_bridges
-            .iter()
-            .any(|bridge| !is_valid_bridge(bridge))
+        if !spec.protocol.engine().allows_socket_bridges()
+            || spec
+                .socket_bridges
+                .iter()
+                .any(|bridge| !is_valid_bridge(bridge))
         {
             return Err(DockerSecurityError::InvalidSocketBridge);
         }
@@ -306,7 +303,7 @@ pub enum DockerSecurityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime::docker::DockerEnv, shared::protocol::Protocol};
+    use crate::{runtime::docker::DockerEnv, utils::protocol::Protocol};
     use secrecy::SecretString;
 
     #[test]

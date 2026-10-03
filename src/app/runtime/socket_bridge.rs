@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 
-use crate::{bins, config::PathConfig, shared::backend::CONTAINER_SOCKET_DIRECTORY};
+use crate::{bins, config::PathConfig, utils::backend::CONTAINER_SOCKET_DIRECTORY};
 
 pub const SOCKET_BRIDGE_SUBCOMMAND: &str = "__socket-bridge-supervisor";
 const HELPER_DIRECTORY: &str = "runtime";

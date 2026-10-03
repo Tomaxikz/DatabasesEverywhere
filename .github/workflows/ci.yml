@@ -60,7 +60,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
           components: rustfmt, clippy
 
       - name: Install cargo-machete
@@ -92,7 +92,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
@@ -117,7 +117,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -184,7 +184,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -227,7 +227,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -266,7 +266,7 @@ jobs:
         if: matrix.language == 'rust'
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1

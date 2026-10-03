@@ -3,7 +3,7 @@ use std::path::{Component, Path};
 use bollard::{API_DEFAULT_VERSION, ClientVersion, Docker, models::SystemVersion};
 
 use crate::config::{DaemonConfig, DaemonEngine};
-use crate::shared::ownership::HostOwner;
+use crate::io::ownership::HostOwner;
 
 const API_TIMEOUT_SECONDS: u64 = 120;
 const PODMAN_SYSTEM_SOCKET: &str = "/run/podman/podman.sock";

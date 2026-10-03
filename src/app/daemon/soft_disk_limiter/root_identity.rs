@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::disk::soft::planner::RootIdentity;
+use crate::instance::disk::soft::planner::RootIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObservationDisposition {
@@ -86,7 +86,7 @@ pub(super) fn watch_fingerprint(
         digest.update(identity.device.to_le_bytes());
         digest.update(identity.inode.to_le_bytes());
     }
-    crate::shared::hex::encode_lower(&digest.finalize())
+    crate::utils::hex::encode_lower(&digest.finalize())
 }
 
 #[cfg(test)]
@@ -98,7 +98,7 @@ mod tests {
     };
     use super::*;
     use crate::{
-        disk::{
+        instance::disk::{
             soft::{
                 HybridScanExecution, PerformedScanKind, ScanOutcome, SoftDiskSnapshot,
                 SoftDiskTarget,
@@ -107,7 +107,7 @@ mod tests {
             },
             usage::DirectoryUsage,
         },
-        shared::protocol::Protocol,
+        utils::protocol::Protocol,
     };
     use std::{
         path::PathBuf,

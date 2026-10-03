@@ -6,8 +6,8 @@ use super::{
     listener_io::{MongodbTunnel, accept_direct_tls, proxy_mongodb_session},
 };
 use crate::{
+    gateway::protocols::mongodb,
     gateway::{resolver::RouteResolver, tunnel},
-    protocols::mongodb,
 };
 
 const MAX_HELLO_MESSAGES: usize = 8;

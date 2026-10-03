@@ -20,29 +20,21 @@ use serde::Deserialize;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 use crate::{
-    api::{
-        http::{response::ApiError, router::build_router},
-        instances::progress::InstallProgressStore,
-    },
     auth::api_token::ApiToken,
     config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
-    constants::{MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
-    disk::DiskLimiter,
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
         supervisor::GatewaySupervisor,
     },
-    instances::{
+    instance::disk::DiskLimiter,
+    instance::jobs::import_export::ImportExportJobs,
+    instance::{
         manager::InstanceManager, metadata::InstanceStatus, paths::InstancePaths, reconcile,
         state::InstanceStore,
     },
-    jobs::import_export::ImportExportJobs,
+    routes::http::{response::ApiError, router::build_router},
     runtime::docker::{
         CpuBurstPolicyStatus, DockerContainerStatus, DockerRuntime, ManagedContainerEvent,
-    },
-    shared::{
-        ids::validate_instance_id, images::has_sha256_digest, limits::mib_to_bytes,
-        logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
     },
     state::{AppState, AppStateData},
     storage::{
@@ -50,6 +42,12 @@ use crate::{
         import_uploads::ImportUploadRepository,
         repositories::{InstanceRepository, ProtectedSecretField},
         sqlite,
+    },
+    subsystems::instances::progress::InstallProgressStore,
+    utils::constants::{MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
+    utils::{
+        ids::validate_instance_id, images::has_sha256_digest, limits::mib_to_bytes,
+        logs::truncate_log_tail, protocol::Protocol, time::now_rfc3339,
     },
 };
 
@@ -72,8 +70,8 @@ pub(crate) mod setup;
 mod soft_disk_limiter;
 mod startup;
 
-use crate::placement::lifecycle::*;
-use crate::placement::tenant::recovery::*;
+use crate::instance::placement::lifecycle::*;
+use crate::instance::placement::tenant::recovery::*;
 use admission::ApiConnectionAcceptor;
 use boot_recovery::*;
 use container_events::*;

@@ -16,7 +16,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use super::{listener_io::accept_direct_tls, *};
-use crate::{protocols::qdrant, shared::backend::BackendEndpoint};
+use crate::{gateway::protocols::qdrant, utils::backend::BackendEndpoint};
 
 impl GatewayStream {
     fn alpn_protocol(&self) -> Option<&[u8]> {
@@ -408,7 +408,7 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
     match endpoint {
         BackendEndpoint::UnixSocket { socket_path } => {
             let socket_path =
-                crate::shared::backend::qdrant_http_socket_path(std::path::Path::new(&socket_path))
+                crate::utils::backend::qdrant_http_socket_path(std::path::Path::new(&socket_path))
                     .ok_or(ListenerError::InvalidQdrantBackend)?;
             Ok(BackendEndpoint::UnixSocket {
                 socket_path: socket_path.display().to_string(),
@@ -422,8 +422,8 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
 mod tests {
     use super::*;
     use crate::{
-        api::monitoring::resources::ResourceCache, instances::state::InstanceStore,
-        shared::protocol::Protocol,
+        instance::state::InstanceStore, subsystems::monitoring::resources::ResourceCache,
+        utils::protocol::Protocol,
     };
 
     #[test]
@@ -586,9 +586,9 @@ mod tests {
 
     fn qdrant_metadata(
         grpc_socket: &std::path::Path,
-    ) -> crate::instances::metadata::InstanceMetadata {
+    ) -> crate::instance::metadata::InstanceMetadata {
         let mut metadata =
-            crate::instances::test_support::metadata("inst_qdrant_rest", Protocol::Qdrant);
+            crate::instance::test_support::metadata("inst_qdrant_rest", Protocol::Qdrant);
         metadata.public.host = "db.example.test".to_string();
         metadata.public.port = 6334;
         metadata.backend = BackendEndpoint::UnixSocket {

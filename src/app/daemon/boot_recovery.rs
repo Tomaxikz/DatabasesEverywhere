@@ -24,10 +24,10 @@ pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result
 
 async fn contain_runtime_without_restart_policy(
     state: &AppState,
-    runtime: &crate::placement::EngineRuntime,
+    runtime: &crate::instance::placement::EngineRuntime,
 ) {
-    if runtime.deployment_mode == crate::placement::DeploymentMode::Shared {
-        crate::placement::containment::contain_locked(
+    if runtime.deployment_mode == crate::instance::placement::DeploymentMode::Shared {
+        crate::instance::placement::containment::contain_locked(
             state,
             runtime,
             "engine restart policy could not be repaired",
@@ -37,14 +37,14 @@ async fn contain_runtime_without_restart_policy(
         return;
     }
     if let Some(mut metadata) = state.instances.get(&runtime.runtime_id).await {
-        crate::instances::sessions::fence(
+        crate::instance::sessions::fence(
             &state.instances,
             &state.gateway_supervisor.tenant_sessions(),
             &metadata.instance_id,
         )
         .await;
         metadata.status = InstanceStatus::Failed;
-        metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
+        metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
         if let Err(error) = state.manager.upsert_fenced(metadata).await {
             tracing::error!(runtime_id = %runtime.runtime_id, %error,
                 "could not persist stopped intent after restart-policy repair failed");
@@ -72,13 +72,13 @@ async fn cleanup_old_console_logs(state: &AppState) {
     };
     let clickhouse_runtimes = runtimes
         .into_iter()
-        .filter(|runtime| runtime.protocol == Protocol::Clickhouse);
+        .filter(|runtime| runtime.protocol.engine().has_hosted_config());
     for runtime in clickhouse_runtimes {
         let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
         let Ok(Some(current)) = state.placements.get(&runtime.runtime_id).await else {
             continue;
         };
-        if current.status != crate::placement::EngineRuntimeStatus::Running {
+        if current.status != crate::instance::placement::EngineRuntimeStatus::Running {
             continue;
         }
         let log_policy_is_current = matches!(
@@ -134,7 +134,8 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
             "shared pool background startup failed; API remains available and affected tenant routes remain closed"
         );
     }
-    let resumed_shared_deletions = crate::api::instances::recover_shared_deletions(&state).await;
+    let resumed_shared_deletions =
+        crate::subsystems::instances::recover_shared_deletions(&state).await;
     if resumed_shared_deletions > 0 {
         tracing::info!(
             resumed_shared_deletions,
@@ -145,7 +146,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
         return;
     }
 
-    let compatibility = crate::compatibility::sync_compatibility(&state).await;
+    let compatibility = crate::instance::compatibility::sync_compatibility(&state).await;
     let shared_compatibility = sync_shared_compatibility(&state).await;
     cleanup_old_console_logs(&state).await;
     if compatibility.failed == 0 && shared_compatibility.failed == 0 {
@@ -262,7 +263,8 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
         return;
     }
 
-    let mysql_auth_hardening = crate::api::instances::create::harden_mysql_accounts(&state).await;
+    let mysql_auth_hardening =
+        crate::subsystems::instances::create::harden_mysql_accounts(&state).await;
     for failure in &mysql_auth_hardening.failures {
         tracing::debug!(
             instance_id = %failure.instance_id,
@@ -294,7 +296,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
     }
 
     let shared_disk_failures =
-        crate::api::monitoring::resources::prime_shared_disk_quotas(&state).await;
+        crate::subsystems::monitoring::resources::prime_shared_disk_quotas(&state).await;
     if shared_disk_failures == 0 {
         tracing::info!(
             "shared tenant disk quotas were measured and enforced before gateway publication"
@@ -310,7 +312,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
     }
 
     let active_migration_fences =
-        match crate::api::instances::fence_active_deployment_migration_routes(&state).await {
+        match crate::subsystems::instances::fence_active_deployment_migration_routes(&state).await {
             Ok(active) => active,
             Err(error) => {
                 tracing::error!(
@@ -345,7 +347,7 @@ pub(super) async fn finish_runtime_boot(state: AppState) {
         return;
     }
     log_gateway_listeners(&state.config);
-    crate::api::backups::start_scheduler(state);
+    crate::subsystems::backups::start_scheduler(state);
 }
 
 pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, usize) {
@@ -354,7 +356,7 @@ pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, us
         .list()
         .await
         .into_iter()
-        .filter(|metadata| metadata.protocol == Protocol::Qdrant)
+        .filter(|metadata| metadata.protocol.engine().cleans_stale_import_bridges())
         .map(|metadata| metadata.instance_id)
         .collect::<Vec<_>>();
     let outcomes = futures::stream::iter(instance_ids)
@@ -363,10 +365,12 @@ pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, us
             let Some(metadata) = state.instances.get(&instance_id).await else {
                 return Ok::<_, (String, ApiError)>(false);
             };
-            if metadata.protocol != Protocol::Qdrant || metadata.status != InstanceStatus::Running {
+            if !metadata.protocol.engine().cleans_stale_import_bridges()
+                || metadata.status != InstanceStatus::Running
+            {
                 return Ok(false);
             }
-            crate::api::import_export::remote::cleanup_stale_bridge(state, &instance_id)
+            crate::subsystems::import_export::remote::cleanup_stale_bridge(state, &instance_id)
                 .await
                 .map(|()| true)
                 .map_err(|error| (instance_id, error))
@@ -409,8 +413,8 @@ pub(super) async fn quarantine_interrupted_jobs(
             continue;
         };
         metadata.status = InstanceStatus::Quarantined;
-        metadata.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-        metadata.updated_at = crate::jobs::import_export::now_rfc3339();
+        metadata.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+        metadata.updated_at = crate::instance::jobs::import_export::now_rfc3339();
         manager
             .quarantine(
                 metadata.clone(),
@@ -499,7 +503,7 @@ pub(super) async fn quarantine_restore_workspaces(
             continue;
         };
         let already_safe = instance.status == InstanceStatus::Quarantined
-            && instance.desired_state == crate::instances::metadata::DesiredInstanceState::Stopped;
+            && instance.desired_state == crate::instance::metadata::DesiredInstanceState::Stopped;
         if already_safe {
             // Preserve older causes, but also record this currently observed
             // rollback blocker even if the target was already quarantined.
@@ -512,8 +516,8 @@ pub(super) async fn quarantine_restore_workspaces(
             continue;
         }
         instance.status = InstanceStatus::Quarantined;
-        instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-        instance.updated_at = crate::jobs::import_export::now_rfc3339();
+        instance.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+        instance.updated_at = crate::instance::jobs::import_export::now_rfc3339();
         manager
             .quarantine(
                 instance,
@@ -544,7 +548,7 @@ pub(super) fn workspace_instance_id(name: &std::ffi::OsStr) -> Option<String> {
     if parsed.hyphenated().to_string() != uuid {
         return None;
     }
-    crate::shared::ids::validate_instance_id(instance_id).ok()?;
+    crate::utils::ids::validate_instance_id(instance_id).ok()?;
     Some(instance_id.to_string())
 }
 
@@ -617,8 +621,8 @@ pub(super) async fn quarantine_import_manifests(
         }
         if instance.status != InstanceStatus::Quarantined {
             instance.status = InstanceStatus::Quarantined;
-            instance.desired_state = crate::instances::metadata::DesiredInstanceState::Stopped;
-            instance.updated_at = crate::jobs::import_export::now_rfc3339();
+            instance.desired_state = crate::instance::metadata::DesiredInstanceState::Stopped;
+            instance.updated_at = crate::instance::jobs::import_export::now_rfc3339();
             manager
                 .quarantine(
                     instance,
@@ -650,7 +654,7 @@ async fn read_recovery_identity(
 ) -> anyhow::Result<(RetainedImportRecoveryIdentity, Protocol)> {
     let manifest_path = path.to_path_buf();
     let contents = tokio::task::spawn_blocking(move || {
-        crate::shared::files::read_bounded_private_file(&manifest_path, max_manifest_bytes)
+        crate::io::files::read_bounded_private_file(&manifest_path, max_manifest_bytes)
     })
     .await
     .with_context(|| format!("failed to join recovery manifest read {}", path.display()))?
@@ -670,7 +674,7 @@ async fn read_recovery_identity(
             path.display()
         );
     }
-    crate::shared::ids::validate_instance_id(&identity.instance_id)
+    crate::utils::ids::validate_instance_id(&identity.instance_id)
         .with_context(|| format!("unsafe instance id in {}", path.display()))?;
     let manifest_protocol = identity
         .protocol
@@ -816,14 +820,5 @@ pub(super) fn is_canonical_uuid(value: &str) -> bool {
 }
 
 pub(super) fn recovery_matches_protocol(kind: &str, protocol: Protocol) -> bool {
-    match kind {
-        "logical_remote_import" => !matches!(
-            protocol,
-            Protocol::Redis | Protocol::Valkey | Protocol::Qdrant
-        ),
-        "redis_remote_import" => protocol == Protocol::Redis,
-        "valkey_remote_import" => protocol == Protocol::Valkey,
-        "qdrant_remote_import" => protocol == Protocol::Qdrant,
-        _ => false,
-    }
+    kind == protocol.engine().remote_import_recovery_kind()
 }

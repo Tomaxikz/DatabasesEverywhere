@@ -23,7 +23,10 @@ use tokio::{
 };
 
 use super::{DockerError, DockerRuntime, ExecRecovery, command::shell_command};
-use crate::shared::{files::sync_directory, logs::summarize_failure_logs, protocol::Protocol};
+use crate::{
+    io::files::sync_directory,
+    utils::{logs::summarize_failure_logs, protocol::Protocol},
+};
 
 const EXEC_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const EXEC_STREAM_DECODER_CAPACITY: usize = 64 * 1024;
@@ -591,7 +594,7 @@ impl StderrTail {
             }
         }
         let decoded = String::from_utf8_lossy(&self.bytes);
-        let redacted = crate::shared::redaction::redact_exact_secrets(&decoded, secret_values);
+        let redacted = crate::utils::redaction::redact_exact_secrets(&decoded, secret_values);
         summarize_failure_logs(&redacted, EXEC_STREAM_FAILURE_DIAGNOSTIC_CHARS)
     }
 }

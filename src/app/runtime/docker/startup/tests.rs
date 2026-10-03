@@ -13,9 +13,9 @@ use tokio::net::UnixListener;
 use super::*;
 use crate::{
     config::{DaemonConfig, DaemonEngine},
-    constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
-    placement::{PlacementRepository, test_support},
+    instance::placement::{PlacementRepository, test_support},
     storage::{repositories::InstanceRepository, sqlite, test_support::seed_dedicated_instance},
+    utils::constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
 };
 
 const ID: &str = "inst_guard";

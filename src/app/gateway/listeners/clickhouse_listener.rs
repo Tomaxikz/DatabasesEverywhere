@@ -6,10 +6,10 @@ use super::{
     listener_io::{accept_direct_tls, read_clickhouse_hello, read_http_headers},
 };
 use crate::{
+    gateway::protocols::clickhouse,
     gateway::{resolver::RouteResolver, tunnel},
-    instances::state::DatabaseRouteResolution,
-    protocols::clickhouse,
-    shared::backend::BackendEndpoint,
+    instance::state::DatabaseRouteResolution,
+    utils::backend::BackendEndpoint,
 };
 
 pub(super) async fn handle_clickhouse_client(
@@ -126,7 +126,7 @@ pub(super) async fn handle_clickhouse_http(
 fn clickhouse_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, ListenerError> {
     match endpoint {
         BackendEndpoint::UnixSocket { socket_path } => {
-            let socket_path = crate::shared::backend::clickhouse_http_socket_path(
+            let socket_path = crate::utils::backend::clickhouse_http_socket_path(
                 std::path::Path::new(&socket_path),
             )
             .ok_or(ListenerError::InvalidClickhouseBackend)?;

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use databases_everywhere::{api::system::API_VERSION, auth::scopes};
+use databases_everywhere::{auth::scopes, subsystems::system::API_VERSION};
 use yaml_serde::Value;
 
 const INSTANCE_PATHS: &[&str] = &[
@@ -64,7 +64,71 @@ const RETIRED_PATHS: &[&str] = &[
 ];
 
 const METHODS: &[&str] = &["get", "post", "patch", "delete"];
-const ROUTE_SOURCES: &[&str] = &[include_str!("../src/app/api/http/router.rs")];
+const ROUTE_SOURCES: &[&str] = &[
+    include_str!("../src/app/routes/api/admin/backups/run.rs"),
+    include_str!("../src/app/routes/api/admin/backups/status.rs"),
+    include_str!("../src/app/routes/api/admin/images/pull.rs"),
+    include_str!("../src/app/routes/api/admin/recovery/failed_jobs.rs"),
+    include_str!("../src/app/routes/api/admin/resources/mod.rs"),
+    include_str!("../src/app/routes/api/admin/resources/summary.rs"),
+    include_str!("../src/app/routes/api/heartbeat.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/activity/history.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/activity/mod.rs"),
+    include_str!(
+        "../src/app/routes/api/instances/_instance_id_/artifacts/_artifact_id_/download.rs"
+    ),
+    include_str!("../src/app/routes/api/instances/_instance_id_/artifacts/_artifact_id_/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/artifacts/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/artifacts/retention.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/backups/_backup_id_/contents.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/backups/_backup_id_/download.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/backups/_backup_id_/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/backups/_backup_id_/restore.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/backups/mod.rs"),
+    include_str!(
+        "../src/app/routes/api/instances/_instance_id_/deployment_migrations/_migration_id_.rs"
+    ),
+    include_str!("../src/app/routes/api/instances/_instance_id_/deployment_migrations/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/export.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/image.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/import/mod.rs"),
+    include_str!(
+        "../src/app/routes/api/instances/_instance_id_/import/uploads/_upload_id_/catalog.rs"
+    ),
+    include_str!("../src/app/routes/api/instances/_instance_id_/import/uploads/_upload_id_/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/import/uploads/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/import_export/jobs/_job_id_.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/import_export/jobs/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/limits.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/logs.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/mod.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/password.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/power.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/reconcile.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/recovery/jobs/_job_id_/retry.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/recovery/restore.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/resources.rs"),
+    include_str!("../src/app/routes/api/instances/_instance_id_/status.rs"),
+    include_str!("../src/app/routes/api/instances/mod.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/backups.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/image.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/instances.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/logs.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/mod.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/power.rs"),
+    include_str!("../src/app/routes/api/pools/_runtime_id_/status.rs"),
+    include_str!("../src/app/routes/api/pools/mod.rs"),
+    include_str!("../src/app/routes/api/system/config.rs"),
+    include_str!("../src/app/routes/api/system/import_export_scheduler/recommendation.rs"),
+    include_str!("../src/app/routes/api/system/mod.rs"),
+    include_str!("../src/app/routes/api/ws_token.rs"),
+    include_str!("../src/app/routes/metrics.rs"),
+    include_str!("../src/app/routes/ws/instances/_instance_id_/import_export.rs"),
+    include_str!("../src/app/routes/ws/instances/_instance_id_/logs.rs"),
+    include_str!("../src/app/routes/ws/monitoring.rs"),
+    include_str!("../src/app/routes/ws/pools/_runtime_id_/logs.rs"),
+    include_str!("../src/app/routes/ws/pools/_runtime_id_/monitoring.rs"),
+];
 
 fn router_paths(source: &str) -> HashSet<&str> {
     source

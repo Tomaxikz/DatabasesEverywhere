@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 
 use crate::{
+    io::files::atomic_write_private,
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
     runtime::socket_bridge::{SocketBridge, loopback_target},
-    shared::{
+    utils::{
         backend::{
             CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH, clickhouse_http_socket,
             container_backend_socket_path,
         },
-        files::atomic_write_private,
         protocol::Protocol,
     },
 };

@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::shared::files::sync_directory;
-use crate::shared::protocol::Protocol;
+use crate::io::files::sync_directory;
+use crate::utils::protocol::Protocol;
 
 const MAX_ROOT_ENTRIES: usize = 4096;
 const MAX_TREE_ENTRIES: usize = 4096;
@@ -307,7 +307,7 @@ fn is_canonical_v4_uuid(value: &str) -> bool {
 }
 
 fn validate_manifest(entry: &RootEntry, recovery_id: &str) -> anyhow::Result<String> {
-    let contents = crate::shared::files::read_bounded_private_file(&entry.path, MAX_MANIFEST_BYTES)
+    let contents = crate::io::files::read_bounded_private_file(&entry.path, MAX_MANIFEST_BYTES)
         .with_context(|| format!("failed to read recovery manifest {}", entry.path.display()))?;
     let manifest: LogicalRecoveryManifest = serde_json::from_slice(&contents)
         .with_context(|| format!("invalid recovery manifest {}", entry.path.display()))?;
@@ -317,13 +317,13 @@ fn validate_manifest(entry: &RootEntry, recovery_id: &str) -> anyhow::Result<Str
             entry.path.display()
         );
     }
-    crate::shared::ids::validate_instance_id(&manifest.instance_id)
+    crate::utils::ids::validate_instance_id(&manifest.instance_id)
         .with_context(|| format!("unsafe instance id in {}", entry.path.display()))?;
     let protocol = manifest
         .protocol
         .parse::<Protocol>()
         .with_context(|| format!("invalid protocol in {}", entry.path.display()))?;
-    let extension = logical_dump_extension(protocol).ok_or_else(|| {
+    let extension = protocol.engine().logical_dump_extension().ok_or_else(|| {
         anyhow::anyhow!(
             "non-logical protocol in recovery manifest {}",
             entry.path.display()
@@ -339,17 +339,6 @@ fn validate_manifest(entry: &RootEntry, recovery_id: &str) -> anyhow::Result<Str
         );
     }
     Ok(expected)
-}
-
-fn logical_dump_extension(protocol: Protocol) -> Option<&'static str> {
-    match protocol {
-        Protocol::Postgres => Some("postgres.sql"),
-        Protocol::Mariadb => Some("mariadb.sql"),
-        Protocol::Mysql => Some("mysql.sql"),
-        Protocol::Mongodb => Some("mongodb.archive.gz"),
-        Protocol::Clickhouse => Some("clickhouse.sql"),
-        Protocol::Redis | Protocol::Valkey | Protocol::Qdrant => None,
-    }
 }
 
 fn validate_directory_tree(root: &Path, max_entries: usize) -> anyhow::Result<()> {
@@ -412,7 +401,7 @@ fn remove_allowlisted_file(entry: &RootEntry) -> anyhow::Result<bool> {
     if current.file_type().is_symlink() || !current.is_file() {
         return Ok(false);
     }
-    crate::shared::files::remove_private_file_durable(&entry.path)
+    crate::io::files::remove_private_file_durable(&entry.path)
         .with_context(|| format!("failed to remove orphan {}", entry.path.display()))?;
     Ok(true)
 }

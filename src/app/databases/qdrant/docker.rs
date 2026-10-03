@@ -7,7 +7,7 @@ use crate::{
         docker::{DockerEnv, DockerInstanceSpec, DockerMount},
         socket_bridge::{SocketBridge, loopback_target},
     },
-    shared::{
+    utils::{
         backend::{
             CONTAINER_SOCKET_DIRECTORY, SOCKET_BRIDGE_CONTAINER_PATH,
             container_backend_socket_path, qdrant_http_socket,

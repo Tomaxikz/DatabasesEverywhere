@@ -1,8 +1,8 @@
 use super::*;
-use crate::{config::Config, placement::ReserveTenant, shared::protocol::Protocol};
+use crate::{config::Config, instance::placement::ReserveTenant, utils::protocol::Protocol};
 
 fn runtime() -> EngineRuntime {
-    let mut runtime = crate::placement::test_support::runtime(
+    let mut runtime = crate::instance::placement::test_support::runtime(
         "pool_recover",
         Protocol::Clickhouse,
         "clickhouse:25.3",
@@ -51,10 +51,10 @@ async fn configured_volume_scan_budget_supports_more_than_4096_entries() {
 fn recovery_accepts_an_attested_pinned_image_without_accepting_drift() {
     let mut pool = runtime();
     pool.database_version = Some("25.3.1.2".into());
-    pool.compatibility = Some(crate::placement::RuntimeCompatibility {
+    pool.compatibility = Some(crate::instance::placement::RuntimeCompatibility {
         container_id: "container-one".into(),
         image_id: "sha256:installed".into(),
-        probe_revision: crate::compatibility::COMPATIBILITY_PROBE_REVISION,
+        probe_revision: crate::instance::compatibility::COMPATIBILITY_PROBE_REVISION,
     });
     assert!(recovery_image_matches(
         &pool,
@@ -119,7 +119,7 @@ fn recovery_pool_gates_preserve_unrelated_quarantines_and_stopped_intent() {
 }
 
 fn tenant(pool: &EngineRuntime) -> InstanceMetadata {
-    let mut metadata = crate::instances::test_support::metadata("tenant_recover", pool.protocol);
+    let mut metadata = crate::instance::test_support::metadata("tenant_recover", pool.protocol);
     metadata.owner = pool.owner.clone();
     metadata.deployment_mode = DeploymentMode::Shared;
     metadata.runtime_id = pool.runtime_id.clone();
@@ -162,7 +162,7 @@ fn tenant_recovery_requires_exact_reserved_identity_and_stopped_intent() {
 }
 
 async fn fixture() -> (AppState, tempfile::TempDir, sqlx::SqlitePool, EngineRuntime) {
-    let (state, dir) = crate::api::test_support::database(Config::default()).await;
+    let (state, dir) = crate::subsystems::test_support::database(Config::default()).await;
     let db = crate::storage::sqlite::connect(dir.path()).await.unwrap();
     let mut pool = runtime();
     let metadata = tenant(&pool);
@@ -316,8 +316,7 @@ async fn retained_restore_manifests_and_workspaces_block_recovery() {
     let path = tmp
         .join("import-export")
         .join(format!(".dbe-import-recovery-{uuid}.json"));
-    crate::shared::files::atomic_write_private(&path, br#"{"instance_id":"tenant_recover"}"#)
-        .unwrap();
+    crate::io::files::atomic_write_private(&path, br#"{"instance_id":"tenant_recover"}"#).unwrap();
     tokio::fs::create_dir(volumes.join(format!(".dbe-restore-pool_recover-{uuid}")))
         .await
         .unwrap();
@@ -353,7 +352,9 @@ async fn automatic_scan_finds_all_dead_pools_without_bypassing_ownership() {
     let (state, dir, _db, pool) = fixture().await;
     let mut other = runtime();
     other.runtime_id = "pool_failed".into();
-    other.owner = Some(crate::placement::test_support::owner("other-server"));
+    other.owner = Some(crate::instance::placement::test_support::owner(
+        "other-server",
+    ));
     other.status = EngineRuntimeStatus::Failed;
     other.desired_state = DesiredInstanceState::Running;
     state.placements.save(&other).await.unwrap();

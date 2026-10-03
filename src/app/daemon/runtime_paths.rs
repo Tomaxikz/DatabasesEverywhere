@@ -103,7 +103,7 @@ pub(super) fn prepare_rootless_paths(
             )
         })?;
         harden_runtime_dir(path)?;
-        crate::shared::ownership::allow_directory_traversal(path, daemon_uid, gid).with_context(
+        crate::io::ownership::allow_directory_traversal(path, daemon_uid, gid).with_context(
             || {
                 format!(
                     "failed to grant rootless Podman gid {gid} traversal access to {}",
@@ -552,7 +552,7 @@ pub(crate) async fn validate_runtime_support(config: &Config) -> anyhow::Result<
 }
 
 pub(crate) fn log_disk_mode(config: &mut Config) -> anyhow::Result<()> {
-    let detection = crate::disk::detect_disk_mode(&config.paths, config.disk.selection)
+    let detection = crate::instance::disk::detect_disk_mode(&config.paths, config.disk.selection)
         .context("failed to inspect configured filesystems for disk-limit selection")?;
     for filesystem in &detection.filesystems {
         tracing::info!(

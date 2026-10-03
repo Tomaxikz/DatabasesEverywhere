@@ -23,11 +23,18 @@ For cross-release packaging, `cargo b` runs the workspace's
 | Path | Contents |
 | --- | --- |
 | `src/main.rs` | Process entry point |
-| `src/app/` | Daemon code, grouped by API, engine, gateway, storage, and runtime |
-| `src/app/cli/` | Argument parsing, command dispatch, and process umask |
-| `src/app/daemon/` | Startup, host setup, maintenance, listeners, recovery, and shutdown |
+| `src/app/` | Daemon code, grouped by domain |
+| `src/app/commands/` | Argument parsing, one file per subcommand, process umask, and the benchmark |
+| `src/app/daemon/` | Startup, host setup, background services, recovery, and shutdown |
 | `src/app/state.rs` | Application composition, shared resources, and mutation draining |
-| `src/app/api/http/` | Route wiring and shared HTTP policy/error adapters |
+| `src/app/routes/` | HTTP layer: URL-mirroring route tree (`api/`, `metrics.rs`, `ws/`) plus `routes/http/` with the router, layers, policy and error adapters |
+| `src/app/subsystems/` | Request handlers and domain logic behind the routes (instances, pools, import/export, monitoring, artifacts, backups, system) |
+| `src/app/instance/` | Instance metadata and lifecycle, placement, disk limits, backups, jobs, compatibility, and monitoring |
+| `src/app/databases/` | Engine traits (`engine/`) and one folder per database engine implementing them |
+| `src/app/gateway/` | Client-facing listeners and wire protocols (`gateway/protocols/`) |
+| `src/app/runtime/` | Container runtime (Docker/Podman) executor |
+| `src/app/storage/` | SQLite repositories, secrets, and migrations |
+| `src/app/io/`, `src/app/utils/` | File/ownership/cgroup helpers and shared utilities and constants |
 | `config/`, `deploy/` | Example configuration and deployment files |
 | `docs/api/` | Integration guides and [OpenAPI](api/openapi.yml) |
 | `migrations/` | SQLite schema migrations |

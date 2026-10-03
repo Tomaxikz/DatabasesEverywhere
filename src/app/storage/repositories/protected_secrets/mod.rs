@@ -5,9 +5,9 @@ use sqlx::Row;
 use subtle::ConstantTimeEq;
 
 use crate::{
-    instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-    shared::time::now_rfc3339,
+    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
     storage::secrets::SecretStoreError,
+    utils::time::now_rfc3339,
 };
 
 use super::{InstanceRepository, RepositoryError, validate_metadata_schema};

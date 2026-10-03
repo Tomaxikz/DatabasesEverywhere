@@ -1,9 +1,9 @@
-use crate::protocols::qdrant::QdrantRouteKey;
+use crate::gateway::protocols::qdrant::QdrantRouteKey;
 use crate::{
-    api::monitoring::resources::{NetworkCounter, ResourceCache},
-    instances::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
-    monitoring::ActivityCounter,
-    shared::backend::BackendEndpoint,
+    instance::monitoring::ActivityCounter,
+    instance::state::{DatabaseRouteResolution, InstanceStore, MariadbRouteTarget, RouteTarget},
+    subsystems::monitoring::resources::{NetworkCounter, ResourceCache},
+    utils::backend::BackendEndpoint,
 };
 use secrecy::SecretString;
 use std::sync::Arc;
@@ -84,7 +84,7 @@ impl RouteResolver {
         let mut resolution = self.store.resolve_postgres(username, database).await;
         if matches!(resolution, DatabaseRouteResolution::NotFound)
             && should_retry_without_database(
-                crate::shared::protocol::Protocol::Postgres,
+                crate::utils::protocol::Protocol::Postgres,
                 username,
                 database,
             )
@@ -219,7 +219,7 @@ impl RouteResolver {
         let mut resolution = self.store.resolve_clickhouse(username, database).await;
         if matches!(resolution, DatabaseRouteResolution::NotFound)
             && should_retry_without_database(
-                crate::shared::protocol::Protocol::Clickhouse,
+                crate::utils::protocol::Protocol::Clickhouse,
                 username,
                 database,
             )
@@ -385,24 +385,22 @@ impl RouteResolver {
 /// application selects its real catalog. Keep those aliases in one resolver
 /// policy so native, HTTP, pooled, and future listener paths cannot diverge.
 fn should_retry_without_database(
-    protocol: crate::shared::protocol::Protocol,
+    protocol: crate::utils::protocol::Protocol,
     username: &str,
     database: Option<&str>,
 ) -> bool {
-    match protocol {
-        crate::shared::protocol::Protocol::Postgres => database == Some(username),
-        crate::shared::protocol::Protocol::Clickhouse => database == Some("default"),
-        _ => false,
-    }
+    protocol
+        .engine()
+        .is_driver_placeholder_database(username, database)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        instances::{metadata::InstanceMetadata, test_support},
-        placement::DeploymentMode,
-        shared::protocol::Protocol,
+        instance::placement::DeploymentMode,
+        instance::{metadata::InstanceMetadata, test_support},
+        utils::protocol::Protocol,
     };
 
     #[test]
@@ -439,7 +437,7 @@ mod tests {
         let resolver = RouteResolver::new(
             store.clone(),
             resources,
-            crate::protocols::qdrant::QdrantRouteKey::new(b"test-key"),
+            crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"test-key"),
             sessions.clone(),
         );
 
@@ -473,7 +471,7 @@ mod tests {
         metadata.runtime.container_name = "pool-mongo".to_string();
         metadata.database.name = "tenant_db".to_string();
         metadata.database.username = "tenant_user".to_string();
-        metadata.image = Some(crate::instances::metadata::InstanceImageStatus {
+        metadata.image = Some(crate::instance::metadata::InstanceImageStatus {
             current: Some("mongo:8".to_string()),
             configured: "mongo:8".to_string(),
             update_available: false,
