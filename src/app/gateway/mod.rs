@@ -1,6 +1,7 @@
 mod buffers;
 pub mod listeners;
 mod postgres_sessions;
+pub mod protocols;
 pub mod resolver;
 pub mod security;
 pub mod sessions;

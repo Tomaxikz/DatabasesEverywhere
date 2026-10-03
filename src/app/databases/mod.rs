@@ -1,4 +1,5 @@
 pub mod clickhouse;
+pub(crate) mod engine;
 pub mod mariadb;
 pub mod mongodb;
 pub mod mysql;

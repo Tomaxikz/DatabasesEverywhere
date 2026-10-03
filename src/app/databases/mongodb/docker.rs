@@ -4,7 +4,7 @@ use secrecy::SecretString;
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
+    utils::{backend::CONTAINER_SOCKET_DIRECTORY, protocol::Protocol},
 };
 
 pub struct MongodbAuth {

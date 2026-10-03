@@ -2,9 +2,9 @@ use secrecy::SecretString;
 
 use super::*;
 use crate::{
-    instances::{manager::InstanceManager, state::InstanceStore, test_support},
-    shared::{backend::BackendEndpoint, protocol::Protocol},
+    instance::{manager::InstanceManager, state::InstanceStore, test_support},
     storage::{secrets::is_encrypted, sqlite},
+    utils::{backend::BackendEndpoint, protocol::Protocol},
 };
 
 #[tokio::test]

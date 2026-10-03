@@ -4,7 +4,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::protocol::Protocol,
+    utils::protocol::Protocol,
 };
 
 struct TenantBootstrap<'a> {
@@ -157,7 +157,8 @@ fn build_spec(
 fn docker_native_password_hash(password: &str) -> String {
     format!(
         "*{}",
-        crate::protocols::mariadb::native_password_sha1_stage2_hex(password).to_ascii_uppercase()
+        crate::gateway::protocols::mariadb::native_password_sha1_stage2_hex(password)
+            .to_ascii_uppercase()
     )
 }
 

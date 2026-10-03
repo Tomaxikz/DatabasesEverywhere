@@ -116,9 +116,10 @@ impl DockerRuntime {
                 }
                 output.push_str(&chunk);
             }
-            let version = crate::compatibility::normalize_database_version(protocol, &output)
-                .ok_or("image version could not be parsed")?;
-            crate::compatibility::compatibility_profile(protocol, &version)
+            let version =
+                crate::instance::compatibility::normalize_database_version(protocol, &output)
+                    .ok_or("image version could not be parsed")?;
+            crate::instance::compatibility::compatibility_profile(protocol, &version)
                 .map_err(|error| error.to_string())?;
             Ok::<_, String>(version)
         })
@@ -192,7 +193,7 @@ fn probe_body(
         image: Some(image.into()),
         entrypoint: Some(vec!["sh".into(), "-c".into()]),
         cmd: Some(vec![
-            crate::compatibility::database_version_script(protocol).into(),
+            crate::instance::compatibility::database_version_script(protocol).into(),
         ]),
         labels: Some(HashMap::from([
             (PROBE_LABEL.into(), "true".into()),

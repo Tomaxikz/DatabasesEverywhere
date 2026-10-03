@@ -7,19 +7,19 @@ use crate::{
         security::GatewayConnectionLimiter,
         supervisor::GatewaySupervisor,
     },
-    instances::state::InstanceStore,
-    shared::protocol::Protocol,
+    instance::state::InstanceStore,
+    utils::protocol::Protocol,
 };
 
 const DEFAULT_MARIADB_CLI_IMAGE: &str = "mariadb:11.4";
 
 pub(super) fn assert_engine_tenant_rows(
-    rows: HashMap<String, crate::monitoring::EngineTotals>,
+    rows: HashMap<String, crate::instance::monitoring::EngineTotals>,
     expected: &[&str],
 ) {
     for username in expected {
         let mut tenant = rows.clone();
-        crate::monitoring::keep_tenant_rows(&mut tenant, [*username]);
+        crate::instance::monitoring::keep_tenant_rows(&mut tenant, [*username]);
         assert_eq!(
             tenant.keys().map(String::as_str).collect::<Vec<_>>(),
             [*username],
@@ -28,7 +28,7 @@ pub(super) fn assert_engine_tenant_rows(
     }
 
     let mut tenants = rows;
-    crate::monitoring::keep_tenant_rows(&mut tenants, expected.iter().copied());
+    crate::instance::monitoring::keep_tenant_rows(&mut tenants, expected.iter().copied());
     let mut actual = tenants.keys().map(String::as_str).collect::<Vec<_>>();
     actual.sort_unstable();
     let mut expected = expected.to_vec();
@@ -56,8 +56,8 @@ pub(super) async fn start_gateway(
     let gateway = tokio::spawn(async move {
         let resolver = RouteResolver::new(
             store,
-            crate::api::monitoring::resources::ResourceCache::default(),
-            crate::protocols::qdrant::QdrantRouteKey::new(b"mysql-wire-integration"),
+            crate::subsystems::monitoring::resources::ResourceCache::default(),
+            crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"mysql-wire-integration"),
             crate::gateway::sessions::TenantSessions::default(),
         );
         match protocol {

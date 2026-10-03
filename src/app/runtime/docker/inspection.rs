@@ -11,13 +11,12 @@ use secrecy::SecretString;
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    constants::docker::PROJECT_LABEL,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
         ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
-        startup_readiness_script,
     },
-    shared::protocol::Protocol,
+    utils::constants::docker::PROJECT_LABEL,
+    utils::protocol::Protocol,
 };
 
 const STARTUP_READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -241,7 +240,7 @@ impl DockerRuntime {
                         self.exec_readiness_probe(
                             protocol,
                             instance_id,
-                            startup_readiness_script(protocol),
+                            protocol.engine().startup_readiness_script(),
                         ),
                     )
                     .await
@@ -447,14 +446,18 @@ impl DockerRuntime {
         expected_source: &std::path::Path,
     ) -> Result<(), DockerError> {
         let actual_source = self
-            .container_bind_source(protocol, instance_id, protocol.container_data_target())
+            .container_bind_source(
+                protocol,
+                instance_id,
+                protocol.engine().container_data_target(),
+            )
             .await?;
         if actual_source.as_deref() == Some(expected_source) {
             return Ok(());
         }
         Err(DockerError::DiskBindSourceMismatch {
             instance_id: instance_id.to_string(),
-            destination: protocol.container_data_target().to_string(),
+            destination: protocol.engine().container_data_target().to_string(),
             expected_source: expected_source.display().to_string(),
             actual_source: actual_source
                 .map(|path| path.display().to_string())
@@ -566,8 +569,8 @@ impl DockerRuntime {
             .to_string();
         let mut stdout = super::CappedExecOutput::default();
         let mut stderr = super::CappedExecOutput::default();
-        let mut stdout_redactor = crate::shared::logs::LogRedactor::default();
-        let mut stderr_redactor = crate::shared::logs::LogRedactor::default();
+        let mut stdout_redactor = crate::utils::logs::LogRedactor::default();
+        let mut stderr_redactor = crate::utils::logs::LogRedactor::default();
         let mut stream = self.docker.logs(
             &name,
             Some(
@@ -856,7 +859,7 @@ mod logging_tests {
     use super::*;
     use crate::{
         config::{DaemonConfig, DaemonEngine},
-        constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
+        utils::constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
     };
 
     #[test]

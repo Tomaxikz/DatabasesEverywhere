@@ -16,7 +16,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use crate::{config::Config, constants};
+use crate::{config::Config, utils::constants};
 
 const LOG_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_ARCHIVES: usize = 4;

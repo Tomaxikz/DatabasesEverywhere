@@ -12,12 +12,12 @@ use tokio::{
 
 use super::*;
 use crate::{
-    api::monitoring::resources::ResourceCache,
+    gateway::protocols::qdrant::QdrantRouteKey,
     gateway::sessions::TenantSessions,
-    instances::{state::InstanceStore, test_support::metadata},
-    placement::DeploymentMode,
-    protocols::qdrant::QdrantRouteKey,
-    shared::{backend::clickhouse_http_socket_path, protocol::Protocol},
+    instance::placement::DeploymentMode,
+    instance::{state::InstanceStore, test_support::metadata},
+    subsystems::monitoring::resources::ResourceCache,
+    utils::{backend::clickhouse_http_socket_path, protocol::Protocol},
 };
 
 fn resolver(store: InstanceStore) -> RouteResolver {

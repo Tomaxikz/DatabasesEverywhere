@@ -9,9 +9,9 @@ use super::{
     listener_io::proxy_postgres_session,
 };
 use crate::{
+    gateway::protocols::postgres,
     gateway::{postgres_sessions, resolver::RouteResolver, tunnel},
-    instances::state::DatabaseRouteResolution,
-    protocols::postgres,
+    instance::state::DatabaseRouteResolution,
 };
 
 const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;

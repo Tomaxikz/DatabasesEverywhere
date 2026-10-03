@@ -40,7 +40,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.99.0
           targets: ${{ matrix.rust_targets }}
 
       - name: Install Zig

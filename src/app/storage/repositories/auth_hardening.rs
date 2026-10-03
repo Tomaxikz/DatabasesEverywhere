@@ -1,7 +1,7 @@
 use sqlx::Row;
 
 use super::{InstanceRepository, RepositoryError};
-use crate::{instances::metadata::InstanceMetadata, shared::protocol::Protocol};
+use crate::instance::metadata::InstanceMetadata;
 
 impl InstanceRepository {
     pub(crate) async fn hardening_is_current(
@@ -86,7 +86,7 @@ impl InstanceRepository {
         .bind(container_started_at)
         .bind(i64::from(hardening_revision))
         .bind(credential_binding)
-        .bind(crate::shared::time::now_rfc3339())
+        .bind(crate::utils::time::now_rfc3339())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -116,26 +116,16 @@ impl InstanceRepository {
             metadata.database.username.as_str(),
             tenant_password,
         ];
-        match metadata.protocol {
-            Protocol::Postgres => fields.push(required_credential(
-                metadata,
-                "postgres_admin_password",
-                || metadata.postgres_admin_password.as_deref(),
-            )?),
-            Protocol::Mysql => {
-                fields.extend([
-                    required_credential(metadata, "mysql_root_password", || {
-                        metadata.mysql_root_password.as_deref()
-                    })?,
-                    required_credential(metadata, "mysql_native_password_sha1_stage2", || {
-                        metadata.mysql_native_password_sha1_stage2.as_deref()
-                    })?,
-                ]);
-            }
-            _ => {
+        match metadata
+            .protocol
+            .engine()
+            .hardening_binding_secrets(metadata)
+        {
+            Ok(secrets) => fields.extend(secrets),
+            Err(field) => {
                 return Err(RepositoryError::AuthHardeningCredentialMissing {
                     instance_id: metadata.instance_id.clone(),
-                    field: "supported_protocol",
+                    field,
                 });
             }
         }

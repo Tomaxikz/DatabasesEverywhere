@@ -5,9 +5,10 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocols::postgres::CancelKey;
+use crate::gateway::protocols::postgres::CancelKey;
 use crate::{
-    api::monitoring::resources::NetworkCounter, gateway::tunnel, shared::backend::BackendEndpoint,
+    gateway::tunnel, subsystems::monitoring::resources::NetworkCounter,
+    utils::backend::BackendEndpoint,
 };
 
 const MAX_ACTIVE_POSTGRES_CANCEL_KEYS: usize = 65_536;
@@ -290,8 +291,9 @@ mod tests {
         let cancel = {
             let mut packet = Vec::new();
             packet.extend_from_slice(&16_u32.to_be_bytes());
-            packet
-                .extend_from_slice(&crate::protocols::postgres::CANCEL_REQUEST_CODE.to_be_bytes());
+            packet.extend_from_slice(
+                &crate::gateway::protocols::postgres::CANCEL_REQUEST_CODE.to_be_bytes(),
+            );
             packet.extend_from_slice(&123_i32.to_be_bytes());
             packet.extend_from_slice(&456_i32.to_be_bytes());
             packet
@@ -402,10 +404,10 @@ mod tests {
             assert_eq!(ready.as_slice(), postgres_message(b'Z', b"I"));
 
             let mut packet = ((8 + body.len()) as u32).to_be_bytes().to_vec();
-            packet.extend(crate::protocols::postgres::CANCEL_REQUEST_CODE.to_be_bytes());
+            packet.extend(crate::gateway::protocols::postgres::CANCEL_REQUEST_CODE.to_be_bytes());
             packet.extend(body);
             assert_eq!(
-                crate::protocols::postgres::cancel_request_key(&packet),
+                crate::gateway::protocols::postgres::cancel_request_key(&packet),
                 Some(key.clone())
             );
             assert!(forward_cancel(key.clone(), &packet).await.unwrap());

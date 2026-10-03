@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    constants::jwt::{AUDIENCE, ISSUER},
-    shared::time::now_unix,
+    utils::constants::jwt::{AUDIENCE, ISSUER},
+    utils::time::now_unix,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,13 +43,13 @@ impl Claims {
 #[serde(deny_unknown_fields)]
 pub struct PoolGrant {
     pub runtime_id: String,
-    pub owner: crate::placement::PoolOwner,
+    pub owner: crate::instance::placement::PoolOwner,
     pub created_at: String,
 }
 
 impl PoolGrant {
-    pub(crate) fn matches(&self, pool: &crate::placement::EngineRuntime) -> bool {
-        pool.deployment_mode == crate::placement::DeploymentMode::Shared
+    pub(crate) fn matches(&self, pool: &crate::instance::placement::EngineRuntime) -> bool {
+        pool.deployment_mode == crate::instance::placement::DeploymentMode::Shared
             && pool.runtime_id == self.runtime_id
             && pool.created_at == self.created_at
             && pool.owner.as_ref() == Some(&self.owner)

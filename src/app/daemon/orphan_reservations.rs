@@ -1,7 +1,9 @@
 use anyhow::Context;
 
 use crate::{
-    placement::{EngineRuntime, EngineRuntimeStatus, TenantReservation, tenant::TenantTarget},
+    instance::placement::{
+        EngineRuntime, EngineRuntimeStatus, TenantReservation, tenant::TenantTarget,
+    },
     state::AppState,
 };
 
@@ -104,13 +106,13 @@ async fn cleanup_orphan(
         database: &orphan.database,
         username: &orphan.username,
     };
-    crate::placement::tenant::disk::prepare_drop(&state.config, runtime, target)
+    crate::instance::placement::tenant::disk::prepare_drop(&state.config, runtime, target)
         .await
         .context("failed to prepare interrupted tenant storage cleanup")?;
-    crate::placement::tenant::drop_tenant(&state.docker, runtime, target)
+    crate::instance::placement::tenant::drop_tenant(&state.docker, runtime, target)
         .await
         .context("failed to remove the interrupted tenant from its shared engine")?;
-    crate::placement::tenant::disk::remove(&state.config, runtime, target)
+    crate::instance::placement::tenant::disk::remove(&state.config, runtime, target)
         .await
         .context("failed to remove the interrupted tenant disk quota")?;
     let released = state
@@ -135,7 +137,7 @@ async fn quarantine(
     orphan: &TenantReservation,
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
-    let containment = crate::placement::containment::contain_locked(
+    let containment = crate::instance::placement::containment::contain_locked(
         state,
         &runtime,
         "an interrupted shared tenant could not be removed safely",
@@ -166,10 +168,10 @@ async fn quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::{backend::BackendEndpoint, protocol::Protocol};
+    use crate::utils::{backend::BackendEndpoint, protocol::Protocol};
 
     fn runtime(status: EngineRuntimeStatus, tenants: u32) -> EngineRuntime {
-        let mut runtime = crate::placement::test_support::runtime(
+        let mut runtime = crate::instance::placement::test_support::runtime(
             "pool_postgres_boot_claim",
             Protocol::Postgres,
             "postgres:18.4",

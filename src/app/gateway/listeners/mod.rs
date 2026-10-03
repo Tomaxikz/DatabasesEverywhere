@@ -37,7 +37,7 @@ use super::{
     supervisor::GatewayConnectionTracker,
     tunnel,
 };
-use crate::protocols::{clickhouse, mariadb, mongodb, postgres, qdrant, redis};
+use crate::gateway::protocols::{clickhouse, mariadb, mongodb, postgres, qdrant, redis};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ListenerError {
@@ -629,9 +629,9 @@ mod tests {
         supervisor.begin(1);
         supervisor.mark_ready();
         let resolver = RouteResolver::new(
-            crate::instances::state::InstanceStore::default(),
-            crate::api::monitoring::resources::ResourceCache::default(),
-            crate::protocols::qdrant::QdrantRouteKey::new(b"test"),
+            crate::instance::state::InstanceStore::default(),
+            crate::subsystems::monitoring::resources::ResourceCache::default(),
+            crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"test"),
             supervisor.tenant_sessions(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

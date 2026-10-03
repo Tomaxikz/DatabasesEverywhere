@@ -4,7 +4,7 @@ use secrecy::SecretString;
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::protocol::Protocol,
+    utils::protocol::Protocol,
 };
 
 pub const INTERNAL_ADMIN_USERNAME: &str = "dbe_admin";

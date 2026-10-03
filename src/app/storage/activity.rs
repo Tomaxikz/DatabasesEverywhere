@@ -1,6 +1,6 @@
 use sqlx::{Row, SqlitePool};
 
-use crate::monitoring::{ActivityBucket, OperationCounts};
+use crate::instance::monitoring::{ActivityBucket, OperationCounts};
 
 pub const MAX_HISTORY_ROWS: u16 = 1_440;
 

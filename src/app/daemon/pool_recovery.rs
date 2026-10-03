@@ -3,21 +3,21 @@ use std::{collections::HashSet, path::Path, time::Duration};
 use anyhow::{Context, ensure};
 
 use crate::{
-    instances::{
-        metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-        paths::InstancePaths,
-    },
-    placement::containment::contain_locked,
-    placement::{
+    instance::placement::containment::contain_locked,
+    instance::placement::{
         DeploymentMode, EngineRuntime, EngineRuntimeStatus, TenantReservation,
         TenantReservationState, lifecycle, tenant,
     },
+    instance::{
+        metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
+        paths::InstancePaths,
+    },
     runtime::docker::DockerContainerStatus,
-    shared::{
+    state::AppState,
+    utils::{
         backend::{BackendEndpoint, backend_socket_path},
         time::now_rfc3339,
     },
-    state::AppState,
 };
 
 const POOL_RECOVERY_READY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -157,7 +157,7 @@ async fn stop_failed_retry(
     let id = &runtime.runtime_id;
     tracing::error!(event = "audit shared_pool_recovery_failed", runtime_id = id, %error,
         "pool retry failed; lifecycle failure policy keeps it down");
-    crate::placement::containment::stop_pool(state, runtime)
+    crate::instance::placement::containment::stop_pool(state, runtime)
         .await
         .map_err(anyhow::Error::msg)
         .context("could not verify shutdown after automatic pool retry")?;
@@ -414,7 +414,7 @@ async fn recover_locked(
     );
     lifecycle::paths::prepare_socket_directory(state, &runtime).await?;
     lifecycle::paths::prepare_hosted_config(state, &runtime).await?;
-    crate::placement::runtime::apply_limits(
+    crate::instance::placement::runtime::apply_limits(
         &state.docker,
         &state.config,
         &state.placements,
@@ -522,7 +522,7 @@ async fn retained_recovery_targets(
     let mut blocked = HashSet::new();
     for path in manifests {
         let bytes = tokio::task::spawn_blocking(move || {
-            crate::shared::files::read_bounded_private_file(&path, MAX_RECOVERY_MANIFEST_BYTES)
+            crate::io::files::read_bounded_private_file(&path, MAX_RECOVERY_MANIFEST_BYTES)
         })
         .await??;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;

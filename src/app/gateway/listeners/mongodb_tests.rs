@@ -6,15 +6,15 @@ use tokio::{
 
 use super::*;
 use crate::{
-    api::monitoring::resources::{NetworkCounter, ResourceCache},
     gateway::sessions::TenantSessions,
-    instances::{
+    instance::placement::DeploymentMode,
+    instance::{
         metadata::{InstanceImageStatus, InstanceMetadata},
         state::InstanceStore,
         test_support,
     },
-    placement::DeploymentMode,
-    shared::{backend::BackendEndpoint, protocol::Protocol},
+    subsystems::monitoring::resources::{NetworkCounter, ResourceCache},
+    utils::{backend::BackendEndpoint, protocol::Protocol},
 };
 
 #[tokio::test]
@@ -267,7 +267,7 @@ async fn resolver(socket: &std::path::Path) -> (RouteResolver, TenantSessions, N
         RouteResolver::new(
             store,
             resources,
-            crate::protocols::qdrant::QdrantRouteKey::new(b"mongo-wire-test"),
+            crate::gateway::protocols::qdrant::QdrantRouteKey::new(b"mongo-wire-test"),
             sessions.clone(),
         ),
         sessions,

@@ -8,7 +8,7 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::{api::monitoring::resources::NetworkCounter, shared::backend::BackendEndpoint};
+use crate::{subsystems::monitoring::resources::NetworkCounter, utils::backend::BackendEndpoint};
 
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKEND_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);

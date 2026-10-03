@@ -1,4 +1,4 @@
-use crate::shared::hex::encode_lower;
+use crate::utils::hex::encode_lower;
 
 pub fn provision_tenant_role_sql(database: &str, username: &str) -> String {
     let username_identifier = quote_ident(username);

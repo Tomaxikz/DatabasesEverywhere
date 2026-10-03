@@ -17,7 +17,7 @@ use super::{
     DockerError, DockerInstanceSpec, DockerRuntime, EXEC_OUTPUT_TRUNCATION_MARKER,
     FILE_TRANSFER_TIMEOUT, MAX_CONTAINER_TRANSFER_BYTES, MAX_EXEC_OUTPUT_BYTES_PER_CHANNEL,
 };
-use crate::{runtime::docker::container_config::bind_mount, shared::protocol::Protocol};
+use crate::{runtime::docker::container_config::bind_mount, utils::protocol::Protocol};
 
 impl DockerRuntime {
     pub async fn upload_file(

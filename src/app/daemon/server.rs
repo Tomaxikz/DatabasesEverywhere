@@ -185,7 +185,7 @@ impl PreparedGatewayListener {
 pub(super) async fn start_gateway_listeners(
     config: &Config,
     store: InstanceStore,
-    resources: crate::api::monitoring::resources::ResourceCache,
+    resources: crate::subsystems::monitoring::resources::ResourceCache,
     supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
     let connection_limit = config.security.db_connection_limit_per_minute;
@@ -215,7 +215,7 @@ pub(super) async fn start_gateway_listeners(
     let resolver = RouteResolver::new(
         store,
         resources,
-        crate::protocols::qdrant::QdrantRouteKey::new(config.websocket_jwt_secret()),
+        crate::gateway::protocols::qdrant::QdrantRouteKey::new(config.websocket_jwt_secret()),
         supervisor.tenant_sessions(),
     );
     let mut listeners = tokio::task::JoinSet::new();
@@ -350,7 +350,7 @@ pub(super) async fn serve_api(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
-    api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
+    api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
     daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
@@ -417,7 +417,7 @@ pub(super) async fn serve_api_tls(
     router: Router,
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
-    api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
+    api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
     daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
@@ -552,7 +552,7 @@ pub(super) fn rustls_config_with_client_ca(
 pub(super) async fn shutdown_signal(
     import_export_jobs: ImportExportJobs,
     install_progress: InstallProgressStore,
-    api_rate_limiter: crate::api::http::limits::ApiRateLimiter,
+    api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
     daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) {
@@ -671,6 +671,6 @@ pub(super) fn startup_banner() -> String {
  DATABASES  PostgreSQL / MySQL / MariaDB / MongoDB
             ClickHouse / Redis / Valkey / Qdrant"#,
         release = env!("CARGO_PKG_VERSION"),
-        api = crate::api::system::API_VERSION,
+        api = crate::subsystems::system::API_VERSION,
     )
 }

@@ -3,10 +3,10 @@ use std::path::Path;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
-    instances::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, SCHEMA_VERSION},
-    placement::DeploymentMode,
-    shared::{backend::BackendEndpoint, protocol::Protocol},
+    instance::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus, SCHEMA_VERSION},
+    instance::placement::DeploymentMode,
     storage::secrets::{SecretStore, SecretStoreError},
+    utils::backend::BackendEndpoint,
 };
 
 mod auth_hardening;
@@ -17,9 +17,6 @@ pub(crate) use compatibility::CompatibilityAttestation;
 pub use protected_secrets::{
     DaemonInstanceLoad, ProtectedSecretField, ProtectedSecretIncident, ProtectedSecretRepair,
 };
-
-const SHA1_HEX_LEN: usize = 40;
-const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct InstanceRepository {
@@ -226,7 +223,7 @@ impl InstanceRepository {
             WHERE instance_id = ?2
             "#,
         )
-        .bind(crate::shared::time::now_rfc3339())
+        .bind(crate::utils::time::now_rfc3339())
         .bind(instance_id)
         .execute(&self.pool)
         .await?;
@@ -489,8 +486,11 @@ impl InstanceRepository {
             .as_ref()
             .and_then(|version| version.current.as_deref());
         if let Some(version) = database_version
-            && crate::compatibility::normalize_database_version(metadata.protocol, version)
-                .as_deref()
+            && crate::instance::compatibility::normalize_database_version(
+                metadata.protocol,
+                version,
+            )
+            .as_deref()
                 != Some(version)
         {
             return Err(RepositoryError::InvalidDatabaseVersion {
@@ -761,45 +761,18 @@ fn validate_secret_recovery(metadata: &InstanceMetadata) -> Result<(), Repositor
     if protected_secret_missing(metadata.tenant_password.as_deref()) {
         missing.push("tenant_password");
     }
-    match metadata.protocol {
-        Protocol::Postgres => {
-            if protected_secret_missing(metadata.postgres_admin_password.as_deref()) {
-                missing.push("postgres_admin_password");
-            }
+    for secret in metadata
+        .protocol
+        .engine()
+        .required_recovery_secrets(metadata)
+    {
+        let missing_secret = match secret.hex_len {
+            Some(expected_len) => !valid_hex_secret(secret.value, expected_len),
+            None => protected_secret_missing(secret.value),
+        };
+        if missing_secret {
+            missing.push(secret.field);
         }
-        Protocol::Mariadb => {
-            if protected_secret_missing(metadata.mariadb_root_password.as_deref()) {
-                missing.push("mariadb_root_password");
-            }
-            if !valid_hex_secret(
-                metadata.mariadb_native_password_sha1_stage2.as_deref(),
-                SHA1_HEX_LEN,
-            ) {
-                missing.push("mariadb_native_password_sha1_stage2");
-            }
-        }
-        Protocol::Mysql => {
-            if protected_secret_missing(metadata.mysql_root_password.as_deref()) {
-                missing.push("mysql_root_password");
-            }
-            if !valid_hex_secret(
-                metadata.mysql_native_password_sha1_stage2.as_deref(),
-                SHA1_HEX_LEN,
-            ) {
-                missing.push("mysql_native_password_sha1_stage2");
-            }
-        }
-        Protocol::Mongodb => {
-            if protected_secret_missing(metadata.mongodb_root_password.as_deref()) {
-                missing.push("mongodb_root_password");
-            }
-        }
-        Protocol::Qdrant => {
-            if !valid_hex_secret(metadata.route_key_sha256.as_deref(), SHA256_HEX_LEN) {
-                missing.push("route_key_sha256");
-            }
-        }
-        Protocol::Redis | Protocol::Valkey | Protocol::Clickhouse => {}
     }
     if missing.is_empty() {
         Ok(())

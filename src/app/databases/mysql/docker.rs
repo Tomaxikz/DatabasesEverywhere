@@ -4,7 +4,7 @@ use secrecy::SecretString;
 
 use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
-    shared::protocol::Protocol,
+    utils::protocol::Protocol,
 };
 
 #[allow(clippy::too_many_arguments)]
