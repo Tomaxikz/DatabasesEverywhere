@@ -1,4 +1,6 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use crate::utils::limits::mib_to_bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

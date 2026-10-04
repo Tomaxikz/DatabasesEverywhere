@@ -1,4 +1,4 @@
-use super::*;
+use std::net::IpAddr;
 
 /// Canonicalizes an HTTP(S) origin as scheme + host + effective port.
 /// Explicit origin values may omit the default port and may carry one trailing

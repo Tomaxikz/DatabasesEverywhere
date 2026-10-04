@@ -1,4 +1,19 @@
+use tokio::io::AsyncWriteExt;
+
 use super::*;
+use crate::{
+    databases::protocol::Protocol,
+    gateway::{
+        listeners::listener_io::{
+            classify::{classify_mongodb, classify_sql},
+            mongodb::{proxy_mongodb_session, read_mongodb_prefix},
+            mysql::proxy_mysql_session,
+            postgres::proxy_postgres_session,
+        },
+        protocols::mariadb,
+    },
+    server::monitoring::OperationKind,
+};
 
 #[tokio::test(start_paused = true)]
 async fn shared_query_deadline_releases_buffer_without_timing_out_idle_clients() {

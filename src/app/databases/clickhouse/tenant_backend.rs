@@ -2,11 +2,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::future::BoxFuture;
 use secrecy::SecretString;
 
-use super::super::{
+use crate::server::placement::tenant::backends::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::{
     TELEMETRY_OPERATION_TIMEOUT, TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget,
     admin_secret, telemetry_command,
 };
-use super::{TenantBackend, TenantOperation};
 use crate::{
     databases::protocol::Protocol,
     databases::{self, clickhouse::docker::INTERNAL_ADMIN_USERNAME},
@@ -216,17 +216,11 @@ async fn clickhouse_sql(
         .await?)
 }
 
-pub(in crate::server::placement::tenant) fn clickhouse_telemetry_command(
-    prior_cutoff_micros: Option<u64>,
-    sql: &str,
-) -> String {
+fn clickhouse_telemetry_command(prior_cutoff_micros: Option<u64>, sql: &str) -> String {
     telemetry_command(clickhouse_telemetry_script(prior_cutoff_micros, sql))
 }
 
-pub(in crate::server::placement::tenant) fn clickhouse_telemetry_script(
-    prior_cutoff_micros: Option<u64>,
-    sql: &str,
-) -> String {
+pub(crate) fn clickhouse_telemetry_script(prior_cutoff_micros: Option<u64>, sql: &str) -> String {
     let prior = prior_cutoff_micros
         .map(|value| value.to_string())
         .unwrap_or_default();

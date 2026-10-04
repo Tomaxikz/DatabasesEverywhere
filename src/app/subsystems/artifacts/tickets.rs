@@ -1,4 +1,11 @@
-use super::*;
+use super::{MAX_ACTIVE_DOWNLOADS, MAX_ACTIVE_DOWNLOADS_PER_PEER, MAX_CONSUMED_DOWNLOAD_TICKETS};
+use crate::routes::http::response::ApiError;
+use crate::utils::time::now_unix;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone)]
 pub struct ArtifactDownloadTickets {

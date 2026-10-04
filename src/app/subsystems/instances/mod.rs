@@ -24,10 +24,6 @@ pub use runtime_info::{
     PowerResponse, ReconcileResponse, UpdateInstanceImageRequest, UpdateInstanceImageResponse,
     create_instance, get_instance, get_instance_status, list_instances,
 };
-use runtime_info::{
-    MajorUpgradePrecheck, fail_image_update_api, fail_image_update_bad_request,
-    fail_image_update_runtime,
-};
 
 pub use deployment::{
     StartDeploymentMigrationRequest, get_deployment_migration, list_deployment_migrations,
@@ -37,10 +33,10 @@ pub(crate) use deployment::{
     fence_active_routes_on_boot as fence_active_deployment_migration_routes,
     recover_on_boot as recover_deployment_migrations,
 };
-use major_upgrade::*;
+
+use normal_image_update::image_update_spec;
 #[cfg(test)]
 use normal_image_update::quarantine_image_metadata;
-use normal_image_update::{image_quarantine_summary, image_update_spec, quarantine_image_update};
 pub(crate) use normal_image_update::{run_image_update, spawn_owned_mutation_task};
 pub(crate) use password::verify_resp_credential;
 pub use password::{
@@ -49,53 +45,18 @@ pub use password::{
 
 use axum::extract::State;
 use bollard::errors::Error as BollardError;
-use futures::{FutureExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use tokio::{
-    sync::Mutex,
-    time::{Duration as TokioDuration, Instant},
-};
 
 use crate::{
     auth::scopes,
-    databases::engine::{CredentialKind, LifecycleFlow, PostLaunchStep, UpgradePrecheck},
-    databases::protocol::Protocol,
     routes::http::{
-        diagnostics::PublicDiagnostic,
-        policy::{ApiRequestContext, DestructiveActionConfirmation, DestructiveActionPolicy},
-        response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
+        policy::ApiRequestContext,
+        response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult},
         router::AppState,
     },
-    runtime::docker::{
-        DockerContainerStatus, DockerError, DockerInstanceInspection, DockerInstanceSpec,
-        DockerRuntime,
-    },
-    server::disk::DiskLimiter,
-    server::{
-        metadata::{
-            DesiredInstanceState, InstanceDatabaseVersion, InstanceImageStatus, InstanceMetadata,
-            InstanceStatus,
-        },
-        paths::InstancePaths,
-        reconcile,
-    },
-    subsystems::instances::{
-        create::{
-            backend_endpoint, create_instance_from_request, enforce_node_allocation_policy,
-            flow_maintenance_credential, launch_container_from_spec, missing_credential_error,
-            prepare_instance_container_user, protocol_pids_limit, provision_mongodb_tenant_user,
-            resolve_image, run_tenant_auth_step,
-        },
-        images::{check_image_allowed, validate_image},
-        progress::{BeginCreationError, InstallProgress, InstallProgressStatus},
-        requests::{
-            CreateInstanceRequest, LimitsRequest, limits_from_request, validate_create_config,
-            validate_create_request, validate_limits, validate_protocol_limits,
-        },
-    },
-    utils::{limits::mib_to_bytes, redaction, time::now_rfc3339},
+    runtime::docker::DockerError,
+    server::{metadata::InstanceMetadata, reconcile},
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::time::Duration;
 
 pub(crate) use purge::{
     purge_instance_paths, purge_provisional_runtime_paths, purge_retired_runtime_paths,
@@ -112,13 +73,15 @@ mod limits;
 mod logs;
 mod start_checks;
 mod startup;
-pub use delete::*;
-pub use image_update::*;
-pub use lifecycle::*;
-pub use limits::*;
-pub use logs::*;
-use start_checks::*;
-use startup::*;
+pub use delete::delete_instance;
+pub use image_update::update_instance_image;
+pub(crate) use image_update::update_instance_image_locked;
+pub use lifecycle::LifecycleAction;
+use lifecycle::change_instance_state;
+pub(crate) use lifecycle::change_instance_state_locked;
+pub use limits::update_instance_limits;
+pub(crate) use logs::check_logs_available;
+pub use logs::instance_logs;
 
 pub async fn reconcile_instance(
     State(state): State<AppState>,

@@ -1,4 +1,17 @@
-use super::*;
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+    time::Instant,
+};
+
+use sha2::{Digest, Sha256};
+
+use super::{
+    BZIP2_MAGIC, DumpArchiveFormat, FORMAT_SNIFF_BYTES, GZIP_MAGIC, HASH_BUFFER_BYTES,
+    InspectionError, MAX_SOURCE_BYTES, TAR_MAGIC, TAR_MAGIC_OFFSET, TAR_MIN_HEADER_BYTES,
+    ZIP_SIGNATURES,
+};
 
 pub(super) fn open_regular_no_follow(path: &Path) -> Result<File, InspectionError> {
     use rustix::fs::{Mode, OFlags};

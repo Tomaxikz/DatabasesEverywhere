@@ -1,4 +1,7 @@
-use super::*;
+use serde::Serialize;
+
+use super::MigrationStage;
+use crate::{databases::protocol::Protocol, server::placement::DeploymentMode};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DeploymentMigration {

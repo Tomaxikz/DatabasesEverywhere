@@ -1,36 +1,14 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    os::unix::fs::FileTypeExt,
-    path::{Path, PathBuf},
-    time::Duration,
-};
-
-use reqwest::{
-    Client, Method, StatusCode,
-    header::{CONTENT_TYPE, HeaderValue},
-    multipart::{Form, Part},
-    redirect::Policy,
-};
-
-use secrecy::ExposeSecret;
-
-use serde::Serialize;
-
-use serde_json::{Value, json};
-
-use tokio::io::AsyncWriteExt;
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
-    databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
     server::paths::InstancePaths,
     subsystems::import_export::{ImportExportSelection, SelectionMode},
-    utils::{backend::SOCKET_BRIDGE_CONTAINER_PATH, shell::sh_quote},
 };
 
 use super::super::{
     ImportMode, REMOTE_IMPORT_LIMITER, RemoteImportSource, commit_recovery_manifest,
-    staging_directory, sync_recovery_file,
+    staging_directory,
 };
 
 const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -333,20 +311,27 @@ pub(crate) async fn import_qdrant(
 
 mod bridge_scripts;
 
-use bridge_scripts::{qdrant_bridge_start_script, qdrant_bridge_stop_script};
-
-mod selection;
-use selection::*;
-mod recovery;
-use recovery::*;
-mod cleanup;
-use cleanup::*;
-mod http;
-use http::*;
 mod bridge;
-pub(crate) use bridge::*;
+mod cleanup;
 mod compat;
-use compat::*;
+mod http;
+mod recovery;
+mod selection;
+
+use bridge::QdrantBridge;
+pub(crate) use bridge::cleanup_stale_bridge;
+use cleanup::{
+    abandon_source_phase, cleanup_source_snapshots, cleanup_staging, cleanup_target_snapshots,
+    describe_quarantine, qdrant_rollback_needs_stop, quiesce_rollback_target, rollback_target,
+    stop_bridge, within_deadline,
+};
+use compat::check_snapshot_compatibility;
+use http::{QdrantHttp, target_api_key};
+use recovery::write_recovery_manifest;
+use selection::{
+    alias_actions, check_qdrant_names, desired_import_aliases, selected_aliases,
+    selected_collections,
+};
 
 #[cfg(test)]
 mod tests;

@@ -1,4 +1,4 @@
-use super::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]

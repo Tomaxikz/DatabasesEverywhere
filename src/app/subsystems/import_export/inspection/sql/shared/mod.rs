@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeSet, VecDeque},
-    io::Read,
-};
+use std::{collections::BTreeSet, io::Read};
 
 use crate::databases::engine::EngineFamily;
 
@@ -13,13 +10,14 @@ use super::{
 
 mod clickhouse;
 mod errors;
-pub(crate) use errors::*;
+pub(crate) use errors::{SharedSqlError, SharedSqlIssue, SharedSqlReport};
 mod mysql_command;
-pub(crate) use mysql_command::*;
+pub(crate) use mysql_command::validate_shared_mysql_command;
+use mysql_command::{executable_mysql_comment, is_mysqldump_sandbox_directive};
 mod mysql;
 mod postgres;
 mod words;
-use words::*;
+use words::statement_words;
 
 const SAFE_MYSQL_ENGINES: &[&str] = &["INNODB", "MYISAM", "MEMORY", "CSV", "ARCHIVE"];
 

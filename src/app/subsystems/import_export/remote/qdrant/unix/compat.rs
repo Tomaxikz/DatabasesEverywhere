@@ -1,4 +1,6 @@
-use super::*;
+use serde_json::Value;
+
+use crate::routes::http::response::ApiError;
 
 pub(super) fn check_snapshot_compatibility(source: &str, target: &str) -> Result<(), ApiError> {
     let source_parts = version_triplet(source).ok_or_else(|| {

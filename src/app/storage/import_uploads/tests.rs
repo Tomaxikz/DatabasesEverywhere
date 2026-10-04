@@ -1,4 +1,8 @@
+use sqlx::SqlitePool;
+
+use super::validation::{parse_protocol, validate_upload};
 use super::*;
+use crate::databases::protocol::Protocol;
 use crate::storage::{migrations, sqlite, test_support};
 
 const CREATED: &str = "2026-08-10T10:00:00Z";

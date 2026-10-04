@@ -1,4 +1,6 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use super::error::JobParseError;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ImportExportJob {

@@ -1,4 +1,8 @@
-use super::*;
+use super::types::BackupInfo;
+use super::types::{BackupObjectSelection, BackupObjectSummary};
+use crate::routes::http::response::ApiError;
+use crate::server::backup::StoredBackup;
+use crate::server::backup::catalog::BackupCatalog;
 
 pub(super) fn backup_objects(
     catalog: &BackupCatalog,

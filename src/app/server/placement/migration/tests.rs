@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    databases::protocol::Protocol,
     server::metadata::{RuntimeKind, RuntimeMetadata},
     server::placement::{
         ENGINE_RUNTIME_SCHEMA_VERSION, EngineRuntime, EngineRuntimeStatus, PlacementRepository,

@@ -354,7 +354,11 @@ fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), Ap
         .ok_or_else(|| ApiError::Conflict("current version cannot be compared".into()))?;
     let mut next = numeric_version_components(protocol, next)
         .ok_or_else(|| ApiError::Conflict("image version cannot be compared".into()))?;
-    let series = protocol.engine().release_line_components();
+    let series = if protocol.engine().family().is_postgres() {
+        1
+    } else {
+        2
+    };
     let same_series =
         current.len() >= series && next.len() >= series && current[..series] == next[..series];
     let length = current.len().max(next.len());

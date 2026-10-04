@@ -1,4 +1,4 @@
-use super::*;
+use serde::{Deserialize, Serialize};
 
 /// Bounds durable data-operation admission separately from active execution.
 /// Dynamic mode accounts for estimated CPU, memory, and I/O work. Operators

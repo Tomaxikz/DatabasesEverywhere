@@ -19,8 +19,8 @@ mod stream_exec;
 mod transfer;
 
 pub use error::DockerError;
-use helpers::*;
-use transfer::{CappedExecOutput, container_mounts, ensure_bind_mount_sources};
+use helpers::is_rootless_security_option;
+use transfer::CappedExecOutput;
 
 pub use command::{CommandOutput, ExecRecovery};
 pub(crate) use cpu_burst::CpuBurstPolicyStatus;
@@ -33,41 +33,15 @@ pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
 pub use stream_exec::ExecStreamResult;
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::time::Duration;
 
-use bollard::{
-    Docker,
-    errors::Error as BollardError,
-    models::{
-        ContainerCreateBody, ContainerSummary, ContainerUpdateBody, HostConfig,
-        SystemInfoCgroupVersionEnum,
-    },
-    query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptions,
-        ListContainersOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
-        StopContainerOptions,
-    },
-};
-use futures::TryStreamExt;
-use secrecy::ExposeSecret;
+use bollard::{Docker, models::SystemInfoCgroupVersionEnum};
 
 use crate::{
     config::{DaemonConfig, DaemonEngine},
     databases::protocol::Protocol,
     io::ownership::HostOwner,
-    runtime::docker::container_config::{cpu_to_nano, disabled_healthcheck, mib_to_bytes},
-    runtime::socket_bridge::supervisor_arguments,
-    utils::constants::docker::{
-        INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROJECT_LABEL, PROTOCOL_LABEL,
-    },
-    utils::{
-        backend::SOCKET_BRIDGE_CONTAINER_PATH,
-        ids::sanitize_docker_suffix,
-        limits::{ResourceLimitError, validate_runtime_limits},
-    },
+    utils::ids::sanitize_docker_suffix,
 };
 
 const MAX_CONTAINER_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;

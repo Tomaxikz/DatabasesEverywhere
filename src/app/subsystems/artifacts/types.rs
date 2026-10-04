@@ -1,4 +1,4 @@
-use super::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DownloadKind {

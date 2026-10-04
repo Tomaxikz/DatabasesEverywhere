@@ -1,4 +1,10 @@
-use super::*;
+use sha2::Digest;
+use std::{fs, path::Path};
+
+use sha2::Sha256;
+
+use super::FuseQuotaPaths;
+use crate::server::disk::{DiskLimitError, path_io_error};
 
 pub(super) fn prepare_fuse_dirs(fuse_root: &Path) -> Result<(), DiskLimitError> {
     for path in [

@@ -8,11 +8,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BoundedReader, DumpArchiveFormat, INSPECTION_TIMEOUT, InspectionError, MAX_INSPECTED_BYTES,
-    MAX_SOURCE_BYTES, detect_archive_format, inspect_mongodb_wrapper,
+    DumpArchiveFormat, INSPECTION_TIMEOUT, InspectionError, MAX_INSPECTED_BYTES, MAX_SOURCE_BYTES,
+    archive::scan_sql_source,
     mongodb::MongoSharedIssue,
-    open_regular_no_follow, scan_sql_source, sha256_reader,
+    source::{BoundedReader, detect_archive_format, open_regular_no_follow, sha256_reader},
     sql::{SharedSqlError, SharedSqlIssue, SharedSqlReport, validate_shared_sql_reader},
+    wrappers::inspect_mongodb_wrapper,
 };
 use crate::databases::protocol::Protocol;
 
@@ -197,7 +198,7 @@ fn validate_blocking(
         }
     }
 
-    let checked = if protocol.engine().inspects_archive_catalogs() {
+    let checked = if protocol.engine().family().is_document() {
         let catalog = inspect_mongodb_wrapper(&mut source, detected, deadline)
             .map_err(map_inspection_error)?;
         validate_mongodb_catalog(&catalog, source_database.unwrap_or(target_database))?;

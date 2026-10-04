@@ -41,8 +41,15 @@ const CURRENT_CREDENTIAL_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 mod rotation;
 mod supervision;
-use rotation::*;
-use supervision::*;
+use rotation::{
+    capture_maintenance_credential, capture_mysql_tenant_auth, capture_postgres_verifier,
+    first_container_secret, verify_tenant_credential, write_resp_acl,
+};
+use supervision::{
+    PasswordMetadataCommitResolution, apply_new_route_auth, delete_managed_container,
+    fail_uncertain_password_commit, invalidate_password_caches, recover_password_panic,
+    reset_live_password, resolve_password_metadata_commit, rollback_or_fail, run_password_worker,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

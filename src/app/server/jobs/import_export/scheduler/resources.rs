@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    MIB,
+    capacity::{SchedulerResourceProvider, SchedulerResourceSample},
+};
 use std::path::{Path, PathBuf};
 
 pub(super) use crate::io::cgroup::{

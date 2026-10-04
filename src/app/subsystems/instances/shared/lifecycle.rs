@@ -1,4 +1,9 @@
-use super::*;
+use crate::routes::http::response::ApiError;
+use crate::server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
+use crate::server::placement::tenant::TenantTarget;
+use crate::server::placement::{DeploymentMode, tenant};
+use crate::utils::limits::InstanceLimits;
+use crate::utils::time::now_rfc3339;
 
 pub(super) fn check_power_state(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.status == InstanceStatus::Quarantined {

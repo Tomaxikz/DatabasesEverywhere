@@ -1,23 +1,22 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use serde::{Deserialize, Serialize};
-use tar::{Archive, Builder, EntryType};
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, broadcast};
 
-use crate::io::files::ensure_private_dir;
 use crate::storage::import_export_jobs::{ImportExportJobRepository, ImportExportJobStorageError};
 pub use crate::utils::time::now_rfc3339;
+#[cfg(test)]
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+#[cfg(test)]
+use std::{fs::File, path::Path, time::Instant};
+#[cfg(test)]
+use tar::{Archive, Builder, EntryType};
 
 mod scheduler;
 pub use scheduler::{
@@ -32,10 +31,22 @@ mod extract;
 mod model;
 pub(crate) mod selection;
 
-pub use self::create::*;
-pub use self::error::*;
-pub use self::extract::*;
-pub use self::model::*;
+pub use self::create::{
+    DataArchiveSourcePolicy, create_bounded_archive, create_bounded_archive_with_policy,
+};
+pub use self::error::{ImportExportError, JobParseError};
+pub use self::extract::extract_bounded_archive;
+pub use self::model::{ImportExportAction, ImportExportJob, ImportExportStatus};
+
+#[cfg(test)]
+use self::create::{
+    append_bounded_archive_file, create_archive_blocking, create_bounded_archive_blocking,
+};
+#[cfg(test)]
+use self::extract::{
+    DeadlineBoundedReader, extract_archive_blocking, extract_archive_entries,
+    extract_bounded_archive_blocking, validate_archive_blocking, validate_archive_path,
+};
 
 pub const MAX_DATA_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_DATA_ARCHIVE_ENTRIES: usize = 100_000;

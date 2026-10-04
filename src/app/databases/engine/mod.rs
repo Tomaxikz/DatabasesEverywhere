@@ -199,10 +199,6 @@ pub(crate) trait EngineInfo {
     fn auth_hardening_revision(&self) -> Option<u32> {
         None
     }
-
-    fn release_line_components(&self) -> usize {
-        2
-    }
 }
 
 pub(crate) trait EngineCompatibility {

@@ -1,4 +1,6 @@
-use super::*;
+use crate::utils::{backend::SOCKET_BRIDGE_CONTAINER_PATH, shell::sh_quote};
+
+use super::{TARGET_BRIDGE_LOG, TARGET_BRIDGE_MARKER, TARGET_BRIDGE_PID, TARGET_BRIDGE_SOCKET};
 
 pub(super) fn qdrant_bridge_start_script() -> String {
     format!(

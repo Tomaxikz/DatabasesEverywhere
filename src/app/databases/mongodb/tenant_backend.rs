@@ -1,8 +1,10 @@
 use futures::future::BoxFuture;
 use secrecy::SecretString;
 
-use super::super::{TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget, admin_secret};
-use super::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::backends::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::{
+    TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget, admin_secret,
+};
 use crate::{
     databases,
     databases::protocol::Protocol,

@@ -1,5 +1,18 @@
-use super::failure::Phase;
-use super::*;
+use anyhow::Context;
+
+use super::{
+    ISOLATED_NETWORK_MODE, POOL_READY_TIMEOUT, attest_runtime_locked, check_shared_start_disk,
+    clear_runtime_caches, failure, failure::Phase, fence_runtime, paths, pool_is_isolated,
+    save_runtime,
+};
+use crate::{
+    server::{
+        metadata::DesiredInstanceState,
+        placement::{EngineRuntime, EngineRuntimeStatus},
+    },
+    state::AppState,
+    utils::time::now_rfc3339,
+};
 
 /// Caller holds the pool lock. Both boot and API power use this path.
 pub(crate) async fn activate_locked(

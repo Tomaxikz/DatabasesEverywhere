@@ -1,4 +1,11 @@
-use super::*;
+use std::{sync::atomic::Ordering, time::Instant};
+
+use super::{
+    SoftDiskWatcher,
+    helpers::{abandon_backend, ensure_backend, install_recursive_watch, lock_recover},
+    state::{RecursiveWatchInstall, RetryCandidate, WatchHealth},
+    types::RetrySummary,
+};
 
 impl SoftDiskWatcher {
     pub(crate) fn retry_degraded(&self) -> RetrySummary {

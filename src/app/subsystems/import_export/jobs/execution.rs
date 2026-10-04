@@ -1,3 +1,31 @@
+use std::path::{Path as FsPath, PathBuf};
+
+use crate::{
+    databases::protocol::Protocol,
+    routes::http::{diagnostics::PublicDiagnostic, response::ApiError, router::AppState},
+    server::{
+        jobs::import_export::{
+            ImportExportAction, JobEstimateInput, JobResourceCost, conservative_import_input_bytes,
+            protocol_uses_logical_dumps, protocol_uses_native_compression,
+        },
+        metadata::InstanceMetadata,
+        paths::InstancePaths,
+        placement::DeploymentMode,
+    },
+    utils::limits::mib_to_bytes,
+};
+
+use super::super::{
+    ExportOptions, ImportOptions, ImportSourceOptions, MAX_UNARCHIVED_BYTES, UploadStagingBudget,
+    files::logical_staging_root,
+    logical::{
+        check_logical_ready, import_instance_source, prepared_support::staging_reservation_bytes,
+        quarantine_uncertain_import,
+    },
+    remote::ImportMode,
+    uploads::{ImportStagingPermit, finish_upload_import_job},
+};
+
 use std::future::Future;
 
 use tokio::sync::OwnedMutexGuard;
@@ -5,7 +33,6 @@ use tokio::sync::OwnedMutexGuard;
 use super::{
     export::{measure_export_bytes, write_reserved_export},
     supervision::{block_uncertain_upload, update_job_result},
-    *,
 };
 
 pub(super) async fn run_export_job_locked(
@@ -103,7 +130,7 @@ pub(super) async fn run_import_job_locked(
         return;
     }
     if let Some(upload_id) = upload_id.as_deref() {
-        super::uploads::finish_upload_import_job(
+        finish_upload_import_job(
             &state,
             &instance_id,
             upload_id,
@@ -178,7 +205,7 @@ pub(super) async fn acquire_upload_staging(
     state: &AppState,
     instance_id: &str,
     options: &ImportOptions,
-) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+) -> Result<Option<ImportStagingPermit>, ApiError> {
     if let Some(staging) = options.upload_staging.as_ref() {
         return acquire_validated_upload_staging(state, instance_id, staging).await;
     }
@@ -204,11 +231,7 @@ pub(super) async fn acquire_upload_staging(
                     .unwrap_or(MAX_UNARCHIVED_BYTES)
             };
             let rollback = measure_export_bytes(state, &metadata).await?;
-            super::logical::prepared_support::staging_reservation_bytes(
-                metadata.deployment_mode,
-                prepared,
-                rollback,
-            )?
+            staging_reservation_bytes(metadata.deployment_mode, prepared, rollback)?
         }
         ImportSourceOptions::Remote(_) => import_staging_bytes(
             metadata.protocol,
@@ -237,7 +260,7 @@ async fn acquire_validated_upload_staging(
     state: &AppState,
     instance_id: &str,
     staging: &UploadStagingBudget,
-) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+) -> Result<Option<ImportStagingPermit>, ApiError> {
     match staging {
         UploadStagingBudget::Logical { budget, .. } => {
             let root = logical_staging_root(state).await?;
@@ -265,7 +288,7 @@ async fn acquire_physical_import_staging(
     instance_id: &str,
     metadata: &InstanceMetadata,
     options: &ImportOptions,
-) -> Result<Option<super::uploads::ImportStagingPermit>, ApiError> {
+) -> Result<Option<ImportStagingPermit>, ApiError> {
     match &options.source {
         ImportSourceOptions::Remote(_) => {
             let root = PathBuf::from(state.config.paths.tmp_root());
@@ -419,6 +442,7 @@ fn estimate_rollback_bytes(metadata: &InstanceMetadata) -> u64 {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+    use std::time::Duration;
 
     use crate::server::test_support::shared_metadata;
 

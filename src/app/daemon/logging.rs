@@ -1,3 +1,4 @@
+use crate::daemon::runtime_paths::{create_runtime_dirs, harden_runtime_dir};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, IsTerminal, Write},
@@ -92,8 +93,8 @@ pub(crate) fn init_stdout_logging() {
 /// records are flushed before the lock is released (statics are never dropped).
 pub(super) fn init_logging(config: &Config) -> anyhow::Result<WorkerGuard> {
     let directory = Path::new(&config.paths.logs);
-    super::create_runtime_dirs(directory)?;
-    super::harden_runtime_dir(directory)?;
+    create_runtime_dirs(directory)?;
+    harden_runtime_dir(directory)?;
     let writer = RollingLog::new(directory, LOG_BYTES)
         .with_context(|| format!("failed to initialize log file in {}", directory.display()))?;
     let (file_writer, guard) = log_queue().finish(writer);

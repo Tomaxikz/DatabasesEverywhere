@@ -1,46 +1,18 @@
-use std::{future::Future, time::Duration};
-
-use secrecy::SecretString;
-use tokio::time::sleep;
+use std::time::Duration;
 
 use crate::{
     databases::protocol::Protocol,
-    databases::{
-        self,
-        engine::{
-            CredentialKind, DedicatedSpecInput, LifecycleFlow, LifecycleRejection, PostLaunchStep,
-            RouteIdentity, TenantAuthStep,
+    routes::http::{response::ApiError, router::AppState},
+    runtime::docker::DockerRuntime,
+    server::{metadata::InstanceMetadata, paths::InstancePaths},
+    subsystems::instances::{
+        images::{check_image_allowed, validate_image},
+        requests::{
+            CreateInstanceRequest, limits_from_request, validate_create_config,
+            validate_create_request,
         },
     },
-    routes::http::{policy::DestructiveActionPolicy, response::ApiError, router::AppState},
-    runtime::docker::{DockerImagePullProgress, DockerInstanceSpec, DockerRuntime, ExecRecovery},
-    server::disk::DiskLimiter,
-    server::{
-        metadata::{
-            DatabaseIdentity, InstanceMetadata, InstanceStatus, PublicEndpoint, RuntimeKind,
-            RuntimeMetadata, SCHEMA_VERSION,
-        },
-        paths::InstancePaths,
-    },
-    subsystems::{
-        instances::{
-            docker_error,
-            images::{check_image_allowed, validate_image},
-            requests::{
-                CreateInstanceRequest, limits_from_request, validate_create_config,
-                validate_create_request,
-            },
-        },
-        monitoring::resources::{read_host_cpu_cores, read_host_disk, read_host_memory},
-    },
-    utils::{
-        backend::BackendEndpoint,
-        limits::{bytes_to_mib_ceil, mib_to_bytes},
-        logs::summarize_failure_logs,
-        redaction,
-        shell::sh_quote,
-        time::now_rfc3339,
-    },
+    utils::backend::BackendEndpoint,
 };
 
 pub(crate) mod dedicated;
@@ -72,11 +44,14 @@ mod cleanup;
 mod conflicts;
 mod launch;
 mod tenant_auth;
-pub(crate) use allocation::*;
-use cleanup::*;
-use conflicts::*;
-pub(crate) use launch::*;
-pub(crate) use tenant_auth::*;
+pub(crate) use allocation::enforce_node_allocation_policy;
+use cleanup::CreateFailureCleanup;
+use conflicts::{handle_stale_instance_resources, reject_duplicate_instance};
+pub(crate) use launch::launch_container_from_spec;
+pub(crate) use tenant_auth::{
+    flow_maintenance_credential, harden_postgres_instance_auth, missing_credential_error,
+    run_tenant_auth_step,
+};
 
 pub async fn create_instance_from_request(
     state: &AppState,

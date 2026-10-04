@@ -12,6 +12,7 @@ use tokio::time::{Instant, sleep};
 
 use crate::{
     databases::protocol::Protocol,
+    runtime::docker::helpers::verify_managed_instance_labels,
     runtime::docker::{
         CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
         ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
@@ -91,7 +92,7 @@ impl DockerRuntime {
             .and_then(|config| config.labels.as_ref())
             .cloned()
             .unwrap_or_default();
-        super::verify_managed_instance_labels(
+        verify_managed_instance_labels(
             &labels,
             &container,
             protocol,

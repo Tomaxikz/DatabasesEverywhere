@@ -1,6 +1,21 @@
 use std::{collections::HashSet, os::unix::fs::MetadataExt};
 
-use super::*;
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use tokio::time::{sleep, timeout};
+
+use super::{
+    MAX_HELPER_CMDLINE_BYTES,
+    control::{remove_control_socket, send_command_detailed},
+    mount::{read_helper_cmdline, unmount},
+    paths::fuse_paths_with_root,
+};
+use crate::server::disk::{DiskLimitError, mounts};
 
 const MAX_SCANNED_ENTRIES: usize = 8192;
 const MAX_CANDIDATES: usize = 4096;

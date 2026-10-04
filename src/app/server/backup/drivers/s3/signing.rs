@@ -1,4 +1,9 @@
-use super::*;
+use reqwest::{Method, header};
+use sha2::Digest;
+use sha2::Sha256;
+
+use super::S3BackupDriver;
+use crate::{server::backup::BackupStoreError, utils::hex::encode_lower};
 
 impl S3BackupDriver {
     pub(super) fn signed_request(

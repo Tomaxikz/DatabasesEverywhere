@@ -161,7 +161,7 @@ fn parse_clickhouse_rows(output: &str) -> Result<HashMap<String, EngineTotals>, 
     })
 }
 
-pub(super) fn parse_clickhouse_window(
+pub(crate) fn parse_clickhouse_window(
     output: &str,
 ) -> Result<(u64, HashMap<String, EngineTotals>), CollectError> {
     let (marker, rows) = output.split_once('\n').unwrap_or((output, ""));

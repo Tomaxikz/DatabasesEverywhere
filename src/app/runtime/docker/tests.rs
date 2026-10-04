@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Error as IoError, ErrorKind},
     path::PathBuf,
     time::Instant,
@@ -8,11 +9,23 @@ use bytes::Bytes;
 use futures::StreamExt;
 use secrecy::SecretString;
 
-use super::transfer::{
-    ensure_bind_mount_sources, extract_one_file, extract_one_file_until,
-    extract_one_file_with_limit, numeric_container_user, stream_with_deadline, transfer_tar_header,
+use super::{
+    transfer::{
+        ensure_bind_mount_sources, extract_one_file, extract_one_file_until,
+        extract_one_file_with_limit, numeric_container_user, stream_with_deadline,
+        transfer_tar_header,
+    },
+    *,
 };
-use super::*;
+use crate::{
+    runtime::docker::{
+        container_config::{cpu_to_nano, mib_to_bytes},
+        helpers::{
+            is_owned_managed_container, managed_container_filters, verify_managed_instance_labels,
+        },
+    },
+    utils::constants::docker::{INSTANCE_LABEL, MANAGED_LABEL, NODE_LABEL, PROTOCOL_LABEL},
+};
 
 #[test]
 fn create_body_does_not_publish_backend_ports_by_default() {

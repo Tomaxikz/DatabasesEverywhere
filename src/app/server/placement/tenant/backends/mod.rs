@@ -12,19 +12,6 @@ use crate::{
     utils::limits::InstanceLimits,
 };
 
-mod clickhouse;
-mod mongodb;
-mod mysql;
-mod postgres;
-
-pub(crate) use clickhouse::Clickhouse as ClickhouseTenantBackend;
-#[cfg(test)]
-pub(super) use clickhouse::clickhouse_telemetry_script;
-pub(crate) use mongodb::Mongodb as MongodbTenantBackend;
-pub(crate) use mysql::MysqlFlavor;
-pub(crate) use postgres::Postgres as PostgresTenantBackend;
-pub(super) use postgres::postgres_sql;
-
 /// Every supported backend implements the complete shared-tenant lifecycle.
 /// No default operation can silently accept an unsupported engine capability.
 pub(crate) trait TenantBackend: Sync {

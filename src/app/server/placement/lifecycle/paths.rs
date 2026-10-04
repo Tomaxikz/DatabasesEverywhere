@@ -48,7 +48,7 @@ pub(crate) async fn prepare_hosted_config(
     state: &AppState,
     runtime: &EngineRuntime,
 ) -> anyhow::Result<()> {
-    if !runtime.protocol.engine().has_hosted_config() {
+    if !runtime.protocol.engine().family().is_columnar() {
         return Ok(());
     }
     use crate::databases::clickhouse::docker;

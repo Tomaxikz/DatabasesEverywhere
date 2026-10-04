@@ -1,4 +1,9 @@
-use super::*;
+use std::time::Duration;
+
+use reqwest::StatusCode;
+
+use super::{MAX_RETRY_BACKOFF_EXPONENT, RETRY_BASE_DELAY_MILLIS};
+use crate::server::backup::BackupStoreError;
 
 pub(super) fn s3_status_error(operation: &str, response: &reqwest::Response) -> BackupStoreError {
     let request_id = response

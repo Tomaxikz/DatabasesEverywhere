@@ -1,3 +1,8 @@
+use super::rotation::{is_password_rejection, needs_postgres_hardening, protected_value_matches};
+use super::supervision::{
+    PasswordMetadataCommitResolution, PasswordWorkerPanicRecoveryPlan, apply_new_route_auth,
+    classify_password_commit, plan_panic_recovery, quarantined_metadata, run_password_worker,
+};
 use super::*;
 
 #[test]

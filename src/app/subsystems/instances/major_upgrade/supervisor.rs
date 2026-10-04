@@ -1,5 +1,14 @@
+use super::super::normal_image_update::{image_quarantine_summary, quarantine_image_update};
+use super::super::runtime_info::{
+    UpdateInstanceImageResponse, fail_image_update_api, fail_image_update_bad_request,
+    fail_image_update_runtime,
+};
 use super::rollback::upgrade_temp_instance_id;
-use super::*;
+use super::run_major_upgrade;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::server::metadata::InstanceMetadata;
+use crate::server::paths::InstancePaths;
 use futures::FutureExt;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;

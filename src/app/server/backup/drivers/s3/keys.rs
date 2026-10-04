@@ -1,4 +1,7 @@
-use super::*;
+use super::S3BackupDriver;
+use crate::server::backup::{
+    BackupStoreError, catalog_file_name, check_instance_id, metadata_file_name, validate_backup_id,
+};
 
 impl S3BackupDriver {
     pub(super) fn instance_prefix(&self, instance_id: &str) -> Result<String, BackupStoreError> {

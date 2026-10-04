@@ -52,12 +52,4 @@ pub(crate) trait EngineTenancy: EngineInfo {
     fn rollback_gap_sql(&self, _database: &str, _username: &str) -> Option<String> {
         None
     }
-
-    fn has_hosted_config(&self) -> bool {
-        false
-    }
-
-    fn cleans_stale_import_bridges(&self) -> bool {
-        false
-    }
 }

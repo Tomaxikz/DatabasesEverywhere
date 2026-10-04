@@ -2,50 +2,25 @@ pub(crate) mod log_stream;
 pub(crate) mod wire;
 use log_stream::stream_logs;
 
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use axum::{
-    extract::{
-        State,
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code},
-    },
+    extract::{State, ws::WebSocketUpgrade},
     response::Response,
 };
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast};
-use tokio::time::{
-    Duration, Instant, MissedTickBehavior, interval, interval_at, sleep_until, timeout_at,
-};
+use serde::Deserialize;
+use tokio::time::Duration;
 
 use crate::{
-    auth::{
-        jwt::{self, Claims},
-        scopes,
-    },
+    auth::{jwt::Claims, scopes},
     routes::http::{
-        diagnostics::PublicDiagnostic,
         limits::{WebSocketAdmissionError, WebSocketConnectionPermit},
         policy::WebSocketRequestContext,
         response::{ApiError, ApiPath, ApiQuery},
         router::AppState,
     },
-    server::jobs::import_export::{ImportExportAction, ImportExportJob, ImportExportStatus},
-    server::metadata::InstanceMetadata,
     subsystems::{
-        artifacts::{DownloadUrlResponse, artifact_download_url},
-        import_export::{ImportExportJobResponse, public_job_response},
         instances::progress::InstallProgress,
-        monitoring::{
-            activity::{TenantActivity, tenant_activity},
-            resources::{ResourceReport, ResourceScope, ResourceView, resource_report},
-        },
+        monitoring::{activity::TenantActivity, resources::ResourceReport},
     },
-    utils::time::now_unix,
 };
 
 #[derive(Debug, Deserialize)]
@@ -78,10 +53,14 @@ mod authorization;
 mod import_export;
 mod monitoring;
 mod socket;
-use authorization::*;
-use import_export::*;
-pub use monitoring::*;
-pub(crate) use socket::*;
+use authorization::resolve_instance_authorization;
+use import_export::stream_import_export;
+
+pub use monitoring::{MonitoringSnapshotCache, monitoring};
+pub(crate) use socket::{
+    close_expired_socket, close_replaced_socket, close_shutdown_socket, complete_before,
+    jwt_expiration_deadline, send_json_before, wait_for_daemon_shutdown,
+};
 
 pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket

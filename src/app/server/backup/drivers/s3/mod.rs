@@ -1,21 +1,11 @@
-use std::{collections::HashSet, fmt, path::Path, time::Duration};
+use std::{fmt, time::Duration};
 
-use bytes::Bytes;
-use futures::{StreamExt, future::BoxFuture};
-use reqwest::{Method, StatusCode, Url, header};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::io::ReaderStream;
+use futures::future::BoxFuture;
+use reqwest::Url;
 
 use crate::{
     config::BackupS3Config,
-    databases::protocol::xml_escape,
-    server::backup::{
-        BackupBundle, BackupStoreError, MAX_METADATA_BYTES, StoredBackup, catalog_file_name,
-        check_instance_id, io_error, metadata_file_name, remove_file_if_exists, sha256_file,
-        validate_backup_id,
-    },
-    utils::hex::{encode_lower, nibble},
+    server::backup::{BackupBundle, BackupStoreError, StoredBackup},
 };
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -44,11 +34,7 @@ mod tests;
 mod upload;
 mod xml;
 
-use self::download::*;
-use self::endpoint::*;
-use self::http::*;
-use self::signing::*;
-use self::xml::*;
+use self::endpoint::credentials;
 
 #[derive(Clone)]
 pub struct S3BackupDriver {

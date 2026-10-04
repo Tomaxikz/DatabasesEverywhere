@@ -59,10 +59,6 @@ impl EngineCredentials for Postgres {
         })
     }
 
-    fn hardens_auth_after_rotation(&self) -> bool {
-        true
-    }
-
     fn required_recovery_secrets<'a>(
         &self,
         metadata: &'a InstanceMetadata,

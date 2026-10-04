@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::process::Command;
 
-use super::{DiskLimitError, btrfs, canonical_path, linux_project, mounts, xfs, zfs};
+use super::{DiskLimitError, btrfs, helpers::canonical_path, linux_project, mounts, xfs, zfs};
 
 pub(super) fn privileged_command(program: &'static str) -> Command {
     if should_use_sudo() {

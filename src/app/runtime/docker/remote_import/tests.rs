@@ -1,7 +1,21 @@
+use std::{collections::HashMap, sync::Arc};
+
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::{
+    runtime::docker::{
+        DockerError, DockerSecurityPolicy,
+        remote_import::{
+            cancellation::{CancelHelperOnDrop, HelperCancellation},
+            container::{ImportHelperCreateOptions, import_helper_body, is_owned_import_helper},
+            output::redact_helper_output,
+            validation::{validate_helper_environment, validate_helper_input},
+        },
+    },
+    utils::constants::docker::{MANAGED_LABEL, NODE_LABEL},
+};
 
 #[test]
 fn helper_body_has_only_the_work_mount_and_strict_sandboxing() {

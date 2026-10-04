@@ -1,5 +1,14 @@
+use super::super::normal_image_update::{image_quarantine_summary, quarantine_image_update};
+use super::super::runtime_info::fail_image_update_runtime;
+use super::super::{IMAGE_UPDATE_ROLLBACK_TIMEOUT, docker_error};
 use super::staging::{StagedMajorUpgrade, recreate_empty_instance};
-use super::*;
+use crate::databases::protocol::Protocol;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::server::disk::DiskLimiter;
+use crate::server::metadata::InstanceMetadata;
+use crate::server::paths::InstancePaths;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::subsystems::instances) enum MajorUpgradeRollbackLocation {

@@ -6,7 +6,11 @@ use std::{
 
 use bson::raw::{RawBsonRef, RawDocument};
 
-use super::{BoundedReader, InspectionError, MAX_INSPECTED_BYTES, MAX_NAMESPACES, ensure_deadline};
+use super::{
+    InspectionError, MAX_INSPECTED_BYTES, MAX_NAMESPACES,
+    source::{BoundedReader, ensure_deadline},
+    wrappers::map_mongodb_read_error,
+};
 
 // Literal on-disk bytes from the mongo-tools archive specification. Keeping
 // these as bytes avoids accidentally reversing the documented representation.
@@ -60,7 +64,7 @@ pub(super) fn inspect_native_gzip<R: Read>(
     let mut bounded = BoundedReader::new(decoder, MAX_INSPECTED_BYTES, deadline);
     let catalog = inspect_native_archive(&mut bounded, deadline)?;
     io::copy(&mut bounded, &mut io::sink()).map_err(|error| {
-        super::map_mongodb_read_error(
+        map_mongodb_read_error(
             error,
             "MongoDB upload contains a malformed native gzip archive",
         )
@@ -171,7 +175,7 @@ fn read_bson_document<R: Read>(
 
 fn read_exact_archive<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), InspectionError> {
     reader.read_exact(buffer).map_err(|error| {
-        super::map_mongodb_read_error(
+        map_mongodb_read_error(
             error,
             "MongoDB native archive ended before its prelude was complete",
         )

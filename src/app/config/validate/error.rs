@@ -1,4 +1,4 @@
-use super::*;
+use crate::config::path_policy::HostPathPolicyError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigValidationError {

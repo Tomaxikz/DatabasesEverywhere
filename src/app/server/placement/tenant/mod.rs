@@ -10,17 +10,17 @@ use crate::{
     utils::{limits::InstanceLimits, shell::sh_quote},
 };
 
-const TENANT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-const TELEMETRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const TENANT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const TELEMETRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub(crate) mod backends;
 pub(crate) mod disk;
 mod manifest;
 pub(crate) mod recovery;
 
+use backends::TenantOperation;
 #[cfg(test)]
-use backends::clickhouse_telemetry_script;
-use backends::{TenantOperation, postgres_sql};
+use databases::clickhouse::tenant_backend::clickhouse_telemetry_script;
 pub(crate) use manifest::{ManifestChallenge, TenantManifest, measure_manifest};
 
 #[derive(Clone, Copy)]
@@ -285,7 +285,7 @@ fn parse_storage(stdout: &str, expected: usize) -> Result<Vec<u64>, TenantEngine
     Ok(values)
 }
 
-fn admin_secret(runtime: &EngineRuntime) -> Result<SecretString, TenantEngineError> {
+pub(crate) fn admin_secret(runtime: &EngineRuntime) -> Result<SecretString, TenantEngineError> {
     runtime
         .admin_secret
         .as_deref()
@@ -293,7 +293,7 @@ fn admin_secret(runtime: &EngineRuntime) -> Result<SecretString, TenantEngineErr
         .ok_or_else(|| TenantEngineError::MissingAdminSecret(runtime.runtime_id.clone()))
 }
 
-fn telemetry_command(script: String) -> String {
+pub(crate) fn telemetry_command(script: String) -> String {
     format!("exec timeout -k 1s 6s sh -c {}", sh_quote(&script))
 }
 

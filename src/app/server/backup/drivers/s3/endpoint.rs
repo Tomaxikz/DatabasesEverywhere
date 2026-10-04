@@ -1,4 +1,7 @@
-use super::*;
+use reqwest::Url;
+
+use super::{S3Credentials, S3Endpoint, signing::aws_uri_encode};
+use crate::{config::BackupS3Config, server::backup::BackupStoreError};
 
 impl S3Endpoint {
     pub(super) fn new(config: &BackupS3Config) -> Result<Self, BackupStoreError> {

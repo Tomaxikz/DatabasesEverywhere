@@ -146,10 +146,6 @@ clickhouse-client \
         ))
     }
 
-    fn shared_wipe_uses_admin_runtime(&self) -> bool {
-        true
-    }
-
     fn validate_remote_database_name(&self, database: Option<&str>) -> Result<(), TransferError> {
         if !database.is_some_and(|value| portable_identifier(value, 128)) {
             return Err(TransferError::BadRequest(

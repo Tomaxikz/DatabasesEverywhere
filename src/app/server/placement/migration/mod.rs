@@ -1,13 +1,8 @@
-use std::str::FromStr;
-
-use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteRow};
+use sqlx::SqlitePool;
 
 use crate::{
-    databases::protocol::Protocol,
-    server::metadata::InstanceMetadata,
-    server::placement::{DeploymentMode, PlacementError},
-    utils::{backend::BackendEndpoint, time::now_rfc3339},
+    server::{metadata::InstanceMetadata, placement::DeploymentMode},
+    utils::time::now_rfc3339,
 };
 
 mod commit;
@@ -19,11 +14,12 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
-pub use self::error::*;
-pub use self::model::*;
-use self::recovery::*;
-use self::rows::*;
-pub use self::stage::*;
+pub use self::error::DeploymentMigrationError;
+pub use self::model::{
+    DeploymentMigration, MigrationFailure, MigrationPatch, MigrationRecoverySummary,
+};
+use self::rows::{is_unique_error, read_migration, u64_to_i64};
+pub use self::stage::MigrationStage;
 
 #[derive(Debug, Clone)]
 pub struct DeploymentMigrationRepository {

@@ -1,4 +1,20 @@
-use super::*;
+use notify::Watcher;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    time::Instant,
+};
+
+use super::{
+    SoftDiskWatcher,
+    helpers::{
+        abandon_backend, ensure_backend, install_recursive_watch, lock_recover, next_nonzero,
+        registration_result, validate_registration,
+    },
+    state::{RecursiveWatchInstall, TargetState, WatchHealth},
+    types::{RegistrationStatus, RetiredWatch, WatchRegistration, WatchRegistrationError},
+};
 
 impl SoftDiskWatcher {
     pub(crate) fn register(

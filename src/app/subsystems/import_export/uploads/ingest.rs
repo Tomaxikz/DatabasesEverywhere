@@ -1,4 +1,44 @@
-use super::*;
+use std::{sync::Arc, time::Duration};
+
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, StatusCode, header},
+};
+
+use futures::StreamExt;
+
+use sha2::{Digest, Sha256};
+
+use tokio::io::AsyncWriteExt;
+
+use crate::{
+    databases::protocol::Protocol,
+    routes::http::{
+        response::{ApiError, ApiResponse, ApiResult},
+        router::AppState,
+    },
+    server::paths::InstancePaths,
+    storage::import_uploads::{
+        ImportUpload, ImportUploadAdmission, ImportUploadArchiveFormat, NewImportUpload,
+    },
+    utils::{hex::nibble, time::now_rfc3339},
+};
+
+use super::{
+    super::{
+        files::{create_private_file_sync, has_allowed_artifact_extension, prepare_private_dir},
+        inspection::DumpArchiveFormat,
+    },
+    FILENAME_HEADER, ImportUploadResponse, MAX_ORIGINAL_FILENAME_BYTES, SHA256_HEADER,
+    SHA256_HEX_LEN, UPLOAD_ID_PREFIX, UPLOADS_DIRECTORY,
+    records::{expiration_timestamp, is_lowercase_hex, public_upload, upload_storage_error},
+    storage::reserve_upload_disk_space,
+    worker::{
+        UploadWorkerGuards, UploadWorkerOptions, UploadWorkerRecovery, recover_interrupted_upload,
+        spawn_upload_worker,
+    },
+};
 
 pub(super) async fn upload_dump(
     state: &AppState,

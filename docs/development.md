@@ -29,8 +29,8 @@ For cross-release packaging, `cargo b` runs the workspace's
 | `src/app/state.rs` | Application composition, shared resources, and mutation draining |
 | `src/app/routes/` | HTTP layer: URL-mirroring route tree (`api/`, `metrics.rs`, `ws/`) plus `routes/http/` with the router, layers, policy and error adapters |
 | `src/app/subsystems/` | Request handlers and domain logic behind the routes (instances, pools, import/export, monitoring, artifacts, backups, system) |
-| `src/app/instance/` | Instance metadata and lifecycle, placement, disk limits, backups, jobs, compatibility, and monitoring |
-| `src/app/databases/` | Engine traits (`engine/`) and one folder per database engine implementing them |
+| `src/app/server/` | Managed-instance domain: metadata and lifecycle, placement, disk limits, backups, jobs, compatibility, and monitoring |
+| `src/app/databases/` | `Protocol`, engine traits (`engine/`), and one folder per database engine implementing them |
 | `src/app/gateway/` | Client-facing listeners and wire protocols (`gateway/protocols/`) |
 | `src/app/runtime/` | Container runtime (Docker/Podman) executor |
 | `src/app/storage/` | SQLite repositories, secrets, and migrations |
@@ -50,26 +50,31 @@ The layout follows the same separation of transport, managed resources, and
 runtime capabilities used by [Calagopus Wings](https://github.com/calagopus/wings/tree/34a1fe19ff30f273cac948b64b72e6d4f1cc4c63/application/src),
 without copying its game-server-specific modules or adding unnecessary crates.
 
-- `cli` parses user input and dispatches commands; `daemon` owns process services
-  and their startup/shutdown ordering. Daemon services do not depend on CLI parsing.
-  `daemon::services::BackgroundServices` owns maintenance and lifecycle task
-  handles. Shutdown closes admission before aborting maintenance and draining
-  lifecycle work; managed database containers are not stopped by daemon shutdown.
-- `api` groups HTTP handlers by resource (`instances`, `pools`, `backups`, etc.).
-  `api/http/router.rs` wires endpoints and middleware; `state.rs` owns application
-  composition, shared resources, and mutation-drain coordination. Shared HTTP error adapters
-  belong in `api/http/response.rs`, not in another resource's provisioning handler.
-- `instances` owns instance metadata and coordination; `placement` owns dedicated
-  and shared runtime placement, tenant lifecycle, and migration state.
-- `runtime` owns container-engine interaction; `databases` and `protocols` own
-  engine-specific operations and wire protocols. `gateway` owns ingress routing.
-- `storage`, `backups`, `disk`, `jobs`, and `monitoring` retain their existing
-  persistence, backup, quota, scheduling, and measurement responsibilities.
+- `commands` parses user input and dispatches one `CliCommand` per subcommand;
+  `daemon` owns process services and their startup/shutdown ordering. Daemon
+  services do not depend on CLI parsing. `daemon::services` registers one
+  `DaemonService` per background task; `BackgroundServices` owns their handles.
+  Shutdown closes admission before aborting maintenance and draining lifecycle
+  work; managed database containers are not stopped by daemon shutdown.
+- `routes` mirrors the URL space: each endpoint file registers its own route and
+  delegates to a handler in `subsystems`. `routes/http/router.rs` merges the tree
+  and applies middleware; shared HTTP error adapters belong in
+  `routes/http/response.rs`. `state.rs` owns application composition, shared
+  resources, and mutation-drain coordination.
+- `subsystems` holds request handling and orchestration by resource (`instances`,
+  `pools`, `import_export`, `backups`, etc.).
+- `server` owns the managed-instance domain: instance metadata and coordination,
+  `placement` (dedicated and shared runtime placement, tenant lifecycle, migration
+  state), plus `backup`, `disk`, `jobs`, `compatibility`, and `monitoring`.
+- `databases` owns `Protocol` and all engine-specific behavior: callers ask
+  `protocol.engine()` instead of matching on the protocol. `runtime` owns
+  container-engine interaction; `gateway` owns ingress routing and wire protocols.
+- `storage` retains persistence; `io` and `utils` hold shared helpers.
 
 Keep behavior with its owner and expose only the capabilities callers need.
-New code should import application state from `crate::state`; the previous
-`api::http::state` and `api::http::router` exports remain available for library
-compatibility. `AppState` is a composition object for handlers and coordinators,
+New code should import application state from `crate::state`; the
+`routes::http::state` and `routes::http::router` exports remain available for
+library compatibility. `AppState` is a composition object for handlers and coordinators,
 not a backend interface. Backends receive the specific resources they need.
 
 ### Backend contracts and ownership
@@ -80,13 +85,13 @@ boundaries, not as a mandatory wrapper around every module.
 
 | Subsystem | Contract / entry point | Responsibility kept outside the backend |
 | --- | --- | --- |
-| Backups | `backups::drivers::BackupDriver`, selected by `BackupStorage` | ID validation, inventory sorting, materialization guards and cancellation ownership |
-| Shared tenants | `placement::tenant::backends::TenantBackend` | Credential-validation order, verified reopening/refencing, strict storage-result validation |
-| Engine telemetry | `monitoring::engine::backends::EngineTelemetry` | Tenant identity/generation checks, backoff, accounting baselines, committing successful checkpoints |
-| Shared-pool safety | `placement::containment` | One fencing/quarantine/verified-stop sequence shared by HTTP and boot recovery |
-| Soft disk enforcement | Existing `disk::soft::SoftDiskRuntime` | Scanning and quota policy remain owned by `disk::soft` |
+| Backups | `server::backup::drivers::BackupDriver`, selected by `BackupStorage` | ID validation, inventory sorting, materialization guards and cancellation ownership |
+| Shared tenants | `server::placement::tenant::backends::TenantBackend` (implemented in `databases/<engine>/tenant_backend.rs`) | Credential-validation order, verified reopening/refencing, strict storage-result validation |
+| Engine telemetry | `server::monitoring::engine::backends::EngineTelemetry` (implemented in `databases/<engine>/telemetry.rs`) | Tenant identity/generation checks, backoff, accounting baselines, committing successful checkpoints |
+| Shared-pool safety | `server::placement::containment` | One fencing/quarantine/verified-stop sequence shared by HTTP and boot recovery |
+| Soft disk enforcement | Existing `server::disk::soft::SoftDiskRuntime` | Scanning and quota policy remain owned by `server::disk::soft` |
 | Import/export scheduling | Existing `SchedulerResourceProvider` | Queue admission, resource budgets, and job lifecycle remain owned by the scheduler |
-| Output disk capacity | `disk::capacity::DiskCapacityService` | One reservation ledger shared by uploads, staging, and backups; HTTP error mapping remains in the upload adapter |
+| Output disk capacity | `server::disk::capacity::DiskCapacityService` | One reservation ledger shared by uploads, staging, and backups; HTTP error mapping remains in the upload adapter |
 
 The new backend traits are internal. HTTP routes, JSON models, configuration,
 public backup provider methods, and persisted metadata do not change. Async

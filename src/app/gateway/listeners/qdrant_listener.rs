@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    io::Error as IoError,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -15,8 +16,19 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
-use super::{listener_io::accept_direct_tls, *};
-use crate::{gateway::protocols::qdrant, utils::backend::BackendEndpoint};
+use super::listener_io::accept_direct_tls;
+use crate::{
+    gateway::{
+        listeners::{
+            CLIENT_HANDSHAKE_TIMEOUT, GatewayStream, ListenerError, MAX_ROUTING_HANDSHAKE_BYTES,
+            client_handshake,
+        },
+        protocols::qdrant,
+        resolver::RouteResolver,
+        tunnel,
+    },
+    utils::backend::BackendEndpoint,
+};
 
 impl GatewayStream {
     fn alpn_protocol(&self) -> Option<&[u8]> {
@@ -421,6 +433,7 @@ fn qdrant_http_endpoint(endpoint: BackendEndpoint) -> Result<BackendEndpoint, Li
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::{listeners::ListenerError, resolver::RouteResolver};
     use crate::{
         databases::protocol::Protocol, server::state::InstanceStore,
         subsystems::monitoring::resources::ResourceCache,

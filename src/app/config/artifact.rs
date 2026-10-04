@@ -1,4 +1,6 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use super::ImportExportSchedulerConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

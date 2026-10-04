@@ -1,7 +1,17 @@
-use super::*;
-
 /// Proxies authenticated PostgreSQL frontend frames without buffering query
 /// bodies. Only complete Query and Execute messages affect activity counters.
+use std::sync::Arc;
+
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    gateway::listeners::{
+        ListenerError,
+        listener_io::{ActivitySession, SQL_PREFIX_BYTES, classify::classify_sql, copy_exact},
+    },
+    server::monitoring::{ActivityCounter, OperationKind},
+};
+
 pub(in super::super) async fn proxy_postgres_session<C, B>(
     client: C,
     backend: B,

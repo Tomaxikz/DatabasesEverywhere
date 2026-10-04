@@ -1,4 +1,7 @@
-use super::*;
+use std::path::{Path, PathBuf};
+
+use super::{MINIMUM_FUSEQUOTA_NOFILE, NofileLimits, TARGET_FUSEQUOTA_NOFILE};
+use crate::server::disk::{DiskLimitError, path_io_error};
 
 pub(super) async fn set_helper_nofile_limit(peer_pid: i32) -> Result<(), DiskLimitError> {
     let limits_path = PathBuf::from(format!("/proc/{peer_pid}/limits"));

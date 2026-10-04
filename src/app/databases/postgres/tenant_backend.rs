@@ -1,8 +1,10 @@
 use futures::future::BoxFuture;
 use secrecy::SecretString;
 
-use super::super::{TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget, admin_secret};
-use super::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::backends::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::{
+    TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget, admin_secret,
+};
 use crate::{
     databases::protocol::Protocol,
     databases::{self, postgres::docker::CONTROL_DATABASE},
@@ -183,7 +185,7 @@ fn quota_sql(target: TenantTarget<'_>, limits: &InstanceLimits) -> String {
     )
 }
 
-pub(in crate::server::placement::tenant) async fn postgres_sql(
+pub(crate) async fn postgres_sql(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
     database: &str,

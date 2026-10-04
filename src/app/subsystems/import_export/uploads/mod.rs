@@ -1,42 +1,15 @@
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
-
-use axum::{
-    body::Body,
-    extract::{FromRequest, Request, State},
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
-};
-
-use futures::StreamExt;
+use std::sync::Arc;
 
 use serde::Serialize;
 
-use sha2::{Digest, Sha256};
-
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::{
-    routes::http::response::{ApiError, ApiJson, ApiPath, ApiResponse},
-    server::disk::capacity::{CapacityError, DiskCapacityService},
-    server::paths::InstancePaths,
-    storage::import_uploads::{
-        ImportUpload, ImportUploadAdmission, ImportUploadArchiveFormat, ImportUploadRepository,
-        ImportUploadState, NewImportUpload,
-    },
-    utils::{hex::nibble, time::now_rfc3339},
+    databases::protocol::Protocol, routes::http::response::ApiError,
+    server::disk::capacity::DiskCapacityService, storage::import_uploads::ImportUploadRepository,
 };
 
-use super::{
-    ImportRequest,
-    files::{create_private_file_sync, has_allowed_artifact_extension, prepare_private_dir},
-    inspection::{
-        DumpArchiveFormat, DumpInspection, DumpInspectionFailure, inspect_uploaded_dump_with_format,
-    },
-    jobs::queue_import_instance,
-    *,
-};
+use super::files::prepare_private_dir;
 
 const FILENAME_HEADER: &str = "x-dbev-filename";
 const SHA256_HEADER: &str = "x-dbev-sha256";
@@ -59,11 +32,6 @@ mod upload_tests;
 mod worker;
 
 pub(super) use mongodb::resolve_upload_catalog;
-
-use worker::{
-    UploadWorkerGuards, UploadWorkerOptions, UploadWorkerRecovery, recover_interrupted_upload,
-    spawn_upload_worker,
-};
 
 #[derive(Debug, Clone)]
 pub struct ImportUploadService {
@@ -197,17 +165,19 @@ pub(super) struct ImportStagingPermit {
 pub(crate) use crate::server::disk::capacity::DiskCapacityReservation;
 
 mod handlers;
-pub(crate) use handlers::*;
+pub(crate) use handlers::{
+    delete_import_upload, get_import_catalog, get_import_upload, import_entry,
+    inspect_import_upload, list_import_uploads,
+};
 mod finalize;
-use finalize::*;
 mod ingest;
-use ingest::*;
-mod records;
-pub(super) use records::*;
-mod storage;
-pub(super) use storage::*;
 mod lifecycle;
-pub(super) use lifecycle::*;
+pub(super) use lifecycle::finish_upload_import_job;
+mod records;
+pub(super) use records::check_upload_selection;
+mod storage;
+use storage::capacity_api_error;
+pub(super) use storage::{harden_upload_source, remove_upload_file, upload_file_path};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ImportUploadResponse {

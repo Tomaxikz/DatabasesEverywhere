@@ -1,11 +1,15 @@
 use std::{
-    collections::{HashMap, HashSet},
-    panic::AssertUnwindSafe,
+    collections::HashMap,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use futures::FutureExt;
+use scanning::{CompletedSoftDiskScan, dispatch_due_scans, finish_soft_disk_scan};
+use targets::{RootObservationContext, sync_soft_disk_targets};
+use watching::{
+    CompletedWatchOperation, PendingWatchRefresh, dispatch_watch, finish_watch,
+    refresh_watcher_work,
+};
 
 mod root_identity;
 mod runtime;
@@ -14,26 +18,19 @@ mod targets;
 mod watch_operations;
 mod watching;
 
-use super::*;
+#[cfg(test)]
+pub(super) use runtime::is_current_target;
+
 use crate::{
     server::disk::soft::{
-        HybridScanExecution, HybridScanRequest, PerformedScanKind, ScanOutcome,
-        SoftDiskLimitExceeded, SoftDiskRuntime, SoftDiskTarget, StopOutcome,
-        planner::{
-            CompletionDisposition, HybridScanPlanner, PlannerConfig, ScanCandidate, ScanCompletion,
-            ScanKind, TargetSpec,
-        },
-        watcher::{DirtyBatch, RegistrationStatus, SoftDiskWatcher},
+        SoftDiskTarget,
+        planner::{HybridScanPlanner, PlannerConfig},
+        watcher::SoftDiskWatcher,
     },
-    server::metadata::DesiredInstanceState,
+    state::AppState,
 };
-use root_identity::{ObservationDisposition, RootIdentityTracker, watch_fingerprint};
-use scanning::*;
-use targets::*;
-use watch_operations::{DesiredWatch, WatchOperation, WatchOperationQueue};
-use watching::*;
-
-pub(super) use runtime::*;
+use root_identity::RootIdentityTracker;
+use watch_operations::WatchOperationQueue;
 
 const GRACEFUL_STOP_TIMEOUT_PADDING: Duration = Duration::from_secs(5);
 

@@ -87,10 +87,6 @@ pub(crate) trait EngineCredentials: EngineInfo {
         ))
     }
 
-    fn hardens_auth_after_rotation(&self) -> bool {
-        false
-    }
-
     fn is_password_rejection(&self, _lowercase_failure_output: &str) -> bool {
         false
     }

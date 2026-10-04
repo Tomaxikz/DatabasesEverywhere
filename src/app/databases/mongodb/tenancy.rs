@@ -1,14 +1,14 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    server::placement::tenant::backends::{MongodbTenantBackend, TenantBackend},
+    server::placement::tenant::backends::TenantBackend,
     utils::shell::sh_quote,
 };
 
-use super::engine::Mongodb;
+use super::{engine::Mongodb, tenant_backend};
 
 impl EngineTenancy for Mongodb {
     fn tenant_backend(&self) -> Option<&'static dyn TenantBackend> {
-        Some(&MongodbTenantBackend)
+        Some(&tenant_backend::Mongodb)
     }
 
     fn tenant_disk_boundary(&self) -> Option<TenantDiskBoundary> {

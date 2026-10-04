@@ -1,9 +1,22 @@
 //! Engine-neutral import/export orchestration around per-engine transfer scripts.
 
-use super::{files::*, *};
+use std::time::Duration;
+
+use crate::{
+    databases::protocol::Protocol,
+    routes::http::{response::ApiError, router::AppState},
+    runtime::docker::ExecRecovery,
+    server::{metadata::InstanceMetadata, placement::DeploymentMode},
+};
+
+use super::{
+    ImportExportSelection, ImportOptions, ImportSourceOptions, LOGICAL_STREAM_EXEC_TIMEOUT,
+    files::validate_artifact_path, logical_exec_recovery, remote::validate_remote_source,
+};
+
 use crate::{databases::engine::LogicalImportRequest, server::credentials::logical_import_env};
 
-pub(super) use crate::databases::engine::{ImportConnection, SelectionUse};
+pub(super) use crate::databases::engine::ImportConnection;
 
 pub(super) async fn validate_import_source(
     _state: &AppState,
@@ -153,7 +166,7 @@ pub(super) async fn wipe_logical_target(
     let timeout = exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT);
     let script = wipe_logical_script(metadata, database_definition_in_dump)?;
     if metadata.deployment_mode == DeploymentMode::Shared
-        && metadata.protocol.engine().shared_wipe_uses_admin_runtime()
+        && metadata.protocol.engine().family().is_columnar()
     {
         return super::shared_restore::wipe_clickhouse(state, metadata, timeout).await;
     }

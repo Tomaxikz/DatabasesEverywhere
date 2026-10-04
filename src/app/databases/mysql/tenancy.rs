@@ -2,15 +2,14 @@ use std::time::Duration;
 
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    server::monitoring::engine::backends::{EngineTelemetry, MysqlTelemetry},
-    server::placement::{
-        policy,
-        tenant::backends::{MysqlFlavor, TenantBackend},
-    },
+    server::monitoring::engine::backends::EngineTelemetry,
+    server::placement::{policy, tenant::backends::TenantBackend},
     utils::{limits::InstanceLimits, shell::sh_quote},
 };
 
-use super::{engine::Mysql, provision::TenantQuota};
+use super::{
+    engine::Mysql, provision::TenantQuota, telemetry::MysqlTelemetry, tenant_backend::MysqlFlavor,
+};
 
 impl EngineTenancy for Mysql {
     fn tenant_backend(&self) -> Option<&'static dyn TenantBackend> {

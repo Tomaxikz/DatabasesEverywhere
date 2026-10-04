@@ -28,4 +28,12 @@ impl EngineFamily {
     pub(crate) const fn is_resp(self) -> bool {
         matches!(self, Self::Resp)
     }
+
+    pub(crate) const fn is_document(self) -> bool {
+        matches!(self, Self::Document)
+    }
+
+    pub(crate) const fn is_vector(self) -> bool {
+        matches!(self, Self::Vector)
+    }
 }

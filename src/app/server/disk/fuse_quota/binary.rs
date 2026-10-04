@@ -1,4 +1,15 @@
-use super::*;
+use sha2::Digest;
+use std::io::Read;
+use std::{
+    fs::File,
+    io::{Error, ErrorKind},
+    path::{Path, PathBuf},
+};
+
+use sha2::Sha256;
+
+use super::{EMBEDDED_BINARY, HASH_BUFFER_BYTES, SHA256_HEX_LENGTH};
+use crate::server::disk::DiskLimitError;
 
 pub(super) async fn resolve_binary(
     binary: &str,

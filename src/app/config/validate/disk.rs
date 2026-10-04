@@ -1,4 +1,4 @@
-use super::*;
+use super::{ConfigValidationError, network::validate_absolute_path};
 
 pub(super) fn validate_disk(disk: &crate::config::DiskConfig) -> Result<(), ConfigValidationError> {
     if disk.project_id_base == 0 {

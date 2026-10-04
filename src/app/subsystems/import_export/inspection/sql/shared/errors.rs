@@ -1,4 +1,4 @@
-use super::*;
+use super::InspectionError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedSqlIssue {

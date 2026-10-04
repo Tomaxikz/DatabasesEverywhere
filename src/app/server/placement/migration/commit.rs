@@ -1,4 +1,14 @@
-use super::*;
+use sqlx::Row;
+
+use super::{
+    DeploymentMigration, DeploymentMigrationError, DeploymentMigrationRepository,
+    recovery::cutover_is_ready,
+    rows::{backend_columns, mark_cutover_committed},
+};
+use crate::{
+    server::{metadata::InstanceMetadata, placement::DeploymentMode},
+    utils::time::now_rfc3339,
+};
 
 impl DeploymentMigrationRepository {
     /// Atomically moves a provisional shared-pool reservation onto the public

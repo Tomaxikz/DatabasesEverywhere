@@ -1,56 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    io::{self, ErrorKind, IsTerminal, Read, Write},
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
-    path::{Path, PathBuf},
-    process::Command as StdCommand,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
-use anyhow::Context;
-use axum::Router;
-use axum_server::{Handle, accept::NoDelayAcceptor, tls_rustls::RustlsConfig};
-use futures::StreamExt;
-use hyper_util::rt::TokioTimer;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use secrecy::SecretString;
-use serde::Deserialize;
-use tokio::{io::AsyncWriteExt, net::TcpListener};
-
-use crate::{
-    auth::api_token::ApiToken,
-    config::{Config, DaemonEngine, DiskLimitMode, load::load_config},
-    databases::protocol::Protocol,
-    gateway::{
-        listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
-        supervisor::GatewaySupervisor,
-    },
-    routes::http::{response::ApiError, router::build_router},
-    runtime::docker::{
-        CpuBurstPolicyStatus, DockerContainerStatus, DockerRuntime, ManagedContainerEvent,
-    },
-    server::disk::DiskLimiter,
-    server::jobs::import_export::ImportExportJobs,
-    server::{
-        manager::InstanceManager, metadata::InstanceStatus, paths::InstancePaths, reconcile,
-        state::InstanceStore,
-    },
-    state::{AppState, AppStateData},
-    storage::{
-        import_export_jobs::ImportExportJobRepository,
-        import_uploads::ImportUploadRepository,
-        repositories::{InstanceRepository, ProtectedSecretField},
-        sqlite,
-    },
-    subsystems::instances::progress::InstallProgressStore,
-    utils::constants::{MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, defaults},
-    utils::{
-        ids::validate_instance_id, images::has_sha256_digest, limits::mib_to_bytes,
-        logs::truncate_log_tail, time::now_rfc3339,
-    },
-};
+use std::time::Duration;
 
 mod admission;
 mod boot_recovery;
@@ -71,20 +19,7 @@ pub(crate) mod setup;
 mod soft_disk_limiter;
 mod startup;
 
-use crate::server::placement::lifecycle::*;
-use crate::server::placement::tenant::recovery::*;
-use admission::ApiConnectionAcceptor;
-use boot_recovery::*;
-use container_events::*;
-use import_temp_cleanup::*;
 pub(crate) use lifecycle::run_daemon;
-use logging::*;
-use orphan_reservations::*;
-use runtime_paths::*;
-use server::*;
-use setup::*;
-use soft_disk_limiter::*;
-use startup::*;
 
 #[cfg(test)]
 mod tests;

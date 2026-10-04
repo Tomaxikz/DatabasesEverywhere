@@ -2,15 +2,13 @@ use std::time::Duration;
 
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    server::monitoring::engine::backends::{EngineTelemetry, MariadbTelemetry},
-    server::placement::{
-        policy,
-        tenant::backends::{MysqlFlavor, TenantBackend},
-    },
+    databases::mysql::tenant_backend::MysqlFlavor,
+    server::monitoring::engine::backends::EngineTelemetry,
+    server::placement::{policy, tenant::backends::TenantBackend},
     utils::{limits::InstanceLimits, shell::sh_quote},
 };
 
-use super::{engine::Mariadb, provision::TenantQuota};
+use super::{engine::Mariadb, provision::TenantQuota, telemetry::MariadbTelemetry};
 
 const STATEMENT_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 

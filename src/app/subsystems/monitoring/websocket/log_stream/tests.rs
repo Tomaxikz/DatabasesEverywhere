@@ -1,3 +1,4 @@
+use super::super::WEBSOCKET_MAX_MESSAGE_BYTES;
 use super::*;
 
 #[test]

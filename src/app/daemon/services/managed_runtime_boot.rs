@@ -1,3 +1,4 @@
+use crate::daemon::boot_recovery::finish_runtime_boot;
 use tokio::task::JoinHandle;
 
 use super::{DaemonService, ServiceKind};
@@ -17,6 +18,6 @@ impl DaemonService for ManagedRuntimeBoot {
     }
 
     fn spawn(&self, state: AppState) -> JoinHandle<()> {
-        tokio::spawn(super::super::finish_runtime_boot(state))
+        tokio::spawn(finish_runtime_boot(state))
     }
 }

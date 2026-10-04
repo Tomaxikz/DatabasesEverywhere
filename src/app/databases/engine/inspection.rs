@@ -7,10 +7,6 @@ pub(crate) trait EngineInspection: EngineInfo {
         None
     }
 
-    fn inspects_archive_catalogs(&self) -> bool {
-        false
-    }
-
     fn catalog_schema_script(
         &self,
         _metadata: &InstanceMetadata,

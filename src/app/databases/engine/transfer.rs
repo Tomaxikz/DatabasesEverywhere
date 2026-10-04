@@ -79,9 +79,11 @@ pub(crate) enum RemoteDumpFlow {
 
 fn validate_sql_object_name(protocol: Protocol, value: &str) -> Result<(), TransferError> {
     let parts: Vec<_> = value.split('.').collect();
-    let valid = match protocol {
-        Protocol::Postgres | Protocol::Mariadb | Protocol::Mysql => (1..=2).contains(&parts.len()),
-        _ => false,
+    let family = protocol.engine().family();
+    let valid = if family.is_postgres() || family.is_mysql() {
+        (1..=2).contains(&parts.len())
+    } else {
+        false
     } && parts
         .iter()
         .all(|part| !part.is_empty() && simple_identifier(part));
@@ -277,10 +279,6 @@ pub(crate) trait EngineTransfer: EngineInfo {
             "{} uses physical archive import",
             self.protocol().as_str()
         )))
-    }
-
-    fn shared_wipe_uses_admin_runtime(&self) -> bool {
-        false
     }
 
     fn validate_remote_source_fields(

@@ -1,27 +1,22 @@
 use std::{
     collections::HashMap,
     future::Future,
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, atomic::AtomicUsize},
+    time::Duration,
 };
 
 use tokio::sync::{Mutex, Semaphore};
 
-use sha2::Digest;
-
 use crate::{
     config::{DiskLimitMode, SoftDiskScannerConfig},
     databases::protocol::Protocol,
-    utils::limits::mib_to_bytes,
 };
 
-use super::usage::{DirectoryUsage, ScanLimits, scan_directory_with_id};
+use super::usage::DirectoryUsage;
+
+#[cfg(test)]
+use std::{path::PathBuf, time::Instant};
 
 // Bound tenant-controlled incremental state; larger trees stream full scans.
 const DEFAULT_MAX_CACHED_DIRECTORIES_PER_TARGET: usize = 4_096;
@@ -48,10 +43,19 @@ mod tests;
 mod thresholds;
 mod types;
 
-use self::cache::*;
-pub(crate) use self::enforcement::*;
-use self::thresholds::*;
-pub use self::types::*;
+use self::cache::{
+    TargetFingerprint, TargetScanFailures, TrackerState, UsageCacheLimits, UsageTreeState,
+};
+pub(crate) use self::enforcement::stop_with_kill_fallback;
+#[cfg(test)]
+use self::thresholds::safety_reserve_bytes;
+#[cfg(test)]
+use self::thresholds::thresholds;
+pub(crate) use self::types::{HybridScanExecution, HybridScanRequest, PerformedScanKind};
+pub use self::types::{
+    ScanOutcome, SoftDiskBlockReason, SoftDiskLimitExceeded, SoftDiskRuntime, SoftDiskSnapshot,
+    SoftDiskTarget, StopOutcome,
+};
 
 pub(crate) type RuntimeFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 pub(crate) type StopRuntimeFuture<'a> =

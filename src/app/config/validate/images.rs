@@ -1,4 +1,5 @@
-use super::*;
+use super::ConfigValidationError;
+use crate::utils::images::is_pinned_image_reference;
 
 pub(super) fn validate_images(
     images: &crate::config::ImageConfig,

@@ -1,4 +1,16 @@
-use super::*;
+use std::time::{Duration, Instant};
+
+use super::{
+    SoftDiskLimiter, WARNING_USAGE_PERCENT,
+    cache::{TargetFingerprint, TargetScanFailures, TrackerState},
+    growth,
+    thresholds::{SampleDecision, full_scan_interval_secs, predict_seconds_to_limit, thresholds},
+    types::{
+        ScanOutcome, SoftDiskBlockReason, SoftDiskLimitExceeded, SoftDiskRuntime, SoftDiskSnapshot,
+        SoftDiskTarget, StopOutcome,
+    },
+};
+use crate::server::disk::usage::DirectoryUsage;
 
 impl SoftDiskLimiter {
     pub(super) async fn record_sample(

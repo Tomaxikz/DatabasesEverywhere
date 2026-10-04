@@ -1,4 +1,4 @@
-use super::*;
+use std::{fmt, path::PathBuf};
 
 /// Root-relative filesystem activity accumulated for one target.
 #[derive(Clone)]

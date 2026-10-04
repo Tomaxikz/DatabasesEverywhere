@@ -1,4 +1,34 @@
-use super::*;
+use std::{
+    path::{Path as FsPath, PathBuf},
+    time::Duration,
+};
+
+use crate::{
+    databases::protocol::Protocol,
+    routes::http::{response::ApiError, router::AppState},
+    server::{
+        credentials::logical_export_env, metadata::InstanceMetadata, placement::DeploymentMode,
+    },
+};
+
+use super::{
+    super::{
+        ExportOptions, ImportOptions, LOGICAL_STREAM_EXEC_TIMEOUT, MAX_UNARCHIVED_BYTES,
+        archive::prepare_import_artifact,
+        files::{
+            archive_or_copy_export, check_import_file_size, cleanup_path, dump_extension,
+            logical_staging_root, prepare_private_dir,
+        },
+        logical_exec_recovery,
+        postgres_dump::wrapper_lines,
+        protocol::{ImportConnection, build_import_script, export_script},
+    },
+    prepared_support::{
+        LogicalApplyError, PreparedLogicalImport, PreparedTarget, apply_prepared_logical_import,
+        cleanup_prepared_logical_import, parse_sha256, pin_prepared_source,
+    },
+    target::{fence_import_target, restore_import_target_route},
+};
 
 #[derive(Clone, Copy, Default)]
 pub(in super::super) struct LogicalExportControls {
@@ -175,7 +205,7 @@ pub(super) async fn prepare_logical_import(
     }
 
     let postgres_wrapper_lines = if protocol.engine().family().is_postgres() {
-        match super::postgres_dump::wrapper_lines(&host_temp, prepared_source_bytes).await {
+        match wrapper_lines(&host_temp, prepared_source_bytes).await {
             Ok(lines) => lines,
             Err(error) => {
                 discard_owned_temp(&host_temp, owns_host_temp).await;
@@ -209,9 +239,9 @@ pub(super) async fn prepare_logical_import(
         controls.database_definition_in_dump,
         postgres_wrapper_lines,
         if shared_restore {
-            super::protocol::ImportConnection::PoolLoopback
+            ImportConnection::PoolLoopback
         } else {
-            super::protocol::ImportConnection::LocalSocket
+            ImportConnection::LocalSocket
         },
     ) {
         Ok(script) => script,
@@ -267,7 +297,7 @@ pub(super) async fn inspect_shared_import_digest(
     source_database: Option<&str>,
     postgres_wrapper_lines: Option<(u64, u64)>,
 ) -> Result<[u8; 32], ApiError> {
-    use super::inspection::shared_import::{
+    use super::super::inspection::shared_import::{
         SharedImportLayout, SharedImportRequest, validate_shared_import,
     };
     let archive_format = if protocol.engine().native_gzip_logical_dump() {

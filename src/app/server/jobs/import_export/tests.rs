@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::io::{Read, Write};
 
 use super::*;
 

@@ -1,4 +1,18 @@
-use super::*;
+use super::super::route_fence;
+use super::lifecycle::{SharedLifecycleError, limits_match, route_was_open, target};
+use super::maintenance::{clear_caches, drain_tenant_sessions};
+use super::runtime::{
+    load_runtime, measure_tenant_usage, reload_after_runtime_lock, restore_access,
+    set_requested_disk_state, shared_runtime_id,
+};
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::server::metadata::{InstanceMetadata, InstanceStatus};
+use crate::server::placement::runtime as shared_runtime;
+use crate::server::placement::{EngineRuntime, EngineRuntimeStatus, tenant};
+use crate::utils::limits::{InstanceLimits, mib_to_bytes};
+use crate::utils::time::now_rfc3339;
+use tokio::sync::OwnedMutexGuard;
 
 pub(in super::super) async fn resize(
     state: &AppState,

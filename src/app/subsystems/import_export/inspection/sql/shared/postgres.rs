@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    SharedObserver, SharedSqlError, SharedSqlIssue, Statement, is_any_keyword, parse_namespace,
+    words::{
+        contains_any, contains_sequence, create_object, is_postgres_system_schema,
+        privileged_object_command, qualified_identifiers, word_at_is,
+    },
+};
 
 impl SharedObserver<'_> {
     pub(super) fn validate_postgres(

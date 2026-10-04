@@ -212,7 +212,7 @@ pub(super) fn needs_postgres_hardening(
     protocol: Protocol,
     target_password: Option<&SecretString>,
 ) -> bool {
-    protocol.engine().hardens_auth_after_rotation() && target_password.is_some()
+    protocol.engine().family().is_postgres() && target_password.is_some()
 }
 
 pub(super) async fn verify_tenant_credential(

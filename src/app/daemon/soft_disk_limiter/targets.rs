@@ -1,4 +1,23 @@
-use super::*;
+use crate::{
+    daemon::soft_disk_limiter::{
+        root_identity::{ObservationDisposition, RootIdentityTracker, watch_fingerprint},
+        runtime::soft_monitoring_required,
+        watch_operations::{DesiredWatch, WatchOperationQueue},
+        watching::is_watching,
+    },
+    server::{
+        disk::soft::{
+            SoftDiskTarget,
+            planner::{HybridScanPlanner, TargetSpec},
+            watcher::SoftDiskWatcher,
+        },
+        metadata::InstanceStatus,
+        paths::InstancePaths,
+    },
+    state::AppState,
+    utils::limits::mib_to_bytes,
+};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub(super) async fn sync_soft_disk_targets(
     state: &AppState,

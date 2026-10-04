@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    ConfigValidationError, MAX_BACKUP_CATALOG_BYTES, SECONDS_PER_DAY,
+    network::validate_absolute_path,
+};
+use crate::config::{BackupStorageDriver, Config};
 
 pub(super) fn validate_backups(config: &Config) -> Result<(), ConfigValidationError> {
     let browsing = &config.backups.browsing;

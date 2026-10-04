@@ -1,7 +1,5 @@
 use std::{
     collections::HashMap,
-    io::{Error as IoError, ErrorKind},
-    path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,26 +7,17 @@ use std::{
     time::Duration,
 };
 
-use axum::extract::State;
-use bollard::models::ContainerStatsResponse;
-use serde::Serialize;
 use tokio::{
     sync::{Mutex, Semaphore},
-    time::{Instant, MissedTickBehavior},
+    time::Instant,
 };
 
 use crate::{
-    auth::scopes,
-    config::Config,
     databases::protocol::Protocol,
     routes::http::{
         policy::ApiRequestContext,
-        response::{ApiError, ApiPath, ApiResponse, ApiResult},
+        response::{ApiError, ApiResponse, ApiResult},
         router::AppState,
-    },
-    server::disk::{
-        DiskLimiter,
-        soft::{SoftDiskSnapshot, SoftDiskTarget},
     },
     server::monitoring::ActivityStore,
     server::placement::DeploymentMode,
@@ -39,8 +28,6 @@ use crate::{
     storage::activity::ActivityRepository,
     utils::limits::mib_to_bytes,
 };
-
-use futures::{StreamExt, TryStreamExt};
 
 mod runtime_metrics;
 
@@ -54,9 +41,7 @@ mod pools;
 
 mod shared_disk;
 
-use runtime_metrics::{
-    container_cpu_total, cpu_percent_over_wall_time, docker_compatible_memory_usage,
-};
+use runtime_metrics::{container_cpu_total, cpu_percent_over_wall_time};
 use sampler::{CachedHostCpuUsage, HostCpuSample};
 #[cfg(test)]
 use sampler::{SharedRuntimeUsage, aggregate_managed_usage, summarize_allocations};
@@ -127,10 +112,15 @@ mod cache;
 mod disk;
 mod handlers;
 mod reports;
-pub use background::*;
-use disk::*;
-pub use handlers::*;
-pub use reports::*;
+pub(crate) use background::prime_shared_disk_quotas;
+pub use background::start_resource_sampler;
+
+pub(crate) use handlers::resource_report;
+pub use handlers::{instance_resources, list_resources, node_resource_summary};
+pub(crate) use reports::ResourceView;
+pub use reports::{
+    CpuReport, DiskReport, MemoryReport, NetworkReport, ResourceReport, ResourceScope,
+};
 
 pub(crate) struct ResourceMonitorGuard {
     active_monitors: Arc<AtomicUsize>,

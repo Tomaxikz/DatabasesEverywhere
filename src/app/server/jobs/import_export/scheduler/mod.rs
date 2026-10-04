@@ -7,12 +7,12 @@ use std::{
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-use crate::{
-    config::ImportExportSchedulerConfig, databases::protocol::Protocol,
-    utils::limits::bytes_to_mib_ceil,
-};
+use crate::config::ImportExportSchedulerConfig;
 
 use super::lock_unpoisoned;
+
+#[cfg(test)]
+use crate::databases::protocol::Protocol;
 
 const MIB: u64 = 1024 * 1024;
 const FALLBACK_AVAILABLE_MEMORY_MIB: u64 = 4096;
@@ -39,9 +39,15 @@ mod dispatch;
 #[cfg(test)]
 mod tests;
 
-pub use self::capacity::*;
-pub use self::cost::*;
-use self::dispatch::*;
+pub use self::capacity::SchedulerCapacity;
+use self::capacity::SchedulerResourceProvider;
+#[cfg(test)]
+use self::capacity::SchedulerResourceSample;
+pub use self::cost::{
+    JobEstimateInput, JobResourceCost, conservative_import_input_bytes,
+    protocol_uses_logical_dumps, protocol_uses_native_compression,
+};
+use self::dispatch::{dispatch, release};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

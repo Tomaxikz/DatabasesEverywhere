@@ -1,6 +1,10 @@
 use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
-use super::*;
+use super::{
+    control::validate_control_socket,
+    nofile::{desired_nofile_current, parse_nofile_limits},
+    *,
+};
 
 #[test]
 fn fuse_quota_uses_database_safe_mount_args() {

@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
-    io::{self, BufWriter, Read, Write},
+    io::{self},
     path::Path,
     time::{Duration, Instant},
 };
@@ -10,13 +9,12 @@ use crate::io::files::sync_directory;
 use crate::routes::http::response::ApiError;
 
 mod bounded;
-use bounded::*;
+use bounded::{BoundedInput, BoundedOutput};
 mod context;
-use context::*;
+use context::{RewriteIdentifiers, SqlContext};
 mod scanner;
-use scanner::*;
+use scanner::rewrite_sql;
 mod qualifiers;
-use qualifiers::*;
 
 const MAX_QUOTED_IDENTIFIER_BYTES: usize = 1024;
 const MAX_QUALIFIER_GAP_BYTES: usize = 64 * 1024;

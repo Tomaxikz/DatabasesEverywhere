@@ -1,5 +1,12 @@
 use super::*;
-use super::{listing::decode_listed_key, upload::multipart_part_size};
+use super::{
+    download::append_bounded_chunk,
+    listing::decode_listed_key,
+    signing::{aws_uri_encode, hmac_sha256},
+    upload::multipart_part_size,
+    xml::{percent_decode, xml_values},
+};
+use crate::utils::hex::encode_lower;
 
 #[test]
 fn aws_encoding_preserves_only_unreserved_bytes_and_key_slashes() {

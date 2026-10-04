@@ -25,14 +25,15 @@ mod native;
 mod path_quota;
 mod teardown;
 
-pub use self::error::*;
-use self::helpers::*;
-pub(crate) use self::native::*;
+pub use self::error::DiskLimitError;
+#[cfg(test)]
+use self::helpers::check_project_quota_restore;
+use self::helpers::invalid_path_input;
+#[cfg(test)]
+use self::native::native_project_quota_fs;
+pub(crate) use self::native::{NativeProjectQuota, NativeProjectQuotaFs};
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::{
     config::{DiskConfig, DiskLimitMode},
@@ -42,7 +43,6 @@ use crate::{
 #[cfg(test)]
 use detection::select_disk_mode;
 pub use detection::{DiskModeDetection, FilesystemInspection, detect_disk_mode};
-use host_quota::{HostQuotaChange, set_host_quota};
 use host_quota::{displayed_privileged_command, privileged_command};
 
 pub(super) fn has_project_quota_option(options: &[String]) -> bool {

@@ -74,10 +74,6 @@ impl EngineInspection for Mongodb {
             })
             .collect();
     }
-
-    fn inspects_archive_catalogs(&self) -> bool {
-        true
-    }
 }
 
 fn schema_script(shared: bool, max_objects: usize) -> String {

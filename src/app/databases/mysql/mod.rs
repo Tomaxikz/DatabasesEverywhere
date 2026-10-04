@@ -5,7 +5,9 @@ pub(crate) mod engine;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
 pub mod provision;
+pub(crate) mod telemetry;
 pub(crate) mod tenancy;
+pub(crate) mod tenant_backend;
 pub(crate) mod transfer;
 
 #[cfg(test)]

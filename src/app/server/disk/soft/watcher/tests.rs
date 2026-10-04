@@ -1,3 +1,4 @@
+use notify::Watcher;
 use std::{
     path::{Path, PathBuf},
     time::Duration,

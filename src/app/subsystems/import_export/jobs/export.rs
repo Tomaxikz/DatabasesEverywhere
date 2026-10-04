@@ -1,4 +1,28 @@
-use super::*;
+use std::path::{Path as FsPath, PathBuf};
+
+use crate::{
+    databases::protocol::Protocol,
+    routes::http::{response::ApiError, router::AppState},
+    server::{
+        jobs::import_export::{
+            JobEstimateInput, JobResourceCost, protocol_uses_native_compression,
+        },
+        metadata::InstanceMetadata,
+        paths::InstancePaths,
+        placement::DeploymentMode,
+    },
+    utils::limits::mib_to_bytes,
+};
+
+use super::super::{
+    ExportArchiveFormat, ExportDelivery, ExportOptions, MAX_UNARCHIVED_BYTES,
+    files::{
+        dump_extension, export_artifact_capacity_bytes, logical_staging_root, prepare_private_dir,
+    },
+    logical::{LogicalExportControls, check_logical_ready, export_logical_dump},
+    physical::export_physical_archive,
+    uploads::DiskCapacityReservation,
+};
 
 const LOGICAL_EXPORT_BASE_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
 const PHYSICAL_EXPORT_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
@@ -63,8 +87,8 @@ pub(super) async fn export_artifact(
 }
 
 pub(super) struct ExportOutputReservations {
-    _artifact: super::uploads::DiskCapacityReservation,
-    _staging: Option<super::uploads::DiskCapacityReservation>,
+    _artifact: DiskCapacityReservation,
+    _staging: Option<DiskCapacityReservation>,
     pub(super) logical_output_capacity: Option<u64>,
 }
 
@@ -217,7 +241,7 @@ async fn reserve_export_staging(
     artifact_root: &FsPath,
     archive_format: ExportArchiveFormat,
     logical_output_capacity: u64,
-) -> Result<Option<super::uploads::DiskCapacityReservation>, ApiError> {
+) -> Result<Option<DiskCapacityReservation>, ApiError> {
     let staging_root = logical_staging_root(state).await?;
     let roots_share_filesystem = state
         .import_uploads

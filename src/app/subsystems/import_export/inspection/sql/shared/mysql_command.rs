@@ -1,4 +1,12 @@
-use super::*;
+use std::collections::VecDeque;
+
+use super::{
+    Protocol, SharedObserver, SharedSqlError, SharedSqlIssue, SqlComment, SqlObserver, SqlToken,
+    Statement,
+    errors::{ExecutableCommentTooLarge, MysqlCommandPolicyError},
+    scan_sql_reader,
+    words::{create_object, has_keyword, has_keyword_sequence, statement_words},
+};
 
 /// Applies only the physical-storage boundary required by a live shared
 /// MySQL/MariaDB session. Unlike dump admission, this deliberately permits

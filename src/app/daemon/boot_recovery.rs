@@ -1,4 +1,28 @@
-use super::*;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use futures::StreamExt;
+use serde::Deserialize;
+
+use crate::{
+    daemon::{
+        server::start_gateway_listeners,
+        startup::{log_gateway_listeners, start_known_instances},
+    },
+    databases::protocol::Protocol,
+    routes::http::response::ApiError,
+    server::{
+        manager::InstanceManager,
+        metadata::InstanceStatus,
+        paths::InstancePaths,
+        placement::{
+            lifecycle::{start_shared_runtimes, sync_shared_compatibility},
+            tenant::recovery::reconcile_shared_tenants,
+        },
+    },
+    state::AppState,
+    utils::constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY,
+};
 
 pub(super) async fn disable_runtime_restarts(state: &AppState) -> anyhow::Result<()> {
     let runtimes = state.placements.list().await?;
@@ -72,7 +96,7 @@ async fn cleanup_old_console_logs(state: &AppState) {
     };
     let clickhouse_runtimes = runtimes
         .into_iter()
-        .filter(|runtime| runtime.protocol.engine().has_hosted_config());
+        .filter(|runtime| runtime.protocol.engine().family().is_columnar());
     for runtime in clickhouse_runtimes {
         let _operation = state.instance_locks.lock(&runtime.runtime_id).await;
         let Ok(Some(current)) = state.placements.get(&runtime.runtime_id).await else {
@@ -356,7 +380,7 @@ pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, us
         .list()
         .await
         .into_iter()
-        .filter(|metadata| metadata.protocol.engine().cleans_stale_import_bridges())
+        .filter(|metadata| metadata.protocol.engine().family().is_vector())
         .map(|metadata| metadata.instance_id)
         .collect::<Vec<_>>();
     let outcomes = futures::stream::iter(instance_ids)
@@ -365,7 +389,7 @@ pub(super) async fn cleanup_stale_qdrant_bridges(state: &AppState) -> (usize, us
             let Some(metadata) = state.instances.get(&instance_id).await else {
                 return Ok::<_, (String, ApiError)>(false);
             };
-            if !metadata.protocol.engine().cleans_stale_import_bridges()
+            if !metadata.protocol.engine().family().is_vector()
                 || metadata.status != InstanceStatus::Running
             {
                 return Ok(false);

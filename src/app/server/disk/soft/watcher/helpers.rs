@@ -1,4 +1,16 @@
-use super::*;
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
+
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+use super::{
+    state::{BackendState, RecursiveWatchInstall, Shared, TargetState, WatchHealth},
+    types::{RegistrationStatus, WatchRegistration, WatchRegistrationError},
+};
 
 pub(super) fn create_backend(shared: Arc<Shared>) -> notify::Result<RecommendedWatcher> {
     RecommendedWatcher::new(

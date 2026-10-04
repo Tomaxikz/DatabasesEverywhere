@@ -1,12 +1,16 @@
+use super::source::{BoundedReader, read_up_to};
+use super::sql::inspect_sql_reader;
 use super::*;
+use sha2::Digest;
 
 use std::{
-    io::{self, Cursor, Write},
+    io::{self, Cursor, Read, Write},
     path::PathBuf,
 };
 
 use bzip2::write::BzEncoder;
 use flate2::{Compression, write::GzEncoder};
+use sha2::Sha256;
 use tempfile::TempDir;
 
 fn scan_sql(protocol: Protocol, sql: &[u8]) -> Result<DumpInspection, InspectionError> {

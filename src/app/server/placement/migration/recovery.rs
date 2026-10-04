@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    DeploymentMigration, DeploymentMigrationError, DeploymentMigrationRepository, MigrationFailure,
+    MigrationPatch, MigrationRecoverySummary, MigrationStage,
+};
+use crate::server::{metadata::InstanceMetadata, placement::DeploymentMode};
 
 impl DeploymentMigrationRepository {
     pub async fn recover_unfinished(

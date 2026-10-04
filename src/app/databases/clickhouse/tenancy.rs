@@ -1,24 +1,24 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    server::monitoring::engine::backends::{ClickhouseTelemetry, EngineTelemetry},
-    server::placement::tenant::backends::{ClickhouseTenantBackend, TenantBackend},
+    server::monitoring::engine::backends::EngineTelemetry,
+    server::placement::tenant::backends::TenantBackend,
     utils::{
         limits::{InstanceLimits, mib_to_bytes},
         shell::sh_quote,
     },
 };
 
-use super::{engine::Clickhouse, provision::TenantQuota};
+use super::{engine::Clickhouse, provision::TenantQuota, telemetry, tenant_backend};
 
 pub(crate) const SHARED_QUERIES_PER_HOUR: u64 = 20_000;
 
 impl EngineTenancy for Clickhouse {
     fn tenant_backend(&self) -> Option<&'static dyn TenantBackend> {
-        Some(&ClickhouseTenantBackend)
+        Some(&tenant_backend::Clickhouse)
     }
 
     fn telemetry(&self) -> Option<&'static dyn EngineTelemetry> {
-        Some(&ClickhouseTelemetry)
+        Some(&telemetry::ClickhouseTelemetry)
     }
 
     fn telemetry_reports_operations(&self) -> bool {
@@ -41,10 +41,6 @@ impl EngineTenancy for Clickhouse {
             sh_quote(username),
             sh_quote(database),
         ))
-    }
-
-    fn has_hosted_config(&self) -> bool {
-        true
     }
 }
 

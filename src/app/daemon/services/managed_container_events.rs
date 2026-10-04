@@ -1,3 +1,4 @@
+use crate::daemon::container_events::monitor_container_events;
 use tokio::task::JoinHandle;
 
 use super::{DaemonService, ServiceKind};
@@ -17,6 +18,6 @@ impl DaemonService for ManagedContainerEvents {
     }
 
     fn spawn(&self, state: AppState) -> JoinHandle<()> {
-        tokio::spawn(super::super::monitor_container_events(state))
+        tokio::spawn(monitor_container_events(state))
     }
 }

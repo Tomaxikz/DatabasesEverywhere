@@ -4,9 +4,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::{
-    checksum_sidecar_path, instance_export_root, is_checksum_sidecar, read_real_directory,
-};
+use super::checksum::{checksum_sidecar_path, is_checksum_sidecar};
+use super::files::{instance_export_root, read_real_directory};
 use crate::{
     routes::http::{response::ApiError, router::AppState},
     utils::ids::validate_instance_id,

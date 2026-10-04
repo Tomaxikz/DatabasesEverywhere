@@ -1,4 +1,23 @@
-use super::*;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+#[cfg(test)]
+use std::sync::Barrier;
+
+use notify::{Event, EventKind, RecommendedWatcher};
+use tokio::sync::Notify;
+
+use super::helpers::{
+    is_strict_descendant, lock_recover, nearest_recorded_ancestor, next_nonzero,
+    root_watch_may_be_lost, route_path, safe_relative_parent,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WatchHealth {

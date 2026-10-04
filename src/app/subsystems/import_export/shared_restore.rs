@@ -140,7 +140,7 @@ fn wipe_target_matches(
             crate::server::metadata::InstanceStatus::Deleting
                 | crate::server::metadata::InstanceStatus::Quarantined
         )
-        && metadata.protocol.engine().shared_wipe_uses_admin_runtime()
+        && metadata.protocol.engine().family().is_columnar()
         && runtime.deployment_mode == DeploymentMode::Shared
         && runtime.protocol == metadata.protocol
         && runtime.status == EngineRuntimeStatus::Running

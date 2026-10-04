@@ -1,4 +1,4 @@
-use super::*;
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiskLimitError {

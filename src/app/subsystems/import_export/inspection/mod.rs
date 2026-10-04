@@ -1,21 +1,14 @@
 //! Bounded, side-effect-free inspection of uploaded database dumps.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::File,
-    io::{self, Read, Seek, SeekFrom},
-    path::{Component, Path},
+    io::{self, Seek, SeekFrom},
+    path::Path,
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 
-use sha2::{Digest, Sha256};
-
-use crate::{
-    databases::engine::EngineFamily, databases::protocol::Protocol,
-    routes::http::response::ApiError, utils::ids::portable_identifier,
-};
+use crate::{databases::protocol::Protocol, routes::http::response::ApiError};
 
 mod mongodb;
 
@@ -23,20 +16,18 @@ pub(crate) mod shared_import;
 
 mod sql;
 
-use mongodb::{MongoArchiveCatalog, inspect_native_gzip};
-
-use sql::inspect_sql_reader;
+use mongodb::MongoArchiveCatalog;
 
 pub(crate) use sql::validate_shared_mysql_command;
 
 mod source;
-use source::*;
+use source::{detect_archive_format, open_regular_no_follow, sha256_reader};
 mod archive;
-use archive::*;
+use archive::inspect_sql_source;
 mod wrappers;
-use wrappers::*;
+use wrappers::{inspect_mongodb_wrapper, validate_physical_wrapper};
 mod catalog;
-use catalog::*;
+use catalog::CatalogBuilder;
 
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_INSPECTED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -105,7 +96,8 @@ impl DumpArchiveFormat {
     pub(crate) fn import_archive_format(self, protocol: Protocol) -> Option<&'static str> {
         match (protocol, self) {
             (protocol, Self::TarGzip) if protocol.engine().is_physical() => None,
-            (Protocol::Mongodb, Self::Gzip) | (_, Self::Plain) => None,
+            (protocol, Self::Gzip) if protocol.engine().native_gzip_logical_dump() => None,
+            (_, Self::Plain) => None,
             (_, format) => Some(format.as_str()),
         }
     }
@@ -239,7 +231,7 @@ fn inspect_dump_file(
         return Ok(full_only_inspection(protocol, sha256, source_size, format));
     }
 
-    if protocol.engine().inspects_archive_catalogs() {
+    if protocol.engine().family().is_document() {
         let catalog = inspect_mongodb_wrapper(&mut source, format, deadline)?;
         return Ok(mongodb_inspection(
             protocol,

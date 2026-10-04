@@ -1,7 +1,28 @@
-use super::*;
+use super::major_upgrade::{ImageVersionChange, classify_image_update, upgrade_required_error};
+use super::route_fence;
+use super::runtime_info::{
+    ImageUpdateStrategy, UpdateInstanceImageResponse, fail_image_update_api,
+    fail_image_update_bad_request, fail_image_update_runtime,
+};
+use super::{IMAGE_UPDATE_ROLLBACK_TIMEOUT, docker_error};
 use crate::databases::engine::DedicatedSpecInput;
+use crate::databases::engine::{CredentialKind, LifecycleFlow};
+use crate::databases::protocol::Protocol;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::runtime::docker::DockerInstanceSpec;
+use crate::server::disk::DiskLimiter;
+use crate::server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
+use crate::server::paths::InstancePaths;
+use crate::subsystems::instances::create::{
+    backend_endpoint, flow_maintenance_credential, launch_container_from_spec,
+    missing_credential_error, prepare_instance_container_user, protocol_pids_limit,
+    run_tenant_auth_step,
+};
+use crate::utils::time::now_rfc3339;
 use futures::FutureExt;
 use secrecy::SecretString;
+use std::time::Duration;
 
 const IMAGE_UPDATE_FAIL_CLOSED_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 

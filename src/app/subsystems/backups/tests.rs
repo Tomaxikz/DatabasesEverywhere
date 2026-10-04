@@ -1,4 +1,19 @@
+use super::catalog::{backup_info, backup_objects, select_catalog_object};
+use super::checks::{
+    check_backup_layout, check_backup_protocol, intentionally_stopped_backup, restore_input_bytes,
+};
+use super::scheduler::backup_all_instances;
+use super::types::{BackupAttempt, RunBackupResponse};
 use super::*;
+use crate::databases::protocol::Protocol;
+use crate::routes::http::response::ApiError;
+use crate::server::backup::BackupLayout;
+use crate::server::backup::StoredBackup;
+use crate::server::backup::catalog::BackupCatalog;
+use crate::server::backup::catalog::BackupCatalogColumn;
+use crate::server::metadata::DesiredInstanceState;
+use crate::server::metadata::InstanceStatus;
+use crate::server::placement::DeploymentMode;
 
 #[test]
 fn only_an_intentional_observed_stop_is_an_expected_backup_skip() {

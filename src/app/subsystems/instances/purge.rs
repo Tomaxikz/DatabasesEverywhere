@@ -1,4 +1,7 @@
-use super::{ApiError, AppState, DiskLimiter, InstancePaths, remove_path_if_exists};
+use super::major_upgrade::remove_path_if_exists;
+use crate::routes::http::{response::ApiError, router::AppState};
+use crate::server::disk::DiskLimiter;
+use crate::server::paths::InstancePaths;
 
 pub(crate) async fn purge_instance_paths(
     state: &AppState,

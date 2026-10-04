@@ -1,4 +1,16 @@
-use super::*;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use super::{
+    types::{SoftDiskSnapshot, SoftDiskTarget},
+    usage_tree,
+};
+use crate::databases::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UsageCacheLimits {

@@ -1,4 +1,5 @@
-use super::*;
+use super::ImportUploadParseError;
+use crate::databases::protocol::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportUploadState {

@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use super::errors::MysqlCommandPolicyError;
 use super::*;
 
 fn validate(protocol: Protocol, sql: &str) -> Result<SharedSqlReport, SharedSqlError> {

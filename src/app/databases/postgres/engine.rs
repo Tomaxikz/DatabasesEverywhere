@@ -89,10 +89,6 @@ impl EngineInfo for Postgres {
     fn gateway_counts_operations(&self) -> bool {
         true
     }
-
-    fn release_line_components(&self) -> usize {
-        1
-    }
 }
 
 impl EngineCompatibility for Postgres {

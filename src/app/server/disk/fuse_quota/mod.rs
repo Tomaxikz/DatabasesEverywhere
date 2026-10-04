@@ -1,17 +1,18 @@
 use std::{
-    fs::{self, File},
-    io::{Error, ErrorKind, Read},
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use sha2::{Digest, Sha256};
+use tokio::process::Command;
+
+#[cfg(test)]
+use std::io::ErrorKind;
+#[cfg(test)]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-    process::Command,
-    time::{sleep, timeout},
+    time::timeout,
 };
 
 use crate::utils::limits::mib_to_bytes;
@@ -28,11 +29,18 @@ mod paths;
 #[cfg(test)]
 mod tests;
 
-use self::binary::*;
-use self::control::*;
-use self::mount::*;
-use self::nofile::*;
-use self::paths::*;
+use self::binary::{display_binary, resolve_binary};
+use self::control::{
+    parse_quota_usage, remove_control_socket, send_command, send_command_detailed, wait_for_socket,
+};
+use self::mount::{helper_cache_is_safe, mount_args, stderr_string, unmount};
+use self::nofile::set_helper_nofile_limit;
+use self::paths::{fuse_paths_with_root, mount_owner_matches, path_owner, prepare_fuse_dirs};
+
+#[cfg(test)]
+use self::binary::check_external_binary;
+#[cfg(test)]
+use self::mount::has_nocache_arg;
 
 #[derive(Debug, Clone)]
 struct FuseQuotaPaths {

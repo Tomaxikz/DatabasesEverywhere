@@ -1,9 +1,6 @@
 use std::sync::Arc;
-use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-};
-use tokio_rustls::TlsAcceptor;
+
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
 const MYSQL_COM_CHANGE_USER: u8 = 0x11;
 const MYSQL_COM_CREATE_DB: u8 = 0x05;
@@ -18,13 +15,7 @@ const MONGODB_OP_MSG: i32 = 2013;
 const MONGODB_MAX_CSTRING_BYTES: usize = 1024;
 
 use super::{GatewayStream, ListenerError};
-use crate::{
-    databases::protocol::Protocol,
-    gateway::protocols::{clickhouse, mariadb, redis},
-    gateway::tunnel,
-    server::monitoring::{ActivityCounter, OperationKind},
-    subsystems::import_export::inspection::validate_shared_mysql_command,
-};
+use crate::{gateway::tunnel, server::monitoring::ActivityCounter};
 
 const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
 const SQL_PREFIX_BYTES: usize = 512;
@@ -78,8 +69,9 @@ mod postgres;
 #[cfg(test)]
 mod tests;
 
-use classify::*;
-pub(super) use handshake::*;
-pub(super) use mongodb::*;
-pub(super) use mysql::*;
-pub(super) use postgres::*;
+pub(super) use handshake::{
+    accept_direct_tls, read_clickhouse_hello, read_http_headers, read_resp_initial_frame,
+};
+pub(super) use mongodb::proxy_mongodb_session;
+pub(super) use mysql::proxy_mysql_session;
+pub(super) use postgres::proxy_postgres_session;

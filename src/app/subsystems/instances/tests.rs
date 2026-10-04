@@ -1,4 +1,17 @@
+use super::delete::deletion_status;
+use super::major_upgrade::{
+    ImageVersionChange, MajorUpgradeCommitResolution, MajorUpgradeRollbackLocation,
+    check_major_upgrade, classify_image_update, classify_upgrade_commit, classify_upgrade_rollback,
+    image_major_version, parse_major_version, replacement_check_command, spawn_upgrade_task,
+    validate_upgrade_path,
+};
 use super::*;
+use crate::databases::protocol::Protocol;
+use crate::runtime::docker::DockerContainerStatus;
+use crate::runtime::docker::DockerInstanceInspection;
+use crate::server::metadata::DesiredInstanceState;
+use crate::server::metadata::InstanceStatus;
+use crate::subsystems::instances::requests::LimitsRequest;
 
 #[tokio::test]
 async fn cancelled_resize_waiter_does_not_leave_queued_work() {

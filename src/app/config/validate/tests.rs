@@ -1,5 +1,7 @@
+use super::images::{kernel_is_6_19_or_newer, mongodb_image_is_8_or_newer};
 use super::*;
 use crate::config::Config;
+use crate::config::{BackupStorageDriver, path_policy::HostPathPolicyError};
 
 #[test]
 fn validates_global_sql_buffer_capacity() {

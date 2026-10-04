@@ -1,4 +1,14 @@
-use super::*;
+use super::super::docker_error;
+use super::super::runtime_info::MajorUpgradePrecheck;
+use crate::databases::engine::{CredentialKind, LifecycleFlow, UpgradePrecheck};
+use crate::databases::protocol::Protocol;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::runtime::docker::DockerContainerStatus;
+use crate::server::disk::DiskLimiter;
+use crate::server::metadata::InstanceMetadata;
+use crate::server::paths::InstancePaths;
+use crate::subsystems::instances::create::missing_credential_error;
 
 pub(super) async fn precheck_major_upgrade(
     state: &AppState,

@@ -1,4 +1,19 @@
-use super::*;
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use flate2::read::GzDecoder;
+use tar::{Archive, EntryType};
+
+use super::{
+    ARCHIVE_COPY_BUFFER_BYTES, ArchiveLimits, DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES,
+    DATA_ARCHIVE_LIMITS, MAX_DATA_ARCHIVE_BYTES, create::create_private_file,
+    error::ImportExportError,
+};
+use crate::io::files::ensure_private_dir;
 
 pub async fn extract_bounded_archive(
     artifact_path: PathBuf,

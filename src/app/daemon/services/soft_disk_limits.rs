@@ -1,3 +1,4 @@
+use crate::daemon::soft_disk_limiter::monitor_soft_disk_limits;
 use tokio::task::JoinHandle;
 
 use super::{DaemonService, ServiceKind};
@@ -15,6 +16,6 @@ impl DaemonService for SoftDiskLimits {
     }
 
     fn spawn(&self, state: AppState) -> JoinHandle<()> {
-        tokio::spawn(super::super::monitor_soft_disk_limits(state))
+        tokio::spawn(monitor_soft_disk_limits(state))
     }
 }

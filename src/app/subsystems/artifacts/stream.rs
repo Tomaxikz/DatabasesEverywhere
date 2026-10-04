@@ -1,4 +1,12 @@
-use super::*;
+use super::one_use;
+use super::tickets::ArtifactDownloadPermit;
+use bytes::Bytes;
+use futures::Stream;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 
 pub(super) struct DownloadStream {
     pub(super) inner: ReaderStream<File>,

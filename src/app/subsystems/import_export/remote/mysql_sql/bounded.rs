@@ -1,4 +1,12 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    io::{self, BufWriter, Read, Write},
+    time::Instant,
+};
+
+use super::{
+    MAX_QUALIFIER_GAP_BYTES, MAX_QUOTED_IDENTIFIER_BYTES, MysqlSqlRewriteError, STREAM_BUFFER_BYTES,
+};
 
 pub(super) struct BoundedInput<R> {
     pub(super) reader: R,

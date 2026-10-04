@@ -1,3 +1,21 @@
+use std::path::PathBuf;
+
+use crate::{
+    routes::http::{diagnostics::PublicDiagnostic, response::ApiError, router::AppState},
+    server::{
+        jobs::import_export::{ImportExportJobPermit, ImportExportStatus, SchedulerAcquireError},
+        metadata::InstanceStatus,
+        placement::DeploymentMode,
+    },
+    subsystems::instances::{LifecycleAction, change_instance_state_locked},
+};
+
+use super::super::{
+    ExportOptions, ImportOptions, ImportSourceOptions, logical::quarantine_uncertain_import,
+    remote::RemoteJobAdmissionPermit, uploads::finish_upload_import_job,
+};
+use super::{capped_retry_delay, close_unclaimed_upload_job, scheduler_capacity_error};
+
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -8,7 +26,6 @@ use super::{
         acquire_upload_staging, estimate_import_cost, run_export_job_locked, run_import_job_locked,
     },
     export::{estimate_export_cost, reserve_export_capacity},
-    *,
 };
 
 const IMPORT_WORKER_QUEUED: u8 = 0;
@@ -268,15 +285,7 @@ async fn release_upload_of_unstarted_import(
     blocked_reason: &str,
 ) {
     if terminal_status_persisted {
-        super::uploads::finish_upload_import_job(
-            state,
-            instance_id,
-            upload_id,
-            job_id,
-            false,
-            Some(failure),
-        )
-        .await;
+        finish_upload_import_job(state, instance_id, upload_id, job_id, false, Some(failure)).await;
     } else {
         block_uncertain_upload(state, instance_id, upload_id, job_id, blocked_reason).await;
     }
@@ -295,7 +304,7 @@ async fn finish_import_start(
     match outcome {
         JobBeginOutcome::Running => {}
         JobBeginOutcome::Closed => {
-            super::uploads::finish_upload_import_job(
+            finish_upload_import_job(
                 state,
                 instance_id,
                 upload_id,
@@ -653,6 +662,7 @@ async fn save_terminal_job_status(
 mod tests {
     use super::*;
     use crate::{server::jobs::import_export::ImportExportJobs, server::locks::InstanceLocks};
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     #[tokio::test]

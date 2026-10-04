@@ -1,7 +1,22 @@
-use super::*;
-use crate::databases::engine::TenantAuthHardening;
-use futures::FutureExt;
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
+
+use futures::{FutureExt, StreamExt};
+
+use crate::{
+    daemon::{CONTAINER_EVENT_RECONNECT_INITIAL_DELAY, CONTAINER_EVENT_RECONNECT_MAX_DELAY},
+    databases::engine::TenantAuthHardening,
+    runtime::docker::{DockerContainerStatus, ManagedContainerEvent},
+    server::{
+        metadata::InstanceStatus,
+        placement::lifecycle::{reconcile_shared_event, reconcile_shared_snapshot},
+        reconcile,
+    },
+    state::AppState,
+    utils::{constants::MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY, time::now_rfc3339},
+};
 
 const EVENT_ACTIVATION_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_CONTAINER_ID_PREFIX_LEN: usize = 12;
@@ -646,6 +661,7 @@ fn container_ids_match(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::databases::protocol::Protocol;
     use crate::runtime::docker::ManagedContainerAction;
 
     fn event(

@@ -1,4 +1,12 @@
+use super::download::{create_download_url, download, validate_download_token};
+use super::files::{read_instance_artifacts, validate_artifact_name};
+use super::types::{CreateDownloadRequest, DownloadClaims, DownloadKind};
 use super::*;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::utils::constants::jwt::AUDIENCE;
+use crate::utils::constants::jwt::ISSUER;
+use crate::utils::time::now_unix;
 use crate::{
     auth::api_token::ApiToken,
     config::{Config, PathConfig},
@@ -10,6 +18,11 @@ use crate::{
     subsystems::test_support as api_test_support,
     utils::backend::BackendEndpoint,
 };
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::Header;
+use jsonwebtoken::encode;
+use std::net::SocketAddr;
 
 #[test]
 fn artifact_names_reject_path_traversal_and_controls() {

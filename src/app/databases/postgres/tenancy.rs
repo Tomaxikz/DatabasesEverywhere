@@ -1,19 +1,16 @@
 use crate::{
     databases::engine::{EngineTenancy, TenantDiskBoundary},
-    server::placement::{
-        policy,
-        tenant::backends::{PostgresTenantBackend, TenantBackend},
-    },
+    server::placement::{policy, tenant::backends::TenantBackend},
     utils::{limits::InstanceLimits, shell::sh_quote},
 };
 
-use super::{engine::Postgres, provision::TenantQuota};
+use super::{engine::Postgres, provision::TenantQuota, tenant_backend};
 
 const STATEMENT_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
 
 impl EngineTenancy for Postgres {
     fn tenant_backend(&self) -> Option<&'static dyn TenantBackend> {
-        Some(&PostgresTenantBackend)
+        Some(&tenant_backend::Postgres)
     }
 
     fn tenant_disk_boundary(&self) -> Option<TenantDiskBoundary> {

@@ -2,7 +2,8 @@ use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::{TenantEngineError, TenantTarget, postgres_sql};
+use super::{TenantEngineError, TenantTarget};
+use crate::databases::postgres::tenant_backend::postgres_sql;
 use crate::{
     config::Config,
     databases::engine::TenantDiskBoundary,

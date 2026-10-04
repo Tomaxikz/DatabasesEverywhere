@@ -4,10 +4,11 @@ use axum::extract::State;
 use serde::Serialize;
 use tokio::time::Instant;
 
+use super::reports::PoolUsageReport;
 use super::{
     ApiError, ApiRequestContext, ApiResponse, ApiResult, AppState, CachedRuntimeStats,
-    DISK_REFRESH_INTERVAL, InstanceMetadata, InstanceStatus, PoolUsageReport, Protocol,
-    RUNTIME_STATS_STALE_AFTER, ResourceView, mib_to_bytes, resource_report,
+    DISK_REFRESH_INTERVAL, InstanceMetadata, InstanceStatus, Protocol, RUNTIME_STATS_STALE_AFTER,
+    ResourceView, mib_to_bytes, resource_report,
     sampler::{
         RuntimeStatsSnapshot, SharedDiskUsage, SharedDiskUsageSource, sample_shared_runtime_usage,
     },
@@ -113,7 +114,7 @@ pub(super) struct RuntimeReportUsage {
     pub(super) cpu_usage_percent: Option<f64>,
     pub(super) memory_usage_bytes: Option<u64>,
     pub(super) memory_limit_bytes: Option<u64>,
-    pub(super) pool: Option<super::PoolUsageReport>,
+    pub(super) pool: Option<PoolUsageReport>,
 }
 
 pub(super) fn runtime_report_usage(

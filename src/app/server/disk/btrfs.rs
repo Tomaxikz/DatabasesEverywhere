@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    DiskLimitError, displayed_privileged_command, privileged_command, remove_empty_data_directory,
+    DiskLimitError, displayed_privileged_command, helpers::remove_empty_data_directory,
+    privileged_command,
 };
 
 pub(super) async fn verify_startup(mount: &Path) -> Result<(), DiskLimitError> {

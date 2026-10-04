@@ -1,8 +1,15 @@
-use super::*;
-
+use crate::{
+    config::Config,
+    daemon::startup::QDRANT_MIGRATION_READY_TIMEOUT,
+    databases::protocol::Protocol,
+    runtime::docker::{DockerContainerStatus, DockerRuntime},
+    server::{disk::DiskLimiter, paths::InstancePaths},
+};
 /// Move a pre-exclusion Qdrant instance from its FuseQuota bind source to the
 /// raw backing directory. Every destructive runtime step has a remount/recreate
 /// rollback; the backing data directory is never renamed or deleted.
+use std::path::{Path, PathBuf};
+
 pub(super) async fn migrate_qdrant_storage(
     config: &Config,
     docker: &DockerRuntime,

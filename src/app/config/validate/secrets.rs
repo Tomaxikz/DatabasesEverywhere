@@ -1,4 +1,4 @@
-use super::*;
+use super::{ConfigValidationError, MIN_SECRET_LEN};
 
 pub(super) fn validate_api_token(token: &str) -> Result<(), ConfigValidationError> {
     if token.trim().is_empty() {

@@ -1,39 +1,17 @@
 use std::time::Duration;
 
-use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::OwnedMutexGuard;
-
-use super::{
-    DeleteResponse, LifecycleAction, ResetInstancePasswordResponse, docker_error,
-    purge_runtime_paths, purge_shared_tenant_paths, route_fence,
-};
+use super::{docker_error, purge_runtime_paths, route_fence};
 use crate::{
-    routes::http::{
-        response::{ApiError, ApiResponse, ApiResult},
-        router::AppState,
-    },
-    runtime::docker::DockerContainerStatus,
-    server::disk::DiskEnforcement,
-    server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus},
-    server::placement::{
-        DeploymentMode, EngineRuntime, EngineRuntimeStatus, runtime as shared_runtime,
-        tenant::{self, TenantTarget},
-    },
-    utils::{
-        limits::{InstanceLimits, mib_to_bytes},
-        time::now_rfc3339,
-    },
+    routes::http::{response::ApiError, router::AppState},
+    server::metadata::InstanceMetadata,
+    server::placement::{EngineRuntime, EngineRuntimeStatus, runtime as shared_runtime},
 };
 
 mod lifecycle;
 mod maintenance;
 
-use lifecycle::{
-    SharedLifecycleError, check_power_state, completion_report, limits_match, mark_quarantined,
-    placement_error, route_was_open, same_shared_identity, target,
-};
+use lifecycle::{mark_quarantined, placement_error};
 pub(crate) use maintenance::delete_empty_pool;
-use maintenance::{clear_caches, drain_tenant_sessions, maintain_pool_after_delete};
 
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const POOL_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,12 +23,13 @@ mod reconcile;
 mod resize;
 mod runtime;
 mod state;
-pub(crate) use delete::*;
-pub(super) use password::*;
-pub(super) use reconcile::*;
-pub(super) use resize::*;
-pub(crate) use runtime::*;
-pub(super) use state::*;
+pub(super) use delete::delete;
+pub(crate) use delete::recover_deleting;
+pub(super) use password::reset_password;
+pub(super) use reconcile::reconcile;
+pub(super) use resize::resize;
+pub(crate) use runtime::reload_after_runtime_lock;
+pub(super) use state::change_state;
 
 pub(super) fn reject_logs() -> ApiError {
     ApiError::Conflict(

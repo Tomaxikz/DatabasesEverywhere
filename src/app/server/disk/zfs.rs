@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{DiskLimitError, privileged_command, remove_empty_data_directory};
+use super::{DiskLimitError, helpers::remove_empty_data_directory, privileged_command};
 
 pub(super) async fn verify_startup() -> Result<(), DiskLimitError> {
     list_datasets().await.map(|_| ())

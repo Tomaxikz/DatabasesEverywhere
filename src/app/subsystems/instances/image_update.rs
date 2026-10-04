@@ -1,4 +1,17 @@
-use super::*;
+use super::deployment;
+use super::docker_error;
+use super::major_upgrade::run_upgrade_supervisor;
+use super::normal_image_update::run_image_update;
+use super::runtime_info::{
+    UpdateInstanceImageRequest, UpdateInstanceImageResponse, fail_image_update_api,
+};
+use crate::auth::scopes;
+use crate::routes::http::policy::ApiRequestContext;
+use crate::routes::http::response::{ApiError, ApiJson, ApiPath, ApiResponse, ApiResult};
+use crate::routes::http::router::AppState;
+use crate::server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
+use crate::subsystems::instances::images::{check_image_allowed, validate_image};
+use axum::extract::State;
 
 pub async fn update_instance_image(
     State(state): State<AppState>,

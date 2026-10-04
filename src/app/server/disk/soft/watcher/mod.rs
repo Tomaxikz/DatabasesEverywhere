@@ -1,19 +1,20 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fmt,
-    path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64},
     },
     time::{Duration, Instant},
 };
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
 #[cfg(test)]
-use std::sync::Barrier;
+use notify::{Config, Event, RecursiveMode};
+#[cfg(test)]
+use std::{
+    collections::BTreeMap,
+    sync::{Barrier, atomic::Ordering},
+};
 
 mod changes;
 mod helpers;
@@ -22,9 +23,17 @@ mod retry;
 mod state;
 mod types;
 
-use self::helpers::*;
-use self::state::*;
-pub(crate) use self::types::*;
+use self::helpers::create_backend;
+#[cfg(test)]
+use self::helpers::{install_recursive_watch, lock_recover, next_nonzero};
+use self::state::{BackendState, RetryPolicy, Shared, WatchState};
+#[cfg(test)]
+use self::state::{RecursiveWatchInstall, RegistrationPause, TargetState, WatchHealth};
+#[cfg(test)]
+use self::types::WatchRegistrationError;
+pub(crate) use self::types::{
+    DirtyBatch, RegistrationStatus, RetiredWatch, RetrySummary, WatchRegistration,
+};
 
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(5 * 60);

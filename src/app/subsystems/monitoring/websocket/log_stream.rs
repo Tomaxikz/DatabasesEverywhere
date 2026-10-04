@@ -1,8 +1,19 @@
-use super::*;
+use super::HEARTBEAT_INTERVAL;
+use super::socket::{
+    close_expired_socket, close_replaced_socket, close_shutdown_socket, close_unresponsive_socket,
+    complete_before, instance_generation_is_current, jwt_expiration_deadline, send_json_before,
+    send_message_before, wait_for_daemon_shutdown,
+};
+use crate::routes::http::diagnostics::PublicDiagnostic;
+use crate::routes::http::limits::WebSocketConnectionPermit;
+use crate::routes::http::router::AppState;
 use crate::utils::logs::LogRedactor;
 #[cfg(test)]
 use crate::utils::logs::{INCOMPLETE_RECORD, LOG_RECORD_LIMIT, TRUNCATED_RECORD};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, close_code};
 use futures::StreamExt;
+use serde::Serialize;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
 // A JSON control character expands to six bytes; leave room for the envelope.
 const LOG_CHUNK_BYTES: usize = 1536;

@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub(crate) mod backends;
-mod queries;
+pub(crate) mod queries;
 pub(crate) use queries::keep_tenant_rows;
 #[cfg(test)]
 pub(crate) use queries::{
@@ -491,17 +491,17 @@ async fn collect_pool(
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct EngineTotals {
-    cpu_time_micros: u64,
-    peak_query_memory_bytes: u64,
-    operations: OperationCounts,
+    pub(crate) cpu_time_micros: u64,
+    pub(crate) peak_query_memory_bytes: u64,
+    pub(crate) operations: OperationCounts,
 }
 
 #[derive(Debug)]
 pub(crate) struct EngineSample {
-    capabilities: Capabilities,
-    rows: HashMap<String, EngineTotals>,
-    mode: SampleMode,
-    next_clickhouse_checkpoint: Option<u64>,
+    pub(crate) capabilities: Capabilities,
+    pub(crate) rows: HashMap<String, EngineTotals>,
+    pub(crate) mode: SampleMode,
+    pub(crate) next_clickhouse_checkpoint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,8 +3,8 @@
 use std::{collections::VecDeque, io::Read};
 
 use super::{
-    CatalogBuilder, InspectionError, MAX_ARCHIVE_DEPTH, MAX_IDENTIFIER_BYTES,
-    MAX_SQL_TOKENS_PER_STATEMENT, Protocol,
+    InspectionError, MAX_ARCHIVE_DEPTH, MAX_IDENTIFIER_BYTES, MAX_SQL_TOKENS_PER_STATEMENT,
+    Protocol, catalog::CatalogBuilder,
 };
 
 mod shared;

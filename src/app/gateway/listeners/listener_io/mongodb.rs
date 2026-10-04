@@ -1,8 +1,23 @@
-use super::*;
-
 /// Keeps a successfully authenticated MongoDB socket bound to the identity
 /// that acquired its tenant session. Messages are streamed after inspecting
 /// only the bounded command prefix, so normal 16 MiB writes are not buffered.
+use std::sync::Arc;
+
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    gateway::listeners::{
+        ListenerError,
+        listener_io::{
+            ActivitySession, MONGODB_MAX_CSTRING_BYTES, MONGODB_OP_COMPRESSED, MONGODB_OP_MSG,
+            MONGODB_OP_QUERY,
+            classify::{MONGODB_IDENTITY_COMMANDS, classify_mongodb, matches_any_ignore_case},
+            copy_exact,
+        },
+    },
+    server::monitoring::{ActivityCounter, OperationKind},
+};
+
 pub(in super::super) async fn proxy_mongodb_session<C, B>(
     client: C,
     backend: B,

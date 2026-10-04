@@ -1,4 +1,19 @@
-use super::*;
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::{Component, Path},
+    time::Instant,
+};
+
+use crate::databases::protocol::Protocol;
+
+use super::{
+    DumpArchiveFormat, InspectionError, MAX_ARCHIVE_DEPTH, MAX_ARCHIVE_ENTRIES,
+    MAX_INSPECTED_BYTES, UNIX_DIRECTORY, UNIX_FILE_TYPE_MASK, UNIX_REGULAR_FILE,
+    catalog::CatalogBuilder,
+    source::{BoundedReader, ensure_deadline},
+    sql::inspect_sql_reader,
+};
 
 pub(super) fn inspect_sql_source(
     source: &mut File,

@@ -1,4 +1,30 @@
-use super::*;
+use std::{
+    collections::HashMap,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use futures::FutureExt;
+
+use crate::{
+    daemon::soft_disk_limiter::{
+        root_identity::{ObservationDisposition, RootIdentityTracker},
+        runtime::AppStateSoftDiskRuntime,
+        targets::{RootObservationContext, observe_root_identity},
+        watch_operations::WatchOperationQueue,
+        watching::watcher_is_trusted,
+    },
+    server::disk::soft::{
+        HybridScanExecution, HybridScanRequest, PerformedScanKind, ScanOutcome, SoftDiskTarget,
+        StopOutcome,
+        planner::{
+            CompletionDisposition, HybridScanPlanner, ScanCandidate, ScanCompletion, ScanKind,
+        },
+        watcher::{DirtyBatch, SoftDiskWatcher},
+    },
+    state::AppState,
+};
 
 pub(super) fn dispatch_due_scans(
     state: &AppState,

@@ -1,4 +1,32 @@
-use super::*;
+use std::{path::Path as FsPath, time::Duration};
+
+use crate::{
+    routes::http::{response::ApiError, router::AppState},
+    server::{metadata::InstanceMetadata, placement::DeploymentMode},
+};
+
+use super::{
+    super::{
+        ExportOptions, ImportOptions, ImportSourceOptions,
+        files::{cleanup_path, dump_extension, logical_staging_root},
+        remote::ImportMode,
+    },
+    dump::{
+        LogicalExportControls, LogicalImportControls, export_logical_dump, import_logical_dump,
+        prepare_logical_import,
+    },
+    prepared_support::{
+        LogicalApplyError, PreparedLogicalImport, apply_prepared_logical_import,
+        apply_prepared_logical_imports, cleanup_prepared_logical_imports,
+    },
+    sources::logical_apply_options,
+    staging::{LogicalStagingLimits, check_remote_staging_space},
+    target::{
+        check_shared_rollback_objects, commit_recovery_manifest, fail_quiesced_setup,
+        fence_import_target, quarantine_suffix, quarantine_uncertain_import,
+        restore_import_target_route, write_logical_recovery_manifest,
+    },
+};
 
 pub(super) async fn import_logical_batch(
     state: &AppState,

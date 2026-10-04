@@ -1,4 +1,14 @@
 use super::*;
+use serde_json::json;
+
+use crate::utils::{backend::SOCKET_BRIDGE_CONTAINER_PATH, shell::sh_quote};
+
+use super::{
+    bridge_scripts::{qdrant_bridge_start_script, qdrant_bridge_stop_script},
+    compat::topology_is_standalone,
+    http::encode_path_segment,
+    selection::QdrantAlias,
+};
 
 #[test]
 fn path_segments_are_encoded() {

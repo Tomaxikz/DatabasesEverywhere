@@ -1,4 +1,19 @@
 use super::*;
+use super::{
+    clickhouse::CLICKHOUSE_REBASE_CREATE_SCRIPT,
+    mysql::{
+        MYSQL_DEFINER_SED_PROGRAM, MYSQL_TARGET_DEFINER_AWK_PROGRAM, mysql_definer_filter,
+        mysql_extra_args, mysql_option_value, mysql_selection_args,
+    },
+    postgres::{
+        POSTGRES_TOC_FILTER_PROGRAM, pgpass_value, postgres_schema_query, postgres_selection_args,
+        postgres_string_literal,
+    },
+};
+use crate::{
+    subsystems::import_export::{CLICKHOUSE_ENGINE_AWK_PROGRAM, SelectionMode},
+    utils::shell::sh_quote,
+};
 
 #[test]
 fn option_file_escapes_quotes_and_backslashes() {

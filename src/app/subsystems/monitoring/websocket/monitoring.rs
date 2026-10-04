@@ -1,4 +1,37 @@
-use super::*;
+use super::admit_websocket;
+use super::authorization::{InstanceAuthorization, resolve_instance_authorization};
+use super::socket::send_message_before;
+use super::socket::{
+    close_expired_socket, close_shutdown_socket, complete_before, jwt_expiration_deadline,
+    wait_for_daemon_shutdown,
+};
+use super::{
+    BATCH_ENVELOPE_BYTES, MONITORING_BATCH_TARGET_BYTES, MONITORING_SNAPSHOT_TTL,
+    WEBSOCKET_MAX_MESSAGE_BYTES, upgrade_websocket,
+};
+use super::{MONITORING_TICK_INTERVAL, wire};
+use crate::auth::scopes;
+use crate::routes::http::diagnostics::PublicDiagnostic;
+use crate::routes::http::limits::WebSocketConnectionPermit;
+use crate::routes::http::policy::WebSocketRequestContext;
+use crate::routes::http::response::ApiError;
+use crate::routes::http::router::AppState;
+use crate::server::metadata::InstanceMetadata;
+use crate::subsystems::instances::progress::InstallProgress;
+use crate::subsystems::monitoring::activity::{TenantActivity, tenant_activity};
+use crate::subsystems::monitoring::resources::{
+    ResourceReport, ResourceScope, ResourceView, resource_report,
+};
+use crate::utils::time::now_unix;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::Response;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+use tokio::time::{MissedTickBehavior, interval, sleep_until};
 
 pub async fn monitoring(
     State(state): State<AppState>,

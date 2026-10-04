@@ -1,28 +1,25 @@
-use std::{fmt, future::Future, net::SocketAddr, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt, net::SocketAddr, path::Path, time::Duration};
 
 use secrecy::{ExposeSecret, SecretString};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncWrite, BufReader},
     net::{TcpStream, UnixStream},
     time::{Instant, timeout_at},
-};
-
-use tokio_rustls::{
-    TlsConnector,
-    rustls::{self, ClientConfig, RootCertStore, pki_types::ServerName},
 };
 
 use super::security::ResolvedRemoteEndpoint;
 
 mod types;
-pub use types::*;
+pub use types::{
+    RedisRelayError, RedisRespError, RedisRespResult, RedisRestoreExpiration, RespLimits,
+    RespValue, ScanPage,
+};
 mod budget;
-use budget::*;
 mod helpers;
+use helpers::{expect_simple, parse_scan_page, tls_connector, tls_server_name, unexpected};
 mod reader;
 mod restore;
-use helpers::*;
 
 const RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const RESTORE_SERIALIZED_VALUE_ARGUMENT_INDEX: usize = 3;

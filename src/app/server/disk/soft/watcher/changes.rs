@@ -1,4 +1,11 @@
-use super::*;
+use std::sync::atomic::Ordering;
+
+use super::{
+    SoftDiskWatcher,
+    helpers::{health_status, lock_recover},
+    state::WatchHealth,
+    types::{DirtyBatch, TargetWatchStatus, WatcherChanges},
+};
 
 impl SoftDiskWatcher {
     pub(crate) fn capture(&self, target_id: &str) -> Option<DirtyBatch> {

@@ -4,11 +4,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::future::BoxFuture;
 use secrecy::SecretString;
 
-use super::super::{
+use crate::server::placement::tenant::backends::{TenantBackend, TenantOperation};
+use crate::server::placement::tenant::{
     TELEMETRY_OPERATION_TIMEOUT, TENANT_OPERATION_TIMEOUT, TenantEngineError, TenantTarget,
     admin_secret, telemetry_command,
 };
-use super::{TenantBackend, TenantOperation};
 use crate::{
     databases,
     databases::protocol::Protocol,
@@ -66,7 +66,7 @@ impl MysqlFlavor {
         }
     }
 
-    pub(in crate::server::placement::tenant) async fn sql(
+    async fn sql(
         self,
         docker: &DockerRuntime,
         runtime: &EngineRuntime,
@@ -75,7 +75,7 @@ impl MysqlFlavor {
         sql_client(docker, runtime, self, sql, TENANT_OPERATION_TIMEOUT, false).await
     }
 
-    pub(in crate::server::placement::tenant) async fn telemetry(
+    async fn telemetry(
         self,
         docker: &DockerRuntime,
         runtime: &EngineRuntime,

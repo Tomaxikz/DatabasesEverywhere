@@ -1,4 +1,19 @@
-use super::*;
+use std::{
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+    time::Instant,
+};
+
+use super::{
+    DumpArchiveFormat, InspectionError, MAX_ARCHIVE_ENTRIES, MAX_INSPECTED_BYTES,
+    archive::{
+        add_expanded_bytes, count_archive_entry, drain_zip_entry, ensure_supported_tar_entry,
+        tar_entry_size, validate_archive_path, validate_zip_entry_type,
+    },
+    mongodb::{MongoArchiveCatalog, inspect_native_gzip},
+    source::{BoundedReader, ensure_deadline},
+};
 
 pub(super) fn validate_physical_wrapper(
     source: &mut File,

@@ -1,8 +1,28 @@
-use super::*;
-
 /// Proxies an authenticated MySQL-family session while retaining the routed
 /// tenant identity. Shared tenants additionally validate complete text-query
 /// and prepared-statement packets before any byte reaches the backend.
+use std::sync::Arc;
+
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::{
+    databases::protocol::Protocol,
+    gateway::{
+        listeners::{
+            ListenerError,
+            listener_io::{
+                ActivitySession, MYSQL_COM_CHANGE_USER, MYSQL_COM_CREATE_DB, MYSQL_COM_DROP_DB,
+                MYSQL_COM_QUERY, MYSQL_COM_STMT_EXECUTE, MYSQL_COM_STMT_PREPARE,
+                MYSQL_MAX_SINGLE_PACKET_PAYLOAD, QUERY_BODY_TIMEOUT, SQL_PREFIX_BYTES,
+                classify::classify_sql, copy_exact,
+            },
+        },
+        protocols::mariadb,
+    },
+    server::monitoring::{ActivityCounter, OperationKind},
+    subsystems::import_export::inspection::validate_shared_mysql_command,
+};
+
 pub(in super::super) async fn proxy_mysql_session<C, B>(
     client: C,
     backend: B,

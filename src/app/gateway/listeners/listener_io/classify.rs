@@ -1,4 +1,4 @@
-use super::*;
+use crate::server::monitoring::OperationKind;
 
 const SQL_READ_KEYWORDS: &[&[u8]] = &[b"SELECT", b"SHOW", b"DESCRIBE", b"DESC", b"EXPLAIN"];
 const SQL_WRITE_KEYWORDS: &[&[u8]] = &[

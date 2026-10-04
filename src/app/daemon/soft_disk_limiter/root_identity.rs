@@ -92,9 +92,9 @@ pub(super) fn watch_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        CompletedSoftDiskScan, CompletedWatchOperation, WatchOperationResult, apply_soft_disk_scan,
-        finish_watch,
+        scanning::{CompletedSoftDiskScan, apply_soft_disk_scan},
         watch_operations::{DesiredWatch, WatchOperationQueue},
+        watching::{CompletedWatchOperation, WatchOperationResult, finish_watch},
     };
     use super::*;
     use crate::{

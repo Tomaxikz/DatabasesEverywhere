@@ -1,4 +1,7 @@
 use super::*;
+use axum::http::HeaderMap;
+
+use super::ingest::{expected_sha256, percent_decode_utf8};
 
 #[test]
 fn filename_percent_decoding_is_strict() {
