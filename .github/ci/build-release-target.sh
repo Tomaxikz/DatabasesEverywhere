@@ -27,13 +27,13 @@ case "$rust_target:$asset_arch" in
     helper_target="aarch64-unknown-linux-musl"
     helper_linker="rust-lld"
     fusequota_arch="aarch64"
-    fusequota_sha256="afd429f034458e0f3fe200cf74f91f82813a7395378174ba8985ce988492f740"
+    fusequota_sha256="e5a8702c91c43e10377bfaadb856f0d8c8e6d7eb4e8f54a0fbde7a3066f8554a"
     ;;
   riscv64gc-unknown-linux-gnu:riscv64)
     helper_target="riscv64gc-unknown-linux-musl"
     helper_uses_zig=true
     fusequota_arch="riscv64"
-    fusequota_sha256="ab3b6c84dc905abf8b358f93e5b3eb9d2d8b8d3d0a542971cfa27414c5c34109"
+    fusequota_sha256="574c6fbfbda83ee04cd4b870d3dd0e405d185c7f68524c0a81edfeb287b020b2"
     ;;
   *)
     echo "unsupported release target and asset architecture: $rust_target / $asset_arch" >&2
@@ -82,7 +82,7 @@ if [ -n "$helper_target" ]; then
     chmod 0755 "$helper_linker"
   fi
 
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 6 --retry-delay 10 --retry-max-time 300 \
     --connect-timeout 10 --max-time 120 \
     "https://github.com/calagopus/fusequota/releases/download/${fusequota_version}/fusequota-${fusequota_arch}-linux" \
     --output "$fusequota_executable"

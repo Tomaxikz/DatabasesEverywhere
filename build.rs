@@ -2,13 +2,13 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const FUSEQUOTA_X86_64_COMPRESSED_SHA256: &str =
-    "2722e74f095f93e56b775e38f60364c878bf27515a52435123704535047113e3";
+    "1c03574bd8b4471f79a11c745e7d9ba360a8f8bb76aeb499c0f4184ea6c32939";
 const FUSEQUOTA_X86_64_EXECUTABLE_SHA256: &str =
-    "82b2703803a67e718e799c328c4d88beb73d58e4c0eac3378f8670b4a927f6ec";
+    "b339e7d89fccc97c85e8575df61b55564f77091da822b421f23f07631d189992";
 const FUSEQUOTA_AARCH64_EXECUTABLE_SHA256: &str =
-    "afd429f034458e0f3fe200cf74f91f82813a7395378174ba8985ce988492f740";
+    "e5a8702c91c43e10377bfaadb856f0d8c8e6d7eb4e8f54a0fbde7a3066f8554a";
 const FUSEQUOTA_RISCV64_EXECUTABLE_SHA256: &str =
-    "ab3b6c84dc905abf8b358f93e5b3eb9d2d8b8d3d0a542971cfa27414c5c34109";
+    "574c6fbfbda83ee04cd4b870d3dd0e405d185c7f68524c0a81edfeb287b020b2";
 // Pin the reviewed source and both artifact forms. Rust/LLD output is not
 // guaranteed to be byte-identical when the compiler host OS changes.
 const SOCKET_BRIDGE_SOURCE_SHA256: &str =
