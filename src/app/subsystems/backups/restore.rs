@@ -1,18 +1,21 @@
 use super::checks::{
     check_backup_layout, check_backup_protocol, check_backup_ready, check_backup_service,
-    restore_input_bytes, scheduler_error, store_error,
+    physical_restore_capacity, restore_input_bytes, scheduler_error, store_error,
 };
+use super::registry::strategy_by_id;
 use super::storage::backup_storage;
+use super::strategy::{OnlineBackupStrategy, RestoreContext};
 use super::types::RestoreBackupResponse;
 use crate::routes::http::response::{ApiError, ApiResponse, ApiResult};
 use crate::routes::http::router::AppState;
-use crate::server::backup::{BackupLayout, prepare_private_dir};
+use crate::server::backup::manifest::{RestoreFormat, RestoreRecipeRef};
+use crate::server::backup::{BackupLayout, StoredBackup, prepare_private_dir};
 use crate::server::jobs::import_export::{
     ImportExportJobPermit, JobEstimateInput, JobResourceCost,
 };
 use crate::server::metadata::InstanceStatus;
 use crate::server::placement::DeploymentMode;
-use crate::utils::limits::mib_to_bytes;
+use crate::subsystems::import_export::StagedDataPreparation;
 use std::path::Path as FsPath;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +38,9 @@ pub(super) async fn restore_backup(
         .map_err(store_error)?;
     check_backup_protocol(&stored.backup_id, stored.protocol, metadata.protocol)?;
     check_backup_layout(&stored.backup_id, stored.layout, metadata.deployment_mode)?;
+    // Resolve the restore recipe from the stored format before anything is
+    // stopped or reserved; unknown recipes fail explicitly.
+    let recipe = recipe_for(&stored)?;
     let logical_rollback_bytes = if stored.layout == BackupLayout::Logical {
         Some(crate::subsystems::import_export::jobs::measure_export_bytes(&state, &metadata).await?)
     } else {
@@ -74,10 +80,8 @@ pub(super) async fn restore_backup(
             ));
         }
     }
-    let extracted_capacity = mib_to_bytes(metadata.limits.disk_mib).clamp(
-        1,
-        crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
-    );
+    let extracted_capacity = physical_restore_capacity(metadata.limits.disk_mib);
+    check_expansion(&stored, extracted_capacity)?;
     let physical_paths = if stored.layout == BackupLayout::Physical {
         let paths = crate::server::paths::InstancePaths::new(&state.config.paths, &instance_id)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -156,15 +160,32 @@ pub(super) async fn restore_backup(
                 drop(materialized);
                 return Err(error);
             }
-            crate::subsystems::import_export::restore_bounded_archive(
-                &state,
-                &instance_id,
-                paths,
-                &materialized.path,
-                was_running,
-                extracted_capacity,
-            )
-            .await
+            match &recipe {
+                Some(recipe) => {
+                    let preparation = StrategyPreparation { recipe };
+                    crate::subsystems::import_export::restore_prepared_archive(
+                        &state,
+                        &instance_id,
+                        paths,
+                        &materialized.path,
+                        was_running,
+                        extracted_capacity,
+                        &preparation,
+                    )
+                    .await
+                }
+                None => {
+                    crate::subsystems::import_export::restore_bounded_archive(
+                        &state,
+                        &instance_id,
+                        paths,
+                        &materialized.path,
+                        was_running,
+                        extracted_capacity,
+                    )
+                    .await
+                }
+            }
         }
         BackupLayout::Logical => {
             crate::subsystems::import_export::logical::restore_shared_backup(
@@ -195,4 +216,176 @@ pub(super) async fn restore_backup(
         backup_id,
         restored: true,
     }))
+}
+
+/// Strategy recipe resolved for an online capture.
+struct StrategyRecipe {
+    strategy: &'static dyn OnlineBackupStrategy,
+    recipe: RestoreRecipeRef,
+    restore_target: PathBuf,
+}
+
+/// A recorded expansion larger than this instance's extraction cap would
+/// fail midway; refuse it before anything is stopped.
+fn check_expansion(stored: &StoredBackup, extracted_capacity: u64) -> Result<(), ApiError> {
+    match stored
+        .details
+        .as_ref()
+        .and_then(|details| details.expanded_bytes)
+    {
+        Some(expanded) if expanded > extracted_capacity => Err(ApiError::Conflict(format!(
+            "backup {} expands to {expanded} bytes, but restore into this instance extracts at most {extracted_capacity} bytes; raise the instance disk limit first",
+            stored.backup_id
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Maps the stored format to its restore path, independent of placement.
+/// Built-in formats need no recipe step but must name a recipe version this
+/// build restores; strategy captures need their exact strategy and a recipe
+/// version this build can still restore. Runs before anything is stopped.
+fn recipe_for(stored: &StoredBackup) -> Result<Option<StrategyRecipe>, ApiError> {
+    let (strategy_id, recipe, restore_target) = match stored.restore_format() {
+        RestoreFormat::DataDirectoryArchive { .. } | RestoreFormat::LogicalDump { .. } => {
+            if let Some(details) = &stored.details
+                && !details.built_in_recipe_supported()
+            {
+                return Err(ApiError::Conflict(format!(
+                    "backup {} uses restore recipe {}, which this build cannot restore",
+                    stored.backup_id,
+                    details.restore_recipe.tag_value()
+                )));
+            }
+            return Ok(None);
+        }
+        RestoreFormat::StrategyCapture {
+            strategy,
+            recipe,
+            restore_target,
+        } => (strategy, recipe, restore_target),
+    };
+    let strategy = strategy_by_id(strategy_id).ok_or_else(|| {
+        ApiError::Conflict(format!(
+            "backup {} requires the {strategy_id} restore recipe, which this build does not provide",
+            stored.backup_id
+        ))
+    })?;
+    if strategy.restore_recipe().id != recipe.id
+        || !strategy
+            .restorable_recipe_versions()
+            .contains(&recipe.version)
+    {
+        return Err(ApiError::Conflict(format!(
+            "backup {} uses restore recipe {}, which this build cannot restore",
+            stored.backup_id,
+            recipe.tag_value()
+        )));
+    }
+    Ok(Some(StrategyRecipe {
+        strategy,
+        recipe: recipe.clone(),
+        restore_target: PathBuf::from(restore_target),
+    }))
+}
+
+struct StrategyPreparation<'a> {
+    recipe: &'a StrategyRecipe,
+}
+
+impl StagedDataPreparation for StrategyPreparation<'_> {
+    fn prepare<'a>(
+        &'a self,
+        staged_data: &'a FsPath,
+    ) -> futures::future::BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            let ctx = RestoreContext {
+                recipe: &self.recipe.recipe,
+                extracted_root: staged_data,
+                restore_target: &self.recipe.restore_target,
+            };
+            self.recipe
+                .strategy
+                .prepare_restore(&ctx)
+                .await
+                .map_err(ApiError::from)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::databases::protocol::Protocol;
+    use crate::server::backup::manifest::{
+        ArtifactFormat, BackupMethod, ConsistencyLevel, ManifestDetails,
+    };
+
+    fn stored(details: Option<ManifestDetails>) -> StoredBackup {
+        StoredBackup {
+            schema_version: if details.is_some() { 2 } else { 1 },
+            backup_id: "one.physical.tar.gz".to_string(),
+            instance_id: "inst_one".to_string(),
+            protocol: Protocol::Postgres,
+            layout: BackupLayout::Physical,
+            size_bytes: 1,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at_unix: 1_767_225_600,
+            sha256: "0".repeat(64),
+            catalog_available: false,
+            details,
+        }
+    }
+
+    #[test]
+    fn built_in_formats_restore_without_a_recipe_step() {
+        assert!(recipe_for(&stored(None)).unwrap().is_none());
+        let offline = crate::server::backup::test_details(BackupLayout::Physical);
+        assert!(recipe_for(&stored(Some(offline))).unwrap().is_none());
+    }
+
+    #[test]
+    fn newer_built_in_recipe_versions_are_refused() {
+        for layout in [BackupLayout::Physical, BackupLayout::Logical] {
+            let mut details = crate::server::backup::test_details(layout);
+            details.restore_recipe.version = 2;
+            let mut backup = stored(Some(details));
+            backup.layout = layout;
+            let Err(error) = recipe_for(&backup) else {
+                panic!("a newer built-in recipe must not restore as version 1");
+            };
+            assert!(matches!(error, ApiError::Conflict(message) if message.contains("@2")));
+        }
+    }
+
+    #[test]
+    fn recorded_expansion_must_fit_the_extraction_cap() {
+        let mut details = crate::server::backup::test_details(BackupLayout::Physical);
+        details.expanded_bytes = Some(2048);
+        let backup = stored(Some(details));
+        assert!(check_expansion(&backup, 2048).is_ok());
+        assert!(matches!(
+            check_expansion(&backup, 2047),
+            Err(ApiError::Conflict(message)) if message.contains("2048")
+        ));
+        // Backups without a recorded expansion keep the extraction-time cap.
+        assert!(check_expansion(&stored(None), 1).is_ok());
+    }
+
+    #[test]
+    fn strategy_captures_without_their_recipe_are_refused() {
+        let mut details = crate::server::backup::test_details(BackupLayout::Physical);
+        details.format = ArtifactFormat::OnlineCapture;
+        details.method = BackupMethod::OnlineStrategy;
+        details.strategy = Some("example.unknown".to_string());
+        details.restore_recipe = RestoreRecipeRef::new("example.unknown", 1);
+        details.restore_target = Some("data".to_string());
+        details.consistency = ConsistencyLevel::PhysicalRecoveryPoint;
+        let Err(error) = recipe_for(&stored(Some(details))) else {
+            panic!("an unknown recipe must not restore");
+        };
+        assert!(
+            matches!(error, ApiError::Conflict(message) if message.contains("example.unknown"))
+        );
+    }
 }

@@ -196,6 +196,7 @@ fn validate_username(value: &str) -> Result<(), ApiError> {
             | "mysql"
             | "default"
             | crate::databases::postgres::docker::INTERNAL_ADMIN_USERNAME
+            | crate::databases::postgres::online_backup::REPLICATION_ROLE
             | "dbe_health"
     ) {
         return Err(ApiError::BadRequest(
@@ -343,7 +344,15 @@ mod tests {
                 "accepted database name: {database}"
             );
         }
-        for username in ["bad user", "-bad", "root", "dbe_admin", "dbe_health"] {
+        for username in [
+            "bad user",
+            "-bad",
+            "root",
+            "dbe_admin",
+            "dbe_health",
+            "dbe_replication",
+            "DBE_Replication",
+        ] {
             assert!(
                 validate_username(username).is_err(),
                 "accepted username: {username}"

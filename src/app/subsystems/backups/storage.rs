@@ -81,7 +81,22 @@ pub(super) async fn prune_instance_backups(
         .retention_max_age_days
         .saturating_mul(SECONDS_PER_DAY);
     let now = now_unix();
-    let mut backups = storage.list(instance_id).await.map_err(store_error)?;
+    let inventory = storage.inventory(instance_id).await.map_err(store_error)?;
+    if !inventory.unsupported.is_empty() {
+        // Never interpreted, so never pruned: surface them instead.
+        tracing::warn!(
+            event = "audit backup_retention_unsupported_retained",
+            instance_id,
+            unsupported = inventory.unsupported.len(),
+            backup_ids = ?inventory
+                .unsupported
+                .iter()
+                .map(|entry| entry.backup_id.as_str())
+                .collect::<Vec<_>>(),
+            "retention kept backups this daemon cannot read; upgrade the daemon or delete them explicitly"
+        );
+    }
+    let mut backups = inventory.backups;
     backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));
     let mut deleted = 0_usize;
     for (index, backup) in backups.into_iter().enumerate() {

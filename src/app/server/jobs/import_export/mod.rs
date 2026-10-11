@@ -28,6 +28,7 @@ pub use scheduler::{
 mod create;
 mod error;
 mod extract;
+mod live_archive;
 mod model;
 pub(crate) mod selection;
 
@@ -36,6 +37,7 @@ pub use self::create::{
 };
 pub use self::error::{ImportExportError, JobParseError};
 pub use self::extract::extract_bounded_archive;
+pub use self::live_archive::StagedDataArchive;
 pub use self::model::{ImportExportAction, ImportExportJob, ImportExportStatus};
 
 #[cfg(test)]
@@ -49,8 +51,8 @@ use self::extract::{
 };
 
 pub const MAX_DATA_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const MAX_DATA_ARCHIVE_ENTRIES: usize = 100_000;
-const DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_DATA_ARCHIVE_ENTRIES: usize = 100_000;
+pub(crate) const DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES: u64 = 16 * 1024;
 const MAX_DATA_ARCHIVE_DEPTH: usize = 64;
 const DATA_ARCHIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_CACHED_JOBS: usize = 2_048;

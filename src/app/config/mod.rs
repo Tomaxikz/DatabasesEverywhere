@@ -21,7 +21,7 @@ pub use allocation::AllocationConfig;
 pub use artifact::ArtifactConfig;
 pub use backup::{
     BackupBrowsingConfig, BackupConfig, BackupKopiaConfig, BackupS3Config, BackupStorageConfig,
-    BackupStorageDriver,
+    BackupStorageDriver, DedicatedBackupMode,
 };
 pub use daemon::{DaemonConfig, DaemonEngine};
 pub use disk::{DiskConfig, DiskLimitMode, DiskLimitSelection, SoftDiskScannerConfig};

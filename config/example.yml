@@ -146,6 +146,16 @@ backups:
   run_on_startup: false
   retention_keep_latest_per_instance: 7
   retention_max_age_days: 30
+  # offline (the default when omitted) stops a dedicated database for a cold
+  # copy and works for every engine. online keeps it serving reads and writes
+  # through a certified engine-native strategy (currently PostgreSQL 14-18)
+  # and fails clearly, never falling back, for engines without one, so a
+  # scheduled pass reports those instances as failed. One request can choose
+  # with POST /api/instances/{instance_id}/backups?mode=online|offline.
+  dedicated_mode: offline
+  # Capture plus native verification deadline. Expiry kills the backup work;
+  # the serving database is never restarted.
+  online_timeout_minutes: 360
   storage:
     # local keeps manifested archives under paths.backups. Choose
     # exactly one of local, s3, or kopia for this daemon. Changing drivers does

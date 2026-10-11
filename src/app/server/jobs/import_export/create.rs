@@ -91,7 +91,7 @@ pub(super) fn create_bounded_archive_blocking(
     result
 }
 
-struct BoundedWriter<W> {
+pub(super) struct BoundedWriter<W> {
     pub(super) inner: W,
     pub(super) remaining: u64,
 }

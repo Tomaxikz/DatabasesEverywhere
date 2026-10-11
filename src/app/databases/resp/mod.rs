@@ -3,6 +3,7 @@ pub(crate) mod credentials;
 pub(crate) mod engine;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
+pub(crate) mod online_backup;
 pub(crate) mod tenancy;
 pub(crate) mod transfer;
 

@@ -1,7 +1,8 @@
 use crate::{
     databases::engine::{
         CredentialKind, DedicatedSpecInput, EngineInfo, EngineLifecycle, LifecycleFlow,
-        LifecycleRejection, PostLaunchPlan, PostLaunchStep, SharedSpecInput, UpgradePrecheck,
+        LifecycleRejection, OnlineBackup, PostLaunchPlan, PostLaunchStep, SharedSpecInput,
+        UpgradePrecheck,
     },
     runtime::docker::DockerInstanceSpec,
     server::metadata::InstanceMetadata,
@@ -14,6 +15,16 @@ use super::{
 };
 
 impl EngineLifecycle for Mongodb {
+    fn online_backup(&self) -> OnlineBackup {
+        // fsyncLock would freeze every write for the whole copy, and a
+        // standalone Community server has no hot-backup cursor. Strict online
+        // capture needs an opt-in replica set (mongodump --oplog) or a
+        // certified atomic data/journal snapshot with a restore transaction.
+        OnlineBackup::Unavailable {
+            reason: "MongoDB standalone deployments have no consistent online capture; an opt-in replica set or certified snapshot backend is required",
+        }
+    }
+
     fn generate_maintenance_password(&self) -> Option<String> {
         Some(format!("dbe-root-{}", uuid::Uuid::new_v4()))
     }

@@ -66,6 +66,11 @@ pub(super) fn select_catalog_object(
 }
 
 pub(super) fn backup_info(backup: StoredBackup) -> BackupInfo {
+    let consistency = backup.consistency();
+    let restore_recipe = backup
+        .details
+        .as_ref()
+        .map(|details| details.restore_recipe.tag_value());
     BackupInfo {
         id: backup.backup_id,
         instance_id: backup.instance_id,
@@ -74,5 +79,8 @@ pub(super) fn backup_info(backup: StoredBackup) -> BackupInfo {
         size_bytes: backup.size_bytes,
         modified_at: backup.created_at,
         sha256: backup.sha256,
+        manifest_schema_version: backup.schema_version,
+        consistency,
+        restore_recipe,
     }
 }

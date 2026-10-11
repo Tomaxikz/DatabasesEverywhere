@@ -44,6 +44,8 @@ pub struct AppStateData {
     pub instance_locks: crate::server::locks::InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
+    /// Durable online backup coordinator journal.
+    pub backup_jobs: crate::storage::backup_jobs::BackupJobRepository,
     pub import_uploads: crate::subsystems::import_export::ImportUploadService,
     pub api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
     pub install_progress: crate::subsystems::instances::progress::InstallProgressStore,

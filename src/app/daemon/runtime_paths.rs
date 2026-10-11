@@ -137,40 +137,8 @@ pub(super) fn prepare_rootless_paths(
 }
 
 pub(super) fn check_rootless_path_access(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    for ancestor in path.ancestors().skip(1) {
-        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
-            format!(
-                "failed to inspect rootless Podman bind-mount ancestor {}",
-                ancestor.display()
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            anyhow::bail!(
-                "rootless Podman bind-mount ancestor {} must be a real directory",
-                ancestor.display()
-            );
-        }
-        let mode = metadata.permissions().mode();
-        let execute_bit = if metadata.uid() == uid {
-            0o100
-        } else if metadata.gid() == gid {
-            0o010
-        } else {
-            0o001
-        };
-        if mode & execute_bit == 0 {
-            anyhow::bail!(
-                "rootless Podman uid {uid}/gid {gid} cannot traverse bind-mount ancestor {} (owner {}:{}, mode {:04o}); grant that account execute-only traversal or use the default DBE paths",
-                ancestor.display(),
-                metadata.uid(),
-                metadata.gid(),
-                mode & 0o7777
-            );
-        }
-    }
-    Ok(())
+    crate::io::ownership::ensure_traversable(path, uid, gid)
+        .map_err(|error| anyhow::anyhow!("rootless Podman {error}"))
 }
 
 pub(super) fn parse_container_user(user: &str) -> Option<(u32, u32)> {

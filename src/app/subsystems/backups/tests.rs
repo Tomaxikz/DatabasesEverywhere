@@ -75,6 +75,9 @@ fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure(
             size_bytes: 1,
             modified_at: "2026-09-11T10:00:00Z".into(),
             sha256: "ab".repeat(32),
+            manifest_schema_version: 2,
+            consistency: None,
+            restore_recipe: None,
         })),
     );
     assert_eq!(response.status(), "partial_failure");
@@ -214,9 +217,12 @@ fn backup_info_keeps_restore_compatibility_fields() {
         created_at_unix: 1_704_067_200,
         sha256: "ab".repeat(32),
         catalog_available: true,
+        details: None,
     });
 
     let value = serde_json::to_value(info).unwrap();
     assert_eq!(value["protocol"], "postgres");
     assert_eq!(value["layout"], "logical");
+    assert!(value["consistency"].is_null());
+    assert!(value["restore_recipe"].is_null());
 }

@@ -16,12 +16,21 @@ use crate::{
     databases::protocol::Protocol,
     io::files::read_bounded_private_file,
     server::backup::{
-        BackupBundle, BackupLayout, BackupStoreError, StoredBackup, catalog_file_name,
-        check_instance_id, io_error, prepare_private_dir, remove_file_if_exists,
-        validate_backup_id,
+        BackupBundle, BackupInventory, BackupLayout, BackupStoreError, MAX_METADATA_BYTES,
+        StoredBackup, UnsupportedBackup, catalog_file_name, check_instance_id,
+        drivers::{PublicationJournal, PublicationResource},
+        io_error,
+        manifest::ArtifactFormat,
+        metadata_file_name, prepare_private_dir, remove_file_if_exists, validate_backup_id,
     },
 };
 
+// `--tags key:value` arguments name tags without a prefix; the CLI stores
+// them on the manifest under `tag:<key>`, which is what `snapshot list
+// --json` returns. See kopia v0.22 cli/command_snapshot_create.go getTags.
+const STORED_TAG_PREFIX: &str = "tag:";
+/// Pin that keeps Kopia policy retention away from DBEV-owned snapshots.
+const DBEV_PIN: &str = "dbev";
 const TAG_INSTANCE: &str = "dbev-instance";
 const TAG_BACKUP: &str = "dbev-backup";
 const TAG_SIZE: &str = "dbev-size";
@@ -31,6 +40,17 @@ const TAG_CREATED_AT: &str = "dbev-created-at";
 const TAG_PROTOCOL: &str = "dbev-protocol";
 const TAG_CATALOG: &str = "dbev-catalog";
 const TAG_LAYOUT: &str = "dbev-layout";
+// Schema 2 projection. Legacy summary tags are deliberately absent from these
+// snapshots so a schema 1 daemon rejects them instead of reconstructing a
+// schema 1 manifest; the complete canonical manifest travels inside the
+// snapshot and is authenticated by its tagged SHA-256.
+const TAG_MANIFEST_VERSION: &str = "dbev-manifest-version";
+const TAG_MANIFEST_SHA256: &str = "dbev-manifest-sha256";
+const TAG_V2_SIZE: &str = "dbev-v2-size";
+const TAG_V2_SHA256: &str = "dbev-v2-sha256";
+const TAG_V2_CREATED: &str = "dbev-v2-created";
+const TAG_V2_FORMAT: &str = "dbev-v2-format";
+const TAG_V2_RECIPE: &str = "dbev-v2-recipe";
 const MAX_COMMAND_STDOUT: u64 = 8 * 1024 * 1024;
 const MAX_COMMAND_STDERR: u64 = 128 * 1024;
 const MAX_QUIET_COMMAND_STDOUT: u64 = 64 * 1024;
@@ -43,6 +63,9 @@ const STICKY_BIT: u32 = 0o1000;
 pub struct KopiaBackupDriver {
     config: BackupKopiaConfig,
     config_file: PathBuf,
+    /// Scratch space for canonical manifest retrieval. It lives under backup
+    /// staging, which daemon startup removes.
+    scratch_root: PathBuf,
 }
 
 impl fmt::Debug for KopiaBackupDriver {
@@ -59,11 +82,27 @@ impl fmt::Debug for KopiaBackupDriver {
 #[serde(rename_all = "camelCase")]
 struct KopiaManifest {
     id: String,
+    source: KopiaSource,
     root_entry: KopiaRootEntry,
     #[serde(default)]
     incomplete: String,
+    /// Tag keys without the stored `tag:` prefix once [`normalize_tags`] ran.
     #[serde(default)]
     tags: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KopiaSource {
+    path: String,
+}
+
+/// One `kopia manifest list --json` entry.
+#[derive(Debug, Deserialize)]
+struct KopiaManifestEntry {
+    id: String,
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,17 +129,18 @@ impl super::BackupCommit for KopiaBackupDriver {
         &'a self,
         bundle: &'a BackupBundle,
         manifest: &'a StoredBackup,
+        journal: &'a dyn PublicationJournal,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
-        Box::pin(Self::commit(self, bundle, manifest))
+        Box::pin(Self::commit(self, bundle, manifest, journal))
     }
 }
 
-impl super::BackupInventory for KopiaBackupDriver {
-    fn list<'a>(
+impl super::BackupListing for KopiaBackupDriver {
+    fn inventory<'a>(
         &'a self,
         instance_id: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<StoredBackup>, BackupStoreError>> {
-        Box::pin(Self::list(self, instance_id))
+    ) -> BoxFuture<'a, Result<BackupInventory, BackupStoreError>> {
+        Box::pin(Self::inventory(self, instance_id))
     }
 
     fn find<'a>(
@@ -119,6 +159,20 @@ impl super::BackupDelete for KopiaBackupDriver {
         backup_id: &'a str,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(Self::delete(self, instance_id, backup_id))
+    }
+
+    fn purge_unpublished<'a>(
+        &'a self,
+        instance_id: &'a str,
+        backup_id: &'a str,
+        resources: &'a [PublicationResource],
+    ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
+        Box::pin(Self::purge_unpublished(
+            self,
+            instance_id,
+            backup_id,
+            resources,
+        ))
     }
 }
 
@@ -143,6 +197,7 @@ impl KopiaBackupDriver {
         Ok(Self {
             config,
             config_file,
+            scratch_root: backups_root.join(".staging").join(".kopia-manifests"),
         })
     }
 
@@ -163,29 +218,37 @@ impl KopiaBackupDriver {
         &self,
         bundle: &BackupBundle,
         manifest: &StoredBackup,
+        journal: &dyn PublicationJournal,
     ) -> Result<(), BackupStoreError> {
         manifest.validate(&manifest.instance_id)?;
         self.preflight().await?;
-        let mut arguments = vec![
-            OsString::from("snapshot"),
-            OsString::from("create"),
-            bundle.directory.as_os_str().to_owned(),
-            OsString::from("--json"),
-            OsString::from("--description"),
-            OsString::from(format!("DatabasesEverywhere backup {}", manifest.backup_id)),
-            // DBEV owns retention for these snapshots. Pinning prevents an
-            // unrelated Kopia source policy from expiring them behind DBEV.
-            OsString::from("--pin"),
-        ];
-        for tag in manifest_tags(manifest) {
-            arguments.push(OsString::from("--tags"));
-            arguments.push(OsString::from(tag));
-        }
-        let output = self.run(arguments, MAX_COMMAND_STDOUT).await?;
+        let tags = self.commit_tags(bundle, manifest).await?;
+        // Periodic checkpoints are saved untagged while the upload runs, so
+        // the bundle's unique path is journaled before Kopia can save one.
+        let source_path = snapshot_source_path(&bundle.directory)?;
+        journal
+            .record(&PublicationResource::KopiaSourcePath(source_path.clone()))
+            .await?;
+        let output = self
+            .run(
+                create_arguments(&source_path, manifest, tags),
+                MAX_COMMAND_STDOUT,
+            )
+            .await?;
         ensure_success("create snapshot", &output)?;
-        let snapshot: KopiaManifest = serde_json::from_slice(&output.stdout).map_err(|error| {
-            BackupStoreError::Corrupt(format!("Kopia returned invalid snapshot metadata: {error}"))
-        })?;
+        let snapshot = serde_json::from_slice::<KopiaManifest>(&output.stdout)
+            .map_err(|error| {
+                BackupStoreError::Corrupt(format!(
+                    "Kopia returned invalid snapshot metadata: {error}"
+                ))
+            })
+            .and_then(normalize_tags)?;
+        if snapshot.source.path != source_path {
+            return Err(BackupStoreError::Corrupt(format!(
+                "Kopia recorded snapshot source {} instead of {source_path}",
+                snapshot.source.path
+            )));
+        }
         if snapshot.id.trim().is_empty()
             || snapshot.root_entry.object_id.trim().is_empty()
             || !snapshot.incomplete.trim().is_empty()
@@ -198,14 +261,110 @@ impl KopiaBackupDriver {
         Ok(())
     }
 
+    pub fn identity(&self) -> String {
+        format!("kopia:{}", self.config_file.display())
+    }
+
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
+        Ok(self.inventory(instance_id).await?.backups)
+    }
+
+    pub async fn inventory(&self, instance_id: &str) -> Result<BackupInventory, BackupStoreError> {
         check_instance_id(instance_id)?;
         let snapshots = self
             .list_manifests(&[instance_tag(instance_id)], false)
             .await?;
-        snapshots
+        let mut inventory = BackupInventory::default();
+        for snapshot in snapshots {
+            match self.load_record(instance_id, &snapshot).await {
+                Ok(manifest) => inventory.backups.push(manifest),
+                // Newer formats are listed opaquely; retention keeps them.
+                Err(BackupStoreError::UnsupportedFormat(reason)) => {
+                    match snapshot
+                        .tags
+                        .get(TAG_BACKUP)
+                        .filter(|backup_id| validate_backup_id(backup_id).is_ok())
+                    {
+                        Some(backup_id) => inventory.unsupported.push(UnsupportedBackup {
+                            backup_id: backup_id.clone(),
+                            diagnostic: reason,
+                        }),
+                        None => tracing::warn!(
+                            instance_id,
+                            %reason,
+                            "skipped unsupported Kopia snapshot without a valid backup tag"
+                        ),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(inventory)
+    }
+
+    /// Deletes every snapshot tagged with the backup id, whether or not its
+    /// canonical manifest exists, and every snapshot of the journaled source
+    /// paths, which includes untagged checkpoints. Succeeds only once a
+    /// relisting finds none of them.
+    pub async fn purge_unpublished(
+        &self,
+        instance_id: &str,
+        backup_id: &str,
+        resources: &[PublicationResource],
+    ) -> Result<(), BackupStoreError> {
+        check_instance_id(instance_id)?;
+        validate_backup_id(backup_id)?;
+        let sources = resources
+            .iter()
+            .map(|resource| match resource {
+                PublicationResource::KopiaSourcePath(path) => Ok(path.as_str()),
+                other => Err(BackupStoreError::Corrupt(format!(
+                    "publication journal holds {other:?}, which is not a Kopia resource"
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let tags = [
+            instance_tag(instance_id),
+            format!("{TAG_BACKUP}:{backup_id}"),
+        ];
+        for snapshot in self.list_manifests(&tags, true).await? {
+            self.delete_snapshot(snapshot.id).await?;
+        }
+        for path in &sources {
+            for id in self.source_snapshot_ids(path).await? {
+                self.delete_snapshot(id).await?;
+            }
+        }
+        let mut remaining = self.list_manifests(&tags, true).await?.len();
+        for path in &sources {
+            remaining += self.source_snapshot_ids(path).await?.len();
+        }
+        if remaining > 0 {
+            return Err(BackupStoreError::Remote(format!(
+                "Kopia still lists {remaining} snapshot(s) of unpublished backup {backup_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ids of every snapshot manifest, complete or not, whose source path is
+    /// exactly `path`. Kopia saves each checkpoint with the source labels, so
+    /// the path label finds them without tags or the client's user@host.
+    async fn source_snapshot_ids(&self, path: &str) -> Result<Vec<String>, BackupStoreError> {
+        self.preflight().await?;
+        let output = self
+            .run(source_manifest_arguments(path), MAX_COMMAND_STDOUT)
+            .await?;
+        ensure_success("list source snapshots", &output)?;
+        let entries = parse_manifest_entries(&output.stdout)?;
+        if entries.len() >= MAX_LISTED_SNAPSHOTS {
+            return Err(BackupStoreError::Remote(format!(
+                "Kopia lists {MAX_LISTED_SNAPSHOTS} or more snapshots of source {path}"
+            )));
+        }
+        entries
             .into_iter()
-            .map(|snapshot| record_from_snapshot(instance_id, &snapshot))
+            .map(|entry| source_entry_id(entry, path))
             .collect()
     }
 
@@ -215,7 +374,7 @@ impl KopiaBackupDriver {
         backup_id: &str,
     ) -> Result<StoredBackup, BackupStoreError> {
         let snapshot = self.find_manifest(instance_id, backup_id).await?;
-        record_from_snapshot(instance_id, &snapshot)
+        self.load_record(instance_id, &snapshot).await
     }
 
     pub async fn delete(&self, instance_id: &str, backup_id: &str) -> Result<(), BackupStoreError> {
@@ -257,7 +416,7 @@ impl KopiaBackupDriver {
         destination: &Path,
     ) -> Result<(), BackupStoreError> {
         let snapshot = self.find_manifest(instance_id, backup_id).await?;
-        let manifest = record_from_snapshot(instance_id, &snapshot)?;
+        let manifest = self.load_record(instance_id, &snapshot).await?;
         self.restore_object(
             &format!("{}/{}", snapshot.root_entry.object_id, backup_id),
             destination,
@@ -278,7 +437,7 @@ impl KopiaBackupDriver {
         tmp_root: &Path,
     ) -> Result<Option<Vec<u8>>, BackupStoreError> {
         let snapshot = self.find_manifest(instance_id, backup_id).await?;
-        let manifest = record_from_snapshot(instance_id, &snapshot)?;
+        let manifest = self.load_record(instance_id, &snapshot).await?;
         if !manifest.catalog_available {
             return Ok(None);
         }
@@ -305,6 +464,82 @@ impl KopiaBackupDriver {
         read_result
             .map(Some)
             .map_err(|source| io_error("read restored Kopia catalog", source))
+    }
+
+    /// Tags for a new snapshot. Schema 2 manifests are projected onto
+    /// versioned tags and bound to the canonical sidecar by its SHA-256.
+    async fn commit_tags(
+        &self,
+        bundle: &BackupBundle,
+        manifest: &StoredBackup,
+    ) -> Result<Vec<String>, BackupStoreError> {
+        if manifest.details.is_none() {
+            return Ok(legacy_manifest_tags(manifest));
+        }
+        let bytes = read_metadata_file(bundle.metadata.clone()).await?;
+        let canonical =
+            StoredBackup::from_json(&bytes, &manifest.instance_id, "staged backup metadata")?;
+        if canonical.backup_id != manifest.backup_id
+            || canonical.sha256 != manifest.sha256
+            || canonical.size_bytes != manifest.size_bytes
+            || canonical.details != manifest.details
+        {
+            return Err(BackupStoreError::Corrupt(
+                "staged backup metadata does not match the committed manifest".to_string(),
+            ));
+        }
+        v2_manifest_tags(manifest, &crate::server::backup::sha256_bytes(&bytes))
+    }
+
+    /// Reads one snapshot's manifest. Snapshots without a version tag are
+    /// legacy schema 1 records reconstructed from tags; schema 2 snapshots
+    /// are read only from their canonical sidecar.
+    async fn load_record(
+        &self,
+        instance_id: &str,
+        snapshot: &KopiaManifest,
+    ) -> Result<StoredBackup, BackupStoreError> {
+        match snapshot.tags.get(TAG_MANIFEST_VERSION).map(String::as_str) {
+            None => record_from_snapshot(instance_id, snapshot),
+            Some("2") => self.canonical_record(instance_id, snapshot).await,
+            Some(version) => Err(BackupStoreError::UnsupportedFormat(format!(
+                "Kopia snapshot {} uses manifest schema {version}, which this daemon cannot read",
+                snapshot.id
+            ))),
+        }
+    }
+
+    async fn canonical_record(
+        &self,
+        instance_id: &str,
+        snapshot: &KopiaManifest,
+    ) -> Result<StoredBackup, BackupStoreError> {
+        let projection = V2Projection::from_snapshot(instance_id, snapshot)?;
+        prepare_private_dir(&self.scratch_root, "Kopia manifest scratch directory").await?;
+        let destination = self
+            .scratch_root
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        self.restore_object(
+            &format!(
+                "{}/{}",
+                snapshot.root_entry.object_id,
+                metadata_file_name(&projection.backup_id)
+            ),
+            &destination,
+        )
+        .await?;
+        let read = read_metadata_file(destination.clone()).await;
+        remove_file_if_exists(&destination).await;
+        let bytes = read?;
+        if crate::server::backup::sha256_bytes(&bytes) != projection.manifest_sha256 {
+            return Err(BackupStoreError::Corrupt(format!(
+                "Kopia snapshot {} manifest does not match its tagged checksum",
+                snapshot.id
+            )));
+        }
+        let manifest = StoredBackup::from_json(&bytes, instance_id, "Kopia backup metadata")?;
+        projection.check(&manifest)?;
+        Ok(manifest)
     }
 
     async fn find_manifest(
@@ -356,18 +591,19 @@ impl KopiaBackupDriver {
         }
         let output = self.run(arguments, MAX_COMMAND_STDOUT).await?;
         ensure_success("list snapshots", &output)?;
-        let snapshots: Vec<KopiaManifest> =
-            serde_json::from_slice(&output.stdout).map_err(|error| {
-                BackupStoreError::Corrupt(format!(
-                    "Kopia returned invalid snapshot list JSON: {error}"
-                ))
-            })?;
+        let snapshots = parse_snapshot_list(&output.stdout)?;
         if snapshots.len() >= MAX_LISTED_SNAPSHOTS {
             return Err(BackupStoreError::Remote(format!(
                 "Kopia returned {MAX_LISTED_SNAPSHOTS} snapshots; narrow the repository or prune old DBEV backups"
             )));
         }
-        Ok(snapshots)
+        // `--incomplete` filters only the text listing; JSON always includes
+        // incomplete snapshots. A canceled upload keeps its tags and must
+        // never be read as a published backup.
+        Ok(snapshots
+            .into_iter()
+            .filter(|snapshot| include_incomplete || snapshot.incomplete.trim().is_empty())
+            .collect())
     }
 
     async fn restore_object(
@@ -457,6 +693,127 @@ fn restore_arguments(object_path: &str, destination: &Path) -> Vec<OsString> {
     ]
 }
 
+fn create_arguments(
+    source_path: &str,
+    manifest: &StoredBackup,
+    tags: Vec<String>,
+) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("snapshot"),
+        OsString::from("create"),
+        OsString::from(source_path),
+        OsString::from("--json"),
+        OsString::from("--description"),
+        OsString::from(format!("DatabasesEverywhere backup {}", manifest.backup_id)),
+        // DBEV owns retention for these snapshots. Pinning prevents an
+        // unrelated Kopia source policy from expiring them behind DBEV.
+        // `--pin` takes a value; without one the CLI rejects the command.
+        OsString::from("--pin"),
+        OsString::from(DBEV_PIN),
+    ];
+    for tag in tags {
+        arguments.push(OsString::from("--tags"));
+        arguments.push(OsString::from(tag));
+    }
+    arguments
+}
+
+fn source_manifest_arguments(path: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("manifest"),
+        OsString::from("list"),
+        OsString::from("--json"),
+        OsString::from("--filter"),
+        OsString::from("type:snapshot"),
+        // Kopia splits a filter at its first ':', so the path keeps its own.
+        OsString::from("--filter"),
+        OsString::from(format!("path:{path}")),
+    ]
+}
+
+/// The source path Kopia records for `directory`: `filepath.Clean` of the
+/// absolute path, without resolving symlinks.
+fn snapshot_source_path(directory: &Path) -> Result<String, BackupStoreError> {
+    use std::path::Component;
+
+    let mut clean = PathBuf::new();
+    for component in directory.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => clean.push(component),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(BackupStoreError::InvalidConfiguration(format!(
+                    "Kopia source {} must be a plain absolute path",
+                    directory.display()
+                )));
+            }
+        }
+    }
+    match clean.to_str() {
+        Some(path) if clean.is_absolute() && clean.parent().is_some() => Ok(path.to_string()),
+        _ => Err(BackupStoreError::InvalidConfiguration(format!(
+            "Kopia source {} must be an absolute UTF-8 path below the root",
+            directory.display()
+        ))),
+    }
+}
+
+fn parse_snapshot_list(stdout: &[u8]) -> Result<Vec<KopiaManifest>, BackupStoreError> {
+    serde_json::from_slice::<Vec<KopiaManifest>>(stdout)
+        .map_err(|error| {
+            BackupStoreError::Corrupt(format!(
+                "Kopia returned invalid snapshot list JSON: {error}"
+            ))
+        })?
+        .into_iter()
+        .map(normalize_tags)
+        .collect()
+}
+
+/// The filter is evaluated by Kopia; a manifest is deleted only when its
+/// labels prove it is a snapshot of exactly `path`.
+fn source_entry_id(entry: KopiaManifestEntry, path: &str) -> Result<String, BackupStoreError> {
+    let label = |name: &str| entry.labels.get(name).map(String::as_str);
+    if label("type") == Some("snapshot") && label("path") == Some(path) && !entry.id.is_empty() {
+        Ok(entry.id)
+    } else {
+        Err(BackupStoreError::Corrupt(format!(
+            "Kopia returned manifest {} outside source {path}",
+            entry.id
+        )))
+    }
+}
+
+fn parse_manifest_entries(stdout: &[u8]) -> Result<Vec<KopiaManifestEntry>, BackupStoreError> {
+    serde_json::from_slice(stdout).map_err(|error| {
+        BackupStoreError::Corrupt(format!(
+            "Kopia returned invalid manifest list JSON: {error}"
+        ))
+    })
+}
+
+/// Strips the stored `tag:` prefix. An unprefixed key is accepted as the
+/// same tag; one present in both forms with different values is ambiguous.
+fn normalize_tags(mut snapshot: KopiaManifest) -> Result<KopiaManifest, BackupStoreError> {
+    let mut tags = HashMap::with_capacity(snapshot.tags.len());
+    for (key, value) in std::mem::take(&mut snapshot.tags) {
+        let key = key
+            .strip_prefix(STORED_TAG_PREFIX)
+            .map(str::to_string)
+            .unwrap_or(key);
+        if let Some(previous) = tags.insert(key.clone(), value)
+            && tags.get(&key) != Some(&previous)
+        {
+            return Err(BackupStoreError::Corrupt(format!(
+                "Kopia snapshot {} has conflicting values for tag {key}",
+                snapshot.id
+            )));
+        }
+    }
+    snapshot.tags = tags;
+    Ok(snapshot)
+}
+
 fn instance_tag(instance_id: &str) -> String {
     format!("{TAG_INSTANCE}:{instance_id}")
 }
@@ -468,7 +825,7 @@ fn layout_tag_value(layout: BackupLayout) -> &'static str {
     }
 }
 
-fn manifest_tags(manifest: &StoredBackup) -> Vec<String> {
+fn legacy_manifest_tags(manifest: &StoredBackup) -> Vec<String> {
     vec![
         instance_tag(&manifest.instance_id),
         format!("{TAG_BACKUP}:{}", manifest.backup_id),
@@ -480,6 +837,114 @@ fn manifest_tags(manifest: &StoredBackup) -> Vec<String> {
         format!("{TAG_CATALOG}:{}", manifest.catalog_available),
         format!("{TAG_LAYOUT}:{}", layout_tag_value(manifest.layout)),
     ]
+}
+
+fn v2_manifest_tags(
+    manifest: &StoredBackup,
+    manifest_sha256: &str,
+) -> Result<Vec<String>, BackupStoreError> {
+    let details = manifest.details.as_ref().ok_or_else(|| {
+        BackupStoreError::Corrupt("schema 2 projection requires manifest details".to_string())
+    })?;
+    Ok(vec![
+        instance_tag(&manifest.instance_id),
+        format!("{TAG_BACKUP}:{}", manifest.backup_id),
+        format!("{TAG_MANIFEST_VERSION}:{}", manifest.schema_version),
+        format!("{TAG_MANIFEST_SHA256}:{manifest_sha256}"),
+        format!("{TAG_V2_SIZE}:{}", manifest.size_bytes),
+        format!("{TAG_V2_SHA256}:{}", manifest.sha256),
+        format!("{TAG_V2_CREATED}:{}", manifest.created_at_unix),
+        format!("{TAG_V2_FORMAT}:{}", format_tag_value(details.format)),
+        format!("{TAG_V2_RECIPE}:{}", details.restore_recipe.tag_value()),
+    ])
+}
+
+fn format_tag_value(format: ArtifactFormat) -> &'static str {
+    match format {
+        ArtifactFormat::DataDirectoryArchive => "data_directory_archive",
+        ArtifactFormat::LogicalDump => "logical_dump",
+        ArtifactFormat::OnlineCapture => "online_capture",
+    }
+}
+
+/// Schema 2 tag projection: enough to locate and authenticate the canonical
+/// manifest and to cross-check it, never enough to reconstruct a recipe.
+struct V2Projection {
+    backup_id: String,
+    manifest_sha256: String,
+    size_bytes: u64,
+    sha256: String,
+    created_at_unix: i64,
+    format: String,
+    recipe: String,
+}
+
+impl V2Projection {
+    fn from_snapshot(
+        instance_id: &str,
+        snapshot: &KopiaManifest,
+    ) -> Result<Self, BackupStoreError> {
+        let tag = |name: &str| {
+            snapshot.tags.get(name).cloned().ok_or_else(|| {
+                BackupStoreError::Corrupt(format!("Kopia snapshot omitted tag {name}"))
+            })
+        };
+        if tag(TAG_INSTANCE)? != instance_id {
+            return Err(BackupStoreError::Corrupt(
+                "Kopia snapshot instance tag does not match".to_string(),
+            ));
+        }
+        let backup_id = tag(TAG_BACKUP)?;
+        validate_backup_id(&backup_id)?;
+        let manifest_sha256 = tag(TAG_MANIFEST_SHA256)?;
+        if !crate::server::backup::is_sha256(&manifest_sha256) {
+            return Err(BackupStoreError::Corrupt(
+                "Kopia snapshot has an invalid manifest checksum tag".to_string(),
+            ));
+        }
+        let invalid =
+            |name: &str| BackupStoreError::Corrupt(format!("Kopia snapshot has invalid {name}"));
+        Ok(Self {
+            backup_id,
+            manifest_sha256,
+            size_bytes: tag(TAG_V2_SIZE)?
+                .parse()
+                .map_err(|_| invalid(TAG_V2_SIZE))?,
+            sha256: tag(TAG_V2_SHA256)?,
+            created_at_unix: tag(TAG_V2_CREATED)?
+                .parse()
+                .map_err(|_| invalid(TAG_V2_CREATED))?,
+            format: tag(TAG_V2_FORMAT)?,
+            recipe: tag(TAG_V2_RECIPE)?,
+        })
+    }
+
+    fn check(&self, manifest: &StoredBackup) -> Result<(), BackupStoreError> {
+        let details = manifest.details.as_ref();
+        let matches = manifest.backup_id == self.backup_id
+            && manifest.size_bytes == self.size_bytes
+            && manifest.sha256 == self.sha256
+            && manifest.created_at_unix == self.created_at_unix
+            && details.is_some_and(|details| {
+                format_tag_value(details.format) == self.format
+                    && details.restore_recipe.tag_value() == self.recipe
+            });
+        if matches {
+            Ok(())
+        } else {
+            Err(BackupStoreError::Corrupt(format!(
+                "Kopia snapshot tags disagree with the canonical manifest for {}",
+                self.backup_id
+            )))
+        }
+    }
+}
+
+async fn read_metadata_file(path: PathBuf) -> Result<Vec<u8>, BackupStoreError> {
+    tokio::task::spawn_blocking(move || read_bounded_private_file(&path, MAX_METADATA_BYTES))
+        .await
+        .map_err(|error| BackupStoreError::Runtime(format!("metadata read task failed: {error}")))?
+        .map_err(|source| io_error("read backup metadata", source))
 }
 
 fn record_from_snapshot(
@@ -521,7 +986,7 @@ fn record_from_snapshot(
         }
     };
     let manifest = StoredBackup {
-        schema_version: crate::server::backup::BACKUP_MANIFEST_SCHEMA_VERSION,
+        schema_version: crate::server::backup::manifest::LEGACY_MANIFEST_SCHEMA_VERSION,
         backup_id,
         instance_id: instance_id.to_string(),
         protocol,
@@ -531,6 +996,7 @@ fn record_from_snapshot(
         created_at_unix,
         sha256,
         catalog_available,
+        details: None,
     };
     manifest.validate(instance_id)?;
     Ok(manifest)
@@ -622,29 +1088,152 @@ fn validate_trusted_file(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_wings_compatible_kopia_manifest_shape() {
-        let snapshot: KopiaManifest = serde_json::from_value(serde_json::json!({
-            "id": "m123",
-            "rootEntry": { "obj": "k123" },
-            "incomplete": "",
-            "tags": {
-                (TAG_INSTANCE): "inst_one",
-                (TAG_BACKUP): "one.physical.tar.gz",
-                (TAG_SIZE): "42",
-                (TAG_SHA256): "a".repeat(64),
-                (TAG_CREATED): "1700000000",
-                (TAG_CREATED_AT): "2023-11-14T22_13_20Z",
-                (TAG_PROTOCOL): "postgres",
-                (TAG_CATALOG): "true"
-            }
-        }))
-        .unwrap();
+    const SOURCE: &str = "/var/lib/dbev/backups/.staging/inst_one/.0d9c.bundle";
 
-        let record = record_from_snapshot("inst_one", &snapshot).unwrap();
+    /// `kopia snapshot list --json` output (v0.22): user tags are stored
+    /// under `tag:<key>`, and an untagged checkpoint of the same source is
+    /// listed alongside the final snapshot.
+    fn authentic_snapshot_list() -> String {
+        format!(
+            r#"[
+  {{
+    "id": "8f3a2c9d0e1b4f5a6b7c8d9e0f1a2b3c",
+    "source": {{ "host": "node-a", "userName": "root", "path": "{SOURCE}" }},
+    "description": "",
+    "startTime": "2026-10-11T09:00:00.123456789Z",
+    "endTime": "2026-10-11T09:45:00.123456789Z",
+    "stats": {{ "totalSize": 1048576, "excludedTotalSize": 0, "fileCount": 1, "cachedFiles": 0, "nonCachedFiles": 1, "dirCount": 1, "excludedFileCount": 0, "excludedDirCount": 0, "ignoredErrorCount": 0, "errorCount": 0 }},
+    "incomplete": "checkpoint",
+    "rootEntry": {{ "name": ".0d9c.bundle", "type": "d", "mode": "0700", "mtime": "2026-10-11T09:00:00Z", "obj": "kc0ffee" }},
+    "retentionReason": []
+  }},
+  {{
+    "id": "1b2c3d4e5f60718293a4b5c6d7e8f901",
+    "source": {{ "host": "node-a", "userName": "root", "path": "{SOURCE}" }},
+    "description": "DatabasesEverywhere backup one.physical.tar.gz",
+    "startTime": "2026-10-11T09:00:00.123456789Z",
+    "endTime": "2026-10-11T10:00:00.123456789Z",
+    "stats": {{ "totalSize": 2097152, "excludedTotalSize": 0, "fileCount": 3, "cachedFiles": 0, "nonCachedFiles": 3, "dirCount": 1, "excludedFileCount": 0, "excludedDirCount": 0, "ignoredErrorCount": 0, "errorCount": 0 }},
+    "rootEntry": {{ "name": ".0d9c.bundle", "type": "d", "mode": "0700", "mtime": "2026-10-11T09:00:00Z", "obj": "k123", "summ": {{ "size": 2097152, "files": 3, "symlinks": 0, "dirs": 1, "maxTime": "2026-10-11T09:00:00Z", "numFailed": 0 }} }},
+    "tags": {{
+      "tag:dbev-instance": "inst_one",
+      "tag:dbev-backup": "one.physical.tar.gz",
+      "tag:dbev-size": "42",
+      "tag:dbev-sha256": "{sha}",
+      "tag:dbev-created": "1700000000",
+      "tag:dbev-created-at": "2023-11-14T22_13_20Z",
+      "tag:dbev-protocol": "postgres",
+      "tag:dbev-catalog": "true",
+      "tag:dbev-layout": "physical"
+    }},
+    "pins": ["dbev"],
+    "retentionReason": ["latest-1", "hourly-1", "daily-1"]
+  }}
+]"#,
+            sha = "a".repeat(64)
+        )
+    }
+
+    #[test]
+    fn authentic_cli_snapshot_lists_are_read_through_stored_tag_keys() {
+        let snapshots = parse_snapshot_list(authentic_snapshot_list().as_bytes()).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let checkpoint = &snapshots[0];
+        assert_eq!(checkpoint.incomplete, "checkpoint");
+        assert!(checkpoint.tags.is_empty());
+        assert_eq!(checkpoint.source.path, SOURCE);
+
+        let record = record_from_snapshot("inst_one", &snapshots[1]).unwrap();
         assert_eq!(record.backup_id, "one.physical.tar.gz");
         assert_eq!(record.protocol, Protocol::Postgres);
+        assert_eq!(record.layout, BackupLayout::Physical);
         assert!(record.catalog_available);
+    }
+
+    #[test]
+    fn unprefixed_tags_are_accepted_but_conflicting_forms_are_not() {
+        let snapshot = |tags: serde_json::Value| -> KopiaManifest {
+            serde_json::from_value(serde_json::json!({
+                "id": "m1",
+                "source": { "host": "h", "userName": "u", "path": SOURCE },
+                "rootEntry": { "obj": "k1" },
+                "tags": tags,
+            }))
+            .unwrap()
+        };
+        let plain = normalize_tags(snapshot(serde_json::json!({ "dbev-backup": "a" }))).unwrap();
+        assert_eq!(plain.tags.get(TAG_BACKUP).map(String::as_str), Some("a"));
+        let same = serde_json::json!({ "dbev-backup": "a", "tag:dbev-backup": "a" });
+        assert!(normalize_tags(snapshot(same)).is_ok());
+        let conflict = serde_json::json!({ "dbev-backup": "a", "tag:dbev-backup": "b" });
+        assert!(matches!(
+            normalize_tags(snapshot(conflict)),
+            Err(BackupStoreError::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_passes_unprefixed_tags_and_a_pin_value() {
+        let manifest = v2_manifest().await;
+        let arguments = create_arguments(SOURCE, &manifest, legacy_manifest_tags(&manifest));
+        let position = |flag: &str| arguments.iter().position(|arg| arg == flag).unwrap();
+        assert_eq!(arguments[2], SOURCE);
+        // kingpin rejects `--pin --tags ...`: the next token must be a value.
+        assert_eq!(arguments[position("--pin") + 1], DBEV_PIN);
+        let tag = &arguments[position("--tags") + 1];
+        assert!(tag.to_str().unwrap().starts_with("dbev-instance:"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|arg| arg.to_str().unwrap().starts_with("tag:"))
+        );
+    }
+
+    #[test]
+    fn source_paths_match_kopia_clean_without_resolving_links() {
+        assert_eq!(
+            snapshot_source_path(Path::new("/var/lib/dbev/./backups//.staging/i/.x.bundle/"))
+                .unwrap(),
+            "/var/lib/dbev/backups/.staging/i/.x.bundle"
+        );
+        for path in ["relative/bundle", "/var/../etc", "/"] {
+            assert!(snapshot_source_path(Path::new(path)).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn checkpoints_are_found_by_their_source_path_label() {
+        let arguments = source_manifest_arguments(SOURCE);
+        assert_eq!(
+            arguments[..2],
+            [OsString::from("manifest"), OsString::from("list")]
+        );
+        assert!(arguments.contains(&OsString::from("type:snapshot")));
+        assert!(arguments.contains(&OsString::from(format!("path:{SOURCE}"))));
+
+        // `kopia manifest list --json` output (v0.22 manifest.EntryMetadata).
+        let stdout = format!(
+            r#"[
+  {{ "id": "8f3a2c9d0e1b4f5a6b7c8d9e0f1a2b3c", "length": 812, "labels": {{ "hostname": "node-a", "path": "{SOURCE}", "type": "snapshot", "username": "root" }}, "mtime": "2026-10-11T09:45:00.1Z" }},
+  {{ "id": "1b2c3d4e5f60718293a4b5c6d7e8f901", "length": 1204, "labels": {{ "hostname": "node-a", "path": "{SOURCE}", "tag:dbev-backup": "one.physical.tar.gz", "type": "snapshot", "username": "root" }}, "mtime": "2026-10-11T10:00:00.1Z" }}
+]"#
+        );
+        let ids = parse_manifest_entries(stdout.as_bytes())
+            .unwrap()
+            .into_iter()
+            .map(|entry| source_entry_id(entry, SOURCE))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+
+        for labels in [
+            serde_json::json!({ "type": "snapshot", "path": "/other" }),
+            serde_json::json!({ "type": "policy", "path": SOURCE }),
+        ] {
+            let entry: KopiaManifestEntry =
+                serde_json::from_value(serde_json::json!({ "id": "m", "labels": labels })).unwrap();
+            assert!(source_entry_id(entry, SOURCE).is_err());
+        }
     }
 
     #[test]
@@ -653,5 +1242,87 @@ mod tests {
         assert_eq!(arguments[0], "snapshot");
         assert_eq!(arguments[1], "restore");
         assert_eq!(arguments[2], "k123/archive");
+    }
+
+    /// A snapshot as `snapshot list --json` returns it after `snapshot create
+    /// --tags <tag>...`: each `key:value` argument stored as `tag:key`.
+    fn snapshot_with_tags(tags: Vec<String>) -> KopiaManifest {
+        normalize_tags(KopiaManifest {
+            id: "m456".to_string(),
+            source: KopiaSource {
+                path: SOURCE.to_string(),
+            },
+            root_entry: KopiaRootEntry {
+                object_id: "k456".to_string(),
+            },
+            incomplete: String::new(),
+            tags: tags
+                .into_iter()
+                .map(|tag| {
+                    let (key, value) = tag.split_once(':').unwrap();
+                    (format!("{STORED_TAG_PREFIX}{key}"), value.to_string())
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    async fn v2_manifest() -> StoredBackup {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("archive");
+        tokio::fs::write(&archive, b"archive").await.unwrap();
+        crate::server::backup::build_manifest(
+            "two.physical.tar.gz".to_string(),
+            "inst_one".to_string(),
+            Protocol::Postgres,
+            BackupLayout::Physical,
+            &archive,
+            false,
+            crate::server::backup::test_details(BackupLayout::Physical),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_two_tags_bind_the_canonical_manifest_and_starve_legacy_readers() {
+        let manifest = v2_manifest().await;
+        let bytes = manifest.to_json().unwrap();
+        let checksum = crate::server::backup::sha256_bytes(&bytes);
+        let snapshot = snapshot_with_tags(v2_manifest_tags(&manifest, &checksum).unwrap());
+
+        let projection = V2Projection::from_snapshot("inst_one", &snapshot).unwrap();
+        assert_eq!(projection.manifest_sha256, checksum);
+        projection.check(&manifest).unwrap();
+        // A schema 1 reader must not reconstruct a manifest from these tags.
+        assert!(matches!(
+            record_from_snapshot("inst_one", &snapshot),
+            Err(BackupStoreError::Corrupt(_))
+        ));
+
+        let mut altered = manifest.clone();
+        altered.details.as_mut().unwrap().restore_recipe.version = 9;
+        assert!(projection.check(&altered).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_kopia_manifest_versions_are_unsupported() {
+        let driver = KopiaBackupDriver::new(
+            BackupKopiaConfig {
+                executable: "/usr/bin/kopia".to_string(),
+                ..Default::default()
+            },
+            PathBuf::from("/var/lib/dbev/backups"),
+        )
+        .unwrap();
+        let mut tags = v2_manifest_tags(&v2_manifest().await, &"a".repeat(64)).unwrap();
+        tags.retain(|tag| !tag.starts_with(TAG_MANIFEST_VERSION));
+        tags.push(format!("{TAG_MANIFEST_VERSION}:3"));
+        assert!(matches!(
+            driver
+                .load_record("inst_one", &snapshot_with_tags(tags))
+                .await,
+            Err(BackupStoreError::UnsupportedFormat(_))
+        ));
     }
 }

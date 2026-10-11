@@ -95,7 +95,30 @@ pub(crate) struct SharedSpecInput<'a> {
     pub socket_bridge_binary: PathBuf,
 }
 
+/// Certified online backup capability of a dedicated engine runtime.
+///
+/// Only strategies whose capture *and* restore satisfy the online contract
+/// (no planned write freeze, no restart, no silent downgrade) may be declared.
+/// The backup coordinator maps each variant to a
+/// `subsystems::backups::strategy::OnlineBackupStrategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnlineBackup {
+    /// No certified strategy. Strict online requests fail with this reason.
+    Unavailable { reason: &'static str },
+    /// `pg_basebackup -X stream` capture verified by `pg_verifybackup`.
+    PostgresBaseBackup,
+}
+
+pub(crate) const NO_ONLINE_BACKUP_STRATEGY: &str =
+    "this engine has no certified online backup strategy yet";
+
 pub(crate) trait EngineLifecycle: EngineInfo {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::Unavailable {
+            reason: NO_ONLINE_BACKUP_STRATEGY,
+        }
+    }
+
     fn generate_maintenance_password(&self) -> Option<String> {
         None
     }

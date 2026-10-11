@@ -6,6 +6,7 @@ use super::scheduler::backup_all_instances;
 use super::storage::backup_storage;
 use super::types::{BackupAttempt, BackupContentsQuery, RestoreBackupResponse, RunBackupResponse};
 use super::types::{BackupContentsResponse, BackupInfo, BackupStatusResponse};
+use super::types::{RunBackupQuery, UnsupportedBackupInfo};
 use super::{DEFAULT_BROWSE_LIMIT, MAX_BROWSE_LIMIT, MAX_BROWSE_OBJECT_ID_BYTES};
 use crate::auth::scopes;
 use crate::routes::http::policy::{
@@ -32,6 +33,7 @@ pub async fn backup_status(
         redis_excluded: false,
         storage_driver: state.config.backups.storage.driver.as_str().to_string(),
         browsing_enabled: state.config.backups.browsing.enabled,
+        dedicated_mode: state.config.backups.dedicated_mode.as_str(),
     }))
 }
 
@@ -51,6 +53,31 @@ pub async fn list_instance_backups(
         .map(backup_info)
         .collect();
     Ok(ApiResponse::ok(backups))
+}
+
+/// Backups in formats this daemon cannot read (for example a newer manifest
+/// schema). They are never restored or pruned; delete one explicitly with
+/// `DELETE /api/instances/{instance_id}/backups/{backup_id}`.
+pub async fn list_unsupported_backups(
+    State(state): State<AppState>,
+    auth: ApiRequestContext,
+    ApiPath(instance_id): ApiPath<String>,
+) -> ApiResult<Vec<UnsupportedBackupInfo>> {
+    auth.require_scope(scopes::BACKUPS_READ)?;
+    require_instance(&state, &instance_id).await?;
+    let entries = backup_storage(&state)?
+        .inventory(&instance_id)
+        .await
+        .map_err(store_error)?
+        .unsupported
+        .into_iter()
+        .map(|entry| UnsupportedBackupInfo {
+            id: entry.backup_id,
+            instance_id: instance_id.clone(),
+            diagnostic: entry.diagnostic,
+        })
+        .collect();
+    Ok(ApiResponse::ok(entries))
 }
 
 pub async fn browse_instance_backup(
@@ -145,9 +172,10 @@ pub async fn run_instance_backup(
     State(state): State<AppState>,
     auth: ApiRequestContext,
     ApiPath(instance_id): ApiPath<String>,
+    ApiQuery(query): ApiQuery<RunBackupQuery>,
 ) -> ApiResult<BackupInfo> {
     auth.require_scope(scopes::BACKUPS_WRITE)?;
-    match backup_instance(&state, &instance_id).await? {
+    match backup_instance(&state, &instance_id, query.mode).await? {
         BackupAttempt::Completed(backup) => Ok(ApiResponse::ok(backup)),
         BackupAttempt::Skipped(issue) => Err(ApiError::BadRequest(issue.reason.message)),
     }

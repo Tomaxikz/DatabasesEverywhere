@@ -1,3 +1,4 @@
+mod backup_helper;
 mod command;
 mod container_config;
 mod cpu_burst;
@@ -18,6 +19,9 @@ mod startup;
 mod stream_exec;
 mod transfer;
 
+pub use backup_helper::{
+    BACKUP_HELPER_STAGING, BackupHelperError, BackupHelperSocket, BackupHelperSpec,
+};
 pub use error::DockerError;
 use helpers::is_rootless_security_option;
 use transfer::CappedExecOutput;

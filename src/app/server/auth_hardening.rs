@@ -1,7 +1,10 @@
 use super::{manager::InstanceManager, metadata::InstanceMetadata};
 use crate::runtime::docker::{DockerRuntime, ManagedContainerIdentity};
 
-pub(crate) const POSTGRES_HARDENING_REVISION: u32 = 1;
+/// Revision 1 attested local SCRAM. Revision 2 adds the daemon-owned
+/// replication role and its local HBA line, so a revision 1 attestation is
+/// stale and `harden_postgres` runs the script again on daemon upgrade.
+pub(crate) const POSTGRES_HARDENING_REVISION: u32 = 2;
 pub(crate) const MYSQL_HARDENING_REVISION: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -146,4 +149,69 @@ async fn ensure_generation(
         return Err(AuthHardeningCompletionError::ContainerChanged);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::POSTGRES_HARDENING_REVISION;
+    use crate::{
+        databases::protocol::Protocol,
+        runtime::docker::ManagedContainerIdentity,
+        server::{manager::InstanceManager, state::InstanceStore, test_support},
+        storage::{repositories::InstanceRepository, sqlite},
+    };
+
+    #[test]
+    fn postgres_hardening_revision_includes_the_replication_role() {
+        assert_eq!(
+            Protocol::Postgres.engine().auth_hardening_revision(),
+            Some(POSTGRES_HARDENING_REVISION)
+        );
+        assert_ne!(
+            Protocol::Postgres.engine().auth_hardening_revision(),
+            Some(1)
+        );
+        assert_eq!(
+            Protocol::Mysql.engine().auth_hardening_revision(),
+            Some(super::MYSQL_HARDENING_REVISION)
+        );
+    }
+
+    /// `begin_attestation` reports `current: false` when this lookup is false.
+    /// That is the signal `harden_postgres` uses to run the script again.
+    #[tokio::test]
+    async fn revision_one_attestation_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = sqlite::connect(dir.path()).await.unwrap();
+        let repository = InstanceRepository::encrypted(pool, dir.path()).unwrap();
+        let manager = InstanceManager::new(InstanceStore::default(), repository);
+        let mut metadata = test_support::metadata("inst_pg_rev", Protocol::Postgres);
+        metadata.tenant_password = Some("tenant-secret".to_string());
+        metadata.postgres_admin_password = Some("admin-secret".to_string());
+        manager.upsert(metadata.clone()).await.unwrap();
+        let identity = ManagedContainerIdentity {
+            id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".into(),
+            started_at: "2026-08-13T12:00:00Z".into(),
+        };
+        manager
+            .record_hardening_attestation(&metadata, &identity, 1)
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .hardening_is_current(&metadata, &identity, POSTGRES_HARDENING_REVISION)
+                .await
+                .unwrap()
+        );
+        manager
+            .record_hardening_attestation(&metadata, &identity, POSTGRES_HARDENING_REVISION)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .hardening_is_current(&metadata, &identity, POSTGRES_HARDENING_REVISION)
+                .await
+                .unwrap()
+        );
+    }
 }

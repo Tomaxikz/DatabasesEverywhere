@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod drivers;
+pub mod manifest;
 
 use std::path::{Path, PathBuf};
 
@@ -10,11 +11,16 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     config::{BackupStorageDriver, Config},
     databases::protocol::Protocol,
-    io::files::{is_safe_flat_file_name, secure_private_dir},
+    io::{
+        files::is_safe_flat_file_name,
+        ownership::{allow_traversal_below, secure_private_dir_keeping_traversal},
+    },
     utils::ids::validate_instance_id,
 };
 
-pub const BACKUP_MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Schema version written by this daemon. Readers also accept
+/// [`manifest::LEGACY_MANIFEST_SCHEMA_VERSION`].
+pub const BACKUP_MANIFEST_SCHEMA_VERSION: u32 = manifest::MANIFEST_SCHEMA_VERSION;
 pub(crate) const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const PHYSICAL_SUFFIX: &str = ".physical.tar.gz";
 const LOGICAL_SUFFIX: &str = ".logical.dump";
@@ -36,6 +42,26 @@ pub struct StoredBackup {
     pub created_at_unix: i64,
     pub sha256: String,
     pub catalog_available: bool,
+    /// Restore contract; present exactly for schema 2 manifests. Schema 1
+    /// daemons reject it as an unknown field, which keeps them from
+    /// restoring formats they do not understand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<manifest::ManifestDetails>,
+}
+
+/// A stored backup in a format this daemon cannot interpret, such as a newer
+/// manifest schema. It is listed opaquely, never restored and never pruned
+/// by retention; only an explicit delete removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedBackup {
+    pub backup_id: String,
+    pub diagnostic: String,
+}
+
+#[derive(Debug, Default)]
+pub struct BackupInventory {
+    pub backups: Vec<StoredBackup>,
+    pub unsupported: Vec<UnsupportedBackup>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,8 +81,20 @@ impl StoredBackup {
             OffsetDateTime::parse(&self.created_at, &Rfc3339),
             Ok(created_at) if created_at.unix_timestamp() == self.created_at_unix
         );
-        if self.schema_version != BACKUP_MANIFEST_SCHEMA_VERSION
-            || self.instance_id != expected_instance_id
+        match (self.schema_version, &self.details) {
+            (manifest::LEGACY_MANIFEST_SCHEMA_VERSION, None) => {}
+            (manifest::MANIFEST_SCHEMA_VERSION, Some(details)) => details.validate(self.layout)?,
+            (version, _) if !is_supported_schema(version) => {
+                return Err(unsupported_schema(&self.backup_id, version));
+            }
+            _ => {
+                return Err(BackupStoreError::Corrupt(format!(
+                    "backup metadata for {} does not match schema {}",
+                    self.backup_id, self.schema_version
+                )));
+            }
+        }
+        if self.instance_id != expected_instance_id
             || !is_sha256(&self.sha256)
             || !created_at_is_consistent
         {
@@ -78,10 +116,43 @@ impl StoredBackup {
         expected_instance_id: &str,
         label: &str,
     ) -> Result<Self, BackupStoreError> {
-        let manifest: Self = serde_json::from_slice(bytes)
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| BackupStoreError::Corrupt(format!("invalid {label}: {error}")))?;
+        // Check the version before strict field parsing so a newer format is
+        // reported as unsupported rather than as corruption.
+        if let Some(version) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let version = u32::try_from(version).unwrap_or(u32::MAX);
+            if !is_supported_schema(version) {
+                let backup_id = value
+                    .get("backup_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(unsupported_schema(backup_id, version));
+            }
+        }
+        let manifest: Self = serde_json::from_value(value)
             .map_err(|error| BackupStoreError::Corrupt(format!("invalid {label}: {error}")))?;
         manifest.validate(expected_instance_id)?;
         Ok(manifest)
+    }
+
+    /// Restore path dictated by the stored format, never by placement.
+    pub fn restore_format(&self) -> manifest::RestoreFormat<'_> {
+        match (&self.details, self.layout) {
+            (Some(details), _) => details.restore_format(),
+            (None, BackupLayout::Physical) => {
+                manifest::RestoreFormat::DataDirectoryArchive { legacy: true }
+            }
+            (None, BackupLayout::Logical) => manifest::RestoreFormat::LogicalDump { legacy: true },
+        }
+    }
+
+    /// Recorded consistency guarantee. Schema 1 records carry none.
+    pub fn consistency(&self) -> Option<manifest::ConsistencyLevel> {
+        self.details.as_ref().map(|details| details.consistency)
     }
 
     pub(crate) async fn verify_archive(
@@ -159,8 +230,112 @@ impl BackupBundle {
     }
 }
 
+/// Lets the rootless runtime group `gid` bind-mount `staging`, a capture
+/// directory below `<backups_root>/.staging/<instance>`. The backups root and
+/// each staging ancestor become daemon-owned 0710: traversable, never
+/// listable. Private preparation keeps that grant, and everything else below
+/// the root (instance backup directories, bundles) keeps its private mode.
+/// Fails with the blocking ancestor when the runtime still cannot reach it.
+pub async fn allow_staging_traversal(
+    backups_root: &Path,
+    staging: &Path,
+    owner: (u32, u32),
+) -> Result<(), BackupStoreError> {
+    let root = backups_root.to_path_buf();
+    let target = staging.to_path_buf();
+    let daemon_uid = rustix::process::geteuid().as_raw();
+    tokio::task::spawn_blocking(move || {
+        allow_traversal_below(&root, &target, daemon_uid, owner.1)?;
+        crate::io::ownership::ensure_traversable(&target, owner.0, owner.1)
+    })
+    .await
+    .map_err(|error| BackupStoreError::Runtime(format!("staging traversal task failed: {error}")))?
+    .map_err(|source| io_error("grant rootless runtime traversal to backup staging", source))
+}
+
+/// Removes incomplete bundles from an earlier run. Online capture
+/// directories (`.staging/<instance>/.<job>.capture`) are kept: a helper
+/// container may still write to one until journal recovery confirms it gone
+/// and removes the directory itself.
 pub async fn cleanup_staging(backups_root: &Path) -> Result<bool, BackupStoreError> {
-    cleanup_internal_dir(&backups_root.join(".staging"), "backup staging").await
+    let staging = backups_root.join(".staging");
+    match tokio::fs::symlink_metadata(&staging).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error("inspect backup staging directory", source)),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(BackupStoreError::Corrupt(
+                "backup staging path must be a real directory".to_string(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let mut removed = false;
+    let mut instances = tokio::fs::read_dir(&staging)
+        .await
+        .map_err(|source| io_error("read backup staging", source))?;
+    while let Some(instance) = instances
+        .next_entry()
+        .await
+        .map_err(|source| io_error("read backup staging", source))?
+    {
+        let path = instance.path();
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|source| io_error("inspect backup staging entry", source))?;
+        if !metadata.is_dir() {
+            remove_staging_entry(&path, &metadata).await?;
+            removed = true;
+            continue;
+        }
+        let mut kept = false;
+        let mut entries = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|source| io_error("read backup staging", source))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| io_error("read backup staging", source))?
+        {
+            let entry_path = entry.path();
+            let entry_metadata = tokio::fs::symlink_metadata(&entry_path)
+                .await
+                .map_err(|source| io_error("inspect backup staging entry", source))?;
+            if entry_metadata.is_dir() && is_capture_dir_name(&entry.file_name()) {
+                kept = true;
+                continue;
+            }
+            remove_staging_entry(&entry_path, &entry_metadata).await?;
+            removed = true;
+        }
+        if !kept {
+            tokio::fs::remove_dir(&path)
+                .await
+                .map_err(|source| io_error("remove incomplete backup staging", source))?;
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+/// `.<job uuid>.capture`, the online capture staging of one job.
+pub(crate) fn is_capture_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".capture"))
+            .is_some_and(|job| job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    })
+}
+
+async fn remove_staging_entry(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), BackupStoreError> {
+    let removed = if metadata.is_dir() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    removed.map_err(|source| io_error("remove incomplete backup staging", source))
 }
 
 pub async fn cleanup_materializations(tmp_root: &Path) -> Result<usize, BackupStoreError> {
@@ -253,14 +428,49 @@ impl BackupStorage {
         &self,
         bundle: &BackupBundle,
         manifest: &StoredBackup,
+        journal: &dyn drivers::PublicationJournal,
     ) -> Result<(), BackupStoreError> {
-        self.driver().commit(bundle, manifest).await
+        self.driver().commit(bundle, manifest, journal).await
+    }
+
+    /// Identity of the storage target, recorded before publication so
+    /// cleanup never acts on a different target.
+    pub fn identity(&self) -> String {
+        match self {
+            Self::Local(driver) => driver.identity(),
+            Self::S3(driver) => driver.identity(),
+            Self::Kopia(driver) => driver.identity(),
+        }
     }
 
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
-        let mut backups = self.driver().list(instance_id).await?;
-        backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));
-        Ok(backups)
+        Ok(self.inventory(instance_id).await?.backups)
+    }
+
+    /// Readable backups, newest first, plus opaque unsupported entries.
+    pub async fn inventory(&self, instance_id: &str) -> Result<BackupInventory, BackupStoreError> {
+        let mut inventory = self.driver().inventory(instance_id).await?;
+        inventory
+            .backups
+            .sort_by_key(|backup| std::cmp::Reverse(backup.created_at_unix));
+        inventory
+            .unsupported
+            .sort_by(|left, right| left.backup_id.cmp(&right.backup_id));
+        Ok(inventory)
+    }
+
+    /// Idempotently removes every object of a backup id whose publication
+    /// did not settle, plus its journaled `resources`, and confirms removal.
+    pub async fn purge_unpublished(
+        &self,
+        instance_id: &str,
+        backup_id: &str,
+        resources: &[drivers::PublicationResource],
+    ) -> Result<(), BackupStoreError> {
+        validate_backup_id(backup_id)?;
+        self.driver()
+            .purge_unpublished(instance_id, backup_id, resources)
+            .await
     }
 
     pub async fn find(
@@ -367,11 +577,16 @@ impl BackupStorage {
             Self::Kopia(driver) => return driver.delete_instance(instance_id).await,
             Self::Local(_) => {}
         }
-        let backups = self.list(instance_id).await?;
-        for backup in &backups {
-            self.delete(instance_id, &backup.backup_id).await?;
+        let inventory = self.inventory(instance_id).await?;
+        for backup_id in inventory
+            .backups
+            .iter()
+            .map(|backup| &backup.backup_id)
+            .chain(inventory.unsupported.iter().map(|entry| &entry.backup_id))
+        {
+            self.delete(instance_id, backup_id).await?;
         }
-        Ok(backups.len())
+        Ok(inventory.backups.len() + inventory.unsupported.len())
     }
 }
 
@@ -382,7 +597,9 @@ pub async fn build_manifest(
     layout: BackupLayout,
     archive: &Path,
     catalog_available: bool,
+    details: manifest::ManifestDetails,
 ) -> Result<StoredBackup, BackupStoreError> {
+    details.validate(layout)?;
     let metadata = tokio::fs::metadata(archive)
         .await
         .map_err(|source| io_error("inspect backup archive", source))?;
@@ -405,7 +622,38 @@ pub async fn build_manifest(
         created_at_unix: created.unix_timestamp(),
         sha256: sha256_file(archive).await?,
         catalog_available,
+        details: Some(details),
     })
+}
+
+fn is_supported_schema(version: u32) -> bool {
+    matches!(
+        version,
+        manifest::LEGACY_MANIFEST_SCHEMA_VERSION | manifest::MANIFEST_SCHEMA_VERSION
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_details(layout: BackupLayout) -> manifest::ManifestDetails {
+    let consistency = match layout {
+        BackupLayout::Physical => manifest::ConsistencyLevel::StoppedCopy,
+        BackupLayout::Logical => manifest::ConsistencyLevel::PerObject,
+    };
+    manifest::ManifestDetails::built_in(
+        layout,
+        consistency,
+        manifest::CaptureInterval {
+            started_at_unix: 0,
+            finished_at_unix: 0,
+        },
+        manifest::EngineRecord::default(),
+    )
+}
+
+fn unsupported_schema(backup_id: &str, version: u32) -> BackupStoreError {
+    BackupStoreError::UnsupportedFormat(format!(
+        "backup {backup_id} uses manifest schema {version}, which this daemon cannot read; upgrade the daemon to restore it"
+    ))
 }
 
 pub async fn sha256_file(path: &Path) -> Result<String, BackupStoreError> {
@@ -428,6 +676,10 @@ pub async fn sha256_file(path: &Path) -> Result<String, BackupStoreError> {
     .await
     .map_err(|error| BackupStoreError::Runtime(format!("backup hash task failed: {error}")))?
     .map_err(|source| io_error("hash backup archive", source))
+}
+
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
+    crate::utils::hex::encode_lower(&Sha256::digest(bytes))
 }
 
 pub fn new_backup_id(layout: BackupLayout) -> String {
@@ -477,7 +729,7 @@ async fn create_private_directory(path: &Path, label: &str) -> Result<(), Backup
 
 async fn secure_directory(path: &Path, label: &str) -> Result<(), BackupStoreError> {
     let path = path.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || secure_private_dir(&path))
+    let result = tokio::task::spawn_blocking(move || secure_private_dir_keeping_traversal(&path))
         .await
         .map_err(|error| BackupStoreError::Runtime(format!("{label} task failed: {error}")))?;
     match result {
@@ -519,7 +771,7 @@ pub(crate) async fn remove_file_if_exists(path: &Path) {
     }
 }
 
-fn is_sha256(value: &str) -> bool {
+pub(crate) fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -543,6 +795,9 @@ pub enum BackupStoreError {
     InvalidConfiguration(String),
     #[error("backup data is corrupt: {0}")]
     Corrupt(String),
+    /// Written by a newer daemon in a format this build must not interpret.
+    #[error("unsupported backup format: {0}")]
+    UnsupportedFormat(String),
     #[error("backup storage operation failed: {0}")]
     Remote(String),
     #[error("{operation}: {source}")]
@@ -576,6 +831,7 @@ mod tests {
             BackupLayout::Physical,
             &bundle.archive,
             false,
+            test_details(BackupLayout::Physical),
         )
         .await
         .unwrap();
@@ -585,7 +841,10 @@ mod tests {
             .format(&Rfc3339)
             .unwrap();
         bundle.write_metadata(&manifest).await.unwrap();
-        storage.commit(&bundle, &manifest).await.unwrap();
+        storage
+            .commit(&bundle, &manifest, &drivers::DiscardJournal)
+            .await
+            .unwrap();
         bundle.cleanup().await;
         manifest
     }
@@ -764,7 +1023,7 @@ mod tests {
     #[test]
     fn old_manifests_default_to_physical_while_new_ids_mark_logical_backups() {
         let old: StoredBackup = serde_json::from_value(serde_json::json!({
-            "schema_version": BACKUP_MANIFEST_SCHEMA_VERSION,
+            "schema_version": manifest::LEGACY_MANIFEST_SCHEMA_VERSION,
             "backup_id": "old.physical.tar.gz",
             "instance_id": "inst_old",
             "protocol": "postgres",
@@ -777,6 +1036,120 @@ mod tests {
         .unwrap();
         assert_eq!(old.layout, BackupLayout::Physical);
         assert!(new_backup_id(BackupLayout::Logical).ends_with(".logical.dump"));
+    }
+
+    fn legacy_manifest_json(layout: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "backup_id": "old.physical.tar.gz",
+            "instance_id": "inst_old",
+            "protocol": "postgres",
+            "layout": layout,
+            "size_bytes": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_at_unix": 1767225600,
+            "sha256": "0".repeat(64),
+            "catalog_available": false
+        })
+    }
+
+    #[test]
+    fn legacy_manifests_restore_by_layout_without_invented_guarantees() {
+        for (layout, expected) in [
+            (
+                "physical",
+                manifest::RestoreFormat::DataDirectoryArchive { legacy: true },
+            ),
+            (
+                "logical",
+                manifest::RestoreFormat::LogicalDump { legacy: true },
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&legacy_manifest_json(layout)).unwrap();
+            let legacy = StoredBackup::from_json(&bytes, "inst_old", "metadata").unwrap();
+            assert_eq!(legacy.restore_format(), expected);
+            assert_eq!(legacy.consistency(), None);
+            // Re-serializing a legacy record must not upgrade it.
+            let round_trip = serde_json::to_value(&legacy).unwrap();
+            assert_eq!(round_trip["schema_version"], 1);
+            assert!(round_trip.get("details").is_none());
+        }
+    }
+
+    #[test]
+    fn schema_versions_and_details_must_agree() {
+        let mut legacy_with_details = legacy_manifest_json("physical");
+        legacy_with_details["details"] =
+            serde_json::to_value(test_details(BackupLayout::Physical)).unwrap();
+        let bytes = serde_json::to_vec(&legacy_with_details).unwrap();
+        assert!(matches!(
+            StoredBackup::from_json(&bytes, "inst_old", "metadata"),
+            Err(BackupStoreError::Corrupt(_))
+        ));
+
+        let mut v2_without_details = legacy_manifest_json("physical");
+        v2_without_details["schema_version"] = serde_json::json!(2);
+        let bytes = serde_json::to_vec(&v2_without_details).unwrap();
+        assert!(matches!(
+            StoredBackup::from_json(&bytes, "inst_old", "metadata"),
+            Err(BackupStoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn future_schema_versions_are_rejected_as_unsupported() {
+        let mut future = legacy_manifest_json("physical");
+        future["schema_version"] = serde_json::json!(3);
+        future["something_new"] = serde_json::json!({"recipe": "x"});
+        let bytes = serde_json::to_vec(&future).unwrap();
+        assert!(matches!(
+            StoredBackup::from_json(&bytes, "inst_old", "metadata"),
+            Err(BackupStoreError::UnsupportedFormat(message)) if message.contains("schema 3")
+        ));
+    }
+
+    #[tokio::test]
+    async fn current_manifests_round_trip_their_restore_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("archive");
+        tokio::fs::write(&archive, b"archive").await.unwrap();
+        let manifest = build_manifest(
+            "new.logical.dump".to_string(),
+            "inst_one".to_string(),
+            Protocol::Postgres,
+            BackupLayout::Logical,
+            &archive,
+            false,
+            test_details(BackupLayout::Logical),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.schema_version, BACKUP_MANIFEST_SCHEMA_VERSION);
+        let parsed =
+            StoredBackup::from_json(&manifest.to_json().unwrap(), "inst_one", "metadata").unwrap();
+        assert_eq!(parsed.details, manifest.details);
+        assert_eq!(
+            parsed.restore_format(),
+            manifest::RestoreFormat::LogicalDump { legacy: false }
+        );
+        assert_eq!(
+            parsed.consistency(),
+            Some(manifest::ConsistencyLevel::PerObject)
+        );
+        // A contract that disagrees with the layout is never written.
+        assert!(
+            build_manifest(
+                "bad.physical.tar.gz".to_string(),
+                "inst_one".to_string(),
+                Protocol::Postgres,
+                BackupLayout::Physical,
+                &archive,
+                false,
+                test_details(BackupLayout::Logical),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -792,8 +1165,33 @@ mod tests {
             .unwrap();
 
         assert!(cleanup_staging(temp.path()).await.unwrap());
-        assert!(!temp.path().join(".staging").exists());
+        assert!(!staging.exists());
         assert!(temp.path().join("published.physical.tar.gz").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_leaves_online_capture_staging_to_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join(".staging").join("inst_one");
+        let capture = staging.join(".0123456789abcdef0123456789abcdef.capture");
+        tokio::fs::create_dir_all(capture.join("pgdata"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(staging.join(".bundle-id.bundle"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(temp.path().join(".staging/.kopia-manifests"))
+            .await
+            .unwrap();
+
+        assert!(cleanup_staging(temp.path()).await.unwrap());
+        assert!(capture.join("pgdata").exists());
+        assert!(!staging.join(".bundle-id.bundle").exists());
+        assert!(!temp.path().join(".staging/.kopia-manifests").exists());
+        assert!(is_capture_dir_name(std::ffi::OsStr::new(
+            ".0123456789abcdef0123456789abcdef.capture"
+        )));
+        assert!(!is_capture_dir_name(std::ffi::OsStr::new(".x.capture")));
     }
 
     #[tokio::test]

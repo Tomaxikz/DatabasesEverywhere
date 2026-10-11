@@ -15,7 +15,11 @@ use super::{
 };
 use crate::{
     databases::protocol::xml_escape,
-    server::backup::{BackupStoreError, MAX_METADATA_BYTES, io_error},
+    server::backup::{
+        BackupStoreError, MAX_METADATA_BYTES,
+        drivers::{PublicationJournal, PublicationResource},
+        io_error,
+    },
 };
 
 impl S3BackupDriver {
@@ -25,6 +29,7 @@ impl S3BackupDriver {
         path: &Path,
         size: u64,
         sha256: &str,
+        journal: &dyn PublicationJournal,
     ) -> Result<(), BackupStoreError> {
         let metadata = tokio::fs::symlink_metadata(path)
             .await
@@ -35,7 +40,7 @@ impl S3BackupDriver {
             ));
         }
         if size >= MULTIPART_THRESHOLD_BYTES {
-            return self.multipart_upload(key, path, size).await;
+            return self.multipart_upload(key, path, size, journal).await;
         }
 
         for attempt in 0..=self.config.max_retries {
@@ -78,6 +83,7 @@ impl S3BackupDriver {
         key: &str,
         path: &Path,
         size: u64,
+        journal: &dyn PublicationJournal,
     ) -> Result<(), BackupStoreError> {
         if size > MAX_S3_OBJECT_BYTES {
             return Err(BackupStoreError::InvalidConfiguration(
@@ -85,6 +91,17 @@ impl S3BackupDriver {
             ));
         }
         let upload_id = self.initiate_multipart_upload(key).await?;
+        // Parts are billable until aborted. Journal the id before any part
+        // exists so recovery can abort it after a crash; an initiation whose
+        // id never reached the journal is found by listing the key.
+        let resource = PublicationResource::S3MultipartUpload {
+            key: key.to_string(),
+            upload_id: upload_id.clone(),
+        };
+        if let Err(error) = journal.record(&resource).await {
+            self.abort_multipart_upload(key, &upload_id).await;
+            return Err(error);
+        }
         let result = match self
             .upload_multipart_parts(key, path, size, &upload_id)
             .await

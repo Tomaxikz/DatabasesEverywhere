@@ -3,6 +3,7 @@ use crate::routes::http::diagnostics::PublicDiagnostic;
 use crate::routes::http::response::ApiError;
 use crate::server::backup::BackupLayout;
 use crate::server::backup::catalog::BackupCatalogColumn;
+use crate::server::backup::manifest::ConsistencyLevel;
 use crate::server::metadata::InstanceMetadata;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,7 @@ pub struct BackupStatusResponse {
     pub redis_excluded: bool,
     pub storage_driver: String,
     pub browsing_enabled: bool,
+    pub dedicated_mode: &'static str,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -34,6 +36,29 @@ pub struct BackupInfo {
     pub size_bytes: u64,
     pub modified_at: String,
     pub sha256: String,
+    pub manifest_schema_version: u32,
+    /// Recorded consistency guarantee; `null` for legacy backups, which never
+    /// recorded one.
+    pub consistency: Option<ConsistencyLevel>,
+    /// Restore recipe as `id@version`; `null` for legacy backups.
+    pub restore_recipe: Option<String>,
+}
+
+/// A stored backup this daemon cannot interpret. Retention never deletes it;
+/// it is removed only by an explicit delete of its id.
+#[derive(Debug, Serialize)]
+pub struct UnsupportedBackupInfo {
+    pub id: String,
+    pub instance_id: String,
+    pub diagnostic: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunBackupQuery {
+    /// Overrides `backups.dedicated_mode` for this request. Shared tenants
+    /// always use their logical dump.
+    pub mode: Option<crate::config::DedicatedBackupMode>,
 }
 
 #[derive(Debug, Serialize)]

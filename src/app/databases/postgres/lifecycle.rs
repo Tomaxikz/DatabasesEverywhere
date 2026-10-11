@@ -1,7 +1,7 @@
 use crate::{
     databases::engine::{
         CredentialKind, DedicatedSpecInput, EngineInfo, EngineLifecycle, LifecycleFlow,
-        LifecycleRejection, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
+        LifecycleRejection, OnlineBackup, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
     },
     runtime::docker::DockerInstanceSpec,
     server::metadata::InstanceMetadata,
@@ -14,6 +14,10 @@ use super::{
 };
 
 impl EngineLifecycle for Postgres {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::PostgresBaseBackup
+    }
+
     fn generate_maintenance_password(&self) -> Option<String> {
         Some(format!("dbe-admin-{}", uuid::Uuid::new_v4().simple()))
     }

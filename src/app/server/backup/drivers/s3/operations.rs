@@ -2,7 +2,10 @@ use std::path::Path;
 
 use super::{METADATA_KEY_SUFFIX, S3BackupDriver};
 use crate::server::backup::{
-    BackupBundle, BackupStoreError, MAX_METADATA_BYTES, StoredBackup, io_error, sha256_file,
+    BackupBundle, BackupInventory, BackupStoreError, MAX_METADATA_BYTES, StoredBackup,
+    UnsupportedBackup,
+    drivers::{PublicationJournal, PublicationResource},
+    io_error, sha256_file, validate_backup_id,
 };
 
 impl S3BackupDriver {
@@ -21,6 +24,7 @@ impl S3BackupDriver {
         &self,
         bundle: &BackupBundle,
         manifest: &StoredBackup,
+        journal: &dyn PublicationJournal,
     ) -> Result<(), BackupStoreError> {
         manifest.validate(&manifest.instance_id)?;
         let archive_key = self.archive_key(&manifest.instance_id, &manifest.backup_id)?;
@@ -33,6 +37,7 @@ impl S3BackupDriver {
                 &bundle.archive,
                 manifest.size_bytes,
                 &manifest.sha256,
+                journal,
             )
             .await
         {
@@ -52,6 +57,7 @@ impl S3BackupDriver {
                     &bundle.catalog,
                     catalog_metadata.len(),
                     &catalog_sha,
+                    journal,
                 )
                 .await
             {
@@ -75,17 +81,44 @@ impl S3BackupDriver {
         Ok(())
     }
 
+    pub fn identity(&self) -> String {
+        format!(
+            "s3:{}|{}|{}",
+            self.endpoint.base,
+            self.config.bucket,
+            self.config.prefix.trim_matches('/')
+        )
+    }
+
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
+        Ok(self.inventory(instance_id).await?.backups)
+    }
+
+    pub async fn inventory(&self, instance_id: &str) -> Result<BackupInventory, BackupStoreError> {
         let prefix = self.instance_prefix(instance_id)?;
         let keys = self.list_keys(&prefix).await?;
-        let mut backups = Vec::new();
+        let mut inventory = BackupInventory::default();
         for key in keys {
             if !key.ends_with(METADATA_KEY_SUFFIX) {
                 continue;
             }
             match self.get_manifest_by_key(instance_id, &key).await {
-                Ok(manifest) => backups.push(manifest),
+                Ok(manifest) => inventory.backups.push(manifest),
                 Err(BackupStoreError::NotFound) => {}
+                // Newer formats are listed opaquely; retention keeps them.
+                Err(BackupStoreError::UnsupportedFormat(reason)) => {
+                    match backup_id_from_metadata_key(&prefix, &key) {
+                        Some(backup_id) => inventory.unsupported.push(UnsupportedBackup {
+                            backup_id,
+                            diagnostic: reason,
+                        }),
+                        None => tracing::warn!(
+                            object_key = %key,
+                            %reason,
+                            "ignored unsupported S3 backup metadata with an invalid key"
+                        ),
+                    }
+                }
                 Err(error @ (BackupStoreError::InvalidBackupId | BackupStoreError::Corrupt(_))) => {
                     tracing::warn!(
                         object_key = %key,
@@ -96,7 +129,36 @@ impl S3BackupDriver {
                 Err(error) => return Err(error),
             }
         }
-        Ok(backups)
+        Ok(inventory)
+    }
+
+    /// Hides the metadata first, aborts every multipart upload of the archive
+    /// and catalog keys (journaled or listed) so none can complete into an
+    /// object later, then removes the catalog and archive. Every object may
+    /// already be absent.
+    pub async fn purge_unpublished(
+        &self,
+        instance_id: &str,
+        backup_id: &str,
+        resources: &[PublicationResource],
+    ) -> Result<(), BackupStoreError> {
+        let metadata = self.metadata_key(instance_id, backup_id)?;
+        let catalog = self.catalog_key(instance_id, backup_id)?;
+        let archive = self.archive_key(instance_id, backup_id)?;
+        let journaled = journaled_uploads(resources, &[&archive, &catalog])?;
+        self.delete_object(&metadata, true).await?;
+        for key in [&archive, &catalog] {
+            let upload_ids = journaled
+                .iter()
+                .filter(|(upload_key, _)| upload_key == key)
+                .map(|(_, upload_id)| *upload_id)
+                .collect::<Vec<_>>();
+            self.purge_multipart_uploads(key, &upload_ids).await?;
+        }
+        for key in [catalog, archive] {
+            self.delete_object(&key, true).await?;
+        }
+        Ok(())
     }
 
     pub async fn find(
@@ -109,12 +171,18 @@ impl S3BackupDriver {
     }
 
     pub async fn delete(&self, instance_id: &str, backup_id: &str) -> Result<(), BackupStoreError> {
-        let manifest = self.find(instance_id, backup_id).await?;
+        // An unsupported format cannot say whether it has a catalog, so an
+        // explicit delete removes every object of the id.
+        let catalog_available = match self.find(instance_id, backup_id).await {
+            Ok(manifest) => manifest.catalog_available,
+            Err(BackupStoreError::UnsupportedFormat(_)) => true,
+            Err(error) => return Err(error),
+        };
         let archive = self.archive_key(instance_id, backup_id)?;
         let catalog = self.catalog_key(instance_id, backup_id)?;
         let metadata = self.metadata_key(instance_id, backup_id)?;
         self.delete_object(&archive, true).await?;
-        if manifest.catalog_available {
+        if catalog_available {
             self.delete_object(&catalog, true).await?;
         }
         self.delete_object(&metadata, false).await
@@ -174,5 +242,81 @@ impl S3BackupDriver {
             ));
         }
         Ok(manifest)
+    }
+}
+
+/// Journaled `(key, upload id)` pairs. A resource of another provider or of
+/// a key this backup does not own is never acted on.
+fn journaled_uploads<'a>(
+    resources: &'a [PublicationResource],
+    owned: &[&str],
+) -> Result<Vec<(&'a str, &'a str)>, BackupStoreError> {
+    resources
+        .iter()
+        .map(|resource| match resource {
+            PublicationResource::S3MultipartUpload { key, upload_id }
+                if owned.contains(&key.as_str()) =>
+            {
+                Ok((key.as_str(), upload_id.as_str()))
+            }
+            other => Err(BackupStoreError::Corrupt(format!(
+                "publication journal holds {other:?}, which this S3 backup does not own"
+            ))),
+        })
+        .collect()
+}
+
+fn backup_id_from_metadata_key(prefix: &str, key: &str) -> Option<String> {
+    let backup_id = key
+        .strip_prefix(prefix)?
+        .strip_suffix(METADATA_KEY_SUFFIX)?;
+    validate_backup_id(backup_id).ok()?;
+    Some(backup_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_entries_take_their_id_from_the_metadata_key() {
+        let prefix = "dbev/instances/inst_one/backups/";
+        assert_eq!(
+            backup_id_from_metadata_key(
+                prefix,
+                "dbev/instances/inst_one/backups/new.physical.tar.gz.metadata.json"
+            )
+            .as_deref(),
+            Some("new.physical.tar.gz")
+        );
+        for key in [
+            "dbev/instances/inst_two/backups/new.physical.tar.gz.metadata.json",
+            "dbev/instances/inst_one/backups/new.physical.tar.gz",
+            "dbev/instances/inst_one/backups/../x.metadata.json",
+            "dbev/instances/inst_one/backups/.metadata.json",
+        ] {
+            assert!(backup_id_from_metadata_key(prefix, key).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn only_journaled_uploads_of_owned_keys_are_aborted() {
+        let upload = |key: &str| PublicationResource::S3MultipartUpload {
+            key: key.to_string(),
+            upload_id: "id".to_string(),
+        };
+        let owned = ["p/a", "p/a.catalog.json"];
+        assert_eq!(
+            journaled_uploads(&[upload("p/a")], &owned).unwrap(),
+            vec![("p/a", "id")]
+        );
+        assert!(journaled_uploads(&[upload("p/other")], &owned).is_err());
+        assert!(
+            journaled_uploads(
+                &[PublicationResource::KopiaSourcePath("/p".to_string())],
+                &owned
+            )
+            .is_err()
+        );
     }
 }

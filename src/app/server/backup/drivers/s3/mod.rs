@@ -5,7 +5,10 @@ use reqwest::Url;
 
 use crate::{
     config::BackupS3Config,
-    server::backup::{BackupBundle, BackupStoreError, StoredBackup},
+    server::backup::{
+        BackupBundle, BackupInventory, BackupStoreError, StoredBackup,
+        drivers::{PublicationJournal, PublicationResource},
+    },
 };
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -27,6 +30,7 @@ mod endpoint;
 mod http;
 mod keys;
 mod listing;
+mod multipart;
 mod operations;
 mod signing;
 #[cfg(test)]
@@ -88,17 +92,18 @@ impl super::BackupCommit for S3BackupDriver {
         &'a self,
         bundle: &'a BackupBundle,
         manifest: &'a StoredBackup,
+        journal: &'a dyn PublicationJournal,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
-        Box::pin(Self::commit(self, bundle, manifest))
+        Box::pin(Self::commit(self, bundle, manifest, journal))
     }
 }
 
-impl super::BackupInventory for S3BackupDriver {
-    fn list<'a>(
+impl super::BackupListing for S3BackupDriver {
+    fn inventory<'a>(
         &'a self,
         instance_id: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<StoredBackup>, BackupStoreError>> {
-        Box::pin(Self::list(self, instance_id))
+    ) -> BoxFuture<'a, Result<BackupInventory, BackupStoreError>> {
+        Box::pin(Self::inventory(self, instance_id))
     }
 
     fn find<'a>(
@@ -117,6 +122,20 @@ impl super::BackupDelete for S3BackupDriver {
         backup_id: &'a str,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(Self::delete(self, instance_id, backup_id))
+    }
+
+    fn purge_unpublished<'a>(
+        &'a self,
+        instance_id: &'a str,
+        backup_id: &'a str,
+        resources: &'a [PublicationResource],
+    ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
+        Box::pin(Self::purge_unpublished(
+            self,
+            instance_id,
+            backup_id,
+            resources,
+        ))
     }
 }
 

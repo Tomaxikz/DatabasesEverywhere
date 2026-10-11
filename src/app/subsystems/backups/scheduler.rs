@@ -7,7 +7,7 @@ use tokio::time::sleep;
 pub(crate) async fn backup_all_instances(state: &AppState) -> RunBackupResponse {
     let mut response = RunBackupResponse::default();
     for metadata in state.instances.list().await {
-        let result = backup_instance(state, &metadata.instance_id).await;
+        let result = backup_instance(state, &metadata.instance_id, None).await;
         response.record(&metadata, result);
     }
     if response.failed.is_empty() {

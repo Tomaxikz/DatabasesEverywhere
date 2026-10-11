@@ -33,6 +33,7 @@ pub(crate) fn state(
         docker: DockerRuntime::offline_for_tests(&Default::default(), false)
             .with_startup_history(pool.clone()),
         import_export_jobs: ImportExportJobs::default(),
+        backup_jobs: crate::storage::backup_jobs::BackupJobRepository::new(pool.clone()),
         import_uploads: crate::subsystems::import_export::ImportUploadService::with_limits(
             crate::storage::import_uploads::ImportUploadRepository::new(pool),
             config.artifacts.import_upload_max_concurrent,

@@ -319,6 +319,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         instance_locks: instance_locks.clone(),
         docker: docker.clone(),
         import_export_jobs: import_export_jobs.clone(),
+        backup_jobs: crate::storage::backup_jobs::BackupJobRepository::new(pool.clone()),
         import_uploads: import_uploads.clone(),
         api_rate_limiter: crate::routes::http::limits::ApiRateLimiter::with_limits(
             config.security.api_rate_limit_per_minute,
@@ -410,6 +411,19 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         shared_pools_quarantined = shared_reconcile.quarantined,
         "startup phase 4/5: dedicated instances and physical shared pools reconciled"
     );
+    // Interrupted online backups: clean up only resources their journal proves
+    // they own in the matching runtime generation. Failures stay pending and
+    // block further backups of that instance; they never block startup.
+    match crate::subsystems::backups::recover_interrupted_backups(&state).await {
+        Ok(summary) if summary != Default::default() => tracing::warn!(
+            recovered = summary.recovered,
+            published = summary.published,
+            cleanup_pending = summary.cleanup_pending,
+            "classified interrupted online backup jobs"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "online backup job recovery failed"),
+    }
     sync_cpu_burst_limits(&manager, &docker).await;
     // Scan failed/quarantined pools before API handlers, container
     // event workers, or database gateway listeners can mutate/publish tenants.

@@ -4,9 +4,9 @@ use futures::future::BoxFuture;
 
 use crate::io::files::read_bounded_private_file;
 use crate::server::backup::{
-    BackupBundle, BackupStoreError, MAX_METADATA_BYTES, MaterializedBackup, StoredBackup,
-    catalog_file_name, check_instance_id, io_error, metadata_file_name, prepare_private_dir,
-    remove_file_if_exists, validate_backup_id,
+    BackupBundle, BackupInventory, BackupStoreError, MAX_METADATA_BYTES, MaterializedBackup,
+    StoredBackup, UnsupportedBackup, catalog_file_name, check_instance_id, io_error,
+    metadata_file_name, prepare_private_dir, remove_file_if_exists, validate_backup_id,
 };
 
 #[derive(Debug, Clone)]
@@ -25,17 +25,19 @@ impl super::BackupCommit for LocalBackupDriver {
         &'a self,
         bundle: &'a BackupBundle,
         manifest: &'a StoredBackup,
+        // Local publication creates nothing beyond the backup id's files.
+        _journal: &'a dyn super::PublicationJournal,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(Self::commit(self, bundle, manifest))
     }
 }
 
-impl super::BackupInventory for LocalBackupDriver {
-    fn list<'a>(
+impl super::BackupListing for LocalBackupDriver {
+    fn inventory<'a>(
         &'a self,
         instance_id: &'a str,
-    ) -> BoxFuture<'a, Result<Vec<StoredBackup>, BackupStoreError>> {
-        Box::pin(Self::list(self, instance_id))
+    ) -> BoxFuture<'a, Result<BackupInventory, BackupStoreError>> {
+        Box::pin(Self::inventory(self, instance_id))
     }
 
     fn find<'a>(
@@ -54,6 +56,15 @@ impl super::BackupDelete for LocalBackupDriver {
         backup_id: &'a str,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(Self::delete(self, instance_id, backup_id))
+    }
+
+    fn purge_unpublished<'a>(
+        &'a self,
+        instance_id: &'a str,
+        backup_id: &'a str,
+        _resources: &'a [super::PublicationResource],
+    ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
+        Box::pin(Self::purge_unpublished(self, instance_id, backup_id))
     }
 }
 
@@ -77,6 +88,13 @@ impl LocalBackupDriver {
         if manifest.catalog_available {
             verify_regular_file(&bundle.catalog, "staged backup catalog").await?;
         }
+        // The archive is the inventory commit marker, so every sidecar and the
+        // archive contents must be durable before the archive becomes visible.
+        sync_file(&bundle.archive, "staged backup archive").await?;
+        sync_file(&bundle.metadata, "staged backup metadata").await?;
+        if manifest.catalog_available {
+            sync_file(&bundle.catalog, "staged backup catalog").await?;
+        }
 
         let destination = self.instance_root(&manifest.instance_id)?;
         prepare_private_dir(&destination, "instance backup directory").await?;
@@ -92,26 +110,41 @@ impl LocalBackupDriver {
             remove_file_if_exists(&catalog).await;
             return Err(error);
         }
+        if let Err(error) = sync_file(&metadata, "published backup metadata").await {
+            remove_file_if_exists(&metadata).await;
+            remove_file_if_exists(&catalog).await;
+            return Err(error);
+        }
         if let Err(error) = rename_new(&bundle.archive, &archive, "publish backup archive").await {
             remove_file_if_exists(&metadata).await;
             remove_file_if_exists(&catalog).await;
             return Err(error);
         }
-        Ok(())
+        // A failure here leaves a complete, verifiable bundle whose directory
+        // entry may not yet be durable; report it rather than unpublishing.
+        sync_file(&archive, "published backup archive").await
+    }
+
+    pub fn identity(&self) -> String {
+        format!("local:{}", self.root.display())
     }
 
     pub async fn list(&self, instance_id: &str) -> Result<Vec<StoredBackup>, BackupStoreError> {
+        Ok(self.inventory(instance_id).await?.backups)
+    }
+
+    pub async fn inventory(&self, instance_id: &str) -> Result<BackupInventory, BackupStoreError> {
         let root = self.instance_root(instance_id)?;
         match verify_real_directory(&root, "instance backup directory").await {
             Ok(()) => {}
-            Err(BackupStoreError::NotFound) => return Ok(Vec::new()),
+            Err(BackupStoreError::NotFound) => return Ok(BackupInventory::default()),
             Err(error) => return Err(error),
         }
         let mut entries = tokio::fs::read_dir(&root)
             .await
             .map_err(|source| io_error("read instance backup directory", source))?;
 
-        let mut backups = Vec::new();
+        let mut inventory = BackupInventory::default();
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -130,12 +163,43 @@ impl LocalBackupDriver {
             if validate_backup_id(backup_id).is_err() {
                 continue;
             }
-            backups.push(
-                self.load_manifest(instance_id, backup_id, &metadata)
-                    .await?,
-            );
+            match self.load_manifest(instance_id, backup_id, &metadata).await {
+                Ok(manifest) => inventory.backups.push(manifest),
+                // Newer formats are listed opaquely and never interpreted;
+                // retention keeps them until an explicit delete.
+                Err(BackupStoreError::UnsupportedFormat(reason)) => {
+                    inventory.unsupported.push(UnsupportedBackup {
+                        backup_id: backup_id.to_string(),
+                        diagnostic: reason,
+                    })
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(backups)
+        Ok(inventory)
+    }
+
+    /// Removes the archive (the commit marker) first, then its sidecars.
+    pub async fn purge_unpublished(
+        &self,
+        instance_id: &str,
+        backup_id: &str,
+    ) -> Result<(), BackupStoreError> {
+        validate_backup_id(backup_id)?;
+        let root = self.instance_root(instance_id)?;
+        match verify_real_directory(&root, "instance backup directory").await {
+            Ok(()) => {}
+            Err(BackupStoreError::NotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        for name in [
+            backup_id.to_string(),
+            metadata_file_name(backup_id),
+            catalog_file_name(backup_id),
+        ] {
+            remove_regular_if_present(&root.join(name)).await?;
+        }
+        Ok(())
     }
 
     pub async fn find(
@@ -309,6 +373,33 @@ async fn verify_regular_file(path: &Path, label: &str) -> Result<(), BackupStore
     Ok(())
 }
 
+async fn remove_regular_if_present(path: &Path) -> Result<(), BackupStoreError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error("inspect unpublished backup file", source)),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(BackupStoreError::Corrupt(format!(
+                "refusing to remove {}: not a regular file",
+                path.display()
+            )))
+        }
+        Ok(_) => match tokio::fs::remove_file(path).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(io_error("remove unpublished backup file", error))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+async fn sync_file(path: &Path, label: &str) -> Result<(), BackupStoreError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::io::files::sync_private_file(&path))
+        .await
+        .map_err(|error| BackupStoreError::Runtime(format!("{label} sync task failed: {error}")))?
+        .map_err(|source| io_error(format!("sync {label}"), source))
+}
+
 async fn rename_new(
     source: &Path,
     destination: &Path,
@@ -329,7 +420,9 @@ async fn rename_new(
 mod tests {
     use super::*;
     use crate::databases::protocol::Protocol;
-    use crate::server::backup::{BackupBundle, BackupLayout, build_manifest, new_backup_id};
+    use crate::server::backup::{
+        BackupBundle, BackupLayout, build_manifest, new_backup_id, test_details,
+    };
 
     #[tokio::test]
     async fn local_driver_round_trips_a_bundle_and_catalog() {
@@ -350,6 +443,7 @@ mod tests {
             BackupLayout::Physical,
             &bundle.archive,
             true,
+            test_details(BackupLayout::Physical),
         )
         .await
         .unwrap();
@@ -397,6 +491,7 @@ mod tests {
             BackupLayout::Physical,
             &bundle.archive,
             false,
+            test_details(BackupLayout::Physical),
         )
         .await
         .unwrap();
@@ -411,5 +506,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, BackupStoreError::Corrupt(_)));
+    }
+
+    #[tokio::test]
+    async fn local_driver_skips_but_never_reinterprets_future_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let driver = LocalBackupDriver::new(root.clone());
+        driver.preflight().await.unwrap();
+        let instance_root = root.join("inst_one");
+        prepare_private_dir(&instance_root, "test").await.unwrap();
+        let backup_id = "future.physical.tar.gz";
+        tokio::fs::write(instance_root.join(backup_id), b"archive")
+            .await
+            .unwrap();
+        let future = serde_json::json!({
+            "schema_version": 3,
+            "backup_id": backup_id,
+            "instance_id": "inst_one",
+            "recipe": "unknown"
+        });
+        crate::io::files::atomic_write_private(
+            &instance_root.join(metadata_file_name(backup_id)),
+            &serde_json::to_vec(&future).unwrap(),
+        )
+        .unwrap();
+
+        assert!(driver.list("inst_one").await.unwrap().is_empty());
+        let inventory = driver.inventory("inst_one").await.unwrap();
+        assert_eq!(inventory.unsupported.len(), 1);
+        assert_eq!(inventory.unsupported[0].backup_id, backup_id);
+        assert!(inventory.unsupported[0].diagnostic.contains("schema 3"));
+        assert!(matches!(
+            driver.find("inst_one", backup_id).await,
+            Err(BackupStoreError::UnsupportedFormat(_))
+        ));
+        assert!(matches!(
+            driver.materialize("inst_one", backup_id).await,
+            Err(BackupStoreError::UnsupportedFormat(_))
+        ));
+        // Only an explicit delete removes it.
+        driver.delete("inst_one", backup_id).await.unwrap();
+        assert!(
+            driver
+                .inventory("inst_one")
+                .await
+                .unwrap()
+                .unsupported
+                .is_empty()
+        );
+        assert!(!instance_root.join(metadata_file_name(backup_id)).exists());
+    }
+
+    #[tokio::test]
+    async fn local_purge_removes_partial_publications_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let driver = LocalBackupDriver::new(root.clone());
+        driver.preflight().await.unwrap();
+        // Nothing published yet: purging is a no-op.
+        driver
+            .purge_unpublished("inst_one", "partial.physical.tar.gz")
+            .await
+            .unwrap();
+        let instance_root = root.join("inst_one");
+        prepare_private_dir(&instance_root, "test").await.unwrap();
+        let backup_id = "partial.physical.tar.gz";
+        // A crash between the metadata and archive renames leaves sidecars.
+        for name in [metadata_file_name(backup_id), catalog_file_name(backup_id)] {
+            tokio::fs::write(instance_root.join(name), b"partial")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(instance_root.join("other.physical.tar.gz"), b"keep")
+            .await
+            .unwrap();
+        driver
+            .purge_unpublished("inst_one", backup_id)
+            .await
+            .unwrap();
+        driver
+            .purge_unpublished("inst_one", backup_id)
+            .await
+            .unwrap();
+        assert!(!instance_root.join(metadata_file_name(backup_id)).exists());
+        assert!(!instance_root.join(catalog_file_name(backup_id)).exists());
+        assert!(instance_root.join("other.physical.tar.gz").exists());
+        assert!(
+            driver
+                .purge_unpublished("inst_one", "../escape")
+                .await
+                .is_err()
+        );
     }
 }

@@ -27,6 +27,9 @@ pub(super) fn validate_backups(config: &Config) -> Result<(), ConfigValidationEr
             "must be between 65536 and 1048576",
         );
     }
+    if !(1..=24 * 60).contains(&config.backups.online_timeout_minutes) {
+        return invalid_backup("online_timeout_minutes", "must be between 1 and 1440");
+    }
 
     match config.backups.storage.driver {
         BackupStorageDriver::Local => Ok(()),

@@ -11,5 +11,9 @@ pub(crate) fn router() -> Router<AppState> {
             get(crate::subsystems::backups::list_instance_backups)
                 .post(crate::subsystems::backups::run_instance_backup),
         )
+        .route(
+            "/api/instances/{instance_id}/unsupported-backups",
+            get(crate::subsystems::backups::list_unsupported_backups),
+        )
         .merge(_backup_id_::router())
 }

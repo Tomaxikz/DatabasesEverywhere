@@ -1,15 +1,21 @@
 use crate::{
-    databases::engine::{DedicatedSpecInput, EngineLifecycle, RouteIdentity},
+    databases::engine::{DedicatedSpecInput, EngineLifecycle, OnlineBackup, RouteIdentity},
     databases::protocol::Protocol,
     runtime::docker::DockerInstanceSpec,
 };
 
 use super::{
     engine::{Redis, Valkey},
-    instance_spec,
+    instance_spec, online_backup,
 };
 
 impl EngineLifecycle for Redis {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::Unavailable {
+            reason: online_backup::RESP_ONLINE_BACKUP_UNSUPPORTED,
+        }
+    }
+
     fn acl_file_stage(&self) -> Option<&'static str> {
         Some("writing Redis ACL configuration")
     }
@@ -36,6 +42,12 @@ impl EngineLifecycle for Redis {
 }
 
 impl EngineLifecycle for Valkey {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::Unavailable {
+            reason: online_backup::RESP_ONLINE_BACKUP_UNSUPPORTED,
+        }
+    }
+
     fn acl_file_stage(&self) -> Option<&'static str> {
         Some("writing Valkey ACL configuration")
     }

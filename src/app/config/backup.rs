@@ -10,6 +10,16 @@ pub struct BackupConfig {
     pub run_on_startup: bool,
     pub retention_keep_latest_per_instance: usize,
     pub retention_max_age_days: u64,
+    /// How dedicated runtimes are backed up. Omitted keeps the legacy
+    /// `offline` behaviour (stop the database for a cold copy), so existing
+    /// schedules keep producing backups for every engine. `online` must be
+    /// selected explicitly; it requires a certified engine-native strategy
+    /// and fails clearly, without falling back, when none exists. A backup
+    /// request may override this with `?mode=`.
+    pub dedicated_mode: DedicatedBackupMode,
+    /// Deadline for online capture plus native verification. Expiry kills the
+    /// backup work; the serving database is never restarted.
+    pub online_timeout_minutes: u64,
     pub storage: BackupStorageConfig,
     pub browsing: BackupBrowsingConfig,
 }
@@ -22,8 +32,28 @@ impl Default for BackupConfig {
             run_on_startup: false,
             retention_keep_latest_per_instance: 7,
             retention_max_age_days: 30,
+            dedicated_mode: DedicatedBackupMode::default(),
+            online_timeout_minutes: 360,
             storage: BackupStorageConfig::default(),
             browsing: BackupBrowsingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DedicatedBackupMode {
+    Online,
+    /// Legacy default for configurations that do not name a mode.
+    #[default]
+    Offline,
+}
+
+impl DedicatedBackupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
         }
     }
 }
@@ -140,5 +170,23 @@ impl Default for BackupBrowsingConfig {
             max_row_bytes: 4 * 1024,
             max_catalog_bytes: 1024 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_dedicated_mode_keeps_legacy_offline_backups() {
+        let legacy: BackupConfig = yaml_serde::from_str("enabled: true\n").unwrap();
+        assert_eq!(legacy.dedicated_mode, DedicatedBackupMode::Offline);
+        assert_eq!(
+            BackupConfig::default().dedicated_mode,
+            DedicatedBackupMode::Offline
+        );
+        let online: BackupConfig = yaml_serde::from_str("dedicated_mode: online\n").unwrap();
+        assert_eq!(online.dedicated_mode, DedicatedBackupMode::Online);
+        assert!(yaml_serde::from_str::<BackupConfig>("dedicated_mode: hot\n").is_err());
     }
 }

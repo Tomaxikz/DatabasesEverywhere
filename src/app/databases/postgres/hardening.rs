@@ -27,6 +27,13 @@ pub struct PostgresHardeningFailure {
     pub reason: String,
 }
 
+/// The instance still serves. Online capture stays off until the named role is renamed or dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresReplicationCaptureBlock {
+    pub instance_id: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PostgresHardeningSummary {
     pub checked: usize,
@@ -35,6 +42,21 @@ pub struct PostgresHardeningSummary {
     pub attestations_reused: usize,
     pub deferred: usize,
     pub failures: Vec<PostgresHardeningFailure>,
+    pub replication_capture_blocked: Vec<PostgresReplicationCaptureBlock>,
+}
+
+#[derive(Debug)]
+struct AuthHardeningOutcome {
+    changed: bool,
+    replication_capture_blocked: bool,
+}
+
+#[derive(Debug)]
+enum HardeningStdout {
+    Completed(AuthHardeningOutcome),
+    LegacyBootstrapSuperuser,
+    MissingTenantRole,
+    Unexpected,
 }
 
 pub async fn provision_tenant_role(
@@ -141,6 +163,35 @@ async fn provision_role(
     .map(|_| ())
 }
 
+fn foreign_replication_role_diagnostic() -> String {
+    // `online_backup::command` is private. Keep this sentence equal to
+    // `command::foreign_replication_role_diagnostic`.
+    format!(
+        "online backup capture is disabled because role {} exists without ownership marker {}; rename or drop that role, then rerun authentication hardening",
+        super::online_backup::REPLICATION_ROLE,
+        "dbe-managed-replication-v1",
+    )
+}
+
+fn classify_hardening_stdout(stdout: &str) -> HardeningStdout {
+    let replication_capture_blocked = stdout
+        .lines()
+        .any(|line| line == "replication_capture_blocked");
+    match stdout.lines().last() {
+        Some("hardened") => HardeningStdout::Completed(AuthHardeningOutcome {
+            changed: true,
+            replication_capture_blocked,
+        }),
+        Some("already_hardened") => HardeningStdout::Completed(AuthHardeningOutcome {
+            changed: false,
+            replication_capture_blocked,
+        }),
+        Some("legacy_bootstrap_superuser") => HardeningStdout::LegacyBootstrapSuperuser,
+        Some("missing_tenant_role") => HardeningStdout::MissingTenantRole,
+        _ => HardeningStdout::Unexpected,
+    }
+}
+
 pub async fn harden_instance_auth(
     docker: &DockerRuntime,
     instance_id: &str,
@@ -150,9 +201,41 @@ pub async fn harden_instance_auth(
     admin_password: &SecretString,
     recovery: ExecRecovery,
 ) -> Result<bool, DockerError> {
+    Ok(execute_auth_hardening(
+        docker,
+        instance_id,
+        tenant_database,
+        tenant_username,
+        tenant_password,
+        admin_password,
+        recovery,
+    )
+    .await?
+    .changed)
+}
+
+async fn execute_auth_hardening(
+    docker: &DockerRuntime,
+    instance_id: &str,
+    tenant_database: &str,
+    tenant_username: &str,
+    tenant_password: &SecretString,
+    admin_password: &SecretString,
+    recovery: ExecRecovery,
+) -> Result<AuthHardeningOutcome, DockerError> {
     let invalid_password = random_invalid_password();
     let tenant_database_secret = SecretString::from(tenant_database.to_string());
     let tenant_username_secret = SecretString::from(tenant_username.to_string());
+    let replication_password =
+        match super::online_backup::replication_password(admin_password.expose_secret()) {
+            Ok(password) => password,
+            Err(reason) => {
+                return Err(DockerError::PostgresAuthHardeningFailed {
+                    instance_id: instance_id.to_string(),
+                    reason: reason.to_string(),
+                });
+            }
+        };
     let script = hardening_script(tenant_username);
     let output = run_hardening_command(
         docker,
@@ -164,22 +247,36 @@ pub async fn harden_instance_auth(
             ("DBE_POSTGRES_USER", &tenant_username_secret),
             ("DBE_POSTGRES_ADMIN_PASSWORD", admin_password),
             ("DBE_INVALID_PASSWORD", &invalid_password),
+            ("DBE_REPLICATION_PASSWORD", &replication_password),
         ],
         recovery,
     )
     .await?;
-    match output.stdout.lines().last() {
-        Some("hardened") => Ok(true),
-        Some("already_hardened") => Ok(false),
-        Some("legacy_bootstrap_superuser") => Err(DockerError::LegacyPostgresBootstrapSuperuser {
+    match classify_hardening_stdout(&output.stdout) {
+        HardeningStdout::Completed(outcome) => {
+            if outcome.replication_capture_blocked {
+                let reason = foreign_replication_role_diagnostic();
+                tracing::warn!(
+                    event = "audit postgres_replication_capture_blocked",
+                    instance_id,
+                    role = super::online_backup::REPLICATION_ROLE,
+                    %reason,
+                    "PostgreSQL authentication hardening kept this instance in service"
+                );
+            }
+            Ok(outcome)
+        }
+        HardeningStdout::LegacyBootstrapSuperuser => {
+            Err(DockerError::LegacyPostgresBootstrapSuperuser {
+                instance_id: instance_id.to_string(),
+                username: tenant_username.to_string(),
+            })
+        }
+        HardeningStdout::MissingTenantRole => Err(DockerError::MissingPostgresTenantRole {
             instance_id: instance_id.to_string(),
             username: tenant_username.to_string(),
         }),
-        Some("missing_tenant_role") => Err(DockerError::MissingPostgresTenantRole {
-            instance_id: instance_id.to_string(),
-            username: tenant_username.to_string(),
-        }),
-        _ => Err(DockerError::UnexpectedPostgresProvisioningOutput {
+        HardeningStdout::Unexpected => Err(DockerError::UnexpectedPostgresProvisioningOutput {
             instance_id: instance_id.to_string(),
         }),
     }
@@ -561,7 +658,7 @@ async fn harden_postgres(
             }
         };
     summary.checked = 1;
-    let hardening = harden_instance_auth(
+    let hardening = execute_auth_hardening(
         docker,
         &metadata.instance_id,
         &metadata.database.name,
@@ -571,8 +668,8 @@ async fn harden_postgres(
         ExecRecovery::RestartRuntime,
     )
     .await;
-    let changed = match hardening {
-        Ok(changed) => changed,
+    let outcome = match hardening {
+        Ok(outcome) => outcome,
         Err(_) => {
             record_auth_failure(
                 manager,
@@ -585,8 +682,16 @@ async fn harden_postgres(
             return summary;
         }
     };
-    if changed {
+    if outcome.changed {
         summary.hardened = 1;
+    }
+    if outcome.replication_capture_blocked {
+        summary
+            .replication_capture_blocked
+            .push(PostgresReplicationCaptureBlock {
+                instance_id: metadata.instance_id.clone(),
+                reason: foreign_replication_role_diagnostic(),
+            });
     }
     if migrate_admin_password || migrate_tenant_password {
         metadata.postgres_admin_password = Some(admin_password.expose_secret().to_string());
@@ -735,8 +840,16 @@ fn merge_postgres_hardening(outcomes: Vec<PostgresHardeningSummary>) -> Postgres
         summary.attestations_reused += outcome.attestations_reused;
         summary.deferred += outcome.deferred;
         summary.failures.append(&mut outcome.failures);
+        summary
+            .replication_capture_blocked
+            .append(&mut outcome.replication_capture_blocked);
     }
     summary.failures.sort_by(|left, right| {
+        left.instance_id
+            .cmp(&right.instance_id)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    summary.replication_capture_blocked.sort_by(|left, right| {
         left.instance_id
             .cmp(&right.instance_id)
             .then_with(|| left.reason.cmp(&right.reason))
@@ -785,7 +898,36 @@ pub(super) fn hardening_script(tenant_username: &str) -> String {
     let reset = sh_quote(&super::provision::reset_tenant_password_sql(
         tenant_username,
     ));
+    let ensure_sql = super::online_backup::ensure_replication_role_sql();
+    assert!(
+        ensure_sql.contains(&super::online_backup::replication_role_comment_sql()),
+        "replication role creation must commit the ownership comment in the same transaction"
+    );
+    let ensure_replication = sh_quote(&ensure_sql);
+    let reset_replication = sh_quote(&super::online_backup::reset_replication_password_sql());
+    let replication_state = sh_quote(&super::online_backup::replication_role_state_sql());
+    let replication_ownership = sh_quote(&super::online_backup::replication_role_ownership_sql());
+    // Longer placeholders first. `@REPLICATION_ROLE@` is not a substring of
+    // `@REPLICATION_ROLE_STATE@` (the next character is `_`), and this order
+    // keeps that true if a name is extended later.
     HARDENING_SCRIPT
+        .replace("@REPLICATION_OWNERSHIP_SQL@", &replication_ownership)
+        .replace("@ENSURE_REPLICATION_ROLE_SQL@", &ensure_replication)
+        .replace("@RESET_REPLICATION_PASSWORD_SQL@", &reset_replication)
+        .replace("@REPLICATION_ROLE_STATE_SQL@", &replication_state)
+        .replace(
+            "@REPLICATION_ROLE_STATE@",
+            super::online_backup::REPLICATION_ROLE_STATE,
+        )
+        .replace(
+            "@REPLICATION_HBA_LINE@",
+            super::online_backup::REPLICATION_HBA_LINE,
+        )
+        .replace(
+            "@LOCAL_CLIENT_HBA_LINE@",
+            super::online_backup::LOCAL_CLIENT_HBA_LINE,
+        )
+        .replace("@REPLICATION_ROLE@", super::online_backup::REPLICATION_ROLE)
         .replace("@ROLE_STATE_SQL@", &role_state)
         .replace("@RESTRICT_ROLE_SQL@", &restrict)
         .replace("@RESET_PASSWORD_SQL@", &reset)
@@ -816,10 +958,10 @@ hba_is_hardened() {
     $1 ~ /^include/ { exit 10 }
     $1 == "local" {
       if ($2 == "all" && $3 == "all" && $4 == "scram-sha-256" && NF == 4) all_scram++
-      else if ($2 == "replication" && $3 == "all" && $4 == "scram-sha-256" && NF == 4) replication_scram++
+      else if ($2 == "replication" && $3 == "@REPLICATION_ROLE@" && $4 == "scram-sha-256" && NF == 4) replication_scram++
       else exit 11
     }
-    END { if (all_scram == 1 && replication_scram <= 1) exit 0; exit 12 }
+    END { if (all_scram == 1 && replication_scram == 1) exit 0; exit 12 }
   ' "$hba_file"
 }
 verify_tenant_auth() {
@@ -839,8 +981,9 @@ awk '/^[[:space:]]*(include|include_if_exists|include_dir)[[:space:]]/ { exit 1 
   umask 077
   hba_tmp=$(mktemp "${hba_file}.dbev.XXXXXX")
   trap 'rm -f "$hba_tmp"' EXIT HUP INT TERM
-  awk '$1 != "local" { print }' "$hba_file" >"$hba_tmp"
-  printf '%s\n' 'local all all scram-sha-256' >>"$hba_tmp"
+  awk '$1 == "local" || $2 == "replication" { next } { print }' "$hba_file" >"$hba_tmp"
+  printf '%s\n' '@LOCAL_CLIENT_HBA_LINE@' >>"$hba_tmp"
+  printf '%s\n' '@REPLICATION_HBA_LINE@' >>"$hba_tmp"
   chmod --reference="$hba_file" "$hba_tmp"
   mv -f "$hba_tmp" "$hba_file"
   trap - EXIT HUP INT TERM
@@ -861,6 +1004,72 @@ if ! tenant_psql -Atqc 'SELECT 1' >/dev/null 2>&1; then
   { printf '%s\n' '\getenv tenant_password DBE_TENANT_PASSWORD'; printf '%s\n' @RESET_PASSWORD_SQL@; } | admin_psql -v ON_ERROR_STOP=1
   changed=true
 fi
+replication_auth_ok() {
+  db=$1
+  output=$(PGPASSWORD="$DBE_REPLICATION_PASSWORD" psql -X -h /var/run/postgresql -U @REPLICATION_ROLE@ -d "$db" -Atqc 'SELECT 1' 2>&1) && return 0
+  case "$output" in
+    *'permission denied'*) return 0 ;;
+    *'does not exist'*) return 2 ;;
+    *) return 1 ;;
+  esac
+}
+replication_login_ok() {
+  status=0
+  replication_auth_ok postgres || status=$?
+  if [ "$status" -eq 0 ]; then return 0; fi
+  if [ "$status" -eq 1 ]; then return 1; fi
+  status=0
+  replication_auth_ok template1 || status=$?
+  if [ "$status" -eq 0 ]; then return 0; fi
+  if [ "$status" -eq 1 ]; then return 1; fi
+  if [ -n "${POSTGRES_DB:-}" ]; then
+    status=0
+    replication_auth_ok "$POSTGRES_DB" || status=$?
+    if [ "$status" -eq 0 ]; then return 0; fi
+    if [ "$status" -eq 1 ]; then return 1; fi
+  fi
+  return 1
+}
+replication_capture_blocked=false
+replication_ownership=$(admin_psql -Atq -c @REPLICATION_OWNERSHIP_SQL@) || replication_ownership=
+case "$replication_ownership" in
+  missing)
+    { printf '%s\n' '\getenv replication_password DBE_REPLICATION_PASSWORD'; printf '%s\n' @ENSURE_REPLICATION_ROLE_SQL@; } | admin_psql -v ON_ERROR_STOP=1
+    changed=true
+    ;;
+  owned)
+    replication_role_state=$(admin_psql -Atq -c @REPLICATION_ROLE_STATE_SQL@)
+    if [ "$replication_role_state" != "@REPLICATION_ROLE_STATE@" ]; then
+      { printf '%s\n' '\getenv replication_password DBE_REPLICATION_PASSWORD'; printf '%s\n' @ENSURE_REPLICATION_ROLE_SQL@; } | admin_psql -v ON_ERROR_STOP=1
+      changed=true
+    elif ! replication_login_ok; then
+      { printf '%s\n' '\getenv replication_password DBE_REPLICATION_PASSWORD'; printf '%s\n' @RESET_REPLICATION_PASSWORD_SQL@; } | admin_psql -v ON_ERROR_STOP=1
+      changed=true
+      if ! replication_login_ok; then
+        printf 'replication_auth_failed\n'
+        exit 50
+      fi
+    fi
+    ;;
+  candidate)
+    # Partial earlier run committed the role before the password and marker.
+    # It already has the daemon privilege bits and owns nothing.
+    { printf '%s\n' '\getenv replication_password DBE_REPLICATION_PASSWORD'; printf '%s\n' @ENSURE_REPLICATION_ROLE_SQL@; } | admin_psql -v ON_ERROR_STOP=1
+    changed=true
+    ;;
+  foreign)
+    replication_capture_blocked=true
+    printf 'replication_capture_blocked\n'
+    ;;
+  *)
+    printf 'replication_role_not_owned\n'
+    exit 52
+    ;;
+esac
+if [ "$replication_capture_blocked" != true ]; then
+  confirmed=$(admin_psql -Atq -c @REPLICATION_ROLE_STATE_SQL@)
+  test "$confirmed" = "@REPLICATION_ROLE_STATE@" || { printf 'replication_role_privileges\n'; exit 51; }
+fi
 verify_tenant_auth
 hba_is_hardened
 if test "$changed" = true; then printf 'hardened\n'; else printf 'already_hardened\n'; fi
@@ -879,6 +1088,24 @@ mod tests {
         let script = hardening_script("tenant_user");
 
         assert!(script.contains("local all all scram-sha-256"));
+        assert!(script.contains("local replication dbe_replication scram-sha-256"));
+        assert!(script.contains("replication_scram == 1"));
+        assert!(script.contains("$2 == \"replication\""));
+        assert!(!script.contains("local replication all"));
+        assert!(!script.contains("host replication"));
+        assert!(!script.contains("@REPLICATION"));
+        assert!(!script.contains("@LOCAL_CLIENT"));
+        assert!(!script.contains("@ENSURE_"));
+        assert!(!script.contains("@RESET_REPLICATION"));
+        assert!(script.contains("\\getenv replication_password DBE_REPLICATION_PASSWORD"));
+        assert!(script.contains(" REPLICATION "));
+        assert!(script.contains("NOSUPERUSER"));
+        assert!(script.contains("NOBYPASSRLS"));
+        assert!(script.contains("NOINHERIT"));
+        assert!(script.contains("NOCREATEDB"));
+        assert!(script.contains("NOCREATEROLE"));
+        assert!(script.contains("LOGIN"));
+        assert!(!script.contains("hunter2"));
         assert!(script.contains("DBE_POSTGRES_ADMIN_PASSWORD"));
         assert!(script.contains("DBE_INVALID_PASSWORD"));
         assert!(script.contains("kill -HUP 1"));
@@ -887,6 +1114,62 @@ mod tests {
         assert!(script.contains("admin_available"));
         assert!(script.contains("tenant_available"));
         assert!(script.contains("mv -f \"$hba_tmp\" \"$hba_file\""));
+        assert!(script.contains("case \"$replication_ownership\" in"));
+        assert!(script.contains("dbe-managed-replication-v1"));
+        let probe = script.find("replication_ownership=$(admin_psql").unwrap();
+        let decision = script.find("case \"$replication_ownership\" in").unwrap();
+        let confirmed_probe = script.find("confirmed=$(admin_psql").unwrap();
+        assert!(probe < decision && decision < confirmed_probe);
+
+        let candidate = shell_case_arm(&script, "candidate");
+        let begin = candidate.find("BEGIN;").unwrap();
+        let create = candidate.find("CREATE ROLE").unwrap();
+        let commit = candidate.find("COMMIT;").unwrap();
+        assert!(begin < create && create < commit);
+        assert!(candidate.contains("COMMENT ON ROLE"));
+        assert!(candidate.contains("replication_password"));
+        assert!(candidate.contains("ON_ERROR_STOP=1"));
+        assert!(!candidate.contains("exit "));
+        assert!(!candidate.contains("hunter2"));
+
+        let foreign = shell_case_arm(&script, "foreign");
+        assert!(foreign.contains("replication_capture_blocked=true"));
+        assert!(foreign.contains("printf 'replication_capture_blocked\\n'"));
+        assert!(!foreign.contains("exit "));
+        assert!(!foreign.contains("ALTER"));
+        assert!(!foreign.contains("CREATE ROLE"));
+        assert!(!foreign.contains("COMMENT"));
+
+        let unexpected = shell_case_arm(&script, "*");
+        assert!(unexpected.contains("replication_role_not_owned"));
+        assert!(unexpected.contains("exit 52"));
+        assert!(!unexpected.contains("ALTER"));
+        assert!(!unexpected.contains("CREATE ROLE"));
+        assert!(!unexpected.contains("COMMENT"));
+
+        let skipped = script
+            .find("if [ \"$replication_capture_blocked\" != true ]")
+            .unwrap();
+        let confirmed = script.find("confirmed=$(admin_psql").unwrap();
+        assert!(skipped < confirmed);
+        assert!(foreign_replication_role_diagnostic().contains("rename or drop"));
+
+        let owned = shell_case_arm(&script, "owned");
+        assert!(owned.contains("replication_login_ok"));
+        assert!(owned.contains("replication_auth_failed"));
+        assert!(owned.contains("ALTER ROLE"));
+        assert!(owned.contains("COMMENT ON ROLE"));
+    }
+
+    fn shell_case_arm<'a>(script: &'a str, label: &str) -> &'a str {
+        let marker = format!("\n  {label})");
+        let rest = script
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("missing {label}"))
+            .1;
+        rest.split_once("\n    ;;")
+            .unwrap_or_else(|| panic!("unterminated {label}"))
+            .0
     }
 
     #[test]
@@ -993,6 +1276,10 @@ mod tests {
                     instance_id: "postgres-z".to_string(),
                     reason: "z failure".to_string(),
                 }],
+                replication_capture_blocked: vec![PostgresReplicationCaptureBlock {
+                    instance_id: "postgres-z".to_string(),
+                    reason: "z blocked".to_string(),
+                }],
             },
             PostgresHardeningSummary {
                 checked: 2,
@@ -1003,6 +1290,10 @@ mod tests {
                 failures: vec![PostgresHardeningFailure {
                     instance_id: "postgres-a".to_string(),
                     reason: "a failure".to_string(),
+                }],
+                replication_capture_blocked: vec![PostgresReplicationCaptureBlock {
+                    instance_id: "postgres-a".to_string(),
+                    reason: "a blocked".to_string(),
                 }],
             },
         ]);
@@ -1015,6 +1306,43 @@ mod tests {
         assert_eq!(summary.failures.len(), 2);
         assert_eq!(summary.failures[0].instance_id, "postgres-a");
         assert_eq!(summary.failures[1].instance_id, "postgres-z");
+        assert_eq!(summary.replication_capture_blocked.len(), 2);
+        assert_eq!(
+            summary.replication_capture_blocked[0].instance_id,
+            "postgres-a"
+        );
+        assert_eq!(
+            summary.replication_capture_blocked[1].instance_id,
+            "postgres-z"
+        );
+    }
+
+    #[test]
+    fn foreign_replication_role_keeps_hardening_successful() {
+        match classify_hardening_stdout("replication_capture_blocked\nhardened\n") {
+            HardeningStdout::Completed(outcome) => {
+                assert!(outcome.changed);
+                assert!(outcome.replication_capture_blocked);
+            }
+            other => panic!("expected a completed hardening run, got {other:?}"),
+        }
+        match classify_hardening_stdout("already_hardened\n") {
+            HardeningStdout::Completed(outcome) => {
+                assert!(!outcome.changed);
+                assert!(!outcome.replication_capture_blocked);
+            }
+            other => panic!("expected an unchanged hardening run, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_hardening_stdout("replication_role_not_owned\n"),
+            HardeningStdout::Unexpected
+        ));
+        assert!(matches!(
+            classify_hardening_stdout("replication_capture_blocked\n"),
+            HardeningStdout::Unexpected
+        ));
+        assert!(foreign_replication_role_diagnostic().contains("dbe_replication"));
+        assert!(foreign_replication_role_diagnostic().contains("dbe-managed-replication-v1"));
     }
 
     fn test_metadata(instance_id: &str, username: &str, database: &str) -> InstanceMetadata {

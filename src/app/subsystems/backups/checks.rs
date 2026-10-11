@@ -126,6 +126,16 @@ pub(super) fn check_backup_layout(
     )))
 }
 
+/// Bytes a physical restore extracts into an instance with this disk limit.
+/// Online captures are budgeted to the same figure so every published
+/// capture fits the existing restore path.
+pub(super) fn physical_restore_capacity(disk_mib: u64) -> u64 {
+    mib_to_bytes(disk_mib).clamp(
+        1,
+        crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
+    )
+}
+
 pub(super) fn restore_input_bytes(layout: BackupLayout, stored_bytes: u64, disk_mib: u64) -> u64 {
     match layout {
         BackupLayout::Logical => stored_bytes.max(1),
@@ -139,6 +149,7 @@ pub(super) fn store_error(error: BackupStoreError) -> ApiError {
     match error {
         BackupStoreError::InvalidBackupId => ApiError::BadRequest("invalid backup id".to_string()),
         BackupStoreError::NotFound => ApiError::NotFound,
+        BackupStoreError::UnsupportedFormat(reason) => ApiError::Conflict(reason),
         error => ApiError::Runtime(error.to_string()),
     }
 }

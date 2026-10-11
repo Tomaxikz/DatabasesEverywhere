@@ -205,6 +205,42 @@ pub(crate) async fn restore_bounded_archive(
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: true,
         },
+        None,
+    )
+    .await
+}
+
+/// Engine recipe step run on an extracted archive before it replaces the live
+/// data directory (for example recovery signal files). A failure leaves the
+/// current data untouched.
+pub(crate) trait StagedDataPreparation: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        staged_data: &'a FsPath,
+    ) -> futures::future::BoxFuture<'a, Result<(), ApiError>>;
+}
+
+/// Restores a data directory archive that needs a recipe step before install.
+pub(crate) async fn restore_prepared_archive(
+    state: &AppState,
+    instance_id: &str,
+    paths: InstancePaths,
+    artifact_path: &FsPath,
+    should_be_running: bool,
+    max_extracted_bytes: u64,
+    preparation: &dyn StagedDataPreparation,
+) -> Result<(), ApiError> {
+    restore_archive(
+        state,
+        instance_id,
+        paths,
+        artifact_path,
+        should_be_running,
+        max_extracted_bytes,
+        PhysicalRestorePolicy {
+            recover_current_after_preparation_failure: true,
+        },
+        Some(preparation),
     )
     .await
 }
@@ -225,10 +261,12 @@ pub(crate) async fn rollback_from_archive(
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: false,
         },
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restore_archive(
     state: &AppState,
     instance_id: &str,
@@ -237,6 +275,7 @@ async fn restore_archive(
     should_be_running: bool,
     max_extracted_bytes: u64,
     policy: PhysicalRestorePolicy,
+    preparation: Option<&dyn StagedDataPreparation>,
 ) -> Result<(), ApiError> {
     let metadata = state
         .instances
@@ -261,7 +300,13 @@ async fn restore_archive(
             "the original runtime",
         ));
     }
-    let replacement = match prepare_restore(paths.clone(), artifact_path, max_extracted_bytes).await
+    let replacement = match prepare_restore(
+        paths.clone(),
+        artifact_path,
+        max_extracted_bytes,
+        preparation,
+    )
+    .await
     {
         Ok(replacement) => replacement,
         Err(failure)
@@ -401,6 +446,7 @@ async fn prepare_restore(
     paths: InstancePaths,
     artifact_path: &FsPath,
     max_extracted_bytes: u64,
+    preparation: Option<&dyn StagedDataPreparation>,
 ) -> Result<PendingDataReplacement, DataReplacementPreparationError> {
     let import_id = uuid::Uuid::new_v4();
     let expected_root = paths
@@ -450,6 +496,12 @@ async fn prepare_restore(
         return Err(DataReplacementPreparationError::safe(ApiError::BadRequest(
             error.to_string(),
         )));
+    }
+    if let Some(preparation) = preparation
+        && let Err(error) = preparation.prepare(&staged_data).await
+    {
+        cleanup_dir(&workspace).await;
+        return Err(DataReplacementPreparationError::safe(error));
     }
 
     if let Err(error) = prepare_private_dir(&backup_dir, "physical import rollback directory").await

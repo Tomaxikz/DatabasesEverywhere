@@ -979,7 +979,7 @@ components:
     BackupInfo:
       type: object
       additionalProperties: false
-      required: [id, instance_id, protocol, layout, size_bytes, modified_at, sha256]
+      required: [id, instance_id, protocol, layout, size_bytes, modified_at, sha256, manifest_schema_version, consistency, restore_recipe]
       properties:
         id: {type: string}
         instance_id: {type: string}
@@ -990,6 +990,16 @@ components:
         size_bytes: {type: integer}
         modified_at: {type: string, format: date-time}
         sha256: {type: string}
+        manifest_schema_version:
+          type: integer
+          description: Backup manifest schema. Schema 1 backups predate recorded restore contracts.
+        consistency:
+          type: [string, "null"]
+          enum: [stopped_copy, transactional_snapshot, physical_recovery_point, per_object, null]
+          description: Recorded consistency guarantee; null for schema 1 backups, which never recorded one.
+        restore_recipe:
+          type: [string, "null"]
+          description: Restore recipe as id@version; null for schema 1 backups.
     CreateDownloadRequest:
       type: object
       additionalProperties: false
@@ -1028,7 +1038,7 @@ components:
     BackupStatusResponse:
       type: object
       additionalProperties: false
-      required: [enabled, interval_minutes, run_on_startup, retention_keep_latest_per_instance, retention_max_age_days, redis_excluded, storage_driver, browsing_enabled]
+      required: [enabled, interval_minutes, run_on_startup, retention_keep_latest_per_instance, retention_max_age_days, redis_excluded, storage_driver, browsing_enabled, dedicated_mode]
       properties:
         enabled: {type: boolean}
         interval_minutes: {type: integer}
@@ -1040,6 +1050,20 @@ components:
           type: string
           enum: [local, s3, kopia]
         browsing_enabled: {type: boolean}
+        dedicated_mode:
+          type: string
+          enum: [online, offline]
+          description: Configured default for dedicated instances. offline (used when the setting is omitted) stops the database for a cold copy; online requires a certified engine-native strategy and fails clearly, without falling back, when none exists. A backup request may override it with mode.
+    UnsupportedBackupInfo:
+      type: object
+      additionalProperties: false
+      required: [id, instance_id, diagnostic]
+      properties:
+        id: {type: string}
+        instance_id: {type: string}
+        diagnostic:
+          type: string
+          description: Why this daemon cannot read the backup, for example a newer manifest schema.
     BackupCatalogColumn:
       type: object
       additionalProperties: false
@@ -2889,6 +2913,13 @@ paths:
           required: true
           schema:
             type: string
+        - name: mode
+          in: query
+          required: false
+          description: Overrides backups.dedicated_mode for this dedicated backup. online returns 409 when the engine, version or storage layout has no certified online strategy and never falls back to stopping the database; offline stops the database for a cold copy. Ignored for shared tenants.
+          schema:
+            type: string
+            enum: [online, offline]
       responses:
         default:
           $ref: "#/components/responses/ApiError"
@@ -2898,6 +2929,28 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BackupInfo"
+  /api/instances/{instance_id}/unsupported-backups:
+    get:
+      summary: List backups of one instance that this daemon cannot read.
+      description: Backups written in a format this daemon does not understand, such as a newer manifest schema. They are never restored or removed by retention; upgrade the daemon to use them, or remove one explicitly with DELETE /api/instances/{instance_id}/backups/{backup_id}.
+      x-required-scope: backups:read
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          $ref: "#/components/responses/ApiError"
+        "200":
+          description: Unsupported backup entries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UnsupportedBackupInfo"
   /api/admin/backups/status:
     get:
       summary: Get automatic backup configuration status.
@@ -2927,6 +2980,7 @@ paths:
   /api/instances/{instance_id}/backups/{backup_id}:
     delete:
       summary: Delete one backup belonging to an instance.
+      description: Also removes a backup listed under unsupported-backups; that is the only way such a backup is deleted.
       x-required-scope: backups:write
       parameters:
         - name: instance_id
