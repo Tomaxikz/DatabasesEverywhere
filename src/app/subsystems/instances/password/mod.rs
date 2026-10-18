@@ -210,7 +210,7 @@ async fn reset_instance_password_inner(
     ensure_qdrant_route_is_available(&state, &metadata, &new_password).await?;
 
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     // Existing instances must keep using the bind source recorded in durable
     // metadata. In particular, RESP ACL files must be read and replaced
     // through a live FuseQuota mount rather than by mutating its raw backing
@@ -220,7 +220,7 @@ async fn reset_instance_password_inner(
             .for_persisted_method(&metadata.limits.disk_enforcement_method);
     let credential_data_path = disk_limiter
         .container_data_path(&paths.data)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let previous = capture_previous_credential(&state, &metadata, &credential_data_path).await?;
     if !requires_container_recreation(metadata.protocol, &previous) {
         attest_password_reset_target(&state, &metadata).await?;
@@ -254,13 +254,13 @@ async fn reset_instance_password_inner(
     disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let container_data_path = disk_limiter
         .container_data_path(&paths.data)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let container_user = prepare_instance_container_user(&state.docker, &paths, metadata.protocol)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
 
     let new_spec_password = spec_password(metadata.protocol, &new_password, &previous, false)?;
     let old_spec_password = spec_password(metadata.protocol, &new_password, &previous, true)?;
@@ -534,7 +534,7 @@ async fn capture_previous_credential(
                 read_bounded_private_file(&path, MAX_ACL_FILE_BYTES)
             })
             .await
-            .map_err(|error| ApiError::Runtime(format!("failed to read current ACL: {error}")))?
+            .map_err(ApiError::runtime_context("failed to read current ACL"))?
             .map_err(|error| {
                 ApiError::Conflict(format!(
                     "the current database ACL cannot be captured for rollback: {error}"
@@ -588,7 +588,7 @@ async fn reset_password(
         paths
             .restore_data_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
     }
 
     let no_progress = |_event| {};
@@ -624,11 +624,9 @@ async fn attest_password_reset_target(
         true,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "database compatibility probe failed before password rotation: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "database compatibility probe failed before password rotation",
+    ))?;
     if outcome.compatible {
         Ok(())
     } else {

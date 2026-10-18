@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use procfs::process::MountInfo as ProcMountInfo;
+
 use super::DiskLimitError;
 use crate::io::cgroup::unescape_mountinfo;
 
 const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
-const MOUNTPOINT_FIELD: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountInfo {
@@ -21,8 +22,8 @@ pub(super) fn find_mount(path: &Path) -> Result<MountInfo, DiskLimitError> {
             path: path.display().to_string(),
             source,
         })?;
-    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).map_err(DiskLimitError::Io)?;
-    find_mount_in(&path, &mountinfo).ok_or(DiskLimitError::MountpointNotFound(path))
+    let mounts = read_mountinfo()?;
+    find_mount_in(&path, &mounts).ok_or(DiskLimitError::MountpointNotFound(path))
 }
 
 pub(super) fn is_mountpoint(path: &Path) -> Result<bool, DiskLimitError> {
@@ -39,25 +40,35 @@ pub(super) fn is_mountpoint(path: &Path) -> Result<bool, DiskLimitError> {
         .components()
         .filter(|component| !matches!(component, std::path::Component::CurDir))
         .collect::<PathBuf>();
+    let mounts = read_mountinfo()?;
+    Ok(is_mountpoint_in(&path, &mounts))
+}
+
+fn read_mountinfo() -> Result<Vec<ProcMountInfo>, DiskLimitError> {
     let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).map_err(DiskLimitError::Io)?;
-    Ok(is_mountpoint_in(&path, &mountinfo))
+    Ok(parse_mountinfo(&mountinfo))
 }
 
-fn is_mountpoint_in(path: &Path, mountinfo: &str) -> bool {
-    mountinfo.lines().any(|line| {
-        let Some((before_separator, _)) = line.split_once(" - ") else {
-            return false;
-        };
-        before_separator
-            .split_whitespace()
-            .nth(MOUNTPOINT_FIELD)
-            .is_some_and(|mountpoint| Path::new(&unescape_mountinfo(mountpoint)) == path)
-    })
+/// Parses each line on its own so one malformed entry is skipped instead of
+/// hiding every other mount.
+fn parse_mountinfo(mountinfo: &str) -> Vec<ProcMountInfo> {
+    mountinfo
+        .lines()
+        .filter_map(|line| ProcMountInfo::from_line(line).ok())
+        .collect()
 }
 
-fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
+fn mountpoint_path(mount: &ProcMountInfo) -> PathBuf {
+    PathBuf::from(unescape_mountinfo(&mount.mount_point.to_string_lossy()))
+}
+
+fn is_mountpoint_in(path: &Path, mounts: &[ProcMountInfo]) -> bool {
+    mounts.iter().any(|mount| mountpoint_path(mount) == path)
+}
+
+fn find_mount_in(path: &Path, mounts: &[ProcMountInfo]) -> Option<MountInfo> {
     let mut best: Option<MountInfo> = None;
-    for mount in mountinfo.lines().filter_map(parse_mountinfo_line) {
+    for mount in mounts.iter().map(mount_info) {
         let is_more_specific = best.as_ref().is_none_or(|current| {
             mount.mountpoint.as_os_str().len() > current.mountpoint.as_os_str().len()
         });
@@ -68,25 +79,27 @@ fn find_mount_in(path: &Path, mountinfo: &str) -> Option<MountInfo> {
     best
 }
 
-fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
-    let (before_separator, after_separator) = line.split_once(" - ")?;
-    let mountpoint = before_separator.split_whitespace().nth(MOUNTPOINT_FIELD)?;
-    let mut filesystem_fields = after_separator.split_whitespace();
-    let fstype = filesystem_fields.next()?;
-    let source = filesystem_fields.next().unwrap_or("-").to_string();
-    let options = filesystem_fields
-        .next()
-        .unwrap_or_default()
-        .split(',')
-        .filter(|option| !option.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    Some(MountInfo {
-        mountpoint: PathBuf::from(unescape_mountinfo(mountpoint)),
-        fstype: fstype.to_string(),
-        source,
+fn mount_info(mount: &ProcMountInfo) -> MountInfo {
+    // procfs keeps super options in a map, so sort them for a stable order.
+    let mut options = mount
+        .super_options
+        .iter()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| match value {
+            Some(value) => format!("{name}={value}"),
+            None => name.clone(),
+        })
+        .collect::<Vec<_>>();
+    options.sort();
+    MountInfo {
+        mountpoint: mountpoint_path(mount),
+        fstype: mount.fs_type.clone(),
+        source: mount
+            .mount_source
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
         options,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +115,7 @@ mod tests {
 
         let mount = find_mount_in(
             Path::new("/var/lib/databases-everywhere/instances/inst_1"),
-            mountinfo,
+            &parse_mountinfo(mountinfo),
         )
         .unwrap();
 
@@ -120,11 +133,15 @@ mod tests {
 1 0 0:1 / / rw,relatime - ext4 /dev/vda3 rw,relatime,prjquota,errors=remount-ro
 ";
 
-        let mount = find_mount_in(Path::new("/var/lib/databases-everywhere"), mountinfo).unwrap();
+        let mount = find_mount_in(
+            Path::new("/var/lib/databases-everywhere"),
+            &parse_mountinfo(mountinfo),
+        )
+        .unwrap();
 
         assert_eq!(
             mount.options,
-            vec!["rw", "relatime", "prjquota", "errors=remount-ro"]
+            vec!["errors=remount-ro", "prjquota", "relatime", "rw"]
         );
     }
 
@@ -137,11 +154,11 @@ mod tests {
 
         assert!(is_mountpoint_in(
             Path::new("/var/lib/dbev/fuse/instances/db one"),
-            mountinfo
+            &parse_mountinfo(mountinfo)
         ));
         assert!(!is_mountpoint_in(
             Path::new("/var/lib/dbev/fuse/instances/db one/data"),
-            mountinfo
+            &parse_mountinfo(mountinfo)
         ));
     }
 }

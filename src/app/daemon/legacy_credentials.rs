@@ -125,7 +125,7 @@ mod tests {
         let mut metadata = crate::server::test_support::metadata("legacy", Protocol::Qdrant);
         assert!(!matches_saved_verifier(&metadata, "secret", b"daemon"));
         for fingerprint in [
-            crate::utils::hex::encode_lower(&Sha256::digest(b"secret")),
+            hex::encode(Sha256::digest(b"secret")),
             crate::gateway::protocols::qdrant::route_key_fingerprint(b"daemon", "secret"),
         ] {
             metadata.route_key_sha256 = Some(fingerprint);

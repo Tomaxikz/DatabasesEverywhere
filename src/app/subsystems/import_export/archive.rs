@@ -157,7 +157,7 @@ pub(super) async fn extract_tar_archive(
         },
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to extract tar archive: {error}")))?
+    .map_err(ApiError::runtime_context("failed to extract tar archive"))?
     .map_err(|error| ApiError::BadRequest(format!("failed to extract tar archive: {error}")))
 }
 
@@ -209,7 +209,7 @@ pub(super) async fn extract_zip_archive(
         },
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to extract zip archive: {error}")))?
+    .map_err(ApiError::runtime_context("failed to extract zip archive"))?
     .map_err(|error| ApiError::BadRequest(format!("failed to extract zip archive: {error}")))
 }
 
@@ -331,9 +331,9 @@ pub(super) async fn install_selected_dump(
     let candidate =
         tokio::task::spawn_blocking(move || find_dump_candidate(protocol, &staging_dir))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("failed to inspect archive contents: {error}"))
-            })?
+            .map_err(ApiError::runtime_context(
+                "failed to inspect archive contents",
+            ))?
             .map_err(ApiError::BadRequest)?;
     move_or_copy_file(&candidate, host_temp).await
 }
@@ -369,18 +369,33 @@ pub(super) fn find_dump_candidate(protocol: Protocol, root: &FsPath) -> Result<P
     ))
 }
 
+/// Regular files below `dir`, bounded like extraction itself: at most
+/// `MAX_ARCHIVE_ENTRIES` entries and `MAX_ARCHIVE_DEPTH` levels. Links are
+/// never followed.
 pub(super) fn collect_regular_files(
     dir: &FsPath,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), std::io::Error> {
-    for entry in std::fs::read_dir(dir)? {
+    let invalid = |reason: String| std::io::Error::new(std::io::ErrorKind::InvalidData, reason);
+    for (index, entry) in walkdir::WalkDir::new(dir)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            return Err(invalid(format!(
+                "archive has more than {MAX_ARCHIVE_ENTRIES} entries"
+            )));
+        }
         let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_regular_files(&path, files)?;
-        } else if metadata.is_file() {
-            files.push(path);
+        if entry.depth() > MAX_ARCHIVE_DEPTH {
+            return Err(invalid(format!(
+                "archive path depth exceeds {MAX_ARCHIVE_DEPTH}"
+            )));
+        }
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
         }
     }
     Ok(())

@@ -21,7 +21,7 @@ pub async fn metrics(
         .import_export_jobs
         .count_by_status()
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let mut out = String::new();
     out.push_str("# HELP dbe_instances_total Managed instances by protocol and status\n");
     out.push_str("# TYPE dbe_instances_total gauge\n");

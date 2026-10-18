@@ -70,11 +70,9 @@ pub(in super::super) async fn resize(
         drain_tenant_sessions(state, &metadata.instance_id).await?;
         tenant::fence(&state.docker, &previous_runtime, target(&metadata))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to fence the shared tenant before changing its disk boundary: {error}"
-                ))
-            })?;
+            .map_err(ApiError::runtime_context(
+                "failed to fence the shared tenant before changing its disk boundary",
+            ))?;
         if disk_shrinks {
             let used_bytes = match measure_resize_usage(
                 state,
@@ -243,7 +241,7 @@ pub(in super::super) async fn resize(
             .map_err(ApiError::Runtime)?;
         tenant::set_quota(&state.docker, &runtime, target(&metadata), &requested)
             .await
-            .map_err(|error| ApiError::Runtime(format!("tenant quota update failed: {error}")))?;
+            .map_err(ApiError::runtime_context("tenant quota update failed"))?;
         Ok::<_, ApiError>(())
     }
     .await;

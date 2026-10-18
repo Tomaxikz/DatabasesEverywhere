@@ -20,8 +20,10 @@
 //! INTERFACE CHANGES
 //! - `RestoreContext` gained `restore_target` (read-only for strategies).
 //! - `verify` receives the registrar so native verifiers can run in helpers.
-//! - Registration: `registry.rs` expects the PostgreSQL strategy's `id()` to
-//!   be `registry::POSTGRES_BASE_BACKUP` (`postgres.pg_basebackup`).
+//! - Registration: `registry.rs` maps each `OnlineBackup` variant to the
+//!   strategy whose `id()` is the matching `registry` constant.
+//! - `BackupHelperSpec::data` mounts the instance data directory read-only
+//!   for tools that copy live files next to a server session.
 
 use std::{
     collections::BTreeMap,
@@ -35,10 +37,13 @@ use crate::{
     routes::http::{response::ApiError, router::AppState},
     runtime::docker::{BackupHelperError, BackupHelperSpec, CommandOutput},
     server::{
-        backup::manifest::{ConsistencyLevel, RecoveryCoordinates, RestoreRecipeRef},
+        backup::manifest::{
+            ConsistencyLevel, RecoveryCoordinates, RestoreRecipeRef, is_safe_relative,
+        },
         metadata::InstanceMetadata,
         paths::InstancePaths,
     },
+    utils::shell::sh_quote,
 };
 
 /// Prefix of every server-side or host-side resource name a backup job may
@@ -60,6 +65,73 @@ impl StrategyError {
     pub(crate) fn failed(context: &str, error: impl std::fmt::Display) -> Self {
         Self::Failed(format!("{context}: {error}"))
     }
+
+    /// Names the native tool in a failure; `Unsupported` stays as it is.
+    pub(crate) fn for_tool(self, tool: &str) -> Self {
+        match self {
+            Self::Failed(reason) => Self::Failed(format!("{tool}: {reason}")),
+            unsupported => unsupported,
+        }
+    }
+}
+
+/// `set -eu` plus the quoted argv. Secrets travel only in the environment.
+pub(crate) fn exec_script(argv: &[String]) -> String {
+    let argv = argv
+        .iter()
+        .map(|arg| sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("set -eu\numask 077\nexec {argv}\n")
+}
+
+/// Runs short, bounded file work off the async runtime and joins it.
+pub(crate) async fn blocking<T: Send + 'static>(
+    context: &str,
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, StrategyError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| StrategyError::failed(context, error))?
+        .map_err(|error| StrategyError::Failed(format!("{context}: {error}")))
+}
+
+/// Fails unless `path` is a plain relative path inside staging.
+pub(crate) fn require_relative(path: &Path, what: &str) -> Result<(), StrategyError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| StrategyError::Failed(format!("{what} is not utf-8")))?;
+    if is_safe_relative(text) {
+        Ok(())
+    } else {
+        Err(StrategyError::Failed(format!(
+            "{what} is not a safe relative path"
+        )))
+    }
+}
+
+/// Refuses staging that overlaps the instance data or socket directories.
+pub(crate) fn refuse_overlapping_staging(
+    paths: &InstancePaths,
+    staging: &StagingArea,
+) -> Result<(), StrategyError> {
+    for (source, what) in [
+        (&paths.sockets, "the instance socket mount"),
+        (&paths.data, "the instance data directory"),
+    ] {
+        if overlaps(source, &staging.root).map_err(StrategyError::Failed)? {
+            return Err(StrategyError::Failed(format!("staging overlaps {what}")));
+        }
+    }
+    Ok(())
+}
+
+fn overlaps(left: &Path, right: &Path) -> Result<bool, String> {
+    let left = std::fs::canonicalize(left)
+        .map_err(|error| format!("canonicalize {}: {error}", left.display()))?;
+    let right = std::fs::canonicalize(right)
+        .map_err(|error| format!("canonicalize {}: {error}", right.display()))?;
+    Ok(left.starts_with(&right) || right.starts_with(&left))
 }
 
 impl From<StrategyError> for ApiError {
@@ -299,6 +371,37 @@ pub(crate) struct RestoreContext<'a> {
     pub restore_target: &'a Path,
 }
 
+impl RestoreContext<'_> {
+    /// Refuses any recipe but `id@version` before the extracted tree is
+    /// touched.
+    pub(crate) fn require_recipe(&self, id: &str, version: u32) -> Result<(), StrategyError> {
+        if self.recipe.id != id || self.recipe.version != version {
+            return Err(StrategyError::Unsupported(format!(
+                "recipe {}@{} is not {id}@{version}",
+                self.recipe.id, self.recipe.version
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Reads a helper's report from staging and removes it, so staging holds only
+/// the capture afterwards. Helper stdout is redacted and truncated; reports
+/// must be neither.
+pub(crate) async fn take_report(path: PathBuf, max_bytes: u64) -> Result<String, StrategyError> {
+    blocking("read helper report", move || {
+        let read = crate::io::files::read_bounded_private_file(&path, max_bytes);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove the report: {error}")),
+        }
+        String::from_utf8(read.map_err(|error| error.to_string())?)
+            .map_err(|_| "the report is not UTF-8".to_string())
+    })
+    .await
+}
+
 pub(crate) trait OnlineBackupStrategy: Send + Sync {
     /// Stable strategy id recorded in manifests, e.g. `postgres.pg_basebackup`.
     fn id(&self) -> &'static str;
@@ -339,12 +442,22 @@ pub(crate) trait OnlineBackupStrategy: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<VerificationCheck>, StrategyError>>;
 
     /// Removes one resource previously registered by this strategy. Must be
-    /// idempotent and must touch only the named resource.
+    /// idempotent and must touch only the named resource. Default: the
+    /// strategy owns only helper containers, which the coordinator removes
+    /// itself, so anything else is refused.
     fn cleanup_owned<'a>(
         &'a self,
-        ctx: &'a CleanupContext<'a>,
+        _ctx: &'a CleanupContext<'a>,
         resource: &'a OwnedResource,
-    ) -> BoxFuture<'a, Result<(), StrategyError>>;
+    ) -> BoxFuture<'a, Result<(), StrategyError>> {
+        Box::pin(async move {
+            Err(StrategyError::Failed(format!(
+                "refusing to clean {} {}; this strategy owns only helper containers",
+                resource.kind.as_str(),
+                resource.name
+            )))
+        })
+    }
 
     /// Turns an extracted capture into a data tree the runtime can start from
     /// (e.g. recovery signal files, ownership). Default: not restorable.

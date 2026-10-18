@@ -2,8 +2,8 @@ use super::super::migration_error;
 use super::copy::{admit_logical_copy, copy_logical_data, validate_target};
 use super::recovery::{retire_dedicated_source, retire_shared_source};
 use super::support::{
-    clear_caches, dedicated_target_request, remove_artifact_root, runtime_error, target_request,
-    temp_instance_id, temporary_password, tenant_target,
+    clear_caches, dedicated_target_request, remove_artifact_root, target_request, temp_instance_id,
+    temporary_password, tenant_target,
 };
 use super::{advance, advance_to};
 use crate::routes::http::response::ApiError;
@@ -36,7 +36,7 @@ pub(super) async fn run_dedicated_to_shared(
         .placements
         .get(source.runtime_id())
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| ApiError::Conflict("source runtime disappeared during preflight".into()))?;
     let password = source
         .tenant_password
@@ -90,9 +90,9 @@ pub(super) async fn run_dedicated_to_shared(
         tenant_limits.disk_mib,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!("target tenant storage preparation failed: {error}"))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "target tenant storage preparation failed",
+    ))?;
     tenant::create(
         &state.docker,
         &target_runtime,
@@ -101,7 +101,7 @@ pub(super) async fn run_dedicated_to_shared(
         &tenant_limits,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("target tenant creation failed: {error}")))?;
+    .map_err(ApiError::runtime_context("target tenant creation failed"))?;
     let disk = tenant::disk::set_limit(
         &state.config,
         &state.docker,
@@ -110,14 +110,14 @@ pub(super) async fn run_dedicated_to_shared(
         tenant_limits.disk_mib,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("target tenant disk limit failed: {error}")))?;
+    .map_err(ApiError::runtime_context("target tenant disk limit failed"))?;
     tenant_limits.disk_enforced = disk.enforced;
     tenant_limits.disk_enforcement_method = disk.method;
     state
         .placements
         .mark_provisioned(&temp_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     migration = advance(
         state,
         migration,
@@ -179,7 +179,9 @@ pub(super) async fn run_dedicated_to_shared(
         password,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("target credential adoption failed: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "target credential adoption failed",
+    ))?;
     tenant::verify_password(
         &state.docker,
         &target_runtime,
@@ -187,9 +189,9 @@ pub(super) async fn run_dedicated_to_shared(
         password,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!("target credential verification failed: {error}"))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "target credential verification failed",
+    ))?;
 
     let mut final_metadata = provisional;
     final_metadata.instance_id.clone_from(&source.instance_id);
@@ -223,7 +225,9 @@ pub(super) async fn run_dedicated_to_shared(
         password,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("cutover target verification failed: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "cutover target verification failed",
+    ))?;
     state.instances.upsert(final_metadata).await;
     clear_caches(state, &source.instance_id).await;
     migration = advance_to(state, migration, MigrationStage::VerifyingCutover).await?;
@@ -280,7 +284,7 @@ async fn save_runtime_without_admin_secret(
         .placements
         .save(&runtime_record)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     Ok(())
 }
 
@@ -295,7 +299,7 @@ pub(super) async fn run_shared_to_dedicated(
         .placements
         .get(source.runtime_id())
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| ApiError::Conflict("source runtime disappeared during preflight".into()))?;
     let _source_runtime_operation = state.instance_locks.lock(&source_runtime.runtime_id).await;
     let password = source
@@ -333,7 +337,7 @@ pub(super) async fn run_shared_to_dedicated(
         .manager
         .stage_dedicated_admin_secrets(&target.metadata)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     let mut target_runtime = target.runtime();
     save_runtime_without_admin_secret(state, &target_runtime).await?;
     // The provisional engine row is the durable node-capacity commit. Release
@@ -371,12 +375,12 @@ pub(super) async fn run_shared_to_dedicated(
     // DBE's private export connection; the gateway route remains fenced.
     tenant::fence(&state.docker, &source_runtime, tenant_target(&source))
         .await
-        .map_err(|error| ApiError::Runtime(format!("source tenant fence failed: {error}")))?;
+        .map_err(ApiError::runtime_context("source tenant fence failed"))?;
     tenant::unfence(&state.docker, &source_runtime, tenant_target(&source))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("source tenant export enable failed: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "source tenant export enable failed",
+        ))?;
     migration = advance(
         state,
         migration,
@@ -422,9 +426,9 @@ pub(super) async fn run_shared_to_dedicated(
         password,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!("target credential verification failed: {error}"))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "target credential verification failed",
+    ))?;
 
     migration = advance_to(state, migration, MigrationStage::CutoverPending).await?;
     let source_reservation_id = temp_instance_id(&migration.migration_id)?;
@@ -447,7 +451,9 @@ pub(super) async fn run_shared_to_dedicated(
         password,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("cutover target verification failed: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "cutover target verification failed",
+    ))?;
     state.instances.upsert(final_metadata).await;
     clear_caches(state, &source.instance_id).await;
     migration = advance_to(state, migration, MigrationStage::VerifyingCutover).await?;

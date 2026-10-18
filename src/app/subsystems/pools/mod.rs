@@ -18,7 +18,7 @@ pub(crate) async fn load(state: &AppState, runtime_id: &str) -> Result<EngineRun
         .placements
         .get(runtime_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .filter(|pool| pool.deployment_mode == DeploymentMode::Shared)
         .ok_or(ApiError::NotFound)
 }
@@ -33,7 +33,7 @@ pub(crate) async fn tenants(
         .placements
         .reservations(&pool.runtime_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let mut tenants = Vec::with_capacity(reservations.len());
     for reservation in reservations {
         let id = &reservation.instance_id;
@@ -85,7 +85,7 @@ async fn lookup_published_tenant(
         .placements
         .get_orphan(id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     if state.install_progress.is_creating(id)
         || orphan
             .as_ref()
@@ -103,7 +103,7 @@ async fn lookup_published_tenant(
         .manager
         .get_persisted(id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     if stored.is_none() || state.install_progress.is_creating(id) {
         return Ok(TenantLookup::Skip);
     }
@@ -134,7 +134,7 @@ async fn reservation_has_changed(
         .placements
         .get_reservation(&reservation.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     Ok(current
         .as_ref()
         .is_none_or(|current| current != reservation))

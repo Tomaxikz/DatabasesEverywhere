@@ -1,7 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
-use crate::utils::hex::nibble;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickhouseRoute {
     pub username: String,
@@ -92,44 +90,92 @@ pub fn native_hello_with_database(
     Ok(rewritten)
 }
 
-pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, ClickhouseParseError> {
-    let header_end = find_header_end(bytes).ok_or(ClickhouseParseError::IncompleteHttpRequest)?;
-    let headers = std::str::from_utf8(&bytes[..header_end])
+/// A strictly framed HTTP/1 request head. Every line ends in CRLF and is
+/// parsed by `httparse`, so the gateway sees exactly the header lines the
+/// backend will see.
+struct HttpHead<'a> {
+    method: &'a str,
+    target: &'a str,
+    minor_version: u8,
+    headers: Vec<(&'a str, &'a str)>,
+    /// Offset of the first body byte.
+    body_start: usize,
+}
+
+const MAX_HTTP_HEADERS: usize = 100;
+
+fn parse_http_head(bytes: &[u8]) -> Result<HttpHead<'_>, ClickhouseParseError> {
+    let header_end = find_header_end(bytes);
+    reject_bare_line_breaks(&bytes[..header_end.unwrap_or(bytes.len())])?;
+    let header_end = header_end.ok_or(ClickhouseParseError::IncompleteHttpRequest)?;
+    std::str::from_utf8(&bytes[..header_end])
         .map_err(|_| ClickhouseParseError::InvalidHttpRequest)?;
-    let mut lines = headers.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
-    let target = request_parts
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+
+    let mut storage = [httparse::EMPTY_HEADER; MAX_HTTP_HEADERS];
+    let mut request = httparse::Request::new(&mut storage);
+    match request.parse(bytes) {
+        Ok(httparse::Status::Complete(parsed)) if parsed == header_end => {}
+        _ => return Err(ClickhouseParseError::InvalidHttpRequest),
+    }
+    let (Some(method), Some(target), Some(minor_version)) =
+        (request.method, request.path, request.version)
+    else {
+        return Err(ClickhouseParseError::InvalidHttpRequest);
+    };
     if method.is_empty() || target.is_empty() {
         return Err(ClickhouseParseError::InvalidHttpRequest);
     }
+    let headers = request
+        .headers
+        .iter()
+        .map(|header| {
+            std::str::from_utf8(header.value)
+                .map(|value| (header.name, value))
+                .map_err(|_| ClickhouseParseError::InvalidHttpRequest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HttpHead {
+        method,
+        target,
+        minor_version,
+        headers,
+        body_start: header_end,
+    })
+}
 
+/// Refuses a CR or LF that is not part of a CRLF pair. A bare LF would end a
+/// header line for a lenient backend while hiding the next header from a
+/// CRLF-only reader, which could smuggle a database or user override past the
+/// gateway. A trailing CR may still be followed by its LF in a later read.
+fn reject_bare_line_breaks(head: &[u8]) -> Result<(), ClickhouseParseError> {
+    for (index, byte) in head.iter().enumerate() {
+        let bare = match byte {
+            b'\n' => index == 0 || head[index - 1] != b'\r',
+            b'\r' => head.get(index + 1).is_some_and(|next| *next != b'\n'),
+            _ => false,
+        };
+        if bare {
+            return Err(ClickhouseParseError::InvalidHttpRequest);
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_http_initial_route(bytes: &[u8]) -> Result<ClickhouseHttpRoute, ClickhouseParseError> {
+    let head = parse_http_head(bytes)?;
     let mut username = None;
     let mut database = None;
-    if let Some((_, query)) = target.split_once('?') {
-        for pair in query.split('&') {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = percent_decode(key);
+    if let Some((_, query)) = head.target.split_once('?') {
+        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             if key.eq_ignore_ascii_case("user") {
-                merge_route_field(&mut username, percent_decode(value))?;
+                merge_route_field(&mut username, value.into_owned())?;
             } else if key.eq_ignore_ascii_case("database") {
-                merge_route_field(&mut database, percent_decode(value))?;
+                merge_route_field(&mut database, value.into_owned())?;
             }
         }
     }
 
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
+    for (name, value) in &head.headers {
         let value = value.trim();
         if name.eq_ignore_ascii_case("x-clickhouse-user") {
             merge_route_field(&mut username, value.to_string())?;
@@ -155,37 +201,19 @@ pub fn http_request_for_gateway(
     database: &str,
 ) -> Result<Vec<u8>, ClickhouseParseError> {
     parse_http_initial_route(bytes)?;
-    if database.is_empty() {
+    if database.is_empty() || database.chars().any(char::is_control) {
         return Err(ClickhouseParseError::InvalidHttpRequest);
     }
-    let header_end = find_header_end(bytes).ok_or(ClickhouseParseError::IncompleteHttpRequest)?;
-    let header_block = std::str::from_utf8(&bytes[..header_end - HTTP_HEADER_TERMINATOR.len()])
-        .map_err(|_| ClickhouseParseError::InvalidHttpRequest)?;
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
-    let mut request_parts = request_line.splitn(3, ' ');
-    let method = request_parts
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
-    let target = request_parts
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
-    let version = request_parts
-        .next()
-        .ok_or(ClickhouseParseError::InvalidHttpRequest)?;
+    let head = parse_http_head(bytes)?;
 
     let mut rewritten = format!(
-        "{method} {} {version}\r\n",
-        target_with_database(target, database)
+        "{} {} HTTP/1.{}\r\n",
+        head.method,
+        target_with_database(head.target, database),
+        head.minor_version
     );
     let mut database_header_seen = false;
-    for line in lines {
-        let Some((name, _)) = line.split_once(':') else {
-            return Err(ClickhouseParseError::InvalidHttpRequest);
-        };
-        let name = name.trim();
+    for (name, value) in &head.headers {
         if name.eq_ignore_ascii_case("x-clickhouse-database") {
             push_database_header(&mut rewritten, database);
             database_header_seen = true;
@@ -196,7 +224,9 @@ pub fn http_request_for_gateway(
             // keep-alive reuse could otherwise authenticate a later request
             // as another shared tenant while retaining the first meter/fence.
         } else {
-            rewritten.push_str(line);
+            rewritten.push_str(name);
+            rewritten.push_str(": ");
+            rewritten.push_str(value);
             rewritten.push_str("\r\n");
         }
     }
@@ -207,7 +237,7 @@ pub fn http_request_for_gateway(
     rewritten.push_str("\r\n");
 
     let mut output = rewritten.into_bytes();
-    output.extend_from_slice(&bytes[header_end..]);
+    output.extend_from_slice(&bytes[head.body_start..]);
     Ok(output)
 }
 
@@ -219,15 +249,22 @@ fn push_database_header(headers: &mut String, database: &str) {
 
 fn target_with_database(target: &str, database: &str) -> String {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut pairs: Vec<&str> = query
+    let mut pairs: Vec<String> = query
         .split('&')
         .filter(|pair| {
             let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
-            !percent_decode(name).eq_ignore_ascii_case("database") && !pair.is_empty()
+            !pair.is_empty()
+                && !form_urlencoded::parse(name.as_bytes())
+                    .next()
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("database"))
         })
+        .map(str::to_string)
         .collect();
-    let database_pair = format!("database={database}");
-    pairs.push(&database_pair);
+    pairs.push(
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("database", database)
+            .finish(),
+    );
     format!("{path}?{}", pairs.join("&"))
 }
 
@@ -277,36 +314,6 @@ fn merge_route_field(
     }
     *current = Some(value);
     Ok(())
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                if let (Some(high), Some(low)) =
-                    (nibble(bytes[index + 1]), nibble(bytes[index + 2]))
-                {
-                    output.push((high << 4) | low);
-                    index += 3;
-                } else {
-                    output.push(bytes[index]);
-                    index += 1;
-                }
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&output).into_owned()
 }
 
 struct NativeReader<'a> {
@@ -484,6 +491,72 @@ mod tests {
         assert_eq!(rewritten.matches("Connection: close\r\n").count(), 1);
         assert!(!rewritten.to_ascii_lowercase().contains("keep-alive"));
         assert!(!rewritten.to_ascii_lowercase().contains("proxy-connection"));
+    }
+
+    #[test]
+    fn bare_line_breaks_cannot_smuggle_route_headers() {
+        for request in [
+            // A bare LF hides the second header from a CRLF-only reader.
+            &b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nX-Note: x\nX-ClickHouse-Database: other\r\n\r\n"[..],
+            b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nX-Note: x\nX-ClickHouse-User: admin\r\n\r\n",
+            // A bare CR is a line break for some servers.
+            b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nX-Note: x\rX-ClickHouse-Database: other\r\n\r\n",
+            // LF-only framing throughout.
+            b"GET /?database=tenant HTTP/1.1\nX-ClickHouse-User: app\nX-ClickHouse-Database: other\n\n\r\n\r\n",
+            // Obsolete line folding continues a header on the next line.
+            b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\n X-ClickHouse-Database: other\r\n\r\n",
+        ] {
+            assert!(
+                matches!(
+                    parse_http_initial_route(request),
+                    Err(ClickhouseParseError::InvalidHttpRequest)
+                ),
+                "{}",
+                String::from_utf8_lossy(request)
+            );
+            assert!(http_request_for_gateway(request, "tenant").is_err());
+        }
+    }
+
+    #[test]
+    fn conflicting_route_headers_are_refused() {
+        for request in [
+            &b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nX-ClickHouse-User: admin\r\n\r\n"[..],
+            b"GET /?user=app HTTP/1.1\r\nX-ClickHouse-User: admin\r\n\r\n",
+            b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nX-ClickHouse-Database: other\r\n\r\n",
+        ] {
+            assert!(matches!(
+                parse_http_initial_route(request),
+                Err(ClickhouseParseError::InvalidHttpRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn every_forwarded_database_value_is_the_gateway_database() {
+        let request = b"POST /?database=tenant&Database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\nx-clickhouse-database: tenant\r\nX-Other: kept\r\n\r\nSELECT 1";
+        let rewritten =
+            String::from_utf8(http_request_for_gateway(request, "tenant").unwrap()).unwrap();
+        let (head, body) = rewritten.split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, "SELECT 1");
+        assert!(head.split("\r\n").all(|line| !line.contains(['\r', '\n'])));
+        assert!(head.starts_with("POST /?database=tenant HTTP/1.1\r\n"));
+        assert_eq!(head.matches("X-ClickHouse-Database: tenant").count(), 1);
+        assert!(head.contains("X-Other: kept"));
+        assert!(http_request_for_gateway(request, "ten\r\nant").is_err());
+    }
+
+    #[test]
+    fn partial_heads_still_wait_for_more_bytes() {
+        for partial in [
+            &b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r"[..],
+            b"GET /?database=tenant HTTP/1.1\r\nX-ClickHouse-User: app\r\n",
+        ] {
+            assert!(matches!(
+                parse_http_initial_route(partial),
+                Err(ClickhouseParseError::IncompleteHttpRequest)
+            ));
+        }
     }
 
     fn write_string(bytes: &mut Vec<u8>, value: &str) {

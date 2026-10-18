@@ -84,7 +84,7 @@ pub(super) async fn restore_backup(
     check_expansion(&stored, extracted_capacity)?;
     let physical_paths = if stored.layout == BackupLayout::Physical {
         let paths = crate::server::paths::InstancePaths::new(&state.config.paths, &instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            .map_err(ApiError::bad_request)?;
         crate::subsystems::import_export::check_restore_layout(&state, &metadata, &paths)?;
         Some(paths)
     } else {

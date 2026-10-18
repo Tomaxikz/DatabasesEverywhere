@@ -43,9 +43,9 @@ pub(super) async fn prepare_mongodb(
         ),
         password: source.password.as_ref().map(ExposeSecret::expose_secret),
     };
-    let config = yaml_serde::to_string(&config).map_err(|error| {
-        ApiError::Runtime(format!("failed to encode mongodb credentials: {error}"))
-    })?;
+    let config = yaml_serde::to_string(&config).map_err(ApiError::runtime_context(
+        "failed to encode mongodb credentials",
+    ))?;
     write_private_file(&work_dir.join("mongodump.yml"), config.as_bytes()).await?;
 
     let mut authentication = String::new();

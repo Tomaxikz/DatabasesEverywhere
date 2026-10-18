@@ -172,10 +172,7 @@ fn shared_restore_body_has_only_read_only_input_and_work_mounts() {
             size_bytes: 512,
             sha256: [7; 32],
         }),
-        environment: vec![DockerEnv {
-            key: "DBE_IMPORT_PASSWORD".to_string(),
-            value: secret,
-        }],
+        environment: vec![DockerEnv::new("DBE_IMPORT_PASSWORD", secret)],
         read_only_work_dir: true,
     };
     let (environment, _) = validate_helper_environment(&spec).unwrap();
@@ -228,10 +225,7 @@ fn helper_output_and_validation_never_expose_environment_secrets() {
         max_output_bytes: 1,
         network: ImportHelperNetwork::Outbound,
         input: None,
-        environment: vec![DockerEnv {
-            key: "PGPASSWORD".to_string(),
-            value: secret,
-        }],
+        environment: vec![DockerEnv::new("PGPASSWORD", secret)],
         read_only_work_dir: false,
     };
     let (_, secrets) = validate_helper_environment(&spec).unwrap();

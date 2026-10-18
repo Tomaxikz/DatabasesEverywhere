@@ -40,7 +40,7 @@ pub(crate) async fn create(
     auth.require_scope(scopes::POOLS_WRITE)?;
     DeploymentMode::Shared
         .check(request.protocol)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     if !state.config.protocol_enabled(request.protocol) {
         return Err(ApiError::BadRequest("protocol is disabled".into()));
     }
@@ -121,7 +121,7 @@ async fn create_pool(state: &AppState, pool: &PoolSpec, runtime_id: &str) -> Res
         .placements
         .server_pool(pool.protocol, &pool.owner)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     if existing_pool.is_some() {
         return Err(ApiError::Conflict(
             "this server already owns a pool for this engine".into(),
@@ -249,7 +249,7 @@ pub(crate) async fn delete(
             .placements
             .tenant_count(&runtime_id)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         if tenant_count != 0 {
             return Err(ApiError::Conflict(
                 "pool is not empty; delete or migrate its databases first".into(),
@@ -261,7 +261,7 @@ pub(crate) async fn delete(
         ))
     })
     .await
-    .map_err(|error| ApiError::Runtime(error.to_string()))?
+    .map_err(ApiError::runtime)?
 }
 
 pub(crate) async fn power(

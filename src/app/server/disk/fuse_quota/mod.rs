@@ -76,7 +76,6 @@ const SOCKET_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const UNMOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EMBEDDED_BINARY: &str = "embedded";
 const SHA256_HEX_LENGTH: usize = 64;
-const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) async fn verify_startup(
     binary: &str,

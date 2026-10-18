@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use backon::{ConstantBuilder, RetryableWithContext};
 use futures::future::BoxFuture;
 
 use super::{
@@ -93,7 +94,7 @@ pub(super) async fn capture_online(
     reservation: &mut Option<DiskCapacityReservation>,
 ) -> Result<ValidatedCapture, ApiError> {
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     // Phase 1 is limited to layouts the existing physical restore accepts.
     crate::subsystems::import_export::check_restore_layout(state, metadata, &paths).map_err(
         |error| {
@@ -253,7 +254,7 @@ impl Job<'_> {
     ) -> Result<ManifestDetails, ApiError> {
         crate::server::backup::prepare_private_dir(&self.staging.root, "online backup staging")
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         // Rootless Podman resolves bind-mount sources as its own account,
         // which must traverse the daemon-owned staging ancestors.
         if let Some(owner) = self.state.docker.rootless_podman_host_owner() {
@@ -264,7 +265,7 @@ impl Job<'_> {
                 owner,
             )
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         }
         self.advance(BackupJobState::Capturing).await?;
         let started_at_unix = now_unix();
@@ -334,7 +335,7 @@ impl Job<'_> {
         details.expanded_bytes = Some(expanded_bytes);
         details
             .validate(BackupLayout::Physical)
-            .map_err(|error| ApiError::Runtime(format!("online backup manifest: {error}")))?;
+            .map_err(ApiError::runtime_context("online backup manifest"))?;
         self.advance(BackupJobState::Validated).await?;
         Ok(details)
     }
@@ -519,22 +520,33 @@ fn hold_until_helpers_removed(
 ) {
     tokio::spawn(async move {
         let _reservation = reservation;
-        let mut pending = helpers;
-        loop {
-            let mut still_pending = Vec::new();
-            for name in pending {
-                if let Err(error) = state.docker.remove_backup_helper(&name).await {
-                    tracing::warn!(helper = name, %error,
-                        "backup helper removal is unconfirmed; its staging reservation stays held");
-                    still_pending.push(name);
+        let remove_pending = |pending: Vec<String>| {
+            let state = &state;
+            async move {
+                let mut still_pending = Vec::new();
+                for name in pending {
+                    if let Err(error) = state.docker.remove_backup_helper(&name).await {
+                        tracing::warn!(helper = name, %error,
+                            "backup helper removal is unconfirmed; its staging reservation stays held");
+                        still_pending.push(name);
+                    }
                 }
+                let removed = if still_pending.is_empty() {
+                    Ok(())
+                } else {
+                    Err(())
+                };
+                (still_pending, removed)
             }
-            if still_pending.is_empty() {
-                return;
-            }
-            pending = still_pending;
-            tokio::time::sleep(HELPER_RETRY_DELAY).await;
-        }
+        };
+        let _ = remove_pending
+            .retry(
+                ConstantBuilder::new()
+                    .with_delay(HELPER_RETRY_DELAY)
+                    .without_max_times(),
+            )
+            .context(helpers)
+            .await;
     });
 }
 
@@ -546,7 +558,7 @@ pub(super) async fn runtime_generation(
         .docker
         .verified_container_identity(metadata.protocol, metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(format!("inspect backup source runtime: {error}")))?
+        .map_err(ApiError::runtime_context("inspect backup source runtime"))?
         .ok_or_else(|| ApiError::Conflict("backup source container does not exist".to_string()))?;
     Ok(format!("{}@{}", identity.id, identity.started_at))
 }
@@ -622,9 +634,7 @@ async fn native_manifest_checksum(
         .filter(|metadata| metadata.is_file())
         .map(|metadata| metadata.len())
         .ok_or_else(|| ApiError::Runtime("native backup manifest is missing".to_string()))?;
-    let sha256 = sha256_file(&path)
-        .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let sha256 = sha256_file(&path).await.map_err(ApiError::runtime)?;
     Ok(vec![FileChecksum {
         path: relative.to_string(),
         size_bytes,
@@ -643,7 +653,7 @@ async fn package_capture(
     let data_root = data_root.to_path_buf();
     let restore_target = PathBuf::from(restore_target);
     let archive = archive.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::routes::http::response::run_blocking("online backup packaging failed", move || {
         let mut packaged =
             StagedDataArchive::create(&root_name, &data_root, &archive, max_archive_bytes)?;
         packaged.append_directory_chain(&restore_target, &data_root)?;
@@ -651,8 +661,6 @@ async fn package_capture(
         packaged.finish()
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("online backup packaging failed: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("online backup packaging failed: {error}")))
 }
 
 /// Re-reads the packaged archive: every entry must sit below the data
@@ -696,8 +704,10 @@ async fn validate_archive_structure(
         Ok((entries, expanded))
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("archive validation task failed: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("online backup archive is invalid: {error}")))?;
+    .map_err(ApiError::runtime_context("archive validation task failed"))?
+    .map_err(ApiError::runtime_context(
+        "online backup archive is invalid",
+    ))?;
     check_restorable(entries, expanded, restore_capacity)?;
     Ok((
         VerificationCheck {
@@ -771,12 +781,8 @@ fn online_details(
 }
 
 pub(super) async fn remove_staging(path: &Path) {
-    match tokio::fs::remove_dir_all(path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "failed to remove online backup staging")
-        }
+    if let Err(error) = crate::io::files::ignore_missing(tokio::fs::remove_dir_all(path).await) {
+        tracing::warn!(path = %path.display(), %error, "failed to remove online backup staging")
     }
 }
 

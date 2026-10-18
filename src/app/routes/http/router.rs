@@ -275,7 +275,7 @@ mod tests {
 
         let (state, _directory) = upload_test_state().await;
         let content = vec![b'x'; 64];
-        let digest = crate::utils::hex::encode_lower(&Sha256::digest(&content));
+        let digest = hex::encode(Sha256::digest(&content));
         let response = build_router(state.clone())
             .oneshot(
                 Request::builder()

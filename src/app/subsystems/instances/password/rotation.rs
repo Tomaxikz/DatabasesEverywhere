@@ -49,7 +49,7 @@ pub(super) async fn reset_password_in_place(
             .paths
             .restore_data_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         activate_resp_acl(
             context.state,
             context.metadata,
@@ -101,7 +101,7 @@ pub(super) async fn activate_resp_acl(
             PASSWORD_EXEC_TIMEOUT,
         )
         .await
-        .map_err(|error| ApiError::Runtime(format!("database ACL reload failed: {error}")))?;
+        .map_err(ApiError::runtime_context("database ACL reload failed"))?;
     Ok(())
 }
 
@@ -177,9 +177,9 @@ pub(super) async fn apply_db_credential(
             PASSWORD_EXEC_TIMEOUT,
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("database password rotation failed: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "database password rotation failed",
+        ))?;
     if needs_postgres_hardening(metadata.protocol, target_password)
         && let Some(password) = target_password
     {
@@ -199,11 +199,9 @@ pub(super) async fn apply_db_credential(
             ExecRecovery::RestartRuntime,
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "PostgreSQL password rotation succeeded, but local authentication hardening failed: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "PostgreSQL password rotation succeeded, but local authentication hardening failed",
+        ))?;
     }
     Ok(())
 }
@@ -237,9 +235,9 @@ pub(super) async fn verify_tenant_credential(
             PASSWORD_EXEC_TIMEOUT,
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("database credential verification failed: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "database credential verification failed",
+        ))?;
     Ok(())
 }
 
@@ -256,7 +254,7 @@ pub(super) async fn write_resp_acl(
     }
     databases::resp::write_acl_file(data_path, username, password)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))
+        .map_err(ApiError::runtime)
 }
 
 pub(super) async fn restore_resp_acl(
@@ -271,7 +269,7 @@ pub(super) async fn restore_resp_acl(
     }
     databases::resp::restore_acl_file(data_path, acl)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))
+        .map_err(ApiError::runtime)
 }
 
 pub(super) async fn capture_maintenance_credential(
@@ -446,7 +444,7 @@ pub(super) async fn capture_mysql_tenant_auth(
         )
     })?;
     databases::mysql::provision::restore_tenant_auth_sql(&metadata.database.username, plugin)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(ApiError::conflict)?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(authentication_string_b64)
         .map_err(|_| {
@@ -556,11 +554,9 @@ async fn confirm_password_enforcement(
     }
     probe_admin_auth(state, metadata, command, maintenance)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "maintenance authentication became unavailable after password-enforcement verification: {error}"
-            ))
-        })
+        .map_err(ApiError::runtime_context(
+            "maintenance authentication became unavailable after password-enforcement verification",
+        ))
 }
 
 async fn probe_admin_auth(

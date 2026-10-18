@@ -170,8 +170,8 @@ pub(super) async fn wipe_logical_target(
     {
         return super::shared_restore::wipe_clickhouse(state, metadata, timeout).await;
     }
-    let credentials = logical_import_env(metadata, database_definition_in_dump)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let credentials =
+        logical_import_env(metadata, database_definition_in_dump).map_err(ApiError::conflict)?;
     let environment = credentials.references();
     let result = match logical_exec_recovery(metadata) {
         ExecRecovery::RestartRuntime => {

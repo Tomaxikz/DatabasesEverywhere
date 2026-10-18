@@ -41,8 +41,7 @@ pub(crate) async fn provision_pool(
     // snapshot.
     let runtime_operation = state.instance_locks.lock(&runtime_id).await;
     let admin_password = generate_admin_password();
-    let paths = InstancePaths::new(&state.config.paths, &runtime_id)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    let paths = InstancePaths::new(&state.config.paths, &runtime_id).map_err(ApiError::runtime)?;
     // Resolve every fallible identity value before creating the pool's
     // filesystem namespace. From create_dirs onward there is no durable row
     // for boot recovery until the initial placement save succeeds.

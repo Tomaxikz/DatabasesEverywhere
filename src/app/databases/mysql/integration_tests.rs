@@ -1,5 +1,4 @@
 use std::{
-    io::Write,
     process::{Command, Output, Stdio},
     thread::sleep,
     time::{Duration, Instant},
@@ -13,7 +12,7 @@ use crate::databases::{
         assert_engine_tenant_rows, run_jdbc_smoke, run_mariadb_cli, start_gateway,
         test_tls_acceptor,
     },
-    test_support::DockerContainer,
+    test_support::{DockerContainer, assert_success, exec_mysql_family_with_input},
 };
 use crate::{
     databases::protocol::Protocol,
@@ -46,7 +45,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     );
 
     let sql = materialize_password(shared_tenant_user_sql(DATABASE, TENANT), TENANT_PASSWORD);
-    let provision = exec_with_input(
+    let provision = exec_mysql_family_with_input(
         &name,
         ROOT_PASSWORD,
         &["mysql", "--protocol=socket", "-uroot"],
@@ -59,7 +58,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
         NEIGHBOR_PASSWORD,
     );
     assert_success(
-        &exec_with_input(
+        &exec_mysql_family_with_input(
             &name,
             ROOT_PASSWORD,
             &["mysql", "--protocol=socket", "-uroot"],
@@ -106,7 +105,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     let mut failing_rotation_sql =
         materialize_password(reset_tenant_password_sql(TENANT), ROTATED_TENANT_PASSWORD);
     failing_rotation_sql.push_str("\nSELECT * FROM `dbev_missing_schema`.`dbev_missing_table`;\n");
-    let failed_rotation = exec_with_input(
+    let failed_rotation = exec_mysql_family_with_input(
         &name,
         ROOT_PASSWORD,
         &["mysql", "--protocol=socket", "-uroot"],
@@ -122,7 +121,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     );
 
     let rollback_sql = materialize_password(reset_tenant_password_sql(TENANT), TENANT_PASSWORD);
-    let rollback = exec_with_input(
+    let rollback = exec_mysql_family_with_input(
         &name,
         ROOT_PASSWORD,
         &["mysql", "--protocol=socket", "-uroot"],
@@ -179,7 +178,7 @@ async fn mysql_supported_version_provisions_routes_and_round_trips_dump() {
     );
     assert_success(&mutate, "tenant table mutation");
 
-    let restore = exec_with_input(
+    let restore = exec_mysql_family_with_input(
         &name,
         TENANT_PASSWORD,
         &["mysql", "--protocol=socket", "-u", TENANT, DATABASE],
@@ -381,30 +380,4 @@ fn query_mysql(name: &str, password: &str, user: &str, database: &str, sql: &str
         .expect("MySQL query output is UTF-8")
         .trim()
         .to_string()
-}
-
-fn exec_with_input(name: &str, password: &str, command: &[&str], input: &[u8]) -> Output {
-    let mut child = Command::new("docker")
-        .args(["exec", "-i", "-e", &format!("MYSQL_PWD={password}"), name])
-        .args(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start MySQL command");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input)
-        .expect("write MySQL input");
-    child.wait_with_output().expect("wait for MySQL command")
-}
-
-fn assert_success(output: &Output, operation: &str) {
-    assert!(
-        output.status.success(),
-        "{operation} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

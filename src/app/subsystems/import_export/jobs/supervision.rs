@@ -14,11 +14,12 @@ use super::super::{
     ExportOptions, ImportOptions, ImportSourceOptions, logical::quarantine_uncertain_import,
     remote::RemoteJobAdmissionPermit, uploads::finish_upload_import_job,
 };
-use super::{capped_retry_delay, close_unclaimed_upload_job, scheduler_capacity_error};
+use super::{close_unclaimed_upload_job, scheduler_capacity_error, storage_retry_backoff};
+use backon::Retryable;
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicU32, Ordering},
 };
 
 use super::{
@@ -32,9 +33,7 @@ const IMPORT_WORKER_QUEUED: u8 = 0;
 const IMPORT_WORKER_RUNNING: u8 = 1;
 const IMPORT_WORKER_FINISHED: u8 = 2;
 const BEGIN_RETRY_BASE_DELAY_MS: u64 = 50;
-const BEGIN_RETRY_MAX_BACKOFF_EXPONENT: u32 = 5;
 const TERMINAL_RETRY_BASE_DELAY_MS: u64 = 100;
-const TERMINAL_RETRY_MAX_BACKOFF_EXPONENT: u32 = 4;
 
 pub(super) fn spawn_export_supervisor(
     state: AppState,
@@ -545,27 +544,28 @@ enum JobBeginOutcome {
 
 async fn begin_import_export_job(state: &AppState, job_id: &str) -> JobBeginOutcome {
     let mut attempt = 0_u32;
-    loop {
+    let started = (|| async move {
         if !state.import_export_jobs.is_accepting() {
-            return close_job_for_shutdown(state, job_id).await;
+            return Ok(false);
         }
-        match state
+        state
             .import_export_jobs
             .update_status(job_id, ImportExportStatus::Running, None, None)
             .await
-        {
-            Ok(()) => return JobBeginOutcome::Running,
-            Err(error) => {
-                attempt = attempt.saturating_add(1);
-                tracing::warn!(%job_id, %error, attempt, "retrying durable running status before import/export execution");
-                tokio::time::sleep(capped_retry_delay(
-                    BEGIN_RETRY_BASE_DELAY_MS,
-                    attempt,
-                    BEGIN_RETRY_MAX_BACKOFF_EXPONENT,
-                ))
-                .await;
-            }
-        }
+            .map(|()| true)
+    })
+    .retry(storage_retry_backoff(BEGIN_RETRY_BASE_DELAY_MS))
+    .notify(|error, _| {
+        attempt = attempt.saturating_add(1);
+        tracing::warn!(%job_id, %error, attempt, "retrying durable running status before import/export execution");
+    })
+    .await;
+    match started {
+        Ok(true) => JobBeginOutcome::Running,
+        Ok(false) => close_job_for_shutdown(state, job_id).await,
+        // Unreachable: the backoff has no attempt limit and every storage
+        // error is retried until shutdown is observed.
+        Err(_) => JobBeginOutcome::Uncertain,
     }
 }
 
@@ -630,30 +630,29 @@ async fn save_terminal_job_status(
     error: Option<String>,
 ) -> bool {
     const SHUTDOWN_ATTEMPTS: u32 = 3;
-    let mut attempt = 0_u32;
-    loop {
-        attempt = attempt.saturating_add(1);
-        match state
+    let attempt = AtomicU32::new(0);
+    let persisted = (|| {
+        attempt.fetch_add(1, Ordering::Relaxed);
+        state
             .import_export_jobs
             .update_status(job_id, status, artifact_path.clone(), error.clone())
-            .await
-        {
-            Ok(()) => return true,
-            Err(storage_error)
-                if state.import_export_jobs.is_accepting() || attempt < SHUTDOWN_ATTEMPTS =>
-            {
-                tracing::warn!(%job_id, %storage_error, attempt, "retrying terminal import/export job persistence");
-                tokio::time::sleep(capped_retry_delay(
-                    TERMINAL_RETRY_BASE_DELAY_MS,
-                    attempt,
-                    TERMINAL_RETRY_MAX_BACKOFF_EXPONENT,
-                ))
-                .await;
-            }
-            Err(storage_error) => {
-                tracing::error!(%job_id, %storage_error, attempt, "import/export operation completed but its terminal status could not be persisted");
-                return false;
-            }
+    })
+    .retry(storage_retry_backoff(TERMINAL_RETRY_BASE_DELAY_MS))
+    .when(|_| {
+        state.import_export_jobs.is_accepting()
+            || attempt.load(Ordering::Relaxed) < SHUTDOWN_ATTEMPTS
+    })
+    .notify(|storage_error, _| {
+        let attempt = attempt.load(Ordering::Relaxed);
+        tracing::warn!(%job_id, %storage_error, attempt, "retrying terminal import/export job persistence");
+    })
+    .await;
+    match persisted {
+        Ok(()) => true,
+        Err(storage_error) => {
+            let attempt = attempt.load(Ordering::Relaxed);
+            tracing::error!(%job_id, %storage_error, attempt, "import/export operation completed but its terminal status could not be persisted");
+            false
         }
     }
 }

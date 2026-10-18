@@ -25,10 +25,57 @@ pub struct DockerInstanceSpec {
     pub command: Vec<String>,
 }
 
+impl DockerInstanceSpec {
+    /// A spec with the managed defaults (1 CPU, 1 GiB memory, 10 GiB disk,
+    /// image user, entrypoint and working directory, no extra mounts, bridges,
+    /// environment or command). Engines override fields with struct update.
+    pub fn with_defaults(
+        instance_id: &str,
+        protocol: Protocol,
+        image: &str,
+        data_path: PathBuf,
+        data_target: &str,
+    ) -> Self {
+        Self {
+            instance_id: instance_id.to_string(),
+            protocol,
+            image: image.to_string(),
+            project_id: None,
+            user: None,
+            working_dir: None,
+            entrypoint: None,
+            cpu_cores: 1.0,
+            memory_mib: 1024,
+            disk_mib: 10240,
+            pids_limit: None,
+            data_path,
+            data_target: data_target.to_string(),
+            extra_mounts: Vec::new(),
+            socket_bridges: Vec::new(),
+            env: Vec::new(),
+            command: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerEnv {
     pub key: String,
     pub value: SecretString,
+}
+
+impl DockerEnv {
+    pub fn new(key: &str, value: SecretString) -> Self {
+        Self {
+            key: key.to_string(),
+            value,
+        }
+    }
+
+    /// A non-secret value; it is still stored redacted like every entry.
+    pub fn plain(key: &str, value: &str) -> Self {
+        Self::new(key, SecretString::from(value.to_string()))
+    }
 }
 
 #[derive(Debug, Clone)]

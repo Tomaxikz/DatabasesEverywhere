@@ -80,7 +80,7 @@ async fn measure_usage(state: &AppState, metadata: &InstanceMetadata) -> Result<
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared runtime: {error}")))?
+        .map_err(ApiError::runtime_context("failed to load shared runtime"))?
         .ok_or_else(|| ApiError::Conflict("shared runtime is missing".to_string()))?;
     if runtime.deployment_mode != DeploymentMode::Shared
         || runtime.protocol != metadata.protocol
@@ -103,11 +103,9 @@ async fn measure_usage(state: &AppState, metadata: &InstanceMetadata) -> Result<
         .map_err(|_| {
             ApiError::Runtime("shared tenant project-quota measurement timed out".to_string())
         })?
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "shared tenant project-quota measurement failed: {error}"
-            ))
-        });
+        .map_err(ApiError::runtime_context(
+            "shared tenant project-quota measurement failed",
+        ));
     }
     let values = tokio::time::timeout(
         MEASURE_TIMEOUT,
@@ -115,9 +113,9 @@ async fn measure_usage(state: &AppState, metadata: &InstanceMetadata) -> Result<
     )
     .await
     .map_err(|_| ApiError::Runtime("shared tenant storage measurement timed out".to_string()))?
-    .map_err(|error| {
-        ApiError::Runtime(format!("shared tenant storage measurement failed: {error}"))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "shared tenant storage measurement failed",
+    ))?;
     values
         .into_iter()
         .next()

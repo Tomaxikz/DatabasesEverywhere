@@ -6,14 +6,12 @@ use crate::{
 
 use super::{
     engine::{Redis, Valkey},
-    instance_spec, online_backup,
+    instance_spec,
 };
 
 impl EngineLifecycle for Redis {
     fn online_backup(&self) -> OnlineBackup {
-        OnlineBackup::Unavailable {
-            reason: online_backup::RESP_ONLINE_BACKUP_UNSUPPORTED,
-        }
+        OnlineBackup::RespRdbSnapshot
     }
 
     fn acl_file_stage(&self) -> Option<&'static str> {
@@ -43,9 +41,7 @@ impl EngineLifecycle for Redis {
 
 impl EngineLifecycle for Valkey {
     fn online_backup(&self) -> OnlineBackup {
-        OnlineBackup::Unavailable {
-            reason: online_backup::RESP_ONLINE_BACKUP_UNSUPPORTED,
-        }
+        OnlineBackup::RespRdbSnapshot
     }
 
     fn acl_file_stage(&self) -> Option<&'static str> {

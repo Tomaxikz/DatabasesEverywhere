@@ -1,8 +1,4 @@
-use super::HASH_READ_BUFFER_BYTES;
 use crate::routes::http::response::ApiError;
-use sha2::Digest;
-use sha2::Sha256;
-use std::io::Read;
 use std::path::Path as FsPath;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -13,7 +9,7 @@ use time::format_description::well_known::Rfc3339;
 pub(super) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
     let metadata = tokio::fs::metadata(&path)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to stat artifact: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to stat artifact"))?;
     if let Some(hash) = cached_sha256(&path, &metadata).await? {
         return Ok(hash);
     }
@@ -23,24 +19,14 @@ pub(super) async fn sha256_file(path: PathBuf) -> Result<String, ApiError> {
         move || sha256_file_blocking(&path)
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to hash artifact: {error}")))?;
+    .map_err(ApiError::runtime_context("failed to hash artifact"))?
+    .map_err(ApiError::runtime_context("failed to hash artifact"))?;
     write_checksum_sidecar(&path, &metadata, &hash).await;
     Ok(hash)
 }
 
 pub(super) fn sha256_file_blocking(path: &FsPath) -> Result<String, std::io::Error> {
-    let mut file = std::fs::File::open(path)?;
-    let mut buffer = [0_u8; HASH_READ_BUFFER_BYTES];
-    let mut hasher = Sha256::new();
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(crate::utils::hex::encode_lower(&hasher.finalize()))
+    crate::utils::hash::sha256_reader(std::fs::File::open(path)?)
 }
 
 pub(super) fn checksum_sidecar_path(path: &FsPath) -> Option<PathBuf> {
@@ -121,12 +107,8 @@ pub(super) async fn remove_checksum_sidecar(path: &FsPath) {
     let Some(sidecar) = checksum_sidecar_path(path) else {
         return;
     };
-    match tokio::fs::remove_file(sidecar).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::debug!(%error, path = %path.display(), "failed to delete checksum sidecar")
-        }
+    if let Err(error) = crate::io::files::ignore_missing(tokio::fs::remove_file(sidecar).await) {
+        tracing::debug!(%error, path = %path.display(), "failed to delete checksum sidecar")
     }
 }
 

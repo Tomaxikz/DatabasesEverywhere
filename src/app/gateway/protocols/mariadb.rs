@@ -3,8 +3,6 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::utils::hex::{encode_lower, nibble};
-
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
@@ -428,7 +426,7 @@ pub fn auth_switch_request(payload: &[u8]) -> Option<BackendHandshake> {
 pub fn native_password_sha1_stage2_hex(password: &str) -> String {
     let stage_1 = Sha1::digest(password.as_bytes());
     let stage_2 = Sha1::digest(stage_1);
-    encode_lower(&stage_2)
+    hex::encode(stage_2)
 }
 
 pub fn native_password_token(password: &str, seed: &[u8]) -> Vec<u8> {
@@ -495,14 +493,22 @@ fn trim_trailing_nuls(bytes: &mut Vec<u8>) {
 }
 
 pub fn new_gateway_auth_seed() -> [u8; GATEWAY_AUTH_SEED_LEN] {
-    let left = uuid::Uuid::new_v4();
-    let right = uuid::Uuid::new_v4();
-    let mut random = [0_u8; GATEWAY_AUTH_SEED_LEN];
-    random[..16].copy_from_slice(left.as_bytes());
-    random[16..].copy_from_slice(&right.as_bytes()[..4]);
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    // Largest multiple of the alphabet length that fits in a byte; bytes at or
+    // above it are discarded so every alphabet character is equally likely.
+    let limit = 256 - 256 % AUTH_SEED_ALPHABET.len();
     let mut seed = [0_u8; GATEWAY_AUTH_SEED_LEN];
-    for (output, input) in seed.iter_mut().zip(random) {
-        *output = AUTH_SEED_ALPHABET[usize::from(input) % AUTH_SEED_ALPHABET.len()];
+    let mut filled = 0;
+    while filled < seed.len() {
+        let mut random = [0_u8; GATEWAY_AUTH_SEED_LEN * 2];
+        aws_lc_rs::rand::SecureRandom::fill(&rng, &mut random)
+            .expect("system CSPRNG failed to produce gateway auth seed");
+        for byte in random {
+            if usize::from(byte) < limit && filled < seed.len() {
+                seed[filled] = AUTH_SEED_ALPHABET[usize::from(byte) % AUTH_SEED_ALPHABET.len()];
+                filled += 1;
+            }
+        }
     }
     seed
 }
@@ -555,16 +561,9 @@ fn native_password_challenge(seed: &[u8], stage_2: &[u8]) -> Vec<u8> {
 }
 
 fn hex_decode_20(value: &str) -> Result<[u8; 20], MariadbProxyError> {
-    if value.len() != 40 {
-        return Err(MariadbProxyError::InvalidNativePasswordVerifier);
-    }
-
     let mut bytes = [0_u8; 20];
-    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let high = nibble(chunk[0]).ok_or(MariadbProxyError::InvalidNativePasswordVerifier)?;
-        let low = nibble(chunk[1]).ok_or(MariadbProxyError::InvalidNativePasswordVerifier)?;
-        bytes[index] = (high << 4) | low;
-    }
+    hex::decode_to_slice(value, &mut bytes)
+        .map_err(|_| MariadbProxyError::InvalidNativePasswordVerifier)?;
     Ok(bytes)
 }
 
@@ -792,8 +791,9 @@ mod tests {
         let second = new_gateway_auth_seed();
 
         assert_ne!(first, second);
-        assert!(first.iter().all(u8::is_ascii_alphanumeric));
-        assert!(second.iter().all(u8::is_ascii_alphanumeric));
+        assert_eq!(first.len(), GATEWAY_AUTH_SEED_LEN);
+        assert!(first.iter().all(|byte| AUTH_SEED_ALPHABET.contains(byte)));
+        assert!(second.iter().all(|byte| AUTH_SEED_ALPHABET.contains(byte)));
     }
 
     #[test]
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn caching_sha2_backend_token_matches_the_protocol_formula() {
         assert_eq!(
-            encode_lower(&caching_sha2_password_token(
+            hex::encode(caching_sha2_password_token(
                 "mysql-password-1",
                 b"backend-seed-1234567"
             )),

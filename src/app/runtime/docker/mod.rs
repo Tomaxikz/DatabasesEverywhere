@@ -35,7 +35,7 @@ pub use remote_import::{
 };
 pub use security::DockerSecurityPolicy;
 pub use spec::{DockerEnv, DockerInstanceSpec, DockerMount};
-pub use stream_exec::ExecStreamResult;
+pub use stream_exec::{ExecInputFile, ExecStreamResult, ShellExec};
 
 use std::time::Duration;
 

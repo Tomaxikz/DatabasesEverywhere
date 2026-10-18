@@ -79,7 +79,7 @@ pub async fn history(
         .resource_cache
         .activity_history(&instance_id, &metadata.created_at, query.before, limit)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load activity history: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to load activity history"))?;
     Ok(ApiResponse::ok(ActivityHistory {
         instance_id,
         bucket_seconds: crate::server::monitoring::BUCKET_SECONDS,

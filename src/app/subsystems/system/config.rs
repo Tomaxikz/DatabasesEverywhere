@@ -49,7 +49,7 @@ impl ConfigPatchCoordinator {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || apply_config_patch(&path, patch))
             .await
-            .map_err(|error| ApiError::Runtime(format!("failed to join config writer: {error}")))?
+            .map_err(ApiError::runtime_context("failed to join config writer"))?
     }
 }
 
@@ -84,18 +84,18 @@ pub async fn patch_config(
 }
 
 fn apply_config_patch(path: &Path, patch: Value) -> Result<(), ApiError> {
-    let current = load_config(path)
-        .map_err(|error| ApiError::Runtime(format!("failed to load current config: {error}")))?;
+    let current =
+        load_config(path).map_err(ApiError::runtime_context("failed to load current config"))?;
     let mut document = serde_json::to_value(current)
-        .map_err(|error| ApiError::Runtime(format!("failed to serialize config: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to serialize config"))?;
     merge_json(&mut document, patch);
     let config: Config = serde_json::from_value(document)
         .map_err(|error| ApiError::BadRequest(format!("invalid config patch: {error}")))?;
-    validate_config(&config).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_config(&config).map_err(ApiError::bad_request)?;
     let yaml = yaml_serde::to_string(&config)
-        .map_err(|error| ApiError::Runtime(format!("failed to encode config: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to encode config"))?;
     atomic_replace_private(path, yaml.as_bytes())
-        .map_err(|error| ApiError::Runtime(format!("failed to write config: {error}")))
+        .map_err(ApiError::runtime_context("failed to write config"))
 }
 
 fn merge_json(target: &mut Value, patch: Value) {

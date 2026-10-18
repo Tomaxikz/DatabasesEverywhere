@@ -49,11 +49,9 @@ async fn verify_upgrade_source(
         false,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "source compatibility verification failed before major-upgrade export: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "source compatibility verification failed before major-upgrade export",
+    ))?;
     if !compatibility.compatible {
         return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
             || "source database version is unsupported".to_string(),

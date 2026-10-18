@@ -1,7 +1,7 @@
 use crate::{
     databases::engine::{
         CredentialKind, DedicatedSpecInput, EngineInfo, EngineLifecycle, LifecycleFlow,
-        LifecycleRejection, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
+        LifecycleRejection, OnlineBackup, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
     },
     runtime::docker::DockerInstanceSpec,
     server::metadata::InstanceMetadata,
@@ -13,6 +13,10 @@ use super::{
 };
 
 impl EngineLifecycle for Mariadb {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::MariadbBackup
+    }
+
     fn generate_maintenance_password(&self) -> Option<String> {
         Some(format!("dbe-root-{}", uuid::Uuid::new_v4()))
     }
@@ -39,16 +43,7 @@ impl EngineLifecycle for Mariadb {
     }
 
     fn dedicated_spec(&self, input: DedicatedSpecInput<'_>) -> DockerInstanceSpec {
-        instance_spec(
-            input.instance_id,
-            input.image,
-            input.database,
-            input.username,
-            input.password,
-            input.maintenance_password,
-            input.data_path,
-            input.sockets,
-        )
+        instance_spec(input)
     }
 
     fn shared_spec(&self, input: SharedSpecInput<'_>) -> Option<DockerInstanceSpec> {

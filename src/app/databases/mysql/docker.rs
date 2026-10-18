@@ -7,7 +7,6 @@ use crate::{
     runtime::docker::{DockerEnv, DockerInstanceSpec, DockerMount},
 };
 
-#[allow(clippy::too_many_arguments)]
 pub fn instance_spec(
     instance_id: &str,
     image: &str,
@@ -43,7 +42,6 @@ pub fn shared_spec(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_spec(
     runtime_id: &str,
     image: &str,
@@ -52,40 +50,20 @@ fn build_spec(
     data_path: PathBuf,
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
-    let mut env = vec![DockerEnv {
-        key: "MYSQL_ROOT_PASSWORD".to_string(),
-        value: root_password,
-    }];
+    let mut env = vec![DockerEnv::new("MYSQL_ROOT_PASSWORD", root_password)];
     if let Some(database) = database {
         env.insert(
             0,
-            DockerEnv {
-                key: "MYSQL_DATABASE".to_string(),
-                value: SecretString::from(database.to_string()),
-            },
+            DockerEnv::new("MYSQL_DATABASE", SecretString::from(database.to_string())),
         );
     }
 
     DockerInstanceSpec {
-        instance_id: runtime_id.to_string(),
-        protocol: Protocol::Mysql,
-        image: image.to_string(),
-        project_id: None,
-        user: None,
-        working_dir: None,
-        entrypoint: None,
-        cpu_cores: 1.0,
-        memory_mib: 1024,
-        disk_mib: 10240,
-        pids_limit: None,
-        data_path,
-        data_target: "/var/lib/mysql".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: "/var/run/mysqld".to_string(),
             read_only: false,
         }],
-        socket_bridges: Vec::new(),
         env,
         command: vec![
             "--skip-networking=ON".to_string(),
@@ -94,6 +72,13 @@ fn build_spec(
             "--skip-log-bin".to_string(),
             "--innodb-file-per-table=ON".to_string(),
         ],
+        ..DockerInstanceSpec::with_defaults(
+            runtime_id,
+            Protocol::Mysql,
+            image,
+            data_path,
+            "/var/lib/mysql",
+        )
     }
 }
 

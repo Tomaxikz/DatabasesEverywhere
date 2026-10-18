@@ -5,6 +5,7 @@ use std::{
 };
 
 use futures::StreamExt;
+use procfs::{FromBufReadSI, KernelStats};
 use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
@@ -160,44 +161,25 @@ pub(crate) async fn read_host_cpu_cores() -> Result<u64, std::io::Error> {
 }
 
 pub(super) fn parse_host_cpu(contents: &str) -> Result<HostCpuSample, std::io::Error> {
-    let aggregate = contents
-        .lines()
-        .find(|line| line.starts_with("cpu "))
-        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing aggregate CPU counters"))?;
-    let values = aggregate
-        .split_whitespace()
-        .skip(1)
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|error| IoError::new(ErrorKind::InvalidData, error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.len() < 4 {
-        return Err(IoError::new(
-            ErrorKind::InvalidData,
-            "aggregate CPU counters are incomplete",
-        ));
-    }
+    let stats = KernelStats::from_buf_read(contents.as_bytes(), procfs::current_system_info())
+        .map_err(proc_error)?;
+    let cpu = &stats.total;
     // Linux user/nice counters already include guest time, so exclude the guest
     // fields and sum user through steal only to avoid counting them twice.
-    let total = values
-        .iter()
-        .take(8)
-        .try_fold(0_u64, |total, value| total.checked_add(*value))
+    let total = [cpu.user, cpu.nice, cpu.system, cpu.idle]
+        .into_iter()
+        .chain(
+            [cpu.iowait, cpu.irq, cpu.softirq, cpu.steal]
+                .into_iter()
+                .flatten(),
+        )
+        .try_fold(0_u64, u64::checked_add)
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "CPU counters overflowed"))?;
-    let idle = values[3]
-        .checked_add(values.get(4).copied().unwrap_or_default())
+    let idle = cpu
+        .idle
+        .checked_add(cpu.iowait.unwrap_or_default())
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "CPU idle counters overflowed"))?;
-    let cores = contents
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| {
-            name.strip_prefix("cpu").is_some_and(|suffix| {
-                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-            })
-        })
-        .count() as u64;
+    let cores = stats.cpu_time.len() as u64;
     if cores == 0 {
         return Err(IoError::new(
             ErrorKind::InvalidData,
@@ -205,6 +187,13 @@ pub(super) fn parse_host_cpu(contents: &str) -> Result<HostCpuSample, std::io::E
         ));
     }
     Ok(HostCpuSample { total, idle, cores })
+}
+
+fn proc_error(error: procfs::ProcError) -> std::io::Error {
+    match error {
+        procfs::ProcError::Io(error, _) => error,
+        error => IoError::new(ErrorKind::InvalidData, error),
+    }
 }
 
 pub(super) fn host_cpu_percent_between(

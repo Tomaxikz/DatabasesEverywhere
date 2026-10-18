@@ -96,8 +96,8 @@ pub(crate) async fn import_qdrant(
         }
     };
 
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     let bridge = match within_deadline(
         work_deadline,
         "target bridge startup",

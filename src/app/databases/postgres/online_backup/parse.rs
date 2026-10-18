@@ -10,10 +10,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{
-    server::backup::manifest::{RecoveryCoordinates, is_identifier},
-    utils::hex::encode_lower,
-};
+use crate::server::backup::manifest::{RecoveryCoordinates, is_identifier};
 
 const MAX_LABEL_BYTES: u64 = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024 * 1024;
@@ -265,7 +262,7 @@ fn check_file(path: &Path, file: &ManifestFile, len: u64) -> Result<(), String> 
         }
         hasher.update(&buffer[..read]);
     }
-    let digest = encode_lower(&hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     if !digest.eq_ignore_ascii_case(&file.checksum) {
         return Err(format!(
             "{} checksum does not match the manifest",
@@ -294,7 +291,7 @@ pub(crate) fn verify_manifest_checksum(bytes: &[u8]) -> Result<(), String> {
         return Err("backup manifest is missing its checksum trailer".to_string());
     };
     let hex = manifest_checksum_hex(&bytes[penultimate + 1..])?;
-    let digest = encode_lower(Sha256::digest(&bytes[..=penultimate]).as_slice());
+    let digest = hex::encode(Sha256::digest(&bytes[..=penultimate]).as_slice());
     if !digest.eq_ignore_ascii_case(hex) {
         return Err("backup manifest checksum does not match its contents".to_string());
     }
@@ -514,15 +511,7 @@ fn pg_control_crc_offset(version: u32) -> Result<usize, String> {
 
 /// CRC-32C (Castagnoli), the `pg_crc32c` value stored in `pg_control`.
 fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-        }
-    }
-    !crc
+    crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(bytes)
 }
 
 fn valid_wal_segment_bytes(size: u64) -> bool {
@@ -557,11 +546,9 @@ fn read_limited(path: &Path, max: u64) -> Result<String, String> {
 }
 
 fn read_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    crate::io::files::require_regular_file(path)?;
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
     if metadata.len() > max {
         return Err(format!(
             "{} is {} bytes; limit is {max}",
@@ -671,7 +658,7 @@ mod tests {
 
     #[test]
     fn manifest_checksum_includes_the_wal_ranges_comma() {
-        let file_hash = encode_lower(Sha256::digest(b"START\n").as_slice());
+        let file_hash = hex::encode(Sha256::digest(b"START\n").as_slice());
         assert_eq!(
             file_hash,
             "c89d6966e9327382a8a6cbafabc0c5c74e288f4fbf09baf4cd5362160d442f71"
@@ -694,7 +681,7 @@ mod tests {
         let prefix = manifest_prefix(2, Some(7_251_860_123_456_789_012), &files, &ranges);
         assert!(prefix.ends_with(",\n"));
         let excluded =
-            encode_lower(Sha256::digest(&prefix.as_bytes()[..prefix.len() - 2]).as_slice());
+            hex::encode(Sha256::digest(&prefix.as_bytes()[..prefix.len() - 2]).as_slice());
         let stale = format!("{prefix}\"Manifest-Checksum\": \"{excluded}\"}}\n");
         assert!(verify_manifest_checksum(stale.as_bytes()).is_err());
 
@@ -939,7 +926,7 @@ mod tests {
     }
 
     fn file_sha(bytes: &[u8]) -> String {
-        encode_lower(Sha256::digest(bytes).as_slice())
+        hex::encode(Sha256::digest(bytes).as_slice())
     }
 
     /// Byte layout emitted by `AddFileToBackupManifest` and
@@ -1000,7 +987,7 @@ mod tests {
         ranges: &[(u64, &str, &str)],
     ) -> String {
         let prefix = manifest_prefix(version, system_id, files, ranges);
-        let digest = encode_lower(Sha256::digest(prefix.as_bytes()).as_slice());
+        let digest = hex::encode(Sha256::digest(prefix.as_bytes()).as_slice());
         let mut manifest = prefix;
         manifest.push_str("\"Manifest-Checksum\": \"");
         manifest.push_str(&digest);

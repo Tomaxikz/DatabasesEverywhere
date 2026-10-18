@@ -1,5 +1,4 @@
 use std::{
-    io::Write,
     process::{Command, Output, Stdio},
     thread::sleep,
     time::{Duration, Instant},
@@ -13,7 +12,7 @@ use crate::{
             assert_engine_tenant_rows, run_jdbc_smoke, run_mariadb_cli, start_gateway,
             test_tls_acceptor,
         },
-        test_support::DockerContainer,
+        test_support::{DockerContainer, assert_success, exec_mysql_family_with_input},
     },
     gateway::protocols::mariadb::native_password_sha1_stage2_hex,
     server::{state::InstanceStore, test_support},
@@ -242,40 +241,19 @@ fn query_mariadb(name: &str, password: &str, user: &str, database: &str, sql: &s
 }
 
 fn exec_with_input(name: &str, password: &str, input: &[u8]) -> Output {
-    let mut child = Command::new("docker")
-        .args([
-            "exec",
-            "-i",
-            "-e",
-            &format!("MYSQL_PWD={password}"),
-            name,
+    exec_mysql_family_with_input(
+        name,
+        password,
+        &[
             "mariadb",
             "--protocol=socket",
             "--socket=/run/mysqld/mysqld.sock",
             "-uroot",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start MariaDB command");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input)
-        .expect("write MariaDB input");
-    child.wait_with_output().expect("wait for MariaDB command")
+        ],
+        input,
+    )
 }
 
 fn host_mariadb(port: u16, password: &str, sql: &str) -> Output {
     run_mariadb_cli(port, DATABASE, TENANT, password, sql)
-}
-
-fn assert_success(output: &Output, operation: &str) {
-    assert!(
-        output.status.success(),
-        "{operation} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

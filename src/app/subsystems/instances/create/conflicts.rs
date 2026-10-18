@@ -28,7 +28,7 @@ pub(super) async fn reject_duplicate_instance(
         .placements
         .get(&request.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .is_some()
     {
         return Err(ApiError::Conflict(format!(
@@ -40,7 +40,7 @@ pub(super) async fn reject_duplicate_instance(
         .placements
         .get_reservation(&request.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .is_some()
     {
         return Err(ApiError::Conflict(format!(
@@ -100,10 +100,10 @@ pub(super) async fn handle_stale_instance_resources(
     }
 
     let paths = InstancePaths::new(&state.config.paths, &request.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let stale_paths = stale_persistent_paths(&paths)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     if stale_containers.is_empty() && stale_paths.is_empty() {
         return Ok(());
     }

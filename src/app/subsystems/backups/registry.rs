@@ -4,15 +4,28 @@ use std::sync::LazyLock;
 
 use super::strategy::{OnlineBackupStrategy, StrategyError};
 use crate::{
-    databases::{engine::OnlineBackup, postgres::online_backup::PostgresBaseBackupStrategy},
+    databases::{
+        engine::OnlineBackup, mariadb::online_backup::MariadbBackupStrategy,
+        postgres::online_backup::PostgresBaseBackupStrategy,
+        resp::online_backup::RespRdbSnapshotStrategy,
+    },
     server::{metadata::InstanceMetadata, placement::DeploymentMode},
 };
 
 /// Manifest strategy id of the PostgreSQL `pg_basebackup` strategy.
 pub(crate) const POSTGRES_BASE_BACKUP: &str = "postgres.pg_basebackup";
+/// Manifest strategy id of the Redis and Valkey RDB snapshot strategy.
+pub(crate) const RESP_RDB_SNAPSHOT: &str = "resp.rdb_snapshot";
+/// Manifest strategy id of the MariaDB `mariadb-backup` strategy.
+pub(crate) const MARIADB_BACKUP: &str = "mariadb.mariadb_backup";
 
-static STRATEGIES: LazyLock<Vec<Box<dyn OnlineBackupStrategy>>> =
-    LazyLock::new(|| vec![Box::new(PostgresBaseBackupStrategy)]);
+static STRATEGIES: LazyLock<Vec<Box<dyn OnlineBackupStrategy>>> = LazyLock::new(|| {
+    vec![
+        Box::new(PostgresBaseBackupStrategy),
+        Box::new(RespRdbSnapshotStrategy),
+        Box::new(MariadbBackupStrategy),
+    ]
+});
 
 /// Selects the certified strategy for a backup source, or explains why
 /// strict online capture is unsupported. Never falls back.
@@ -29,6 +42,8 @@ pub(crate) fn strategy_for(
             return Err(StrategyError::Unsupported(reason.to_string()));
         }
         OnlineBackup::PostgresBaseBackup => POSTGRES_BASE_BACKUP,
+        OnlineBackup::RespRdbSnapshot => RESP_RDB_SNAPSHOT,
+        OnlineBackup::MariadbBackup => MARIADB_BACKUP,
     };
     strategy_by_id(id).ok_or_else(|| {
         StrategyError::Unsupported(format!(
@@ -52,12 +67,7 @@ mod tests {
 
     #[test]
     fn engines_without_certified_strategies_fail_clearly() {
-        for protocol in [
-            Protocol::Mongodb,
-            Protocol::Redis,
-            Protocol::Valkey,
-            Protocol::Mysql,
-        ] {
+        for protocol in [Protocol::Mongodb, Protocol::Mysql] {
             let metadata = crate::server::test_support::metadata("inst_one", protocol);
             let Err(StrategyError::Unsupported(reason)) = strategy_for(&metadata) else {
                 panic!("{} must not have an online strategy", protocol.as_str());

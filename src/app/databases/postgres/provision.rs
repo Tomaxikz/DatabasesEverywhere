@@ -1,5 +1,3 @@
-use crate::utils::hex::encode_lower;
-
 pub fn provision_tenant_role_sql(database: &str, username: &str) -> String {
     let username_identifier = quote_ident(username);
     let database_identifier = quote_ident(database);
@@ -117,7 +115,7 @@ pub fn drop_tenant_sql(database: &str, username: &str) -> TenantDropSql {
 pub fn tenant_tablespace_name(database: &str) -> String {
     use sha2::{Digest, Sha256};
 
-    let suffix = encode_lower(&Sha256::digest(database.as_bytes())[..16]);
+    let suffix = hex::encode(&Sha256::digest(database.as_bytes())[..16]);
     format!("dbev_ts_{suffix}")
 }
 

@@ -70,18 +70,13 @@ pub(super) async fn write_recovery_manifest(
         target_aliases,
         created_at: crate::server::jobs::import_export::now_rfc3339(),
     };
-    let contents = serde_json::to_vec_pretty(&manifest).map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to encode qdrant recovery manifest: {error}"
-        ))
-    })?;
+    let contents = serde_json::to_vec_pretty(&manifest).map_err(ApiError::runtime_context(
+        "failed to encode qdrant recovery manifest",
+    ))?;
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::io::files::atomic_write_private(&path, &contents))
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to write qdrant recovery manifest: {error}"))
-        })?
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to write qdrant recovery manifest: {error}"))
-        })
+    crate::routes::http::response::run_blocking(
+        "failed to write qdrant recovery manifest",
+        move || crate::io::files::atomic_write_private(&path, &contents),
+    )
+    .await
 }

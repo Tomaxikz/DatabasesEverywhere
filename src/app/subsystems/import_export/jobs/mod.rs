@@ -2,10 +2,12 @@
 
 use std::{
     path::{Path as FsPath, PathBuf},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
 use axum::extract::State;
+use backon::{ExponentialBuilder, Retryable};
 
 use crate::{
     auth::scopes,
@@ -48,7 +50,6 @@ use supervision::{spawn_export_supervisor, spawn_import_supervisor};
 pub(super) const MAX_REPLAY_OPTIONS_BYTES: usize = 64 * 1024;
 const MAX_RETRY_DELAY_MS: u64 = 1_000;
 const ENQUEUE_READBACK_BASE_DELAY_MS: u64 = 25;
-const MAX_ENQUEUE_READBACK_BACKOFF_EXPONENT: u32 = 6;
 
 fn scheduler_capacity_error() -> ApiError {
     ApiError::Conflict(
@@ -292,9 +293,9 @@ pub(crate) async fn queue_import_instance(
 async fn wait_for_enqueue(
     supervisor: tokio::task::JoinHandle<Result<ImportExportJob, ApiError>>,
 ) -> Result<ImportExportJob, ApiError> {
-    supervisor.await.map_err(|error| {
-        ApiError::Runtime(format!("import/export enqueue supervisor failed: {error}"))
-    })?
+    supervisor.await.map_err(ApiError::runtime_context(
+        "import/export enqueue supervisor failed",
+    ))?
 }
 
 async fn upload_staging_budget(
@@ -374,7 +375,7 @@ pub async fn get_import_export_job(
         .import_export_jobs
         .get(&job_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .ok_or(ApiError::NotFound)?;
     if job.instance_id != instance_id {
         return Err(ApiError::NotFound);
@@ -399,12 +400,12 @@ pub async fn list_import_export_jobs(
         .as_deref()
         .map(ImportExportStatus::parse)
         .transpose()
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let jobs = state
         .import_export_jobs
         .list(Some(&instance_id), status, query.limit.unwrap_or(100))
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let mut response = Vec::with_capacity(jobs.len());
     for job in jobs {
         response.push(public_job_response(job).await);
@@ -465,59 +466,58 @@ async fn recover_uncertain_enqueue(
     job: &ImportExportJob,
     insert_error: impl std::fmt::Display,
 ) -> Result<(), ApiError> {
-    let mut attempt = 0_u32;
-    loop {
-        attempt = attempt.saturating_add(1);
-        match state.import_export_jobs.get(&job.job_id).await {
-            Ok(Some(stored)) if stored == *job => {
-                state
-                    .import_export_jobs
-                    .cache_durable_job(job.clone())
-                    .await;
-                tracing::warn!(job_id = job.job_id, %insert_error, attempt, "recovered an acknowledged durable import/export enqueue");
-                return Ok(());
-            }
-            Ok(Some(_)) => {
-                tracing::error!(job_id = job.job_id, %insert_error, attempt, "import/export enqueue read-back differed from the intended durable job");
-                return Err(ApiError::Runtime(
-                    "import/export job persistence was inconsistent".to_string(),
-                ));
-            }
-            Ok(None) => return Err(ApiError::Runtime(insert_error.to_string())),
-            Err(read_error) if state.import_export_jobs.is_accepting() => {
-                tracing::warn!(job_id = job.job_id, %insert_error, %read_error, attempt, "retrying uncertain import/export enqueue read-back");
-                tokio::time::sleep(enqueue_readback_delay(attempt)).await;
-            }
-            Err(read_error) => {
-                tracing::error!(job_id = job.job_id, %insert_error, %read_error, attempt, "daemon shutdown interrupted uncertain import/export enqueue classification; startup recovery will reconcile any durable row");
-                return Err(ApiError::Runtime(insert_error.to_string()));
-            }
+    let attempt = AtomicU32::new(0);
+    let read_back = (|| {
+        attempt.fetch_add(1, Ordering::Relaxed);
+        state.import_export_jobs.get(&job.job_id)
+    })
+    .retry(storage_retry_backoff(ENQUEUE_READBACK_BASE_DELAY_MS))
+    .when(|_| state.import_export_jobs.is_accepting())
+    .notify(|read_error, _| {
+        let attempt = attempt.load(Ordering::Relaxed);
+        tracing::warn!(job_id = job.job_id, %insert_error, %read_error, attempt, "retrying uncertain import/export enqueue read-back");
+    })
+    .await;
+    let attempt = attempt.load(Ordering::Relaxed);
+    match read_back {
+        Ok(Some(stored)) if stored == *job => {
+            state
+                .import_export_jobs
+                .cache_durable_job(job.clone())
+                .await;
+            tracing::warn!(job_id = job.job_id, %insert_error, attempt, "recovered an acknowledged durable import/export enqueue");
+            Ok(())
+        }
+        Ok(Some(_)) => {
+            tracing::error!(job_id = job.job_id, %insert_error, attempt, "import/export enqueue read-back differed from the intended durable job");
+            Err(ApiError::Runtime(
+                "import/export job persistence was inconsistent".to_string(),
+            ))
+        }
+        Ok(None) => Err(ApiError::Runtime(insert_error.to_string())),
+        Err(read_error) => {
+            tracing::error!(job_id = job.job_id, %insert_error, %read_error, attempt, "daemon shutdown interrupted uncertain import/export enqueue classification; startup recovery will reconcile any durable row");
+            Err(ApiError::Runtime(insert_error.to_string()))
         }
     }
 }
 
-fn enqueue_readback_delay(attempt: u32) -> Duration {
-    capped_retry_delay(
-        ENQUEUE_READBACK_BASE_DELAY_MS,
-        attempt,
-        MAX_ENQUEUE_READBACK_BACKOFF_EXPONENT,
-    )
-}
-
-fn capped_retry_delay(base_delay_ms: u64, attempt: u32, max_exponent: u32) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(max_exponent);
-    let delay_ms = base_delay_ms
-        .saturating_mul(1_u64 << exponent)
-        .min(MAX_RETRY_DELAY_MS);
-    Duration::from_millis(delay_ms)
+/// Durable job-store retries double from `base_delay_ms` up to
+/// `MAX_RETRY_DELAY_MS` and never run out of attempts on their own; callers
+/// stop them through `when`.
+fn storage_retry_backoff(base_delay_ms: u64) -> ExponentialBuilder {
+    ExponentialBuilder::new()
+        .with_min_delay(Duration::from_millis(base_delay_ms))
+        .with_max_delay(Duration::from_millis(MAX_RETRY_DELAY_MS))
+        .without_max_times()
 }
 
 pub(super) fn serialize_replay_descriptor(
     descriptor: &ReplayDescriptor,
 ) -> Result<String, ApiError> {
-    let encoded = serde_json::to_string(descriptor).map_err(|error| {
-        ApiError::Runtime(format!("failed to encode job replay options: {error}"))
-    })?;
+    let encoded = serde_json::to_string(descriptor).map_err(ApiError::runtime_context(
+        "failed to encode job replay options",
+    ))?;
     if encoded.len() > MAX_REPLAY_OPTIONS_BYTES {
         return Err(ApiError::BadRequest(format!(
             "import/export selection exceeds the {MAX_REPLAY_OPTIONS_BYTES}-byte queued-job limit"

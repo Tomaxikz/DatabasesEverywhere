@@ -2,7 +2,6 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, ensure};
 use futures::StreamExt;
-use secrecy::SecretString;
 
 use super::{
     DockerContainerStatus, DockerEnv, DockerInstanceSpec, DockerRuntime, ManagedContainerAction,
@@ -167,10 +166,7 @@ fn smoke_spec(instance_id: &str, image: &str, data_path: PathBuf) -> DockerInsta
         data_target: "/data".to_string(),
         extra_mounts: Vec::new(),
         socket_bridges: Vec::new(),
-        env: vec![DockerEnv {
-            key: "DBEV_PODMAN_SMOKE".to_string(),
-            value: SecretString::from("true"),
-        }],
+        env: vec![DockerEnv::plain("DBEV_PODMAN_SMOKE", "true")],
         command: vec![
             "sh".to_string(),
             "-c".to_string(),

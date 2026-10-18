@@ -52,7 +52,7 @@ pub async fn update_instance_limits(
         result
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("limit update worker failed: {error}")))?
+    .map_err(ApiError::runtime_context("limit update worker failed"))?
 }
 
 pub(super) async fn resize_instance(
@@ -83,7 +83,7 @@ pub(super) async fn resize_instance(
     let paths = if disk_changed {
         Some(
             InstancePaths::new(&state.config.paths, &metadata.instance_id)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+                .map_err(ApiError::bad_request)?,
         )
     } else {
         None
@@ -92,7 +92,7 @@ pub(super) async fn resize_instance(
     if let Some(paths) = paths.as_ref() {
         effective_disk_limiter
             .check_method_change(&metadata.limits.disk_enforcement_method)
-            .map_err(|error| ApiError::Conflict(error.to_string()))?;
+            .map_err(ApiError::conflict)?;
         if crate::config::DiskLimitMode::from_persisted_method(
             &metadata.limits.disk_enforcement_method,
         ) != Some(effective_disk_limiter.mode())
@@ -105,7 +105,7 @@ pub(super) async fn resize_instance(
         }
         let expected_data_source = effective_disk_limiter
             .container_data_path(&paths.data)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         match state
             .docker
             .verify_data_bind(

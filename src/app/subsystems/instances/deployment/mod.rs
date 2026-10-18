@@ -144,7 +144,7 @@ pub async fn start_deployment_migration(
             .manager
             .upsert(metadata.clone())
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
     }
     let migration = state
         .placements
@@ -216,7 +216,7 @@ async fn validate_source(
 ) -> Result<(), ApiError> {
     target_mode
         .check(metadata.protocol)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     if metadata.deployment_mode == target_mode {
         return Err(ApiError::Conflict(format!(
             "instance already uses {} deployment",
@@ -245,7 +245,7 @@ async fn validate_source(
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| {
             ApiError::Conflict(
                 "source placement runtime is missing; reconcile it first".to_string(),

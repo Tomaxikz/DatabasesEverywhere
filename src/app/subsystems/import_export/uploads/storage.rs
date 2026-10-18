@@ -26,7 +26,7 @@ pub(in super::super) fn upload_file_path(
         ));
     }
     let paths = InstancePaths::new(&state.config.paths, &upload.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     Ok(paths
         .imports
         .join(UPLOADS_DIRECTORY)
@@ -69,7 +69,7 @@ pub(in super::super) async fn harden_upload_source(
     let path = upload_file_path(state, &upload)?;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to inspect import upload: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to inspect import upload"))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(ApiError::BadRequest(
             "temporary import upload is not a regular file".to_string(),
@@ -94,13 +94,13 @@ pub(in super::super) async fn remove_upload_file(
     let path = upload_file_path(state, upload)?;
     tokio::task::spawn_blocking(move || crate::io::files::remove_private_file_durable(&path))
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to join upload cleanup: {error}")))?
+        .map_err(ApiError::runtime_context("failed to join upload cleanup"))?
         .or_else(|error| {
             (error.kind() == std::io::ErrorKind::NotFound)
                 .then_some(())
                 .ok_or(error)
         })
-        .map_err(|error| ApiError::Runtime(format!("failed to delete upload: {error}")))
+        .map_err(ApiError::runtime_context("failed to delete upload"))
 }
 
 pub(super) async fn reserve_upload_disk_space(

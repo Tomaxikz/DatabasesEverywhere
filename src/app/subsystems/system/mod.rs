@@ -181,7 +181,7 @@ pub async fn scheduler_recommendation(
         .as_deref()
         .unwrap_or("postgres")
         .parse::<crate::databases::protocol::Protocol>()
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let export = parse_is_export(query.action.as_deref())?;
     let wipe = parse_is_wipe(query.mode.as_deref(), export)?;
     let size_bytes = query

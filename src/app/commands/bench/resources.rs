@@ -5,6 +5,7 @@ use std::{
 };
 
 use bollard::models::{ContainerCpuStats, ContainerStatsResponse};
+use procfs::{FromBufReadSI, KernelStats};
 use tokio::{
     sync::watch,
     task::JoinHandle,
@@ -318,31 +319,23 @@ fn read_host_cpu_counter() -> Option<HostCpuCounter> {
 }
 
 fn parse_host_cpu_counter(contents: &str) -> Option<HostCpuCounter> {
-    let mut lines = contents.lines();
-    let aggregate = lines.next()?;
-    let mut fields = aggregate.split_whitespace();
-    if fields.next()? != "cpu" {
-        return None;
-    }
+    let stats =
+        KernelStats::from_buf_read(contents.as_bytes(), procfs::current_system_info()).ok()?;
+    let cpu = &stats.total;
     // Linux reports guest and guest_nice inside user and nice already. Only the
     // first eight counters belong in the denominator or guest time is counted
     // twice and process CPU is understated.
-    let total_ticks = fields.take(8).try_fold(0_u64, |total, field| {
-        field
-            .parse::<u64>()
-            .ok()
-            .and_then(|value| total.checked_add(value))
-    })?;
-    let logical_cpus = contents
-        .lines()
-        .filter(|line| {
-            line.strip_prefix("cpu")
-                .is_some_and(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_digit))
-        })
-        .count() as u64;
+    let total_ticks = [cpu.user, cpu.nice, cpu.system, cpu.idle]
+        .into_iter()
+        .chain(
+            [cpu.iowait, cpu.irq, cpu.softirq, cpu.steal]
+                .into_iter()
+                .flatten(),
+        )
+        .try_fold(0_u64, u64::checked_add)?;
     Some(HostCpuCounter {
         total_ticks,
-        logical_cpus: logical_cpus.max(1),
+        logical_cpus: (stats.cpu_time.len() as u64).max(1),
     })
 }
 
@@ -432,7 +425,7 @@ mod tests {
 
     #[test]
     fn parses_host_ticks_and_cpu_count() {
-        let stat = "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2\ncpu1 1 2\nintr 0\n";
+        let stat = "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4\ncpu1 1 2 3 4\nintr 0\nctxt 0\nbtime 0\nprocesses 0\n";
         let parsed = parse_host_cpu_counter(stat).unwrap();
 
         assert_eq!(parsed.total_ticks, 36);

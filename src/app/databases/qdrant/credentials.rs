@@ -49,7 +49,7 @@ impl EngineCredentials for Qdrant {
             return false;
         };
         let current = route_key_fingerprint(daemon_secret, secret);
-        let legacy = crate::utils::hex::encode_lower(&Sha256::digest(secret.as_bytes()));
+        let legacy = hex::encode(Sha256::digest(secret.as_bytes()));
         saved == &current || saved == &legacy
     }
 

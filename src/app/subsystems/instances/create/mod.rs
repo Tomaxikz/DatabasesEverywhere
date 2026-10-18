@@ -182,8 +182,8 @@ pub(crate) fn backend_endpoint(
     protocol: Protocol,
     instance_id: &str,
 ) -> Result<BackendEndpoint, ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     Ok(BackendEndpoint::UnixSocket {
         socket_path: crate::utils::backend::backend_socket_path(&paths.sockets, protocol)
             .display()

@@ -32,7 +32,7 @@ impl SoftDiskTarget {
             digest.update(component.len().to_le_bytes());
             digest.update(component);
         }
-        crate::utils::hex::encode_lower(&digest.finalize())
+        hex::encode(digest.finalize())
     }
 }
 

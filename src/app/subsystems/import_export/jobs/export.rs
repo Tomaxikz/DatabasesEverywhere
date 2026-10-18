@@ -121,7 +121,7 @@ pub(crate) async fn measure_export_bytes(
         ));
     }
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let database_used_bytes = state
         .resource_cache
         .fresh_disk_usage(&state.config, &metadata.instance_id, paths.data)
@@ -296,8 +296,7 @@ pub(super) async fn export_artifact_path(
     archive_format: ExportArchiveFormat,
     delivery: ExportDelivery,
 ) -> Result<PathBuf, ApiError> {
-    crate::utils::ids::validate_instance_id(instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    crate::utils::ids::validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     let export_root = if delivery.is_one_use() {
         crate::subsystems::artifacts::instance_spool_root(state, instance_id)
     } else {

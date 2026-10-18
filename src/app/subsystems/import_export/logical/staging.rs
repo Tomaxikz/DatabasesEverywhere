@@ -45,11 +45,12 @@ pub(in crate::subsystems::import_export) async fn check_remote_staging_space(
         return Err(staging_limit_exceeded(max_bytes));
     }
     for path in paths {
-        let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to inspect remote import staging data: {error}"
-            ))
-        })?;
+        let metadata =
+            tokio::fs::symlink_metadata(path)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to inspect remote import staging data",
+                ))?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(ApiError::Runtime(
                 "remote import staging data is not a regular file".to_string(),

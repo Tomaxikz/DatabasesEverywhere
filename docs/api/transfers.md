@@ -23,10 +23,19 @@ The scheduler uses the same classification and emits one `backup_pass_finished`
 summary with counts and `completed`, `completed_with_skips`, `partial_failure`,
 or `failed` status. Failures are logged at ERROR, not disguised as skipped work.
 
-Dedicated physical backups still stop/archive/restart a running database to
-keep the data directory consistent; they are not hot backups. The
+Offline dedicated backups (the default) stop/archive/restart a running database
+to keep the data directory consistent; they are not hot backups. The
 `physical_backup_pause` and `physical_backup_resumed` events identify planned
-interruptions. Queued container events log `event_action` separately from the
+interruptions. `mode=online` keeps the database serving through an
+engine-native strategy and returns 409, never falling back, when none applies:
+
+| Engine | Online capture | Restore |
+| --- | --- | --- |
+| PostgreSQL 14–18 | `pg_basebackup` with streamed WAL, checked by `pg_verifybackup` | Replays the included WAL |
+| Redis / Valkey 7+ | Diskless rdb-only replication snapshot, checked by `check-rdb`; needs `repl-diskless-sync yes`, `rdbchecksum yes` and fork headroom (resident set at most half the memory limit) | Installed as the multi-part AOF base; ACLs come from the current credential |
+| MariaDB 10.6+ | `mariadb-backup` hot copy, prepared with `--prepare`; InnoDB-only user tables, files inside the data directory | Starts on the prepared tree |
+
+MySQL, MongoDB, ClickHouse, and Qdrant have no online strategy yet. Queued container events log `event_action` separately from the
 current `observed_status`, which may already reflect a later restart.
 
 For a shared-runtime placement conflict, inspect the named `mismatched_fields`

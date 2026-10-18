@@ -45,7 +45,7 @@ pub async fn delete_instance(
         .manager
         .upsert(metadata.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)
@@ -75,18 +75,18 @@ pub async fn delete_instance(
         .import_export_jobs
         .delete_for_instance(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to purge instance jobs: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to purge instance jobs"))?;
     state
         .import_uploads
         .repo()
         .delete_for_instance(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to purge import uploads: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to purge import uploads"))?;
     let deleted = state
         .manager
         .delete(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     state.soft_disk_limiter.remove(&metadata.instance_id).await;
     state
         .instance_runtime_cache

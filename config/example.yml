@@ -148,8 +148,9 @@ backups:
   retention_max_age_days: 30
   # offline (the default when omitted) stops a dedicated database for a cold
   # copy and works for every engine. online keeps it serving reads and writes
-  # through a certified engine-native strategy (currently PostgreSQL 14-18)
-  # and fails clearly, never falling back, for engines without one, so a
+  # through a certified engine-native strategy (currently PostgreSQL 14-18,
+  # Redis and Valkey 7+, and MariaDB 10.6+ with InnoDB-only user tables) and
+  # fails clearly, never falling back, for engines without one, so a
   # scheduled pass reports those instances as failed. One request can choose
   # with POST /api/instances/{instance_id}/backups?mode=online|offline.
   dedicated_mode: offline

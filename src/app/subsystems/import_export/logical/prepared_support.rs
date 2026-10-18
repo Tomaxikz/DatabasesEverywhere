@@ -5,6 +5,7 @@ use super::super::{
 use crate::{
     databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
+    runtime::docker::{ExecInputFile, ShellExec},
     server::placement::DeploymentMode,
     server::{credentials::logical_import_env, metadata::InstanceMetadata},
     subsystems::import_export::remote::ImportMode,
@@ -243,7 +244,7 @@ pub(super) async fn apply_prepared_logical_imports(
         .map_err(apply_error_from_restore)?;
     }
     let credentials = logical_import_env(metadata, first.database_definition_in_dump)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(ApiError::conflict)?;
     let environment = credentials.references();
     let import_started = Instant::now();
     for artifact in prepared {
@@ -268,18 +269,22 @@ pub(super) async fn apply_prepared_logical_imports(
             state
                 .docker
                 .exec_shell_with_input(
-                    artifact.protocol,
-                    runtime_id,
-                    &artifact.script,
-                    &environment,
-                    &artifact.host_temp,
-                    artifact.prepared_source_bytes,
-                    artifact.expected_sha256,
-                    timeout,
-                    logical_exec_recovery(metadata),
+                    ShellExec {
+                        protocol: artifact.protocol,
+                        instance_id: runtime_id,
+                        script: &artifact.script,
+                        environment: &environment,
+                        timeout,
+                        recovery: logical_exec_recovery(metadata),
+                    },
+                    ExecInputFile {
+                        path: &artifact.host_temp,
+                        max_bytes: artifact.prepared_source_bytes,
+                        expected_sha256: artifact.expected_sha256,
+                    },
                 )
                 .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                .map_err(ApiError::runtime)?;
         }
     }
     super::super::shared_security::verify_import_size(state, metadata).await?;

@@ -47,13 +47,13 @@ pub(super) async fn precheck_dedicated_start(
     let disk_limiter = persisted_disk_limiter(state, metadata);
     disk_limiter
         .check_method_change(&metadata.limits.disk_enforcement_method)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(ApiError::conflict)?;
     check_disk_method(&disk_limiter, metadata)?;
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let expected_data_source = disk_limiter
         .container_data_path(&paths.data)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     match state
         .docker
         .verify_data_bind(

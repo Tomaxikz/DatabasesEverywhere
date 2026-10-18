@@ -24,7 +24,7 @@ pub(crate) fn instance_spool_root(state: &AppState, instance_id: &str) -> PathBu
 }
 
 pub(crate) async fn check_export_slot(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     let active = active_spool_paths(state).await;
     sweep_instance_exports(state, instance_id, &active).await?;
     let retained = count_regular_exports(&instance_export_root(state, instance_id)).await?;
@@ -47,21 +47,24 @@ pub(crate) async fn sweep_one_use_exports(state: &AppState) -> Result<usize, Api
     let active = active_spool_paths(state).await;
     let mut examined = 0_usize;
     let mut removed = 0_usize;
-    while let Some(entry) = entries.next_entry().await.map_err(|error| {
-        ApiError::Runtime(format!("failed to read one-use export root: {error}"))
-    })? {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(ApiError::runtime_context(
+            "failed to read one-use export root",
+        ))?
+    {
         record_bounded_entry(&mut examined, "one-use export sweep")?;
         let name = match entry.file_name().to_str() {
             Some(name) if validate_instance_id(name).is_ok() => name.to_string(),
             _ => continue,
         };
-        let metadata = tokio::fs::symlink_metadata(entry.path())
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to inspect one-use export directory: {error}"
-                ))
-            })?;
+        let metadata =
+            tokio::fs::symlink_metadata(entry.path())
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to inspect one-use export directory",
+                ))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
@@ -114,13 +117,16 @@ async fn sweep_instance_exports(
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read one-use exports: {error}")))?
+        .map_err(ApiError::runtime_context("failed to read one-use exports"))?
     {
         record_bounded_entry(&mut examined, "one-use instance export sweep")?;
         let path = entry.path();
-        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
-            ApiError::Runtime(format!("failed to inspect one-use export: {error}"))
-        })?;
+        let metadata =
+            tokio::fs::symlink_metadata(&path)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to inspect one-use export",
+                ))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || is_checksum_sidecar(&path)
@@ -154,13 +160,13 @@ async fn count_regular_exports(root: &FsPath) -> Result<usize, ApiError> {
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to count artifacts: {error}")))?
+        .map_err(ApiError::runtime_context("failed to count artifacts"))?
     {
         record_bounded_entry(&mut examined, "artifact count")?;
         let path = entry.path();
         let metadata = tokio::fs::symlink_metadata(&path)
             .await
-            .map_err(|error| ApiError::Runtime(format!("failed to inspect artifact: {error}")))?;
+            .map_err(ApiError::runtime_context("failed to inspect artifact"))?;
         if metadata.is_file() && !metadata.file_type().is_symlink() && !is_checksum_sidecar(&path) {
             count += 1;
         }
@@ -179,8 +185,8 @@ fn record_bounded_entry(examined: &mut usize, context: &'static str) -> Result<(
 async fn remove_download_spool(path: PathBuf) -> Result<(), ApiError> {
     tokio::task::spawn_blocking(move || remove_download_spool_sync(&path))
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to join export cleanup: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to remove one-use export: {error}")))
+        .map_err(ApiError::runtime_context("failed to join export cleanup"))?
+        .map_err(ApiError::runtime_context("failed to remove one-use export"))
 }
 
 pub(super) fn remove_download_spool_sync(path: &FsPath) -> Result<(), std::io::Error> {

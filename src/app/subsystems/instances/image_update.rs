@@ -74,7 +74,6 @@ pub async fn update_instance_image(
     .map(ApiResponse::ok)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_instance_image_locked(
     state: AppState,
     operation: tokio::sync::OwnedMutexGuard<()>,

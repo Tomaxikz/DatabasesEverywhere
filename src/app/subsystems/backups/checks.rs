@@ -41,7 +41,7 @@ pub(super) async fn require_instance(
     state: &AppState,
     instance_id: &str,
 ) -> Result<InstanceMetadata, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     state
         .instances
         .get(instance_id)

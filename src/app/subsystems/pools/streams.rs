@@ -57,7 +57,7 @@ pub(crate) async fn logs(
         .docker
         .logs(pool.protocol, &id, query.tail)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     Ok(ApiResponse::ok(serde_json::json!({"runtime_id":id,
         "stdout":crate::utils::redaction::redact_connection_url(&logs.stdout),
         "stderr":crate::utils::redaction::redact_connection_url(&logs.stderr)})))

@@ -69,7 +69,7 @@ fn caching_sha2_backend_tokens_work_for_mysql_8_9_and_26_backends() {
     assert_eq!(first, second);
     assert_eq!(first.len(), 32);
     assert_eq!(
-        crate::utils::hex::encode_lower(&first),
+        hex::encode(&first),
         "32ba59bc9c089a5c16872d9f2a14dccab67d1045ae3a721585fe1c37688e8dec"
     );
     assert_ne!(
@@ -85,7 +85,7 @@ fn native_password_tokens_keep_the_existing_sha1_format() {
         "14e65567abdb5135d0cfd9a70b3032c179a49ee7"
     );
     assert_eq!(
-        crate::utils::hex::encode_lower(&mariadb::native_password_token(
+        hex::encode(mariadb::native_password_token(
             "secret",
             b"12345678901234567890",
         )),

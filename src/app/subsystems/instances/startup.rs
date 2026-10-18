@@ -20,15 +20,15 @@ pub(super) async fn prepare_dedicated_start(
     metadata: &mut InstanceMetadata,
 ) -> Result<(), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let disk_limiter = persisted_disk_limiter(state, metadata);
     disk_limiter
         .check_method_change(&metadata.limits.disk_enforcement_method)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(ApiError::conflict)?;
     check_disk_method(&disk_limiter, metadata)?;
     let expected_data_source = disk_limiter
         .container_data_path(&paths.data)
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     match state
         .docker
         .verify_data_bind(
@@ -64,17 +64,15 @@ pub(super) async fn prepare_dedicated_start(
                 .manager
                 .upsert(metadata.clone())
                 .await
-                .map_err(|error| {
-                    ApiError::Runtime(format!(
-                        "failed to clear recovered disk-limit block: {error}"
-                    ))
-                })?;
+                .map_err(ApiError::runtime_context(
+                    "failed to clear recovered disk-limit block",
+                ))?;
         }
     }
     disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     Ok(())
 }
 
@@ -143,11 +141,9 @@ pub(super) async fn verify_startup_readiness(
         false,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "database compatibility attestation failed during activation: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "database compatibility attestation failed during activation",
+    ))?;
     if !compatibility.compatible {
         return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
             || "database engine version is unsupported".to_string(),

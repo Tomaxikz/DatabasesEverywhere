@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum::{
@@ -15,15 +16,24 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use governor::{
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock, Reference},
+    middleware::NoOpMiddleware,
+    nanos::Nanos,
+    state::keyed::HashMapStateStore,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     auth::{api_token::AcceptedApiToken, jwt},
     routes::http::{policy::websocket_token, response::ApiError, router::AppState},
-    utils::{hex::encode_lower, time::now_unix},
+    utils::time::now_unix,
 };
 
+/// A key idle for this long has a fully replenished per-minute quota, so its
+/// bookkeeping can be dropped without changing any rate decision.
 const API_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_API_RATE_LIMIT_KEYS: usize = 65_536;
 const API_RATE_LIMIT_SHARDS: usize = 64;
@@ -33,16 +43,18 @@ const UNAUTHENTICATED_RATE_LIMIT_BUCKETS: u16 = 4096;
 const MAX_ACTIVE_API_REQUESTS: usize = 1024;
 const MAX_CONSUMED_WEBSOCKET_JTIS: usize = 65_536;
 
+type KeyedRateLimiter<K, C> =
+    RateLimiter<K, HashMapStateStore<K>, C, NoOpMiddleware<<C as Clock>::Instant>>;
+
 #[derive(Debug, Clone)]
-pub struct ApiRateLimiter {
-    inner: Arc<[Mutex<RateLimitShard>; API_RATE_LIMIT_SHARDS]>,
+pub struct ApiRateLimiter<C: Clock = DefaultClock> {
+    inner: Arc<[Mutex<RateLimitShard<C>>; API_RATE_LIMIT_SHARDS]>,
     consumed_websocket_jtis: Arc<Mutex<HashMap<String, i64>>>,
     active_websockets: Arc<Semaphore>,
     websocket_drain: Arc<Notify>,
     active_requests: Arc<Semaphore>,
     active_heartbeat_requests: Arc<Semaphore>,
     request_capacity_logged: Arc<AtomicBool>,
-    max_requests: u32,
     limits: crate::config::RuntimeLimits,
 }
 
@@ -58,9 +70,16 @@ impl ApiRateLimiter {
     }
 
     pub(crate) fn with_limits(max_requests: u32, limits: &crate::config::RuntimeLimits) -> Self {
+        Self::with_clock(max_requests, limits, DefaultClock::default())
+    }
+}
+
+impl<C: Clock + Clone> ApiRateLimiter<C> {
+    fn with_clock(max_requests: u32, limits: &crate::config::RuntimeLimits, clock: C) -> Self {
+        let quota = Quota::per_minute(NonZeroU32::new(max_requests).unwrap_or(NonZeroU32::MIN));
         Self {
             inner: Arc::new(std::array::from_fn(|_| {
-                Mutex::new(RateLimitShard::default())
+                Mutex::new(RateLimitShard::new(quota, clock.clone()))
             })),
             consumed_websocket_jtis: Arc::default(),
             active_websockets: Arc::new(Semaphore::new(limits.api_websockets)),
@@ -68,7 +87,6 @@ impl ApiRateLimiter {
             active_requests: Arc::new(Semaphore::new(limits.api_requests)),
             active_heartbeat_requests: Arc::new(Semaphore::new(limits.api_heartbeat_requests)),
             request_capacity_logged: Arc::new(AtomicBool::new(false)),
-            max_requests: max_requests.max(1),
             limits: limits.clone(),
         }
     }
@@ -122,35 +140,29 @@ impl ApiRateLimiter {
     }
 
     async fn allow(&self, identity: &RateLimitIdentity) -> RateLimitDecision {
-        let now = Instant::now();
         let shard_index = rate_limit_shard(&identity.key);
         let mut shard = self.inner[shard_index].lock().await;
-        evict_expired_windows(&mut shard, now);
+        let now = shard.limiter.clock().now();
+        shard.evict_idle_keys(now);
         if let Some(rejection) = make_room_for_new_key(&mut shard, identity) {
             return rejection;
         }
-        let window = shard
-            .windows
+        let allowed = shard.limiter.check_key(&identity.key).is_ok();
+        let key = shard
+            .keys
             .entry(identity.key.clone())
-            .or_insert_with(|| RateWindow {
-                started_at: now,
+            .or_insert_with(|| KeyState {
                 last_seen: now,
-                count: 0,
                 trusted: identity.trusted,
                 rejection_logged: false,
             });
-        if now.duration_since(window.started_at) >= API_RATE_LIMIT_WINDOW {
-            window.started_at = now;
-            window.count = 0;
-            window.rejection_logged = false;
-        }
-        window.last_seen = now;
-        window.count = window.count.saturating_add(1);
-        if window.count <= self.max_requests {
+        key.last_seen = now;
+        if allowed {
+            key.rejection_logged = false;
             RateLimitDecision::Allowed
         } else {
-            let should_log = !window.rejection_logged;
-            window.rejection_logged = true;
+            let should_log = !key.rejection_logged;
+            key.rejection_logged = true;
             RateLimitDecision::Rejected { should_log }
         }
     }
@@ -213,35 +225,61 @@ pub enum WebSocketAdmissionError {
     ConnectionCapacity,
 }
 
-#[derive(Debug, Default)]
-struct RateLimitShard {
-    windows: HashMap<RateLimitKey, RateWindow>,
+/// One shard of the per-key limiter. `limiter` holds the GCRA state that
+/// decides admission; `keys` mirrors the tracked keys so the shard can cap
+/// their number, prefer evicting untrusted keys, and log rejections once.
+#[derive(Debug)]
+struct RateLimitShard<C: Clock> {
+    limiter: KeyedRateLimiter<RateLimitKey, C>,
+    keys: HashMap<RateLimitKey, KeyState<C::Instant>>,
+    last_sweep: C::Instant,
     capacity_rejection_logged: bool,
 }
 
-fn evict_expired_windows(inner: &mut RateLimitShard, now: Instant) {
-    if inner.windows.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
-        inner.capacity_rejection_logged = false;
-        return;
+impl<C: Clock> RateLimitShard<C> {
+    fn new(quota: Quota, clock: C) -> Self {
+        let limiter = RateLimiter::hashmap_with_clock(quota, clock);
+        let last_sweep = limiter.clock().now();
+        Self {
+            limiter,
+            keys: HashMap::new(),
+            last_sweep,
+            capacity_rejection_logged: false,
+        }
     }
-    inner
-        .windows
-        .retain(|_, window| now.duration_since(window.started_at) < API_RATE_LIMIT_WINDOW);
-    if inner.windows.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
-        inner.capacity_rejection_logged = false;
+
+    /// Drops keys idle for a full window, both from the bookkeeping map and
+    /// (via `retain_recent`) from governor's store. Runs once per window, or on
+    /// every call while the shard is full.
+    fn evict_idle_keys(&mut self, now: C::Instant) {
+        let window = Nanos::from(API_RATE_LIMIT_WINDOW);
+        let full = self.keys.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD;
+        let sweep_due = now.duration_since(self.last_sweep) >= window;
+        if sweep_due || full {
+            self.keys
+                .retain(|_, key| now.duration_since(key.last_seen) < window);
+            self.limiter.retain_recent();
+        }
+        if sweep_due {
+            self.limiter.shrink_to_fit();
+            self.last_sweep = now;
+        }
+        if self.keys.len() < MAX_API_RATE_LIMIT_KEYS_PER_SHARD {
+            self.capacity_rejection_logged = false;
+        }
     }
 }
 
-fn make_room_for_new_key(
-    shard: &mut RateLimitShard,
+fn make_room_for_new_key<C: Clock>(
+    shard: &mut RateLimitShard<C>,
     identity: &RateLimitIdentity,
 ) -> Option<RateLimitDecision> {
-    let shard_is_full = shard.windows.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD;
-    if !shard_is_full || shard.windows.contains_key(&identity.key) {
+    let shard_is_full = shard.keys.len() >= MAX_API_RATE_LIMIT_KEYS_PER_SHARD;
+    if !shard_is_full || shard.keys.contains_key(&identity.key) {
         return None;
     }
     let untrusted_victim =
-        least_recently_seen_key(shard.windows.iter().filter(|(_, window)| !window.trusted));
+        least_recently_seen_key(shard.keys.iter().filter(|(_, key)| !key.trusted));
     let victim = match untrusted_victim {
         Some(key) => key,
         None if !identity.trusted => {
@@ -249,18 +287,19 @@ fn make_room_for_new_key(
             shard.capacity_rejection_logged = true;
             return Some(RateLimitDecision::Rejected { should_log });
         }
-        None => least_recently_seen_key(shard.windows.iter())?,
+        None => least_recently_seen_key(shard.keys.iter())?,
     };
-    shard.windows.remove(&victim);
+    // The victim's GCRA state stays in governor's store until it has fully
+    // replenished, so evicting a key never refills its quota early.
+    shard.keys.remove(&victim);
     shard.capacity_rejection_logged = false;
     None
 }
 
-fn least_recently_seen_key<'a>(
-    windows: impl Iterator<Item = (&'a RateLimitKey, &'a RateWindow)>,
+fn least_recently_seen_key<'a, I: Reference + 'a>(
+    keys: impl Iterator<Item = (&'a RateLimitKey, &'a KeyState<I>)>,
 ) -> Option<RateLimitKey> {
-    windows
-        .min_by_key(|(_, window)| window.last_seen)
+    keys.min_by_key(|(_, key)| key.last_seen)
         .map(|(key, _)| key.clone())
 }
 
@@ -286,11 +325,9 @@ fn rate_limit_shard(key: &RateLimitKey) -> usize {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RateWindow {
-    started_at: Instant,
-    last_seen: Instant,
-    count: u32,
+#[derive(Debug, Clone, Copy)]
+struct KeyState<I> {
+    last_seen: I,
     trusted: bool,
     rejection_logged: bool,
 }
@@ -325,7 +362,7 @@ impl RateLimitKey {
             Self::Authenticated {
                 kind, fingerprint, ..
             } => {
-                format!("{}-peer:{}", kind.as_str(), encode_lower(fingerprint))
+                format!("{}-peer:{}", kind.as_str(), hex::encode(fingerprint))
             }
             Self::Anonymous { bucket } => format!("peer-bucket:{bucket}"),
         }
@@ -737,6 +774,58 @@ mod tests {
             limiter.allow(&second_peer).await,
             RateLimitDecision::Allowed
         );
+    }
+
+    #[tokio::test]
+    async fn quota_does_not_double_across_a_minute_boundary() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter =
+            ApiRateLimiter::with_clock(60, &crate::config::RuntimeLimits::default(), clock.clone());
+        let identity = RateLimitIdentity {
+            key: RateLimitKey::Anonymous { bucket: 7 },
+            trusted: false,
+        };
+        let allowed_until_rejected = async || {
+            let mut allowed = 0;
+            while limiter.allow(&identity).await == RateLimitDecision::Allowed {
+                allowed += 1;
+            }
+            allowed
+        };
+
+        // A fixed window opened at t=0 would admit 60 at t=59s and another 60
+        // at t=61s. GCRA only refills one request per second.
+        assert_eq!(limiter.allow(&identity).await, RateLimitDecision::Allowed);
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(allowed_until_rejected().await, 60);
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(allowed_until_rejected().await, 2);
+    }
+
+    #[tokio::test]
+    async fn idle_keys_are_evicted_from_governor_after_a_window() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter =
+            ApiRateLimiter::with_clock(2, &crate::config::RuntimeLimits::default(), clock.clone());
+        let identity = RateLimitIdentity {
+            key: RateLimitKey::Anonymous { bucket: 3 },
+            trusted: false,
+        };
+        assert_eq!(limiter.allow(&identity).await, RateLimitDecision::Allowed);
+        let shard_index = rate_limit_shard(&identity.key);
+        assert_eq!(limiter.inner[shard_index].lock().await.limiter.len(), 1);
+
+        clock.advance(API_RATE_LIMIT_WINDOW);
+        let other = RateLimitIdentity {
+            key: RateLimitKey::Anonymous {
+                bucket: 3 + API_RATE_LIMIT_SHARDS as u16,
+            },
+            trusted: false,
+        };
+        assert_eq!(limiter.allow(&other).await, RateLimitDecision::Allowed);
+        let shard = limiter.inner[shard_index].lock().await;
+        assert!(!shard.keys.contains_key(&identity.key));
+        assert_eq!(shard.limiter.len(), 1);
     }
 
     #[tokio::test]

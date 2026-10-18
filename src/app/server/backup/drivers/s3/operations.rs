@@ -84,7 +84,7 @@ impl S3BackupDriver {
     pub fn identity(&self) -> String {
         format!(
             "s3:{}|{}|{}",
-            self.endpoint.base,
+            self.base,
             self.config.bucket,
             self.config.prefix.trim_matches('/')
         )

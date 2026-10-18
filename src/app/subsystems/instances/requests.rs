@@ -55,13 +55,12 @@ pub struct LimitsRequest {
 }
 
 pub fn validate_create_request(request: &CreateInstanceRequest) -> Result<(), ApiError> {
-    validate_instance_id(&request.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(&request.instance_id).map_err(ApiError::bad_request)?;
     validate_database_name(&request.database)?;
     request
         .deployment_mode
         .check(request.protocol)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     if request.deployment_mode == DeploymentMode::Shared
         && is_reserved_shared_db(request.protocol, &request.database)
     {
@@ -126,7 +125,7 @@ fn validate_shared_placement(request: &CreateInstanceRequest) -> Result<(), ApiE
     let pool_id = request.pool_id.as_deref().ok_or_else(|| {
         ApiError::BadRequest("shared deployment requires pool_id; create the pool first".into())
     })?;
-    validate_instance_id(pool_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(pool_id).map_err(ApiError::bad_request)?;
     Ok(())
 }
 
@@ -239,8 +238,7 @@ fn validate_database_identifier(kind: &str, value: &str) -> Result<(), ApiError>
 }
 
 pub fn validate_limits(limits: &LimitsRequest) -> Result<(), ApiError> {
-    validate_runtime_limits(limits.cpu_cores, limits.memory_mib)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_runtime_limits(limits.cpu_cores, limits.memory_mib).map_err(ApiError::bad_request)?;
     if limits.disk_mib == 0 {
         return Err(ApiError::BadRequest(
             "disk_mib must be greater than zero".to_string(),

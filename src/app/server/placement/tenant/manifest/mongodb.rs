@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use bson::{raw::RawBsonRef, raw::RawDocument};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, BufReader};
-use uuid::Uuid;
 
 use super::{
     MAX_OBJECTS, ManifestError,
@@ -41,8 +40,13 @@ pub(super) async fn collect(
             continue;
         }
         let remaining = context.max_data_bytes.saturating_sub(scanned_bytes);
-        let path = temp_path();
-        let guard = TempFileGuard(path.clone());
+        // A private directory owned by this scan; the stream helper creates
+        // the dump file itself (create-new) inside it. Dropping the
+        // directory removes both.
+        let scratch = tempfile::Builder::new()
+            .prefix("dbev-manifest-")
+            .tempdir()?;
+        let path = scratch.path().join("collection.bson");
         let result = dump_collection(context, &collection.name, &path, remaining).await?;
         scanned_bytes = scanned_bytes
             .checked_add(result.transferred_bytes)
@@ -52,7 +56,7 @@ pub(super) async fn collect(
         }
         let key = object_key("collection-data", &[&collection.name]);
         let digest = digest_bson_file(context, &path, &key).await?;
-        drop(guard);
+        drop(scratch);
         collected.push_data(DataRecord::new(key, digest)?)?;
     }
     Ok(collected)
@@ -234,26 +238,6 @@ fn validate_bson(bytes: &[u8]) -> Result<(), ManifestError> {
 
 fn malformed_bson() -> ManifestError {
     ManifestError::InvalidCatalog("MongoDB dump contains malformed BSON")
-}
-
-fn temp_path() -> PathBuf {
-    std::env::temp_dir().join(format!("dbev-manifest-{}.bson", Uuid::new_v4()))
-}
-
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
-                path = %self.0.display(),
-                %error,
-                "failed to remove temporary MongoDB manifest stream"
-            ),
-        }
-    }
 }
 
 #[cfg(test)]

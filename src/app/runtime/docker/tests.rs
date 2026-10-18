@@ -7,7 +7,6 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt;
-use secrecy::SecretString;
 
 use super::{
     transfer::{
@@ -575,10 +574,7 @@ fn postgres_spec() -> DockerInstanceSpec {
         data_target: "/var/lib/postgresql".to_string(),
         extra_mounts: Vec::new(),
         socket_bridges: Vec::new(),
-        env: vec![DockerEnv {
-            key: "POSTGRES_PASSWORD".to_string(),
-            value: SecretString::from("super-secret"),
-        }],
+        env: vec![DockerEnv::plain("POSTGRES_PASSWORD", "super-secret")],
         command: Vec::new(),
     }
 }

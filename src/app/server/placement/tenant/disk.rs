@@ -13,7 +13,6 @@ use crate::{
     server::paths::InstancePaths,
     server::placement::EngineRuntime,
     utils::{
-        hex::encode_lower,
         limits::{InstanceLimits, mib_to_bytes},
         shell::sh_quote,
     },
@@ -379,7 +378,7 @@ fn project_registry_root(config: &Config) -> PathBuf {
 }
 
 fn storage_key(database: &str) -> String {
-    encode_lower(&Sha256::digest(database.as_bytes())[..16])
+    hex::encode(&Sha256::digest(database.as_bytes())[..16])
 }
 
 fn postgres_container_path(key: &str) -> String {

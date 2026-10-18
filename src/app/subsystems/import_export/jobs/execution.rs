@@ -323,8 +323,8 @@ async fn acquire_physical_import_staging(
 }
 
 fn physical_data_parent(state: &AppState, instance_id: &str) -> Result<PathBuf, ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     paths.data.parent().map(FsPath::to_path_buf).ok_or_else(|| {
         ApiError::Runtime("physical import data directory has no parent".to_string())
     })

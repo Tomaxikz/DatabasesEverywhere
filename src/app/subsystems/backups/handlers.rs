@@ -228,5 +228,5 @@ pub async fn restore_instance_backup(
         async move { restore_backup(state, instance_id, backup_id, reason, admission).await },
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("backup restore task failed: {error}")))?
+    .map_err(ApiError::runtime_context("backup restore task failed"))?
 }

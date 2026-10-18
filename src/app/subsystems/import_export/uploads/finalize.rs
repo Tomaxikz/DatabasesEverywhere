@@ -130,7 +130,7 @@ pub(super) async fn store_inspection_catalog(
         return Err(ApiError::Conflict(message.to_string()));
     }
     let catalog_json = serde_json::to_string(catalog)
-        .map_err(|error| ApiError::Runtime(format!("failed to encode upload catalog: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to encode upload catalog"))?;
     let confirmed_archive_format =
         confirmed_storage_archive_format(upload.protocol, catalog.detected_archive_format);
     let restored = state
@@ -192,6 +192,7 @@ pub(super) fn upload_catalog(upload: &ImportUpload) -> Result<DumpInspection, Ap
     let catalog = upload.catalog_json.as_deref().ok_or_else(|| {
         ApiError::Conflict("upload catalog is unavailable; inspect this upload first".into())
     })?;
-    serde_json::from_str(catalog)
-        .map_err(|error| ApiError::Runtime(format!("stored upload catalog is invalid: {error}")))
+    serde_json::from_str(catalog).map_err(ApiError::runtime_context(
+        "stored upload catalog is invalid",
+    ))
 }

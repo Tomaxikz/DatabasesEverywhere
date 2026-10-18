@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256, digest::Output};
 use uuid::Uuid;
 
 use super::{MAX_OBJECTS, MAX_SCHEMA_BYTES, ManifestError};
-use crate::{databases::protocol::Protocol, utils::hex::encode_lower};
+use crate::databases::protocol::Protocol;
 
 const MANIFEST_VERSION: &[u8] = b"dbev-tenant-integrity-v2";
 const SCHEMA_VERSION: &[u8] = b"dbev-tenant-schema-v2";
@@ -29,7 +29,7 @@ impl ManifestChallenge {
     }
 
     pub(super) fn hex(self) -> String {
-        encode_lower(&self.0)
+        hex::encode(self.0)
     }
 }
 
@@ -224,9 +224,9 @@ pub(super) fn finish(
         object_count: collected.schema.len() as u64,
         counted_object_count: collected.data.len() as u64,
         row_count,
-        schema_sha256: encode_lower(&schema_digest),
-        data_sha256: encode_lower(&data_digest),
-        fingerprint_sha256: encode_lower(&manifest_hasher.finalize()),
+        schema_sha256: hex::encode(schema_digest),
+        data_sha256: hex::encode(data_digest),
+        fingerprint_sha256: hex::encode(manifest_hasher.finalize()),
     })
 }
 

@@ -97,11 +97,9 @@ async fn rewrite_schema_qualifiers(
         )
     })
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "mysql schema qualifier rewrite worker failed: {error}"
-        ))
-    })?
+    .map_err(ApiError::runtime_context(
+        "mysql schema qualifier rewrite worker failed",
+    ))?
     .map(|_| ())
     .map_err(rewrite_api_error)
 }

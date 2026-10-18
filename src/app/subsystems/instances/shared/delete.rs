@@ -24,7 +24,7 @@ pub(in super::super) async fn delete(
         .manager
         .upsert(metadata.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let result = finish_delete(state, metadata, runtime, purge_reason).await?;
     Ok(ApiResponse::ok(result))
 }
@@ -39,33 +39,29 @@ pub(super) async fn finish_delete(
 
     tenant::disk::prepare_drop(&state.config, &runtime, target(&metadata))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to prepare shared tenant storage deletion: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to prepare shared tenant storage deletion",
+        ))?;
     tenant::drop_tenant(&state.docker, &runtime, target(&metadata))
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to drop shared tenant: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to drop shared tenant"))?;
     tenant::disk::remove(&state.config, &runtime, target(&metadata))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to remove shared tenant disk quota: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to remove shared tenant disk quota",
+        ))?;
     purge_shared_tenant_paths(state, &metadata.instance_id).await?;
     state
         .import_export_jobs
         .delete_for_instance(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to purge instance jobs: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to purge instance jobs"))?;
     state
         .import_uploads
         .repo()
         .delete_for_instance(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to purge import uploads: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to purge import uploads"))?;
     let deleted = match state.manager.delete(&metadata.instance_id).await {
         Ok(deleted) => deleted,
         Err(error) => match state.manager.get_persisted(&metadata.instance_id).await {

@@ -7,6 +7,34 @@ use std::{
 
 const SNAPSHOT_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Treats a missing path as already removed: `ignore_missing(remove_file(p))`.
+pub(crate) fn ignore_missing(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Fails unless `path` is a regular file, without following a final link.
+pub(crate) fn require_regular_file(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    Ok(())
+}
+
+/// Fails unless `path` is a directory, without following a final link.
+pub(crate) fn require_directory(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    Ok(())
+}
+
 fn path_parts(path: &Path) -> Result<(&Path, &OsStr), std::io::Error> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidInput, "file path has no parent directory")

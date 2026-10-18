@@ -23,11 +23,11 @@ pub(super) async fn precheck_major_upgrade(
     );
     check_major_upgrade(metadata.protocol)?;
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
         .for_persisted_method(&metadata.limits.disk_enforcement_method)
         .check_upgrade_cutover(&paths.data)
-        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        .map_err(ApiError::conflict)?;
     let inspection = state
         .docker
         .inspect_instance(metadata.protocol, &metadata.instance_id)

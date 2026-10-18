@@ -36,17 +36,7 @@ impl EngineLifecycle for Clickhouse {
     }
 
     fn dedicated_spec(&self, input: DedicatedSpecInput<'_>) -> DockerInstanceSpec {
-        instance_spec(
-            input.instance_id,
-            input.image,
-            input.database,
-            input.username,
-            input.password,
-            input.data_path,
-            input.hosted_config.unwrap_or_default(),
-            input.sockets,
-            input.socket_bridge_binary,
-        )
+        instance_spec(input)
     }
 
     fn shared_spec(&self, input: SharedSpecInput<'_>) -> Option<DockerInstanceSpec> {

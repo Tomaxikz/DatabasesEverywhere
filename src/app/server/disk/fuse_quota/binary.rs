@@ -1,14 +1,10 @@
-use sha2::Digest;
-use std::io::Read;
 use std::{
     fs::File,
     io::{Error, ErrorKind},
     path::{Path, PathBuf},
 };
 
-use sha2::Sha256;
-
-use super::{EMBEDDED_BINARY, HASH_BUFFER_BYTES, SHA256_HEX_LENGTH};
+use super::{EMBEDDED_BINARY, SHA256_HEX_LENGTH};
 use crate::server::disk::DiskLimitError;
 
 pub(super) async fn resolve_binary(
@@ -120,17 +116,8 @@ fn verify_external_binary(path: &Path, expected_digest: &str) -> Result<(), Erro
     Ok(())
 }
 
-fn sha256_hex(mut file: File) -> Result<String, Error> {
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(crate::utils::hex::encode_lower(&hasher.finalize()))
+fn sha256_hex(file: File) -> Result<String, Error> {
+    crate::utils::hash::sha256_reader(file)
 }
 
 fn open_trusted_root_dir(path: &Path) -> Result<rustix::fd::OwnedFd, Error> {

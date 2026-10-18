@@ -40,9 +40,13 @@ pub async fn node_resource_summary(
 ) -> ApiResult<NodeResourceSummary> {
     auth.require_scope(scopes::RESOURCES_ADMIN)?;
     let instances = state.instances.list().await;
-    let runtimes = state.placements.list().await.map_err(|error| {
-        ApiError::Runtime(format!("failed to load runtime allocation: {error}"))
-    })?;
+    let runtimes = state
+        .placements
+        .list()
+        .await
+        .map_err(ApiError::runtime_context(
+            "failed to load runtime allocation",
+        ))?;
     let allocations = sampler::summarize_allocations(&instances, &runtimes);
     let resource_reports = futures::stream::iter(instances.iter().cloned())
         .map(|metadata| {
@@ -65,12 +69,10 @@ pub async fn node_resource_summary(
         resource_reports,
         shared_runtime_usage,
     );
-    let host_cpu = host_cpu
-        .map_err(|error| ApiError::Runtime(format!("failed to sample host CPU: {error}")))?;
-    let host_memory = host_memory
-        .map_err(|error| ApiError::Runtime(format!("failed to sample host memory: {error}")))?;
-    let host_disk = host_disk
-        .map_err(|error| ApiError::Runtime(format!("failed to sample host disk: {error}")))?;
+    let host_cpu = host_cpu.map_err(ApiError::runtime_context("failed to sample host CPU"))?;
+    let host_memory =
+        host_memory.map_err(ApiError::runtime_context("failed to sample host memory"))?;
+    let host_disk = host_disk.map_err(ApiError::runtime_context("failed to sample host disk"))?;
     let managed = sampler::aggregate_managed_usage(&resource_reports, &shared_runtime_usage);
 
     Ok(ApiResponse::ok(NodeResourceSummary {
@@ -239,7 +241,7 @@ pub(super) async fn dedicated_disk_usage(
     scanner_active: bool,
 ) -> Result<(Option<SoftDiskSnapshot>, Option<u64>), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let scanner_target = SoftDiskTarget {
         instance_id: metadata.instance_id.clone(),
         created_at: metadata.created_at.clone(),
@@ -261,7 +263,7 @@ pub(super) async fn dedicated_disk_usage(
             .map(|sample| sample.used_bytes)
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to measure disk usage: {error}")))?;
+    .map_err(ApiError::runtime_context("failed to measure disk usage"))?;
     Ok((scanner, Some(used)))
 }
 

@@ -1,3 +1,4 @@
+use crate::databases::engine::DedicatedSpecInput;
 use std::path::PathBuf;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -13,28 +14,18 @@ struct TenantBootstrap<'a> {
     password: SecretString,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn instance_spec(
-    instance_id: &str,
-    image: &str,
-    database: &str,
-    username: &str,
-    password: SecretString,
-    root_password: SecretString,
-    data_path: PathBuf,
-    runtime_path: PathBuf,
-) -> DockerInstanceSpec {
+pub(crate) fn instance_spec(input: DedicatedSpecInput<'_>) -> DockerInstanceSpec {
     build_spec(
-        instance_id,
-        image,
+        input.instance_id,
+        input.image,
         Some(TenantBootstrap {
-            database,
-            username,
-            password,
+            database: input.database,
+            username: input.username,
+            password: input.password,
         }),
-        root_password,
-        data_path,
-        runtime_path,
+        input.maintenance_password,
+        input.data_path,
+        input.sockets,
     )
 }
 
@@ -55,7 +46,6 @@ pub fn shared_spec(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_spec(
     runtime_id: &str,
     image: &str,
@@ -75,43 +65,34 @@ fn build_spec(
     let mut env = Vec::new();
     if let Some(tenant) = tenant {
         env.extend([
-            DockerEnv {
-                key: "MARIADB_DATABASE".to_string(),
-                value: SecretString::from(tenant.database.to_string()),
-            },
-            DockerEnv {
-                key: "MARIADB_USER".to_string(),
-                value: SecretString::from(tenant.username.to_string()),
-            },
+            DockerEnv::new(
+                "MARIADB_DATABASE",
+                SecretString::from(tenant.database.to_string()),
+            ),
+            DockerEnv::new(
+                "MARIADB_USER",
+                SecretString::from(tenant.username.to_string()),
+            ),
             DockerEnv {
                 key: "MARIADB_PASSWORD_HASH".to_string(),
                 value: SecretString::from(docker_native_password_hash(
                     tenant.password.expose_secret(),
                 )),
             },
-            DockerEnv {
-                key: "MARIADB_ROOT_PASSWORD_HASH".to_string(),
-                value: SecretString::from(root_password_hash),
-            },
-            DockerEnv {
-                key: "DBE_MARIADB_PASSWORD".to_string(),
-                value: tenant.password,
-            },
-            DockerEnv {
-                key: "DBE_MARIADB_ROOT_PASSWORD".to_string(),
-                value: root_password,
-            },
+            DockerEnv::new(
+                "MARIADB_ROOT_PASSWORD_HASH",
+                SecretString::from(root_password_hash),
+            ),
+            DockerEnv::new("DBE_MARIADB_PASSWORD", tenant.password),
+            DockerEnv::new("DBE_MARIADB_ROOT_PASSWORD", root_password),
         ]);
     } else {
         env.extend([
-            DockerEnv {
-                key: "MARIADB_ROOT_PASSWORD_HASH".to_string(),
-                value: SecretString::from(root_password_hash),
-            },
-            DockerEnv {
-                key: "DBE_MARIADB_ROOT_PASSWORD".to_string(),
-                value: root_password,
-            },
+            DockerEnv::new(
+                "MARIADB_ROOT_PASSWORD_HASH",
+                SecretString::from(root_password_hash),
+            ),
+            DockerEnv::new("DBE_MARIADB_ROOT_PASSWORD", root_password),
         ]);
     }
 
@@ -130,27 +111,20 @@ fn build_spec(
     }
 
     DockerInstanceSpec {
-        instance_id: runtime_id.to_string(),
-        protocol: Protocol::Mariadb,
-        image: image.to_string(),
-        project_id: None,
-        user: None,
-        working_dir: None,
-        entrypoint: None,
-        cpu_cores: 1.0,
-        memory_mib: 1024,
-        disk_mib: 10240,
-        pids_limit: None,
-        data_path,
-        data_target: "/var/lib/mysql".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: "/run/mysqld".to_string(),
             read_only: false,
         }],
-        socket_bridges: Vec::new(),
         env,
         command,
+        ..DockerInstanceSpec::with_defaults(
+            runtime_id,
+            Protocol::Mariadb,
+            image,
+            data_path,
+            "/var/lib/mysql",
+        )
     }
 }
 
@@ -168,16 +142,18 @@ mod tests {
 
     #[test]
     fn uses_mysql_data_directory_and_no_public_port() {
-        let spec = instance_spec(
-            "inst_mysql_1",
-            "mariadb:11",
-            "mysql_1",
-            "app_mysql_1",
-            SecretString::from("secret"),
-            SecretString::from("root-secret"),
-            PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/run"),
-        );
+        let spec = instance_spec(DedicatedSpecInput {
+            instance_id: "inst_mysql_1",
+            image: "mariadb:11",
+            database: "mysql_1",
+            username: "app_mysql_1",
+            password: SecretString::from("secret"),
+            maintenance_password: SecretString::from("root-secret"),
+            data_path: PathBuf::from("/tmp/data"),
+            sockets: PathBuf::from("/tmp/run"),
+            hosted_config: None,
+            socket_bridge_binary: PathBuf::new(),
+        });
 
         assert_eq!(spec.protocol, Protocol::Mariadb);
         assert_eq!(spec.data_target, "/var/lib/mysql");

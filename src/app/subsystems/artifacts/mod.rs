@@ -13,7 +13,6 @@ const MAX_CONSUMED_DOWNLOAD_TICKETS: usize = 16_384;
 const MAX_ACTIVE_DOWNLOADS: usize = 128;
 const MAX_ACTIVE_DOWNLOADS_PER_PEER: usize = 32;
 const DOWNLOAD_STREAM_BUFFER_BYTES: usize = 128 * 1024;
-const HASH_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 mod checksum;
 mod download;

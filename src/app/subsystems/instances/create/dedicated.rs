@@ -417,11 +417,9 @@ pub(crate) async fn attest(state: &AppState, metadata: &InstanceMetadata) -> Res
         true,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "created database container but its compatibility probe failed: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "created database container but its compatibility probe failed",
+    ))?;
     if compatibility.compatible {
         Ok(())
     } else {

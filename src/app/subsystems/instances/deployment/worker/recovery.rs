@@ -1,7 +1,5 @@
 use super::super::{migration_admission_error, migration_error};
-use super::support::{
-    clear_caches, remove_artifact_root, runtime_error, temp_instance_id, tenant_target,
-};
+use super::support::{clear_caches, remove_artifact_root, temp_instance_id, tenant_target};
 use super::{advance_to, advance_with_failure};
 use crate::routes::http::response::ApiError;
 use crate::routes::http::router::AppState;
@@ -34,7 +32,7 @@ async fn lock_shared_runtime(
             .placements
             .reservation_runtime(&temp_id)
             .await
-            .map_err(runtime_error)?
+            .map_err(ApiError::runtime)?
             .map(|runtime| runtime.runtime_id)
     };
     Ok(match runtime_id {
@@ -199,7 +197,7 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
         .manager
         .get_persisted(&migration.instance_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or(ApiError::NotFound)?;
     match migration.target_mode {
         DeploymentMode::Shared => {
@@ -214,13 +212,13 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
         .manager
         .get_persisted(&migration.instance_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or(ApiError::NotFound)?;
     let source_runtime = state
         .placements
         .get(source.runtime_id())
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| ApiError::Conflict("source runtime is missing during rollback".into()))?;
     ensure_runtime_ready(state, &source_runtime).await?;
     if source.deployment_mode == DeploymentMode::Shared {
@@ -230,9 +228,9 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
             .map_err(ApiError::Runtime)?;
         tenant::unfence(&state.docker, &source_runtime, tenant_target(&source))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("source tenant rollback enable failed: {error}"))
-            })?;
+            .map_err(ApiError::runtime_context(
+                "source tenant rollback enable failed",
+            ))?;
     }
     let password = source
         .tenant_password
@@ -245,7 +243,9 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
         password,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("source rollback verification failed: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "source rollback verification failed",
+    ))?;
     let failure = if migration.failure_code.as_deref()
         == Some(MigrationFailure::StructuralValidationTimedOut.code())
     {
@@ -272,7 +272,7 @@ async fn rollback_shared_target(
         .placements
         .reservation_runtime(&temp_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
     {
         Some(runtime) => Some(runtime),
         None => match migration.target_runtime_id.as_deref() {
@@ -280,7 +280,7 @@ async fn rollback_shared_target(
                 .placements
                 .get(runtime_id)
                 .await
-                .map_err(runtime_error)?,
+                .map_err(ApiError::runtime)?,
             None => None,
         },
     };
@@ -288,24 +288,22 @@ async fn rollback_shared_target(
         ensure_runtime_ready(state, &runtime).await?;
         tenant::disk::prepare_drop(&state.config, &runtime, tenant_target(source))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!(
-                    "target rollback storage preparation failed: {error}"
-                ))
-            })?;
+            .map_err(ApiError::runtime_context(
+                "target rollback storage preparation failed",
+            ))?;
         tenant::drop_tenant(&state.docker, &runtime, tenant_target(source))
             .await
-            .map_err(|error| ApiError::Runtime(format!("target rollback failed: {error}")))?;
+            .map_err(ApiError::runtime_context("target rollback failed"))?;
         tenant::disk::remove(&state.config, &runtime, tenant_target(source))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("target rollback quota cleanup failed: {error}"))
-            })?;
+            .map_err(ApiError::runtime_context(
+                "target rollback quota cleanup failed",
+            ))?;
         let _ = state
             .placements
             .release(&temp_id)
             .await
-            .map_err(runtime_error)?;
+            .map_err(ApiError::runtime)?;
         reapply_runtime_limits(state, &runtime.runtime_id).await?;
     }
     crate::subsystems::instances::purge_shared_tenant_paths(state, &temp_id).await
@@ -329,14 +327,14 @@ async fn rollback_dedicated_target(
         .placements
         .get(&migration.instance_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
     {
         crate::subsystems::instances::purge_retired_runtime_paths(state, &runtime).await?;
         state
             .placements
             .delete(&runtime.runtime_id)
             .await
-            .map_err(runtime_error)?;
+            .map_err(ApiError::runtime)?;
     } else {
         crate::subsystems::instances::purge_provisional_runtime_paths(
             state,
@@ -350,12 +348,12 @@ async fn rollback_dedicated_target(
         .manager
         .delete_compatibility(&migration.instance_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     state
         .manager
         .clear_staged_admin_secrets(&migration.instance_id)
         .await
-        .map_err(runtime_error)
+        .map_err(ApiError::runtime)
 }
 
 async fn finish_forward_cleanup(
@@ -368,13 +366,13 @@ async fn finish_forward_cleanup(
         .manager
         .get_persisted(&migration.instance_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or(ApiError::NotFound)?;
     let target_runtime = state
         .placements
         .get(target.runtime_id())
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| ApiError::Conflict("committed target runtime is missing".into()))?;
     ensure_runtime_ready(state, &target_runtime).await?;
     if target.deployment_mode == DeploymentMode::Shared {
@@ -415,7 +413,7 @@ async fn finish_forward_cleanup(
         .placements
         .get(&migration.source_runtime_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
     {
         match migration.source_mode {
             DeploymentMode::Dedicated => retire_dedicated_source(state, &source_runtime).await?,
@@ -454,12 +452,12 @@ pub(super) async fn retire_dedicated_source(
         .manager
         .delete_compatibility(&runtime.runtime_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     state
         .placements
         .delete(&runtime.runtime_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     Ok(())
 }
 
@@ -472,23 +470,23 @@ pub(super) async fn retire_shared_source(
     ensure_runtime_ready(state, runtime).await?;
     tenant::disk::prepare_drop(&state.config, runtime, tenant_target(source))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("shared source storage preparation failed: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "shared source storage preparation failed",
+        ))?;
     tenant::drop_tenant(&state.docker, runtime, tenant_target(source))
         .await
-        .map_err(|error| ApiError::Runtime(format!("shared source cleanup failed: {error}")))?;
+        .map_err(ApiError::runtime_context("shared source cleanup failed"))?;
     tenant::disk::remove(&state.config, runtime, tenant_target(source))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("shared source quota cleanup failed: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "shared source quota cleanup failed",
+        ))?;
     let reservation_id = temp_instance_id(migration_id)?;
     state
         .placements
         .release(&reservation_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     reapply_runtime_limits(state, &runtime.runtime_id).await
 }
 
@@ -497,7 +495,7 @@ async fn reapply_runtime_limits(state: &AppState, runtime_id: &str) -> Result<()
         .placements
         .get(runtime_id)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
     else {
         return Ok(());
     };
@@ -520,24 +518,22 @@ async fn apply_tenant_disk(
         metadata.limits.disk_mib,
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("shared tenant disk limit failed: {error}")))?;
+    .map_err(ApiError::runtime_context("shared tenant disk limit failed"))?;
     let changed = tenant::disk::update_state(
         &mut metadata.limits,
         &mut metadata.disk_limit_blocked,
         &disk,
     )
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "shared tenant disk boundary could not be restored during migration recovery: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "shared tenant disk boundary could not be restored during migration recovery",
+    ))?;
     if changed {
         metadata.updated_at = now_rfc3339();
         state
             .manager
             .upsert_fenced(metadata.clone())
             .await
-            .map_err(runtime_error)?;
+            .map_err(ApiError::runtime)?;
     }
     Ok(())
 }
@@ -554,7 +550,7 @@ async fn ensure_runtime_ready(state: &AppState, runtime: &EngineRuntime) -> Resu
         .docker
         .inspect_instance(runtime.protocol, &runtime.runtime_id)
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     match inspection.status {
         DockerContainerStatus::Running | DockerContainerStatus::Starting => {}
         DockerContainerStatus::Created | DockerContainerStatus::Stopped => {
@@ -562,7 +558,7 @@ async fn ensure_runtime_ready(state: &AppState, runtime: &EngineRuntime) -> Resu
                 .docker
                 .start(runtime.protocol, &runtime.runtime_id)
                 .await
-                .map_err(runtime_error)?;
+                .map_err(ApiError::runtime)?;
         }
         DockerContainerStatus::Failed => {
             return Err(ApiError::Conflict(format!(
@@ -579,7 +575,7 @@ async fn ensure_runtime_ready(state: &AppState, runtime: &EngineRuntime) -> Resu
             RECOVERY_READY_TIMEOUT,
         )
         .await
-        .map_err(runtime_error)?;
+        .map_err(ApiError::runtime)?;
     Ok(())
 }
 

@@ -202,21 +202,23 @@ impl HttpPhaseReport {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_histograms(
         name: impl Into<String>,
         wall_duration: Duration,
         active_load_duration: Duration,
-        attempted_requests: usize,
-        successful_requests: usize,
-        rate_limited_requests: usize,
-        transport_errors: usize,
-        status_codes: BTreeMap<String, usize>,
-        target_requests: BTreeMap<String, usize>,
+        counts: PhaseCounts,
         retained_request_samples: usize,
         all_latencies: &Histogram<u64>,
         successful_latencies: &Histogram<u64>,
     ) -> Self {
+        let PhaseCounts {
+            attempted_requests,
+            successful_requests,
+            rate_limited_requests,
+            transport_errors,
+            status_codes,
+            target_requests,
+        } = counts;
         let seconds = wall_duration.as_secs_f64();
         let wall_rate = |count: usize| per_second(count, seconds);
         let active_seconds = active_load_duration.as_secs_f64();
@@ -244,6 +246,17 @@ impl HttpPhaseReport {
             successful_latency_ms: LatencySummary::from_histogram(successful_latencies),
         }
     }
+}
+
+/// Request counters of one benchmark phase.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PhaseCounts {
+    pub attempted_requests: usize,
+    pub successful_requests: usize,
+    pub rate_limited_requests: usize,
+    pub transport_errors: usize,
+    pub status_codes: BTreeMap<String, usize>,
+    pub target_requests: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]

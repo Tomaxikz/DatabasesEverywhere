@@ -17,11 +17,9 @@ pub(super) async fn wrapper_lines(
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || wrapper_lines_blocking(&path, expected_bytes))
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to join PostgreSQL dump wrapper inspection: {error}"
-            ))
-        })?
+        .map_err(ApiError::runtime_context(
+            "failed to join PostgreSQL dump wrapper inspection",
+        ))?
         .map_err(|error| {
             if error.kind() == ErrorKind::InvalidData {
                 ApiError::BadRequest(format!(

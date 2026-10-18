@@ -304,7 +304,6 @@ pub enum DockerSecurityError {
 mod tests {
     use super::*;
     use crate::{databases::protocol::Protocol, runtime::docker::DockerEnv};
-    use secrecy::SecretString;
 
     #[test]
     fn applies_hardening_defaults() {
@@ -528,10 +527,7 @@ mod tests {
             data_target: "/var/lib/postgresql".to_string(),
             extra_mounts: Vec::new(),
             socket_bridges: Vec::new(),
-            env: vec![DockerEnv {
-                key: "POSTGRES_PASSWORD".to_string(),
-                value: SecretString::from("secret"),
-            }],
+            env: vec![DockerEnv::plain("POSTGRES_PASSWORD", "secret")],
             command: Vec::new(),
         }
     }

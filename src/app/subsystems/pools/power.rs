@@ -39,7 +39,7 @@ impl PoolGuard {
             .placements
             .reservations(runtime_id)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         let mut jobs = Vec::new();
         let mut tenants = Vec::new();
         let mut ids = Vec::new();
@@ -81,7 +81,7 @@ impl PoolGuard {
             .migrations()
             .list_active()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         if active
             .iter()
             .any(|migration| migration_involves_runtime(migration, runtime_id))
@@ -95,7 +95,7 @@ impl PoolGuard {
             .placements
             .tenants(runtime_id)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         current_ids.sort_unstable();
         if current.created_at != snapshot.created_at
             || current.owner != snapshot.owner
@@ -160,7 +160,7 @@ pub(super) async fn change(
                     let restart = action == LifecycleAction::Restart;
                     lifecycle::activate_locked(&state, &mut pool, restart)
                         .await
-                        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                        .map_err(ApiError::runtime)?;
                 }
             }
             LifecycleAction::Stop | LifecycleAction::Kill => {
@@ -171,7 +171,7 @@ pub(super) async fn change(
         Ok(())
     })
     .await
-    .map_err(|error| ApiError::Runtime(error.to_string()))?
+    .map_err(ApiError::runtime)?
 }
 
 async fn stop_locked(
@@ -183,7 +183,7 @@ async fn stop_locked(
     lifecycle::fence_runtime(state, &pool.runtime_id).await;
     lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let stopped = if action == LifecycleAction::Kill {
         state.docker.kill(pool.protocol, &pool.runtime_id).await
     } else {
@@ -206,7 +206,7 @@ async fn stop_locked(
     pool.updated_at = crate::utils::time::now_rfc3339();
     lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     lifecycle::clear_runtime_caches(state, &pool.runtime_id).await;
     Ok(())
 }

@@ -73,7 +73,7 @@ pub(super) async fn create_download_url(
         &claims,
         &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
     )
-    .map_err(|error| ApiError::Runtime(format!("failed to issue download token: {error}")))?;
+    .map_err(ApiError::runtime_context("failed to issue download token"))?;
     // Keep the credential-bearing URL origin-relative. Building an absolute URL
     // from Host or X-Forwarded-* would let an untrusted proxy/client poison it.
     let url = kind.download_path(instance_id, name, &token);

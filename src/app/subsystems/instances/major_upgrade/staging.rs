@@ -315,14 +315,14 @@ pub(super) async fn recreate_empty_instance(
 ) -> Result<(), ApiError> {
     let container_user = prepare_instance_container_user(&state.docker, paths, metadata.protocol)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let disk_limiter =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
             .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method);
     let disk = disk_limiter
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let container_data_path = disk.container_data_path.unwrap_or(paths.data.clone());
     let mut spec = image_update_spec(
         metadata,

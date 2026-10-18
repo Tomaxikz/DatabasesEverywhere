@@ -100,11 +100,12 @@ impl ImportUploadService {
         root: &std::path::Path,
         requested: u64,
     ) -> Result<ImportStagingPermit, ApiError> {
-        let metadata = tokio::fs::symlink_metadata(root).await.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to inspect import staging filesystem: {error}"
-            ))
-        })?;
+        let metadata =
+            tokio::fs::symlink_metadata(root)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to inspect import staging filesystem",
+                ))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ApiError::Runtime(
                 "import staging filesystem root must be a real directory".to_string(),
@@ -131,9 +132,12 @@ impl ImportUploadService {
         root: &std::path::Path,
         requested: u64,
     ) -> Result<DiskCapacityReservation, ApiError> {
-        let metadata = tokio::fs::symlink_metadata(root).await.map_err(|error| {
-            ApiError::Runtime(format!("failed to inspect output filesystem: {error}"))
-        })?;
+        let metadata =
+            tokio::fs::symlink_metadata(root)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to inspect output filesystem",
+                ))?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ApiError::Runtime(
                 "output filesystem root must be a real directory".to_string(),

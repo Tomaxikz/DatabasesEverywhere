@@ -132,11 +132,9 @@ pub(crate) async fn import_for_deployment_migration(
             max_prepared_bytes: Some(
                 tokio::fs::metadata(artifact_path)
                     .await
-                    .map_err(|error| {
-                        ApiError::Runtime(format!(
-                            "failed to inspect deployment migration artifact: {error}"
-                        ))
-                    })?
+                    .map_err(ApiError::runtime_context(
+                        "failed to inspect deployment migration artifact",
+                    ))?
                     .len(),
             ),
             ..LogicalImportControls::default()

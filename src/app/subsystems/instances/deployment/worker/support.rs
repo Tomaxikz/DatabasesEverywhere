@@ -112,10 +112,8 @@ pub(super) async fn remove_artifact_root(state: &AppState, migration_id: &str) {
         return;
     };
     let Some(root) = path.parent() else { return };
-    match tokio::fs::remove_dir_all(root).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => tracing::warn!(%migration_id, %error, "failed to remove migration staging"),
+    if let Err(error) = crate::io::files::ignore_missing(tokio::fs::remove_dir_all(root).await) {
+        tracing::warn!(%migration_id, %error, "failed to remove migration staging");
     }
 }
 
@@ -136,10 +134,6 @@ pub(super) fn scheduler_error(error: SchedulerAcquireError) -> ApiError {
                 .to_string(),
         ),
     }
-}
-
-pub(super) fn runtime_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError::Runtime(error.to_string())
 }
 
 #[cfg(test)]

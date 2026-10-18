@@ -46,7 +46,7 @@ pub(crate) async fn resize_pool(
             .placements
             .get(&runtime_id)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?
+            .map_err(ApiError::runtime)?
             .filter(|pool| pool.deployment_mode == DeploymentMode::Shared)
             .ok_or(ApiError::NotFound)?;
         check_resize(&pool, &limits)?;
@@ -73,7 +73,7 @@ pub(crate) async fn resize_pool(
             .placements
             .save(&pool)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         drop(creation);
         if let Err(error) =
             runtime::apply_limits(&state.docker, &state.config, &state.placements, &pool).await
@@ -104,7 +104,7 @@ pub(crate) async fn resize_pool(
         }))
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("pool resize worker failed: {error}")))?
+    .map_err(ApiError::runtime_context("pool resize worker failed"))?
 }
 
 fn check_resize(pool: &EngineRuntime, limits: &PoolLimits) -> Result<(), ApiError> {

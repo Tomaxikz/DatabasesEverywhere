@@ -1451,3 +1451,28 @@ fn test_state_with_store(
         pool,
     )
 }
+
+#[test]
+fn extracted_file_collection_is_bounded_and_ignores_links() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("nested/deeper")).unwrap();
+    std::fs::write(root.path().join("nested/deeper/dump.sql"), b"select 1").unwrap();
+    std::os::unix::fs::symlink("/etc", root.path().join("link")).unwrap();
+    let mut files = Vec::new();
+    collect_regular_files(root.path(), &mut files).unwrap();
+    assert_eq!(files, [root.path().join("nested/deeper/dump.sql")]);
+
+    let deep = tempfile::tempdir().unwrap();
+    let mut path = deep.path().to_path_buf();
+    for level in 0..=MAX_ARCHIVE_DEPTH {
+        path.push(format!("d{level}"));
+    }
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(collect_regular_files(deep.path(), &mut Vec::new()).is_err());
+
+    let wide = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_ARCHIVE_ENTRIES {
+        std::fs::write(wide.path().join(format!("f{index}")), b"").unwrap();
+    }
+    assert!(collect_regular_files(wide.path(), &mut Vec::new()).is_err());
+}

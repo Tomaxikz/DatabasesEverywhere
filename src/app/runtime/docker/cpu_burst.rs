@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use procfs::process::MountInfo;
+
 use crate::{
     databases::protocol::Protocol,
     io::cgroup::{membership_path, safe_relative_path, unescape_mountinfo},
@@ -412,36 +414,27 @@ fn parse_v2_quota(value: &str, path: &Path) -> Result<u64, CpuBurstError> {
 }
 
 fn parse_cgroup_mounts(mountinfo: &str) -> Result<Vec<CgroupMount>, CpuBurstError> {
+    let mountinfo = mountinfo
+        .lines()
+        .filter_map(|line| match MountInfo::from_line(line) {
+            Ok(mount) => Some(Ok(mount)),
+            // Malformed entries only matter when they describe a cgroup mount.
+            Err(_) if is_cgroup_mount_line(line) => Some(Err(CpuBurstError::InvalidMetadata(
+                "cgroup mountinfo entry was malformed".to_string(),
+            ))),
+            Err(_) => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut mounts = Vec::new();
-    for line in mountinfo.lines() {
-        let Some((before_separator, after_separator)) = line.split_once(" - ") else {
-            continue;
-        };
-        let mut after = after_separator.split_whitespace();
-        let Some(filesystem) = after.next() else {
-            continue;
-        };
-        let _source = after.next();
-        let super_options = after.next().unwrap_or_default();
-        let kind = match filesystem {
+    for mount in mountinfo {
+        let kind = match mount.fs_type.as_str() {
             "cgroup2" => CgroupKind::Unified,
-            "cgroup"
-                if super_options
-                    .split(',')
-                    .any(|controller| controller == "cpu") =>
-            {
-                CgroupKind::LegacyCpu
-            }
+            "cgroup" if mount.super_options.contains_key("cpu") => CgroupKind::LegacyCpu,
             _ => continue,
         };
-        let fields = before_separator.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 5 {
-            return Err(CpuBurstError::InvalidMetadata(
-                "cgroup mountinfo entry had fewer than five fields".to_string(),
-            ));
-        }
-        let root = absolute_kernel_path(&unescape_mountinfo(fields[3]))?;
-        let mountpoint = absolute_kernel_path(&unescape_mountinfo(fields[4]))?;
+        let root = absolute_kernel_path(&unescape_mountinfo(&mount.root))?;
+        let mountpoint =
+            absolute_kernel_path(&unescape_mountinfo(&mount.mount_point.to_string_lossy()))?;
         mounts.push(CgroupMount {
             kind,
             root,
@@ -449,6 +442,22 @@ fn parse_cgroup_mounts(mountinfo: &str) -> Result<Vec<CgroupMount>, CpuBurstErro
         });
     }
     Ok(mounts)
+}
+
+fn is_cgroup_mount_line(line: &str) -> bool {
+    let Some((_, after_separator)) = line.split_once(" - ") else {
+        return false;
+    };
+    let mut after = after_separator.split_whitespace();
+    match after.next() {
+        Some("cgroup2") => true,
+        Some("cgroup") => after
+            .nth(1)
+            .unwrap_or_default()
+            .split(',')
+            .any(|controller| controller == "cpu"),
+        _ => false,
+    }
 }
 
 fn resolve_cgroup_directory(

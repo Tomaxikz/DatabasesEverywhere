@@ -186,20 +186,15 @@ fn validate_request_origin(headers: &HeaderMap, policy: &OriginPolicy) -> Result
 }
 
 pub fn reject_query_token(uri: &Uri) -> Result<(), ApiError> {
-    let has_token_parameter = uri
-        .query()
-        .is_some_and(|query| query.split('&').any(is_token_parameter));
+    // Names are compared after decoding, as query extractors see them, so
+    // `%74oken=` or `tok%65n` cannot slip a token past this check.
+    let has_token_parameter = uri.query().is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == "token")
+    });
     if has_token_parameter {
         return Err(ApiError::QueryTokenRejected);
     }
     Ok(())
-}
-
-fn is_token_parameter(parameter: &str) -> bool {
-    match parameter.split_once('=') {
-        Some((name, _)) => name == "token",
-        None => parameter == "token",
-    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -318,11 +313,16 @@ mod tests {
             "/api/system?token=secret",
             "/api/system?other=1&token=secret",
             "/api/system?token",
+            "/api/system?%74oken=secret",
+            "/api/system?tok%65n=secret",
         ] {
             assert!(matches!(
                 reject_query_token(&uri.parse().unwrap()),
                 Err(ApiError::QueryTokenRejected)
             ));
+        }
+        for uri in ["/api/system?tokens=1", "/api/system?x=token"] {
+            assert!(reject_query_token(&uri.parse().unwrap()).is_ok(), "{uri}");
         }
     }
 

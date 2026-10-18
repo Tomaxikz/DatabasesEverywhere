@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use super::{ManifestChallenge, ManifestError};
 use crate::{
-    runtime::docker::{DockerError, DockerRuntime, ExecRecovery, ExecStreamResult},
+    runtime::docker::{DockerError, DockerRuntime, ExecRecovery, ExecStreamResult, ShellExec},
     server::placement::{DeploymentMode, EngineRuntime},
     utils::shell::sh_quote,
 };
@@ -123,14 +123,16 @@ mongodump --quiet \
         };
         self.docker
             .exec_shell_to_file(
-                self.runtime.protocol,
-                &self.runtime.runtime_id,
-                &command,
-                &[("DBE_TENANT_PASSWORD", &password)],
+                ShellExec {
+                    protocol: self.runtime.protocol,
+                    instance_id: &self.runtime.runtime_id,
+                    script: &command,
+                    environment: &[("DBE_TENANT_PASSWORD", &password)],
+                    timeout: self.remaining()?,
+                    recovery,
+                },
                 output_path,
                 max_bytes,
-                self.remaining()?,
-                recovery,
             )
             .await
             .map_err(ManifestError::from)

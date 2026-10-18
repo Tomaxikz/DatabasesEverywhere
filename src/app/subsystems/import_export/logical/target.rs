@@ -25,7 +25,7 @@ async fn shared_runtime(
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared runtime: {error}")))?
+        .map_err(ApiError::runtime_context("failed to load shared runtime"))?
         .ok_or_else(|| {
             ApiError::Runtime(format!(
                 "shared runtime {} is missing",
@@ -78,11 +78,9 @@ pub(super) async fn restore_import_target_route(
             password,
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to re-enable and verify the shared tenant: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to re-enable and verify the shared tenant",
+        ))?;
     }
     state.instances.upsert(metadata.clone()).await;
     Ok(())
@@ -136,20 +134,16 @@ async fn fence_shared_tenant_for_rollback(
     let target = shared_tenant(metadata);
     crate::server::placement::tenant::fence(&state.docker, &runtime, target)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to terminate and fence the shared tenant before rollback: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to terminate and fence the shared tenant before rollback",
+        ))?;
     // The gateway route remains fenced. Re-enable only the database role so
     // DBE can apply the tenant-scoped rollback with the tenant credential.
     crate::server::placement::tenant::unfence(&state.docker, &runtime, target)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to enable the fenced shared tenant for rollback: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to enable the fenced shared tenant for rollback",
+        ))?;
     Ok(())
 }
 
@@ -173,11 +167,9 @@ async fn restart_dedicated_target_for_rollback(
     .map_err(|_| {
         ApiError::Runtime("timed out restarting target before logical import rollback".to_string())
     })?
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to restart target before logical import rollback: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "failed to restart target before logical import rollback",
+    ))?;
 
     let readiness_timeout = operation_timeout
         .unwrap_or(LOGICAL_ROLLBACK_READINESS_TIMEOUT)
@@ -186,11 +178,9 @@ async fn restart_dedicated_target_for_rollback(
         .docker
         .wait_until_ready(metadata.protocol, metadata.runtime_id(), readiness_timeout)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "target did not become ready before logical import rollback: {error}"
-            ))
-        })
+        .map_err(ApiError::runtime_context(
+            "target did not become ready before logical import rollback",
+        ))
         .map(|_| ())
 }
 
@@ -322,21 +312,7 @@ pub(super) fn quarantine_suffix(result: &Result<(), ApiError>) -> String {
     }
 }
 
-pub(super) async fn commit_recovery_manifest(path: &FsPath) -> Result<(), ApiError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::io::files::remove_private_file_durable(&path))
-        .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to commit import recovery metadata: {error}"
-            ))
-        })?
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to commit import recovery metadata: {error}"
-            ))
-        })
-}
+pub(super) use crate::subsystems::import_export::files::commit_recovery_manifest;
 
 #[derive(Serialize)]
 struct LogicalRecoveryManifest<'a> {
@@ -356,10 +332,10 @@ pub(super) async fn write_logical_recovery_manifest(
     mode: ImportMode,
 ) -> Result<(), ApiError> {
     let durable_rollback = rollback_path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::io::files::sync_private_file(&durable_rollback))
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to sync rollback data: {error}")))?;
+    crate::routes::http::response::run_blocking("failed to sync rollback data", move || {
+        crate::io::files::sync_private_file(&durable_rollback)
+    })
+    .await?;
     let rollback_file = rollback_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -373,10 +349,12 @@ pub(super) async fn write_logical_recovery_manifest(
         rollback_file,
         created_at: crate::server::jobs::import_export::now_rfc3339(),
     })
-    .map_err(|error| ApiError::Runtime(format!("failed to encode recovery manifest: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "failed to encode recovery manifest",
+    ))?;
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || crate::io::files::atomic_write_private(&path, &manifest))
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to write recovery manifest: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to write recovery manifest: {error}")))
+    crate::routes::http::response::run_blocking("failed to write recovery manifest", move || {
+        crate::io::files::atomic_write_private(&path, &manifest)
+    })
+    .await
 }

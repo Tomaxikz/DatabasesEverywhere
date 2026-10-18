@@ -134,16 +134,18 @@ async fn receive_upload(
     };
     tokio::fs::rename(&recovery.partial_path, &recovery.final_path)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to publish completed upload: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to publish completed upload",
+        ))?;
     let durable_path = recovery.final_path.clone();
     tokio::task::spawn_blocking(move || crate::io::files::sync_private_file(&durable_path))
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to join durable upload sync: {error}")))?
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to make completed upload durable: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to join durable upload sync",
+        ))?
+        .map_err(ApiError::runtime_context(
+            "failed to make completed upload durable",
+        ))?;
 
     let repository = &recovery.repository;
     let upload = &recovery.upload;
@@ -244,6 +246,6 @@ pub(super) async fn remove_worker_file(path: &std::path::Path) -> Result<(), Api
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || crate::io::files::remove_private_file_durable(&path))
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to join upload cleanup: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to delete upload data: {error}")))
+        .map_err(ApiError::runtime_context("failed to join upload cleanup"))?
+        .map_err(ApiError::runtime_context("failed to delete upload data"))
 }

@@ -34,9 +34,13 @@ pub(crate) async fn enforce_node_allocation_policy(
         return Ok(());
     }
 
-    let runtimes = state.placements.list().await.map_err(|error| {
-        ApiError::Runtime(format!("failed to load runtime allocation: {error}"))
-    })?;
+    let runtimes = state
+        .placements
+        .list()
+        .await
+        .map_err(ApiError::runtime_context(
+            "failed to load runtime allocation",
+        ))?;
     let allocated = crate::server::placement::policy::sum_runtime_limits(
         runtimes.iter().map(|runtime| &runtime.limits),
     );

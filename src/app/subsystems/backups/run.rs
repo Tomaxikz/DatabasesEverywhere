@@ -44,7 +44,7 @@ pub(super) async fn backup_instance(
     let instance_id = instance_id.to_string();
     tokio::spawn(async move { run_backup(state, instance_id, mode, admission).await })
         .await
-        .map_err(|error| ApiError::Runtime(format!("backup task failed: {error}")))?
+        .map_err(ApiError::runtime_context("backup task failed"))?
 }
 
 /// A complete local artifact that no longer depends on the source.
@@ -213,9 +213,7 @@ async fn prepare_backup(
             )
             .await
             .encode_bounded(state.config.backups.browsing.max_catalog_bytes)
-            .map_err(|error| {
-                ApiError::Runtime(format!("failed to encode backup catalog: {error}"))
-            })?,
+            .map_err(ApiError::runtime_context("failed to encode backup catalog"))?,
         )
     } else {
         None
@@ -465,7 +463,7 @@ pub(super) async fn create_physical_archive(
         .await?;
     }
     let paths = crate::server::paths::InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(ApiError::bad_request)?;
     let archive_policy = if metadata.protocol == Protocol::Mysql {
         DataArchiveSourcePolicy::MysqlDataDirectory
     } else {
@@ -478,7 +476,7 @@ pub(super) async fn create_physical_archive(
         max_output_bytes,
     )
     .await
-    .map_err(|error| ApiError::Runtime(error.to_string()));
+    .map_err(ApiError::runtime);
     if let Err(error) = &result {
         tracing::error!(
             event = "audit backup_archive_failed",

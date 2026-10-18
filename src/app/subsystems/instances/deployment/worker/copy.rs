@@ -1,5 +1,5 @@
 use super::support::scheduler_error;
-use super::support::{artifact_path, migration_staging_bytes, runtime_error, tenant_target};
+use super::support::{artifact_path, migration_staging_bytes, tenant_target};
 use super::{advance_to, advance_with_failure};
 use crate::routes::http::response::ApiError;
 use crate::routes::http::router::AppState;
@@ -125,7 +125,7 @@ pub(super) async fn copy_logical_data(
     .await?;
     let artifact_bytes = tokio::fs::metadata(&artifact)
         .await
-        .map_err(runtime_error)?
+        .map_err(ApiError::runtime)?
         .len();
     if artifact_bytes == 0 {
         return Err(ApiError::Conflict(
@@ -178,7 +178,7 @@ pub(super) async fn validate_target(
 ) -> Result<(), ApiError> {
     tenant::verify_password(&state.docker, runtime, tenant_target(metadata), password)
         .await
-        .map_err(|error| ApiError::Runtime(format!("target reachability failed: {error}")))?;
+        .map_err(ApiError::runtime_context("target reachability failed"))?;
     let target_manifest = match tenant::measure_manifest(
         &state.docker,
         runtime,

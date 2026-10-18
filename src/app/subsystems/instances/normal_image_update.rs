@@ -205,11 +205,9 @@ pub(super) async fn update_instance_image_normal(
             true,
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "replacement image compatibility probe failed: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "replacement image compatibility probe failed",
+        ))?;
         if !compatibility.compatible {
             return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
                 || "replacement database version is unsupported".to_string(),
@@ -222,7 +220,7 @@ pub(super) async fn update_instance_image_normal(
             .manager
             .upsert(metadata.clone())
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         Ok(())
     }
     .await;
@@ -448,20 +446,14 @@ async fn restore_image_update(
         .manager
         .upsert(rollback_metadata.clone())
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "previous container was restored but its metadata could not be persisted: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "previous container was restored but its metadata could not be persisted",
+        ))?;
     state
         .manager
         .delete_compatibility(&rollback_metadata.instance_id)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "previous container was restored but its stale compatibility attestation could not be invalidated: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context("previous container was restored but its stale compatibility attestation could not be invalidated"))?;
     clear_image_update_caches(state, &rollback_metadata.instance_id).await;
     Ok(())
 }

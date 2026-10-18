@@ -79,7 +79,7 @@ impl<'a> CreateFailureCleanup<'a> {
     pub(super) async fn cleanup_resources(&self) -> Result<(), ApiError> {
         cleanup_created_container(self.state, self.protocol, &self.instance_id).await?;
         let paths = InstancePaths::new(&self.state.config.paths, &self.instance_id)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         cleanup_created_paths(self.state, &paths).await
     }
 }

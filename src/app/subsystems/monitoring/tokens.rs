@@ -58,7 +58,7 @@ pub async fn issue_ws_token(
         targets,
         ttl_seconds,
     )
-    .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    .map_err(ApiError::runtime)?;
 
     tracing::info!(
         event = "audit ws_token_issued",
@@ -162,8 +162,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
     }
     let mut unique_instances = HashSet::with_capacity(request.instances.len());
     for instance_id in &request.instances {
-        crate::utils::ids::validate_instance_id(instance_id)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        crate::utils::ids::validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
         if !unique_instances.insert(instance_id) {
             return Err(ApiError::BadRequest(
                 "instances must not contain duplicates".to_string(),
@@ -180,8 +179,7 @@ fn validate_request(request: &IssueWsTokenRequest) -> Result<(), ApiError> {
         }
         let mut seen = HashSet::new();
         for id in &request.pools {
-            crate::utils::ids::validate_instance_id(id)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            crate::utils::ids::validate_instance_id(id).map_err(ApiError::bad_request)?;
             if !seen.insert(id) {
                 return Err(ApiError::BadRequest("duplicate pool target".into()));
             }

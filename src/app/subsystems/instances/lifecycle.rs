@@ -95,20 +95,17 @@ pub(crate) async fn change_instance_state(
     let worker = spawn_owned_mutation_task(async move {
         let _mutation = mutation;
         let _operation = operation;
-        let lifecycle = async {
-            if metadata_changed {
-                worker_state
-                    .manager
-                    .upsert(metadata)
-                    .await
-                    .map_err(|error| {
-                        ApiError::Runtime(format!(
-                            "failed to persist requested lifecycle state before applying it: {error}"
-                        ))
-                    })?;
-            }
-            change_instance_state_locked(&worker_state, &worker_instance_id, action).await
-        };
+        let lifecycle =
+            async {
+                if metadata_changed {
+                    worker_state.manager.upsert(metadata).await.map_err(
+                        ApiError::runtime_context(
+                            "failed to persist requested lifecycle state before applying it",
+                        ),
+                    )?;
+                }
+                change_instance_state_locked(&worker_state, &worker_instance_id, action).await
+            };
         match std::panic::AssertUnwindSafe(lifecycle).catch_unwind().await {
             Ok(result) => result,
             Err(_) => {

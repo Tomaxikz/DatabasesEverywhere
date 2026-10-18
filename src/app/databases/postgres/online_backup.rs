@@ -36,10 +36,6 @@
 //! and its sessions carry statement and lock timeouts, so server-side work
 //! ends even after the client is killed.
 
-// Transitional: `command.rs` still builds the retired socket-mount scripts
-// (`basebackup_script`, `verifybackup_script`); helpers use the argv builders
-// directly. Drop this once those scripts are removed there.
-#[allow(dead_code)]
 mod command;
 mod parse;
 mod preflight;
@@ -47,8 +43,9 @@ mod restore;
 
 pub(crate) use command::{
     LOCAL_CLIENT_HBA_LINE, REPLICATION_HBA_LINE, REPLICATION_ROLE, REPLICATION_ROLE_STATE,
-    ensure_replication_role_sql, replication_password, replication_role_comment_sql,
-    replication_role_ownership_sql, replication_role_state_sql, reset_replication_password_sql,
+    ensure_replication_role_sql, foreign_replication_role_diagnostic, replication_password,
+    replication_role_comment_sql, replication_role_ownership_sql, replication_role_state_sql,
+    reset_replication_password_sql,
 };
 pub(crate) use restore::prepare_basebackup_restore;
 
@@ -63,7 +60,6 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::{
     databases::protocol::Protocol,
-    io::files::read_bounded_private_file,
     runtime::docker::{BACKUP_HELPER_STAGING, BackupHelperSocket, BackupHelperSpec, DockerEnv},
     server::{
         backup::manifest::{ConsistencyLevel, RestoreRecipeRef, is_safe_relative},
@@ -72,9 +68,9 @@ use crate::{
     subsystems::backups::{
         registry::POSTGRES_BASE_BACKUP,
         strategy::{
-            CaptureResult, CleanupContext, OnlineBackupContext, OnlineBackupStrategy,
-            OwnedResource, OwnedResourceRegistrar, RestoreContext, StagingArea, StrategyError,
-            VerificationCheck,
+            CaptureResult, OnlineBackupContext, OnlineBackupStrategy, OwnedResourceRegistrar,
+            RestoreContext, StagingArea, StrategyError, VerificationCheck, blocking, exec_script,
+            refuse_overlapping_staging, require_relative, take_report,
         },
     },
     utils::{backend::POSTGRES_SOCKET_DIRECTORY, shell::sh_quote},
@@ -148,35 +144,13 @@ impl OnlineBackupStrategy for PostgresBaseBackupStrategy {
         })
     }
 
-    fn cleanup_owned<'a>(
-        &'a self,
-        _ctx: &'a CleanupContext<'a>,
-        resource: &'a OwnedResource,
-    ) -> BoxFuture<'a, Result<(), StrategyError>> {
-        Box::pin(async move {
-            let _ = self;
-            // Helper containers are the only owned resources and the
-            // coordinator removes those itself.
-            Err(StrategyError::Failed(format!(
-                "refusing to clean {} {}; this strategy owns only helper containers",
-                resource.kind.as_str(),
-                resource.name
-            )))
-        })
-    }
-
     fn prepare_restore<'a>(
         &'a self,
         ctx: &'a RestoreContext<'a>,
     ) -> BoxFuture<'a, Result<(), StrategyError>> {
         Box::pin(async move {
             let _ = self;
-            if ctx.recipe.id != RESTORE_RECIPE_ID || ctx.recipe.version != RESTORE_RECIPE_VERSION {
-                return Err(StrategyError::Unsupported(format!(
-                    "recipe {}@{} is not {RESTORE_RECIPE_ID}@{RESTORE_RECIPE_VERSION}",
-                    ctx.recipe.id, ctx.recipe.version
-                )));
-            }
+            ctx.require_recipe(RESTORE_RECIPE_ID, RESTORE_RECIPE_VERSION)?;
             let target = ctx
                 .restore_target
                 .to_str()
@@ -219,37 +193,24 @@ async fn load_plan(
             source: ctx.paths.sockets.clone(),
             target: POSTGRES_SOCKET_DIRECTORY.to_string(),
         }),
+        data: None,
         staging_dir: staging.root.clone(),
         staging_read_only: false,
-        script: preflight_helper_script(&user, &database),
+        script: preflight_exec_script(&user, &database),
         environment: vec![
-            DockerEnv {
-                key: "DBE_POSTGRES_ADMIN_PASSWORD".to_string(),
-                value: admin,
-            },
-            DockerEnv {
-                key: "DBE_REPLICATION_PASSWORD".to_string(),
-                value: replication,
-            },
+            DockerEnv::new("DBE_POSTGRES_ADMIN_PASSWORD", admin),
+            DockerEnv::new("DBE_REPLICATION_PASSWORD", replication),
         ],
         timeout: ctx.remaining()?.min(PREFLIGHT_TIMEOUT),
         max_staging_bytes: staging.native_budget_bytes,
     };
     ctx.run_helper(registrar, &spec)
         .await
-        .map_err(|error| prefixed("preflight", error))?;
-    let report_path = staging.root.join(PREFLIGHT_REPORT);
-    let report = blocking("read preflight report", move || {
-        let read = read_bounded_private_file(&report_path, MAX_PREFLIGHT_REPORT_BYTES);
-        // Staging must hold only the capture once pg_basebackup starts.
-        match std::fs::remove_file(&report_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("remove the report: {error}")),
-        }
-        String::from_utf8(read.map_err(|error| error.to_string())?)
-            .map_err(|_| "the report is not UTF-8".to_string())
-    })
+        .map_err(|error| error.for_tool("preflight"))?;
+    let report = take_report(
+        staging.root.join(PREFLIGHT_REPORT),
+        MAX_PREFLIGHT_REPORT_BYTES,
+    )
     .await?;
     let report = parse_report(&report)
         .map_err(|error| StrategyError::Failed(format!("preflight report: {error}")))?;
@@ -282,7 +243,7 @@ async fn bootstrap_login(ctx: &OnlineBackupContext<'_>) -> Result<(String, Strin
 /// staging: helper stdout is redacted and truncated, the report must be
 /// neither. Secrets stay in the environment. The replication role ownership
 /// probe follows the inventory and is the report's final line.
-fn preflight_helper_script(user: &str, database: &str) -> String {
+fn preflight_exec_script(user: &str, database: &str) -> String {
     format!(
         "set -eu\numask 077\nexport POSTGRES_USER={} POSTGRES_DB={} PGCONNECT_TIMEOUT={PREFLIGHT_CONNECT_TIMEOUT_SECONDS} PGOPTIONS={}\nexec >{}\n{}PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h {} -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -Atq <<'SQL'\n{}\nSQL\n",
         sh_quote(user),
@@ -301,7 +262,7 @@ async fn capture_tree(
     registrar: &dyn OwnedResourceRegistrar,
 ) -> Result<CaptureResult, StrategyError> {
     let plan = load_plan(ctx, staging, registrar).await?;
-    refuse_layout(ctx, staging)?;
+    refuse_overlapping_staging(ctx.paths, staging)?;
     let space =
         sample_space(&staging.root, staging.native_budget_bytes).map_err(StrategyError::Failed)?;
     let estimate = plan.estimate().map_err(StrategyError::Failed)?;
@@ -321,19 +282,17 @@ async fn capture_tree(
             source: ctx.paths.sockets.clone(),
             target: POSTGRES_SOCKET_DIRECTORY.to_string(),
         }),
+        data: None,
         staging_dir: staging.root.clone(),
         staging_read_only: false,
-        script: helper_script(&basebackup_argv(&pgdata, &label)),
-        environment: vec![DockerEnv {
-            key: "PGPASSWORD".to_string(),
-            value: replication,
-        }],
+        script: exec_script(&basebackup_argv(&pgdata, &label)),
+        environment: vec![DockerEnv::new("PGPASSWORD", replication)],
         timeout: ctx.remaining()?,
         max_staging_bytes: staging.native_budget_bytes,
     };
     ctx.run_helper(registrar, &spec)
         .await
-        .map_err(|error| prefixed("pg_basebackup", error))?;
+        .map_err(|error| error.for_tool("pg_basebackup"))?;
 
     let host_pgdata = staging.root.join(DATA_ROOT);
     let recovery = blocking("read backup description", move || {
@@ -378,16 +337,17 @@ async fn verify_capture(
         instance_id: ctx.metadata.instance_id.clone(),
         image: ctx.runtime_image().await?,
         socket: None,
+        data: None,
         staging_dir: staging.root.clone(),
         staging_read_only: true,
-        script: helper_script(&verifybackup_argv(&pgdata)),
+        script: exec_script(&verifybackup_argv(&pgdata)),
         environment: Vec::new(),
         timeout: ctx.remaining()?,
         max_staging_bytes: staging.native_budget_bytes,
     };
     ctx.run_helper(registrar, &spec)
         .await
-        .map_err(|error| prefixed("pg_verifybackup", error))?;
+        .map_err(|error| error.for_tool("pg_verifybackup"))?;
     let host_pgdata = staging.root.join(&capture.data_root);
     let files = blocking("rehash staged backup", move || {
         parse::verify_staged_tree(&host_pgdata)
@@ -400,34 +360,6 @@ async fn verify_capture(
             "version-matched pg_verifybackup accepted the final staged tree including its WAL; {files} files rehashed against backup_manifest"
         )),
     }])
-}
-
-/// `set -eu` plus the quoted argv. Secrets travel only in the environment.
-fn helper_script(argv: &[String]) -> String {
-    let argv = argv
-        .iter()
-        .map(|arg| sh_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("set -eu\numask 077\nexec {argv}\n")
-}
-
-/// Runs short, bounded file work off the async runtime and joins it.
-async fn blocking<T: Send + 'static>(
-    context: &str,
-    work: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<T, StrategyError> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|error| StrategyError::failed(context, error))?
-        .map_err(|error| StrategyError::Failed(format!("{context}: {error}")))
-}
-
-fn prefixed(tool: &str, error: StrategyError) -> StrategyError {
-    match error {
-        StrategyError::Failed(reason) => StrategyError::Failed(format!("{tool}: {reason}")),
-        unsupported => unsupported,
-    }
 }
 
 fn replication_secrets(
@@ -446,44 +378,6 @@ fn replication_secrets(
     let replication = replication_password(admin)
         .map_err(|reason| StrategyError::Unsupported(reason.to_string()))?;
     Ok((SecretString::from(admin.to_string()), replication))
-}
-
-fn refuse_layout(
-    ctx: &OnlineBackupContext<'_>,
-    staging: &StagingArea,
-) -> Result<(), StrategyError> {
-    if overlaps(&ctx.paths.sockets, &staging.root).map_err(StrategyError::Failed)? {
-        return Err(StrategyError::Failed(
-            "staging must not use the PostgreSQL socket mount".to_string(),
-        ));
-    }
-    if overlaps(&ctx.paths.data, &staging.root).map_err(StrategyError::Failed)? {
-        return Err(StrategyError::Failed(
-            "staging overlaps the instance data directory".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn overlaps(left: &Path, right: &Path) -> Result<bool, String> {
-    let left = std::fs::canonicalize(left)
-        .map_err(|error| format!("canonicalize {}: {error}", left.display()))?;
-    let right = std::fs::canonicalize(right)
-        .map_err(|error| format!("canonicalize {}: {error}", right.display()))?;
-    Ok(left.starts_with(&right) || right.starts_with(&left))
-}
-
-fn require_relative(path: &Path, what: &str) -> Result<(), StrategyError> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| StrategyError::Failed(format!("{what} is not utf-8")))?;
-    if is_safe_relative(text) {
-        Ok(())
-    } else {
-        Err(StrategyError::Failed(format!(
-            "{what} is not a safe relative path"
-        )))
-    }
 }
 
 #[cfg(test)]
@@ -506,7 +400,7 @@ mod tests {
     #[test]
     fn helper_scripts_write_into_staging_and_never_carry_the_password() {
         let pgdata = format!("{BACKUP_HELPER_STAGING}/{DATA_ROOT}");
-        let capture = helper_script(&basebackup_argv(&pgdata, LABEL));
+        let capture = exec_script(&basebackup_argv(&pgdata, LABEL));
         assert!(capture.starts_with("set -eu\n"));
         assert!(capture.contains(&sh_quote(&pgdata)));
         assert!(capture.contains(&sh_quote(POSTGRES_SOCKET_DIRECTORY)));
@@ -515,14 +409,14 @@ mod tests {
         assert!(!capture.contains("rm -rf"));
         // Nothing is written below the socket mount any more.
         assert!(!capture.contains(&format!("{POSTGRES_SOCKET_DIRECTORY}/dbev_bk_")));
-        let verify = helper_script(&verifybackup_argv(&pgdata));
+        let verify = exec_script(&verifybackup_argv(&pgdata));
         assert!(verify.contains(&sh_quote("pg_verifybackup")));
         assert!(verify.contains(&sh_quote(&pgdata)));
     }
 
     #[test]
     fn preflight_runs_bounded_in_a_helper_and_reports_into_staging() {
-        let script = preflight_helper_script("dbe_admin", "app's db");
+        let script = preflight_exec_script("dbe_admin", "app's db");
         assert!(script.starts_with("set -eu\numask 077\n"));
         assert!(script.contains(&format!("POSTGRES_USER={}", sh_quote("dbe_admin"))));
         assert!(script.contains(&format!("POSTGRES_DB={}", sh_quote("app's db"))));
@@ -543,17 +437,13 @@ mod tests {
 
     #[test]
     fn helper_failures_name_the_native_tool() {
-        let error = prefixed(
-            "pg_basebackup",
-            StrategyError::Failed("backup helper exited 1".to_string()),
-        );
+        let error =
+            StrategyError::Failed("backup helper exited 1".to_string()).for_tool("pg_basebackup");
         assert!(
             matches!(error, StrategyError::Failed(reason) if reason.starts_with("pg_basebackup: "))
         );
-        let unsupported = prefixed(
-            "pg_basebackup",
-            StrategyError::Unsupported("no credential".to_string()),
-        );
+        let unsupported =
+            StrategyError::Unsupported("no credential".to_string()).for_tool("pg_basebackup");
         assert!(
             matches!(unsupported, StrategyError::Unsupported(reason) if reason == "no credential")
         );

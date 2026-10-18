@@ -36,13 +36,13 @@ pub(super) async fn wipe_clickhouse(
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?
+        .map_err(ApiError::runtime)?
         .ok_or_else(|| ApiError::Conflict("shared wipe runtime is missing".into()))?;
     let reservation = state
         .placements
         .get_reservation(&metadata.instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let tenant_is_fenced_and_drained =
         wipe_target_matches(metadata, &runtime, reservation.as_ref())
             && state.instances.routes_fenced(&metadata.instance_id).await
@@ -58,7 +58,7 @@ pub(super) async fn wipe_clickhouse(
         .docker
         .verified_compatibility_identity(metadata.protocol, metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let container_matches_attestation = identity
         .as_ref()
         .zip(runtime.compatibility.as_ref())
@@ -211,7 +211,7 @@ pub(super) async fn run(state: &AppState, request: RestoreRequest<'_>) -> Result
         .placements
         .get(metadata.runtime_id())
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared runtime: {error}")))?
+        .map_err(ApiError::runtime_context("failed to load shared runtime"))?
         .ok_or_else(|| ApiError::Runtime("shared restore runtime is missing".to_string()))?;
     if runtime.deployment_mode != DeploymentMode::Shared
         || runtime.protocol != metadata.protocol
@@ -394,14 +394,14 @@ impl Drop for PinnedInput {
             return;
         };
         runtime.spawn(async move {
-            match tokio::fs::remove_dir_all(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => tracing::warn!(
+            if let Err(error) =
+                crate::io::files::ignore_missing(tokio::fs::remove_dir_all(&path).await)
+            {
+                tracing::warn!(
                     path = %path.display(),
                     %error,
                     "shared restore sandbox cleanup failed; boot recovery will retry it"
-                ),
+                );
             }
         });
     }
@@ -433,7 +433,7 @@ pub(super) async fn pin_input(
         }
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to join input pinning: {error}")))?;
+    .map_err(ApiError::runtime_context("failed to join input pinning"))?;
     if let Err(error) = checked {
         cleanup_path(&root).await;
         return Err(ApiError::BadRequest(format!(

@@ -458,7 +458,7 @@ async fn rollback_in_place_password_reset(
             .paths
             .restore_data_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         let previous_password = context.previous.environment.as_ref().ok_or_else(|| {
             ApiError::Runtime("previous RESP credential was not captured for rollback".to_string())
         })?;
@@ -646,7 +646,7 @@ async fn rollback_password_reset(
         paths
             .restore_data_owner()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
     }
 
     let no_progress = |_event| {};

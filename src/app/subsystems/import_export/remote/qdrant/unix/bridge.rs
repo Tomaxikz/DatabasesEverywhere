@@ -34,11 +34,9 @@ pub(crate) async fn cleanup_stale_bridge(
     .map_err(|_| {
         ApiError::Runtime("timed out cleaning up a stale managed qdrant HTTP bridge".to_string())
     })?
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "failed to clean up a stale managed qdrant HTTP bridge: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "failed to clean up a stale managed qdrant HTTP bridge",
+    ))?;
     Ok(())
 }
 

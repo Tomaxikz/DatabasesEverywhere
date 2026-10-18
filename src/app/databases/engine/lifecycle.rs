@@ -107,6 +107,11 @@ pub(crate) enum OnlineBackup {
     Unavailable { reason: &'static str },
     /// `pg_basebackup -X stream` capture verified by `pg_verifybackup`.
     PostgresBaseBackup,
+    /// Diskless replication RDB snapshot verified by `check-rdb` and restored
+    /// as the base of a multi-part AOF.
+    RespRdbSnapshot,
+    /// `mariadb-backup --backup` hot copy prepared with `--prepare`.
+    MariadbBackup,
 }
 
 pub(crate) const NO_ONLINE_BACKUP_STRATEGY: &str =

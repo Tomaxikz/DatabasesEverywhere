@@ -114,7 +114,7 @@ pub(crate) async fn reconcile_instance_locked(
     let metadata = reconcile::reconcile_one(metadata, &state.docker).await;
     reconcile::persist_reconciled(&state.manager, previous, metadata.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     state
         .instance_runtime_cache
         .remove(&metadata.instance_id)

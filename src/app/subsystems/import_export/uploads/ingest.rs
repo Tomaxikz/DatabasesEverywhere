@@ -22,7 +22,7 @@ use crate::{
     storage::import_uploads::{
         ImportUpload, ImportUploadAdmission, ImportUploadArchiveFormat, NewImportUpload,
     },
-    utils::{hex::nibble, time::now_rfc3339},
+    utils::time::now_rfc3339,
 };
 
 use super::{
@@ -84,8 +84,8 @@ pub(super) async fn upload_dump(
         .get(instance_id)
         .await
         .ok_or(ApiError::NotFound)?;
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     let root = paths.imports.join(UPLOADS_DIRECTORY);
     prepare_private_dir(&root, "managed import upload directory").await?;
     let disk_reservation = reserve_upload_disk_space(state, &root, declared_size).await?;
@@ -240,10 +240,11 @@ pub(super) async fn receive_upload_body(
     idle_timeout: Duration,
 ) -> Result<String, ApiError> {
     let path_owned = path.to_path_buf();
-    let file = tokio::task::spawn_blocking(move || create_private_file_sync(&path_owned))
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to create upload file: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to create upload file: {error}")))?;
+    let file =
+        crate::routes::http::response::run_blocking("failed to create upload file", move || {
+            create_private_file_sync(&path_owned)
+        })
+        .await?;
     let mut file = tokio::fs::File::from_std(file);
     let mut stream = body.into_data_stream();
     let mut size = 0_u64;
@@ -270,7 +271,7 @@ pub(super) async fn receive_upload_body(
         }
         file.write_all(&chunk)
             .await
-            .map_err(|error| ApiError::Runtime(format!("failed to write upload: {error}")))?;
+            .map_err(ApiError::runtime_context("failed to write upload"))?;
         hash.update(&chunk);
     }
     if size != declared_size {
@@ -280,12 +281,12 @@ pub(super) async fn receive_upload_body(
     }
     file.flush()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to flush upload: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to flush upload"))?;
     file.sync_all()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to sync upload: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to sync upload"))?;
     drop(file);
-    let digest = crate::utils::hex::encode_lower(&hash.finalize());
+    let digest = hex::encode(hash.finalize());
     if expected_sha256.is_some_and(|expected| expected != digest) {
         return Err(ApiError::BadRequest(
             "uploaded content did not match x-dbev-sha256".to_string(),
@@ -338,32 +339,17 @@ pub(super) fn content_length(headers: &HeaderMap) -> Result<u64, ApiError> {
 }
 
 pub(super) fn percent_decode_utf8(value: &str) -> Result<String, ApiError> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err(ApiError::BadRequest(
-                "x-dbev-filename contains invalid percent encoding".to_string(),
-            ));
-        }
-        let high = nibble(bytes[index + 1]);
-        let low = nibble(bytes[index + 2]);
-        let Some(byte) = high.zip(low).map(|(high, low)| (high << 4) | low) else {
-            return Err(ApiError::BadRequest(
-                "x-dbev-filename contains invalid percent encoding".to_string(),
-            ));
-        };
-        decoded.push(byte);
-        index += 3;
-    }
-    String::from_utf8(decoded)
-        .map_err(|_| ApiError::BadRequest("x-dbev-filename is not valid UTF-8".to_string()))
+    use crate::utils::percent::{DecodeError, decode_strict};
+
+    decode_strict(value).map_err(|error| {
+        ApiError::BadRequest(
+            match error {
+                DecodeError::Encoding => "x-dbev-filename contains invalid percent encoding",
+                DecodeError::Utf8 => "x-dbev-filename is not valid UTF-8",
+            }
+            .to_string(),
+        )
+    })
 }
 
 pub(super) fn hardened_upload_archive_format(

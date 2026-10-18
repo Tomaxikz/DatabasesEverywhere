@@ -654,8 +654,7 @@ fn verify_completed_upload(
         }
         digest.update(&buffer[..read]);
     }
-    Ok(total == expected_size
-        && crate::utils::hex::encode_lower(&digest.finalize()) == expected_digest)
+    Ok(total == expected_size && hex::encode(digest.finalize()) == expected_digest)
 }
 
 fn open_regular_no_follow(path: &Path) -> Result<File, io::Error> {
@@ -806,7 +805,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("upload");
         std::fs::write(&path, b"dump").unwrap();
-        let digest = crate::utils::hex::encode_lower(&Sha256::digest(b"dump"));
+        let digest = hex::encode(Sha256::digest(b"dump"));
         assert!(verify_completed_upload(&path, 4, &digest).unwrap());
         assert!(!verify_completed_upload(&path, 3, &digest).unwrap());
         assert!(!verify_completed_upload(&path, 4, &"0".repeat(64)).unwrap());
@@ -823,7 +822,7 @@ mod tests {
         std::fs::write(&source, b"dump").unwrap();
         symlink(&source, &symlink_path).unwrap();
         std::fs::hard_link(&source, &hardlink_path).unwrap();
-        let digest = crate::utils::hex::encode_lower(&Sha256::digest(b"dump"));
+        let digest = hex::encode(Sha256::digest(b"dump"));
 
         assert!(verify_completed_upload(&symlink_path, 4, &digest).is_err());
         assert!(verify_completed_upload(&hardlink_path, 4, &digest).is_err());

@@ -240,7 +240,7 @@ async fn load_shared_runtime(
         .placements
         .get(runtime_id)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared pool: {error}")))?
+        .map_err(ApiError::runtime_context("failed to load shared pool"))?
         .filter(|runtime| runtime.deployment_mode == DeploymentMode::Shared)
         .ok_or(ApiError::NotFound)
 }
@@ -250,7 +250,7 @@ async fn shared_runtimes(state: &AppState) -> Result<Vec<EngineRuntime>, ApiErro
         .placements
         .list()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to load shared pools: {error}")))
+        .map_err(ApiError::runtime_context("failed to load shared pools"))
         .map(|runtimes| {
             runtimes
                 .into_iter()

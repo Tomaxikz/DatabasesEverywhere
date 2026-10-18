@@ -94,6 +94,22 @@ pub enum ApiError {
     RequestRejected { status: StatusCode, message: String },
 }
 
+/// Runs blocking work off the async runtime. A join failure and a work
+/// failure are both reported as `context: <error>`.
+pub(crate) async fn run_blocking<T, E>(
+    context: &str,
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(ApiError::runtime_context(context))?
+        .map_err(ApiError::runtime_context(context))
+}
+
 pub(crate) fn placement_error(error: PlacementRepositoryError) -> ApiError {
     match error {
         PlacementRepositoryError::CapacityUnavailable(_) => ApiError::Conflict("shared_pool_full: the server pool has reached its disk or database-count limit; resize it explicitly".into()),
@@ -116,6 +132,27 @@ impl From<TransferError> for ApiError {
 }
 
 impl ApiError {
+    /// `map_err(ApiError::runtime)` for any displayable failure.
+    pub(crate) fn runtime(error: impl std::fmt::Display) -> Self {
+        Self::Runtime(error.to_string())
+    }
+
+    /// `map_err(ApiError::runtime_context("context"))` reports
+    /// `context: <error>` as a runtime failure.
+    pub(crate) fn runtime_context<E: std::fmt::Display>(
+        context: &str,
+    ) -> impl FnOnce(E) -> Self + '_ {
+        move |error| Self::Runtime(format!("{context}: {error}"))
+    }
+
+    pub(crate) fn bad_request(error: impl std::fmt::Display) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+
+    pub(crate) fn conflict(error: impl std::fmt::Display) -> Self {
+        Self::Conflict(error.to_string())
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,

@@ -85,9 +85,9 @@ pub(super) async fn quiesce_rollback_target(
     tokio::time::timeout_at(deadline, state.docker.start(Protocol::Qdrant, instance_id))
         .await
         .map_err(|_| operation_timeout_error("target restart before rollback"))?
-        .map_err(|error| {
-            ApiError::Runtime(format!("failed to start qdrant before rollback: {error}"))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to start qdrant before rollback",
+        ))?;
 
     let ready_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
     if ready_timeout.is_zero() {
@@ -101,7 +101,9 @@ pub(super) async fn quiesce_rollback_target(
     )
     .await
     .map_err(|_| operation_timeout_error("target readiness before rollback"))?
-    .map_err(|error| ApiError::Runtime(format!("qdrant was not ready for rollback: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "qdrant was not ready for rollback",
+    ))?;
 
     let replacement_bridge =
         tokio::time::timeout_at(deadline, QdrantBridge::start(state, instance_id, paths))

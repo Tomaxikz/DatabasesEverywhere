@@ -2,8 +2,10 @@
 //!
 //! A helper runs an engine-native tool from the instance's own immutable
 //! image, so its binaries match the server version. It mounts only the
-//! instance socket directory (read-only, for the Unix-socket connection) and
-//! one coordinator-reserved, disk-backed staging directory. It has no
+//! instance socket directory (read-only, for the Unix-socket connection),
+//! optionally the instance data directory (read-only, for tools that copy
+//! live data files next to a server session), and one
+//! coordinator-reserved, disk-backed staging directory. It has no
 //! network, CPU, memory and pid limits of its own, a read-only root
 //! filesystem, no capabilities and `no-new-privileges`. Native output never
 //! lands on the socket mount, which is commonly tmpfs charged to the
@@ -94,6 +96,8 @@ pub struct BackupHelperSpec {
     /// Immutable image id of the running instance.
     pub image: String,
     pub socket: Option<BackupHelperSocket>,
+    /// Instance data directory, mounted read-only.
+    pub data: Option<BackupHelperSocket>,
     pub staging_dir: PathBuf,
     pub staging_read_only: bool,
     /// Shell script. It is stored in the container configuration and must
@@ -105,7 +109,7 @@ pub struct BackupHelperSpec {
     pub max_staging_bytes: u64,
 }
 
-/// Instance socket directory, mounted read-only.
+/// An instance directory (socket or data), mounted read-only.
 #[derive(Clone, Debug)]
 pub struct BackupHelperSocket {
     pub source: PathBuf,
@@ -513,8 +517,8 @@ fn helper_body(options: HelperBody<'_>) -> ContainerCreateBody {
         BACKUP_HELPER_STAGING,
         spec.staging_read_only,
     )];
-    if let Some(socket) = &spec.socket {
-        mounts.push(bind_mount(&socket.source, &socket.target, true));
+    for mount in spec.socket.iter().chain(&spec.data) {
+        mounts.push(bind_mount(&mount.source, &mount.target, true));
     }
     let mut host_config = HostConfig::default();
     security.apply(&mut host_config);
@@ -595,8 +599,9 @@ fn validate_spec(spec: &BackupHelperSpec) -> Result<(), BackupHelperError> {
     if !spec.staging_dir.is_absolute()
         || spec
             .socket
-            .as_ref()
-            .is_some_and(|socket| !socket.source.is_absolute() || !socket.target.starts_with('/'))
+            .iter()
+            .chain(&spec.data)
+            .any(|mount| !mount.source.is_absolute() || !mount.target.starts_with('/'))
     {
         return invalid("mount paths must be absolute");
     }
@@ -689,46 +694,46 @@ async fn check_budget(spec: &BackupHelperSpec) -> Result<(), BackupHelperError> 
 }
 
 /// Apparent size of regular files below `root`, stopping once it exceeds
-/// `stop_after`. Symbolic links are not followed.
+/// `stop_after`. Symbolic links are not followed; entries that disappear
+/// while the tool runs (temporary names) are skipped.
 fn staging_bytes(root: &Path, stop_after: u64) -> Result<u64, IoError> {
     let mut total = 0_u64;
-    let mut entries = 0_usize;
-    let mut pending = vec![(root.to_path_buf(), 0_usize)];
-    while let Some((directory, depth)) = pending.pop() {
-        if depth > MAX_STAGING_DEPTH {
+    for (index, entry) in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if index >= MAX_STAGING_ENTRIES {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "backup staging has too many entries",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.io_error().map(IoError::kind) == Some(ErrorKind::NotFound) => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if entry.depth() > MAX_STAGING_DEPTH + 1 {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
                 "backup staging nesting is too deep",
             ));
         }
-        let listing = match std::fs::read_dir(&directory) {
-            Ok(listing) => listing,
-            // The tool may not have created its output directory yet.
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in listing {
-            entries += 1;
-            if entries > MAX_STAGING_ENTRIES {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "backup staging has too many entries",
-                ));
-            }
-            let entry = entry?;
-            let metadata = match std::fs::symlink_metadata(entry.path()) {
-                Ok(metadata) => metadata,
-                // Files can disappear while the tool runs (temporary names).
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.is_dir() {
-                pending.push((entry.path(), depth + 1));
-            } else if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
-                if total > stop_after {
-                    return Ok(total);
+        if entry.file_type().is_file() {
+            let size = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.io_error().map(IoError::kind) == Some(ErrorKind::NotFound) => {
+                    continue;
                 }
+                Err(error) => return Err(error.into()),
+            };
+            total = total.saturating_add(size);
+            if total > stop_after {
+                return Ok(total);
             }
         }
     }
@@ -738,7 +743,6 @@ fn staging_bytes(root: &Path, stop_after: u64) -> Result<u64, IoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
 
     const TAG: &str = "dbev_bk_0123456789abcdef0123456789abcdef";
 
@@ -751,13 +755,11 @@ mod tests {
                 source: PathBuf::from("/run/dbev/sockets/inst_one"),
                 target: "/var/run/postgresql".to_string(),
             }),
+            data: None,
             staging_dir: staging.to_path_buf(),
             staging_read_only: false,
             script: "set -eu\nexec pg_basebackup\n".to_string(),
-            environment: vec![DockerEnv {
-                key: "PGPASSWORD".to_string(),
-                value: SecretString::from("hunter2"),
-            }],
+            environment: vec![DockerEnv::plain("PGPASSWORD", "hunter2")],
             timeout: Duration::from_secs(60),
             max_staging_bytes: 1024,
         }
@@ -839,6 +841,12 @@ mod tests {
         let mut unbounded = spec(staging);
         unbounded.max_staging_bytes = 0;
         assert!(validate_spec(&unbounded).is_err());
+        let mut data = spec(staging);
+        data.data = Some(BackupHelperSocket {
+            source: PathBuf::from("volumes/inst_one"),
+            target: "/var/lib/mysql".to_string(),
+        });
+        assert!(validate_spec(&data).is_err());
     }
 
     #[test]

@@ -275,7 +275,7 @@ async fn cut_over_to_replacement(
         .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
         .purge_instance_data(&paths.data)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     commit_staged_replacement(state, metadata, paths, staged, image, password).await?;
     metadata.backend = backend_endpoint(state, metadata.protocol, &metadata.instance_id)?;
     metadata.runtime.network_mode = "none".to_string();
@@ -294,11 +294,9 @@ async fn cut_over_to_replacement(
         true,
     )
     .await
-    .map_err(|error| {
-        ApiError::Runtime(format!(
-            "migrated database compatibility probe failed: {error}"
-        ))
-    })?;
+    .map_err(ApiError::runtime_context(
+        "migrated database compatibility probe failed",
+    ))?;
     if !compatibility.compatible {
         return Err(ApiError::Conflict(compatibility.diagnostic.unwrap_or_else(
             || "migrated database version is unsupported".to_string(),

@@ -95,7 +95,7 @@ pub(crate) async fn replace_image_locked(
                 progress.docker_pull(&progress_id, event)
             })
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         state.install_progress.stage(
             &pool.runtime_id,
             "probe_image",
@@ -121,14 +121,14 @@ pub(crate) async fn replace_image_locked(
         }
         let was_running = pool.desired_state == DesiredInstanceState::Running;
         let paths = InstancePaths::new(&state.config.paths, &pool.runtime_id)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         let user = instances::create::prepare_instance_container_user(
             &state.docker,
             &paths,
             pool.protocol,
         )
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
         let limiter = DiskLimiter::with_fuse_root(
             state.config.disk.clone(),
             state.config.paths.fuse_root(),
@@ -136,7 +136,7 @@ pub(crate) async fn replace_image_locked(
         .for_persisted_protocol(pool.protocol, &pool.limits.disk_enforcement_method);
         let data = limiter
             .container_data_path(&paths.data)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         let mut spec = super::provision::shared_spec(
             pool.protocol,
             &pool.runtime_id,
@@ -165,7 +165,7 @@ pub(crate) async fn replace_image_locked(
         lifecycle::fence_runtime(state, &pool.runtime_id).await;
         lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         state.install_progress.stage(
             &pool.runtime_id,
             "replace_image",
@@ -175,17 +175,17 @@ pub(crate) async fn replace_image_locked(
         paths
             .clear_socket_dir()
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         state
             .docker
             .create_with_progress(&spec, &|_| {})
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         // activate_locked intentionally leaves tenant routes fenced while
         // pending_image exists, even after readiness and credential checks.
         lifecycle::activate_locked(state, pool, false)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         if pool.database_version.as_deref() != Some(&version)
             || pool
                 .compatibility
@@ -206,21 +206,21 @@ pub(crate) async fn replace_image_locked(
         pool.updated_at = now_rfc3339();
         lifecycle::save_runtime(&state.placements, &state.manager, pool.clone())
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         if was_running {
             let recovered =
                 crate::server::placement::tenant::recovery::reconcile_runtime_tenants_locked(
                     state, pool,
                 )
                 .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                .map_err(ApiError::runtime)?;
             if recovered.pools_contained != 0 {
                 return Err(ApiError::Conflict("pool failed tenant recovery".into()));
             }
         } else {
             lifecycle::honor_stop(state, pool)
                 .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                .map_err(ApiError::runtime)?;
         }
         lifecycle::clear_runtime_caches(state, &pool.runtime_id).await;
         Ok::<_, ApiError>(())
@@ -263,7 +263,7 @@ async fn remove_pool_container(
                 Err(error)
             }
         })
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     state
         .docker
         .delete(pool.protocol, &pool.runtime_id)
@@ -275,7 +275,7 @@ async fn remove_pool_container(
                 Err(error)
             }
         })
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     Ok(())
 }
 
@@ -304,7 +304,9 @@ pub(crate) async fn refresh_logging(state: &AppState, runtime_id: &str) -> Resul
         refresh_logging_locked(&state, &mut pool).await
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("pool console-policy worker failed: {error}")))?
+    .map_err(ApiError::runtime_context(
+        "pool console-policy worker failed",
+    ))?
 }
 
 pub(super) async fn refresh_logging_locked(

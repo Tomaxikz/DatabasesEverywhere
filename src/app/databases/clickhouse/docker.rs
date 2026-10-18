@@ -1,3 +1,4 @@
+use crate::databases::engine::DedicatedSpecInput;
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
@@ -29,34 +30,22 @@ struct Bootstrap {
     password: SecretString,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn instance_spec(
-    instance_id: &str,
-    image: &str,
-    database: &str,
-    username: &str,
-    password: SecretString,
-    data_path: PathBuf,
-    hosted_config_path: PathBuf,
-    runtime_path: PathBuf,
-    bridge_binary_path: PathBuf,
-) -> DockerInstanceSpec {
+pub(crate) fn instance_spec(input: DedicatedSpecInput<'_>) -> DockerInstanceSpec {
     build_spec(
-        instance_id,
-        image,
+        input.instance_id,
+        input.image,
         Bootstrap {
-            database: database.to_string(),
-            username: username.to_string(),
-            password,
+            database: input.database.to_string(),
+            username: input.username.to_string(),
+            password: input.password,
         },
-        data_path,
-        hosted_config_path,
-        runtime_path,
-        bridge_binary_path,
+        input.data_path,
+        input.hosted_config.unwrap_or_default(),
+        input.sockets,
+        input.socket_bridge_binary,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn shared_spec(
     runtime_id: &str,
     image: &str,
@@ -81,7 +70,6 @@ pub fn shared_spec(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_spec(
     runtime_id: &str,
     image: &str,
@@ -92,19 +80,6 @@ fn build_spec(
     bridge_binary_path: PathBuf,
 ) -> DockerInstanceSpec {
     DockerInstanceSpec {
-        instance_id: runtime_id.to_string(),
-        protocol: Protocol::Clickhouse,
-        image: image.to_string(),
-        project_id: None,
-        user: None,
-        working_dir: None,
-        entrypoint: None,
-        cpu_cores: 1.0,
-        memory_mib: 1024,
-        disk_mib: 10240,
-        pids_limit: None,
-        data_path,
-        data_target: "/var/lib/clickhouse".to_string(),
         extra_mounts: vec![
             DockerMount {
                 source: hosted_config_path,
@@ -133,32 +108,20 @@ fn build_spec(
             },
         ],
         env: vec![
-            DockerEnv {
-                key: "CLICKHOUSE_DB".to_string(),
-                value: SecretString::from(bootstrap.database),
-            },
-            DockerEnv {
-                key: "CLICKHOUSE_USER".to_string(),
-                value: SecretString::from(bootstrap.username),
-            },
-            DockerEnv {
-                key: "CLICKHOUSE_PASSWORD".to_string(),
-                value: bootstrap.password,
-            },
-            DockerEnv {
-                key: "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT".to_string(),
-                value: SecretString::from("1"),
-            },
-            DockerEnv {
-                key: "CLICKHOUSE_RUN_AS_ROOT".to_string(),
-                value: SecretString::from("1"),
-            },
-            DockerEnv {
-                key: "CLICKHOUSE_DO_NOT_CHOWN".to_string(),
-                value: SecretString::from("1"),
-            },
+            DockerEnv::new("CLICKHOUSE_DB", SecretString::from(bootstrap.database)),
+            DockerEnv::new("CLICKHOUSE_USER", SecretString::from(bootstrap.username)),
+            DockerEnv::new("CLICKHOUSE_PASSWORD", bootstrap.password),
+            DockerEnv::plain("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1"),
+            DockerEnv::plain("CLICKHOUSE_RUN_AS_ROOT", "1"),
+            DockerEnv::plain("CLICKHOUSE_DO_NOT_CHOWN", "1"),
         ],
-        command: Vec::new(),
+        ..DockerInstanceSpec::with_defaults(
+            runtime_id,
+            Protocol::Clickhouse,
+            image,
+            data_path,
+            "/var/lib/clickhouse",
+        )
     }
 }
 
@@ -371,17 +334,18 @@ mod tests {
 
     #[test]
     fn uses_clickhouse_data_directory_and_native_port() {
-        let spec = instance_spec(
-            "inst_ch_1",
-            "clickhouse/clickhouse-server:25.8.25.37",
-            "ch_1",
-            "app_ch_1",
-            SecretString::from("secret"),
-            PathBuf::from("/tmp/data"),
-            PathBuf::from("/tmp/logs/dbe-hosted-overrides.xml"),
-            PathBuf::from("/tmp/run"),
-            PathBuf::from("/tmp/dbev-socket-bridge"),
-        );
+        let spec = instance_spec(DedicatedSpecInput {
+            instance_id: "inst_ch_1",
+            image: "clickhouse/clickhouse-server:25.8.25.37",
+            database: "ch_1",
+            username: "app_ch_1",
+            password: SecretString::from("secret"),
+            maintenance_password: SecretString::from("unused"),
+            data_path: PathBuf::from("/tmp/data"),
+            sockets: PathBuf::from("/tmp/run"),
+            hosted_config: Some(PathBuf::from("/tmp/logs/dbe-hosted-overrides.xml")),
+            socket_bridge_binary: PathBuf::from("/tmp/dbev-socket-bridge"),
+        });
 
         assert_eq!(spec.protocol, Protocol::Clickhouse);
         assert_eq!(spec.data_target, "/var/lib/clickhouse");

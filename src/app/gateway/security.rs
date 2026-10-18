@@ -1,18 +1,35 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
+    num::NonZeroU32,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
+use governor::{
+    Quota, RateLimiter,
+    clock::{Clock, DefaultClock, Reference},
+    middleware::NoOpMiddleware,
+    nanos::Nanos,
+    state::keyed::HashMapStateStore,
+};
+
+/// A peer idle for this long has a fully replenished per-minute quota, so its
+/// bookkeeping can be dropped without changing any rate decision.
 const DB_CONNECTION_WINDOW: Duration = Duration::from_secs(60);
 const MAX_GATEWAY_RATE_LIMIT_KEYS: usize = 8192;
 const DEFAULT_MAX_CONNECTIONS_PER_WINDOW: u32 = 240;
 
+type KeyedRateLimiter<C> = RateLimiter<
+    GatewayPeer,
+    HashMapStateStore<GatewayPeer>,
+    C,
+    NoOpMiddleware<<C as Clock>::Instant>,
+>;
+
 #[derive(Debug, Clone)]
-pub struct GatewayConnectionLimiter {
-    inner: Arc<Mutex<LimiterState>>,
-    max_connections: u32,
+pub struct GatewayConnectionLimiter<C: Clock = DefaultClock> {
+    inner: Arc<Mutex<LimiterState<C>>>,
     max_active_per_ip: u32,
 }
 
@@ -30,12 +47,12 @@ pub struct GatewayConnectionRejection {
 }
 
 #[derive(Debug)]
-pub struct GatewayConnectionPermit {
-    inner: Arc<Mutex<LimiterState>>,
+pub struct GatewayConnectionPermit<C: Clock = DefaultClock> {
+    inner: Arc<Mutex<LimiterState<C>>>,
     peer: GatewayPeer,
 }
 
-impl Drop for GatewayConnectionPermit {
+impl<C: Clock> Drop for GatewayConnectionPermit<C> {
     fn drop(&mut self) {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let Some(active) = state.active.get_mut(&self.peer) else {
@@ -44,8 +61,8 @@ impl Drop for GatewayConnectionPermit {
         *active = active.saturating_sub(1);
         if *active == 0 {
             state.active.remove(&self.peer);
-            if let Some(window) = state.windows.get_mut(&self.peer) {
-                window.active_rejection_logged = false;
+            if let Some(peer) = state.peers.get_mut(&self.peer) {
+                peer.active_rejection_logged = false;
             }
         }
     }
@@ -66,25 +83,32 @@ impl GatewayConnectionLimiter {
     }
 
     pub(crate) fn with_active_limit(max_connections: u32, max_active: usize) -> Self {
-        let max_connections = max_connections.max(1);
+        Self::with_clock(max_connections, max_active, DefaultClock::default())
+    }
+}
+
+impl<C: Clock> GatewayConnectionLimiter<C> {
+    fn with_clock(max_connections: u32, max_active: usize, clock: C) -> Self {
+        let max_connections = NonZeroU32::new(max_connections).unwrap_or(NonZeroU32::MIN);
         Self {
-            inner: Arc::default(),
-            max_connections,
-            max_active_per_ip: max_active.max(1).min(max_connections as usize) as u32,
+            inner: Arc::new(Mutex::new(LimiterState::new(
+                Quota::per_minute(max_connections),
+                clock,
+            ))),
+            max_active_per_ip: max_active.max(1).min(max_connections.get() as usize) as u32,
         }
     }
 
     pub fn try_acquire(
         &self,
         ip: IpAddr,
-    ) -> Result<GatewayConnectionPermit, GatewayConnectionRejection> {
-        let now = Instant::now();
+    ) -> Result<GatewayConnectionPermit<C>, GatewayConnectionRejection> {
         let peer = GatewayPeer::from_ip(ip);
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        evict_expired_windows(&mut state, now);
+        let now = state.limiter.clock().now();
+        state.evict_idle_peers(now);
 
-        if state.windows.len() >= MAX_GATEWAY_RATE_LIMIT_KEYS && !state.windows.contains_key(&peer)
-        {
+        if state.peers.len() >= MAX_GATEWAY_RATE_LIMIT_KEYS && !state.peers.contains_key(&peer) {
             let should_log = !state.capacity_rejection_logged;
             state.capacity_rejection_logged = true;
             return Err(GatewayConnectionRejection {
@@ -94,37 +118,27 @@ impl GatewayConnectionLimiter {
         }
 
         if state.active.get(&peer).copied().unwrap_or_default() >= self.max_active_per_ip {
-            let window = state
-                .windows
-                .entry(peer)
-                .or_insert_with(|| ConnectionWindow::new(now));
-            let should_log = !window.active_rejection_logged;
-            window.active_rejection_logged = true;
+            let peer_state = state.touch(peer, now);
+            let should_log = !peer_state.active_rejection_logged;
+            peer_state.active_rejection_logged = true;
             return Err(GatewayConnectionRejection {
                 reason: GatewayConnectionRejectionReason::TooManyActive,
                 should_log,
             });
         }
 
-        let window = state
-            .windows
-            .entry(peer)
-            .or_insert_with(|| ConnectionWindow::new(now));
-        if now.duration_since(window.started_at) >= DB_CONNECTION_WINDOW {
-            window.started_at = now;
-            window.count = 0;
-            window.rate_rejection_logged = false;
-        }
-        if window.count >= self.max_connections {
-            let should_log = !window.rate_rejection_logged;
-            window.rate_rejection_logged = true;
+        let allowed = state.limiter.check_key(&peer).is_ok();
+        let peer_state = state.touch(peer, now);
+        if !allowed {
+            let should_log = !peer_state.rate_rejection_logged;
+            peer_state.rate_rejection_logged = true;
             return Err(GatewayConnectionRejection {
                 reason: GatewayConnectionRejectionReason::RateLimited,
                 should_log,
             });
         }
-        window.active_rejection_logged = false;
-        window.count += 1;
+        peer_state.rate_rejection_logged = false;
+        peer_state.active_rejection_logged = false;
         *state.active.entry(peer).or_default() += 1;
 
         Ok(GatewayConnectionPermit {
@@ -134,30 +148,69 @@ impl GatewayConnectionLimiter {
     }
 }
 
-#[derive(Debug, Default)]
-struct LimiterState {
-    windows: HashMap<GatewayPeer, ConnectionWindow>,
+/// `limiter` holds the GCRA state that decides admission; `peers` mirrors the
+/// tracked peers so the limiter can cap their number and log rejections once.
+#[derive(Debug)]
+struct LimiterState<C: Clock> {
+    limiter: KeyedRateLimiter<C>,
+    peers: HashMap<GatewayPeer, PeerState<C::Instant>>,
     active: HashMap<GatewayPeer, u32>,
+    last_sweep: C::Instant,
     capacity_rejection_logged: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ConnectionWindow {
-    started_at: Instant,
-    count: u32,
-    rate_rejection_logged: bool,
-    active_rejection_logged: bool,
-}
-
-impl ConnectionWindow {
-    fn new(started_at: Instant) -> Self {
+impl<C: Clock> LimiterState<C> {
+    fn new(quota: Quota, clock: C) -> Self {
+        let limiter = RateLimiter::hashmap_with_clock(quota, clock);
+        let last_sweep = limiter.clock().now();
         Self {
-            started_at,
-            count: 0,
-            rate_rejection_logged: false,
-            active_rejection_logged: false,
+            limiter,
+            peers: HashMap::new(),
+            active: HashMap::new(),
+            last_sweep,
+            capacity_rejection_logged: false,
         }
     }
+
+    fn touch(&mut self, peer: GatewayPeer, now: C::Instant) -> &mut PeerState<C::Instant> {
+        let peer_state = self.peers.entry(peer).or_insert(PeerState {
+            last_seen: now,
+            rate_rejection_logged: false,
+            active_rejection_logged: false,
+        });
+        peer_state.last_seen = now;
+        peer_state
+    }
+
+    /// Drops peers with no active connection that have been idle for a full
+    /// window, both from the bookkeeping map and (via `retain_recent`) from
+    /// governor's store. Runs once per window, or on every call while full.
+    fn evict_idle_peers(&mut self, now: C::Instant) {
+        let window = Nanos::from(DB_CONNECTION_WINDOW);
+        let full = self.peers.len() >= MAX_GATEWAY_RATE_LIMIT_KEYS;
+        let sweep_due = now.duration_since(self.last_sweep) >= window;
+        if sweep_due || full {
+            let active = &self.active;
+            self.peers.retain(|peer, state| {
+                active.contains_key(peer) || now.duration_since(state.last_seen) < window
+            });
+            self.limiter.retain_recent();
+        }
+        if sweep_due {
+            self.limiter.shrink_to_fit();
+            self.last_sweep = now;
+        }
+        if self.peers.len() < MAX_GATEWAY_RATE_LIMIT_KEYS {
+            self.capacity_rejection_logged = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerState<I> {
+    last_seen: I,
+    rate_rejection_logged: bool,
+    active_rejection_logged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,22 +235,55 @@ impl GatewayPeer {
     }
 }
 
-fn evict_expired_windows(state: &mut LimiterState, now: Instant) {
-    if state.windows.len() < MAX_GATEWAY_RATE_LIMIT_KEYS {
-        return;
-    }
-    state.windows.retain(|ip, window| {
-        state.active.contains_key(ip)
-            || now.duration_since(window.started_at) < DB_CONNECTION_WINDOW
-    });
-    if state.windows.len() < MAX_GATEWAY_RATE_LIMIT_KEYS {
-        state.capacity_rejection_logged = false;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_does_not_double_across_a_minute_boundary() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter = GatewayConnectionLimiter::with_clock(60, 1000, clock.clone());
+        let ip = "192.0.2.30".parse().unwrap();
+        let allowed_until_rejected = || {
+            let mut allowed = 0;
+            while limiter.try_acquire(ip).is_ok() {
+                allowed += 1;
+            }
+            allowed
+        };
+
+        // A fixed window opened at t=0 would admit 60 at t=59s and another 60
+        // at t=61s. GCRA only refills one connection per second.
+        drop(limiter.try_acquire(ip).unwrap());
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(allowed_until_rejected(), 60);
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(allowed_until_rejected(), 2);
+        assert!(matches!(
+            limiter.try_acquire(ip),
+            Err(GatewayConnectionRejection {
+                reason: GatewayConnectionRejectionReason::RateLimited,
+                should_log: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn idle_peers_are_evicted_but_active_peers_are_kept() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter = GatewayConnectionLimiter::with_clock(2, 2, clock.clone());
+        let idle = "192.0.2.40".parse().unwrap();
+        let busy = "192.0.2.41".parse().unwrap();
+        drop(limiter.try_acquire(idle).unwrap());
+        let _permit = limiter.try_acquire(busy).unwrap();
+
+        clock.advance(DB_CONNECTION_WINDOW);
+        drop(limiter.try_acquire("192.0.2.42".parse().unwrap()).unwrap());
+        let state = limiter.inner.lock().unwrap();
+        assert!(!state.peers.contains_key(&GatewayPeer::from_ip(idle)));
+        assert!(state.peers.contains_key(&GatewayPeer::from_ip(busy)));
+        assert_eq!(state.limiter.len(), 1);
+    }
 
     #[test]
     fn active_peer_limit_is_configurable_and_releases_capacity() {

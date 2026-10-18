@@ -5,8 +5,7 @@ use aws_lc_rs::hmac;
 use secrecy::SecretString;
 
 use crate::{
-    databases::postgres::provision::quote_ident,
-    utils::{backend::POSTGRES_SOCKET_DIRECTORY, hex::encode_lower, shell::sh_quote},
+    databases::postgres::provision::quote_ident, utils::backend::POSTGRES_SOCKET_DIRECTORY,
 };
 
 pub(crate) const REPLICATION_ROLE: &str = "dbe_replication";
@@ -34,7 +33,7 @@ pub(crate) fn replication_password(admin_password: &str) -> Result<SecretString,
     }
     let key = hmac::Key::new(hmac::HMAC_SHA256, admin_password.as_bytes());
     let tag = hmac::sign(&key, REPLICATION_PASSWORD_DOMAIN);
-    Ok(SecretString::from(encode_lower(tag.as_ref())))
+    Ok(SecretString::from(hex::encode(tag.as_ref())))
 }
 
 pub(crate) fn capture_tag(tag: &str) -> bool {
@@ -189,66 +188,13 @@ pub(crate) fn verifybackup_argv(pgdata: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) fn basebackup_script(tag: &str, label: &str) -> Result<String, String> {
-    let dir = capture_dir(tag)?;
-    if !valid_label(label) {
-        return Err("backup label is empty or contains control characters".to_string());
-    }
-    let pgdata = format!("{dir}/{DATA_ROOT}");
-    let argv = join_quoted(&basebackup_argv(&pgdata, label));
-    Ok(BASEBACKUP_SCRIPT
-        .replace("@DIR_PATTERN@", &dir)
-        .replace("@DIR@", &sh_quote(&dir))
-        .replace("@ARGV@", &argv))
-}
-
-pub(crate) fn verifybackup_script(tag: &str) -> Result<String, String> {
-    let dir = capture_dir(tag)?;
-    let argv = join_quoted(&verifybackup_argv(&format!("{dir}/{DATA_ROOT}")));
-    Ok(format!("set -eu\nexec {argv}\n"))
-}
-
 pub(crate) fn preflight_script() -> &'static str {
     PREFLIGHT_SCRIPT
-}
-
-fn capture_dir(tag: &str) -> Result<String, String> {
-    if !capture_tag(tag) {
-        return Err("capture tag is not a backup directory name".to_string());
-    }
-    Ok(format!("{POSTGRES_SOCKET_DIRECTORY}/{tag}"))
-}
-
-fn valid_label(label: &str) -> bool {
-    !label.is_empty() && label.len() <= 128 && !label.chars().any(char::is_control)
-}
-
-fn join_quoted(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| sh_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
-
-const BASEBACKUP_SCRIPT: &str = r#"set -eu
-dir=@DIR@
-case "$dir" in
-  @DIR_PATTERN@) ;;
-  *) printf 'refusing_capture_path\n'; exit 2 ;;
-esac
-if [ -L "$dir" ]; then printf 'refusing_symlink\n'; exit 2; fi
-rm -rf -- "$dir"
-mkdir -- "$dir"
-chmod 700 -- "$dir"
-mkdir -- "$dir/pgdata"
-chmod 700 -- "$dir/pgdata"
-export PGPASSWORD="$DBE_REPLICATION_PASSWORD"
-exec @ARGV@
-"#;
 
 const PREFLIGHT_SCRIPT: &str = r#"set -eu
 printf 'DBEV_PG_PREFLIGHT_V1\n'
@@ -377,7 +323,6 @@ mod tests {
             "pgdata",
         ] {
             assert!(!capture_tag(tag), "{tag}");
-            assert!(basebackup_script(tag, LABEL).is_err(), "{tag}");
         }
     }
 
@@ -410,34 +355,6 @@ mod tests {
         ] {
             assert!(!argv.iter().any(|arg| arg == forbidden), "{forbidden}");
         }
-    }
-
-    #[test]
-    fn basebackup_script_quotes_the_tag_directory_and_hides_the_password() {
-        let script = basebackup_script(TAG, LABEL).unwrap();
-        let dir = format!("{POSTGRES_SOCKET_DIRECTORY}/{TAG}");
-        assert!(script.contains(&sh_quote(&dir)));
-        assert!(script.contains(&format!("  {dir}) ;;")));
-        assert!(script.contains("rm -rf -- \"$dir\""));
-        assert!(script.contains("mkdir -- \"$dir\""));
-        assert!(!script.contains("mkdir -p"));
-        assert!(script.contains("export PGPASSWORD=\"$DBE_REPLICATION_PASSWORD\""));
-        assert!(script.contains("exec "));
-        assert!(!script.contains("super-secret"));
-        assert!(!script.contains("--no-slot"));
-        assert!(!script.contains("--checkpoint=fast"));
-        assert!(script.contains(&sh_quote(&format!("{dir}/{DATA_ROOT}"))));
-        assert!(!script.contains('@'));
-    }
-
-    #[test]
-    fn verify_script_points_at_the_captured_tree() {
-        let script = verifybackup_script(TAG).unwrap();
-        let pgdata = format!("{POSTGRES_SOCKET_DIRECTORY}/{TAG}/{DATA_ROOT}");
-        assert!(script.contains(&sh_quote("pg_verifybackup")));
-        assert!(script.contains(&sh_quote("--exit-on-error")));
-        assert!(script.contains(&sh_quote(&pgdata)));
-        assert!(!script.contains("rm -rf"));
     }
 
     #[test]

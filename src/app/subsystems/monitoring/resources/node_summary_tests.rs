@@ -52,10 +52,10 @@ fn generic_disk_sampler_excludes_shared_pool_roots() {
 #[test]
 fn parses_host_cpu_and_calculates_non_idle_percentage() {
     let previous =
-        parse_host_cpu("cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425\ncpu1 50 0 25 425\n")
+        parse_host_cpu("cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425\ncpu1 50 0 25 425\nctxt 0\nbtime 0\nprocesses 0\n")
             .unwrap();
     let current =
-        parse_host_cpu("cpu  150 0 100 950 0 0 0 0 0 0\ncpu0 75 0 50 475\ncpu1 75 0 50 475\n")
+        parse_host_cpu("cpu  150 0 100 950 0 0 0 0 0 0\ncpu0 75 0 50 475\ncpu1 75 0 50 475\nctxt 0\nbtime 0\nprocesses 0\n")
             .unwrap();
 
     assert_eq!(current.cores, 2);

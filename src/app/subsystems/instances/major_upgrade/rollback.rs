@@ -114,11 +114,7 @@ pub(super) async fn rollback_major_upgrade(
         .manager
         .delete_compatibility(&instance_id)
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "major-upgrade rollback restored the old container but could not invalidate the replacement compatibility attestation: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context("major-upgrade rollback restored the old container but could not invalidate the replacement compatibility attestation"))?;
     Ok(())
 }
 
@@ -154,17 +150,13 @@ impl MajorUpgradeRollback {
             disk_limiter
                 .purge_instance_data(&self.paths.data)
                 .await
-                .map_err(|error| {
-                    ApiError::Runtime(format!(
-                        "failed to tear down replacement data before rollback: {error}"
-                    ))
-                })?;
+                .map_err(ApiError::runtime_context(
+                    "failed to tear down replacement data before rollback",
+                ))?;
             remove_path_if_exists(&self.paths.data).await?;
             rename_path(old_volume_backup, &self.paths.data)
                 .await
-                .map_err(|error| {
-                    ApiError::Runtime(format!("failed to restore old volume: {error}"))
-                })?;
+                .map_err(ApiError::runtime_context("failed to restore old volume"))?;
         } else if classify_upgrade_rollback(&self.paths.data, old_volume_backup).await?
             != MajorUpgradeRollbackLocation::OriginalDataInPlace
         {
@@ -184,7 +176,7 @@ impl MajorUpgradeRollback {
             .manager
             .upsert(self.metadata.clone())
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         tracing::warn!(
             event = "audit instance_major_upgrade_rollback_completed",
             instance_id = %self.metadata.instance_id,

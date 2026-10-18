@@ -61,7 +61,6 @@ pub fn shared_spec(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_spec(
     runtime_id: &str,
     image: &str,
@@ -74,29 +73,17 @@ fn build_spec(
     let mut env = Vec::new();
     if let Some(tenant) = tenant {
         env.extend([
-            DockerEnv {
-                key: "DBE_MONGO_USER".to_string(),
-                value: SecretString::from(tenant.username),
-            },
-            DockerEnv {
-                key: "DBE_MONGO_PASSWORD".to_string(),
-                value: tenant.password,
-            },
-            DockerEnv {
-                key: "DBE_MONGO_DATABASE".to_string(),
-                value: SecretString::from(tenant.database),
-            },
+            DockerEnv::new("DBE_MONGO_USER", SecretString::from(tenant.username)),
+            DockerEnv::new("DBE_MONGO_PASSWORD", tenant.password),
+            DockerEnv::new("DBE_MONGO_DATABASE", SecretString::from(tenant.database)),
         ]);
     }
     env.extend([
-        DockerEnv {
-            key: "DBE_MONGO_ROOT_USER".to_string(),
-            value: SecretString::from(INTERNAL_ROOT_USERNAME.to_string()),
-        },
-        DockerEnv {
-            key: "DBE_MONGO_ROOT_PASSWORD".to_string(),
-            value: root_password,
-        },
+        DockerEnv::new(
+            "DBE_MONGO_ROOT_USER",
+            SecretString::from(INTERNAL_ROOT_USERNAME.to_string()),
+        ),
+        DockerEnv::new("DBE_MONGO_ROOT_PASSWORD", root_password),
     ]);
 
     let mut command = vec![
@@ -118,27 +105,20 @@ fn build_spec(
     }
 
     DockerInstanceSpec {
-        instance_id: runtime_id.to_string(),
-        protocol: Protocol::Mongodb,
-        image: image.to_string(),
-        project_id: None,
-        user: None,
-        working_dir: None,
-        entrypoint: None,
-        cpu_cores: 1.0,
-        memory_mib: 1024,
-        disk_mib: 10240,
-        pids_limit: None,
-        data_path,
-        data_target: "/data/db".to_string(),
         extra_mounts: vec![DockerMount {
             source: runtime_path,
             target: CONTAINER_SOCKET_DIRECTORY.to_string(),
             read_only: false,
         }],
-        socket_bridges: Vec::new(),
         env,
         command,
+        ..DockerInstanceSpec::with_defaults(
+            runtime_id,
+            Protocol::Mongodb,
+            image,
+            data_path,
+            "/data/db",
+        )
     }
 }
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 pub(super) async fn require_instance(state: &AppState, instance_id: &str) -> Result<(), ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     state
         .instances
         .get(instance_id)
@@ -58,7 +58,7 @@ pub(super) async fn read_instance_artifacts(
     state: &AppState,
     instance_id: &str,
 ) -> Result<Vec<ArtifactInfo>, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     let instance_root = instance_export_root(state, instance_id);
     let Some(mut entries) = read_real_directory(&instance_root).await? else {
         return Ok(Vec::new());
@@ -68,11 +68,11 @@ pub(super) async fn read_instance_artifacts(
     while let Some(entry) = entries
         .next_entry()
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to read artifact entry: {error}")))?
+        .map_err(ApiError::runtime_context("failed to read artifact entry"))?
     {
         let metadata = tokio::fs::symlink_metadata(entry.path())
             .await
-            .map_err(|error| ApiError::Runtime(format!("failed to stat artifact: {error}")))?;
+            .map_err(ApiError::runtime_context("failed to stat artifact"))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
@@ -117,7 +117,7 @@ pub(crate) async fn verified_artifact_path(
     name: &str,
     instance_id: &str,
 ) -> Result<PathBuf, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     validate_artifact_name(name)?;
     let root = instance_export_root(state, instance_id);
     verified_path_in_root(&root, name).await
@@ -128,7 +128,7 @@ pub(super) async fn downloadable_artifact_path(
     name: &str,
     instance_id: &str,
 ) -> Result<DownloadableArtifact, ApiError> {
-    validate_instance_id(instance_id).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     validate_artifact_name(name)?;
     let retained = verified_path_in_root(&instance_export_root(state, instance_id), name).await;
     let one_use = verified_path_in_root(&instance_spool_root(state, instance_id), name).await;
@@ -164,7 +164,7 @@ pub(super) async fn verified_path_in_root(root: &FsPath, name: &str) -> Result<P
     }
     let root = tokio::fs::canonicalize(&root)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to resolve artifact root: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to resolve artifact root"))?;
     let path = root.join(name);
     let metadata =
         tokio::fs::symlink_metadata(&path)
@@ -180,7 +180,7 @@ pub(super) async fn verified_path_in_root(root: &FsPath, name: &str) -> Result<P
     }
     let canonical = tokio::fs::canonicalize(&path)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to resolve artifact: {error}")))?;
+        .map_err(ApiError::runtime_context("failed to resolve artifact"))?;
     if !canonical.starts_with(&root) {
         return Err(ApiError::BadRequest(
             "artifact resolves outside artifact root".to_string(),

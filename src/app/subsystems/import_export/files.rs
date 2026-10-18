@@ -47,8 +47,8 @@ pub(super) async fn copy_file(from: &FsPath, to: &FsPath) -> Result<(), ApiError
         })
     })
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to join file copy task: {error}")))?
-    .map_err(|error| ApiError::Runtime(format!("failed to copy file: {error}")))
+    .map_err(ApiError::runtime_context("failed to join file copy task"))?
+    .map_err(ApiError::runtime_context("failed to copy file"))
 }
 
 pub(super) async fn archive_or_copy_export(
@@ -58,7 +58,9 @@ pub(super) async fn archive_or_copy_export(
 ) -> Result<(), ApiError> {
     let source_bytes = tokio::fs::symlink_metadata(from)
         .await
-        .map_err(|error| ApiError::Runtime(format!("failed to inspect export staging: {error}")))?
+        .map_err(ApiError::runtime_context(
+            "failed to inspect export staging",
+        ))?
         .len();
     let output_bound = export_artifact_capacity_bytes(source_bytes, format).ok_or_else(|| {
         ApiError::Runtime("compressed export capacity calculation overflowed".to_string())
@@ -87,11 +89,11 @@ pub(super) async fn move_or_copy_file(from: &FsPath, to: &FsPath) -> Result<(), 
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
             copy_file(from, to).await?;
-            tokio::fs::remove_file(from).await.map_err(|error| {
-                ApiError::Runtime(format!(
-                    "failed to remove export staging file after copying it: {error}"
+            tokio::fs::remove_file(from)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to remove export staging file after copying it",
                 ))
-            })
         }
         Err(error) => Err(ApiError::Runtime(format!(
             "failed to install export artifact: {error}"
@@ -287,8 +289,7 @@ pub(super) async fn validate_artifact_path(
     instance_id: &str,
     path: &FsPath,
 ) -> Result<PathBuf, ApiError> {
-    crate::utils::ids::validate_instance_id(instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    crate::utils::ids::validate_instance_id(instance_id).map_err(ApiError::bad_request)?;
     let artifact_id = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -315,9 +316,9 @@ pub(super) async fn validate_artifact_path(
 
         tokio::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o600))
             .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("failed to secure import artifact: {error}"))
-            })?;
+            .map_err(ApiError::runtime_context(
+                "failed to secure import artifact",
+            ))?;
     }
     Ok(artifact_path)
 }
@@ -335,11 +336,12 @@ async fn prepare_instance_artifact_roots(
         prepare_private_dir(&base_root, "artifact root").await?;
         let instance_root = base_root.join(instance_id);
         prepare_private_dir(&instance_root, "instance artifact directory").await?;
-        let canonical_root = tokio::fs::canonicalize(&instance_root)
-            .await
-            .map_err(|error| {
-                ApiError::Runtime(format!("failed to resolve instance artifact root: {error}"))
-            })?;
+        let canonical_root =
+            tokio::fs::canonicalize(&instance_root)
+                .await
+                .map_err(ApiError::runtime_context(
+                    "failed to resolve instance artifact root",
+                ))?;
         instance_roots.push(canonical_root);
     }
     Ok(instance_roots)
@@ -391,9 +393,11 @@ async fn find_relative_artifact(
                 "artifact_id must name a real regular file".to_string(),
             ));
         }
-        return tokio::fs::canonicalize(candidate).await.map_err(|error| {
-            ApiError::Runtime(format!("failed to resolve import artifact: {error}"))
-        });
+        return tokio::fs::canonicalize(candidate)
+            .await
+            .map_err(ApiError::runtime_context(
+                "failed to resolve import artifact",
+            ));
     }
     Err(ApiError::NotFound)
 }
@@ -419,4 +423,14 @@ pub(super) fn has_allowed_artifact_extension(path: &FsPath) -> bool {
     ]
     .iter()
     .any(|suffix| filename.ends_with(suffix))
+}
+
+/// Durably removes an import recovery manifest once the import committed.
+pub(crate) async fn commit_recovery_manifest(path: &FsPath) -> Result<(), ApiError> {
+    let path = path.to_path_buf();
+    crate::routes::http::response::run_blocking(
+        "failed to commit import recovery metadata",
+        move || crate::io::files::remove_private_file_durable(&path),
+    )
+    .await
 }

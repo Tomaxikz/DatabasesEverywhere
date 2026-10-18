@@ -262,11 +262,9 @@ impl QdrantHttp {
         }
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);
-        let mut output = options.open(path).await.map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to create qdrant snapshot staging file: {error}"
-            ))
-        })?;
+        let mut output = options.open(path).await.map_err(ApiError::runtime_context(
+            "failed to create qdrant snapshot staging file",
+        ))?;
         let mut total = 0_u64;
         while let Some(chunk) = response
             .chunk()
@@ -282,13 +280,15 @@ impl QdrantHttp {
                     "qdrant snapshot exceeds the remaining {max_bytes}-byte staging limit"
                 )));
             }
-            output.write_all(&chunk).await.map_err(|error| {
-                ApiError::Runtime(format!("failed to stage qdrant snapshot: {error}"))
-            })?;
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(ApiError::runtime_context("failed to stage qdrant snapshot"))?;
         }
-        output.sync_all().await.map_err(|error| {
-            ApiError::Runtime(format!("failed to sync qdrant snapshot: {error}"))
-        })?;
+        output
+            .sync_all()
+            .await
+            .map_err(ApiError::runtime_context("failed to sync qdrant snapshot"))?;
         if total == 0 {
             drop(output);
             let _ = tokio::fs::remove_file(path).await;
@@ -302,9 +302,9 @@ impl QdrantHttp {
         collection: &str,
         path: &Path,
     ) -> Result<(), ApiError> {
-        let part = Part::file(path).await.map_err(|error| {
-            ApiError::Runtime(format!("failed to open staged qdrant snapshot: {error}"))
-        })?;
+        let part = Part::file(path).await.map_err(ApiError::runtime_context(
+            "failed to open staged qdrant snapshot",
+        ))?;
         let form = Form::new().part("snapshot", part);
         let endpoint = format!(
             "/collections/{}/snapshots/upload?priority=snapshot&wait=true",
@@ -416,11 +416,9 @@ pub(super) async fn target_api_key(
             ],
         )
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to access managed qdrant credentials: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to access managed qdrant credentials",
+        ))?;
     let key = output.stdout;
     if key.is_empty() || key.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
         return Err(ApiError::Runtime(
@@ -446,16 +444,7 @@ pub(super) fn secret_header(
 }
 
 pub(super) fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
+    crate::utils::percent::encode_unreserved(value.as_bytes())
 }
 
 pub(super) fn safe_reqwest_error(error: &reqwest::Error) -> &'static str {

@@ -37,7 +37,7 @@ pub(in super::super) async fn reconcile(
         .manager
         .upsert(metadata.clone())
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     Ok(metadata)
 }
 

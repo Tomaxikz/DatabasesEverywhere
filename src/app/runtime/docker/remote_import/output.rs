@@ -14,6 +14,7 @@ use std::{
     path::Path,
     time::Duration,
 };
+use walkdir::WalkDir;
 
 pub(super) async fn measure_work_directory(
     path: &Path,
@@ -31,52 +32,38 @@ pub(super) async fn measure_work_directory(
 }
 
 pub(super) fn measure_work_dir_sync(root: &Path, stop_after: u64) -> Result<u64, IoError> {
+    let invalid = |reason: &str| IoError::new(ErrorKind::InvalidData, reason);
     let mut total = 0_u64;
-    let mut entries = 0_usize;
-    let mut pending = vec![(root.to_path_buf(), 0_usize)];
-
-    while let Some((directory, depth)) = pending.pop() {
-        if depth > MAX_WORK_DIRECTORY_DEPTH {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "remote import work directory nesting is too deep",
+    for (index, entry) in WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .enumerate()
+    {
+        if index >= MAX_WORK_DIRECTORY_ENTRIES {
+            return Err(invalid("remote import work directory has too many entries"));
+        }
+        let entry = entry?;
+        if entry.depth() > MAX_WORK_DIRECTORY_DEPTH + 1 {
+            return Err(invalid("remote import work directory nesting is too deep"));
+        }
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            return Err(invalid(
+                "remote import work directory contains a symbolic link",
             ));
         }
-        for entry in std::fs::read_dir(directory)? {
-            entries += 1;
-            if entries > MAX_WORK_DIRECTORY_ENTRIES {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "remote import work directory has too many entries",
-                ));
+        if file_type.is_file() {
+            total = total
+                .checked_add(entry.metadata()?.len())
+                .ok_or_else(|| invalid("remote import work directory size overflow"))?;
+            if total > stop_after {
+                return Ok(total);
             }
-            let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())?;
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "remote import work directory contains a symbolic link",
-                ));
-            }
-            if file_type.is_dir() {
-                pending.push((entry.path(), depth + 1));
-            } else if file_type.is_file() {
-                total = total.checked_add(metadata.len()).ok_or_else(|| {
-                    IoError::new(
-                        ErrorKind::InvalidData,
-                        "remote import work directory size overflow",
-                    )
-                })?;
-                if total > stop_after {
-                    return Ok(total);
-                }
-            } else {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "remote import work directory contains a special file",
-                ));
-            }
+        } else if !file_type.is_dir() {
+            return Err(invalid(
+                "remote import work directory contains a special file",
+            ));
         }
     }
     Ok(total)

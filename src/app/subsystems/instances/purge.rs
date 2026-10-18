@@ -55,13 +55,13 @@ pub(crate) async fn purge_provisional_runtime_paths(
     protocol: crate::databases::protocol::Protocol,
     disk_enforcement_method: Option<&str>,
 ) -> Result<(), ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, runtime_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, runtime_id).map_err(ApiError::bad_request)?;
     let limiter =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
     let limiter =
         provisional_cleanup_limiter(limiter, protocol, &paths.data, disk_enforcement_method)
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
     purge_with_limiter(paths, limiter).await
 }
 
@@ -70,8 +70,8 @@ async fn purge_physical_paths(
     runtime_id: &str,
     disk_enforcement_method: &str,
 ) -> Result<(), ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, runtime_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, runtime_id).map_err(ApiError::bad_request)?;
     let limiter =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root());
     let limiter = limiter.for_persisted_method(disk_enforcement_method);
@@ -110,7 +110,7 @@ async fn purge_with_limiter(paths: InstancePaths, limiter: DiskLimiter) -> Resul
     limiter
         .release_instance_storage(&paths.instance_id, &paths.data)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     for path in [paths.data, paths.logs, paths.sockets, paths.runtime_config] {
         remove_path_if_exists(&path).await?;
     }
@@ -127,8 +127,8 @@ async fn purge_paths(
     instance_id: &str,
     cleanup: DataCleanup<'_>,
 ) -> Result<(), ApiError> {
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     let disk_limiter = match cleanup {
         DataCleanup::Plain => None,
         DataCleanup::Quota(method) => {
@@ -146,7 +146,7 @@ async fn purge_paths(
         disk_limiter
             .release_instance_storage(instance_id, &paths.data)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
     }
     let deleted_backups =
         crate::subsystems::backups::purge_instance_backups(state, instance_id).await?;
@@ -170,11 +170,9 @@ async fn purge_paths(
     ];
     let retained_volumes = retained_instance_volume_paths(&removable_paths[0])
         .await
-        .map_err(|error| {
-            ApiError::Runtime(format!(
-                "failed to discover retained instance volumes: {error}"
-            ))
-        })?;
+        .map_err(ApiError::runtime_context(
+            "failed to discover retained instance volumes",
+        ))?;
     // Retained major-upgrade/restore volumes can themselves be Btrfs
     // subvolumes or ZFS datasets. Remove their native quota object before the
     // generic filesystem cleanup; `remove_dir_all` cannot delete those roots.
@@ -183,7 +181,7 @@ async fn purge_paths(
             disk_limiter
                 .purge_instance_data(retained_volume)
                 .await
-                .map_err(|error| ApiError::Runtime(error.to_string()))?;
+                .map_err(ApiError::runtime)?;
         }
     }
     removable_paths.extend(retained_volumes);

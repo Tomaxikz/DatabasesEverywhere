@@ -6,14 +6,15 @@ use serde_json::Value;
 use crate::{
     config::BackupBrowsingConfig, databases::protocol::Protocol, runtime::docker::DockerRuntime,
     server::credentials::logical_export_env, server::metadata::InstanceMetadata,
-    server::placement::DeploymentMode, utils::hex::nibble,
+    server::placement::DeploymentMode,
 };
 
 #[cfg(test)]
 use crate::{
     databases::{
-        mysql::inspection::{mysql_identifier, mysql_string},
+        mysql::inspection::mysql_string,
         postgres::inspection::{parse_postgres_schema, postgres_identifier},
+        quote_mysql_ident,
     },
     utils::shell::sh_quote,
 };
@@ -409,15 +410,10 @@ pub(crate) fn object_id(namespace: &str, name: &str) -> String {
 }
 
 pub(crate) fn decode_hex(value: &str) -> Result<String, &'static str> {
-    if !value.len().is_multiple_of(2) {
-        return Err("invalid hex field length");
-    }
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().as_chunks::<2>().0 {
-        let high = nibble(pair[0]).ok_or("invalid hex field")?;
-        let low = nibble(pair[1]).ok_or("invalid hex field")?;
-        bytes.push((high << 4) | low);
-    }
+    let bytes = hex::decode(value).map_err(|error| match error {
+        hex::FromHexError::OddLength => "invalid hex field length",
+        _ => "invalid hex field",
+    })?;
     String::from_utf8(bytes).map_err(|_| "database identifier was not UTF-8")
 }
 
@@ -484,7 +480,7 @@ mod tests {
     #[test]
     fn identifier_quoting_never_turns_names_into_commands() {
         assert_eq!(postgres_identifier("a\"b"), "\"a\"\"b\"");
-        assert_eq!(mysql_identifier("a`b"), "`a``b`");
+        assert_eq!(quote_mysql_ident("a`b"), "`a``b`");
         assert_eq!(sh_quote("a'b"), "'a'\"'\"'b'");
     }
 

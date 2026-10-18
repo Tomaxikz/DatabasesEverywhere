@@ -23,19 +23,6 @@ pub fn instance_spec(
     bridge_binary_path: PathBuf,
 ) -> DockerInstanceSpec {
     DockerInstanceSpec {
-        instance_id: instance_id.to_string(),
-        protocol: Protocol::Qdrant,
-        image: image.to_string(),
-        project_id: None,
-        user: None,
-        working_dir: None,
-        entrypoint: None,
-        cpu_cores: 1.0,
-        memory_mib: 1024,
-        disk_mib: 10240,
-        pids_limit: None,
-        data_path,
-        data_target: "/dbe-qdrant".to_string(),
         extra_mounts: vec![
             DockerMount {
                 source: runtime_path,
@@ -59,40 +46,22 @@ pub fn instance_spec(
             },
         ],
         env: vec![
-            DockerEnv {
-                key: "QDRANT__TELEMETRY_DISABLED".to_string(),
-                value: SecretString::from("true"),
-            },
-            DockerEnv {
-                key: "QDRANT__SERVICE__HOST".to_string(),
-                value: SecretString::from("127.0.0.1"),
-            },
-            DockerEnv {
-                key: "QDRANT__SERVICE__HTTP_PORT".to_string(),
-                value: SecretString::from("6333"),
-            },
-            DockerEnv {
-                key: "QDRANT__SERVICE__GRPC_PORT".to_string(),
-                value: SecretString::from("6334"),
-            },
-            DockerEnv {
-                key: "QDRANT__SERVICE__API_KEY".to_string(),
-                value: api_key,
-            },
-            DockerEnv {
-                key: "QDRANT__STORAGE__STORAGE_PATH".to_string(),
-                value: SecretString::from("/dbe-qdrant/storage"),
-            },
-            DockerEnv {
-                key: "QDRANT__STORAGE__SNAPSHOTS_PATH".to_string(),
-                value: SecretString::from("/dbe-qdrant/snapshots"),
-            },
-            DockerEnv {
-                key: "QDRANT_INIT_FILE_PATH".to_string(),
-                value: SecretString::from("/dbe-qdrant/.qdrant-initialized"),
-            },
+            DockerEnv::plain("QDRANT__TELEMETRY_DISABLED", "true"),
+            DockerEnv::plain("QDRANT__SERVICE__HOST", "127.0.0.1"),
+            DockerEnv::plain("QDRANT__SERVICE__HTTP_PORT", "6333"),
+            DockerEnv::plain("QDRANT__SERVICE__GRPC_PORT", "6334"),
+            DockerEnv::new("QDRANT__SERVICE__API_KEY", api_key),
+            DockerEnv::plain("QDRANT__STORAGE__STORAGE_PATH", "/dbe-qdrant/storage"),
+            DockerEnv::plain("QDRANT__STORAGE__SNAPSHOTS_PATH", "/dbe-qdrant/snapshots"),
+            DockerEnv::plain("QDRANT_INIT_FILE_PATH", "/dbe-qdrant/.qdrant-initialized"),
         ],
-        command: Vec::new(),
+        ..DockerInstanceSpec::with_defaults(
+            instance_id,
+            Protocol::Qdrant,
+            image,
+            data_path,
+            "/dbe-qdrant",
+        )
     }
 }
 

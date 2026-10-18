@@ -649,14 +649,11 @@ pub(super) fn is_quota_like_error(error: &std::io::Error) -> bool {
 
 pub(super) async fn cleanup_disk_test_path(limiter: &DiskLimiter, test_path: &Path) {
     let _ = limiter.purge_instance_data(test_path).await;
-    match tokio::fs::remove_dir_all(test_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            eprintln!(
-                "warning: failed to remove disk test path {}: {error}",
-                test_path.display()
-            );
-        }
+    if let Err(error) = crate::io::files::ignore_missing(tokio::fs::remove_dir_all(test_path).await)
+    {
+        eprintln!(
+            "warning: failed to remove disk test path {}: {error}",
+            test_path.display()
+        );
     }
 }

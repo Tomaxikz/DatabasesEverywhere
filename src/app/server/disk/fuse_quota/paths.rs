@@ -120,7 +120,7 @@ fn fuse_mount_name(data_path: &Path, instance_id: &std::ffi::OsStr) -> String {
 }
 
 fn hex_prefix(bytes: &[u8], chars: usize) -> String {
-    let mut output = crate::utils::hex::encode_lower(bytes);
+    let mut output = hex::encode(bytes);
     output.truncate(chars.min(output.len()));
     output
 }

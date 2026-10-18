@@ -45,8 +45,8 @@ pub(super) async fn export_physical_archive(
         let _ = change_instance_state_locked(state, instance_id, LifecycleAction::Stop).await?;
     }
 
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     let max_output_bytes = mib_to_bytes(metadata.limits.disk_mib)
         .saturating_add(PHYSICAL_ARCHIVE_HEADROOM_BYTES)
         .clamp(
@@ -59,7 +59,7 @@ pub(super) async fn export_physical_archive(
         max_output_bytes,
     )
     .await
-    .map_err(|error| ApiError::Runtime(error.to_string()));
+    .map_err(ApiError::runtime);
     finish_physical_change(state, instance_id, was_running, result).await
 }
 
@@ -82,8 +82,8 @@ pub(super) async fn import_physical_archive(
         .await
         .ok_or(ApiError::NotFound)?;
     reject_shared_physical(&metadata)?;
-    let paths = InstancePaths::new(&state.config.paths, instance_id)
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let paths =
+        InstancePaths::new(&state.config.paths, instance_id).map_err(ApiError::bad_request)?;
     check_restore_layout(state, &metadata, &paths)?;
     let was_running = metadata.status == InstanceStatus::Running;
     if was_running {
@@ -107,7 +107,7 @@ pub(crate) fn check_restore_layout(
 ) -> Result<(), ApiError> {
     physical_disk_limiter(state, metadata)
         .check_restore_layout(&paths.data)
-        .map_err(|error| ApiError::Conflict(error.to_string()))
+        .map_err(ApiError::conflict)
 }
 
 pub(crate) async fn restore_instance_data_owner(
@@ -118,12 +118,9 @@ pub(crate) async fn restore_instance_data_owner(
         paths
             .set_rootless_owner(uid, gid)
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))
+            .map_err(ApiError::runtime)
     } else {
-        paths
-            .restore_data_owner()
-            .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))
+        paths.restore_data_owner().await.map_err(ApiError::runtime)
     }
 }
 
@@ -157,9 +154,11 @@ struct PendingDataReplacement {
     backup_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PhysicalRestorePolicy {
+#[derive(Clone, Copy)]
+struct PhysicalRestorePolicy<'a> {
     recover_current_after_preparation_failure: bool,
+    /// Engine recipe step run on the extracted tree before it is installed.
+    preparation: Option<&'a dyn StagedDataPreparation>,
 }
 
 impl PendingDataReplacement {
@@ -204,8 +203,8 @@ pub(crate) async fn restore_bounded_archive(
         max_extracted_bytes,
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: true,
+            preparation: None,
         },
-        None,
     )
     .await
 }
@@ -239,8 +238,8 @@ pub(crate) async fn restore_prepared_archive(
         max_extracted_bytes,
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: true,
+            preparation: Some(preparation),
         },
-        Some(preparation),
     )
     .await
 }
@@ -260,13 +259,12 @@ pub(crate) async fn rollback_from_archive(
         crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
         PhysicalRestorePolicy {
             recover_current_after_preparation_failure: false,
+            preparation: None,
         },
-        None,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn restore_archive(
     state: &AppState,
     instance_id: &str,
@@ -274,8 +272,7 @@ async fn restore_archive(
     artifact_path: &FsPath,
     should_be_running: bool,
     max_extracted_bytes: u64,
-    policy: PhysicalRestorePolicy,
-    preparation: Option<&dyn StagedDataPreparation>,
+    policy: PhysicalRestorePolicy<'_>,
 ) -> Result<(), ApiError> {
     let metadata = state
         .instances
@@ -304,7 +301,7 @@ async fn restore_archive(
         paths.clone(),
         artifact_path,
         max_extracted_bytes,
-        preparation,
+        policy.preparation,
     )
     .await
     {
@@ -380,7 +377,9 @@ async fn restore_credentials(metadata: &InstanceMetadata, data: &FsPath) -> Resu
         &secrecy::SecretString::from(password.to_string()),
     )
     .await
-    .map_err(|error| ApiError::Runtime(format!("failed to restore current tenant ACL: {error}")))?;
+    .map_err(ApiError::runtime_context(
+        "failed to restore current tenant ACL",
+    ))?;
     Ok(())
 }
 
@@ -426,7 +425,7 @@ async fn recover_detached_runtime(
         .apply_instance_limit(&metadata.instance_id, &paths.data, metadata.limits.disk_mib)
         .await
         .map(|_| ())
-        .map_err(|error| ApiError::Runtime(error.to_string()))
+        .map_err(ApiError::runtime)
 }
 
 fn physical_recovery_error(
@@ -626,12 +625,12 @@ async fn validate_replacement(
     .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
     .apply_instance_limit(instance_id, &paths.data, metadata.limits.disk_mib)
     .await
-    .map_err(|error| ApiError::Runtime(error.to_string()))?;
+    .map_err(ApiError::runtime)?;
     state
         .docker
         .start(metadata.protocol, instance_id)
         .await
-        .map_err(|error| ApiError::Runtime(error.to_string()))?;
+        .map_err(ApiError::runtime)?;
     let readiness = async {
         state
             .docker
@@ -641,7 +640,7 @@ async fn validate_replacement(
                 REPLACEMENT_READINESS_TIMEOUT,
             )
             .await
-            .map_err(|error| ApiError::Runtime(error.to_string()))?;
+            .map_err(ApiError::runtime)?;
         crate::subsystems::instances::verify_resp_credential(state, &metadata).await
     }
     .await;

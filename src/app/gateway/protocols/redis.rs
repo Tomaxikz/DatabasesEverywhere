@@ -1,7 +1,5 @@
 use sha2::{Digest, Sha256};
 
-use crate::utils::hex::encode_lower;
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct RedisRoute {
     username: Option<String>,
@@ -171,7 +169,7 @@ fn hello_auth_index(args: &[Vec<u8>]) -> Result<usize, RedisParseError> {
 }
 
 pub fn password_route_sha256(password: &[u8]) -> String {
-    encode_lower(&Sha256::digest(password))
+    hex::encode(Sha256::digest(password))
 }
 
 fn serialize_resp_array(args: &[Vec<u8>]) -> Vec<u8> {

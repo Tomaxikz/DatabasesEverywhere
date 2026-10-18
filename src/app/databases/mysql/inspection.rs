@@ -1,5 +1,5 @@
 use crate::{
-    databases::engine::EngineInspection,
+    databases::{engine::EngineInspection, quote_mysql_ident},
     server::backup::catalog::{
         BackupCatalogObject, ParsedColumn, decode_hex, parse_relational_schema,
     },
@@ -79,12 +79,12 @@ pub(crate) fn preview_script(
     let fields = object
         .columns
         .iter()
-        .flat_map(|column| [mysql_string(&column.name), mysql_identifier(&column.name)])
+        .flat_map(|column| [mysql_string(&column.name), quote_mysql_ident(&column.name)])
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!(
         "SELECT LEFT(JSON_OBJECT({fields}), {max_row_bytes}) FROM {} LIMIT {rows}",
-        mysql_identifier(&object.name)
+        quote_mysql_ident(&object.name)
     );
     Some(format!(
         "set -eu\n{command} --batch --raw --skip-column-names -e {}\n",
@@ -110,10 +110,6 @@ pub(crate) fn parse_mysql_schema(output: &str) -> Result<Vec<BackupCatalogObject
             nullable: fields[7] == "YES",
         })
     })
-}
-
-pub(crate) fn mysql_identifier(value: &str) -> String {
-    format!("`{}`", value.replace('`', "``"))
 }
 
 pub(crate) fn mysql_string(value: &str) -> String {

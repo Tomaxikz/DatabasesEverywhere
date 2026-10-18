@@ -122,7 +122,7 @@ pub(super) fn expiration_timestamp(ttl_hours: u64) -> Result<String, ApiError> {
         .map_err(|_| ApiError::Runtime("upload TTL does not fit in time range".to_string()))?;
     (OffsetDateTime::now_utc() + time::Duration::hours(hours))
         .format(&Rfc3339)
-        .map_err(|error| ApiError::Runtime(format!("failed to format upload expiry: {error}")))
+        .map_err(ApiError::runtime_context("failed to format upload expiry"))
 }
 
 pub(super) fn upload_storage_error(error: impl std::fmt::Display) -> ApiError {

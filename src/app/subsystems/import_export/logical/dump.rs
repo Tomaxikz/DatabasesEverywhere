@@ -6,6 +6,7 @@ use std::{
 use crate::{
     databases::protocol::Protocol,
     routes::http::{response::ApiError, router::AppState},
+    runtime::docker::ShellExec,
     server::{
         credentials::logical_export_env, metadata::InstanceMetadata, placement::DeploymentMode,
     },
@@ -84,20 +85,21 @@ pub(in super::super) async fn export_logical_dump(
             "logical export output limit must be nonzero".to_string(),
         ));
     }
-    let credentials =
-        logical_export_env(metadata).map_err(|error| ApiError::Conflict(error.to_string()))?;
+    let credentials = logical_export_env(metadata).map_err(ApiError::conflict)?;
     let environment = credentials.references();
     let stream_result = state
         .docker
         .exec_shell_to_file(
-            protocol,
-            runtime_id,
-            &script,
-            &environment,
+            ShellExec {
+                protocol,
+                instance_id: runtime_id,
+                script: &script,
+                environment: &environment,
+                timeout: controls.exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT),
+                recovery: logical_exec_recovery(metadata),
+            },
             &host_temp,
             max_output_bytes,
-            controls.exec_timeout.unwrap_or(LOGICAL_STREAM_EXEC_TIMEOUT),
-            logical_exec_recovery(metadata),
         )
         .await;
     if let Err(error) = stream_result {

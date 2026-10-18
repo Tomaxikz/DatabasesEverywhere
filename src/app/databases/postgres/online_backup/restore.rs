@@ -2,6 +2,8 @@
 
 use std::{fs, path::Path};
 
+use crate::io::files::{require_directory, require_regular_file};
+
 // INTEGRATION: `subsystems/backups/restore.rs` already calls
 // `OnlineBackupStrategy::prepare_restore` through `import_export/physical.rs`
 // `StagedDataPreparation` (`restore_prepared_archive`) after the archive is
@@ -16,7 +18,7 @@ use std::{fs, path::Path};
 const SUPPORTED_MAJORS: std::ops::RangeInclusive<u32> = 14..=18;
 
 pub(crate) fn prepare_basebackup_restore(pgdata: &Path) -> Result<(), String> {
-    require_regular(&pgdata.join("PG_VERSION"))?;
+    require_regular_file(&pgdata.join("PG_VERSION"))?;
     let version = fs::read_to_string(pgdata.join("PG_VERSION"))
         .map_err(|error| format!("PG_VERSION: {error}"))?;
     let major: u32 = version
@@ -28,8 +30,8 @@ pub(crate) fn prepare_basebackup_restore(pgdata: &Path) -> Result<(), String> {
             "PG_VERSION {major} is outside the certified 14-18 restore range"
         ));
     }
-    require_regular(&pgdata.join("backup_label"))?;
-    require_regular(&pgdata.join("backup_manifest"))?;
+    require_regular_file(&pgdata.join("backup_label"))?;
+    require_regular_file(&pgdata.join("backup_manifest"))?;
     require_directory(&pgdata.join("pg_wal"))?;
     require_empty_directory(&pgdata.join("pg_tblspc"))?;
     refuse_present(
@@ -46,25 +48,7 @@ pub(crate) fn prepare_basebackup_restore(pgdata: &Path) -> Result<(), String> {
     )?;
     remove_regular(&pgdata.join("postmaster.pid"))?;
     remove_regular(&pgdata.join("postmaster.opts"))?;
-    require_regular(&pgdata.join("backup_label"))?;
-    Ok(())
-}
-
-fn require_regular(path: &Path) -> Result<(), String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    Ok(())
-}
-
-fn require_directory(path: &Path) -> Result<(), String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("{} is not a directory", path.display()));
-    }
+    require_regular_file(&pgdata.join("backup_label"))?;
     Ok(())
 }
 

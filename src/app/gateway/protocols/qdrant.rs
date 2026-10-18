@@ -10,8 +10,6 @@ use std::{fmt, future::Future, future::poll_fn, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
-use crate::utils::hex::encode_lower;
-
 const API_KEY_HEADER: &str = "api-key";
 const MAX_CONCURRENT_STREAMS: u32 = 128;
 const MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
@@ -35,7 +33,7 @@ impl QdrantRouteKey {
 
     pub fn fingerprint(&self, api_key: &str) -> String {
         let tag = hmac::sign(&self.key, api_key.as_bytes());
-        encode_lower(tag.as_ref())
+        hex::encode(tag.as_ref())
     }
 }
 
