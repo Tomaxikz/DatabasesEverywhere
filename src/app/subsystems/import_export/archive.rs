@@ -183,7 +183,12 @@ pub(super) async fn extract_zip_archive(
                 let mut file = archive.by_index(index)?;
                 let enclosed = file
                     .enclosed_name()
-                    .ok_or_else(|| format!("zip entry {} has unsafe path", file.name()))?
+                    .ok_or_else(|| {
+                        format!(
+                            "zip entry {} has unsafe path",
+                            String::from_utf8_lossy(file.name_raw())
+                        )
+                    })?
                     .to_path_buf();
                 validate_relative_archive_path(&enclosed)?;
                 total = archive_accounted_bytes(total, file.size())

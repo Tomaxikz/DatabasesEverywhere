@@ -15,76 +15,76 @@ name = "dbev"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.103"
-aws-lc-rs = "1.18.1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "ws"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-base64 = "0.23"
-bzip2 = { version = "0.6", features = ["static"] }
-bollard = { version = "0.21.0", default-features = false, features = ["pipe"] }
+anyhow = "1.0.104"
+aws-lc-rs = "1.18.2"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.23.1"
+bzip2 = { version = "0.6.1", features = ["static"] }
+bollard = { version = "0.21.1", default-features = false, features = ["pipe"] }
 bson = "3.1.0"
-bytes = "1.6"
-clap = { version = "4.5", features = ["derive", "env"] }
-crc = "3.4"
-form_urlencoded = "1.2"
-futures = "0.3"
-h2 = "0.4.19"
-hex = "0.4"
-hdrhistogram = { version = "7.5", default-features = false }
-http = "1.1"
-httparse = "1.10"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
-libc = "0.2"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crc = "3.4.0"
+form_urlencoded = "1.2.2"
+futures = "0.3.34"
+h2 = "0.4.20"
+hex = "0.4.3"
+hdrhistogram = { version = "7.6.0", default-features = false }
+http = "1.5.0"
+httparse = "1.10.1"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
+libc = "0.2.191"
 notify = { version = "8.2.0", default-features = false }
-secrecy = { version = "0.10", features = ["serde"] }
-percent-encoding = "2.3"
-rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs"] }
-rustls-pki-types = { version = "1.14", features = ["std"] }
-rustix = { version = "1.1", features = ["fs", "process"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+secrecy = { version = "0.10.3", features = ["serde"] }
+percent-encoding = "2.3.2"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 yaml_serde = "0.10.7"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "multipart", "stream"] }
-sha1 = "0.11"
-sha2 = "0.11"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
-subtle = "2.6"
-flate2 = "1.0"
-tempfile = "3.10"
-tar = { version = "0.4", default-features = false }
-thiserror = "2.0"
-time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.38", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
-tower-http = { version = "0.7", features = ["cors", "timeout", "trace"] }
-tracing = "0.1"
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.10", features = ["v4"] }
-walkdir = "2.5"
-webpki-root-certs = "1.0"
-webpki-roots = "1.0"
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
-zstd = { version = "0.14", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "multipart", "stream"] }
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2.6.1"
+flate2 = "1.1.10"
+tempfile = "3.27.0"
+tar = { version = "0.4.46", default-features = false }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tokio-util = { version = "0.7.20", features = ["io", "io-util"] }
+tower-http = { version = "0.7.1", features = ["cors", "timeout", "trace"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.28.0", features = ["v4"] }
+walkdir = "2.5.0"
+webpki-root-certs = "1.0.9"
+webpki-roots = "1.0.9"
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+zstd = { version = "0.14.3", default-features = false }
 governor = "0.10.4"
 procfs = { version = "0.18.0", default-features = false }
 object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 backon = "1.6.0"
-async-trait = "0.1"
-http-body = "1"
-quick-xml = { version = "0.41", features = ["serialize"] }
+async-trait = "0.1.92"
+http-body = "1.1.0"
+quick-xml = { version = "0.41.0", features = ["serialize"] }
 
 [build-dependencies]
-sha2 = "0.11"
-zstd = { version = "0.14", default-features = false }
+sha2 = "0.11.1"
+zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.38", features = ["test-util"] }
-tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1.53.3", features = ["test-util"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
 lto = "thin"
