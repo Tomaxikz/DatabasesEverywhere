@@ -156,6 +156,28 @@ but disconnect gateway/WebSocket clients. Updates that replace containers or
 unsafe quota mounts can restart databases; plan a maintenance window.
 See [readiness and recovery](../api/system.md) and [FuseQuota upgrades](disk-limits.md#fusequota-memory).
 
+## Admin console
+
+```bash
+sudo dbev --cli
+```
+
+An interactive terminal console for operators on the node. It lists every
+instance with live status and creation progress, creates instances, starts,
+stops, restarts and deletes them, shows container logs, and takes, lists and
+restores backups. Press `?` for keys.
+
+The console calls the running daemon's local API with the config `token`, so
+every change goes through the same validation, locks and audit logs as the
+panel. With `api.ssl` on it trusts exactly the configured certificate; APIs
+that require client certificates are not supported. The panel does not learn
+about instances created here; they are tagged `project_id: dbev-cli`.
+
+The API never returns passwords. `p` reveals an instance's stored password,
+and for dedicated runtimes the engine superuser, by reading the encrypted
+metadata read-only. This works only as root and hides the values after 60
+seconds. Treat the screen as you would the metadata key.
+
 ## Upgrades and maintenance
 
 Back up database data, SQLite metadata, and its encryption key together.

@@ -39,6 +39,14 @@ impl InstanceRepository {
         })
     }
 
+    /// A repository over an already opened (e.g. read-only) pool and key.
+    pub fn with_secrets(pool: SqlitePool, secrets: SecretStore) -> Self {
+        Self {
+            pool,
+            secrets: Some(secrets),
+        }
+    }
+
     pub async fn list(&self) -> Result<Vec<InstanceMetadata>, RepositoryError> {
         let rows = sqlx::query(
             r#"

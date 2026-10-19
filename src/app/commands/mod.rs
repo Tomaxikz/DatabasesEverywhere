@@ -20,6 +20,7 @@ use reset_metadata::ResetMetadataCommand;
 
 pub mod bench;
 mod check_config;
+mod console;
 mod daemon;
 mod dev_clean;
 mod disk_test;
@@ -48,6 +49,9 @@ pub struct Cli {
     config: PathBuf,
     #[command(flatten)]
     bench: crate::commands::bench::BenchArgs,
+    /// Open the interactive admin console (talks to the local daemon API).
+    #[arg(long)]
+    cli: bool,
     #[arg(long)]
     setup: bool,
     #[arg(long)]
@@ -107,6 +111,12 @@ pub async fn run() -> anyhow::Result<()> {
         }
         init_stdout_logging();
         return crate::commands::bench::run(cli.config, cli.bench).await;
+    }
+    if cli.cli {
+        if cli.setup || cli.move_new_config || cli.command.is_some() {
+            anyhow::bail!("--cli cannot be combined with setup, migration, or daemon commands");
+        }
+        return console::run(cli.config).await;
     }
     if cli.setup {
         init_stdout_logging();

@@ -27,6 +27,18 @@ pub struct SecretStore {
 }
 
 impl SecretStore {
+    /// Opens the existing key without creating it or changing any mode, for
+    /// read-only inspection while the daemon runs.
+    pub fn open_existing(metadata_root: &Path) -> Result<Self, SecretStoreError> {
+        let key_path = metadata_root.join(KEY_FILE_NAME);
+        let contents =
+            fs::read_to_string(&key_path).map_err(|source| SecretStoreError::ReadKey {
+                path: key_path.clone(),
+                source,
+            })?;
+        Self::from_key(decode_key(&key_path, contents.trim())?)
+    }
+
     pub fn open_or_create(metadata_root: &Path) -> Result<Self, SecretStoreError> {
         fs::create_dir_all(metadata_root).map_err(|source| SecretStoreError::CreateDir {
             path: metadata_root.to_path_buf(),
@@ -40,6 +52,10 @@ impl SecretStore {
         } else {
             create_key(&key_path)?
         };
+        Self::from_key(key_bytes)
+    }
+
+    fn from_key(key_bytes: [u8; KEY_LEN]) -> Result<Self, SecretStoreError> {
         let unbound = UnboundKey::new(&aead::AES_256_GCM, &key_bytes)
             .map_err(|_| SecretStoreError::Crypto("failed to initialize metadata key".into()))?;
         let derivation_key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
