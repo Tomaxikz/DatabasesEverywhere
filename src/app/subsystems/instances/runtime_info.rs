@@ -291,7 +291,12 @@ pub async fn create_instance(
     let image = resolve_image(&state, &request)?;
     let creation_permit = state
         .install_progress
-        .try_begin_creation(&instance_id, request.protocol, &image)
+        .try_begin_instance_creation(
+            &instance_id,
+            request.protocol,
+            &image,
+            request.deployment_mode == crate::server::placement::DeploymentMode::Dedicated,
+        )
         .map_err(|error| match error {
             BeginCreationError::AlreadyRunning => ApiError::Conflict(format!(
                 "instance creation already running for {instance_id}"

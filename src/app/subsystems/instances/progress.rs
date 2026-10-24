@@ -18,6 +18,9 @@ use crate::{
 };
 
 const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;
+/// Prefix of a creation-attempt generation. Stored instances use their RFC 3339
+/// `created_at`, so the two kinds can never collide.
+pub(crate) const CREATION_GENERATION_PREFIX: &str = "creating:";
 const MAX_PROGRESS_TEXT_CHARS: usize = 2_048;
 #[cfg(test)]
 const MAX_ADMITTED_CREATIONS: usize = 64;
@@ -80,6 +83,24 @@ impl InstallProgressStore {
             self.revision.fetch_add(1, Ordering::Relaxed),
             self.progress_capacity(),
         );
+    }
+
+    /// Admits an instance creation and gives it a unique attempt, so a
+    /// WebSocket token can follow this creation before the instance exists.
+    pub fn try_begin_instance_creation(
+        &self,
+        instance_id: &str,
+        protocol: Protocol,
+        image: &str,
+        dedicated: bool,
+    ) -> Result<CreationPermit, BeginCreationError> {
+        let permit = self.try_begin_creation(instance_id, protocol, image)?;
+        let watch = CreationWatch {
+            attempt: uuid::Uuid::new_v4().simple().to_string(),
+            dedicated,
+        };
+        self.update(instance_id, |progress| progress.watch = Some(watch));
+        Ok(permit)
     }
 
     pub fn try_begin_creation(
@@ -365,6 +386,33 @@ pub struct InstallProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<PublicDiagnostic>,
     pub updated_at: String,
+    /// Set only for instance creations; pool creations stay unwatchable.
+    #[serde(skip)]
+    pub(crate) watch: Option<CreationWatch>,
+}
+
+/// Identity of one instance creation attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreationWatch {
+    pub attempt: String,
+    /// Dedicated creations have a container of their own whose logs can be
+    /// followed; shared tenants live inside a pool.
+    pub dedicated: bool,
+}
+
+impl InstallProgress {
+    /// The generation a WebSocket token binds to while this instance is being
+    /// created. It survives completion or failure of the same attempt.
+    pub(crate) fn creation_generation(&self) -> Option<String> {
+        self.watch
+            .as_ref()
+            .filter(|_| self.action == "create")
+            .map(|watch| format!("{CREATION_GENERATION_PREFIX}{}", watch.attempt))
+    }
+
+    pub(crate) fn creates_dedicated_container(&self) -> bool {
+        self.watch.as_ref().is_some_and(|watch| watch.dedicated) && self.action == "create"
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -407,6 +455,7 @@ fn queued_progress(
         percent: None,
         diagnostic: None,
         updated_at: now_rfc3339(),
+        watch: None,
     }
 }
 
@@ -630,5 +679,43 @@ mod tests {
         assert_eq!(store.active_creation_count(), 0);
         store.begin("tenant", Protocol::Postgres, "postgres:test");
         assert!(!store.is_creating("tenant"));
+    }
+
+    #[test]
+    fn creation_generations_identify_one_instance_creation_attempt() {
+        let store = InstallProgressStore::default();
+        let permit = store
+            .try_begin_instance_creation("inst_one", Protocol::Postgres, "postgres:18.4", true)
+            .unwrap();
+        let generation = store
+            .get("inst_one")
+            .unwrap()
+            .creation_generation()
+            .unwrap();
+        assert!(generation.starts_with(CREATION_GENERATION_PREFIX));
+        assert!(store.get("inst_one").unwrap().creates_dedicated_container());
+
+        store.stage("inst_one", "pull", "pulling image");
+        store.complete("inst_one", "created");
+        assert_eq!(
+            store.get("inst_one").unwrap().creation_generation(),
+            Some(generation.clone()),
+            "the attempt survives its own progress updates"
+        );
+        drop(permit);
+
+        store.begin_image_update("inst_one", Protocol::Postgres, "postgres:18.5");
+        assert_eq!(store.get("inst_one").unwrap().creation_generation(), None);
+
+        let _again = store
+            .try_begin_instance_creation("inst_two", Protocol::Redis, "redis:8.8.0", false)
+            .unwrap();
+        let other = store.get("inst_two").unwrap();
+        assert_ne!(other.creation_generation(), Some(generation));
+        assert!(!other.creates_dedicated_container());
+        assert!(
+            !serde_json::to_string(&other).unwrap().contains("creating:"),
+            "the attempt never appears on the wire"
+        );
     }
 }

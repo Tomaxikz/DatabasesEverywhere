@@ -36,16 +36,30 @@ impl InstanceAuthorization {
         }
     }
 
+    /// Progress is visible for the stored instance the token binds, or for
+    /// the creation attempt it binds, including that attempt's final record.
     pub(super) fn allows_progress(
         &self,
-        instance_id: &str,
+        progress: &crate::subsystems::instances::progress::InstallProgress,
         instance_generation: Option<&str>,
     ) -> bool {
         match self {
             Self::All => true,
             Self::Selected(_) => {
-                instance_generation.is_some_and(|generation| self.allows(instance_id, generation))
+                instance_generation
+                    .is_some_and(|generation| self.allows(&progress.instance_id, generation))
+                    || progress
+                        .creation_generation()
+                        .is_some_and(|generation| self.allows(&progress.instance_id, &generation))
             }
+        }
+    }
+
+    /// The instance IDs a selective token names.
+    pub(super) fn selected_ids(&self) -> Vec<&str> {
+        match self {
+            Self::All => Vec::new(),
+            Self::Selected(selected) => selected.keys().map(String::as_str).collect(),
         }
     }
 
@@ -72,6 +86,35 @@ impl InstanceAuthorization {
     }
 }
 
+/// Generations a WebSocket token may bind for `instance_id`: the stored
+/// instance's `created_at`, and the attempt of a creation that is running or
+/// just finished. Either may be absent.
+pub(crate) struct BindableGenerations {
+    pub stored: Option<String>,
+    pub creating: Option<String>,
+}
+
+impl BindableGenerations {
+    pub(crate) async fn of(state: &AppState, instance_id: &str) -> Self {
+        Self {
+            stored: state
+                .instances
+                .get(instance_id)
+                .await
+                .map(|metadata| metadata.created_at),
+            creating: state
+                .install_progress
+                .get(instance_id)
+                .and_then(|progress| progress.creation_generation()),
+        }
+    }
+
+    /// What a newly minted token binds to: the stored instance when it exists.
+    pub(crate) fn preferred(self) -> Option<String> {
+        self.stored.or(self.creating)
+    }
+}
+
 pub(super) async fn resolve_instance_authorization(
     state: &AppState,
     claims: &Claims,
@@ -85,17 +128,20 @@ pub(super) async fn resolve_instance_authorization(
     }
 
     let mut seen = HashSet::with_capacity(claims.instances.len());
-    let mut generations = Vec::with_capacity(claims.instances.len());
+    let mut stored_first = Vec::with_capacity(claims.instances.len());
+    let mut creating_first = Vec::with_capacity(claims.instances.len());
     for instance_id in &claims.instances {
         if !seen.insert(instance_id) {
             return Err(ApiError::Unauthorized);
         }
-        let metadata = state
-            .instances
-            .get(instance_id)
-            .await
-            .ok_or(ApiError::Unauthorized)?;
-        generations.push((instance_id.clone(), metadata.created_at));
+        let generations = BindableGenerations::of(state, instance_id).await;
+        let creating = generations.creating.clone().or(generations.stored.clone());
+        let stored = generations.preferred().ok_or(ApiError::Unauthorized)?;
+        stored_first.push((instance_id.clone(), stored));
+        creating_first.push((instance_id.clone(), creating.unwrap_or_default()));
     }
-    InstanceAuthorization::selected(claims, generations)
+    // A token minted during a creation stays valid for that attempt even when
+    // the instance was stored before the socket connected.
+    InstanceAuthorization::selected(claims, stored_first)
+        .or_else(|_| InstanceAuthorization::selected(claims, creating_first))
 }

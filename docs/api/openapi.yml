@@ -1199,7 +1199,7 @@ components:
             type: string
           default: []
           maxItems: 256
-          description: Explicit instance allow-list. Each ID is bound inside the opaque JWT to the current immutable instance generation, so deletion/recreation never transfers access to a replacement. Must be non-empty unless all_instances is true.
+          description: Explicit instance allow-list. Each ID is bound inside the opaque JWT to the current immutable instance generation, so deletion/recreation never transfers access to a replacement. While an instance's creation (accepted with 202) has not stored it yet, its ID binds to that creation attempt instead; such a token streams the attempt's install_progress (through completed or failed) and, for dedicated creations, its container logs, but never the stored instance. Mint a new token once the instance exists. Unknown IDs return 404. Must be non-empty unless all_instances is true.
         all_instances:
           type: boolean
           default: false

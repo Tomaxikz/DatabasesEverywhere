@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
+use super::websocket::BindableGenerations;
 use crate::{
     auth::{jwt, scopes},
     routes::http::{
@@ -98,12 +99,12 @@ async fn instance_generation_digest(
 ) -> Result<String, ApiError> {
     let mut generations = Vec::with_capacity(instance_ids.len());
     for instance_id in instance_ids {
-        let metadata = state
-            .instances
-            .get(instance_id)
+        // While an instance is being created the token binds to that attempt.
+        let generation = BindableGenerations::of(state, instance_id)
             .await
+            .preferred()
             .ok_or(ApiError::NotFound)?;
-        generations.push((instance_id.clone(), metadata.created_at));
+        generations.push((instance_id.clone(), generation));
     }
     Ok(jwt::instance_generation_digest(&generations))
 }
@@ -247,5 +248,36 @@ mod tests {
             validate_request(&request(vec!["inst_one", "inst_one"], false)),
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn tokens_bind_running_creations_and_reject_unknown_instances() {
+        let (state, _dir) =
+            crate::subsystems::test_support::database(crate::config::Config::default()).await;
+        assert!(matches!(
+            instance_generation_digest(&state, &["creating_one".to_string()]).await,
+            Err(ApiError::NotFound)
+        ));
+        let _permit = state
+            .install_progress
+            .try_begin_instance_creation(
+                "creating_one",
+                crate::databases::protocol::Protocol::Postgres,
+                "postgres:18.4",
+                true,
+            )
+            .unwrap();
+        let generation = state
+            .install_progress
+            .get("creating_one")
+            .unwrap()
+            .creation_generation()
+            .unwrap();
+        assert_eq!(
+            instance_generation_digest(&state, &["creating_one".to_string()])
+                .await
+                .unwrap(),
+            jwt::instance_generation_digest(&[("creating_one".to_string(), generation)])
+        );
     }
 }

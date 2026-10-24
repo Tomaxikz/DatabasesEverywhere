@@ -72,7 +72,10 @@ its final tenant is gone.
 
 Accepted creation returns `202` immediately with `instance_id`,
 `status: "creating"`, and an origin-relative `status_url`. Follow that URL
-or monitoring; HTTP acceptance is not successful provisioning. Admission is
+or monitoring; HTTP acceptance is not successful provisioning. The instance is
+stored only once creation succeeds, so `GET /api/instances/{id}` and its
+activity return 404 until then; [watch a creation](websockets.md#watching-a-creation)
+live with a token bound to the attempt. Admission is
 bounded to 64 tasks and per-instance mutations are serialized.
 
 Key validation:

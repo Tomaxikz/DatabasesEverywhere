@@ -205,9 +205,11 @@ pub(super) async fn monitoring_snapshot(
 
     let mut install_progress = match authorization {
         InstanceAuthorization::All => state.install_progress.list(),
-        InstanceAuthorization::Selected(_) => instances
-            .iter()
-            .filter_map(|instance| state.install_progress.get(&instance.instance_id))
+        // Includes creations: their instance is not stored yet.
+        InstanceAuthorization::Selected(_) => authorization
+            .selected_ids()
+            .into_iter()
+            .filter_map(|instance_id| state.install_progress.get(instance_id))
             .collect(),
     };
     install_progress.sort_unstable_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -299,7 +301,7 @@ impl MonitoringSnapshotData {
                 .iter()
                 .filter(|progress| {
                     authorization.allows_progress(
-                        &progress.instance_id,
+                        progress,
                         current_generations
                             .get(progress.instance_id.as_str())
                             .copied(),

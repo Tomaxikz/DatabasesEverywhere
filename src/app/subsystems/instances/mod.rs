@@ -80,8 +80,8 @@ pub use lifecycle::LifecycleAction;
 use lifecycle::change_instance_state;
 pub(crate) use lifecycle::change_instance_state_locked;
 pub use limits::update_instance_limits;
-pub(crate) use logs::check_logs_available;
 pub use logs::instance_logs;
+pub(crate) use logs::{check_logs_available, shared_logs_unavailable};
 
 pub async fn reconcile_instance(
     State(state): State<AppState>,

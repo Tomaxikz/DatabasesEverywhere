@@ -53,6 +53,7 @@ mod authorization;
 mod import_export;
 mod monitoring;
 mod socket;
+pub(crate) use authorization::BindableGenerations;
 use authorization::resolve_instance_authorization;
 use import_export::stream_import_export;
 
@@ -81,33 +82,60 @@ pub async fn logs(
     websocket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let claims = auth.require_scope(scopes::LOGS_READ, Some(&instance_id))?;
-    let metadata = state
-        .instances
-        .get(&instance_id)
-        .await
-        .ok_or(ApiError::NotFound)?;
-    let authorization = resolve_instance_authorization(&state, &claims).await?;
-    if !authorization.allows(&instance_id, &metadata.created_at) {
-        return Err(ApiError::Unauthorized);
+    let metadata = state.instances.get(&instance_id).await;
+    let progress = state.install_progress.get(&instance_id);
+    if metadata.is_none()
+        && progress
+            .as_ref()
+            .and_then(|p| p.creation_generation())
+            .is_none()
+    {
+        return Err(ApiError::NotFound);
     }
-    crate::subsystems::instances::check_logs_available(&metadata)?;
+    let authorization = resolve_instance_authorization(&state, &claims).await?;
+    let target = match metadata {
+        Some(metadata) if authorization.allows(&instance_id, &metadata.created_at) => {
+            crate::subsystems::instances::check_logs_available(&metadata)?;
+            log_stream::LogTarget::Instance {
+                instance_id: metadata.instance_id,
+                created_at: metadata.created_at,
+                protocol: metadata.protocol,
+            }
+        }
+        // A token bound to a creation attempt follows that creation's container,
+        // including after the instance was stored.
+        _ => creating_log_target(&instance_id, progress, &authorization)?,
+    };
     let connection = admit_websocket(&state, &claims).await?;
     Ok(upgrade_websocket(websocket)
         .protocols(["dbe.jwt", "bearer"])
         .on_upgrade(move |socket| {
-            stream_logs(
-                socket,
-                state,
-                log_stream::LogTarget::Instance {
-                    instance_id: metadata.instance_id,
-                    created_at: metadata.created_at,
-                    protocol: metadata.protocol,
-                },
-                query.tail,
-                claims.exp,
-                connection,
-            )
+            stream_logs(socket, state, target, query.tail, claims.exp, connection)
         }))
+}
+
+fn creating_log_target(
+    instance_id: &str,
+    progress: Option<InstallProgress>,
+    authorization: &authorization::InstanceAuthorization,
+) -> Result<log_stream::LogTarget, ApiError> {
+    let progress = progress.ok_or(ApiError::Unauthorized)?;
+    let generation = progress
+        .creation_generation()
+        .filter(|generation| authorization.allows(instance_id, generation))
+        .ok_or(ApiError::Unauthorized)?;
+    if !progress.creates_dedicated_container() {
+        return Err(crate::subsystems::instances::shared_logs_unavailable());
+    }
+    let protocol = progress
+        .protocol
+        .parse()
+        .map_err(|_| ApiError::Runtime("creation progress names an unknown engine".to_string()))?;
+    Ok(log_stream::LogTarget::Creating {
+        instance_id: instance_id.to_string(),
+        generation,
+        protocol,
+    })
 }
 
 pub async fn import_export(

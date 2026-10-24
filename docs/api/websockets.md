@@ -32,6 +32,8 @@ The response contains `token_type`, `token`, and `expires_at_unix`.
 - TTL defaults to 900 seconds; range 1–3,600.
 - Use an explicit allow-list of at most 256 existing instance IDs. Tokens bind
   to their current generations and cannot access a deleted/recreated replacement.
+- An instance that is still being created can be named too; see
+  [watching a creation](#watching-a-creation).
 - Node-wide access requires `all_instances: true`, without an instance list.
   An empty list without this flag is rejected.
 - Each JWT allows **one upgrade only**. Mint a new token for every socket,
@@ -125,6 +127,26 @@ an empty array does not clear pending progress. Missing progress never means
 a database is installing: use its actual instance status.
 The `healthcheck` stage is a startup-readiness check, not a permanent probe.
 After a daemon restart, use REST instance state; progress history is not replayed.
+
+## Watching a creation
+
+`POST /api/instances` returns `202` before the instance is stored, so
+`GET /api/instances/{id}` returns 404 until creation finishes. To watch it:
+
+1. Right after the `202`, mint a token naming the new instance ID. It binds to
+   this creation attempt, not to an instance generation.
+2. Open `/ws/monitoring` with it. `install_progress` carries the attempt's
+   stage, pull progress and percent, and finally `completed` or `failed` with a
+   public diagnostic. `instances` stays empty for this token.
+3. For dedicated instances, also open `/ws/instances/{id}/logs`. The socket
+   stays silent until the container exists, then sends `reset` and follows it
+   from its first start. Shared creations return `409`, as their logs are
+   pool-wide.
+4. After `completed`, mint a fresh token for the stored instance to receive its
+   live stats. A creation token never covers a later creation attempt under
+   the same ID.
+
+`GET /api/instances/{id}/status` reports the same progress over REST.
 
 ## Logs
 

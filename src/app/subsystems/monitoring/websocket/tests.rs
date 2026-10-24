@@ -641,3 +641,170 @@ fn progress_delta_batches_are_bounded_and_authorized() {
         .collect::<Vec<_>>();
     assert_eq!(ids, ["tenant-0000"]);
 }
+
+fn claims_bound(bindings: &[(&str, &str)]) -> Claims {
+    let mut claims = claims_for_instances(bindings.iter().map(|(id, _)| *id).collect());
+    claims.instance_generation_digest = Some(jwt::instance_generation_digest(
+        &bindings
+            .iter()
+            .map(|(id, generation)| (id.to_string(), generation.to_string()))
+            .collect::<Vec<_>>(),
+    ));
+    claims.scopes = vec![
+        scopes::MONITOR_READ.to_string(),
+        scopes::LOGS_READ.to_string(),
+    ];
+    claims
+}
+
+#[tokio::test]
+async fn creation_tokens_follow_their_attempt_through_completion() {
+    use crate::subsystems::instances::progress::{
+        CREATION_GENERATION_PREFIX, InstallProgressStatus,
+    };
+
+    let (state, _dir) =
+        crate::subsystems::test_support::database(crate::config::Config::default()).await;
+    assert!(
+        BindableGenerations::of(&state, "creating_one")
+            .await
+            .preferred()
+            .is_none(),
+        "nothing to bind before the creation is admitted"
+    );
+    let permit = state
+        .install_progress
+        .try_begin_instance_creation(
+            "creating_one",
+            crate::databases::protocol::Protocol::Postgres,
+            "postgres:18.4",
+            true,
+        )
+        .unwrap();
+    let generation = BindableGenerations::of(&state, "creating_one")
+        .await
+        .preferred()
+        .unwrap();
+    assert!(generation.starts_with(CREATION_GENERATION_PREFIX));
+    let claims = claims_bound(&[("creating_one", &generation)]);
+
+    let authorization = resolve_instance_authorization(&state, &claims)
+        .await
+        .unwrap();
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await;
+    let filtered = snapshot.filtered(&authorization);
+    assert!(filtered.instances.is_empty());
+    assert_eq!(filtered.install_progress.len(), 1);
+    assert_eq!(
+        filtered.install_progress[0].status,
+        InstallProgressStatus::Running
+    );
+
+    // The instance is stored and the creation completes before the socket
+    // connects: the attempt's token still connects and sees the final record,
+    // but never the stored instance itself.
+    state
+        .instances
+        .upsert(instance_metadata("creating_one", "2026-10-24T20:56:00Z"))
+        .await;
+    state.install_progress.complete("creating_one", "created");
+    drop(permit);
+    let authorization = resolve_instance_authorization(&state, &claims)
+        .await
+        .unwrap();
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await;
+    let filtered = snapshot.filtered(&authorization);
+    assert!(filtered.instances.is_empty());
+    assert_eq!(
+        filtered.install_progress[0].status,
+        InstallProgressStatus::Completed
+    );
+    assert_eq!(
+        BindableGenerations::of(&state, "creating_one")
+            .await
+            .preferred()
+            .as_deref(),
+        Some("2026-10-24T20:56:00Z"),
+        "new tokens bind the stored instance"
+    );
+
+    // A later creation attempt under the same ID is a different generation.
+    state.instances.remove("creating_one").await;
+    state.install_progress.remove("creating_one");
+    let _retry = state
+        .install_progress
+        .try_begin_instance_creation(
+            "creating_one",
+            crate::databases::protocol::Protocol::Postgres,
+            "postgres:18.4",
+            true,
+        )
+        .unwrap();
+    assert!(
+        resolve_instance_authorization(&state, &claims)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn pool_creations_cannot_be_bound_by_instance_tokens() {
+    let (state, _dir) =
+        crate::subsystems::test_support::database(crate::config::Config::default()).await;
+    let _permit = state
+        .install_progress
+        .try_begin_creation(
+            "pool_postgres_one",
+            crate::databases::protocol::Protocol::Postgres,
+            "postgres:18.4",
+        )
+        .unwrap();
+    assert!(
+        BindableGenerations::of(&state, "pool_postgres_one")
+            .await
+            .preferred()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() {
+    let (state, _dir) =
+        crate::subsystems::test_support::database(crate::config::Config::default()).await;
+    for (instance_id, dedicated) in [("dedicated_new", true), ("shared_new", false)] {
+        let _permit = state.install_progress.try_begin_instance_creation(
+            instance_id,
+            crate::databases::protocol::Protocol::Mysql,
+            "mysql:8.4",
+            dedicated,
+        );
+    }
+    let dedicated = state.install_progress.get("dedicated_new").unwrap();
+    let generation = dedicated.creation_generation().unwrap();
+    let claims = claims_bound(&[("dedicated_new", &generation)]);
+    let authorization = resolve_instance_authorization(&state, &claims)
+        .await
+        .unwrap();
+    assert!(matches!(
+        creating_log_target("dedicated_new", Some(dedicated.clone()), &authorization),
+        Ok(log_stream::LogTarget::Creating { .. })
+    ));
+
+    let other = claims_bound(&[("dedicated_new", "creating:someone-else")]);
+    assert!(
+        resolve_instance_authorization(&state, &other)
+            .await
+            .is_err()
+    );
+
+    let shared = state.install_progress.get("shared_new").unwrap();
+    let shared_generation = shared.creation_generation().unwrap();
+    let shared_claims = claims_bound(&[("shared_new", &shared_generation)]);
+    let shared_authorization = resolve_instance_authorization(&state, &shared_claims)
+        .await
+        .unwrap();
+    assert!(matches!(
+        creating_log_target("shared_new", Some(shared), &shared_authorization),
+        Err(ApiError::Conflict(_))
+    ));
+}

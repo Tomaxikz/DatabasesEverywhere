@@ -34,6 +34,11 @@ pub async fn instance_logs(
     }))
 }
 
+/// The refusal for a shared tenant's logs, which are pool-wide.
+pub(crate) fn shared_logs_unavailable() -> ApiError {
+    shared::reject_logs()
+}
+
 pub(crate) fn check_logs_available(metadata: &InstanceMetadata) -> Result<(), ApiError> {
     if metadata.deployment_mode == crate::server::placement::DeploymentMode::Shared {
         Err(shared::reject_logs())

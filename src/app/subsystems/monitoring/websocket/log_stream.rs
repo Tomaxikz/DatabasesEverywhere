@@ -56,10 +56,20 @@ enum LogIdentity<'a> {
     Pool { runtime_id: &'a str },
 }
 
+/// While a creation is running its container may not exist yet.
+const CONTAINER_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub(crate) enum LogTarget {
     Instance {
         instance_id: String,
         created_at: String,
+        protocol: crate::databases::protocol::Protocol,
+    },
+    /// A dedicated instance whose creation attempt the token binds. Its
+    /// container appears partway through creation and keeps running after it.
+    Creating {
+        instance_id: String,
+        generation: String,
         protocol: crate::databases::protocol::Protocol,
     },
     Pool {
@@ -71,19 +81,19 @@ pub(crate) enum LogTarget {
 impl LogTarget {
     fn id(&self) -> &str {
         match self {
-            Self::Instance { instance_id, .. } => instance_id,
+            Self::Instance { instance_id, .. } | Self::Creating { instance_id, .. } => instance_id,
             Self::Pool { grant, .. } => &grant.runtime_id,
         }
     }
     fn protocol(&self) -> crate::databases::protocol::Protocol {
         match self {
-            Self::Instance { protocol, .. } => *protocol,
+            Self::Instance { protocol, .. } | Self::Creating { protocol, .. } => *protocol,
             Self::Pool { protocol, .. } => *protocol,
         }
     }
     fn identity(&self) -> LogIdentity<'_> {
         match self {
-            Self::Instance { .. } => LogIdentity::Instance {
+            Self::Instance { .. } | Self::Creating { .. } => LogIdentity::Instance {
                 instance_id: self.id(),
             },
             Self::Pool { .. } => LogIdentity::Pool {
@@ -98,10 +108,41 @@ impl LogTarget {
                 created_at,
                 ..
             } => instance_generation_is_current(state, instance_id, created_at).await,
+            Self::Creating {
+                instance_id,
+                generation,
+                ..
+            } => state
+                .install_progress
+                .get(instance_id)
+                .and_then(|progress| progress.creation_generation())
+                .is_some_and(|current| current == *generation),
             Self::Pool { grant, .. } => crate::subsystems::pools::load(state, &grant.runtime_id)
                 .await
                 .is_ok_and(|pool| grant.matches(&pool)),
         }
+    }
+
+    /// True while this target's creation runs and its container is not there yet.
+    async fn awaits_container(&self, state: &AppState) -> bool {
+        let Self::Creating { instance_id, .. } = self else {
+            return false;
+        };
+        let running = state
+            .install_progress
+            .get(instance_id)
+            .is_some_and(|progress| {
+                progress.status
+                    == crate::subsystems::instances::progress::InstallProgressStatus::Running
+            });
+        running
+            && matches!(
+                state
+                    .docker
+                    .verified_container_identity(self.protocol(), instance_id)
+                    .await,
+                Ok(None) | Err(_)
+            )
     }
 }
 
@@ -117,6 +158,9 @@ pub(crate) async fn stream_logs(
     let deadline = jwt_expiration_deadline(jwt_exp);
     if !target.is_current(&state).await {
         close_replaced_socket(&mut socket).await;
+        return;
+    }
+    if !wait_for_container(&mut socket, &state, &target, &mut shutdown, deadline).await {
         return;
     }
     let mut sequence = 0;
@@ -273,6 +317,37 @@ pub(crate) async fn stream_logs(
             break;
         }
     }
+}
+
+/// Waits, without sending anything, until a creating instance's container
+/// exists or its creation stops running. Returns false once the socket closed.
+async fn wait_for_container(
+    socket: &mut WebSocket,
+    state: &AppState,
+    target: &LogTarget,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    deadline: Instant,
+) -> bool {
+    let expiration = sleep_until(deadline);
+    tokio::pin!(expiration);
+    while target.awaits_container(state).await {
+        tokio::select! {
+            _ = wait_for_daemon_shutdown(shutdown) => {
+                close_shutdown_socket(socket).await;
+                return false;
+            }
+            _ = &mut expiration => {
+                close_expired_socket(socket).await;
+                return false;
+            }
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return false,
+                Some(Ok(_)) => {}
+            },
+            _ = tokio::time::sleep(CONTAINER_WAIT_INTERVAL) => {}
+        }
+    }
+    true
 }
 
 async fn finish_stream(
