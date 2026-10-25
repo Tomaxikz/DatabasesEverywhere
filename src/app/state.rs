@@ -1,67 +1,67 @@
-//! Application composition and shared shutdown coordination.
-//!
-//! The daemon constructs this state once. HTTP handlers and background
-//! coordinators share its resources; backend implementations take narrower
-//! dependencies rather than the whole application state.
+//! App state the daemon builds once and shares with handlers and background
+//! tasks, plus the shutdown fence for changes still in flight.
 
-use std::{
-    ops::Deref,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 
 use crate::{
     auth::api_token::ApiToken,
     config::RuntimeConfig,
-    routes::http::policy::OriginPolicy,
+    gateway::supervisor::GatewaySupervisor,
+    routes::http::{limits::ApiRateLimiter, policy::OriginPolicy},
     runtime::docker::DockerRuntime,
-    server::jobs::import_export::ImportExportJobs,
-    server::{manager::InstanceManager, state::InstanceStore},
+    server::{
+        disk::soft::SoftDiskLimiter, jobs::import_export::ImportExportJobs, locks::InstanceLocks,
+        manager::InstanceManager, placement::PlacementRepository, state::InstanceStore,
+    },
+    storage::backup_jobs::BackupJobRepository,
+    subsystems::{
+        artifacts::ArtifactDownloadTickets,
+        import_export::ImportUploadService,
+        instances::{InstanceRuntimeInfoCache, progress::InstallProgressStore},
+        monitoring::{resources::ResourceCache, websocket::MonitoringSnapshotCache},
+        system::config::ConfigPatchCoordinator,
+    },
 };
 
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<AppStateData>,
     origin_policy: Arc<OriginPolicy>,
-    pub gateway_supervisor: crate::gateway::supervisor::GatewaySupervisor,
+    pub gateway_supervisor: GatewaySupervisor,
 }
 
 #[cfg_attr(test, derive(Clone))]
 pub struct AppStateData {
     pub config: Arc<RuntimeConfig>,
     pub config_path: PathBuf,
-    pub config_patches: crate::subsystems::system::config::ConfigPatchCoordinator,
+    pub config_patches: ConfigPatchCoordinator,
     pub api_token: ApiToken,
     pub instances: InstanceStore,
     pub manager: InstanceManager,
-    pub placements: crate::server::placement::PlacementRepository,
-    pub instance_locks: crate::server::locks::InstanceLocks,
+    pub placements: PlacementRepository,
+    pub instance_locks: InstanceLocks,
     pub docker: DockerRuntime,
     pub import_export_jobs: ImportExportJobs,
-    /// Durable online backup coordinator journal.
-    pub backup_jobs: crate::storage::backup_jobs::BackupJobRepository,
-    pub import_uploads: crate::subsystems::import_export::ImportUploadService,
-    pub api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
-    pub install_progress: crate::subsystems::instances::progress::InstallProgressStore,
-    pub artifact_downloads: crate::subsystems::artifacts::ArtifactDownloadTickets,
-    pub resource_cache: crate::subsystems::monitoring::resources::ResourceCache,
-    pub soft_disk_limiter: crate::server::disk::soft::SoftDiskLimiter,
-    pub monitoring_cache: crate::subsystems::monitoring::websocket::MonitoringSnapshotCache,
-    pub instance_runtime_cache: crate::subsystems::instances::InstanceRuntimeInfoCache,
+    /// Journal of online backup jobs, survives restarts.
+    pub backup_jobs: BackupJobRepository,
+    pub import_uploads: ImportUploadService,
+    pub api_rate_limiter: ApiRateLimiter,
+    pub install_progress: InstallProgressStore,
+    pub artifact_downloads: ArtifactDownloadTickets,
+    pub resource_cache: ResourceCache,
+    pub soft_disk_limiter: SoftDiskLimiter,
+    pub monitoring_cache: MonitoringSnapshotCache,
+    pub instance_runtime_cache: InstanceRuntimeInfoCache,
     pub daemon_shutdown: DaemonShutdown,
 }
 
 impl AppState {
     pub fn new(data: AppStateData) -> Self {
         let origin_policy = Arc::new(OriginPolicy::from_config(&data.config));
-        let gateway_supervisor =
-            crate::gateway::supervisor::GatewaySupervisor::with_config(Arc::clone(&data.config));
+        let gateway_supervisor = GatewaySupervisor::with_config(Arc::clone(&data.config));
         Self {
             inner: Arc::new(data),
             origin_policy,
@@ -84,104 +84,75 @@ impl Deref for AppState {
 
 #[derive(Debug, Clone)]
 pub struct DaemonShutdown {
-    sender: watch::Sender<bool>,
-    accepting_mutations: Arc<AtomicBool>,
-    active_mutations: Arc<AtomicUsize>,
-    mutation_drain: Arc<Notify>,
+    stopping: watch::Sender<bool>,
+    mutations: TaskTracker,
 }
 
 #[derive(Debug)]
 pub(crate) struct MutationPermit {
-    active: Arc<AtomicUsize>,
-    drain: Arc<Notify>,
+    _token: TaskTrackerToken,
 }
 
 impl Default for DaemonShutdown {
     fn default() -> Self {
-        let (sender, _) = watch::channel(false);
         Self {
-            sender,
-            accepting_mutations: Arc::new(AtomicBool::new(true)),
-            active_mutations: Arc::default(),
-            mutation_drain: Arc::default(),
+            stopping: watch::Sender::new(false),
+            mutations: TaskTracker::new(),
         }
     }
 }
 
 impl DaemonShutdown {
     pub fn trigger(&self) {
-        self.accepting_mutations.store(false, Ordering::Release);
-        self.sender.send_replace(true);
+        self.stopping.send_replace(true);
+        self.mutations.close();
     }
 
     pub fn subscribe(&self) -> watch::Receiver<bool> {
-        self.sender.subscribe()
+        self.stopping.subscribe()
     }
 
     pub fn is_triggered(&self) -> bool {
-        *self.sender.borrow()
+        *self.stopping.borrow()
     }
 
     pub(crate) fn try_admit_mutation(&self) -> Option<MutationPermit> {
-        if !self.accepting_mutations.load(Ordering::Acquire) {
+        if self.is_triggered() {
             return None;
         }
-        self.active_mutations.fetch_add(1, Ordering::AcqRel);
-        if !self.accepting_mutations.load(Ordering::Acquire) {
-            release_mutation(&self.active_mutations, &self.mutation_drain);
+        let token = self.mutations.token();
+        // Shutdown may have started between the check and taking the token.
+        if self.is_triggered() {
             return None;
         }
-        Some(MutationPermit {
-            active: Arc::clone(&self.active_mutations),
-            drain: Arc::clone(&self.mutation_drain),
-        })
+        Some(MutationPermit { _token: token })
     }
 
-    /// Keeps detached daemon-owned mutation work inside the same shutdown
-    /// fence as the HTTP request that started it. This is intentionally
-    /// separate from request middleware because a disconnected client drops
-    /// the request permit while its owned worker must continue safely.
+    /// For work that keeps running after its request is gone; a dropped
+    /// client drops the request permit, not this one.
     pub(crate) fn try_admit_background_mutation(&self) -> Option<MutationPermit> {
         self.try_admit_mutation()
     }
 
     pub fn active_mutation_count(&self) -> usize {
-        self.active_mutations.load(Ordering::Acquire)
+        self.mutations.len()
     }
 
+    /// Only finishes after [`Self::trigger`].
     pub async fn wait_for_mutation_drain(&self, deadline: Duration) -> bool {
-        let drained = async {
-            loop {
-                let notified = self.mutation_drain.notified();
-                if self.active_mutation_count() == 0 {
-                    return;
-                }
-                notified.await;
-            }
-        };
-        tokio::time::timeout(deadline, drained).await.is_ok()
-    }
-}
-
-impl Drop for MutationPermit {
-    fn drop(&mut self) {
-        release_mutation(&self.active, &self.drain);
-    }
-}
-
-fn release_mutation(active: &AtomicUsize, drain: &Notify) {
-    let previous = active.fetch_sub(1, Ordering::AcqRel);
-    debug_assert!(previous > 0, "active API mutation count underflow");
-    if previous == 1 {
-        drain.notify_waiters();
+        tokio::time::timeout(deadline, self.mutations.wait())
+            .await
+            .is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn compatibility_exports_share_the_same_shutdown_coordinator() {
-        let shutdown = super::DaemonShutdown::default();
+        let shutdown = DaemonShutdown::default();
         let http: crate::routes::http::state::DaemonShutdown = shutdown.clone();
         let router: crate::routes::http::router::DaemonShutdown = http.clone();
         let permit = router.try_admit_mutation().unwrap();
@@ -217,8 +188,6 @@ mod tests {
         assert!(second.query_budget().reserve(1024 * 1024).is_ok());
     }
 
-    use super::*;
-
     #[tokio::test]
     async fn shutdown_closes_mutation_admission_and_drains_existing_work() {
         let shutdown = DaemonShutdown::default();
@@ -241,5 +210,18 @@ mod tests {
                 .await
         );
         assert_eq!(shutdown.active_mutation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_drain_times_out_while_a_change_is_still_running() {
+        let shutdown = DaemonShutdown::default();
+        let _running = shutdown.try_admit_mutation().unwrap();
+        shutdown.trigger();
+        assert!(
+            !shutdown
+                .wait_for_mutation_drain(Duration::from_millis(20))
+                .await
+        );
+        assert_eq!(shutdown.active_mutation_count(), 1);
     }
 }

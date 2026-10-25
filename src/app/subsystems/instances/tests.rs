@@ -65,6 +65,7 @@ async fn cancelled_resize_waiter_does_not_leave_queued_work() {
     let _ = waiter.await;
     assert_eq!(state.daemon_shutdown.active_mutation_count(), 0);
     drop(creation);
+    state.daemon_shutdown.trigger();
     assert!(
         state
             .daemon_shutdown
