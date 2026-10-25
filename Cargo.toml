@@ -92,3 +92,11 @@ tower = { version = "0.5.3", features = ["util"] }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Optimized but quick to rebuild, for running dbev on your own machine:
+# `cargo local`, binary at target/local/dbev. Published builds use release.
+[profile.local]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

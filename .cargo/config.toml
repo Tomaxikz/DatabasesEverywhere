@@ -3,3 +3,4 @@ b = "run --quiet --locked --package dbev-release-builder --target-dir target/car
 check-linux = "check --workspace --all-targets --locked --target x86_64-unknown-linux-gnu"
 build-linux = "build --package databases-everywhere --bin dbev --release --locked --target x86_64-unknown-linux-gnu"
 test-linux = "test --workspace --locked --target x86_64-unknown-linux-gnu"
+local = "build --package databases-everywhere --bin dbev --profile local --locked"
