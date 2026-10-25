@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use super::{
-    generate::{BindScope, DiskMode, chosen_mongodb_image},
+    generate::{BindScope, ContainerRuntime, DiskMode, chosen_mongodb_image},
     managed_steps,
     wizard::{QUESTIONS, Step, Wizard},
 };
@@ -87,7 +87,7 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
             ("Esc", "back"),
         ],
         Step::PublicHost => &[("Enter", "next"), ("Ctrl+U", "clear"), ("Esc", "back")],
-        Step::Scope | Step::Disk | Step::Api => {
+        Step::Scope | Step::Runtime | Step::Disk | Step::Api => {
             &[("↑↓", "choose"), ("Enter", "next"), ("Esc", "back")]
         }
         Step::Summary => &[
@@ -104,6 +104,7 @@ fn question_title(step: Step) -> &'static str {
         Step::Engines => "Engines",
         Step::PublicHost => "Public host",
         Step::Scope => "Listen on",
+        Step::Runtime => "Container engine",
         Step::Disk => "Disk limits",
         Step::Api => "Network API",
         Step::Start | Step::Managed | Step::Summary => "",
@@ -247,6 +248,36 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
             Line::default(),
             dim("On the network, restrict access with a firewall; the gateways start without TLS."),
         ],
+        Step::Runtime => {
+            let mut lines = vec![
+                Line::from("Which container runtime runs the databases?"),
+                Line::default(),
+            ];
+            lines.extend(ContainerRuntime::ALL.iter().map(|runtime| {
+                let found = if wizard.environment.runtimes.contains(runtime) {
+                    "installed"
+                } else {
+                    "not found on PATH"
+                };
+                option(
+                    *runtime == wizard.runtime,
+                    runtime.label(),
+                    &format!("{found}; {}", runtime.description()),
+                )
+            }));
+            lines.push(Line::default());
+            if wizard.environment.runtimes.contains(&wizard.runtime) {
+                lines.push(dim(
+                    "Don't switch runtimes later on a node that has databases.",
+                ));
+            } else {
+                lines.push(dim(format!(
+                    "Install {} before setup runs; setup needs its socket.",
+                    wizard.runtime.label()
+                )));
+            }
+            lines
+        }
         Step::Disk => {
             let mut lines = vec![
                 Line::from("How should per-database disk limits be enforced?"),
@@ -305,6 +336,7 @@ fn summary(wizard: &Wizard) -> Vec<Line<'static>> {
         field("Engines", engines),
         field("Public host", choices.public_host.clone()),
         field("Listen on", scope),
+        field("Containers", choices.runtime.label()),
         field("Disk limits", choices.disk.as_str()),
         field(
             "Network API",
@@ -385,6 +417,7 @@ mod tests {
                     hostname: String::new(),
                     kernel: Some("7.0.0".to_string()),
                     config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
+                    runtimes: Vec::new(),
                 },
                 NodeIdentity::generate(),
             );
@@ -396,6 +429,7 @@ mod tests {
                 Step::Engines,
                 Step::PublicHost,
                 Step::Scope,
+                Step::Runtime,
                 Step::Disk,
                 Step::Api,
                 Step::Summary,
@@ -421,6 +455,7 @@ mod tests {
                 hostname: "node-1".to_string(),
                 kernel: None,
                 config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
+                runtimes: vec![ContainerRuntime::Podman],
             },
             NodeIdentity::generate(),
         );

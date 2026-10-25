@@ -8,7 +8,7 @@ use std::{net::IpAddr, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::generate::{BindScope, Choices, DiskMode, NodeIdentity};
+use super::generate::{BindScope, Choices, ContainerRuntime, DiskMode, NodeIdentity};
 use crate::{config::Config, databases::protocol::Protocol};
 
 const MAX_HOST_LEN: usize = 253;
@@ -21,6 +21,8 @@ pub(super) struct Environment {
     pub hostname: String,
     pub kernel: Option<String>,
     pub config_path: PathBuf,
+    /// Container runtimes found on this machine.
+    pub runtimes: Vec<ContainerRuntime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,16 +32,18 @@ pub(super) enum Step {
     Engines,
     PublicHost,
     Scope,
+    Runtime,
     Disk,
     Api,
     Summary,
 }
 
 /// The standalone questions in order; the summary follows the last one.
-pub(super) const QUESTIONS: [Step; 5] = [
+pub(super) const QUESTIONS: [Step; 6] = [
     Step::Engines,
     Step::PublicHost,
     Step::Scope,
+    Step::Runtime,
     Step::Disk,
     Step::Api,
 ];
@@ -62,6 +66,7 @@ pub(super) struct Wizard {
     pub engine_cursor: usize,
     pub public_host: String,
     pub scope: BindScope,
+    pub runtime: ContainerRuntime,
     pub disk: DiskMode,
     pub api_enabled: bool,
     pub error: Option<String>,
@@ -83,6 +88,12 @@ impl Wizard {
             engine_cursor: 0,
             public_host: environment.hostname.clone(),
             scope: BindScope::Local,
+            // Docker when it is installed (or nothing is), else Podman.
+            runtime: environment
+                .runtimes
+                .first()
+                .copied()
+                .unwrap_or(ContainerRuntime::Docker),
             disk: DiskMode::Auto,
             api_enabled: false,
             error: None,
@@ -101,6 +112,7 @@ impl Wizard {
                 .collect(),
             public_host: self.public_host.trim().to_string(),
             scope: self.scope,
+            runtime: self.runtime,
             disk: self.disk,
             api_enabled: self.api_enabled,
         }
@@ -202,6 +214,12 @@ impl Wizard {
                     BindScope::Network => BindScope::Local,
                 };
             }
+            Step::Runtime if forward || backward || toggle => {
+                self.runtime = match self.runtime {
+                    ContainerRuntime::Docker => ContainerRuntime::Podman,
+                    ContainerRuntime::Podman => ContainerRuntime::Docker,
+                };
+            }
             Step::Disk if forward || backward || toggle => {
                 let count = DiskMode::ALL.len();
                 let index = DiskMode::ALL
@@ -287,6 +305,7 @@ mod tests {
                 hostname: "node-1".to_string(),
                 kernel: None,
                 config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
+                runtimes: vec![ContainerRuntime::Docker],
             },
             NodeIdentity::generate(),
         )
@@ -311,6 +330,7 @@ mod tests {
         let choices = wizard.choices();
         assert_eq!(choices.public_host, "node-1");
         assert_eq!(choices.scope, BindScope::Local);
+        assert_eq!(choices.runtime, ContainerRuntime::Docker);
         assert_eq!(choices.disk, DiskMode::Auto);
         assert!(!choices.api_enabled, "the network API starts off");
         assert_eq!(
@@ -337,6 +357,7 @@ mod tests {
             [
                 Step::Api,
                 Step::Disk,
+                Step::Runtime,
                 Step::Scope,
                 Step::PublicHost,
                 Step::Engines,
@@ -408,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn choices_cycle_on_scope_disk_and_api_steps() {
+    fn choices_cycle_on_scope_runtime_disk_and_api_steps() {
         let mut wizard = wizard(true);
         for _ in 0..3 {
             press(&mut wizard, KeyCode::Enter);
@@ -416,6 +437,10 @@ mod tests {
         assert_eq!(wizard.step, Step::Scope);
         press(&mut wizard, KeyCode::Down);
         assert_eq!(wizard.scope, BindScope::Network);
+        press(&mut wizard, KeyCode::Enter);
+        assert_eq!(wizard.step, Step::Runtime);
+        press(&mut wizard, KeyCode::Down);
+        assert_eq!(wizard.runtime, ContainerRuntime::Podman);
         press(&mut wizard, KeyCode::Enter);
         press(&mut wizard, KeyCode::Up);
         assert_eq!(wizard.disk, DiskMode::SoftScanner);

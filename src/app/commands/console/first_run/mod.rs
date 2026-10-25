@@ -42,6 +42,7 @@ pub(super) async fn run(config_path: &Path) -> anyhow::Result<Next> {
             .unwrap_or_default(),
         kernel: generate::kernel_release(),
         config_path: config_path.to_path_buf(),
+        runtimes: generate::ContainerRuntime::installed(),
     };
     let mut wizard = Wizard::new(environment, NodeIdentity::generate());
     let mut terminal = ratatui::try_init().context("failed to prepare the terminal")?;

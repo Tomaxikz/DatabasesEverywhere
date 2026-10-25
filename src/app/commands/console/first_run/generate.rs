@@ -42,6 +42,52 @@ impl BindScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContainerRuntime {
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntime {
+    pub(super) const ALL: [Self; 2] = [Self::Docker, Self::Podman];
+
+    /// The `daemon.engine` value.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Docker => "Docker",
+            Self::Podman => "Podman",
+        }
+    }
+
+    pub(super) fn description(self) -> &'static str {
+        match self {
+            Self::Docker => "the Docker Engine at /var/run/docker.sock",
+            Self::Podman => {
+                "rootful Podman at /run/podman/podman.sock; setup enables podman.socket"
+            }
+        }
+    }
+
+    /// Runtimes whose CLI is on `PATH`, in [`Self::ALL`] order.
+    pub(super) fn installed() -> Vec<Self> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        Self::ALL
+            .into_iter()
+            .filter(|runtime| {
+                std::env::split_paths(&path)
+                    .any(|directory| directory.join(runtime.as_str()).is_file())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DiskMode {
     Auto,
     ProjectQuota,
@@ -82,6 +128,7 @@ pub(super) struct Choices {
     pub engines: Vec<Protocol>,
     pub public_host: String,
     pub scope: BindScope,
+    pub runtime: ContainerRuntime,
     pub disk: DiskMode,
     pub api_enabled: bool,
 }
@@ -180,6 +227,10 @@ pub(super) fn standalone_config(
     }
     *api = settings;
 
+    let daemon = section(&mut root, "daemon")?;
+    daemon.insert("engine".into(), choices.runtime.as_str().into());
+    // Empty selects the runtime's standard root socket.
+    daemon.insert("socket_path".into(), "".into());
     section(&mut root, "disk")?.insert("mode".into(), choices.disk.as_str().into());
     let images = section(&mut root, "images")?;
     let mongodb = images
@@ -264,6 +315,7 @@ mod tests {
             engines: vec![Protocol::Postgres, Protocol::Clickhouse],
             public_host: "db.example.com".to_string(),
             scope: BindScope::Network,
+            runtime: ContainerRuntime::Podman,
             disk: DiskMode::SoftScanner,
             api_enabled: false,
         }
@@ -319,6 +371,8 @@ mod tests {
         assert_eq!(config["api"]["enabled"], Value::Bool(false));
         assert_eq!(text(&config, &["api", "host"]), "127.0.0.1");
         assert_eq!(text(&config, &["disk", "mode"]), "soft_scanner");
+        assert_eq!(text(&config, &["daemon", "engine"]), "podman");
+        assert_eq!(text(&config, &["daemon", "socket_path"]), "");
         for protocol in Protocol::ALL {
             let listener = &config[protocol.as_str()];
             assert_eq!(
@@ -408,15 +462,25 @@ mod tests {
     #[test]
     fn generated_configs_pass_validation() {
         let kernel = kernel_release();
+        // Validation inspects the configured host paths; keep it off this
+        // machine's real (possibly root-only) /var/lib/dbev.
+        let root = tempfile::tempdir().unwrap();
         for api_enabled in [false, true] {
-            for disk in DiskMode::ALL {
-                let mut choices = choices();
-                choices.api_enabled = api_enabled;
-                choices.disk = disk;
-                let identity = NodeIdentity::generate();
-                let yaml = render(&choices, &identity, kernel.as_deref()).unwrap();
-                let config: Config = yaml_serde::from_str(&yaml).unwrap();
-                crate::config::validate::validate_config(&config).unwrap();
+            for runtime in ContainerRuntime::ALL {
+                for disk in DiskMode::ALL {
+                    let mut choices = choices();
+                    choices.api_enabled = api_enabled;
+                    choices.runtime = runtime;
+                    choices.disk = disk;
+                    let mut config = generated(&choices, kernel.as_deref());
+                    let paths = config["paths"].as_mapping_mut().unwrap();
+                    for (_, path) in paths.iter_mut() {
+                        let inside = format!("{}{}", root.path().display(), path.as_str().unwrap());
+                        *path = inside.into();
+                    }
+                    let config: Config = yaml_serde::from_value(config).unwrap();
+                    crate::config::validate::validate_config(&config).unwrap();
+                }
             }
         }
     }
