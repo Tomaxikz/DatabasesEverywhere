@@ -18,7 +18,7 @@ use super::{
     form::{CreateForm, Field},
 };
 
-const ACCENT: Color = Color::Cyan;
+pub(super) const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub(super) fn draw(frame: &mut Frame, app: &App) {
@@ -194,7 +194,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(key_hints(hints)), keys);
 }
 
-fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
+pub(super) fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (key, label) in hints {
         spans.push(Span::styled(
@@ -461,7 +461,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// A centred popup `width` columns wide and `height` rows tall.
-fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> Rect {
+pub(super) fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> Rect {
     let area = frame.area();
     let width = width.min(area.width.saturating_sub(2));
     let height = height.min(area.height.saturating_sub(2));
@@ -482,7 +482,12 @@ fn input_line(label: &str, value: &str, focused: bool) -> Line<'static> {
     input_line_with_cursor(label, value, focused, focused)
 }
 
-fn input_line_with_cursor(label: &str, value: &str, focused: bool, cursor: bool) -> Line<'static> {
+pub(super) fn input_line_with_cursor(
+    label: &str,
+    value: &str,
+    focused: bool,
+    cursor: bool,
+) -> Line<'static> {
     let style = if focused {
         Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52))
     } else {

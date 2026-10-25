@@ -3,7 +3,7 @@ use super::{Config, path_policy::HostPathPolicy};
 mod api;
 mod import_export_scheduler;
 
-use api::{validate_api_host, validate_api_hosts};
+use api::{validate_api_host, validate_api_hosts, validate_api_socket};
 
 mod backups;
 mod disk;
@@ -46,8 +46,13 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_api_token(&config.token)?;
     validate_jwt_signing_key(&config.jwt_signing_key, &config.token)?;
 
-    validate_api_host(&config.api.host)?;
+    // The TCP-only settings matter only while the network API is on.
+    if config.api.enabled {
+        validate_api_host(&config.api.host)?;
+        validate_api_tls(&config.api.ssl)?;
+    }
     validate_api_hosts(config)?;
+    validate_api_socket(&config.api.socket_path)?;
     validate_listener("postgres", &config.postgres, &config.tls)?;
     validate_listener("mariadb", &config.mariadb, &config.tls)?;
     validate_listener("mysql", &config.mysql, &config.tls)?;
@@ -56,7 +61,6 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
     validate_listener("mongodb", &config.mongodb, &config.tls)?;
     validate_clickhouse(&config.clickhouse, &config.tls)?;
     validate_listener("qdrant", &config.qdrant, &config.tls)?;
-    validate_api_tls(&config.api.ssl)?;
     validate_security(&config.security)?;
     validate_allocation(&config.allocation)?;
     validate_disk(&config.disk)?;

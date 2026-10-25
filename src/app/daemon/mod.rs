@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 mod admission;
+mod api_socket;
 mod boot_recovery;
 mod container_events;
 mod fuse_cleanup;

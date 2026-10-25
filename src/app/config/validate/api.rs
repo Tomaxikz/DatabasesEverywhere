@@ -1,11 +1,15 @@
 use std::net::IpAddr;
 
-use crate::config::Config;
+use crate::config::{Config, path_policy::HostPathPolicy};
 
 use super::ConfigValidationError;
 
+/// Longest path that fits `sockaddr_un.sun_path` with its terminating NUL.
+const MAX_SOCKET_PATH_BYTES: usize = 107;
+
 pub(super) fn validate_api_hosts(config: &Config) -> Result<(), ConfigValidationError> {
-    if crate::config::url_origin(&config.remote).is_none() {
+    let remote = config.remote.trim();
+    if !remote.is_empty() && crate::config::url_origin(remote).is_none() {
         return Err(ConfigValidationError::InvalidRemoteUrl);
     }
 
@@ -35,5 +39,16 @@ pub(super) fn validate_api_host(host: &str) -> Result<(), ConfigValidationError>
             value: host.to_string(),
         });
     }
+    Ok(())
+}
+
+pub(super) fn validate_api_socket(socket_path: &str) -> Result<(), ConfigValidationError> {
+    if socket_path.len() > MAX_SOCKET_PATH_BYTES {
+        return Err(ConfigValidationError::ApiSocketPathTooLong {
+            value: socket_path.to_string(),
+            maximum: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    HostPathPolicy::validate_api_socket(socket_path)?;
     Ok(())
 }

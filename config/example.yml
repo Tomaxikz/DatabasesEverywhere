@@ -4,6 +4,8 @@ uuid: dbe-node-generated-by-panel
 token_id: dbe-token-id-generated-by-panel
 token: REPLACE_WITH_32_BYTE_RANDOM_API_TOKEN
 jwt_signing_key: REPLACE_WITH_32_BYTE_RANDOM_JWT_SIGNING_KEY
+# The panel's URL. Omit it or leave it empty on a standalone node managed
+# with `dbev --cli`; then no panel origin is allowed to call the API.
 remote: https://playground.cleaveroute.com
 
 tls:
@@ -53,13 +55,17 @@ qdrant:
   tls: false
 
 api:
+  # The network (TCP) API the panel calls. Set false on a standalone node: no
+  # TCP listener opens, the panel cannot reach the node, and only the socket
+  # below serves the API. host, port, and ssl then go unused.
+  enabled: true
   # HTTP and HTTPS are both supported, matching Wings. Prefer native TLS or a
   # trusted TLS reverse proxy outside isolated development/private networks.
   host: 127.0.0.1
   port: 8090
   # Additional browser origins allowed to call DBEV through CORS and WebSocket
   # upgrades. These are exact HTTP(S) origins: scheme, hostname, and effective
-  # port must all match. The primary `remote` panel origin is always included.
+  # port must all match. The `remote` panel origin, when set, is included.
   trusted_origins: []
   ssl:
     enabled: false
@@ -67,6 +73,9 @@ api:
     key: ''
     require_client_cert: false
     client_ca: ''
+  # Always serves the same API, without TLS, for `dbev --cli` and local
+  # tools. Root-only: mode 0600 in a 0700 directory the daemon creates.
+  socket_path: /run/dbev/api.sock
 
 security:
   api_body_limit_bytes: 1048576

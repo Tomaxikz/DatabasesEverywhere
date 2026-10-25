@@ -1,11 +1,19 @@
 //! Client for the local daemon API, authenticated with the config token.
 //!
 //! The console never edits daemon state directly: every change goes through
-//! the same endpoints, locks, validation and audit logs the panel uses. With
-//! TLS on, it trusts exactly the certificate the daemon is configured to
-//! serve (it connects to a loopback address, so hostname checks cannot apply).
+//! the same endpoints, locks, validation and audit logs the panel uses. It
+//! prefers the daemon's root-only Unix socket, which also serves standalone
+//! nodes whose network API is off. Over TCP with TLS on, it trusts exactly the
+//! certificate the daemon is configured to serve (it connects to a loopback
+//! address, so hostname checks cannot apply).
 
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    net::IpAddr,
+    os::unix::fs::FileTypeExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, anyhow, bail};
 use reqwest::{Method, StatusCode};
@@ -23,10 +31,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Backups and restores finish inside the request.
 const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 pub(super) const LOG_TAIL_LINES: u32 = 500;
+/// Requests over the socket still need a URL; its host is never resolved.
+const SOCKET_REQUEST_BASE: &str = "http://localhost";
 
 #[derive(Clone)]
 pub(super) struct ApiClient {
     base_url: Arc<str>,
+    request_base: Arc<str>,
     token: Arc<str>,
     client: reqwest::Client,
 }
@@ -38,24 +49,39 @@ impl ApiClient {
                 "the config has no API token; run dbev --setup with the panel configuration first"
             );
         }
-        if config.api.ssl.enabled && config.api.ssl.require_client_cert {
-            bail!("the API requires client certificates, which the console does not present");
-        }
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(LONG_REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none());
-        if config.api.ssl.enabled {
-            builder = builder.tls_backend_preconfigured(pinned_tls(&config.api.ssl.cert)?);
-        }
+        let (base_url, request_base, builder) = match ApiTransport::from_config(config) {
+            ApiTransport::Socket(path) => (
+                format!("unix://{}", path.display()),
+                SOCKET_REQUEST_BASE.to_string(),
+                builder.unix_socket(path),
+            ),
+            ApiTransport::Network(url) => {
+                let builder = if !config.api.ssl.enabled {
+                    builder
+                } else if config.api.ssl.require_client_cert {
+                    bail!(
+                        "the API requires client certificates, which the console does not present"
+                    );
+                } else {
+                    builder.tls_backend_preconfigured(pinned_tls(&config.api.ssl.cert)?)
+                };
+                (url.clone(), url, builder)
+            }
+        };
         Ok(Self {
-            base_url: Arc::from(local_api_url(config)),
+            base_url: Arc::from(base_url),
+            request_base: Arc::from(request_base),
             token: Arc::from(config.token.as_str()),
             client: builder.build().context("failed to build the API client")?,
         })
     }
 
+    /// Where the API is reached, for display: a URL, or the socket path.
     pub(super) fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -69,7 +95,7 @@ impl ApiClient {
     ) -> anyhow::Result<T> {
         let mut request = self
             .client
-            .request(method, format!("{}{path}", self.base_url))
+            .request(method, format!("{}{path}", self.request_base))
             .bearer_auth(&*self.token)
             .timeout(timeout);
         if let Some(body) = body {
@@ -196,6 +222,27 @@ impl ApiClient {
             )
             .await?;
         Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ApiTransport {
+    Socket(PathBuf),
+    Network(String),
+}
+
+impl ApiTransport {
+    /// The socket once the daemon has created it, or whenever there is no
+    /// network API to fall back to; otherwise TCP, as configured.
+    fn from_config(config: &Config) -> Self {
+        let socket = Path::new(&config.api.socket_path);
+        let present =
+            std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket());
+        if present || !config.api.enabled {
+            Self::Socket(socket.to_path_buf())
+        } else {
+            Self::Network(local_api_url(config))
+        }
     }
 }
 
@@ -511,6 +558,73 @@ mod tests {
             config.api.ssl.enabled = ssl;
             assert!(local_api_url(&config).starts_with(expected), "{host}");
         }
+    }
+
+    #[test]
+    fn prefers_the_socket_and_falls_back_to_tcp() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("api.sock");
+        let mut config = Config::default();
+        config.api.socket_path = socket.display().to_string();
+        let tcp = ApiTransport::Network(local_api_url(&config));
+
+        assert_eq!(ApiTransport::from_config(&config), tcp);
+        std::fs::write(&socket, b"not a socket").unwrap();
+        assert_eq!(ApiTransport::from_config(&config), tcp);
+        std::fs::remove_file(&socket).unwrap();
+
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(
+            ApiTransport::from_config(&config),
+            ApiTransport::Socket(socket.clone())
+        );
+
+        // With the network API off, a missing socket is the error to report.
+        let mut config = Config::default();
+        config.api.enabled = false;
+        config.api.socket_path = directory.path().join("missing.sock").display().to_string();
+        assert_eq!(
+            ApiTransport::from_config(&config),
+            ApiTransport::Socket(directory.path().join("missing.sock"))
+        );
+    }
+
+    #[tokio::test]
+    async fn talks_to_the_daemon_over_its_socket() {
+        use axum::{http::HeaderMap, routing::get};
+
+        const TOKEN: &str = "test-api-token-0123456789abcdef-01";
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let router = axum::Router::new().route(
+            "/api/system",
+            get(|headers: HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    != Some(&format!("Bearer {TOKEN}"))
+                {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                Ok(axum::Json(serde_json::json!({ "version": "9.9.9" })))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let mut config = Config {
+            token: TOKEN.to_string(),
+            ..Config::default()
+        };
+        config.api.socket_path = socket.display().to_string();
+        // TCP-only requirements do not apply to the socket.
+        config.api.ssl.enabled = true;
+        config.api.ssl.require_client_cert = true;
+        let client = ApiClient::from_config(&config).unwrap();
+
+        assert_eq!(client.base_url(), format!("unix://{}", socket.display()));
+        assert_eq!(client.system().await.unwrap().version, "9.9.9");
+        server.abort();
     }
 
     #[test]

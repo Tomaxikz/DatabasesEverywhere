@@ -21,6 +21,36 @@ Use the README's [verified download](../../README.md#download-and-install),
 the [Compose guide](../../deploy/docker/README.md), or [build from source](../development.md).
 Pin a reviewed version for automated deployments.
 
+## Standalone mode
+
+A node can run without a panel. On a fresh install, run `sudo dbev --cli`.
+With no config at `/etc/databases-everywhere/config.yml` it opens a first-run
+screen; choose **Standalone** and answer:
+
+- the engines to enable (PostgreSQL, MariaDB and Redis are preselected);
+- the public host for connection strings (default: the machine's host name);
+- where gateways listen: this machine only (`127.0.0.1`) or the network (`0.0.0.0`);
+- the [disk mode](disk-limits.md): `auto`, `project_quota`, `fuse_quota` or `soft_scanner`;
+- whether to open the network API. It is off by default: only a panel needs it,
+  and the console reaches the daemon through `api.socket_path` (`/run/dbev/api.sock`).
+
+The console generates the node `uuid`, `token_id`, an API `token` and a separate
+`jwt_signing_key` (32 random bytes each) and shows a summary. On confirmation it
+writes the config root-owned, mode 0600, in a 0700 directory. Other settings
+take the [example config](../../config/example.yml) defaults; the config has no
+`remote`, sets `api.enabled: false` unless the API was opened, and uses
+`mongo:7.0.37` on Linux 6.19 and newer. The public host is kept for the console
+in `console.yml` beside the config; the daemon ignores that file. The console
+then leaves full-screen mode, runs `dbev --setup` with its output visible, waits
+up to two minutes for the daemon to answer, and opens as usual.
+
+- Standalone setup needs root; otherwise the console explains and exits before writing anything.
+- Without systemd (in a container, for example) only the config is written; start
+  `dbev daemon` under your supervisor, or `docker compose up -d` for the
+  [Compose deployment](../../deploy/docker/README.md).
+- An existing config is never overwritten. If setup fails the config stays; fix the
+  cause, then run `sudo dbev --setup` and `sudo dbev --cli`.
+
 ## Configure
 
 Save the panel-generated config to `/etc/databases-everywhere/config.yml`.
@@ -169,11 +199,19 @@ restores backups. Press `?` for keys. It needs the daemon running; otherwise it
 exits before opening and asks whether the daemon is up
 (`sudo systemctl start databases-everywhere`).
 
+Without a config file the console starts with the first-run screen instead.
+**Managed by a panel (API)** lists the steps (generate the node config in the
+panel, save it to the config path, run `sudo dbev --setup`) and exits.
+**Standalone** runs the [standalone setup](#standalone-mode) and then opens the
+console. A config the current user cannot inspect is an error, not a first run.
+
 The console calls the running daemon's local API with the config `token`, so
 every change goes through the same validation, locks and audit logs as the
 panel. With `api.ssl` on it trusts exactly the configured certificate; APIs
 that require client certificates are not supported. The panel does not learn
-about instances created here; they are tagged `project_id: dbev-cli`.
+about instances created here; they are tagged `project_id: dbev-cli`. New
+instances suggest the public host from `console.yml` when standalone setup
+saved one.
 
 The API never returns passwords. `p` reveals an instance's stored password,
 and for dedicated runtimes the engine superuser, by reading the encrypted

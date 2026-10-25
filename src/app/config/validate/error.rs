@@ -22,7 +22,7 @@ pub enum ConfigValidationError {
     PlaceholderJwtSigningKey,
     #[error("jwt_signing_key must be different from token")]
     ReusedJwtSigningKey,
-    #[error("remote must be a full URL such as https://panel.example.com")]
+    #[error("remote must be empty or a full URL such as https://panel.example.com")]
     InvalidRemoteUrl,
     #[error("api.host must be a host or IP address, not a URL/path: {value}")]
     InvalidApiHost { value: String },
@@ -30,6 +30,8 @@ pub enum ConfigValidationError {
         "api.trusted_origins must contain only HTTP(S) origins without paths, queries, or credentials: {value}"
     )]
     InvalidApiOrigin { value: String },
+    #[error("api.socket_path must be at most {maximum} bytes long: {value}")]
+    ApiSocketPathTooLong { value: String, maximum: usize },
     #[error("{field} bind address is invalid: {value}")]
     InvalidBind { field: &'static str, value: String },
     #[error("{field} must be an absolute path: {value}")]

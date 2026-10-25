@@ -3,15 +3,23 @@
 //! It lists every instance with live status, creates instances, runs power
 //! actions, deletes, shows container logs, takes and restores backups, and
 //! (as root) reveals stored credentials. All changes go through the local
-//! daemon API with the config token; see [`api`].
+//! daemon API with the config token; see [`api`]. Without a config it starts
+//! with the first-run setup instead; see [`first_run`].
 
 mod api;
 mod app;
 mod credentials;
+mod first_run;
 mod form;
+mod settings;
 mod ui;
 
-use std::{io::IsTerminal, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io::IsTerminal,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -23,30 +31,67 @@ use crate::config::Config;
 use self::{
     api::ApiClient,
     app::{App, Job, Outcome, Revealed},
+    settings::ConsoleSettings,
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const TICK_INTERVAL: Duration = Duration::from_millis(120);
+/// How long a freshly set-up daemon may take to answer.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(120);
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) async fn run(config_path: PathBuf) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         bail!("dbev --cli needs an interactive terminal");
     }
+    let first_run = !first_run::config_exists(&config_path)?;
+    if first_run {
+        match first_run::run(&config_path).await? {
+            first_run::Next::OpenConsole => {}
+            first_run::Next::Exit => return Ok(()),
+        }
+    }
     let config = crate::config::load::load_config(&config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
     let client = ApiClient::from_config(&config)?;
     // Fail before taking over the screen when the daemon is unreachable.
-    let system = client.system().await.with_context(|| {
-        format!(
-            "the daemon API at {} did not answer; is the daemon running?",
-            client.base_url()
-        )
-    })?;
+    let system = if first_run {
+        wait_for_daemon(&client).await?
+    } else {
+        client.system().await.with_context(|| {
+            format!(
+                "the daemon API at {} did not answer; is the daemon running?",
+                client.base_url()
+            )
+        })?
+    };
+    let settings = ConsoleSettings::load(&config_path);
 
     let mut terminal = ratatui::try_init().context("failed to prepare the terminal")?;
-    let result = event_loop(&mut terminal, Arc::new(config), client, system).await;
+    let result = event_loop(&mut terminal, Arc::new(config), client, system, settings).await;
     ratatui::restore();
     result
+}
+
+/// Polls a daemon that setup just started until its API answers.
+async fn wait_for_daemon(client: &ApiClient) -> anyhow::Result<api::SystemInfo> {
+    println!("waiting for the daemon API at {}…", client.base_url());
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    loop {
+        match client.system().await {
+            Ok(system) => return Ok(system),
+            Err(_) if Instant::now() < deadline => tokio::time::sleep(DAEMON_POLL_INTERVAL).await,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "the daemon did not answer within {}s; check \
+                         `sudo journalctl -u databases-everywhere -e`, then run `sudo dbev --cli`",
+                        DAEMON_START_TIMEOUT.as_secs()
+                    )
+                });
+            }
+        }
+    }
 }
 
 async fn event_loop(
@@ -54,8 +99,10 @@ async fn event_loop(
     config: Arc<Config>,
     client: ApiClient,
     system: api::SystemInfo,
+    settings: ConsoleSettings,
 ) -> anyhow::Result<()> {
     let mut app = App::new(client.base_url().to_string());
+    app.public_host = settings.public_host;
     let (sender, mut outcomes) = mpsc::unbounded_channel();
     app.on_outcome(Outcome::System(system));
     let runner = Runner {

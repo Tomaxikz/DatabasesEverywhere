@@ -47,8 +47,17 @@ pub(crate) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     println!("config read from: {}", config_path.display());
     println!("node uuid: {}", config.uuid);
     println!("token id: {}", config.token_id);
-    println!("remote panel: {}", config.remote);
-    println!("api listener: {}", config.api.bind_addr());
+    if config.remote.trim().is_empty() {
+        println!("remote panel: none (standalone)");
+    } else {
+        println!("remote panel: {}", config.remote);
+    }
+    if config.api.enabled {
+        println!("api listener: {}", config.api.bind_addr());
+    } else {
+        println!("api listener: disabled; the panel cannot reach this node");
+    }
+    println!("api socket: {}", config.api.socket_path);
     println!("service: enabled and started ({SERVICE_UNIT})");
     Ok(())
 }

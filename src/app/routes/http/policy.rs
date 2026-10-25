@@ -169,11 +169,9 @@ pub fn cors_layer(policy: OriginPolicy) -> CorsLayer {
         ])
 }
 
+/// Server clients send no Origin. A standalone node with no `remote` and no
+/// trusted origins therefore still serves them, but admits no browser.
 fn validate_request_origin(headers: &HeaderMap, policy: &OriginPolicy) -> Result<(), ApiError> {
-    if policy.allowed_origins.is_empty() {
-        return Err(ApiError::BrowserOriginNotAllowed);
-    }
-
     if let Some(origin) = headers.get("origin") {
         let origin = origin
             .to_str()
@@ -323,6 +321,21 @@ mod tests {
         }
         for uri in ["/api/system?tokens=1", "/api/system?x=token"] {
             assert!(reject_query_token(&uri.parse().unwrap()).is_ok(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn standalone_nodes_serve_server_clients_but_no_browser_origin() {
+        let policy = OriginPolicy::from_config(&Config::default());
+        let mut headers = HeaderMap::new();
+        assert!(validate_request_origin(&headers, &policy).is_ok());
+
+        for origin in ["https://panel.example.com", "http://localhost", "null"] {
+            headers.insert("origin", origin.parse().unwrap());
+            assert!(matches!(
+                validate_request_origin(&headers, &policy),
+                Err(ApiError::BrowserOriginNotAllowed)
+            ));
         }
     }
 

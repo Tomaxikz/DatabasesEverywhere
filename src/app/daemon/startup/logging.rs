@@ -16,9 +16,11 @@ pub(in super::super) fn log_boot_config(config: &Config, config_path: &Path) {
         "configured paths"
     );
     tracing::info!(
+        api_enabled = config.api.enabled,
         api_bind = %config.api.bind_addr(),
         api_host = %config.api.host,
         api_port = config.api.port,
+        api_socket = %config.api.socket_path,
         remote = %config.remote,
         cors_allowed_origins = ?config.cors_allowed_origins(),
         body_limit_bytes = config.security.api_body_limit_bytes,
@@ -35,7 +37,9 @@ pub(in super::super) fn log_boot_config(config: &Config, config_path: &Path) {
             "api.trusted_hosts is retired and ignored; authenticate server clients with API tokens and restrict browser callers with api.trusted_origins"
         );
     }
-    log_api_host_resolution(config);
+    if config.api.enabled {
+        log_api_host_resolution(config);
+    }
     log_tls_config(config);
     tracing::info!(
         default_pids_limit = config.security.pids_limit,
@@ -139,7 +143,9 @@ pub(in super::super) fn log_api_host_resolution(config: &Config) {
 }
 
 pub(in super::super) fn log_tls_config(config: &Config) {
-    if config.api.ssl.enabled {
+    if !config.api.enabled {
+        tracing::info!("network api disabled; only the api socket serves requests");
+    } else if config.api.ssl.enabled {
         log_tls_file("api tls certificate", &config.api.ssl.cert);
         log_tls_file("api tls private key", &config.api.ssl.key);
         tracing::info!(

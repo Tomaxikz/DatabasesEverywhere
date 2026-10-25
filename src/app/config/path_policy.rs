@@ -88,6 +88,41 @@ impl HostPathPolicy {
         }
         Ok(())
     }
+
+    /// The daemon creates the API socket's directory and restricts it to mode
+    /// 0700, so that directory is held to the rules of a managed runtime root.
+    pub fn validate_api_socket(value: &str) -> Result<(), HostPathPolicyError> {
+        const FIELD: &str = "api.socket_path";
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return Err(HostPathPolicyError::Relative {
+                field: FIELD,
+                value: value.to_string(),
+            });
+        }
+        // Components hide a trailing "/" or "/.", which would bind elsewhere.
+        let dot_segment = value
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."));
+        let directory = match (path.parent(), path.components().next_back()) {
+            (Some(directory), Some(Component::Normal(_)))
+                if !value.ends_with('/') && !dot_segment =>
+            {
+                directory
+            }
+            _ => {
+                return Err(HostPathPolicyError::NonNormalized {
+                    field: FIELD,
+                    value: value.to_string(),
+                });
+            }
+        };
+        validate_root(
+            "api.socket_path directory",
+            &directory.display().to_string(),
+        )?;
+        Ok(())
+    }
 }
 
 fn validate_root(field: &'static str, value: &str) -> Result<PathBuf, HostPathPolicyError> {

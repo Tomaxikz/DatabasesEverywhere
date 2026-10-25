@@ -6,7 +6,10 @@ use super::{
     Config, loopback_bind,
     origins::{normalize_http_origin, url_origin},
 };
-use crate::{databases::protocol::Protocol, utils::constants::ports};
+use crate::{
+    databases::protocol::Protocol,
+    utils::constants::{defaults, ports},
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -94,6 +97,9 @@ impl Default for ListenerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
+    /// Serves the API over TCP. Off for standalone nodes: the panel cannot
+    /// reach them, and only the Unix socket serves the API.
+    pub enabled: bool,
     pub host: String,
     pub port: u16,
     /// Retained only to load v0.6 configuration files. Host headers are not
@@ -107,17 +113,21 @@ pub struct ApiConfig {
     pub fqdn: String,
     pub trusted_origins: Vec<String>,
     pub ssl: ApiSslConfig,
+    /// Always serves the same API as TCP, without TLS; root-only (mode 0600).
+    pub socket_path: String,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host: "127.0.0.1".to_string(),
             port: ports::API,
             trusted_hosts: Vec::new(),
             fqdn: String::new(),
             trusted_origins: Vec::new(),
             ssl: ApiSslConfig::default(),
+            socket_path: defaults::API_SOCKET_PATH.to_string(),
         }
     }
 }

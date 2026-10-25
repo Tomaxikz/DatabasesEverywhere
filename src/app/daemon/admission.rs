@@ -11,9 +11,11 @@ use std::{
 use axum_server::accept::Accept;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
+    net::{TcpStream, UnixStream},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
+
+use super::api_socket::API_SOCKET_PEER;
 
 #[derive(Debug, Clone)]
 pub(super) struct ApiConnectionAcceptor<A> {
@@ -31,26 +33,25 @@ impl<A> ApiConnectionAcceptor<A> {
             )),
         }
     }
-}
 
-impl<S, A> Accept<TcpStream, S> for ApiConnectionAcceptor<A>
-where
-    S: Send + 'static,
-    A: Accept<TcpStream, S> + Send + Sync,
-    A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    A::Service: Send + 'static,
-    A::Future: Send + 'static,
-{
-    type Stream = AdmittedApiStream<A::Stream>;
-    type Service = A::Service;
-    type Future =
-        Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send + 'static>>;
+    /// An acceptor for another API listener, drawing on the same capacity.
+    pub(super) fn sharing<B>(&self, inner: B) -> ApiConnectionAcceptor<B> {
+        ApiConnectionAcceptor {
+            inner,
+            limiter: Arc::clone(&self.limiter),
+        }
+    }
 
-    fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
-        let peer_ip = match stream.peer_addr() {
-            Ok(peer) => peer.ip(),
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
+    fn admit<I, S>(
+        &self,
+        peer_ip: IpAddr,
+        stream: I,
+        service: S,
+    ) -> AdmissionFuture<A::Stream, A::Service>
+    where
+        A: Accept<I, S>,
+        A::Future: Send + 'static,
+    {
         let Some(permit) = self.limiter.try_acquire(peer_ip) else {
             return Box::pin(async {
                 Err(io::Error::new(
@@ -70,6 +71,48 @@ where
                 service,
             ))
         })
+    }
+}
+
+type AdmissionFuture<St, Sv> =
+    Pin<Box<dyn Future<Output = io::Result<(AdmittedApiStream<St>, Sv)>> + Send + 'static>>;
+
+impl<S, A> Accept<TcpStream, S> for ApiConnectionAcceptor<A>
+where
+    S: Send + 'static,
+    A: Accept<TcpStream, S> + Send + Sync,
+    A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A::Service: Send + 'static,
+    A::Future: Send + 'static,
+{
+    type Stream = AdmittedApiStream<A::Stream>;
+    type Service = A::Service;
+    type Future = AdmissionFuture<A::Stream, A::Service>;
+
+    fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        let peer_ip = match stream.peer_addr() {
+            Ok(peer) => peer.ip(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        self.admit(peer_ip, stream, service)
+    }
+}
+
+/// Socket clients have no address; they all count as one local peer.
+impl<S, A> Accept<UnixStream, S> for ApiConnectionAcceptor<A>
+where
+    S: Send + 'static,
+    A: Accept<UnixStream, S> + Send + Sync,
+    A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A::Service: Send + 'static,
+    A::Future: Send + 'static,
+{
+    type Stream = AdmittedApiStream<A::Stream>;
+    type Service = A::Service;
+    type Future = AdmissionFuture<A::Stream, A::Service>;
+
+    fn accept(&self, stream: UnixStream, service: S) -> Self::Future {
+        self.admit(API_SOCKET_PEER.ip(), stream, service)
     }
 }
 

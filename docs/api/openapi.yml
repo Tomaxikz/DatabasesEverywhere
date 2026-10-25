@@ -443,7 +443,7 @@ components:
           description: Readiness of the management API itself. Database listener readiness is reported separately under gateways.
         uuid: {type: string}
         token_id: {type: string}
-        remote: {type: string, format: uri}
+        remote: {type: string, description: "Panel URL; empty on a standalone node"}
         api_host: {type: string}
         api_port: {type: integer}
         api_bind: {type: string}

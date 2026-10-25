@@ -161,6 +161,8 @@ pub(super) enum Outcome {
 pub(super) struct App {
     pub system: Option<SystemInfo>,
     pub api_url: String,
+    /// Public host chosen at first run; suggested for new instances.
+    pub public_host: String,
     pub instances: Vec<Instance>,
     pub loaded: bool,
     pub selected: usize,
@@ -187,6 +189,7 @@ impl App {
         Self {
             system: None,
             api_url,
+            public_host: String::new(),
             instances: Vec::new(),
             loaded: false,
             selected: 0,
@@ -406,6 +409,11 @@ impl App {
                     .as_ref()
                     .map(|system| (system.enabled_protocols(), default_public_host(system)))
                     .unwrap_or_default();
+                let host = if self.public_host.is_empty() {
+                    host
+                } else {
+                    self.public_host.clone()
+                };
                 self.modal = Some(Modal::Create(Box::new(CreateForm::new(protocols, &host))));
             }
             _ => return self.on_instance_action(key),

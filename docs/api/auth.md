@@ -16,7 +16,32 @@ short-lived capability token; [WebSockets](websockets.md) use separate JWTs.
 
 DBEV does not filter authenticated calls by HTTP Host. If an Origin header is
 present, it must exactly match `remote` or `api.trusted_origins`, including
-scheme and effective port.
+scheme and effective port. With neither set, no browser origin is allowed.
+
+### Local socket
+
+The daemon always serves the same API on a Unix socket, `api.socket_path`
+(default `/run/dbev/api.sock`), alongside any TCP listener. The socket is
+root-only (mode 0600, in a 0700 directory) and never uses TLS; requests still
+need the bearer token. `dbev --cli` uses the socket when it exists and falls
+back to TCP otherwise. Any HTTP client that speaks over a Unix socket works:
+
+```bash
+curl --unix-socket /run/dbev/api.sock \
+  -H "Authorization: Bearer $TOKEN" http://localhost/api/system
+```
+
+Socket clients have no IP address. They all count as one peer, `127.0.0.1`,
+for connection limits, rate limits, and request logs. At startup the daemon
+replaces a socket file left by an earlier run, but refuses to replace a
+symlink, any other file, or a socket another process still serves.
+
+### Disabling the network API
+
+A standalone node has no panel. Set `api.enabled: false` to open no TCP
+listener at all; `remote` may then be omitted. `api.host`, `api.port`, and
+`api.ssl` go unused, and the daemon logs a startup warning that the panel
+cannot reach the node. Manage it with `sudo dbev --cli` over the socket.
 
 ### Request limits
 

@@ -2,7 +2,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use axum::Router;
-use axum_server::{Handle, accept::NoDelayAcceptor, tls_rustls::RustlsConfig};
+use axum_server::{
+    Handle,
+    accept::{DefaultAcceptor, NoDelayAcceptor},
+    tls_rustls::RustlsConfig,
+};
 use hyper_util::rt::TokioTimer;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::TcpListener;
@@ -13,7 +17,7 @@ use crate::{
         API_CONNECTION_DRAIN_TIMEOUT, API_HEADER_READ_TIMEOUT, API_MUTATION_DRAIN_TIMEOUT,
         API_TLS_HANDSHAKE_TIMEOUT, GATEWAY_CONNECTION_DRAIN_TIMEOUT,
         GATEWAY_CONNECTION_FORCE_CLOSE_TIMEOUT, WEBSOCKET_DRAIN_TIMEOUT,
-        admission::ApiConnectionAcceptor,
+        admission::ApiConnectionAcceptor, api_socket::ApiSocket,
     },
     gateway::{
         listeners, resolver::RouteResolver, security::GatewayConnectionLimiter,
@@ -377,38 +381,20 @@ pub(super) async fn serve_api(
     daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
-    let bind = config.api.bind_addr();
-    if config.api.ssl.enabled {
-        return serve_api_tls(
-            config,
-            router,
-            import_export_jobs,
-            install_progress,
-            api_rate_limiter,
-            daemon_shutdown,
-            gateway_supervisor,
-        )
-        .await;
-    }
+    let socket = ApiSocket::bind(&config.api.socket_path)?;
+    let network = if config.api.enabled {
+        Some(NetworkApiListener::bind(config).await?)
+    } else {
+        tracing::warn!(
+            socket = %config.api.socket_path,
+            "api.enabled is false: no network API listener is open, so the panel cannot reach this node; manage it with dbev --cli over the API socket"
+        );
+        None
+    };
 
-    let listener = TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("failed to bind API listener on {bind}"))?;
-    tracing::info!(
-        bind = %bind,
-        configured_host = %config.api.host,
-        port = config.api.port,
-        max_active_connections = config.daemon.limits.api_connections,
-        max_active_connections_per_peer = config.daemon.limits.api_connections_per_peer,
-        header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
-        "api listener started"
-    );
-
-    let listener = listener
-        .into_std()
-        .context("failed to convert API listener")?;
-    let handle = Handle::new();
-    let shutdown_handle = handle.clone();
+    let network_handle = Handle::new();
+    let socket_handle = Handle::new();
+    let (network_shutdown, socket_shutdown) = (network_handle.clone(), socket_handle.clone());
     tokio::spawn(async move {
         shutdown_signal(
             import_export_jobs,
@@ -418,88 +404,113 @@ pub(super) async fn serve_api(
             gateway_supervisor,
         )
         .await;
-        shutdown_handle.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
+        network_shutdown.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
+        socket_shutdown.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
     });
 
-    let mut server = axum_server::from_tcp(listener)
-        .context("failed to create API server")?
-        .acceptor(ApiConnectionAcceptor::new(
-            NoDelayAcceptor::new(),
-            &config.daemon.limits,
-        ));
-    configure_api_http(&mut server);
-    server
-        .handle(handle)
-        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("api server failed")
+    // Both listeners share one connection capacity.
+    let admission = ApiConnectionAcceptor::new((), &config.daemon.limits);
+    let socket = socket.serve(
+        router.clone(),
+        admission.sharing(DefaultAcceptor::new()),
+        socket_handle,
+    );
+    match network {
+        Some(network) => {
+            tokio::try_join!(network.serve(router, &admission, network_handle), socket)?;
+            Ok(())
+        }
+        None => socket.await,
+    }
 }
 
-pub(super) async fn serve_api_tls(
-    config: &Config,
-    router: Router,
-    import_export_jobs: ImportExportJobs,
-    install_progress: InstallProgressStore,
-    api_rate_limiter: crate::routes::http::limits::ApiRateLimiter,
-    daemon_shutdown: crate::state::DaemonShutdown,
-    gateway_supervisor: GatewaySupervisor,
-) -> anyhow::Result<()> {
-    let bind_addr = config.api.bind_addr();
-    let listener = std::net::TcpListener::bind(&bind_addr)
-        .with_context(|| format!("failed to bind API listener on {bind_addr}"))?;
-    listener
-        .set_nonblocking(true)
-        .context("failed to configure API TLS listener as non-blocking")?;
-    let tls = api_rustls_config(config)
-        .await
-        .context("failed to build API TLS configuration")?;
-    tracing::info!(
-        cert = %config.api.ssl.cert,
-        key = %config.api.ssl.key,
-        require_client_cert = config.api.ssl.require_client_cert,
-        "api tls configuration loaded"
-    );
+/// The network API listener; TLS applies here and never to the socket.
+enum NetworkApiListener {
+    Plain(std::net::TcpListener),
+    Tls(std::net::TcpListener, RustlsConfig),
+}
 
-    tracing::info!(
-        bind = %bind_addr,
-        configured_host = %config.api.host,
-        port = config.api.port,
-        max_active_connections = config.daemon.limits.api_connections,
-        max_active_connections_per_peer = config.daemon.limits.api_connections_per_peer,
-        header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
-        tls_handshake_timeout_seconds = API_TLS_HANDSHAKE_TIMEOUT.as_secs(),
-        "api tls listener started"
-    );
-    let handle = Handle::new();
-    let shutdown_handle = handle.clone();
-    tokio::spawn(async move {
-        shutdown_signal(
-            import_export_jobs,
-            install_progress,
-            api_rate_limiter,
-            daemon_shutdown,
-            gateway_supervisor,
-        )
-        .await;
-        shutdown_handle.graceful_shutdown(Some(API_CONNECTION_DRAIN_TIMEOUT));
-    });
+impl NetworkApiListener {
+    async fn bind(config: &Config) -> anyhow::Result<Self> {
+        let bind = config.api.bind_addr();
+        let listener = TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("failed to bind API listener on {bind}"))?
+            .into_std()
+            .context("failed to convert API listener")?;
+        if !config.api.ssl.enabled {
+            tracing::info!(
+                bind = %bind,
+                configured_host = %config.api.host,
+                port = config.api.port,
+                max_active_connections = config.daemon.limits.api_connections,
+                max_active_connections_per_peer = config.daemon.limits.api_connections_per_peer,
+                header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
+                "api listener started"
+            );
+            return Ok(Self::Plain(listener));
+        }
 
-    let mut server = axum_server::from_tcp_rustls(listener, tls)
-        .context("failed to create API TLS server")?
-        .map(|acceptor| {
-            ApiConnectionAcceptor::new(
-                acceptor
-                    .handshake_timeout(API_TLS_HANDSHAKE_TIMEOUT)
-                    .acceptor(NoDelayAcceptor::new()),
-                &config.daemon.limits,
-            )
-        });
-    configure_api_http(&mut server);
-    server
-        .handle(handle)
-        .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("api tls server failed")
+        let tls = api_rustls_config(config)
+            .await
+            .context("failed to build API TLS configuration")?;
+        tracing::info!(
+            cert = %config.api.ssl.cert,
+            key = %config.api.ssl.key,
+            require_client_cert = config.api.ssl.require_client_cert,
+            "api tls configuration loaded"
+        );
+        tracing::info!(
+            bind = %bind,
+            configured_host = %config.api.host,
+            port = config.api.port,
+            max_active_connections = config.daemon.limits.api_connections,
+            max_active_connections_per_peer = config.daemon.limits.api_connections_per_peer,
+            header_read_timeout_seconds = API_HEADER_READ_TIMEOUT.as_secs(),
+            tls_handshake_timeout_seconds = API_TLS_HANDSHAKE_TIMEOUT.as_secs(),
+            "api tls listener started"
+        );
+        Ok(Self::Tls(listener, tls))
+    }
+
+    async fn serve(
+        self,
+        router: Router,
+        admission: &ApiConnectionAcceptor<()>,
+        handle: Handle<SocketAddr>,
+    ) -> anyhow::Result<()> {
+        let service = router.into_make_service_with_connect_info::<SocketAddr>();
+        match self {
+            Self::Plain(listener) => {
+                let mut server = axum_server::from_tcp(listener)
+                    .context("failed to create API server")?
+                    .acceptor(admission.sharing(NoDelayAcceptor::new()));
+                configure_api_http(&mut server);
+                server
+                    .handle(handle)
+                    .serve(service)
+                    .await
+                    .context("api server failed")
+            }
+            Self::Tls(listener, tls) => {
+                let mut server = axum_server::from_tcp_rustls(listener, tls)
+                    .context("failed to create API TLS server")?
+                    .map(|acceptor| {
+                        admission.sharing(
+                            acceptor
+                                .handshake_timeout(API_TLS_HANDSHAKE_TIMEOUT)
+                                .acceptor(NoDelayAcceptor::new()),
+                        )
+                    });
+                configure_api_http(&mut server);
+                server
+                    .handle(handle)
+                    .serve(service)
+                    .await
+                    .context("api tls server failed")
+            }
+        }
+    }
 }
 
 pub(super) fn configure_api_http<A, Acc>(server: &mut axum_server::Server<A, Acc>)

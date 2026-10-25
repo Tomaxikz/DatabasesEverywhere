@@ -563,6 +563,139 @@ fn rejects_invalid_remote() {
 }
 
 #[test]
+fn standalone_nodes_need_no_remote_and_add_no_panel_origin() {
+    for remote in ["", "  "] {
+        let mut config = valid_config();
+        config.remote = remote.to_string();
+        config.api.trusted_origins = vec!["https://admin.example.com".to_string()];
+
+        validate_config(&config).unwrap();
+        assert_eq!(
+            config.cors_allowed_origins(),
+            ["https://admin.example.com:443"]
+        );
+    }
+
+    let config: Config = yaml_serde::from_str("uuid: node\n").unwrap();
+    assert!(config.remote.is_empty());
+    assert!(config.cors_allowed_origins().is_empty());
+}
+
+#[test]
+fn network_api_defaults_on_with_a_root_socket() {
+    let config: Config = yaml_serde::from_str("api:\n  port: 8090\n").unwrap();
+    assert!(config.api.enabled);
+    assert_eq!(config.api.socket_path, "/run/dbev/api.sock");
+
+    let config: Config = yaml_serde::from_str(
+        "api:\n  enabled: false\n  socket_path: /run/databases-everywhere/api.sock\n",
+    )
+    .unwrap();
+    assert!(!config.api.enabled);
+    let yaml = yaml_serde::to_string(&config).unwrap();
+    let restored: Config = yaml_serde::from_str(&yaml).unwrap();
+    assert!(!restored.api.enabled);
+    assert_eq!(
+        restored.api.socket_path,
+        "/run/databases-everywhere/api.sock"
+    );
+}
+
+#[test]
+fn disabled_network_api_skips_tcp_only_settings() {
+    let mut config = valid_config();
+    config.api.host = "https://dbe.example.com".to_string();
+    config.api.ssl.enabled = true;
+    assert!(matches!(
+        validate_config(&config),
+        Err(ConfigValidationError::InvalidApiHost { .. })
+    ));
+
+    config.api.enabled = false;
+    validate_config(&config).unwrap();
+
+    config.api.trusted_origins = vec!["https://admin.example.com/path".to_string()];
+    assert!(matches!(
+        validate_config(&config),
+        Err(ConfigValidationError::InvalidApiOrigin { .. })
+    ));
+}
+
+#[test]
+fn api_socket_path_follows_runtime_path_rules() {
+    let mut config = valid_config();
+    for path in [
+        "/run/dbev/api.sock",
+        "/run/databases-everywhere/admin/api.sock",
+    ] {
+        config.api.socket_path = path.to_string();
+        validate_config(&config).unwrap();
+    }
+
+    for (path, expected) in [
+        ("", "relative"),
+        ("api.sock", "relative"),
+        ("/run/dbev/", "non_normalized"),
+        ("/run/dbev/./api.sock", "non_normalized"),
+        ("/run/dbev/api.sock/.", "non_normalized"),
+        ("/run/dbev/../api.sock", "non_normalized"),
+        ("/run/api.sock", "too_shallow"),
+        ("/var/run/api.sock", "protected"),
+        ("/var/lib/api.sock", "protected"),
+        ("/home/operator/api.sock", "protected"),
+    ] {
+        config.api.socket_path = path.to_string();
+        let error = validate_config(&config).unwrap_err();
+        let kind = match error {
+            ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::Relative {
+                field: "api.socket_path",
+                ..
+            }) => "relative",
+            ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::NonNormalized {
+                ..
+            }) => "non_normalized",
+            ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::TooShallow {
+                field: "api.socket_path directory",
+                ..
+            }) => "too_shallow",
+            ConfigValidationError::UnsafeRuntimePath(HostPathPolicyError::Protected {
+                field: "api.socket_path directory",
+                ..
+            }) => "protected",
+            other => panic!("{path}: unexpected {other}"),
+        };
+        assert_eq!(kind, expected, "{path}");
+    }
+
+    config.api.socket_path = format!("/run/dbev/{}.sock", "a".repeat(100));
+    assert!(matches!(
+        validate_config(&config),
+        Err(ConfigValidationError::ApiSocketPathTooLong { maximum: 107, .. })
+    ));
+}
+
+#[test]
+fn api_socket_directory_must_not_traverse_symlinks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let real = temporary.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, temporary.path().join("linked")).unwrap();
+    let mut config = valid_config();
+    config.api.socket_path = temporary
+        .path()
+        .join("linked/api.sock")
+        .display()
+        .to_string();
+
+    assert!(matches!(
+        validate_config(&config),
+        Err(ConfigValidationError::UnsafeRuntimePath(
+            HostPathPolicyError::Symlink { .. }
+        ))
+    ));
+}
+
+#[test]
 fn rejects_unsafe_import_upload_limits() {
     for maximum in [0, 10_001] {
         let mut config = valid_config();

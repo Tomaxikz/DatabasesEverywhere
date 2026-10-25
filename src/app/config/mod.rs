@@ -48,6 +48,8 @@ pub struct Config {
     pub token_id: String,
     pub token: String,
     pub jwt_signing_key: String,
+    /// The panel's URL; its origin may call the API from browsers. Empty on
+    /// standalone nodes, which have no panel.
     pub remote: String,
     pub tls: TlsConfig,
     pub postgres: ListenerConfig,
