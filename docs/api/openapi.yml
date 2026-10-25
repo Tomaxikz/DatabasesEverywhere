@@ -3126,7 +3126,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/RestoreBackupResponse"
         "409":
-          description: The backup protocol or physical/logical layout does not match the instance's current protocol and deployment mode, or another data operation blocks restore.
+          description: The backup protocol or physical/logical layout does not match the instance's current protocol and deployment mode, another data operation blocks restore, or the backup is loaded into the running engine (MySQL and Qdrant online backups taken without a volume snapshot) and the instance is stopped; start it first.
           content:
             application/json:
               schema:
