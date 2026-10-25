@@ -34,9 +34,9 @@ on:
         default: true
         type: boolean
       docker_latest:
-        description: "Also publish the mutable latest tag (not recommended for deployments)"
+        description: "Also publish the latest tag, which the Compose deployment pulls"
         required: true
-        default: false
+        default: true
         type: boolean
       docker_platforms:
         description: "Comma-separated Docker platforms to build"

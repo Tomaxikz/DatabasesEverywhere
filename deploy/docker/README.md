@@ -10,7 +10,7 @@ Compose runs from a deployment folder that holds everything for the node:
 ```text
 /opt/dbev/
 ├── compose.yml          copy of compose.yml
-├── .env                 copy of .env.example; sets DBEV_IMAGE
+├── .env                 optional, copy of .env.example
 └── config/
     └── config.yml       the panel-generated node config
 ```
@@ -26,8 +26,9 @@ sudo install -d -m 0700 /opt/dbev/config
 sudo install -m 0600 /path/to/panel-config.yml /opt/dbev/config/config.yml
 ```
 
-In `/opt/dbev/.env`, replace `<version>` in `DBEV_IMAGE` with a reviewed
-release, or use an immutable image digest. Then start it from that folder:
+Compose runs the newest release (`:latest`) and pulls it on every `up`. To stay
+on one version, set `DBEV_IMAGE` in `/opt/dbev/.env`. Then start it from that
+folder:
 
 ```bash
 cd /opt/dbev
@@ -38,7 +39,7 @@ sudo docker compose ps
 `docker compose logs -f dbev` follows the daemon. Relative paths in
 `compose.yml` resolve against its own folder, so
 `docker compose -f /opt/dbev/compose.yml ...` works from anywhere too.
-Compose refuses to start when `DBEV_IMAGE` is unset or `config/` is missing.
+Compose refuses to start when `config/` is missing.
 
 Before the first start, review [compose.yml](compose.yml):
 
@@ -62,8 +63,9 @@ To run straight from a repository checkout instead, put the config in
 
 ### Updates and config changes
 
-Change `DBEV_IMAGE` in `.env` and run `sudo docker compose up -d` to replace
-the daemon container. After editing `config/config.yml`, run
+Run `sudo docker compose up -d` to pull the newest release and replace the
+daemon container, or change `DBEV_IMAGE` in `.env` first to move to a pinned
+version. After editing `config/config.yml`, run
 `sudo docker compose restart dbev`. Managed database containers keep running
 through both; the daemon drains its connections first, so a restart takes a
 few seconds.
