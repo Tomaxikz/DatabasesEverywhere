@@ -103,6 +103,7 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     let mut app = App::new(client.base_url().to_string());
     app.public_host = settings.public_host;
+    app.gateway_ports = app::standalone_gateway_ports(&config);
     let (sender, mut outcomes) = mpsc::unbounded_channel();
     app.on_outcome(Outcome::System(system));
     let runner = Runner {

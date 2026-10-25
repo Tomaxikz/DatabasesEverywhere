@@ -180,6 +180,8 @@ pub(super) struct App {
     /// Instances seen creating (or asked for here). A failed creation is
     /// cleaned up and drops out of the list; its final status says why.
     pub creating: BTreeSet<String>,
+    /// On a standalone node, the port each gateway listens on now.
+    pub gateway_ports: Vec<(Protocol, u16)>,
     /// Labels of operations still running.
     pub running: Vec<String>,
     pub message: Option<Message>,
@@ -208,6 +210,7 @@ impl App {
             backup_selected: 0,
             progress: BTreeMap::new(),
             creating: BTreeSet::new(),
+            gateway_ports: Vec::new(),
             running: Vec::new(),
             message: None,
             refresh_error: None,
@@ -267,6 +270,16 @@ impl App {
             text: text.into(),
             at: Instant::now(),
         });
+    }
+
+    /// The port clients use for an instance. Instances keep the gateway
+    /// port they were created with; on a standalone node the gateway's
+    /// current port is the one that works after it moves.
+    pub(super) fn connect_port(&self, protocol: Protocol, stored: u16) -> u16 {
+        self.gateway_ports
+            .iter()
+            .find(|(candidate, _)| *candidate == protocol)
+            .map_or(stored, |(_, port)| *port)
     }
 
     /// Reports how a creation that left the list ended.
@@ -741,6 +754,23 @@ fn default_public_host(system: &SystemInfo) -> String {
 }
 
 /// A client connection string, with the password only when given.
+/// Gateway ports of a standalone node (network API off); empty otherwise,
+/// because a panel may give instances a different public port on purpose.
+pub(super) fn standalone_gateway_ports(config: &crate::config::Config) -> Vec<(Protocol, u16)> {
+    if config.api.enabled {
+        return Vec::new();
+    }
+    Protocol::ALL
+        .into_iter()
+        .filter(|protocol| config.protocol_enabled(*protocol))
+        .filter_map(|protocol| {
+            let bind = &protocol.engine().listener(config).bind;
+            let port = bind.rsplit_once(':')?.1.parse().ok()?;
+            Some((protocol, port))
+        })
+        .collect()
+}
+
 pub(super) fn connection_string(
     protocol: Protocol,
     host: &str,
@@ -910,6 +940,28 @@ mod tests {
                 .contains("creating gone failed")
         );
         assert!(app.creating.is_empty());
+    }
+
+    #[test]
+    fn standalone_nodes_show_the_gateway_port_the_instance_is_reachable_on() {
+        let mut config = crate::config::Config::default();
+        config.postgres.enabled = true;
+        config.postgres.bind = "127.0.0.1:55432".to_string();
+        config.redis.enabled = false;
+        // Panel-managed: the stored public port stays authoritative.
+        config.api.enabled = true;
+        let mut app = loaded();
+        app.gateway_ports = standalone_gateway_ports(&config);
+        assert_eq!(app.connect_port(Protocol::Postgres, 5434), 5434);
+
+        config.api.enabled = false;
+        app.gateway_ports = standalone_gateway_ports(&config);
+        assert_eq!(app.connect_port(Protocol::Postgres, 5434), 55432);
+        // Disabled gateways and unknown binds keep what was stored.
+        assert_eq!(app.connect_port(Protocol::Redis, 6380), 6380);
+        config.postgres.bind = "not-an-address".to_string();
+        app.gateway_ports = standalone_gateway_ports(&config);
+        assert_eq!(app.connect_port(Protocol::Postgres, 5434), 5434);
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
             backup_id,
             reason,
         }) => draw_confirm_restore(frame, instance_id, backup_id, &reason.value),
-        Some(Modal::Reveal(revealed)) => draw_reveal(frame, revealed),
+        Some(Modal::Reveal(revealed)) => draw_reveal(frame, app, revealed),
         Some(Modal::Help) => draw_help(frame),
         None => {}
     }
@@ -222,7 +222,11 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             Cell::from(instance.instance_id.clone()),
             Cell::from(instance.protocol.as_str()),
             Cell::from(instance.deployment_mode.clone()),
-            Cell::from(format!("{}:{}", instance.public.host, instance.public.port)),
+            Cell::from(format!(
+                "{}:{}",
+                instance.public.host,
+                app.connect_port(instance.protocol, instance.public.port)
+            )),
         ])
     });
     let title = format!("Instances ({}/{})", visible.len(), app.instances.len());
@@ -276,6 +280,7 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
             Span::raw(value),
         ])
     };
+    let port = app.connect_port(instance.protocol, instance.public.port);
     let mut lines = vec![
         Line::from(Span::styled(
             instance.instance_id.clone(),
@@ -290,10 +295,7 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
         field("Placement", instance.deployment_mode.clone()),
         field("Database", instance.database.name.clone()),
         field("Username", instance.database.username.clone()),
-        field(
-            "Endpoint",
-            format!("{}:{}", instance.public.host, instance.public.port),
-        ),
+        field("Endpoint", format!("{}:{port}", instance.public.host)),
         field(
             "Limits",
             format!(
@@ -309,6 +311,15 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
             ),
         ),
     ];
+    if port != instance.public.port {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{:12}created on :{}; the gateway now listens on :{port}",
+                "", instance.public.port
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     if let Some(project) = &instance.project_id {
         lines.push(field("Project", project.clone()));
     }
@@ -339,7 +350,7 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
         Line::from(connection_string(
             instance.protocol,
             &instance.public.host,
-            instance.public.port,
+            port,
             &instance.database.name,
             &instance.database.username,
             None,
@@ -643,7 +654,7 @@ fn draw_confirm_restore(frame: &mut Frame, id: &str, backup: &str, reason: &str)
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_reveal(frame: &mut Frame, revealed: &Revealed) {
+fn draw_reveal(frame: &mut Frame, app: &App, revealed: &Revealed) {
     let height = if revealed.admin.is_some() { 14 } else { 12 };
     let inner = popup(frame, "Credentials", 86, height);
     let remaining = REVEAL_TTL
@@ -670,7 +681,11 @@ fn draw_reveal(frame: &mut Frame, revealed: &Revealed) {
         Line::default(),
         field(
             "Host",
-            format!("{}:{}", revealed.host, revealed.port),
+            format!(
+                "{}:{}",
+                revealed.host,
+                app.connect_port(revealed.protocol, revealed.port)
+            ),
             false,
         ),
         field("Database", revealed.database.clone(), false),
@@ -689,7 +704,7 @@ fn draw_reveal(frame: &mut Frame, revealed: &Revealed) {
         Line::from(connection_string(
             revealed.protocol,
             &revealed.host,
-            revealed.port,
+            app.connect_port(revealed.protocol, revealed.port),
             &revealed.database,
             &revealed.username,
             Some(&revealed.password),
