@@ -8,67 +8,72 @@ use std::{
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use sha2::{Digest, Sha256};
 
+use payloads::{FUSEQUOTA_BIN, SOCKET_BRIDGE_BIN};
+
+// FuseQuota: the FUSE disk-quota helper, run by the daemon (root only).
 pub const FUSEQUOTA_VERSION: &str = env!("FUSEQUOTA_VERSION");
 const FUSEQUOTA_SHA256: &str = env!("FUSEQUOTA_SHA256");
+const FUSEQUOTA_MODE: u32 = 0o500;
+
+// Socket bridge: mounted into database containers, so any user may run it.
 pub const SOCKET_BRIDGE_VERSION: &str = env!("SOCKET_BRIDGE_VERSION");
 pub const SOCKET_BRIDGE_FILENAME: &str =
     concat!("dbev-socket-bridge-", env!("SOCKET_BRIDGE_VERSION"));
 const SOCKET_BRIDGE_SHA256: &str = env!("SOCKET_BRIDGE_SHA256");
-#[cfg(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    )
-))]
-static FUSEQUOTA_BIN: &[u8] = include_bytes!(env!("FUSEQUOTA_PAYLOAD_PATH"));
-#[cfg(not(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    )
-)))]
-static FUSEQUOTA_BIN: &[u8] = &[];
-#[cfg(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    )
-))]
-static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!(env!("SOCKET_BRIDGE_PAYLOAD_PATH"));
-#[cfg(not(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    )
-)))]
-static SOCKET_BRIDGE_BIN: &[u8] = &[];
-static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-const FUSEQUOTA_MODE: u32 = 0o500;
 const SOCKET_BRIDGE_MODE: u32 = 0o555;
+
 const PERMISSION_BITS: u32 = 0o777;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
+/// Serializes helper installation so concurrent callers never race on the
+/// same temporary or final file.
+static BIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The zstd-compressed helper binaries `build.rs` produces. They exist only
+/// for the Linux targets it builds them for; elsewhere they are empty and the
+/// helpers report themselves unavailable.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+mod payloads {
+    pub(super) static FUSEQUOTA_BIN: &[u8] = include_bytes!(env!("FUSEQUOTA_PAYLOAD_PATH"));
+    pub(super) static SOCKET_BRIDGE_BIN: &[u8] = include_bytes!(env!("SOCKET_BRIDGE_PAYLOAD_PATH"));
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+)))]
+mod payloads {
+    pub(super) static FUSEQUOTA_BIN: &[u8] = &[];
+    pub(super) static SOCKET_BRIDGE_BIN: &[u8] = &[];
+}
+
+/// Whether this build carries a usable FuseQuota helper.
 pub fn embedded_fusequota_available() -> bool {
     !FUSEQUOTA_BIN.is_empty()
         && !FUSEQUOTA_VERSION.trim().is_empty()
         && !FUSEQUOTA_SHA256.trim().is_empty()
 }
 
+/// Whether this build carries a usable socket bridge helper.
 pub fn has_socket_bridge() -> bool {
     !SOCKET_BRIDGE_BIN.is_empty()
         && !SOCKET_BRIDGE_VERSION.trim().is_empty()
         && !SOCKET_BRIDGE_SHA256.trim().is_empty()
 }
 
+/// Installs the FuseQuota helper under `runtime_root/bin` if needed and
+/// returns its verified path.
 pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
     if !embedded_fusequota_available() {
         return Err(Error::new(
@@ -87,6 +92,8 @@ pub async fn get_fusequota_bin_path(runtime_root: &Path) -> Result<PathBuf, Erro
     .await
 }
 
+/// Installs the socket bridge helper under `runtime_root/bin` if needed and
+/// returns its verified path.
 pub async fn get_socket_bridge_bin_path(runtime_root: &Path) -> Result<PathBuf, Error> {
     if !has_socket_bridge() {
         return Err(Error::new(
@@ -115,6 +122,7 @@ async fn install_embedded_helper_serialized(
 ) -> Result<PathBuf, Error> {
     let _lock = BIN_LOCK.lock().await;
     let runtime_root = runtime_root.to_path_buf();
+
     tokio::task::spawn_blocking(move || {
         install_embedded_helper(
             &runtime_root,
@@ -129,6 +137,8 @@ async fn install_embedded_helper_serialized(
     .map_err(Error::other)?
 }
 
+/// Reuses an existing helper when its hash matches; otherwise decompresses
+/// the payload, checks it, and installs it atomically.
 fn install_embedded_helper(
     runtime_root: &Path,
     helper_name: &str,
@@ -149,6 +159,7 @@ fn install_embedded_helper(
     verify_private_directory(&directory, &helper_dir)?;
 
     let file_name = format!("{helper_name}-{version}");
+
     if let Some(existing) = open_existing_helper(&directory, &file_name)? {
         verify_helper_file(
             existing,
@@ -165,6 +176,7 @@ fn install_embedded_helper(
         &format!("embedded {helper_name} payload"),
         expected_sha256,
     )?;
+
     install_helper_atomically(
         &directory,
         &helper_dir,
@@ -198,6 +210,7 @@ fn directory_metadata(directory: &impl std::os::fd::AsFd) -> Result<fs::Metadata
 fn verify_private_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> Result<(), Error> {
     let metadata = directory_metadata(directory)?;
     let expected_uid = rustix::process::geteuid().as_raw();
+
     if !metadata.is_dir() || metadata.uid() != expected_uid {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -209,6 +222,7 @@ fn verify_private_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> 
     }
 
     rustix::fs::fchmod(directory, Mode::RWXU).map_err(Error::other)?;
+
     let mode = directory_metadata(directory)?.permissions().mode() & PERMISSION_BITS;
     if mode != PRIVATE_DIRECTORY_MODE {
         return Err(Error::new(
@@ -219,9 +233,12 @@ fn verify_private_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> 
             ),
         ));
     }
+
     Ok(())
 }
 
+/// Opens `file_name` in the helper directory without following links;
+/// `None` when it does not exist yet.
 fn open_existing_helper(
     directory: &impl std::os::fd::AsFd,
     file_name: &str,
@@ -247,6 +264,7 @@ fn verify_helper_file(
     let metadata = file.metadata()?;
     let expected_uid = rustix::process::geteuid().as_raw();
     let mode = metadata.permissions().mode() & PERMISSION_BITS;
+
     if !metadata.is_file() || metadata.uid() != expected_uid || mode != executable_mode {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -266,6 +284,8 @@ fn verify_helper_file(
     )
 }
 
+/// Writes the helper to a temporary file, syncs it, sets its mode, and
+/// renames it into place without replacing a file another caller installed.
 fn install_helper_atomically(
     directory: &impl std::os::fd::AsFd,
     helper_dir: &Path,
@@ -283,6 +303,9 @@ fn install_helper_atomically(
     )
     .map_err(Error::other)?;
     let mut temporary = File::from(temporary_fd);
+    let remove_temporary = || {
+        let _ = rustix::fs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
+    };
 
     let write_result: Result<(), Error> = (|| {
         temporary.write_all(executable)?;
@@ -291,9 +314,6 @@ fn install_helper_atomically(
             .map_err(Error::other)?;
         Ok(())
     })();
-    let remove_temporary = || {
-        let _ = rustix::fs::unlinkat(directory, temporary_name.as_str(), AtFlags::empty());
-    };
     if let Err(error) = write_result {
         remove_temporary();
         return Err(error);
@@ -308,6 +328,7 @@ fn install_helper_atomically(
         RenameFlags::NOREPLACE,
     ) {
         Ok(()) => rustix::fs::fsync(directory).map_err(Error::other)?,
+        // Another caller installed it first; verify theirs below.
         Err(rustix::io::Errno::EXIST) => remove_temporary(),
         Err(error) => {
             remove_temporary();
@@ -334,6 +355,7 @@ fn install_helper_atomically(
 
 fn verify_digest(bytes: &[u8], label: &str, expected_sha256: &str) -> Result<(), Error> {
     let actual = hex::encode(Sha256::digest(bytes));
+
     if actual == expected_sha256 {
         return Ok(());
     }
