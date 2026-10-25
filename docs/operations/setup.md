@@ -165,7 +165,9 @@ sudo dbev --cli
 An interactive terminal console for operators on the node. It lists every
 instance with live status and creation progress, creates instances, starts,
 stops, restarts and deletes them, shows container logs, and takes, lists and
-restores backups. Press `?` for keys.
+restores backups. Press `?` for keys. It needs the daemon running; otherwise it
+exits before opening and asks whether the daemon is up
+(`sudo systemctl start databases-everywhere`).
 
 The console calls the running daemon's local API with the config `token`, so
 every change goes through the same validation, locks and audit logs as the
