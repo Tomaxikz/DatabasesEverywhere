@@ -5,7 +5,7 @@
 //! here blocks, so the screen stays responsive during long operations.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -143,6 +143,8 @@ pub(super) enum Outcome {
     System(SystemInfo),
     Instances(Vec<Instance>),
     Progress(String, StatusResponse),
+    /// The status of an instance being watched no longer exists.
+    ProgressGone(String),
     Logs(String, String),
     Backups(String, Vec<Backup>),
     Revealed(Box<Revealed>),
@@ -175,6 +177,9 @@ pub(super) struct App {
     pub backups: Option<(String, Vec<Backup>)>,
     pub backup_selected: usize,
     pub progress: BTreeMap<String, StatusResponse>,
+    /// Instances seen creating (or asked for here). A failed creation is
+    /// cleaned up and drops out of the list; its final status says why.
+    pub creating: BTreeSet<String>,
     /// Labels of operations still running.
     pub running: Vec<String>,
     pub message: Option<Message>,
@@ -202,6 +207,7 @@ impl App {
             backups: None,
             backup_selected: 0,
             progress: BTreeMap::new(),
+            creating: BTreeSet::new(),
             running: Vec::new(),
             message: None,
             refresh_error: None,
@@ -263,6 +269,36 @@ impl App {
         });
     }
 
+    /// Reports how a creation that left the list ended.
+    fn finish_creation(&mut self, id: &str, status: &StatusResponse) {
+        let progress = status.progress.as_ref();
+        let state = progress.map_or(status.status.as_str(), |progress| progress.status.as_str());
+        match state {
+            "failed" => {
+                self.creating.remove(id);
+                let reason = progress
+                    .and_then(|progress| progress.diagnostic.as_ref())
+                    .map(|diagnostic| match &diagnostic.error_id {
+                        Some(error_id) => format!("{} (error id {error_id})", diagnostic.message),
+                        None => diagnostic.message.clone(),
+                    })
+                    .or_else(|| progress.map(|progress| progress.message.clone()))
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "no reason was reported".to_string());
+                self.say(
+                    Level::Error,
+                    format!(
+                        "creating {id} failed: {reason}; see journalctl -u databases-everywhere"
+                    ),
+                );
+            }
+            "completed" | "running" if status.status != "creating" => {
+                self.creating.remove(id);
+            }
+            _ => {}
+        }
+    }
+
     /// Jobs for a periodic refresh: the list, plus progress of creations.
     pub(super) fn refresh_jobs(&mut self) -> Vec<Job> {
         if self.refreshing {
@@ -275,6 +311,18 @@ impl App {
                 .iter()
                 .filter(|instance| matches!(instance.status.as_str(), "creating" | "booting"))
                 .map(|instance| Job::Progress(instance.instance_id.clone())),
+        );
+        // Creations that left the list: fetch their final status.
+        jobs.extend(
+            self.creating
+                .iter()
+                .filter(|id| {
+                    !self
+                        .instances
+                        .iter()
+                        .any(|instance| &instance.instance_id == *id)
+                })
+                .map(|id| Job::Progress(id.clone())),
         );
         jobs
     }
@@ -292,6 +340,13 @@ impl App {
             Outcome::Instances(mut instances) => {
                 instances.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
                 let keep = self.current_id();
+                for instance in &instances {
+                    if matches!(instance.status.as_str(), "creating" | "booting") {
+                        self.creating.insert(instance.instance_id.clone());
+                    } else {
+                        self.creating.remove(&instance.instance_id);
+                    }
+                }
                 self.instances = instances;
                 self.loaded = true;
                 self.refreshing = false;
@@ -312,7 +367,25 @@ impl App {
                 self.clamp_selection();
             }
             Outcome::Progress(id, status) => {
-                self.progress.insert(id, status);
+                let listed = self
+                    .instances
+                    .iter()
+                    .any(|instance| instance.instance_id == id);
+                if !listed && self.creating.contains(&id) {
+                    self.finish_creation(&id, &status);
+                } else {
+                    self.progress.insert(id, status);
+                }
+            }
+            Outcome::ProgressGone(id) => {
+                if self.creating.remove(&id) {
+                    self.say(
+                        Level::Error,
+                        format!(
+                            "creating {id} failed and it was removed; see journalctl -u databases-everywhere"
+                        ),
+                    );
+                }
             }
             Outcome::Logs(id, text) => {
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -542,7 +615,10 @@ impl App {
             Modal::Create(mut form) => {
                 if form.on_key(key) {
                     match form.request() {
-                        Ok(request) => (None, vec![Job::Create(Box::new(request))]),
+                        Ok(request) => {
+                            self.creating.insert(request.instance_id.clone());
+                            (None, vec![Job::Create(Box::new(request))])
+                        }
                         Err(error) => {
                             form.error = Some(error);
                             (Some(Modal::Create(form)), Vec::new())
@@ -787,6 +863,53 @@ mod tests {
         assert!(app.refresh_jobs().is_empty());
         app.on_outcome(Outcome::RefreshFailed("down".to_string()));
         assert!(!app.refresh_jobs().is_empty());
+    }
+
+    #[test]
+    fn a_creation_that_leaves_the_list_reports_why_it_failed() {
+        let mut app = loaded();
+        app.on_outcome(Outcome::Instances(vec![instance(
+            "a_pg",
+            Protocol::Postgres,
+            "running",
+        )]));
+        app.refreshing = false;
+        assert!(
+            app.refresh_jobs()
+                .contains(&Job::Progress("c_new".to_string()))
+        );
+        let failed: StatusResponse = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "progress": {
+                "stage": "starting",
+                "message": "container was not ready",
+                "status": "failed",
+                "diagnostic": { "code": "internal", "message": "instance creation failed", "error_id": "e1" }
+            }
+        }))
+        .unwrap();
+        app.on_outcome(Outcome::Progress("c_new".to_string(), failed));
+        let message = app.message.as_ref().unwrap();
+        assert_eq!(message.level, Level::Error);
+        assert!(
+            message
+                .text
+                .contains("creating c_new failed: instance creation failed (error id e1)")
+        );
+        assert!(app.creating.is_empty());
+        app.refreshing = false;
+        assert_eq!(app.refresh_jobs(), [Job::Refresh]);
+
+        app.creating.insert("gone".to_string());
+        app.on_outcome(Outcome::ProgressGone("gone".to_string()));
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("creating gone failed")
+        );
+        assert!(app.creating.is_empty());
     }
 
     #[test]

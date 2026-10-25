@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use super::{DiskLimitError, helpers::remove_empty_data_directory, privileged_command};
+use super::{
+    DiskLimitError,
+    helpers::{ReplacedDirectory, remove_empty_data_directory, restore_replaced_directory},
+    privileged_command,
+};
 
 pub(super) async fn verify_startup() -> Result<(), DiskLimitError> {
     list_datasets().await.map(|_| ())
@@ -34,7 +38,7 @@ async fn ensure_dataset(instance_id: &str, data_path: &Path) -> Result<ZfsDatase
         return Ok(dataset);
     }
 
-    ensure_empty_mountpoint(data_path).await?;
+    let replaced = ensure_empty_mountpoint(data_path).await?;
     let parent = parent_dataset_for_path(data_path, &datasets)
         .ok_or_else(|| DiskLimitError::MountpointNotFound(data_path.to_path_buf()))?;
     let dataset = ZfsDataset {
@@ -56,10 +60,14 @@ async fn ensure_dataset(instance_id: &str, data_path: &Path) -> Result<ZfsDatase
         ),
     )
     .await?;
+    let mountpoint = data_path.to_path_buf();
+    tokio::task::spawn_blocking(move || restore_replaced_directory(&mountpoint, replaced))
+        .await
+        .map_err(|error| DiskLimitError::Task(error.to_string()))??;
     Ok(dataset)
 }
 
-async fn ensure_empty_mountpoint(path: &Path) -> Result<(), DiskLimitError> {
+async fn ensure_empty_mountpoint(path: &Path) -> Result<Option<ReplacedDirectory>, DiskLimitError> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || remove_empty_data_directory(&path))
         .await

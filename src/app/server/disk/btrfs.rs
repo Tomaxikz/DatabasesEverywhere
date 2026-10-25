@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{
-    DiskLimitError, displayed_privileged_command, helpers::remove_empty_data_directory,
+    DiskLimitError, displayed_privileged_command,
+    helpers::{remove_empty_data_directory, restore_replaced_directory},
     privileged_command,
 };
 
@@ -70,14 +71,15 @@ async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
     }
 
     let path = path.to_path_buf();
-    let path = tokio::task::spawn_blocking(move || -> Result<PathBuf, DiskLimitError> {
-        remove_empty_data_directory(&path)?;
-        Ok(path)
-    })
-    .await
-    .map_err(|error| DiskLimitError::Task(error.to_string()))??;
+    let removed = path.clone();
+    let replaced = tokio::task::spawn_blocking(move || remove_empty_data_directory(&removed))
+        .await
+        .map_err(|error| DiskLimitError::Task(error.to_string()))??;
 
-    run(&path, &["subvolume", "create"], "btrfs subvolume create").await
+    run(&path, &["subvolume", "create"], "btrfs subvolume create").await?;
+    tokio::task::spawn_blocking(move || restore_replaced_directory(&path, replaced))
+        .await
+        .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
 pub(super) async fn is_subvolume(path: &Path) -> Result<bool, DiskLimitError> {

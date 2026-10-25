@@ -267,6 +267,28 @@ fn segment(value: &str) -> String {
     crate::utils::percent::encode_unreserved(value.as_bytes())
 }
 
+/// A non-success API answer, kept typed so callers can tell a 404 apart.
+#[derive(Debug)]
+struct ApiStatusError {
+    status: StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for ApiStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} {}", self.status.as_u16(), self.message)
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
+/// True when the API answered 404.
+pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ApiStatusError>()
+        .is_some_and(|error| error.status == StatusCode::NOT_FOUND)
+}
+
 fn api_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
     #[derive(Deserialize)]
     struct ErrorBody {
@@ -274,18 +296,15 @@ fn api_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
         #[serde(default)]
         error_id: Option<String>,
     }
-    match serde_json::from_slice::<ErrorBody>(body) {
+    let message = match serde_json::from_slice::<ErrorBody>(body) {
         Ok(ErrorBody {
             error,
             error_id: Some(id),
-        }) => anyhow!("{} {error} (error id {id})", status.as_u16()),
-        Ok(ErrorBody { error, .. }) => anyhow!("{} {error}", status.as_u16()),
-        Err(_) => anyhow!(
-            "{} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("")
-        ),
-    }
+        }) => format!("{error} (error id {id})"),
+        Ok(ErrorBody { error, .. }) => error,
+        Err(_) => status.canonical_reason().unwrap_or("").to_string(),
+    };
+    anyhow::Error::new(ApiStatusError { status, message })
 }
 
 /// Connection failures carry the URL; the console already shows it.
@@ -451,6 +470,8 @@ pub(super) struct Limits {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct StatusResponse {
     #[serde(default)]
+    pub status: String,
+    #[serde(default)]
     pub progress: Option<Progress>,
 }
 
@@ -462,6 +483,19 @@ pub(super) struct Progress {
     pub message: String,
     #[serde(default)]
     pub percent: Option<f64>,
+    /// `running`, `completed` or `failed`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub diagnostic: Option<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct Diagnostic {
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub error_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -543,6 +577,21 @@ impl BackupMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_404_answers_count_as_not_found() {
+        assert!(is_not_found(&api_error(
+            StatusCode::NOT_FOUND,
+            b"{\"error\":\"missing\"}"
+        )));
+        let conflict = api_error(
+            StatusCode::CONFLICT,
+            b"{\"error\":\"busy\",\"error_id\":\"x\"}",
+        );
+        assert!(!is_not_found(&conflict));
+        assert_eq!(conflict.to_string(), "409 busy (error id x)");
+        assert!(!is_not_found(&anyhow!("cannot reach the daemon API")));
+    }
 
     #[test]
     fn wildcard_and_ipv6_listeners_map_to_reachable_urls() {

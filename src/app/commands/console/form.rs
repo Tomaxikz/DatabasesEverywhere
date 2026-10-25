@@ -54,7 +54,8 @@ impl Field {
         match self {
             Self::Protocol | Self::Mode => "←/→ to change",
             Self::PublicPort => "blank picks the engine's gateway port",
-            Self::Password => "generated; Ctrl+G for a new one",
+            Self::InstanceId | Self::Database | Self::Username => "Ctrl+R for a random one",
+            Self::Password => "generated; Ctrl+R for a new one",
             Self::ServerId => "game server that owns the shared pool",
             Self::CpuCores | Self::MemoryMib => "dedicated only",
             _ => "",
@@ -217,6 +218,9 @@ impl CreateForm {
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.set(Field::Password, generate_password());
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.randomize(field);
+            }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Enter => {
                 if self.focus + 1 == visible {
@@ -242,6 +246,25 @@ impl CreateForm {
         }
         self.focus = self.focus.min(self.visible().len() - 1);
         false
+    }
+
+    /// Fills the focused field with a random value; on a field that has
+    /// none, renews the database, username and password together.
+    fn randomize(&mut self, field: Field) {
+        match field {
+            Field::InstanceId => {
+                self.id_edited = false;
+                self.set(Field::InstanceId, suggested_instance_id(self.protocol()));
+            }
+            Field::Database => self.set(Field::Database, random_identifier("db")),
+            Field::Username => self.set(Field::Username, random_identifier("u")),
+            Field::Password => self.set(Field::Password, generate_password()),
+            _ => {
+                self.set(Field::Database, random_identifier("db"));
+                self.set(Field::Username, random_identifier("u"));
+                self.set(Field::Password, generate_password());
+            }
+        }
     }
 
     /// Builds the API request, or explains the first invalid field.
@@ -342,6 +365,12 @@ fn valid_identifier(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
+/// `<prefix>_` plus 10 random hex digits: a valid database or user name.
+fn random_identifier(prefix: &str) -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}_{}", &suffix[..10])
+}
+
 fn suggested_instance_id(protocol: Protocol) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     format!("cli_{}_{}", protocol.as_str(), &suffix[..8])
@@ -381,6 +410,30 @@ mod tests {
         while form.focused() != field {
             press(form, KeyCode::Tab);
         }
+    }
+
+    #[test]
+    fn ctrl_r_randomizes_the_focused_field_or_all_credentials() {
+        let mut form = CreateForm::new(vec![Protocol::Postgres], "127.0.0.1");
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        focus(&mut form, Field::Username);
+        let password = form.value(Field::Password);
+        form.on_key(ctrl_r);
+        let username = form.value(Field::Username);
+        assert!(
+            username.starts_with("u_") && valid_identifier(&username),
+            "{username}"
+        );
+        assert_eq!(form.value(Field::Database), "app");
+        assert_eq!(form.value(Field::Password), password);
+
+        focus(&mut form, Field::CpuCores);
+        form.on_key(ctrl_r);
+        assert!(form.value(Field::Database).starts_with("db_"));
+        assert_ne!(form.value(Field::Username), username);
+        assert_ne!(form.value(Field::Password), password);
+        assert_eq!(form.value(Field::CpuCores), "1");
+        assert!(form.request().is_ok());
     }
 
     #[test]

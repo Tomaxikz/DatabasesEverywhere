@@ -186,6 +186,7 @@ async fn execute(
         },
         Job::Progress(id) => match client.progress(&id).await {
             Ok(status) => Outcome::Progress(id, status),
+            Err(error) if api::is_not_found(&error) => Outcome::ProgressGone(id),
             Err(error) => Outcome::RefreshFailed(format!("{error:#}")),
         },
         Job::Create(request) => done(client.create(&request).await, true),

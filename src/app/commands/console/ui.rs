@@ -546,6 +546,7 @@ fn draw_create(frame: &mut Frame, form: &CreateForm) {
         ("Tab", "next"),
         ("Enter", "next/create"),
         ("Ctrl+S", "create"),
+        ("Ctrl+R", "random"),
         ("Esc", "cancel"),
     ]));
     frame.render_widget(Paragraph::new(lines), inner);
