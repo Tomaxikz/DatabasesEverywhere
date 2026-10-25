@@ -385,6 +385,47 @@ impl RestoreContext<'_> {
     }
 }
 
+/// Moves an extracted capture from `extracted_root/target` up to the data
+/// volume root it replaces, after `check` accepted the tree. The extracted
+/// root must hold only `target`, and the capture must not contain it.
+pub(crate) fn lift_restore_tree(
+    extracted_root: &Path,
+    target: &str,
+    check: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let names = entry_names(extracted_root)?;
+    if names != [target] {
+        return Err(format!(
+            "the extracted backup must hold only {target}, found {names:?}"
+        ));
+    }
+    let tree = extracted_root.join(target);
+    check(&tree)?;
+    let entries = entry_names(&tree)?;
+    if entries.iter().any(|name| name == target) {
+        return Err(format!("the backup itself contains {target}"));
+    }
+    for name in entries {
+        let entry = tree.join(&name);
+        std::fs::rename(&entry, extracted_root.join(&name))
+            .map_err(|error| format!("install {}: {error}", entry.display()))?;
+    }
+    std::fs::remove_dir(&tree).map_err(|error| format!("remove {}: {error}", tree.display()))
+}
+
+fn entry_names(directory: &Path) -> Result<Vec<String>, String> {
+    let mut names = std::fs::read_dir(directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|error| format!("{}: {error}", directory.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
+}
+
 /// Reads a helper's report from staging and removes it, so staging holds only
 /// the capture afterwards. Helper stdout is redacted and truncated; reports
 /// must be neither.
@@ -470,6 +511,55 @@ pub(crate) trait OnlineBackupStrategy: Send + Sync {
                 "this strategy has no restore recipe in this build".to_string(),
             ))
         })
+    }
+
+    /// How this strategy's captures are restored.
+    fn restore_kind(&self) -> RestoreKind {
+        RestoreKind::DataDirectory
+    }
+
+    /// Loads an extracted capture into the running instance, for
+    /// [`RestoreKind::AfterStart`] strategies. Default: not restorable.
+    fn restore_after_start<'a>(
+        &'a self,
+        _ctx: &'a AfterStartRestoreContext<'a>,
+    ) -> BoxFuture<'a, Result<(), StrategyError>> {
+        Box::pin(async {
+            Err(StrategyError::Unsupported(
+                "this strategy has no after-start restore in this build".to_string(),
+            ))
+        })
+    }
+}
+
+/// Whether a capture replaces the data directory of a stopped instance, or
+/// is loaded into the running instance through the engine (logical dumps,
+/// engine snapshot APIs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestoreKind {
+    DataDirectory,
+    AfterStart,
+}
+
+/// Context for loading an extracted capture into the running instance.
+pub(crate) struct AfterStartRestoreContext<'a> {
+    pub state: &'a AppState,
+    pub metadata: &'a InstanceMetadata,
+    pub recipe: &'a RestoreRecipeRef,
+    /// The extracted capture: the manifest's `restore_target` directory.
+    pub payload: &'a Path,
+}
+
+impl AfterStartRestoreContext<'_> {
+    /// Refuses any recipe but `id@version`.
+    pub(crate) fn require_recipe(&self, id: &str, version: u32) -> Result<(), StrategyError> {
+        if self.recipe.id != id || self.recipe.version != version {
+            return Err(StrategyError::Unsupported(format!(
+                "recipe {}@{} is not {id}@{version}",
+                self.recipe.id, self.recipe.version
+            )));
+        }
+        Ok(())
     }
 }
 

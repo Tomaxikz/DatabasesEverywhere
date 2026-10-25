@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use serde_json::{Value, json};
 
@@ -9,7 +9,8 @@ use crate::{
     subsystems::import_export::{ImportExportSelection, SelectionMode},
 };
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct QdrantAlias {
     pub(super) alias_name: String,
     pub(super) collection_name: String,

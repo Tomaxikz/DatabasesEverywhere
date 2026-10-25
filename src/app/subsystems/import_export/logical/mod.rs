@@ -25,5 +25,5 @@ pub(super) use dump::{LogicalExportControls, export_logical_dump};
 mod backup;
 pub(crate) use backup::{
     create_shared_backup, export_for_deployment_migration, import_for_deployment_migration,
-    restore_shared_backup, shared_restore_staging_bytes,
+    restore_dedicated_backup, restore_shared_backup, shared_restore_staging_bytes,
 };

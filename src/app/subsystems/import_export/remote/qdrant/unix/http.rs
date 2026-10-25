@@ -69,12 +69,25 @@ impl QdrantHttp {
         api_key: &secrecy::SecretString,
         timeout: Duration,
     ) -> Result<Self, ApiError> {
+        Self::target_socket(
+            &paths.sockets.join(HOST_BRIDGE_SOCKET_NAME),
+            api_key,
+            timeout,
+        )
+    }
+
+    /// The managed instance over one of its host-side HTTP sockets.
+    pub(super) fn target_socket(
+        socket: &Path,
+        api_key: &secrecy::SecretString,
+        timeout: Duration,
+    ) -> Result<Self, ApiError> {
         let client = Client::builder()
             .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
             .no_proxy()
             .redirect(Policy::none())
             .timeout(timeout)
-            .unix_socket(paths.sockets.join(HOST_BRIDGE_SOCKET_NAME))
+            .unix_socket(socket)
             .build()
             .map_err(|_| ApiError::Runtime("failed to build managed qdrant client".to_string()))?;
         let mut header = HeaderValue::from_str(api_key.expose_secret()).map_err(|_| {
@@ -197,15 +210,35 @@ impl QdrantHttp {
     }
 
     pub(super) async fn create_snapshot(&self, collection: &str) -> Result<String, ApiError> {
+        self.create_snapshot_with_checksum(collection)
+            .await
+            .map(|(name, _)| name)
+    }
+
+    /// Also returns the lowercase SHA-256 Qdrant reports for the snapshot,
+    /// when its version reports one.
+    pub(super) async fn create_snapshot_with_checksum(
+        &self,
+        collection: &str,
+    ) -> Result<(String, Option<String>), ApiError> {
         let path = format!(
             "/collections/{}/snapshots?wait=true",
             encode_path_segment(collection)
         );
         let json = self.json(Method::POST, &path, None).await?;
-        json.pointer("/result/name")
+        let name = json
+            .pointer("/result/name")
             .and_then(Value::as_str)
             .map(ToString::to_string)
-            .ok_or_else(|| self.bad_response("qdrant did not return a snapshot name"))
+            .ok_or_else(|| self.bad_response("qdrant did not return a snapshot name"))?;
+        let checksum = json
+            .pointer("/result/checksum")
+            .and_then(Value::as_str)
+            .filter(|checksum| {
+                checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(str::to_ascii_lowercase);
+        Ok((name, checksum))
     }
 
     pub(super) async fn delete_snapshot(

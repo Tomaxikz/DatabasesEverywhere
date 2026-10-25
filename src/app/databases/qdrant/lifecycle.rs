@@ -1,11 +1,17 @@
 use crate::{
-    databases::engine::{DedicatedSpecInput, EngineLifecycle, RouteIdentity},
+    databases::engine::{DedicatedSpecInput, EngineLifecycle, OnlineBackup, RouteIdentity},
     runtime::docker::DockerInstanceSpec,
 };
 
 use super::{docker::instance_spec, engine::Qdrant};
 
 impl EngineLifecycle for Qdrant {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::VolumeSnapshot {
+            otherwise: Some(crate::databases::engine::NativeOnline::QdrantSnapshots),
+        }
+    }
+
     fn route_key_fingerprint(&self, daemon_secret: &[u8], password: &str) -> Option<String> {
         Some(crate::gateway::protocols::qdrant::route_key_fingerprint(
             daemon_secret,

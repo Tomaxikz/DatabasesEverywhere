@@ -112,6 +112,21 @@ pub(crate) enum OnlineBackup {
     RespRdbSnapshot,
     /// `mariadb-backup --backup` hot copy prepared with `--prepare`.
     MariadbBackup,
+    /// Atomic read-only snapshot of the instance's Btrfs subvolume or ZFS
+    /// dataset, recovered by the engine's own journal on restore. Volumes
+    /// without snapshots use `otherwise` when the engine has one.
+    VolumeSnapshot { otherwise: Option<NativeOnline> },
+}
+
+/// Engine-native online capture for volumes without atomic snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeOnline {
+    /// `mysqldump --single-transaction`, restored through the importer.
+    MysqlDump,
+    /// One Qdrant snapshot per collection, uploaded back on restore.
+    QdrantSnapshots,
+    /// Per-table `ALTER TABLE ... FREEZE`, restored as a data directory.
+    ClickhouseFreeze,
 }
 
 pub(crate) const NO_ONLINE_BACKUP_STRATEGY: &str =

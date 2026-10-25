@@ -34,8 +34,33 @@ engine-native strategy and returns 409, never falling back, when none applies:
 | PostgreSQL 14–18 | `pg_basebackup` with streamed WAL, checked by `pg_verifybackup` | Replays the included WAL |
 | Redis / Valkey 7+ | Diskless rdb-only replication snapshot, checked by `check-rdb`; needs `repl-diskless-sync yes`, `rdbchecksum yes` and fork headroom (resident set at most half the memory limit) | Installed as the multi-part AOF base; ACLs come from the current credential |
 | MariaDB 10.6+ | `mariadb-backup` hot copy, prepared with `--prepare`; InnoDB-only user tables, files inside the data directory | Starts on the prepared tree |
+| MySQL, MongoDB, ClickHouse, Qdrant on Btrfs/ZFS | Atomic read-only snapshot of the instance's Btrfs subvolume or ZFS dataset, copied to staging and removed; MySQL also needs InnoDB-only user tables | The engine recovers its journal on start, as after a power loss; a restore that does not start rolls back |
+| MySQL elsewhere | `mysqldump --single-transaction` from a helper over the socket, one transaction snapshot; InnoDB-only user tables | Loaded into the running instance through the wipe-and-import path, which takes a rollback dump first |
+| ClickHouse elsewhere | `ALTER TABLE ... FREEZE` per MergeTree table over the HTTP socket; the daemon copies the volume with the frozen parts in place of the live ones and removes the shadow. Each table is consistent at its own freeze | Installed as the data directory; ClickHouse checks every part on start and a restore that does not start rolls back |
+| Qdrant elsewhere | One snapshot per collection through the snapshot API over the HTTP socket, downloaded, checked against its SHA-256 and deleted from the instance. Each collection is consistent at its own snapshot | Wipes the running instance and uploads the snapshots and aliases, after saving rollback snapshots; a failed rollback quarantines the instance |
 
-MySQL, MongoDB, ClickHouse, and Qdrant have no online strategy yet. Queued container events log `event_action` separately from the
+On Btrfs or ZFS project quotas, where every instance volume is its own
+subvolume or dataset, the snapshot strategy wins for those four engines. On
+XFS/ext4 project quotas, FuseQuota, or soft limits, MySQL, ClickHouse and Qdrant
+use their native strategy and MongoDB answers 409: copying live files one by
+one is not a consistent point, and MongoDB's own hot backup needs a replica
+set.
+
+The native strategies refuse what they cannot capture consistently rather
+than copy it live. MySQL refuses non-InnoDB user tables. ClickHouse covers
+Atomic databases and refuses tables with files of their own outside the
+MergeTree family (Log family, Set, Join, Buffer, ...), replicated tables and
+tables on other disks. It leaves out detached parts, Memory-table rows and
+system log rows. Frozen parts that merges retire during the copy stay on the
+instance volume until the shadow is removed. Qdrant needs a standalone
+instance and free quota for its largest collection's snapshot, which it
+writes to its own volume before the download. A daemon crash mid-collection
+can leave that one snapshot behind, visible through Qdrant's snapshot API.
+
+Online and offline ClickHouse backups leave out Atomic-database introspection
+links into `store/` (`metadata/<db>`, `data/<db>/<table>`). ClickHouse reads
+tables through `store/` and recreates the database links at startup; any other
+link still fails the backup. Queued container events log `event_action` separately from the
 current `observed_status`, which may already reflect a later restart.
 
 For a shared-runtime placement conflict, inspect the named `mismatched_fields`

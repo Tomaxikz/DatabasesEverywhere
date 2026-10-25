@@ -40,7 +40,7 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh .github/ci/shared-pool-isolation.sh .github/ci/project-quota-smoke.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
+        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh .github/ci/shared-pool-isolation.sh .github/ci/project-quota-smoke.sh .github/ci/online-backup-e2e.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0

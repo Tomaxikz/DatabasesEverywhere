@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use futures::future::{BoxFuture, FutureExt};
 
 use crate::{
-    databases::engine::{DedicatedSpecInput, EngineLifecycle, SharedSpecInput},
+    databases::engine::{DedicatedSpecInput, EngineLifecycle, OnlineBackup, SharedSpecInput},
     runtime::docker::DockerInstanceSpec,
     server::metadata::InstanceMetadata,
     utils::shell::sh_quote,
@@ -15,6 +15,12 @@ use super::{
 };
 
 impl EngineLifecycle for Clickhouse {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::VolumeSnapshot {
+            otherwise: Some(crate::databases::engine::NativeOnline::ClickhouseFreeze),
+        }
+    }
+
     fn runtime_admin_secret<'a>(&self, metadata: &'a InstanceMetadata) -> Option<&'a str> {
         metadata.tenant_password.as_deref()
     }

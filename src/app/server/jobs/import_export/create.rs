@@ -13,13 +13,96 @@ use super::{
     error::ImportExportError,
     extract::{DeadlineBoundedReader, validate_archive_limits, validate_archive_path_depth},
 };
-use crate::io::files::ensure_private_dir;
+use crate::{databases::protocol::Protocol, io::files::ensure_private_dir};
 use flate2::{Compression, write::GzEncoder};
 
+/// Which links inside a data directory an archive may leave out. Every other
+/// link, and every special file, is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataArchiveSourcePolicy {
     Strict,
+    /// MySQL's image links `mysql.sock` in the data directory to its socket.
     MysqlDataDirectory,
+    /// ClickHouse Atomic databases keep introspection links `metadata/<db>`
+    /// and `data/<db>/<table>` into `store/`. ClickHouse reads tables through
+    /// `store/` and recreates the database links when it loads them.
+    ClickhouseDataDirectory,
+}
+
+impl DataArchiveSourcePolicy {
+    pub fn for_protocol(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Mysql => Self::MysqlDataDirectory,
+            Protocol::Clickhouse => Self::ClickhouseDataDirectory,
+            _ => Self::Strict,
+        }
+    }
+
+    /// What a manifest records as excluded when this policy omitted links.
+    pub(crate) fn omitted_links_note(self) -> Option<&'static str> {
+        match self {
+            Self::Strict => None,
+            Self::MysqlDataDirectory => Some("mysql.sock link to the runtime socket"),
+            Self::ClickhouseDataDirectory => Some(
+                "Atomic database introspection links into store/ (unused by ClickHouse; it recreates database links at startup)",
+            ),
+        }
+    }
+}
+
+const MYSQL_RUNTIME_SOCKET: &str = "/var/run/mysqld/mysqld.sock";
+const CLICKHOUSE_DATA_TARGET: &str = "/var/lib/clickhouse";
+
+/// Whether the link at `relative` (inside the data directory) pointing at
+/// `link` is one the engine recreates and the archive may leave out.
+pub(crate) fn omits_engine_link(
+    policy: DataArchiveSourcePolicy,
+    relative: &Path,
+    link: &Path,
+) -> bool {
+    match policy {
+        DataArchiveSourcePolicy::Strict => false,
+        DataArchiveSourcePolicy::MysqlDataDirectory => {
+            relative == Path::new("mysql.sock") && link == Path::new(MYSQL_RUNTIME_SOCKET)
+        }
+        DataArchiveSourcePolicy::ClickhouseDataDirectory => {
+            (relative.starts_with("data") || relative.starts_with("metadata"))
+                && resolves_into_clickhouse_store(relative, link)
+        }
+    }
+}
+
+/// True when `link`, placed at `relative`, names a directory below `store/`
+/// of the data directory, written relative to the link or absolute in the
+/// container.
+fn resolves_into_clickhouse_store(relative: &Path, link: &Path) -> bool {
+    use std::path::Component;
+
+    let resolved = if link.is_absolute() {
+        match link.strip_prefix(CLICKHOUSE_DATA_TARGET) {
+            Ok(inside) => inside.to_path_buf(),
+            Err(_) => return false,
+        }
+    } else {
+        relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(link)
+    };
+    let mut normalized = PathBuf::new();
+    for component in resolved.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return false;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    normalized.starts_with("store") && normalized.components().count() > 1
 }
 
 pub async fn create_bounded_archive_with_policy(
@@ -205,10 +288,9 @@ fn should_skip_source_symlink(
     data_dir: &Path,
     link_name: &Path,
 ) -> bool {
-    policy == DataArchiveSourcePolicy::MysqlDataDirectory
-        && source.parent() == Some(data_dir)
-        && source.file_name().is_some_and(|name| name == "mysql.sock")
-        && link_name == Path::new("/var/run/mysqld/mysqld.sock")
+    source
+        .strip_prefix(data_dir)
+        .is_ok_and(|relative| omits_engine_link(policy, relative, link_name))
 }
 
 pub(super) fn append_bounded_archive_file<W: Write>(

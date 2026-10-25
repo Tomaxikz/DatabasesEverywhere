@@ -32,6 +32,7 @@ mod live_archive;
 mod model;
 pub(crate) mod selection;
 
+pub(crate) use self::create::omits_engine_link;
 pub use self::create::{
     DataArchiveSourcePolicy, create_bounded_archive, create_bounded_archive_with_policy,
 };

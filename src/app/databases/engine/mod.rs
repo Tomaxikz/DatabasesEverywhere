@@ -15,8 +15,8 @@ pub(crate) use family::EngineFamily;
 pub(crate) use inspection::EngineInspection;
 pub(crate) use lifecycle::{
     CredentialKind, DedicatedSpecInput, EngineLifecycle, LifecycleFlow, LifecycleRejection,
-    OnlineBackup, PostLaunchPlan, PostLaunchStep, RouteIdentity, SharedSpecInput, TenantAuthPlan,
-    TenantAuthStep, UpgradePrecheck,
+    NativeOnline, OnlineBackup, PostLaunchPlan, PostLaunchStep, RouteIdentity, SharedSpecInput,
+    TenantAuthPlan, TenantAuthStep, UpgradePrecheck,
 };
 pub(crate) use tenancy::{EngineTenancy, TenantDiskBoundary};
 #[cfg(test)]

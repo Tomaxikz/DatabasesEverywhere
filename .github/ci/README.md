@@ -107,6 +107,23 @@ Local `all` runs sequentially; cleanup targets managed test containers only.
 The [workflow](../workflows/shared-pool-isolation.yml) runs weekly/manually,
 **not as an ordinary push/release gate**.
 
+## Online backups without volume snapshots
+
+Requires Linux, Docker, root, `curl`, `jq`, `openssl`, and `ss`:
+
+```bash
+cargo build --locked
+sudo bash .github/ci/online-backup-e2e.sh all
+```
+
+A throwaway daemon (own node id, paths under `/var/lib/dbev-online-e2e` and
+`/run/dbev-online-e2e`, ports between 23307 and 29000) runs with `disk.mode: soft_scanner`,
+so MySQL, ClickHouse and Qdrant take their native online strategies. Each case
+checks the refusal of what a strategy cannot capture, backs up while a writer
+keeps writing, then changes the data, restores, and compares fingerprints.
+Pass `mysql`, `clickhouse` or `qdrant` for one engine. `DBEV_E2E_KEEP=1` keeps
+a failed run; `cleanup` removes it.
+
 For Docker-free provisioning checks with an official ClickHouse 26.4+ binary:
 
 ```bash

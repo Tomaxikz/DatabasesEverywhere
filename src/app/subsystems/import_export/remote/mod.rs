@@ -21,7 +21,7 @@ use crate::{
     subsystems::import_export::ImportExportSelection,
 };
 
-pub(crate) use qdrant::{cleanup_stale_bridge, import_qdrant};
+pub(crate) use qdrant::{backup as qdrant_backup, cleanup_stale_bridge, import_qdrant};
 pub(crate) use redis::import_resp;
 pub use security::RemoteEndpointRequest;
 

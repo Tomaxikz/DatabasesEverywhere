@@ -4,7 +4,9 @@ use super::checks::{
 };
 use super::registry::strategy_by_id;
 use super::storage::backup_storage;
-use super::strategy::{OnlineBackupStrategy, RestoreContext};
+use super::strategy::{
+    AfterStartRestoreContext, OnlineBackupStrategy, RestoreContext, RestoreKind,
+};
 use super::types::RestoreBackupResponse;
 use crate::routes::http::response::{ApiError, ApiResponse, ApiResult};
 use crate::routes::http::router::AppState;
@@ -41,6 +43,17 @@ pub(super) async fn restore_backup(
     // Resolve the restore recipe from the stored format before anything is
     // stopped or reserved; unknown recipes fail explicitly.
     let recipe = recipe_for(&stored)?;
+    // Engine-loaded captures (logical dumps, snapshot APIs) restore into the
+    // running instance instead of replacing its data directory.
+    let after_start = recipe
+        .as_ref()
+        .is_some_and(|recipe| recipe.strategy.restore_kind() == RestoreKind::AfterStart);
+    if after_start && metadata.status != InstanceStatus::Running {
+        return Err(ApiError::Conflict(format!(
+            "backup {} is loaded into the running engine; start the instance first",
+            stored.backup_id
+        )));
+    }
     let logical_rollback_bytes = if stored.layout == BackupLayout::Logical {
         Some(crate::subsystems::import_export::jobs::measure_export_bytes(&state, &metadata).await?)
     } else {
@@ -90,7 +103,18 @@ pub(super) async fn restore_backup(
     } else {
         None
     };
-    let _extracted_capacity = if let Some(paths) = physical_paths.as_ref() {
+    let _extracted_capacity = if after_start {
+        let temporary_root = PathBuf::from(state.config.paths.tmp_root());
+        prepare_private_dir(&temporary_root, "backup restore workspace")
+            .await
+            .map_err(store_error)?;
+        Some(
+            state
+                .import_uploads
+                .reserve_output_capacity(&temporary_root, extracted_capacity)
+                .await?,
+        )
+    } else if let Some(paths) = physical_paths.as_ref() {
         let data_parent = paths.data.parent().ok_or_else(|| {
             ApiError::Runtime("backup restore data directory has no parent".to_string())
         })?;
@@ -148,6 +172,31 @@ pub(super) async fn restore_backup(
             let paths = physical_paths.ok_or_else(|| {
                 ApiError::Runtime("physical backup restore paths were unavailable".to_string())
             })?;
+            if let Some(recipe) = recipe.as_ref().filter(|_| after_start) {
+                let finished = restore_into_running(
+                    &state,
+                    &metadata,
+                    recipe,
+                    &materialized.path,
+                    extracted_capacity,
+                    &paths,
+                )
+                .await;
+                drop(materialized);
+                finished?;
+                tracing::info!(
+                    event = "audit backup_restored",
+                    instance_id,
+                    backup_id,
+                    reason,
+                    storage = storage.kind().as_str(),
+                );
+                return Ok(ApiResponse::ok(RestoreBackupResponse {
+                    instance_id,
+                    backup_id,
+                    restored: true,
+                }));
+            }
             let was_running = metadata.status == InstanceStatus::Running;
             if was_running
                 && let Err(error) = crate::subsystems::instances::change_instance_state_locked(
@@ -216,6 +265,59 @@ pub(super) async fn restore_backup(
         backup_id,
         restored: true,
     }))
+}
+
+/// Extracts an engine-loaded capture into a private workspace and lets its
+/// strategy load it into the running instance. The data directory is never
+/// replaced on this path.
+async fn restore_into_running(
+    state: &AppState,
+    metadata: &crate::server::metadata::InstanceMetadata,
+    recipe: &StrategyRecipe,
+    artifact: &FsPath,
+    max_extracted_bytes: u64,
+    paths: &crate::server::paths::InstancePaths,
+) -> Result<(), ApiError> {
+    let root_name = paths
+        .data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ApiError::Runtime("invalid instance data path".to_string()))?
+        .to_string();
+    let workspace = PathBuf::from(state.config.paths.tmp_root())
+        .join(format!(".dbev-restore-{}", uuid::Uuid::new_v4().simple()));
+    prepare_private_dir(&workspace, "backup restore workspace")
+        .await
+        .map_err(store_error)?;
+    let result = async {
+        crate::server::jobs::import_export::extract_bounded_archive(
+            artifact.to_path_buf(),
+            workspace.clone(),
+            root_name.clone(),
+            max_extracted_bytes,
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
+        let payload = workspace.join(&root_name).join(&recipe.restore_target);
+        let ctx = AfterStartRestoreContext {
+            state,
+            metadata,
+            recipe: &recipe.recipe,
+            payload: &payload,
+        };
+        recipe
+            .strategy
+            .restore_after_start(&ctx)
+            .await
+            .map_err(ApiError::from)
+    }
+    .await;
+    if let Err(error) =
+        crate::io::files::ignore_missing(tokio::fs::remove_dir_all(&workspace).await)
+    {
+        tracing::warn!(path = %workspace.display(), %error, "failed to remove backup restore workspace");
+    }
+    result
 }
 
 /// Strategy recipe resolved for an online capture.

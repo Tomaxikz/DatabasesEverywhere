@@ -11,6 +11,7 @@ mod project_id;
 mod project_quota_integration_tests;
 mod project_tree;
 mod project_usage;
+pub(crate) mod snapshot;
 pub mod soft;
 pub mod usage;
 mod xfs;

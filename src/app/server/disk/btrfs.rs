@@ -80,7 +80,7 @@ async fn ensure_subvolume(path: &Path) -> Result<(), DiskLimitError> {
     run(&path, &["subvolume", "create"], "btrfs subvolume create").await
 }
 
-async fn is_subvolume(path: &Path) -> Result<bool, DiskLimitError> {
+pub(super) async fn is_subvolume(path: &Path) -> Result<bool, DiskLimitError> {
     btrfs_succeeds(&["subvolume", "show"], path).await
 }
 

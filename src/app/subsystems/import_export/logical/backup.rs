@@ -69,6 +69,37 @@ pub(crate) async fn restore_shared_backup(
     .await
 }
 
+/// Restores a dedicated instance's online logical dump through the same
+/// wipe-and-import path, with a rollback dump taken first.
+pub(crate) async fn restore_dedicated_backup(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+    artifact_path: &FsPath,
+    max_source_bytes: u64,
+    max_rollback_bytes: u64,
+) -> Result<(), ApiError> {
+    if metadata.deployment_mode != DeploymentMode::Dedicated {
+        return Err(ApiError::Runtime(
+            "dedicated logical restore received a shared tenant".to_string(),
+        ));
+    }
+    let options = ImportOptions::recovery_restore(artifact_path, metadata.protocol);
+    import_logical_batch(
+        state,
+        metadata,
+        &[artifact_path],
+        &options,
+        None,
+        LogicalStagingLimits {
+            remote_staged_limit: Some(max_source_bytes),
+            max_prepared_bytes: Some(max_source_bytes),
+            max_rollback_bytes: Some(max_rollback_bytes),
+            ..LogicalStagingLimits::default()
+        },
+    )
+    .await
+}
+
 /// Capacity created below the logical staging root while restoring a source
 /// that already exists elsewhere. Shared restores pin the inspected source
 /// once, then create and pin one rollback dump before mutation.

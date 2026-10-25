@@ -464,11 +464,7 @@ pub(super) async fn create_physical_archive(
     }
     let paths = crate::server::paths::InstancePaths::new(&state.config.paths, instance_id)
         .map_err(ApiError::bad_request)?;
-    let archive_policy = if metadata.protocol == Protocol::Mysql {
-        DataArchiveSourcePolicy::MysqlDataDirectory
-    } else {
-        DataArchiveSourcePolicy::Strict
-    };
+    let archive_policy = DataArchiveSourcePolicy::for_protocol(metadata.protocol);
     let result = create_bounded_archive_with_policy(
         paths.data,
         archive.to_path_buf(),

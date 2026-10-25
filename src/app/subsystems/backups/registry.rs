@@ -5,7 +5,8 @@ use std::sync::LazyLock;
 use super::strategy::{OnlineBackupStrategy, StrategyError};
 use crate::{
     databases::{
-        engine::OnlineBackup, mariadb::online_backup::MariadbBackupStrategy,
+        engine::{NativeOnline, OnlineBackup},
+        mariadb::online_backup::MariadbBackupStrategy,
         postgres::online_backup::PostgresBaseBackupStrategy,
         resp::online_backup::RespRdbSnapshotStrategy,
     },
@@ -18,12 +19,24 @@ pub(crate) const POSTGRES_BASE_BACKUP: &str = "postgres.pg_basebackup";
 pub(crate) const RESP_RDB_SNAPSHOT: &str = "resp.rdb_snapshot";
 /// Manifest strategy id of the MariaDB `mariadb-backup` strategy.
 pub(crate) const MARIADB_BACKUP: &str = "mariadb.mariadb_backup";
+/// Manifest strategy id of the Btrfs/ZFS volume snapshot strategy.
+pub(crate) const FILESYSTEM_SNAPSHOT: &str = "volume.snapshot";
+/// Manifest strategy id of the MySQL single-transaction dump strategy.
+pub(crate) const MYSQL_CONSISTENT_DUMP: &str = "mysql.consistent_dump";
+/// Manifest strategy id of the Qdrant per-collection snapshot strategy.
+pub(crate) const QDRANT_COLLECTION_SNAPSHOTS: &str = "qdrant.collection_snapshots";
+/// Manifest strategy id of the ClickHouse per-table freeze strategy.
+pub(crate) const CLICKHOUSE_FROZEN_PARTS: &str = "clickhouse.frozen_parts";
 
 static STRATEGIES: LazyLock<Vec<Box<dyn OnlineBackupStrategy>>> = LazyLock::new(|| {
     vec![
         Box::new(PostgresBaseBackupStrategy),
         Box::new(RespRdbSnapshotStrategy),
         Box::new(MariadbBackupStrategy),
+        Box::new(crate::subsystems::backups::snapshot::VolumeSnapshotStrategy),
+        Box::new(crate::subsystems::backups::native::mysql_dump::MysqlDumpStrategy),
+        Box::new(crate::subsystems::backups::native::qdrant::QdrantSnapshotStrategy),
+        Box::new(crate::subsystems::backups::native::clickhouse::ClickhouseFreezeStrategy),
     ]
 });
 
@@ -44,12 +57,31 @@ pub(crate) fn strategy_for(
         OnlineBackup::PostgresBaseBackup => POSTGRES_BASE_BACKUP,
         OnlineBackup::RespRdbSnapshot => RESP_RDB_SNAPSHOT,
         OnlineBackup::MariadbBackup => MARIADB_BACKUP,
+        OnlineBackup::VolumeSnapshot { otherwise } => {
+            let snapshots = crate::server::disk::snapshot::SnapshotBackend::for_enforcement_method(
+                &metadata.limits.disk_enforcement_method,
+            )
+            .is_some();
+            match otherwise {
+                // Without either, the snapshot strategy explains the requirement.
+                Some(native) if !snapshots => native_strategy_id(native),
+                _ => FILESYSTEM_SNAPSHOT,
+            }
+        }
     };
     strategy_by_id(id).ok_or_else(|| {
         StrategyError::Unsupported(format!(
             "the {id} online backup strategy is not available in this build"
         ))
     })
+}
+
+fn native_strategy_id(native: NativeOnline) -> &'static str {
+    match native {
+        NativeOnline::MysqlDump => MYSQL_CONSISTENT_DUMP,
+        NativeOnline::QdrantSnapshots => QDRANT_COLLECTION_SNAPSHOTS,
+        NativeOnline::ClickhouseFreeze => CLICKHOUSE_FROZEN_PARTS,
+    }
 }
 
 /// Looks up a strategy recorded in a manifest or job journal.
@@ -66,13 +98,36 @@ mod tests {
     use crate::databases::protocol::Protocol;
 
     #[test]
-    fn engines_without_certified_strategies_fail_clearly() {
-        for protocol in [Protocol::Mongodb, Protocol::Mysql] {
+    fn every_engine_has_an_online_strategy() {
+        for (protocol, expected) in [
+            (Protocol::Postgres, POSTGRES_BASE_BACKUP),
+            (Protocol::Redis, RESP_RDB_SNAPSHOT),
+            (Protocol::Valkey, RESP_RDB_SNAPSHOT),
+            (Protocol::Mariadb, MARIADB_BACKUP),
+            (Protocol::Mysql, MYSQL_CONSISTENT_DUMP),
+            (Protocol::Mongodb, FILESYSTEM_SNAPSHOT),
+            (Protocol::Clickhouse, CLICKHOUSE_FROZEN_PARTS),
+            (Protocol::Qdrant, QDRANT_COLLECTION_SNAPSHOTS),
+        ] {
             let metadata = crate::server::test_support::metadata("inst_one", protocol);
-            let Err(StrategyError::Unsupported(reason)) = strategy_for(&metadata) else {
-                panic!("{} must not have an online strategy", protocol.as_str());
+            let Ok(strategy) = strategy_for(&metadata) else {
+                panic!("{} has no online strategy", protocol.as_str());
             };
-            assert!(!reason.is_empty());
+            assert_eq!(strategy.id(), expected, "{protocol}");
+        }
+    }
+
+    #[test]
+    fn snapshot_capable_volumes_prefer_the_volume_snapshot() {
+        let mut metadata = crate::server::test_support::metadata("inst_one", Protocol::Mysql);
+        for (method, expected) in [
+            ("host_btrfs_qgroup", FILESYSTEM_SNAPSHOT),
+            ("host_zfs_refquota", FILESYSTEM_SNAPSHOT),
+            ("host_xfs_project", MYSQL_CONSISTENT_DUMP),
+            ("fuse_quota", MYSQL_CONSISTENT_DUMP),
+        ] {
+            metadata.limits.disk_enforcement_method = method.to_string();
+            assert_eq!(strategy_for(&metadata).unwrap().id(), expected, "{method}");
         }
     }
 

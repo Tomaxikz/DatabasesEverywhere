@@ -1,7 +1,7 @@
 use crate::{
     databases::engine::{
         CredentialKind, DedicatedSpecInput, EngineInfo, EngineLifecycle, LifecycleFlow,
-        LifecycleRejection, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
+        LifecycleRejection, OnlineBackup, SharedSpecInput, TenantAuthPlan, TenantAuthStep,
     },
     runtime::docker::DockerInstanceSpec,
     server::metadata::InstanceMetadata,
@@ -14,6 +14,12 @@ use super::{
 };
 
 impl EngineLifecycle for Mysql {
+    fn online_backup(&self) -> OnlineBackup {
+        OnlineBackup::VolumeSnapshot {
+            otherwise: Some(crate::databases::engine::NativeOnline::MysqlDump),
+        }
+    }
+
     fn generate_maintenance_password(&self) -> Option<String> {
         Some(format!("dbe-root-{}", uuid::Uuid::new_v4()))
     }

@@ -79,7 +79,7 @@ async fn set_refquota(dataset: &str, disk_mib: u64) -> Result<(), DiskLimitError
     .await
 }
 
-async fn list_datasets() -> Result<Vec<ZfsDataset>, DiskLimitError> {
+pub(super) async fn list_datasets() -> Result<Vec<ZfsDataset>, DiskLimitError> {
     let output = privileged_command("zfs")
         .arg("list")
         .arg("-H")
@@ -118,7 +118,7 @@ fn parse_zfs_datasets(output: &str) -> Vec<ZfsDataset> {
         .collect()
 }
 
-fn dataset_for_exact_mount(path: &Path, datasets: &[ZfsDataset]) -> Option<ZfsDataset> {
+pub(super) fn dataset_for_exact_mount(path: &Path, datasets: &[ZfsDataset]) -> Option<ZfsDataset> {
     datasets
         .iter()
         .find(|dataset| dataset.mountpoint == path)
@@ -133,7 +133,7 @@ fn parent_dataset_for_path(path: &Path, datasets: &[ZfsDataset]) -> Option<ZfsDa
         .cloned()
 }
 
-async fn run_zfs(args: &[&str], command: String) -> Result<(), DiskLimitError> {
+pub(super) async fn run_zfs(args: &[&str], command: String) -> Result<(), DiskLimitError> {
     let output = privileged_command("zfs")
         .args(args)
         .output()
@@ -166,8 +166,8 @@ fn dataset_suffix(instance_id: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ZfsDataset {
-    name: String,
+pub(super) struct ZfsDataset {
+    pub(super) name: String,
     mountpoint: PathBuf,
 }
 

@@ -16,13 +16,10 @@ use super::{
 
 impl EngineLifecycle for Mongodb {
     fn online_backup(&self) -> OnlineBackup {
-        // fsyncLock would freeze every write for the whole copy, and a
-        // standalone Community server has no hot-backup cursor. Strict online
-        // capture needs an opt-in replica set (mongodump --oplog) or a
-        // certified atomic data/journal snapshot with a restore transaction.
-        OnlineBackup::Unavailable {
-            reason: "MongoDB standalone deployments have no consistent online capture; an opt-in replica set or certified snapshot backend is required",
-        }
+        // A standalone server has no hot-backup cursor and fsyncLock would
+        // freeze writes, but an atomic volume snapshot holds data and the
+        // WiredTiger journal at one instant, which mongod recovers on start.
+        OnlineBackup::VolumeSnapshot { otherwise: None }
     }
 
     fn generate_maintenance_password(&self) -> Option<String> {

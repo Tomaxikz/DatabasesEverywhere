@@ -429,3 +429,130 @@ fn write_symlink_archive(path: &Path, entry_path: &str, link_name: &str) {
         .unwrap();
     builder.into_inner().unwrap().finish().unwrap();
 }
+
+fn clickhouse_layout(data: &std::path::Path) {
+    use std::os::unix::fs::symlink;
+
+    let table = data.join("store/abc/abc12345-0000-4000-8000-000000000001");
+    let database = data.join("store/def/def12345-0000-4000-8000-000000000002");
+    std::fs::create_dir_all(table.join("all_1_1_0")).unwrap();
+    std::fs::create_dir_all(&database).unwrap();
+    std::fs::write(table.join("all_1_1_0/data.bin"), b"clickhouse data").unwrap();
+    std::fs::write(database.join("events.sql"), b"ATTACH TABLE _ UUID '...'").unwrap();
+    std::fs::create_dir_all(data.join("metadata")).unwrap();
+    std::fs::write(
+        data.join("metadata/default.sql"),
+        b"ATTACH DATABASE _ UUID '...'",
+    )
+    .unwrap();
+    std::fs::create_dir_all(data.join("data/default")).unwrap();
+    // Table links are written relative; database links absolute in the container.
+    symlink(
+        "../../store/abc/abc12345-0000-4000-8000-000000000001/",
+        data.join("data/default/events"),
+    )
+    .unwrap();
+    symlink(
+        "/var/lib/clickhouse/store/def/def12345-0000-4000-8000-000000000002/",
+        data.join("metadata/default"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn clickhouse_backups_leave_out_atomic_store_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    clickhouse_layout(&data);
+    let artifact = dir.path().join("backup.tar.gz");
+    let restored = dir.path().join("restored");
+
+    assert!(
+        create_archive_blocking(
+            &data,
+            &dir.path().join("strict.tar.gz"),
+            DataArchiveSourcePolicy::Strict
+        )
+        .is_err()
+    );
+    create_archive_blocking(
+        &data,
+        &artifact,
+        DataArchiveSourcePolicy::ClickhouseDataDirectory,
+    )
+    .unwrap();
+    extract_archive_blocking(&artifact, &restored, "data").unwrap();
+
+    assert_eq!(
+        std::fs::read(
+            restored.join("data/store/abc/abc12345-0000-4000-8000-000000000001/all_1_1_0/data.bin")
+        )
+        .unwrap(),
+        b"clickhouse data"
+    );
+    assert!(restored.join("data/metadata/default.sql").is_file());
+    assert!(restored.join("data/data/default").is_dir());
+    assert!(std::fs::symlink_metadata(restored.join("data/data/default/events")).is_err());
+    assert!(std::fs::symlink_metadata(restored.join("data/metadata/default")).is_err());
+}
+
+#[test]
+fn clickhouse_policy_still_refuses_links_outside_store() {
+    use std::os::unix::fs::symlink;
+
+    for (relative, target) in [
+        ("data/default/escape", "../../../secret"),
+        ("data/default/etc", "/etc"),
+        ("data/default/store_root", "../../store"),
+        ("user_files/table", "../store/abc/abc12345"),
+        ("metadata/default", "/var/lib/clickhouse/metadata/other"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        clickhouse_layout(&data);
+        let link = data.join(relative);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(target, &link).unwrap();
+        let error = create_archive_blocking(
+            &data,
+            &dir.path().join("backup.tar.gz"),
+            DataArchiveSourcePolicy::ClickhouseDataDirectory,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("refuses symbolic link"),
+            "{relative} -> {target}"
+        );
+    }
+}
+
+#[test]
+fn archive_policies_follow_the_engine() {
+    use crate::databases::protocol::Protocol;
+
+    assert_eq!(
+        DataArchiveSourcePolicy::for_protocol(Protocol::Clickhouse),
+        DataArchiveSourcePolicy::ClickhouseDataDirectory
+    );
+    assert_eq!(
+        DataArchiveSourcePolicy::for_protocol(Protocol::Mysql),
+        DataArchiveSourcePolicy::MysqlDataDirectory
+    );
+    for protocol in [
+        Protocol::Postgres,
+        Protocol::Mongodb,
+        Protocol::Qdrant,
+        Protocol::Redis,
+    ] {
+        assert_eq!(
+            DataArchiveSourcePolicy::for_protocol(protocol),
+            DataArchiveSourcePolicy::Strict
+        );
+    }
+    assert!(
+        DataArchiveSourcePolicy::Strict
+            .omitted_links_note()
+            .is_none()
+    );
+}

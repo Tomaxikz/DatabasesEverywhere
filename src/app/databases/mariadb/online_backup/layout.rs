@@ -1,9 +1,6 @@
 //! Staged and restored layout of a prepared `mariadb-backup` tree.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
 use crate::io::files::{require_directory, require_regular_file};
 
@@ -116,43 +113,11 @@ fn refuse_links(root: &Path) -> Result<(), String> {
 /// Moves the extracted prepared tree from `RESTORE_TARGET` to the data
 /// volume root it replaces.
 pub(super) fn install_prepared(extracted_root: &Path) -> Result<(), String> {
-    let names = entry_names(extracted_root)?;
-    if names != [RESTORE_TARGET] {
-        return Err(format!(
-            "the extracted backup must hold only {RESTORE_TARGET}, found {names:?}"
-        ));
-    }
-    let tree = extracted_root.join(RESTORE_TARGET);
-    check_prepared(&tree)?;
-    let entries: Vec<PathBuf> = entry_names(&tree)?
-        .into_iter()
-        .map(|name| tree.join(name))
-        .collect();
-    if entries
-        .iter()
-        .any(|entry| entry.file_name().is_some_and(|name| name == RESTORE_TARGET))
-    {
-        return Err(format!("the backup itself contains {RESTORE_TARGET}"));
-    }
-    for entry in entries {
-        let name = entry.file_name().ok_or("unnamed backup entry")?;
-        fs::rename(&entry, extracted_root.join(name))
-            .map_err(|error| format!("install {}: {error}", entry.display()))?;
-    }
-    fs::remove_dir(&tree).map_err(|error| format!("remove {}: {error}", tree.display()))
-}
-
-fn entry_names(directory: &Path) -> Result<Vec<String>, String> {
-    let mut names = fs::read_dir(directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .map_err(|error| format!("{}: {error}", directory.display()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    names.sort();
-    Ok(names)
+    crate::subsystems::backups::strategy::lift_restore_tree(
+        extracted_root,
+        RESTORE_TARGET,
+        |tree| check_prepared(tree).map(|_| ()),
+    )
 }
 
 #[cfg(test)]
