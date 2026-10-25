@@ -30,6 +30,8 @@ screen; choose **Standalone** and answer:
 - the engines to enable (PostgreSQL, MariaDB and Redis are preselected);
 - the public host for connection strings (default: the machine's host name);
 - where gateways listen: this machine only (`127.0.0.1`) or the network (`0.0.0.0`);
+- the container runtime: Docker or rootful [Podman](#podman), preselected to the
+  one installed (`daemon.engine`; setup enables `podman.socket` for Podman);
 - the [disk mode](disk-limits.md): `auto`, `project_quota`, `fuse_quota` or `soft_scanner`;
 - whether to open the network API. It is off by default: only a panel needs it,
   and the console reaches the daemon through `api.socket_path` (`/run/dbev/api.sock`).
