@@ -1,10 +1,11 @@
 name: Release Nightly
 
-# Builds main every night and publishes it as the `nightly` Docker image.
+# Publishes every push to main as the `nightly` Docker image.
 # Point compose at ghcr.io/tomaxikz/databaseseverywhere:nightly to use it.
 on:
-  schedule:
-    - cron: "30 2 * * *"
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:

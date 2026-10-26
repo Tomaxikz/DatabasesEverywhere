@@ -3,7 +3,7 @@ run-name: Release ${{ inputs.version || github.ref_name }}
 
 # Push a tag (`git tag v1.2.0 && git push origin v1.2.0`) or run it by hand.
 # A prerelease (the checkbox, or a suffix like v1.2.0-rc.1) is not marked
-# latest and does not move the Docker `latest` tag.
+# latest and moves the Docker `latest-pre` tag instead of `latest`.
 on:
   push:
     tags:
@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: "Prerelease (not latest, no Docker latest tag)"
+        description: "Prerelease (Docker latest-pre instead of latest)"
         required: false
         default: false
         type: boolean
@@ -313,7 +313,9 @@ jobs:
           {
             echo "tags<<EOF"
             echo "$VERSION"
-            if [ "$PRERELEASE" != "true" ]; then
+            if [ "$PRERELEASE" = "true" ]; then
+              echo latest-pre
+            else
               echo latest
             fi
             echo "EOF"
