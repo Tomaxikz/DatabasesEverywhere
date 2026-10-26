@@ -6,7 +6,9 @@
 #
 # and run `docker compose up -d` from that folder. Relative paths below resolve
 # against the folder holding this file, wherever Compose is started from.
-name: dbev
+# For more than one node on a host, give each folder its own DBEV_NODE and
+# directories in .env (see .env.example).
+name: ${DBEV_NODE:-dbev}
 
 services:
   dbev:
@@ -14,7 +16,7 @@ services:
     # upgrades on pull.
     image: ${DBEV_IMAGE:-ghcr.io/tomaxikz/databaseseverywhere:latest}
     pull_policy: always
-    container_name: dbev
+    container_name: ${DBEV_NODE:-dbev}
     restart: unless-stopped
 
     # Host networking lets DBEV bind its configured API and gateway addresses.
@@ -75,14 +77,14 @@ services:
       # container: DBEV hands these host paths to Docker when it creates the
       # database containers. Change them only together with `paths` in the config.
       - type: bind
-        source: /var/lib/dbev
-        target: /var/lib/dbev
+        source: ${DBEV_DATA_DIR:-/var/lib/dbev}
+        target: ${DBEV_DATA_DIR:-/var/lib/dbev}
         bind:
           propagation: rshared
-      - /run/dbev:/run/dbev
+      - ${DBEV_RUN_DIR:-/run/dbev}:${DBEV_RUN_DIR:-/run/dbev}
       # Retained for configurations created before logs moved under
       # /var/lib/dbev. New configurations use the data volume above.
-      - /var/log/dbev:/var/log/dbev
+      - ${DBEV_LOG_DIR:-/var/log/dbev}:${DBEV_LOG_DIR:-/var/log/dbev}
       # Uncomment whichever certificate directories your config references.
       # - /etc/letsencrypt:/etc/letsencrypt:ro
       # - /etc/nginx/ssl:/etc/nginx/ssl:ro

@@ -9,7 +9,8 @@ LABEL org.opencontainers.image.source="https://github.com/Tomaxikz/DatabasesEver
 # hadolint ignore=DL3008
 RUN apt-get update --error-on=any \
     && apt-get upgrade -y --with-new-pkgs --no-install-recommends \
-    && apt-get install -y --no-install-recommends ca-certificates fuse3 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates fuse3 btrfs-progs xfsprogs quota \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 /etc/databases-everywhere /var/lib/dbev/logs /var/log/dbev /run/dbev
 
@@ -17,8 +18,10 @@ ARG TARGETPLATFORM
 
 COPY --chown=0:0 --chmod=0555 .docker/${TARGETPLATFORM#linux/}/dbev /usr/local/bin/dbev
 
-# Fail the build if the copied GNU binary or required FUSE/cleanup tools cannot run.
-RUN dbev --version && fusermount3 --version && umount --version
+# Fail the build if the copied GNU binary or the FUSE, quota and cleanup tools
+# cannot run. ZFS tools are left out: they must match the host's kernel module.
+RUN dbev --version && fusermount3 --version && umount --version \
+    && btrfs --version && xfs_quota -V && setquota -V
 
 VOLUME ["/etc/databases-everywhere", "/var/lib/dbev", "/var/log/dbev", "/run/dbev"]
 
