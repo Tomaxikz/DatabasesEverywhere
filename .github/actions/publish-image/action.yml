@@ -40,7 +40,6 @@ runs:
           '2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a' \
           "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
         tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
-        echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
 
     - name: Build Docker image without publishing
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -61,7 +60,7 @@ runs:
       id: trivy
       shell: bash
       run: |
-        trivy image --input "$RUNNER_TEMP/dbev-image" \
+        "$RUNNER_TEMP/trivy-bin/trivy" image --input "$RUNNER_TEMP/dbev-image" \
           --platform linux/amd64 --scanners vuln --severity HIGH,CRITICAL \
           --exit-code 1 --timeout 10m --format json \
           --output "$RUNNER_TEMP/trivy-report.json"
@@ -74,7 +73,7 @@ runs:
           echo "::error::Trivy produced no report. Check the scan step for a scanner or database-download error."
           exit 1
         fi
-        trivy convert --format table "$RUNNER_TEMP/trivy-report.json"
+        "$RUNNER_TEMP/trivy-bin/trivy" convert --format table "$RUNNER_TEMP/trivy-report.json"
 
     - name: Upload image vulnerability report
       if: ${{ !cancelled() && steps.trivy.outcome != 'skipped' }}
