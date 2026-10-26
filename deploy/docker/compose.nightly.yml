@@ -1,0 +1,33 @@
+services:
+  dbev:
+    image: ghcr.io/tomaxikz/databaseseverywhere:nightly
+    pull_policy: always
+    restart: unless-stopped
+    network_mode: host
+    # host cgroup lets dbev read and tune database containers' cgroups
+    cgroup: host
+    init: true
+    read_only: true
+    stop_grace_period: 21m
+    # SYS_ADMIN, /dev/fuse and apparmor:unconfined are for disk quotas
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    environment:
+      RUST_LOG: info
+    volumes:
+      # root-equivalent: run dbev on a dedicated host or VM
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      # dbev inspects its own container on boot and translates these to host
+      # paths, so only the left side needs changing to relocate storage
+      - ./config:/etc/databases-everywhere
+      - ./data:/var/lib/dbev:rshared
+      - ./run:/run/dbev

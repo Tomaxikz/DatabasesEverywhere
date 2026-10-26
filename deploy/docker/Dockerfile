@@ -12,6 +12,7 @@ RUN apt-get update --error-on=any \
     && apt-get install -y --no-install-recommends \
         ca-certificates fuse3 btrfs-progs xfsprogs quota \
     && rm -rf /var/lib/apt/lists/* \
+    && echo user_allow_other >> /etc/fuse.conf \
     && install -d -m 0700 /etc/databases-everywhere /var/lib/dbev /run/dbev
 
 ARG TARGETPLATFORM

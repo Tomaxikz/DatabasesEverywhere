@@ -1,72 +1,32 @@
-name: ${DBEV_NODE:-dbev}
-
 services:
   dbev:
-    image: ${DBEV_IMAGE:-ghcr.io/tomaxikz/databaseseverywhere:latest}
-    pull_policy: always
-    container_name: ${DBEV_NODE:-dbev}
+    image: ghcr.io/tomaxikz/databaseseverywhere:latest
     restart: unless-stopped
     network_mode: host
+    # host cgroup lets dbev read and tune database containers' cgroups
     cgroup: host
-
-    # /dev/fuse, SYS_ADMIN, apparmor:unconfined and /etc/fuse.conf are for FuseQuota only.
-    devices:
-      - /dev/fuse:/dev/fuse
-    cap_drop:
-      - ALL
+    init: true
+    read_only: true
+    stop_grace_period: 21m
+    # SYS_ADMIN, /dev/fuse and apparmor:unconfined are for disk quotas
     cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
       - SYS_ADMIN
+    devices:
+      - /dev/fuse
     security_opt:
       - apparmor:unconfined
       - no-new-privileges:true
-    read_only: true
-    init: true
-    pids_limit: 1024
-    stop_grace_period: 21m
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,mode=1777
-
-    volumes:
-      # Root-equivalent: run dbev on a dedicated host or VM.
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-      - type: bind
-        source: ${DBEV_CONFIG_DIR:-./config}
-        target: /etc/databases-everywhere
-        bind:
-          create_host_path: false
-      - /etc/fuse.conf:/etc/fuse.conf:ro
-      - /proc:/host/proc:ro
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-      - type: bind
-        source: ${DBEV_DATA_DIR:-./data}
-        target: /var/lib/dbev
-        bind:
-          create_host_path: true
-          propagation: rshared
-      - ${DBEV_RUN_DIR:-./run}:/run/dbev
-      # - /etc/letsencrypt:/etc/letsencrypt:ro
-
+      - /tmp
     environment:
-      RUST_LOG: ${RUST_LOG:-info}
-
-    healthcheck:
-      test:
-        - CMD
-        - bash
-        - -c
-        - exec 3<>/dev/tcp/${DBEV_HEALTHCHECK_HOST:-127.0.0.1}/${DBEV_HEALTHCHECK_PORT:-8090}
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 3m
-
-    logging:
-      driver: json-file
-      options:
-        max-size: 20m
-        max-file: "5"
+      RUST_LOG: info
+    volumes:
+      # root-equivalent: run dbev on a dedicated host or VM
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      # dbev inspects its own container on boot and translates these to host
+      # paths, so only the left side needs changing to relocate storage
+      - ./config:/etc/databases-everywhere
+      - ./data:/var/lib/dbev:rshared
+      - ./run:/run/dbev
