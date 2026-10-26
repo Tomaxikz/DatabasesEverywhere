@@ -1,0 +1,51 @@
+name: Build dbev binary
+description: Builds and verifies one Linux release binary into target/release-artifacts.
+
+inputs:
+  asset-arch:
+    description: x86_64, arm64 or riscv64
+    required: true
+  rust-target:
+    description: Rust target of the binary
+    required: true
+  rust-targets:
+    description: Every Rust target the build needs, comma separated
+    required: true
+  cache:
+    description: Restore the build cache. Never for anything that gets published.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      with:
+        toolchain: 1.99.0
+        targets: ${{ inputs.rust-targets }}
+
+    - name: Install Zig
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      with:
+        version: 0.14.1
+
+    - name: Install cargo-zigbuild
+      uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+      with:
+        tool: cargo-zigbuild@0.23.4
+        fallback: none
+
+    - name: Restore architecture build cache
+      if: ${{ inputs.cache == 'true' }}
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: dbev-release-${{ inputs.asset-arch }}
+        cache-on-failure: false
+
+    - name: Build and verify binary
+      shell: bash
+      env:
+        ASSET_ARCH: ${{ inputs.asset-arch }}
+        RUST_TARGET: ${{ inputs.rust-target }}
+      run: bash .github/ci/build-release-target.sh "$RUST_TARGET" "$ASSET_ARCH"

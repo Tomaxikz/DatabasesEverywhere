@@ -9,6 +9,9 @@ on:
       - main
   merge_group:
   workflow_dispatch:
+  # Weekly full run, with the slow real-engine suites.
+  schedule:
+    - cron: "17 3 * * 1"
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -164,11 +167,88 @@ jobs:
           retention-days: 7
 
   mysql_driver_matrix:
-    name: Real MySQL/MariaDB clients and versions
+    name: ${{ matrix.image }} with Connector/J ${{ matrix.connector }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: global_lint
-    permissions:
-      contents: read
-    uses: ./.github/workflows/mysql-driver-matrix.yml
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - protocol: mysql
+            image: mysql:8.4
+            connector: 8.4.0
+          - protocol: mysql
+            image: mysql:8.4
+            connector: 9.7.0
+          - protocol: mysql
+            image: mysql:9.7
+            connector: 9.2.0
+          - protocol: mysql
+            image: mysql:26.7
+            connector: 26.7.0
+          - protocol: mariadb
+            image: mariadb:10.11
+            connector: 8.4.0
+          - protocol: mariadb
+            image: mariadb:11.4
+            connector: 9.2.0
+          - protocol: mariadb
+            image: mariadb:11.8
+            connector: 9.7.0
+          - protocol: mariadb
+            image: mariadb:12.3
+            connector: 26.7.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Select hosted Java 21 and verify client toolchains
+        run: |
+          if [ -z "${JAVA_HOME_21_X64:-}" ] || \
+             [ ! -x "$JAVA_HOME_21_X64/bin/java" ] || \
+             [ ! -x "$JAVA_HOME_21_X64/bin/javac" ]; then
+            echo "GitHub runner is missing its advertised Java 21 toolchain" >&2
+            exit 1
+          fi
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          for command in docker mvn openssl; do
+            command -v "$command" >/dev/null || {
+              echo "GitHub runner is missing required tool: $command" >&2
+              exit 1
+            }
+          done
+
+      - name: Compile the compatibility test
+        run: cargo test --locked --lib --no-run
+
+      - name: Exercise one real database and driver combination
+        env:
+          DBE_MATRIX_PROTOCOL: ${{ matrix.protocol }}
+          DBE_MATRIX_IMAGE: ${{ matrix.image }}
+          DBE_MATRIX_CONNECTOR: ${{ matrix.connector }}
+          DBE_MARIADB_CLI_IMAGE: ${{ matrix.protocol == 'mariadb' && matrix.image || 'mariadb:11.4' }}
+          DBE_DRIVER_CASE_TIMEOUT: 12m
+        run: |
+          bash .github/ci/mysql-driver-matrix.sh \
+            "$DBE_MATRIX_PROTOCOL" \
+            "$DBE_MATRIX_IMAGE" \
+            "$DBE_MATRIX_CONNECTOR"
 
   podman_smoke:
     name: Rootless Podman compatibility
@@ -281,11 +361,166 @@ jobs:
           category: /language:${{ matrix.language }}
 
   release_build:
-    name: Linux release binaries
+    name: dbev-${{ matrix.asset_arch }}-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     needs: global_lint
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-binaries.yml
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - asset_arch: x86_64
+            rust_target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+          - asset_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
+          - asset_arch: riscv64
+            rust_target: riscv64gc-unknown-linux-gnu
+            rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and verify binary
+        uses: ./.github/actions/build-binary
+        with:
+          asset-arch: ${{ matrix.asset_arch }}
+          rust-target: ${{ matrix.rust_target }}
+          rust-targets: ${{ matrix.rust_targets }}
+          cache: "true"
+
+  shared_pool_isolation:
+    name: ${{ matrix.protocol }} tenant isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: global_lint
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        protocol:
+          - postgres
+          - mysql
+          - mariadb
+          - mongodb
+          - clickhouse
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Verify hosted Docker
+        run: docker info >/dev/null
+
+      - name: Compile the shared-pool integration tests
+        run: cargo test --locked --lib --no-run
+
+      - name: Exercise one real shared database engine
+        env:
+          DBE_SHARED_POOL_TEST_TIMEOUT: 12m
+          DBE_SHARED_POOL_PROTOCOL: ${{ matrix.protocol }}
+        run: bash .github/ci/shared-pool-isolation.sh "$DBE_SHARED_POOL_PROTOCOL"
+
+  project_quota:
+    name: XFS + ext4 + F2FS project quotas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: global_lint
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Install project-quota tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs f2fs-tools quota xfsprogs
+
+      - name: Verify privileged loopback support
+        run: sudo -n true && test -e /dev/loop-control
+
+      - name: Exercise native project quotas
+        env:
+          DBE_PROJECT_QUOTA_TEST_TIMEOUT: 6m
+        run: bash .github/ci/project-quota-smoke.sh all
+
+  project_quota_engines:
+    name: ${{ matrix.protocol }} on real XFS + ext4 tenant quotas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    needs: global_lint
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        protocol:
+          - postgres
+          - mysql
+          - mariadb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.99.0
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: dbev-debug
+          cache-on-failure: false
+
+      - name: Install project-quota tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs quota xfsprogs
+
+      - name: Verify privileged loopback and Docker support
+        run: sudo -n true && test -e /dev/loop-control && docker info >/dev/null
+
+      - name: Exercise real engine writes through both hard-quota backends
+        env:
+          DBE_PROJECT_QUOTA_TEST_TIMEOUT: 12m
+          DBE_PROJECT_QUOTA_BUILD_TIMEOUT: 15m
+          DBE_PROJECT_QUOTA_ENGINE_PROTOCOL: ${{ matrix.protocol }}
+        run: |
+          bash .github/ci/project-quota-smoke.sh xfs "$DBE_PROJECT_QUOTA_ENGINE_PROTOCOL"
+          bash .github/ci/project-quota-smoke.sh ext4 "$DBE_PROJECT_QUOTA_ENGINE_PROTOCOL"
 
   ci_gate:
     name: CI gate
