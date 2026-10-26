@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod events;
 mod helpers;
+pub(crate) mod host_paths;
 mod image_probe;
 mod inspection;
 mod lifecycle;

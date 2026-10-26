@@ -91,12 +91,12 @@ pub(super) fn prepare_rootless_paths(
     let metadata = PathBuf::from(config.paths.metadata_root());
     let fuse = PathBuf::from(config.paths.fuse_root());
     let tmp = PathBuf::from(config.paths.tmp_root());
-    let logs = PathBuf::from(&config.paths.logs);
+    let logs = PathBuf::from(&config.paths.logs_root());
     let paths = std::collections::BTreeSet::from([
         PathBuf::from(&config.paths.data),
         PathBuf::from(config.paths.volumes_root()),
         logs.clone(),
-        PathBuf::from(&config.paths.sockets),
+        PathBuf::from(&config.paths.sockets_root()),
         metadata.clone(),
         metadata.join("runtime"),
         metadata.join("runtime/bin"),
@@ -425,12 +425,12 @@ impl Drop for DaemonLock {
 }
 
 pub(super) async fn lock_daemon(config: &Config) -> anyhow::Result<DaemonLock> {
-    let locks_root = Path::new(&config.paths.locks);
-    tokio::fs::create_dir_all(locks_root)
+    let locks_root = PathBuf::from(config.paths.locks_root());
+    tokio::fs::create_dir_all(&locks_root)
         .await
         .with_context(|| format!("failed to create lock directory {}", locks_root.display()))?;
-    harden_runtime_dir(locks_root)?;
-    acquire_daemon_lock(locks_root).context("failed to acquire the process-lifetime daemon lock")
+    harden_runtime_dir(&locks_root)?;
+    acquire_daemon_lock(&locks_root).context("failed to acquire the process-lifetime daemon lock")
 }
 
 pub(super) fn acquire_daemon_lock(locks_root: &Path) -> anyhow::Result<DaemonLock> {
@@ -508,10 +508,10 @@ pub(super) fn runtime_roots(config: &Config) -> Vec<String> {
         ),
         config.paths.volumes_root(),
         config.paths.backups_root(),
-        config.paths.logs.clone(),
-        config.paths.sockets.clone(),
-        config.paths.locks.clone(),
-        config.paths.artifacts.clone(),
+        config.paths.logs_root(),
+        config.paths.sockets_root(),
+        config.paths.locks_root(),
+        config.paths.artifacts_root(),
         config.paths.exports_root(),
         config.paths.imports_root(),
         config.paths.fuse_root(),
@@ -521,7 +521,10 @@ pub(super) fn runtime_roots(config: &Config) -> Vec<String> {
         ),
         format!("{}/mounts", config.paths.fuse_root().trim_end_matches('/')),
         config.paths.tmp_root(),
-        format!("{}/instances", config.paths.logs.trim_end_matches('/')),
+        format!(
+            "{}/instances",
+            config.paths.logs_root().trim_end_matches('/')
+        ),
     ]
 }
 

@@ -30,8 +30,9 @@ impl DockerRuntime {
                 .mounts
                 .ok_or_else(|| anyhow::anyhow!("container mount inventory is unavailable"))?;
             for mount in mounts {
+                // Compared with dbev's own paths, so in dbev's view.
                 if let Some(source) = mount_source(mount)? {
-                    sources.push(source);
+                    sources.extend(super::host_paths::visible(&source));
                 }
             }
         }

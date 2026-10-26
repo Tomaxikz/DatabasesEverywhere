@@ -5,11 +5,7 @@ pub(crate) const MANAGED_INSTANCE_LIFECYCLE_CONCURRENCY: usize = 8;
 pub mod defaults {
     pub const CONFIG_PATH: &str = "/etc/databases-everywhere/config.yml";
     pub const DATA_PATH: &str = "/var/lib/dbev";
-    pub const SOCKETS_PATH: &str = "/run/dbev/sockets";
-    pub const LOCKS_PATH: &str = "/run/dbev/locks";
-    pub const API_SOCKET_PATH: &str = "/run/dbev/api.sock";
-    pub const LOGS_PATH: &str = "/var/lib/dbev/logs";
-    pub const ARTIFACTS_PATH: &str = "/var/lib/dbev/artifacts";
+    pub const RUN_PATH: &str = "/run/dbev";
 }
 
 pub mod docker {

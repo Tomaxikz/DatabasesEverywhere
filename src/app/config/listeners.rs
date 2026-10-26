@@ -6,10 +6,7 @@ use super::{
     Config, loopback_bind,
     origins::{normalize_http_origin, url_origin},
 };
-use crate::{
-    databases::protocol::Protocol,
-    utils::constants::{defaults, ports},
-};
+use crate::{databases::protocol::Protocol, utils::constants::ports};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -127,12 +124,19 @@ impl Default for ApiConfig {
             fqdn: String::new(),
             trusted_origins: Vec::new(),
             ssl: ApiSslConfig::default(),
-            socket_path: defaults::API_SOCKET_PATH.to_string(),
+            socket_path: String::new(),
         }
     }
 }
 
 impl Config {
+    /// `api.socket_path`, or `api.sock` in `paths.run` when unset.
+    pub fn api_socket_path(&self) -> String {
+        crate::config::paths::non_empty_or_else(&self.api.socket_path, || {
+            format!("{}/api.sock", self.paths.run_root())
+        })
+    }
+
     pub fn protocol_enabled(&self, protocol: Protocol) -> bool {
         protocol.engine().listener(self).enabled
     }

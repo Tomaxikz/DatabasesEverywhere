@@ -639,7 +639,7 @@ fn rejects_runtime_directory_owned_by_another_uid() {
 fn default_logs_live_below_the_private_data_root() {
     let paths = crate::config::PathConfig::default();
 
-    assert_eq!(paths.logs, format!("{}/logs", paths.data));
+    assert_eq!(paths.logs_root(), format!("{}/logs", paths.data));
 }
 
 #[test]

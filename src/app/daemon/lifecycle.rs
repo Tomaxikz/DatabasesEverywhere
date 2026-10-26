@@ -72,7 +72,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         phase = "configuration",
         version = env!("CARGO_PKG_VERSION"),
         config = %config_path.display(),
-        logs = %config.paths.logs,
+        logs = %config.paths.logs_root(),
         uuid = %config.uuid,
         token_id = %config.token_id,
         remote = %config.remote,
@@ -83,7 +83,7 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         "startup phase 1/5: configuration loaded"
     );
     tracing::info!(
-        path = %Path::new(&config.paths.locks).join(DAEMON_LOCK_FILE).display(),
+        path = %Path::new(&config.paths.locks_root()).join(DAEMON_LOCK_FILE).display(),
         "exclusive daemon lock acquired"
     );
     tracing::info!(
@@ -272,6 +272,10 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
         .ping()
         .await
         .context("failed to ping container engine API")?;
+    docker
+        .detect_host_paths(&host_path_roots(&config))
+        .await
+        .context("failed to map dbev's folders to host paths")?;
     prepare_rootless_paths(&config, &docker)
         .context("failed to prepare rootless Podman bind-mount paths")?;
     reconcile::validate_runtime(&manager, &docker)
@@ -474,6 +478,26 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     .await;
     services.shutdown(&state, server_result.is_err()).await?;
     server_result
+}
+
+/// Every folder whose paths end up in a container's mounts.
+fn host_path_roots(config: &Config) -> Vec<PathBuf> {
+    let paths = &config.paths;
+    [
+        paths.metadata_root(),
+        paths.volumes_root(),
+        paths.backups_root(),
+        paths.logs_root(),
+        paths.artifacts_root(),
+        paths.exports_root(),
+        paths.imports_root(),
+        paths.fuse_root(),
+        paths.tmp_root(),
+        paths.sockets_root(),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 async fn reconcile_remote_import_leftovers(

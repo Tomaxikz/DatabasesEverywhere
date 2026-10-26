@@ -165,6 +165,8 @@ fn read_secret_from_stdin() -> anyhow::Result<SecretString> {
     Ok(SecretString::from(value))
 }
 
+const LEGACY_LOG_DIRECTORY: &str = "/var/log/dbev";
+
 pub(crate) async fn migrate_paths(
     config_path: PathBuf,
     dry_run: bool,
@@ -256,7 +258,7 @@ impl<'a> PathMigrationPlan<'a> {
         );
         self.add_dir_action(
             &mut actions,
-            &Path::new(&self.config.paths.artifacts).join("exports"),
+            &Path::new(&self.config.paths.artifacts_root()).join("exports"),
             Path::new(&self.config.paths.exports_root()),
         );
         self.add_dir_action(
@@ -266,14 +268,24 @@ impl<'a> PathMigrationPlan<'a> {
         );
         self.add_dir_action(
             &mut actions,
-            &Path::new(&self.config.paths.artifacts).join("imports"),
+            &Path::new(&self.config.paths.artifacts_root()).join("imports"),
             Path::new(&self.config.paths.imports_root()),
         );
         self.add_dir_action(
             &mut actions,
             Path::new("/var/log/databases-everywhere"),
-            Path::new(&self.config.paths.logs),
+            Path::new(&self.config.paths.logs_root()),
         );
+        // Logs from before they moved under paths.data. A subfolder keeps an
+        // old dbev.log from colliding with the current one.
+        let logs_root = PathBuf::from(self.config.paths.logs_root());
+        if !logs_root.starts_with(LEGACY_LOG_DIRECTORY) {
+            self.add_dir_action(
+                &mut actions,
+                Path::new(LEGACY_LOG_DIRECTORY),
+                &logs_root.join("legacy"),
+            );
+        }
         actions
             .into_iter()
             .filter(|action| action.from != action.to)

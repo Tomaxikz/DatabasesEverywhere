@@ -7,13 +7,7 @@
 //! certificate the daemon is configured to serve (it connects to a loopback
 //! address, so hostname checks cannot apply).
 
-use std::{
-    net::IpAddr,
-    os::unix::fs::FileTypeExt,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::IpAddr, os::unix::fs::FileTypeExt, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow, bail};
 use reqwest::{Method, StatusCode};
@@ -235,7 +229,8 @@ impl ApiTransport {
     /// The socket once the daemon has created it, or whenever there is no
     /// network API to fall back to; otherwise TCP, as configured.
     fn from_config(config: &Config) -> Self {
-        let socket = Path::new(&config.api.socket_path);
+        let socket = PathBuf::from(config.api_socket_path());
+        let socket = socket.as_path();
         let present =
             std::fs::metadata(socket).is_ok_and(|metadata| metadata.file_type().is_socket());
         if present || !config.api.enabled {

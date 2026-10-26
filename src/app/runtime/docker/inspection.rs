@@ -433,7 +433,8 @@ impl DockerRuntime {
             .unwrap_or_default()
             .into_iter()
             .find(|mount| mount.destination.as_deref() == Some(destination))
-            .and_then(|mount| mount.source.map(std::path::PathBuf::from)))
+            .and_then(|mount| mount.source.map(std::path::PathBuf::from))
+            .map(|source| super::host_paths::to_container(&source).unwrap_or(source)))
     }
 
     /// Fail closed when an existing managed container is not actually bound

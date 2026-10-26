@@ -52,7 +52,7 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigValidationError> {
         validate_api_tls(&config.api.ssl)?;
     }
     validate_api_hosts(config)?;
-    validate_api_socket(&config.api.socket_path)?;
+    validate_api_socket(&config.api_socket_path())?;
     validate_listener("postgres", &config.postgres, &config.tls)?;
     validate_listener("mariadb", &config.mariadb, &config.tls)?;
     validate_listener("mysql", &config.mysql, &config.tls)?;

@@ -1,35 +1,15 @@
-# DatabasesEverywhere on Docker Compose. Keep this file in a deployment folder:
-#
-#   compose.yml
-#   .env               optional, copied from .env.example
-#   config/config.yml  the panel-generated node config (folder 0700, file 0600)
-#
-# and run `docker compose up -d` from that folder. Relative paths below resolve
-# against the folder holding this file, wherever Compose is started from.
-# For more than one node on a host, give each folder its own DBEV_NODE and
-# directories in .env (see .env.example).
 name: ${DBEV_NODE:-dbev}
 
 services:
   dbev:
-    # Always the newest release. Pin a version in .env (DBEV_IMAGE) to stop
-    # upgrades on pull.
     image: ${DBEV_IMAGE:-ghcr.io/tomaxikz/databaseseverywhere:latest}
     pull_policy: always
     container_name: ${DBEV_NODE:-dbev}
     restart: unless-stopped
-
-    # Host networking lets DBEV bind its configured API and gateway addresses.
-    # Managed database containers use network_mode=none and are reached only
-    # through bind-mounted Unix sockets.
     network_mode: host
-    # Keep /proc/<engine-pid>/cgroup paths anchored in the host hierarchy so
-    # CPU burst writes can be resolved without accepting traversal.
     cgroup: host
 
-    # FuseQuota only (disk.mode fuse_quota, or auto without native quotas):
-    # /dev/fuse, SYS_ADMIN, the AppArmor override and the /etc/fuse.conf mount
-    # below. Remove all four when the node uses native quotas or soft_scanner.
+    # /dev/fuse, SYS_ADMIN, apparmor:unconfined and /etc/fuse.conf are for FuseQuota only.
     devices:
       - /dev/fuse:/dev/fuse
     cap_drop:
@@ -47,55 +27,33 @@ services:
     read_only: true
     init: true
     pids_limit: 1024
-    # Import/export operations have bounded 15-minute deadlines plus recovery.
     stop_grace_period: 21m
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,mode=1777
 
     volumes:
-      # Docker socket access is root-equivalent. Run this stack only on a
-      # dedicated host/VM and prefer a narrowly filtered socket proxy.
+      # Root-equivalent: run dbev on a dedicated host or VM.
       - /var/run/docker.sock:/var/run/docker.sock:rw
-      # The node config, read from config/config.yml next to this file unless
-      # DBEV_CONFIG_DIR points elsewhere. Writable: the config-admin endpoint
-      # replaces config.yml atomically inside this folder. Compose fails fast
-      # when the folder is missing instead of creating an empty one.
       - type: bind
         source: ${DBEV_CONFIG_DIR:-./config}
         target: /etc/databases-everywhere
         bind:
           create_host_path: false
-      # FuseQuota only: the host file must contain an uncommented
-      # `user_allow_other`.
       - /etc/fuse.conf:/etc/fuse.conf:ro
-      # CPU burst reconciliation needs the host process view to bind the
-      # engine-reported PID to its exact cgroup, plus write access to that
-      # cgroup's CPU controller. The Docker socket is already host-root-equivalent.
       - /proc:/host/proc:ro
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-      # Data and runtime paths must keep the same path on the host and in the
-      # container: DBEV hands these host paths to Docker when it creates the
-      # database containers. Change them only together with `paths` in the config.
       - type: bind
-        source: ${DBEV_DATA_DIR:-/var/lib/dbev}
-        target: ${DBEV_DATA_DIR:-/var/lib/dbev}
+        source: ${DBEV_DATA_DIR:-./data}
+        target: /var/lib/dbev
         bind:
+          create_host_path: true
           propagation: rshared
-      - ${DBEV_RUN_DIR:-/run/dbev}:${DBEV_RUN_DIR:-/run/dbev}
-      # Retained for configurations created before logs moved under
-      # /var/lib/dbev. New configurations use the data volume above.
-      - ${DBEV_LOG_DIR:-/var/log/dbev}:${DBEV_LOG_DIR:-/var/log/dbev}
-      # Uncomment whichever certificate directories your config references.
+      - ${DBEV_RUN_DIR:-./run}:/run/dbev
       # - /etc/letsencrypt:/etc/letsencrypt:ro
-      # - /etc/nginx/ssl:/etc/nginx/ssl:ro
 
     environment:
       RUST_LOG: ${RUST_LOG:-info}
 
-    # The management API accepts connections. The image ships bash but no
-    # curl, so this is a TCP probe; match DBEV_HEALTHCHECK_HOST/PORT in .env to
-    # api.host and api.port when they differ from the defaults. Boot can start
-    # every managed database first, hence the long start period.
     healthcheck:
       test:
         - CMD
@@ -107,8 +65,6 @@ services:
       retries: 3
       start_period: 3m
 
-    # The daemon also keeps its own rotated log under /var/lib/dbev/logs, so
-    # the container log only needs a short tail.
     logging:
       driver: json-file
       options:

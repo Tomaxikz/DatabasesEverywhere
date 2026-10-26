@@ -10,9 +10,9 @@ pub(in super::super) fn log_boot_config(config: &Config, config_path: &Path) {
         config = %config_path.display(),
         data = %config.paths.data,
         metadata = %config.paths.metadata_root(),
-        logs = %config.paths.logs,
-        sockets = %config.paths.sockets,
-        artifacts = %config.paths.artifacts,
+        logs = %config.paths.logs_root(),
+        sockets = %config.paths.sockets_root(),
+        artifacts = %config.paths.artifacts_root(),
         "configured paths"
     );
     tracing::info!(

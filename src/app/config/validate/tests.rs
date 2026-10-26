@@ -585,7 +585,7 @@ fn standalone_nodes_need_no_remote_and_add_no_panel_origin() {
 fn network_api_defaults_on_with_a_root_socket() {
     let config: Config = yaml_serde::from_str("api:\n  port: 8090\n").unwrap();
     assert!(config.api.enabled);
-    assert_eq!(config.api.socket_path, "/run/dbev/api.sock");
+    assert_eq!(config.api_socket_path(), "/run/dbev/api.sock");
 
     let config: Config = yaml_serde::from_str(
         "api:\n  enabled: false\n  socket_path: /run/databases-everywhere/api.sock\n",

@@ -154,7 +154,7 @@ pub async fn run(config_path: PathBuf, args: BenchArgs) -> anyhow::Result<()> {
         };
         let sample_interval = Duration::from_millis(args.bench_sample_interval_ms);
         let (resource_sampler, sampler_warnings) = ResourceSampler::start(
-            &config.paths.locks,
+            &config.paths.locks_root(),
             sample_interval,
             docker,
             instance_targets,

@@ -26,7 +26,7 @@ pub(super) fn log_config(engine: crate::config::DaemonEngine) -> HostConfigLogCo
 pub(super) fn bind_mount(source: &std::path::Path, target: &str, read_only: bool) -> Mount {
     Mount {
         typ: Some(MountType::BIND),
-        source: Some(source.display().to_string()),
+        source: Some(super::host_paths::to_host(source).display().to_string()),
         target: Some(target.to_string()),
         read_only: Some(read_only),
         ..Default::default()

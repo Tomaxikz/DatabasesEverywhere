@@ -1033,6 +1033,7 @@ async fn test_paths(root: &Path, runtime_id: &str) -> (InstancePaths, PathConfig
     let path = |name: &str| root.join(name).display().to_string();
     let config = PathConfig {
         data: path("data"),
+        run: path("run"),
         metadata: path("metadata"),
         volumes: path("volumes"),
         backups: path("backups"),

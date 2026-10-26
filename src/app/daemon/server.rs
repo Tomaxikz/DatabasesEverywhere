@@ -381,12 +381,12 @@ pub(super) async fn serve_api(
     daemon_shutdown: crate::state::DaemonShutdown,
     gateway_supervisor: GatewaySupervisor,
 ) -> anyhow::Result<()> {
-    let socket = ApiSocket::bind(&config.api.socket_path)?;
+    let socket = ApiSocket::bind(&config.api_socket_path())?;
     let network = if config.api.enabled {
         Some(NetworkApiListener::bind(config).await?)
     } else {
         tracing::warn!(
-            socket = %config.api.socket_path,
+            socket = %config.api_socket_path(),
             "api.enabled is false: no network API listener is open, so the panel cannot reach this node; manage it with dbev --cli over the API socket"
         );
         None

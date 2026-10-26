@@ -92,7 +92,8 @@ pub(crate) fn init_stdout_logging() {
 /// Callers hold the daemon lock and keep this guard until shutdown so queued
 /// records are flushed before the lock is released (statics are never dropped).
 pub(super) fn init_logging(config: &Config) -> anyhow::Result<WorkerGuard> {
-    let directory = Path::new(&config.paths.logs);
+    let directory = std::path::PathBuf::from(config.paths.logs_root());
+    let directory = directory.as_path();
     create_runtime_dirs(directory)?;
     harden_runtime_dir(directory)?;
     let writer = RollingLog::new(directory, LOG_BYTES)

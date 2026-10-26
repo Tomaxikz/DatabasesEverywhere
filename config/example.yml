@@ -74,8 +74,8 @@ api:
     require_client_cert: false
     client_ca: ''
   # Always serves the same API, without TLS, for `dbev --cli` and local
-  # tools. Root-only: mode 0600 in a 0700 directory the daemon creates.
-  socket_path: /run/dbev/api.sock
+  # tools. Root-only. Empty uses api.sock in paths.run.
+  socket_path: ""
 
 security:
   api_body_limit_bytes: 1048576
@@ -334,16 +334,9 @@ images:
     qdrant:
       - "qdrant/qdrant:v1.18.2"
 
+# Everything lives under these two. metadata, volumes, backups, logs,
+# artifacts, exports, imports, fuse and tmp (under data) and sockets and locks
+# (under run) can still be set one by one to move just that folder.
 paths:
   data: /var/lib/dbev
-  metadata: /var/lib/dbev/metadata
-  volumes: /var/lib/dbev/volumes
-  backups: /var/lib/dbev/backups
-  sockets: /run/dbev/sockets
-  locks: /run/dbev/locks
-  logs: /var/lib/dbev/logs
-  artifacts: /var/lib/dbev/artifacts
-  exports: /var/lib/dbev/artifacts/exports
-  imports: /var/lib/dbev/artifacts/imports
-  fuse: /var/lib/dbev/fuse
-  tmp: /var/lib/dbev/tmp
+  run: /run/dbev

@@ -39,9 +39,9 @@ impl InstancePaths {
         validate_instance_id(instance_id)?;
         let volumes_root_value = config.volumes_root();
         let data_root = root("paths.volumes", &volumes_root_value)?;
-        let logs_root = root("paths.logs", &config.logs)?;
-        let sockets_root = root("paths.sockets", &config.sockets)?;
-        let artifacts_root = root("paths.artifacts", &config.artifacts)?;
+        let logs_root = root("paths.logs_root()", &config.logs_root())?;
+        let sockets_root = root("paths.sockets_root()", &config.sockets_root())?;
+        let artifacts_root = root("paths.artifacts_root()", &config.artifacts_root())?;
         let exports_root = root("paths.exports", &config.exports_root())?;
         let imports_root = root("paths.imports", &config.imports_root())?;
         let backups_root = root("paths.backups", &config.backups_root())?;
