@@ -625,6 +625,7 @@ fn disabled_network_api_skips_tcp_only_settings() {
 fn api_socket_path_follows_runtime_path_rules() {
     let mut config = valid_config();
     for path in [
+        "",
         "/run/dbev/api.sock",
         "/run/databases-everywhere/admin/api.sock",
     ] {
@@ -633,7 +634,6 @@ fn api_socket_path_follows_runtime_path_rules() {
     }
 
     for (path, expected) in [
-        ("", "relative"),
         ("api.sock", "relative"),
         ("/run/dbev/", "non_normalized"),
         ("/run/dbev/./api.sock", "non_normalized"),
