@@ -2,8 +2,8 @@ name: Release
 run-name: Release ${{ inputs.version || github.ref_name }}
 
 # Push a tag (`git tag v1.2.0 && git push origin v1.2.0`) or run it by hand.
-# A version with a suffix (v1.2.0-rc.1) is a prerelease: no "latest" release
-# and no Docker `latest` tag.
+# A prerelease (the checkbox, or a suffix like v1.2.0-rc.1) is not marked
+# latest and does not move the Docker `latest` tag.
 on:
   push:
     tags:
@@ -14,6 +14,11 @@ on:
         description: "Version tag, e.g. v1.2.0 or v1.2.0-rc.1"
         required: true
         type: string
+      prerelease:
+        description: "Prerelease (not latest, no Docker latest tag)"
+        required: false
+        default: false
+        type: boolean
       draft:
         description: "Create the GitHub release as a draft (no Docker image)"
         required: false
@@ -59,6 +64,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version || github.ref_name }}
           DRAFT: ${{ inputs.draft || false }}
+          PRERELEASE: ${{ inputs.prerelease || false }}
           RELEASE_REF: ${{ github.ref }}
           RELEASE_SHA: ${{ github.sha }}
         shell: bash
@@ -103,7 +109,7 @@ jobs:
             exit 1
           fi
 
-          prerelease=false
+          prerelease="$PRERELEASE"
           if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
             prerelease=true
           fi
