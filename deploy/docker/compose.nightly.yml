@@ -1,7 +1,6 @@
 services:
   dbev:
     image: ghcr.io/tomaxikz/databaseseverywhere:nightly
-    pull_policy: always
     restart: unless-stopped
     network_mode: host
     # host cgroup lets dbev read and tune database containers' cgroups
