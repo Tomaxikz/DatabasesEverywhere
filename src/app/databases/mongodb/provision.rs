@@ -1,6 +1,4 @@
-/// Creates or repairs one database-scoped tenant account. The password is
-/// read from the managed exec environment so neither tenant nor administrator
-/// credentials appear in process argv.
+/// The password is read from the exec environment so no credential appears in argv.
 pub fn create_tenant_script(
     database: &str,
     username: &str,
@@ -36,9 +34,7 @@ if (user === null) {{
     ))
 }
 
-/// Runs a daemon-generated maintenance script through an authenticated local
-/// connection without placing the administrator password in `mongosh` argv.
-/// The caller supplies `DBE_ADMIN_PASSWORD` through the managed secret env.
+/// The caller supplies `DBE_ADMIN_PASSWORD` through the managed secret env, keeping it out of argv.
 pub fn admin_script(script: &str) -> String {
     format!(
         r#"
@@ -118,10 +114,7 @@ pub struct TenantQuota {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantQuotaPolicy {
-    /// MongoDB Community has no native per-database CPU, memory, connection,
-    /// or storage quota. These limits must be enforced by the gateway,
-    /// scheduler, and logical disk scanner instead of being represented as a
-    /// server-side guarantee.
+    /// MongoDB Community has no native per-database quotas; the gateway, scheduler and disk scanner enforce them.
     pub engine_enforced: bool,
     pub quota: TenantQuota,
 }
@@ -133,9 +126,7 @@ pub fn tenant_quota_policy(quota: TenantQuota) -> TenantQuotaPolicy {
     }
 }
 
-/// Emits one integer byte count per database, in input order. MongoDB's
-/// `totalSize` is allocated document plus index storage, including reusable
-/// free space, which is the conservative tenant quota measurement.
+/// `totalSize` includes reusable free space, the conservative quota measurement.
 pub fn tenant_storage_script(databases: &[&str]) -> Result<String, MongodbProvisionError> {
     for database in databases {
         validate_identifier("database", database)?;
@@ -155,9 +146,7 @@ for (const database of tenantDatabases) {{
     ))
 }
 
-/// Builds a tenant password rotation script which reads the replacement
-/// password from the managed container environment. Keeping the password out
-/// of generated JavaScript also keeps it out of diagnostics and test output.
+/// The password comes from the container environment, keeping it out of the script and diagnostics.
 pub fn password_update_script(
     database: &str,
     username: &str,

@@ -124,7 +124,6 @@ impl SoftDiskLimiter {
                 && protocol.engine().fuse_quota_unsupported())
     }
 
-    /// Return only samples matching the current target fingerprint.
     pub async fn snapshot(&self, target: &SoftDiskTarget) -> Option<SoftDiskSnapshot> {
         let fingerprint = TargetFingerprint::from(target);
         self.states

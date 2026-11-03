@@ -1,6 +1,5 @@
 use std::{fmt, path::PathBuf};
 
-/// Root-relative filesystem activity accumulated for one target.
 #[derive(Clone)]
 pub(crate) struct DirtyBatch {
     pub(super) target_id: String,
@@ -87,7 +86,6 @@ pub(crate) struct RetrySummary {
     pub(crate) backend_available: bool,
 }
 
-/// Coalesced watcher work and the sequence for the next wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatcherChanges {
     pub(crate) sequence: u64,
@@ -101,7 +99,6 @@ impl WatcherChanges {
     }
 }
 
-/// Opaque token for deferred kernel-watch cleanup.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RetiredWatch {
     pub(super) root: PathBuf,

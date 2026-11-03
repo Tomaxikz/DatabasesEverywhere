@@ -16,16 +16,13 @@ use super::{
 use crate::{databases::protocol::Protocol, io::files::ensure_private_dir};
 use flate2::{Compression, write::GzEncoder};
 
-/// Which links inside a data directory an archive may leave out. Every other
-/// link, and every special file, is refused.
+/// Links an archive may leave out; every other link and special file is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataArchiveSourcePolicy {
     Strict,
     /// MySQL's image links `mysql.sock` in the data directory to its socket.
     MysqlDataDirectory,
-    /// ClickHouse Atomic databases keep introspection links `metadata/<db>`
-    /// and `data/<db>/<table>` into `store/`. ClickHouse reads tables through
-    /// `store/` and recreates the database links when it loads them.
+    /// ClickHouse Atomic introspection links into `store/`; ClickHouse recreates them on load.
     ClickhouseDataDirectory,
 }
 
@@ -38,7 +35,6 @@ impl DataArchiveSourcePolicy {
         }
     }
 
-    /// What a manifest records as excluded when this policy omitted links.
     pub(crate) fn omitted_links_note(self) -> Option<&'static str> {
         match self {
             Self::Strict => None,
@@ -53,8 +49,6 @@ impl DataArchiveSourcePolicy {
 const MYSQL_RUNTIME_SOCKET: &str = "/var/run/mysqld/mysqld.sock";
 const CLICKHOUSE_DATA_TARGET: &str = "/var/lib/clickhouse";
 
-/// Whether the link at `relative` (inside the data directory) pointing at
-/// `link` is one the engine recreates and the archive may leave out.
 pub(crate) fn omits_engine_link(
     policy: DataArchiveSourcePolicy,
     relative: &Path,
@@ -72,9 +66,7 @@ pub(crate) fn omits_engine_link(
     }
 }
 
-/// True when `link`, placed at `relative`, names a directory below `store/`
-/// of the data directory, written relative to the link or absolute in the
-/// container.
+/// True when `link` at `relative` names a directory below `store/`, relative or absolute in the container.
 fn resolves_into_clickhouse_store(relative: &Path, link: &Path) -> bool {
     use std::path::Component;
 

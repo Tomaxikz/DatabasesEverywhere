@@ -20,23 +20,15 @@ pub struct InstanceMetadata {
     pub instance_id: String,
     #[serde(default)]
     pub deployment_mode: DeploymentMode,
-    /// Runtime ownership is normalized in SQLite. Empty values only occur
-    /// while reading metadata JSON written before placement was introduced.
+    /// Empty only for metadata JSON written before placement existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub runtime_id: String,
     pub protocol: Protocol,
     pub status: InstanceStatus,
-    /// Durable operator intent, kept separate from the observed runtime status.
-    ///
-    /// This is loaded from the normalized SQLite column by `InstanceRepository`
-    /// and deliberately omitted from API JSON to preserve the public response
-    /// shape. Runtime reconciliation may change `status`, but must never infer or
-    /// overwrite this value from a transient container state.
+    /// Durable operator intent; omitted from API JSON and never inferred from container state.
     #[serde(skip)]
     pub(crate) desired_state: DesiredInstanceState,
-    /// Durable restart hysteresis owned exclusively by the predictive disk
-    /// limiter. It lives in a normalized SQLite column and is omitted from
-    /// public instance JSON to preserve the API shape.
+    /// Restart hysteresis owned by the predictive disk limiter; omitted from API JSON.
     #[serde(skip)]
     pub(crate) disk_limit_blocked: bool,
     pub public: PublicEndpoint,
@@ -59,9 +51,7 @@ pub struct InstanceMetadata {
     pub mongodb_root_password: Option<String>,
     #[serde(default, skip_serializing)]
     pub postgres_admin_password: Option<String>,
-    /// Current tenant credential used only for daemon-managed maintenance and
-    /// rollback. The repository encrypts it separately from public metadata,
-    /// and API serialization always omits it.
+    /// Tenant credential for maintenance and rollback; stored encrypted and never serialized.
     #[serde(default, skip_serializing)]
     pub tenant_password: Option<String>,
     pub limits: InstanceLimits,
@@ -126,8 +116,7 @@ impl fmt::Debug for InstanceMetadata {
 }
 
 impl InstanceMetadata {
-    /// Returns the runtime that owns the engine process. Historical metadata
-    /// omitted the field because every instance owned its container.
+    /// Runtime owning the engine process; historical metadata omitted it (own container).
     pub fn runtime_id(&self) -> &str {
         if self.runtime_id.is_empty() {
             &self.instance_id

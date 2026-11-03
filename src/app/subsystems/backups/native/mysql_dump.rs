@@ -1,15 +1,3 @@
-//! MySQL online backup on any filesystem: one consistent logical dump.
-//!
-//! `mysqldump --single-transaction` reads every InnoDB table from a single
-//! transaction snapshot while writes continue. It is the same dump dbev's
-//! exports produce, run in a helper container from the instance's own image
-//! over the socket, so nothing executes in the serving container and nothing
-//! can restart it. The inventory first refuses non-InnoDB user tables, which a
-//! transaction snapshot does not cover.
-//!
-//! Restore loads the dump into the running instance through the regular
-//! wipe-and-import path, which takes a rollback dump first.
-
 use std::{collections::BTreeMap, path::PathBuf};
 
 use futures::future::BoxFuture;
@@ -38,10 +26,8 @@ const RESTORE_RECIPE_ID: &str = "mysql.logical_dump.import";
 const RESTORE_RECIPE_VERSION: u32 = 1;
 const DATA_ROOT: &str = "mysql";
 const RESTORE_TARGET: &str = "mysql-dump";
-/// `.sql` keeps the importer's format detection on plain SQL.
 const DUMP_FILE: &str = "backup.mysql.sql";
 const SOCKET_DIRECTORY: &str = "/var/run/mysqld";
-/// mysqldump ends a complete dump with this comment.
 const DUMP_COMPLETED: &[u8] = b"-- Dump completed";
 const TAIL_BYTES: u64 = 4096;
 
@@ -134,8 +120,6 @@ fn static_gate(ctx: &OnlineBackupContext<'_>) -> Result<(), StrategyError> {
     mysql_inventory::static_gate(ctx)
 }
 
-/// The export script dbev already uses, writing into staging instead of a
-/// stream, behind a umask and the output directory.
 fn dump_script(ctx: &OnlineBackupContext<'_>) -> Result<String, StrategyError> {
     let output = format!("{BACKUP_HELPER_STAGING}/{DATA_ROOT}/{DUMP_FILE}");
     let script = ctx
@@ -191,7 +175,6 @@ async fn capture_dump(
     Ok(CaptureResult {
         data_root: PathBuf::from(DATA_ROOT),
         restore_target: PathBuf::from(RESTORE_TARGET),
-        // Every InnoDB table read in one transaction snapshot.
         consistency: ConsistencyLevel::TransactionalSnapshot,
         recovery: RecoveryCoordinates(recovery),
         engine_version: Some(inventory.version),
@@ -203,7 +186,6 @@ async fn capture_dump(
     })
 }
 
-/// The dump exists, is a regular non-empty file and mysqldump finished it.
 fn check_dump(path: &std::path::Path) -> Result<u64, String> {
     use std::io::{Read, Seek, SeekFrom};
 

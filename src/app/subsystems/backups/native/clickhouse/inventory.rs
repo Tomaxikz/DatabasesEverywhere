@@ -1,11 +1,3 @@
-//! Decides which ClickHouse tables a per-table freeze can capture.
-//!
-//! MergeTree tables on the default disk are frozen. Engines that keep no
-//! local data (views, dictionaries, integrations) need only their metadata.
-//! Anything else with files of its own (Log family, Set, Join, Buffer, ...)
-//! and every database engine other than Atomic is refused: a live copy of
-//! those files would not be a consistent point.
-
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
@@ -15,8 +7,6 @@ use crate::subsystems::backups::strategy::StrategyError;
 const DATA_DIRECTORY: &str = "/var/lib/clickhouse/";
 const SYSTEM_DATABASES: [&str; 3] = ["system", "information_schema", "INFORMATION_SCHEMA"];
 const DATABASE_ENGINES: [&str; 2] = ["Atomic", "Memory"];
-/// Engines whose rows live elsewhere (another table, a remote system or
-/// nowhere); their metadata is the whole backup.
 const METADATA_ONLY_ENGINES: [&str; 17] = [
     "View",
     "MaterializedView",
@@ -56,7 +46,6 @@ pub(super) struct TableRow {
     pub data_paths: Vec<String>,
 }
 
-/// A MergeTree table to freeze and its data directory, `store/<xyz>/<uuid>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FrozenTable {
     pub database: String,
@@ -115,8 +104,6 @@ pub(super) fn plan(databases: &[DatabaseRow], tables: &[TableRow]) -> Result<Pla
     Ok(plan)
 }
 
-/// The table's single data path on the default disk, relative to the data
-/// directory: exactly `store/<first three uuid characters>/<uuid>`.
 fn table_directory(table: &TableRow) -> Result<PathBuf, StrategyError> {
     let outside = || {
         StrategyError::Unsupported(format!(

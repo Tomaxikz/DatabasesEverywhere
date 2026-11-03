@@ -1,13 +1,3 @@
-//! Qdrant online backup on any filesystem: per-collection snapshots.
-//!
-//! Qdrant's snapshot API captures each collection while it keeps serving.
-//! The daemon calls it over the instance's always-on HTTP socket, so nothing
-//! executes in the serving container. Collections are consistent one by one,
-//! not at one common point.
-//!
-//! Restore wipes the running instance and uploads the snapshots through the
-//! remote-import apply path, which first saves rollback snapshots.
-
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use futures::future::BoxFuture;
@@ -156,7 +146,6 @@ async fn capture_snapshots(
     Ok(CaptureResult {
         data_root: PathBuf::from(DATA_ROOT),
         restore_target: PathBuf::from(RESTORE_TARGET),
-        // Each collection is its own snapshot point.
         consistency: ConsistencyLevel::PerObject,
         recovery: RecoveryCoordinates(recovery),
         engine_version: Some(summary.qdrant_version),

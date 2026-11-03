@@ -39,7 +39,6 @@ const DEFAULT_RETRY_INITIAL: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MAXIMUM_PENDING_TARGETS: usize = 4_096;
 
-/// Process-wide recursive watcher with serialized registration.
 pub(crate) struct SoftDiskWatcher {
     shared: Arc<Shared>,
     backend: Mutex<BackendState>,

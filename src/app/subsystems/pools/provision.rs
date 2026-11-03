@@ -35,16 +35,11 @@ pub(crate) async fn provision_pool(
     let image = pool.image.as_str();
     let mut limits = pool.limits.limits();
     let runtime_id = runtime_id.to_string();
-    // Container events use this same lock before reading and persisting pool
-    // state. Holding it across the first durable row, bootstrap, and any
-    // cleanup prevents an early event from reviving a failed pool from a stale
-    // snapshot.
+    // Container events use this same lock before reading and persisting pool state.
     let runtime_operation = state.instance_locks.lock(&runtime_id).await;
     let admin_password = generate_admin_password();
     let paths = InstancePaths::new(&state.config.paths, &runtime_id).map_err(ApiError::runtime)?;
-    // Resolve every fallible identity value before creating the pool's
-    // filesystem namespace. From create_dirs onward there is no durable row
-    // for boot recovery until the initial placement save succeeds.
+    // Resolve every fallible identity value before creating the pool's filesystem namespace.
     let backend = backend_endpoint(state, protocol, &runtime_id)?;
     let container_name = state
         .docker
@@ -312,9 +307,8 @@ async fn cleanup_unpersisted_runtime(
         Some(disk_enforcement_method),
     )
     .await;
-    // purge_provisional_runtime_paths deliberately preserves logical instance
-    // artifacts for deployment rollback. A brand-new pool has no logical
-    // owner, so remove the artifacts directory created by create_dirs too.
+    // purge_provisional_runtime_paths deliberately preserves logical instance artifacts for
+    // deployment rollback.
     let artifact_cleanup =
         crate::subsystems::instances::major_upgrade::remove_path_if_exists(&paths.artifacts).await;
     let cleanup_error = match (physical_cleanup, artifact_cleanup) {
@@ -465,7 +459,6 @@ mod tests {
         let (state, _database) = crate::subsystems::test_support::database(config).await;
         let paths = InstancePaths::new(&state.config.paths, "pool_postgres_unpersisted").unwrap();
         paths.create_dirs().await.unwrap();
-        // Old installations may still have a log directory to purge.
         tokio::fs::create_dir_all(&paths.logs).await.unwrap();
         for path in [
             &paths.data,

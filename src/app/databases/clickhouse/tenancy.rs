@@ -52,10 +52,7 @@ pub(crate) fn tenant_quota(limits: &InstanceLimits) -> TenantQuota {
         max_execution_time_seconds: 15 * 60,
         max_result_bytes: memory_bytes / 2,
         max_temp_bytes: mib_to_bytes(limits.disk_mib),
-        // Query history is an accounting input in shared pools. A finite
-        // quota bounds the engine-owned query_log independently of tenant
-        // table quotas; sustained higher-throughput workloads should use a
-        // dedicated ClickHouse engine.
+        // A finite quota bounds the engine-owned query_log; heavier workloads need a dedicated engine.
         max_queries_per_hour: SHARED_QUERIES_PER_HOUR,
         max_read_bytes_per_hour: 0,
         max_written_bytes_per_hour: 0,

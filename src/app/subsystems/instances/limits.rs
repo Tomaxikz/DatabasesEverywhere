@@ -40,7 +40,6 @@ pub async fn update_instance_limits(
     // admitted, so abandoned requests cannot accumulate background waiters.
     let creation = state.instance_locks.lock_creation().await;
     let operation = state.instance_locks.lock(&instance_id).await;
-    // The worker owns the locks through commit or ordinary error rollback.
     spawn_owned_mutation_task(async move {
         let _mutation = mutation;
         let _operation = operation;

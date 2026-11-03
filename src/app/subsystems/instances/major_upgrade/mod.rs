@@ -324,9 +324,6 @@ async fn recover_upgrade_commit_failure(
 ) -> Result<(), ApiError> {
     match resolve_upgrade_commit(state, previous_metadata, metadata).await {
         MajorUpgradeCommitResolution::Committed => {
-            // `InstanceManager` updates the route store only after the
-            // repository returns `Ok`. Rebuild that in-memory side of the
-            // commit after verifying SQLite contains the intended row.
             state.instances.upsert(metadata.clone()).await;
             tracing::warn!(
                 event = "audit instance_major_upgrade_commit_ack_lost",

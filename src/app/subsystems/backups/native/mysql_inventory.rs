@@ -1,10 +1,5 @@
-//! MySQL pre-capture inventory, shared by the volume snapshot and the
-//! consistent dump.
-//!
-//! InnoDB recovers a crash-consistent copy from its redo log and gives
-//! `--single-transaction` dumps one snapshot. Non-transactional engines
-//! (MyISAM, CSV, ...) do neither, so instances with such user tables are
-//! refused rather than captured inconsistently.
+//! InnoDB recovers a crash-consistent copy from its redo log and gives `--single-transaction` dumps
+//! one snapshot.
 
 use std::time::Duration;
 
@@ -72,7 +67,6 @@ fn script() -> String {
     )
 }
 
-/// The root credential, refused when it could change the option file.
 pub(crate) fn root_password(ctx: &OnlineBackupContext<'_>) -> Result<SecretString, StrategyError> {
     let password = ctx
         .metadata

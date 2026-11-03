@@ -86,16 +86,9 @@ pub(crate) struct SharedImportRequest<'a> {
     pub(crate) postgres_wrapper_lines: Option<(u64, u64)>,
 }
 
-/// Performs bounded, side-effect-free admission checks for a shared-engine import.
-///
-/// Approval never authorizes an administrator/root restore. Callers must still use
-/// an isolated staging helper and the exact tenant credential represented here.
-/// Shared imports intentionally reject engine-level database creation, roles,
-/// grants, executable routines, triggers, events, external/remote table engines,
-/// system namespaces, and cross-database objects. MongoDB imports additionally
-/// reject system collections, cross-database namespaces, views, and executable
-/// validator metadata. Physical data-directory restores are never supported for
-/// shared runtimes because they cannot preserve tenant isolation.
+/// Bounded, side-effect-free admission checks for a shared-engine import. Approval never
+/// authorizes an administrator/root restore: callers still stage in an isolated helper with
+/// the tenant credential. Physical data-directory restores are never supported for shared runtimes.
 pub(crate) async fn validate_shared_import(
     path: &Path,
     request: SharedImportRequest<'_>,

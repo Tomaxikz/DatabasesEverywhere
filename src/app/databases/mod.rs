@@ -17,8 +17,7 @@ pub(crate) fn quote_mysql_ident(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
-/// MySQL-family database names in database-level grants are patterns even
-/// when quoted. Escape their pattern metacharacters before identifier quoting.
+/// Database names in MySQL grants are patterns even when quoted; escape the metacharacters.
 pub(crate) fn quote_mysql_grant_db(database: &str) -> String {
     let escaped = database
         .replace('\\', "\\\\")
@@ -27,9 +26,7 @@ pub(crate) fn quote_mysql_grant_db(database: &str) -> String {
     quote_mysql_ident(&escaped)
 }
 
-/// Replaces every existing account grant with the tenant-safe shared profile.
-/// Executable schema objects stay excluded because shared logical restores do
-/// not accept routines or triggers.
+/// Routines and triggers stay excluded because shared logical restores do not accept them.
 pub(crate) fn mysql_shared_grant_sql(database: &str, username: &str) -> String {
     let database = quote_mysql_grant_db(database);
     let username = quote_mysql_ident(username);
@@ -71,8 +68,7 @@ pub(crate) fn mysql_drop_sql(database: &str, username: &str) -> String {
     )
 }
 
-/// Returns one allocated table-and-index byte count per schema, in input
-/// order. Binary comparison keeps tenant identity matching case-sensitive.
+/// Binary comparison keeps tenant identity matching case-sensitive.
 pub(crate) fn mysql_storage_sql(databases: &[&str]) -> String {
     databases
         .iter()
@@ -86,8 +82,7 @@ pub(crate) fn mysql_storage_sql(databases: &[&str]) -> String {
         .join("\n")
 }
 
-/// Counts objects that a tenant-only MySQL-family dump cannot replay exactly.
-/// Run this as the engine administrator while the tenant route is fenced.
+/// Run as the engine administrator while the tenant route is fenced.
 pub(crate) fn mysql_rollback_gap_sql(database: &str, username: &str) -> String {
     let database = quote_mysql_string(database);
     let definer = quote_mysql_string(&format!("{username}@%"));

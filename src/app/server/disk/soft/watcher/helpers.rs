@@ -19,7 +19,6 @@ pub(super) fn create_backend(shared: Arc<Shared>) -> notify::Result<RecommendedW
     )
 }
 
-/// Unwind partial recursive registrations reported by `notify`.
 pub(super) fn install_recursive_watch<W: Watcher>(
     watcher: &mut W,
     root: &Path,

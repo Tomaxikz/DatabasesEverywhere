@@ -98,9 +98,8 @@ pub(super) fn plan_panic_recovery(
 }
 
 pub(super) async fn recover_password_panic(state: &AppState, instance_id: &str) -> String {
-    // This durable read runs while the supervisor still owns the instance
-    // operation lock. A successful credential commit may have happened just
-    // before the worker panicked, while the in-memory store is still stale.
+    // A successful credential commit may have happened just before the worker panicked, while the
+    // in-memory store is still stale.
     let persisted = state
         .manager
         .get_persisted(instance_id)
@@ -471,25 +470,21 @@ async fn rollback_in_place_password_reset(
             .await
             .is_err()
         {
-            // A timed-out ACL LOAD may have completed just before the runtime
-            // recovered the exec by restarting the container. Try the other
-            // known credential so rollback remains deterministic in either
-            // state.
+            // A timed-out ACL LOAD may have completed just before the runtime recovered the exec
+            // by restarting the container.
             activate_resp_acl(context.state, context.metadata, fallback_password).await?;
         }
         return Ok(());
     }
 
-    // The mutation flag is set immediately before a live database command is
-    // dispatched. If it is still clear, preparation or administrator
-    // verification failed and the tenant credential was never touched.
+    // The mutation flag is set immediately before a live database command is dispatched.
     if !credential_changed {
         return Ok(());
     }
 
-    // PostgreSQL and MySQL can restore the exact captured verifier rather than
-    // deriving a new salted verifier from plaintext. This also handles legacy
-    // instances whose tenant plaintext was never persisted.
+    // PostgreSQL and MySQL can restore the exact captured verifier rather than deriving a new
+    // salted verifier from plaintext. This also handles legacy instances whose tenant plaintext
+    // was never persisted.
     let rollback_password = match context.metadata.protocol.engine().credential_rollback() {
         CredentialRollback::PostgresVerifier | CredentialRollback::MysqlAuthString => None,
         _ => context.previous.environment.as_ref(),
@@ -650,9 +645,8 @@ async fn rollback_password_reset(
     }
 
     let no_progress = |_event| {};
-    // The old spec (and restored RESP ACL above) is the rollback. Its normal
-    // launch readiness probe authenticates with the old credential, so a
-    // rollback cannot be reported as successful while authentication is stale.
+    // Its normal launch readiness probe authenticates with the old credential, so a rollback
+    // cannot be reported as successful while authentication is stale.
     launch_container_from_spec(
         state,
         old_spec,

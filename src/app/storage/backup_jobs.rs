@@ -55,7 +55,6 @@ impl BackupJobState {
         .ok_or_else(|| BackupJobStorageError::InvalidState(value.to_string()))
     }
 
-    /// States from which `self` may be entered.
     fn predecessors(self) -> &'static [Self] {
         match self {
             Self::Admitted => &[],
@@ -103,7 +102,6 @@ pub struct BackupResourceRecord {
     pub survives_restart: bool,
 }
 
-/// Unsettled publication of one backup id (`backup_publications`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationState {
     /// Upload started; whether the backup became visible is unknown.
@@ -141,7 +139,6 @@ pub struct BackupPublicationRecord {
     pub updated_at: String,
 }
 
-/// One `backup_publication_resources` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationResourceRecord {
     pub kind: String,
@@ -159,7 +156,6 @@ impl BackupJobRepository {
         Self { pool }
     }
 
-    /// Records a new job before any resource or staging exists.
     pub async fn admit(&self, job: &BackupJobRecord) -> Result<(), BackupJobStorageError> {
         if job.state != BackupJobState::Admitted {
             return Err(BackupJobStorageError::InvalidState(
@@ -189,7 +185,6 @@ impl BackupJobRepository {
         Ok(())
     }
 
-    /// Moves a job forward only along an allowed edge.
     pub async fn transition(
         &self,
         job_id: &str,
@@ -306,7 +301,6 @@ impl BackupJobRepository {
             .collect()
     }
 
-    /// Jobs interrupted mid-flight or still owning resources.
     pub async fn needing_recovery(
         &self,
         instance_id: Option<&str>,
@@ -344,7 +338,6 @@ impl BackupJobRepository {
         row.map(row_to_job).transpose()
     }
 
-    /// Keeps a bounded audit tail of finished jobs.
     pub async fn prune_terminal(&self) -> Result<u64, BackupJobStorageError> {
         let result = sqlx::query(
             r#"
@@ -364,7 +357,6 @@ impl BackupJobRepository {
         Ok(result.rows_affected())
     }
 
-    /// Journals a publication before any object is uploaded.
     pub async fn begin_publication(
         &self,
         record: &BackupPublicationRecord,
@@ -424,7 +416,6 @@ impl BackupJobRepository {
         Ok(())
     }
 
-    /// Records why a publication is still unsettled.
     pub async fn note_publication_error(
         &self,
         backup_id: &str,

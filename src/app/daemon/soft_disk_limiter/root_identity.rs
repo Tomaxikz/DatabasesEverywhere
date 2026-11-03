@@ -18,7 +18,6 @@ struct Observation {
     identity: RootIdentity,
 }
 
-/// Tracks identities observed by bounded scan and watch workers.
 #[derive(Debug, Default)]
 pub(super) struct RootIdentityTracker {
     observations: HashMap<String, Observation>,
@@ -74,7 +73,6 @@ impl RootIdentityTracker {
     }
 }
 
-/// Binds a watch to both metadata generation and opened inode.
 pub(super) fn watch_fingerprint(
     target_fingerprint: &str,
     identity: Option<RootIdentity>,

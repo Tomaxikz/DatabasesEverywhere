@@ -65,8 +65,6 @@ impl Default for ActivityCounter {
 }
 
 impl ActivityCounter {
-    /// Records one accepted operation. This is the hot-path alias used by the
-    /// protocol gateways.
     pub fn record(&self, kind: OperationKind) {
         self.accept(kind);
     }
@@ -77,26 +75,19 @@ impl ActivityCounter {
 
     pub fn accept_many(&self, kind: OperationKind, count: u64) {
         add(&self.accepted[kind.index()], count);
-        // Publish availability only after the corresponding count is visible.
-        // Readers use an acquire load, so they cannot observe a measured zero
-        // while this sample is still being applied.
+        // Publish availability only after the count is visible (readers acquire-load).
         self.operations_measured.store(true, Ordering::Release);
     }
 
-    /// Marks a gateway parser as available before it observes its first
-    /// operation. This lets an idle interval report a measured zero instead
-    /// of looking indistinguishable from an unsupported protocol.
+    /// Marks the parser available before its first operation so idle intervals report a measured zero.
     pub(crate) fn mark_gateway_ops_available(&self) {
         self.operations_measured.store(true, Ordering::Release);
     }
 
-    /// Adds one aggregate engine observation without looping per query. A
-    /// successful all-zero interval still marks operations as available.
+    /// Adds one aggregate engine observation; an all-zero interval still marks operations available.
     #[cfg(test)]
     pub(crate) fn observe_operations(&self, counts: OperationCounts) {
-        // One engine sample contains four categories that belong to the same
-        // observation window. Serialize it with snapshots so a minute bucket
-        // cannot split one aggregate across two samples.
+        // Serialize with snapshots so a minute bucket cannot split one aggregate sample.
         let _observation = self.lock_sample();
         if availability_changed(
             &self.operations_measured,
@@ -108,7 +99,6 @@ impl ActivityCounter {
         self.observe_operations_locked(counts);
     }
 
-    /// Records a rejection that could not be classified more precisely.
     pub fn reject(&self) {
         self.reject_kind(OperationKind::Other);
     }
@@ -126,9 +116,7 @@ impl ActivityCounter {
         self.operations_measured.load(Ordering::Acquire)
     }
 
-    /// Updates optional engine-source availability without discarding any
-    /// cumulative values already observed. `operations` is `None` for engines
-    /// whose operation counter comes from the gateway instead.
+    /// Updates source availability keeping cumulative values; `operations` is `None` when the gateway counts.
     pub(crate) fn set_engine_availability(
         &self,
         cpu: bool,
@@ -152,8 +140,6 @@ impl ActivityCounter {
                 });
     }
 
-    /// Reconciles cumulative byte counters from the canonical gateway network
-    /// meter without changing authenticated connection accounting.
     pub fn observe_network(&self, rx_bytes: u64, tx_bytes: u64) {
         let _sample = self.lock_sample();
         self.rx_bytes
@@ -176,9 +162,7 @@ impl ActivityCounter {
         self.observe_locked(cpu_time_micros, peak_query_memory_bytes);
     }
 
-    /// Publishes one complete engine interval. Values, aggregate operations,
-    /// source availability, and a possible counter discontinuity become
-    /// visible under one lock so a history boundary cannot split the sample.
+    /// Publishes one engine interval under one lock so a history boundary cannot split it.
     pub(crate) fn observe_engine_sample(&self, observation: EngineObservation) {
         let _sample = self.lock_sample();
         if observation.discontinuity {
@@ -258,8 +242,7 @@ impl ActivityCounter {
     }
 
     fn snapshot_locked(&self) -> CounterSnapshot {
-        // Availability is published with Release only after numeric values.
-        // Acquire it first, then read the values it makes visible.
+        // Availability is Release-published after the values; Acquire it first.
         let cpu_available = self.cpu_measured.load(Ordering::Acquire);
         let memory_available = self.memory_measured.load(Ordering::Acquire);
         let operations_available = self.operations_measured.load(Ordering::Acquire);
@@ -365,9 +348,7 @@ fn availability_changed(flag: &AtomicBool, initialized: &AtomicBool, available: 
     if initialized.swap(true, Ordering::Relaxed) {
         previous != available
     } else {
-        // A first available sample can arrive after a history baseline was
-        // taken. Mark that boundary; a first unavailable state has no values
-        // that could contaminate the bucket.
+        // A first available sample after a history baseline marks a boundary; unavailable has nothing to contaminate.
         available
     }
 }

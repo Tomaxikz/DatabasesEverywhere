@@ -70,7 +70,6 @@ impl UsageTreeSlot {
         true
     }
 
-    /// Reserve the reconciled cache size before publishing it.
     pub(super) fn account_reconciled_cache(&self, state: &mut UsageTreeSlotState) -> bool {
         let Some(new_count) = state
             .cache

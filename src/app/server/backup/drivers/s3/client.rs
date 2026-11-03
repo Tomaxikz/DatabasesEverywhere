@@ -1,6 +1,3 @@
-//! Mapping of [`BackupS3Config`] onto `object_store`, the HTTP client both
-//! share, and the signed S3 calls `object_store` has no API for.
-
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -77,9 +74,7 @@ pub(super) fn credentials(config: &BackupS3Config) -> Result<S3Credentials, Back
     })
 }
 
-/// The service endpoint: the custom endpoint, with the bucket prepended to
-/// its host for virtual-hosted style, or AWS's regional endpoint. Its string
-/// form is part of the storage identity, so it must stay stable.
+/// Service endpoint; its string form is part of the storage identity and must stay stable.
 pub(super) fn endpoint_base(config: &BackupS3Config) -> Result<Url, BackupStoreError> {
     let custom_endpoint = config.endpoint.trim();
     let region = config.region.trim();
@@ -109,7 +104,6 @@ pub(super) fn endpoint_base(config: &BackupS3Config) -> Result<Url, BackupStoreE
     Ok(base)
 }
 
-/// URL of the bucket itself, to which `object_store` appends object keys.
 pub(super) fn bucket_endpoint(base: &Url, config: &BackupS3Config) -> String {
     let mut endpoint = base.as_str().trim_end_matches('/').to_string();
     if config.path_style {
@@ -184,8 +178,7 @@ pub(super) fn remote_error(operation: &str, error: object_store::Error) -> Backu
     BackupStoreError::Remote(format!("S3 {operation} failed: {error}"))
 }
 
-/// Hands `object_store` the preconfigured client instead of letting it build
-/// one from [`ClientOptions`], so TLS roots and timeouts stay ours.
+/// Hands `object_store` our client so TLS roots and timeouts stay ours.
 #[derive(Debug)]
 struct FixedConnector(HttpClient);
 
@@ -195,9 +188,7 @@ impl HttpConnector for FixedConnector {
     }
 }
 
-/// Caps every response body except a successful object download at
-/// [`MAX_RESPONSE_BYTES`], so a hostile endpoint cannot make the daemon
-/// buffer an unbounded listing or error document.
+/// Caps response bodies except object downloads at [`MAX_RESPONSE_BYTES`], against hostile endpoints.
 #[derive(Debug)]
 struct BoundedService(reqwest::Client);
 
@@ -257,7 +248,6 @@ impl Body for BoundedBody {
     }
 }
 
-/// Signed bucket-level requests for multipart upload discovery.
 pub(super) struct UploadAdmin {
     http: HttpClient,
     credential: AwsCredential,
@@ -282,9 +272,7 @@ impl UploadAdmin {
         }
     }
 
-    /// Sends a signed request for `key` (or the bucket when empty), retrying
-    /// throttling, server errors and transport failures. Returns the status
-    /// and the bounded body.
+    /// Sends a signed request, retrying throttling, server errors and transport failures; returns status and bounded body.
     pub(super) async fn send(
         &self,
         method: Method,

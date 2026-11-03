@@ -1,17 +1,11 @@
 //! Atomic, read-only snapshots of one instance volume on Btrfs or ZFS.
 //!
-//! With native quotas on those filesystems every instance data directory is
-//! its own subvolume or dataset, so one snapshot captures exactly that
-//! instance at a single instant while it keeps running. The copy is
-//! crash-consistent: the engine recovers it from its own journal, as after a
-//! power loss. Snapshot names always carry a backup job tag so cleanup never
-//! touches anything else.
+//! Snapshot names always carry a backup job tag so cleanup never touches anything else.
 
 use std::path::{Path, PathBuf};
 
 use super::{DiskLimitError, btrfs, privileged_command, zfs};
 
-/// `disk_enforcement_method` values whose volumes support snapshots.
 const BTRFS_METHOD: &str = "host_btrfs_qgroup";
 const ZFS_METHOD: &str = "host_zfs_refquota";
 
@@ -22,8 +16,6 @@ pub(crate) enum SnapshotBackend {
 }
 
 impl SnapshotBackend {
-    /// The backend of an instance whose disk limit uses a native subvolume or
-    /// dataset, or `None` for directories without atomic snapshots.
     pub(crate) fn for_enforcement_method(method: &str) -> Option<Self> {
         match method {
             BTRFS_METHOD => Some(Self::Btrfs),
@@ -40,10 +32,8 @@ impl SnapshotBackend {
     }
 }
 
-/// A snapshot that exists until [`destroy`] removes it.
 #[derive(Debug, Clone)]
 pub(crate) struct VolumeSnapshot {
-    /// Read-only tree of the volume as it was at the snapshot instant.
     pub read_root: PathBuf,
 }
 
@@ -71,7 +61,6 @@ fn invalid_name(name: &str) -> DiskLimitError {
     }
 }
 
-/// Takes an atomic read-only snapshot of the instance volume at `data_path`.
 pub(crate) async fn create(
     backend: SnapshotBackend,
     data_path: &Path,
@@ -113,8 +102,6 @@ pub(crate) async fn create(
     }
 }
 
-/// Removes the named snapshot of the volume at `data_path`. A snapshot that is
-/// already gone counts as removed.
 pub(crate) async fn destroy(
     backend: SnapshotBackend,
     data_path: &Path,

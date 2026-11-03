@@ -88,7 +88,6 @@ impl SoftDiskBlockReason {
 }
 
 pub trait SoftDiskRuntime: Send + Sync {
-    /// Persist stopped intent before touching the runtime.
     fn mark_disk_blocked<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
@@ -103,12 +102,10 @@ pub trait SoftDiskRuntime: Send + Sync {
 
     fn force_kill<'a>(&'a self, target: &'a SoftDiskTarget) -> RuntimeFuture<'a>;
 
-    /// Clear only the limiter-owned block after crossing recovery hysteresis.
     fn clear_disk_blocked<'a>(&'a self, _target: &'a SoftDiskTarget) -> RuntimeFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 
-    /// Persist and enforce stop intent; production wraps this in a lifecycle lock.
     fn enforce_disk_stop<'a>(
         &'a self,
         target: &'a SoftDiskTarget,
@@ -143,12 +140,9 @@ pub enum ScanOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) enum HybridScanRequest {
-    /// Authoritative O(depth) scan that does not retain incremental state.
     StreamingFull,
     Full,
-    Partial {
-        relative_directories: Vec<PathBuf>,
-    },
+    Partial { relative_directories: Vec<PathBuf> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -84,9 +84,7 @@ impl DiskLimiter {
         self.config.mode
     }
 
-    /// Resolve the per-instance mode. Qdrant explicitly rejects FUSE-backed
-    /// storage because its mmap/cache assumptions can corrupt vector data, so
-    /// it uses the predictive scanner whenever the node fallback is FuseQuota.
+    /// Qdrant rejects FUSE-backed storage (mmap/cache assumptions can corrupt vectors), so it uses the predictive scanner when the node fallback is FuseQuota.
     pub fn mode_for_protocol(&self, protocol: Protocol) -> DiskLimitMode {
         if protocol.engine().fuse_quota_unsupported()
             && self.config.mode == DiskLimitMode::FuseQuota
@@ -103,22 +101,15 @@ impl DiskLimiter {
         limiter
     }
 
-    /// Build a limiter for an already-mounted legacy FuseQuota runtime.
-    ///
-    /// This deliberately ignores the node's current selection. It is used
-    /// only while a safe container migration is deferred or rolled back, so
-    /// boot reconciliation continues to verify the enforcement the container
-    /// is actually bound to instead of claiming the newly configured mode.
+    /// Limiter for an already-mounted legacy FuseQuota runtime, ignoring the node's current selection
+    /// so boot reconciliation verifies the enforcement the container is actually bound to.
     pub fn legacy_fuse_limiter(&self) -> Self {
         let mut limiter = self.clone();
         limiter.config.mode = DiskLimitMode::FuseQuota;
         limiter
     }
 
-    /// Resolve the actual method for an existing instance. New Qdrant
-    /// instances never use FUSE, but a pre-exclusion container whose safe
-    /// migration was deferred must remain truthfully attached to, verified
-    /// against, and updated through its legacy mount until migration succeeds.
+    /// Actual method for an existing instance: a pre-exclusion Qdrant container with deferred migration stays on its legacy mount.
     pub fn for_persisted_protocol(&self, protocol: Protocol, persisted_method: &str) -> Self {
         if protocol.engine().fuse_quota_unsupported()
             && DiskLimitMode::from_persisted_method(persisted_method)
@@ -130,9 +121,7 @@ impl DiskLimiter {
         }
     }
 
-    /// Resolve persisted enforcement without applying current selection
-    /// policy. Destructive cleanup and rollback use this so mode changes do
-    /// not orphan old Fuse helpers/mounts or native quota artifacts.
+    /// Persisted enforcement without current selection policy, so mode changes don't orphan old helpers, mounts or native quotas.
     pub fn for_persisted_method(&self, persisted_method: &str) -> Self {
         let mut limiter = self.clone();
         let Some(mode) = DiskLimitMode::from_persisted_method(persisted_method) else {
@@ -142,9 +131,7 @@ impl DiskLimiter {
         limiter
     }
 
-    /// Validate method changes that share the same raw bind path. A native
-    /// project quota remains active until explicitly removed; relabelling it
-    /// as soft enforcement would be false telemetry and surprising policy.
+    /// A native project quota stays active until explicitly removed; relabelling it as soft would be false telemetry.
     pub fn check_method_change(&self, persisted_method: &str) -> Result<(), DiskLimitError> {
         if DiskLimitMode::from_persisted_method(persisted_method)
             == Some(DiskLimitMode::ProjectQuota)

@@ -36,7 +36,6 @@ fn minio_driver() -> S3BackupDriver {
     .expect("build the MinIO driver")
 }
 
-/// A fresh instance id per run, so reruns never see earlier objects.
 fn instance_id() -> String {
     format!("inst_e2e_{}", uuid::Uuid::new_v4().simple())
 }
@@ -192,7 +191,6 @@ async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() {
             "upload {upload} on {path} must be aborted"
         );
     }
-    // Nothing is left, so a repeated purge only confirms absence.
     driver
         .purge_unpublished(&instance, &id, &resources)
         .await

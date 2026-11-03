@@ -1,15 +1,10 @@
-//! Staged and restored layout of a prepared `mariadb-backup` tree.
-
 use std::{fs, path::Path};
 
 use crate::io::files::{require_directory, require_regular_file};
 
-/// Capture directory below the staging root.
 pub(super) const DATA_ROOT: &str = "mariadb";
-/// Where the prepared tree sits in the archive. MariaDB encodes `-` in
-/// schema directory names, so no data directory entry can collide with it.
+/// MariaDB encodes `-` in schema directory names, so no data directory entry can collide with this name.
 pub(super) const RESTORE_TARGET: &str = "dbev-online-backup";
-/// Current and pre-11 names of the checkpoints file.
 const CHECKPOINT_FILES: [&str; 2] = ["mariadb_backup_checkpoints", "xtrabackup_checkpoints"];
 const MAX_WALK_DEPTH: usize = 8;
 const MAX_WALK_ENTRIES: usize = 1_000_000;
@@ -52,7 +47,6 @@ fn parse_checkpoints(file_name: &'static str, text: &str) -> Result<Checkpoints,
     Ok(checkpoints)
 }
 
-/// The tree is a prepared full backup with no linked or external files.
 pub(super) fn check_prepared(root: &Path) -> Result<Checkpoints, String> {
     require_directory(root)?;
     let (file_name, path) = CHECKPOINT_FILES
@@ -68,8 +62,7 @@ pub(super) fn check_prepared(root: &Path) -> Result<Checkpoints, String> {
     Ok(checkpoints)
 }
 
-/// Tables created with `DATA DIRECTORY` leave `.isl` links to files outside
-/// the data directory, which neither the helper nor restore can reach.
+/// `DATA DIRECTORY` tables leave `.isl` links outside the data directory, which neither the helper nor restore can reach.
 pub(super) fn refuse_external_tablespaces(data: &Path) -> Result<(), String> {
     refuse_links(data)
 }
@@ -110,8 +103,6 @@ fn refuse_links(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Moves the extracted prepared tree from `RESTORE_TARGET` to the data
-/// volume root it replaces.
 pub(super) fn install_prepared(extracted_root: &Path) -> Result<(), String> {
     crate::subsystems::backups::strategy::lift_restore_tree(
         extracted_root,

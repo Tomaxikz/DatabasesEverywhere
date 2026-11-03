@@ -1,19 +1,3 @@
-//! Durable publication of finished backups.
-//!
-//! A publication is journaled (storage target and backup id) before anything
-//! is uploaded. After the upload the instance management lock is reacquired,
-//! so the final existence check is serialized with instance deletion, which
-//! purges backups under the same lock. A failed upload, or an instance that
-//! was deleted during the upload, turns the row into `unpublish` and every
-//! object of the backup id is removed idempotently, whether or not its
-//! metadata exists. Rows stay until the outcome is settled, so storage
-//! errors and daemon restarts are retried by recovery; an online job whose
-//! objects could not be removed stays `cleanup_pending`.
-//!
-//! Providers journal remote resources that the backup id cannot find again
-//! (Kopia source paths, S3 multipart upload ids) through [`Journal`] while
-//! they upload; removal includes them and must be confirmed by the provider.
-
 use futures::future::BoxFuture;
 
 use super::{
@@ -33,7 +17,6 @@ use crate::{
     storage::backup_jobs::{BackupPublicationRecord, PublicationResourceRecord, PublicationState},
 };
 
-/// Records the resources of one journaled publication.
 pub(super) struct Journal<'a> {
     state: &'a AppState,
     backup_id: &'a str,
@@ -71,18 +54,13 @@ impl PublicationJournal for Journal<'_> {
     }
 }
 
-/// How recovery settled one unsettled publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Resolution {
-    /// The backup is visible and its instance still exists.
     Published,
-    /// Every object of the backup id is gone.
     Removed,
-    /// Still unsettled; retried later.
     Pending(String),
 }
 
-/// Journals the publication before any object is uploaded.
 pub(super) async fn begin(
     state: &AppState,
     storage: &BackupStorage,
@@ -108,7 +86,6 @@ pub(super) async fn begin(
         .map_err(journal_error)
 }
 
-/// Settles a finished upload. Returns the backup's outcome for the caller.
 pub(super) async fn finish(
     state: &AppState,
     storage: &BackupStorage,
@@ -120,14 +97,11 @@ pub(super) async fn finish(
     let failure = match committed {
         Err(error) => error,
         Ok(()) => {
-            // Serialized with deletion: either deletion runs later and purges
-            // this backup, or it already ran and the backup is removed here.
             let _operation = state.instance_locks.lock(instance_id).await;
             if state.instances.get(instance_id).await.is_some() {
                 if let Some(job_id) = online_job {
                     finish_publication(state, job_id, Ok(()), false).await;
                 }
-                // A leftover row is settled by recovery: the backup is found.
                 if let Err(error) = state.backup_jobs.settle_publication(backup_id).await {
                     tracing::warn!(backup_id, %error, "published backup could not be settled in the journal");
                 }
@@ -165,7 +139,6 @@ pub(super) async fn finish(
     Err(failure)
 }
 
-/// Settles one journaled publication. The caller holds the instance lock.
 pub(super) async fn resolve(state: &AppState, record: &BackupPublicationRecord) -> Resolution {
     let storage = match backup_storage(state) {
         Ok(storage) => storage,
@@ -219,8 +192,6 @@ pub(super) async fn resolve(state: &AppState, record: &BackupPublicationRecord) 
     }
 }
 
-/// Settles journaled publications of one instance (or all), each under its
-/// instance lock unless the caller already holds it.
 pub(super) async fn recover(
     state: &AppState,
     instance_id: Option<&str>,
@@ -288,8 +259,6 @@ async fn unpublish(
         .map_err(|error| error.to_string())
 }
 
-/// An unreadable resource keeps the publication pending: settling it would
-/// forget a remote resource that may still exist.
 async fn journaled_resources(
     state: &AppState,
     backup_id: &str,

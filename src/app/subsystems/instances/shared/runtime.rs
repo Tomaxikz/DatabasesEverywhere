@@ -180,11 +180,8 @@ pub(super) async fn measure_tenant_usage(
     }
 }
 
-/// A caller owns the logical tenant lock before entering this module, then
-/// waits for the shared runtime lock. Pool-wide monitors intentionally own
-/// only the runtime lock, so they can persist a disk block or failed pool state
-/// while the caller is waiting. Always reload after acquiring the runtime lock
-/// instead of later writing the stale pre-lock snapshot back over that state.
+/// Pool-wide monitors intentionally own only the runtime lock, so they can persist a disk block or
+/// failed pool state while the caller is waiting.
 pub(crate) async fn reload_after_runtime_lock(
     state: &AppState,
     snapshot: &InstanceMetadata,

@@ -18,13 +18,8 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 impl ResourceCache {
-    /// Measure managed database bytes for a capacity-sensitive operation.
-    ///
-    /// Dashboard samples may be up to `DISK_REFRESH_INTERVAL` old, which is
-    /// desirable for polling but can substantially overstate a database that
-    /// was just truncated or restored. Export admission must not reserve from
-    /// that stale value, so this path always asks the active quota runtime or
-    /// performs a bounded fresh directory scan before returning.
+    /// Export admission must not reserve from that stale value, so this path always asks the active
+    /// quota runtime or performs a bounded fresh directory scan before returning.
     pub(crate) async fn fresh_disk_usage(
         &self,
         config: &Config,
@@ -260,10 +255,8 @@ impl ResourceCache {
 
     pub async fn refresh_all_disk_usage(&self, state: &AppState) {
         let instances = state.instances.list().await;
-        // Shared tenants have protocol-aware per-tenant sampling in
-        // `shared_disk`. Walking a shared runtime root here duplicates that
-        // work, cannot be attributed to a tenant, and turns one active monitor
-        // into a full-pool scan every five seconds.
+        // Walking a shared runtime root here duplicates that work, cannot be attributed to a
+        // tenant, and turns one active monitor into a full-pool scan every five seconds.
         let instance_ids = disk_sample_instance_ids(instances);
         futures::stream::iter(instance_ids)
             .map(|instance_id| {
@@ -350,9 +343,8 @@ pub(super) fn is_current_refresh_lock(
 pub(super) fn invalidate_disk_locked(inner: &mut ResourceCacheInner, instance_id: &str) {
     inner.disk.remove(instance_id);
     inner.disk_refreshing.remove(instance_id);
-    // Removing the Arc advances the sampling generation. Any in-flight scan
-    // still holding the previous Arc will fail its identity check before it
-    // can publish a result.
+    // Any in-flight scan still holding the previous Arc will fail its identity check before it can
+    // publish a result.
     inner.disk_refresh_locks.remove(instance_id);
 }
 

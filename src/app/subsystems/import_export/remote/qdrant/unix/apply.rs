@@ -1,9 +1,3 @@
-//! Applies staged collection snapshots to the managed Qdrant target.
-//!
-//! The target's affected collections are first downloaded as rollback
-//! snapshots and recorded in a recovery manifest. A failed mutation restores
-//! them; a failed rollback quarantines the instance and keeps the staging.
-
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use crate::{
@@ -20,30 +14,23 @@ use super::{
     stop_bridge, target_api_key, within_deadline, write_recovery_manifest,
 };
 
-/// Collection snapshots staged as `source-{index}.snapshot` inside `staging`,
-/// in the order of `collections`.
 pub(super) struct StagedSource {
     pub(super) staging: PathBuf,
     pub(super) version: String,
     pub(super) collections: Vec<String>,
     pub(super) aliases: Vec<QdrantAlias>,
     pub(super) staged_bytes: u64,
-    /// Names the operation in error messages ("remote import").
     pub(super) operation: &'static str,
 }
 
 pub(super) struct ApplyBudget {
     pub(super) request_timeout: Duration,
-    /// Mutations stop here; the rest of the window is left for rollback.
     pub(super) work_deadline: tokio::time::Instant,
     pub(super) operation_deadline: tokio::time::Instant,
-    /// Cap on staged source and rollback snapshots together.
     pub(super) max_staged_bytes: u64,
 }
 
-/// Replaces (wipe) or overwrites (merge) the target's collections with the
-/// staged snapshots. The staging directory is consumed: removed on every
-/// outcome except a failed rollback, where it holds the recovery snapshots.
+/// Replaces (wipe) or overwrites (merge) the target's collections; staging is removed unless rollback fails.
 pub(super) async fn apply_staged_source(
     state: &AppState,
     instance_id: &str,

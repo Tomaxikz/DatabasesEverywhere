@@ -45,8 +45,6 @@ pub(super) struct ReplacedDirectory {
     mode: u32,
 }
 
-/// Removes the empty data directory so a subvolume or dataset can take its
-/// place, returning what [`restore_replaced_directory`] needs.
 pub(super) fn remove_empty_data_directory(
     path: &Path,
 ) -> Result<Option<ReplacedDirectory>, DiskLimitError> {

@@ -397,15 +397,9 @@ async fn remove_credential_files(root: &Path) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Removes known logical-import credential files left behind by a process
-/// crash. Once stale acquisition helpers have been confirmed removed, it also
-/// removes generated staging directories that have no recovery manifest.
-/// Manifest-backed snapshot and rollback artifacts are deliberately retained
-/// so interrupted imports can still be quarantined and recovered.
-///
-/// The walk is limited to immediate UUID-named job directories beneath the
-/// configured remote-import staging root. Symlinks and special files are never
-/// followed or removed.
+/// Removes credential files and generated staging directories left by a crashed logical import.
+/// Manifest-backed snapshot and rollback artifacts are retained for recovery; symlinks and special
+/// files are never followed or removed.
 pub(crate) async fn cleanup_stale_import_secrets(
     tmp_root: &Path,
     remove_orphaned_staging: bool,

@@ -115,9 +115,8 @@ impl ResourceCache {
 pub(super) fn start(state: AppState) {
     let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
-        // A failed SQLite write retains the exact prepared batch. We do not
-        // advance sampling again until that batch is durably stored, so a
-        // transient metadata outage cannot silently consume a minute.
+        // We do not advance sampling again until that batch is durably stored, so a transient
+        // metadata outage cannot silently consume a minute.
         let mut pending = Vec::new();
         let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -155,9 +154,6 @@ async fn flush_on_shutdown(state: &AppState, pending: &mut Vec<ActivityBucket>) 
         .await
     {
         Ok(_) if had_pending => {
-            // The first call durably drains the exact
-            // retry batch. A second call may persist an
-            // independently due final full-minute bucket.
             if let Err(error) = state
                 .resource_cache
                 .sample_activity(now_unix(), &targets, pending)

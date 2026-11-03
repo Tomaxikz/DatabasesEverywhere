@@ -8,11 +8,7 @@ use crate::{
     utils::{backend::BackendEndpoint, limits::InstanceLimits},
 };
 
-/// Complete, neutral instance metadata for tests that only care about a few fields.
-///
-/// Callers should override the fields involved in the behavior under test. Keeping
-/// the unrelated defaults here makes schema additions a one-line test maintenance
-/// change instead of forcing every fixture to repeat the full durable record.
+/// Neutral instance metadata; override only the fields under test.
 pub(crate) fn metadata(instance_id: &str, protocol: Protocol) -> InstanceMetadata {
     let port = protocol.engine().default_container_port();
     InstanceMetadata {
@@ -58,7 +54,6 @@ pub(crate) fn metadata(instance_id: &str, protocol: Protocol) -> InstanceMetadat
     }
 }
 
-/// Shared MySQL tenant used by lifecycle, job-lock, and quota tests.
 pub(crate) fn shared_metadata() -> InstanceMetadata {
     let mut metadata = metadata("tenant-a", Protocol::Mysql);
     metadata.deployment_mode = DeploymentMode::Shared;

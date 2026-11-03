@@ -13,10 +13,8 @@ use super::{
 };
 
 impl DiskLimiter {
-    /// Adopt a shared tenant directory into a native filesystem project and
-    /// apply its hard byte limit. XFS and Linux project-quota backends adopt
-    /// existing descendants; ext4/F2FS reject symlinks, special files, and
-    /// nested mounts rather than leaving uncharged data behind.
+    /// Adopts a shared tenant directory into a native project and applies its hard limit.
+    /// ext4/F2FS reject symlinks, special files and nested mounts rather than leave uncharged data.
     pub(crate) async fn apply_path_quota(
         &self,
         owner_id: &str,
@@ -67,9 +65,7 @@ impl DiskLimiter {
         })
     }
 
-    /// Update only the quota value for an already-adopted path. In
-    /// particular, XFS does not rerun recursive `project -s`, so resizing or
-    /// recovering a shared pool cannot overwrite nested tenant project IDs.
+    /// Updates only the quota value of an adopted path; XFS must not rerun recursive `project -s`, which would overwrite nested tenant IDs.
     pub(crate) async fn update_path_quota(
         &self,
         owner_id: &str,
@@ -97,9 +93,7 @@ impl DiskLimiter {
         .map(|_| ())
     }
 
-    /// Read an active per-path project's kernel-accounted byte usage without
-    /// walking the tenant directory. Pending, released, missing, or
-    /// differently-owned claims are rejected before the filesystem query.
+    /// Kernel-accounted usage of an active per-path project, without walking the directory.
     pub(crate) async fn path_quota_usage_bytes(
         &self,
         owner_id: &str,
@@ -188,10 +182,8 @@ impl DiskLimiter {
         }
     }
 
-    /// Remove a shared path quota safely and idempotently. Labels are restored
-    /// while the old cap remains active, then the limit is zeroed and the
-    /// project-ID claim is tombstoned. The ID is never reused, so an uncertain
-    /// old inode cannot later become charged to a different tenant.
+    /// Idempotent removal: restore labels under the old cap, zero the limit, then tombstone the claim.
+    /// The ID is never reused so an uncertain old inode cannot be charged to another tenant.
     pub(crate) async fn remove_path_quota(
         &self,
         owner_id: &str,

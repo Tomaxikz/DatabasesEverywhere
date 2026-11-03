@@ -34,12 +34,8 @@ impl SharedTenantBootSummary {
     }
 }
 
-/// Replays each shared tenant's durable state after its physical pool is ready.
-///
-/// Shared lifecycle, password, and quota updates necessarily touch the engine
-/// and SQLite in separate steps. A daemon exit between those steps can leave
-/// the engine ahead of durable metadata. Gateway listeners stay closed until
-/// this pass has made the durable row authoritative again.
+/// Replays each shared tenant's durable state once its pool is ready; a daemon exit mid-update can leave the engine ahead of SQLite,
+/// so gateway listeners stay closed until this pass finishes.
 pub(crate) async fn reconcile_shared_tenants(
     state: &AppState,
 ) -> anyhow::Result<SharedTenantBootSummary> {
@@ -84,10 +80,7 @@ async fn reconcile_pool(
     reconcile_runtime_tenants_locked(state, &runtime).await
 }
 
-/// Replays tenant security state while the caller holds the pool runtime lock.
-///
-/// Pool activation uses the same path as daemon boot so a restarted or
-/// reconstructed engine cannot publish routes after only a health check.
+/// Replays tenant security state under the pool runtime lock; shared with pool activation so routes never publish after only a health check.
 pub(crate) async fn reconcile_runtime_tenants_locked(
     state: &AppState,
     runtime: &EngineRuntime,
@@ -178,9 +171,7 @@ pub(crate) async fn reconcile_runtime_tenants_locked(
         match secure_tenant(state, runtime, &mut metadata).await {
             Ok(()) => match access_for(&metadata) {
                 TenantAccess::Open => {
-                    // Keep the route fenced until every tenant hard-quota fact
-                    // is durable and the root quota has been lowered around
-                    // those child projects.
+                    // Keep the route fenced until every hard-quota fact is durable and the root quota is lowered around the child projects.
                     ready.push(metadata);
                 }
                 TenantAccess::Fenced => summary.fenced += 1,
@@ -319,10 +310,7 @@ async fn secure_tenant(
     Ok(())
 }
 
-/// Measures every catalog-enforced tenant in one engine query while the
-/// caller still holds the runtime lock. Tenants that are full or cannot be
-/// measured stay fenced; a pool restart can therefore never create a brief
-/// write window before the periodic sampler catches up.
+/// Measures every catalog-enforced tenant in one query under the runtime lock; full or unmeasurable tenants stay fenced.
 async fn admit_soft_tenants(
     state: &AppState,
     runtime: &EngineRuntime,

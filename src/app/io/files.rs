@@ -7,7 +7,6 @@ use std::{
 
 const SNAPSHOT_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Treats a missing path as already removed: `ignore_missing(remove_file(p))`.
 pub(crate) fn ignore_missing(result: std::io::Result<()>) -> std::io::Result<()> {
     match result {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -15,7 +14,6 @@ pub(crate) fn ignore_missing(result: std::io::Result<()>) -> std::io::Result<()>
     }
 }
 
-/// Fails unless `path` is a regular file, without following a final link.
 pub(crate) fn require_regular_file(path: &Path) -> Result<(), String> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -25,7 +23,6 @@ pub(crate) fn require_regular_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Fails unless `path` is a directory, without following a final link.
 pub(crate) fn require_directory(path: &Path) -> Result<(), String> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -87,14 +84,11 @@ fn create_new_private_file<P: rustix::path::Arg>(
     Ok(File::from(descriptor))
 }
 
-/// Creates a private directory tree and rejects a symlink or non-directory at
-/// the final path.
 pub fn ensure_private_dir(path: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(path)?;
     secure_private_dir(path)
 }
 
-/// Rejects a symlink or non-directory and limits access to the owning user.
 pub(crate) fn secure_private_dir(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -120,11 +114,8 @@ pub fn is_safe_flat_file_name(name: &str) -> bool {
             .any(|byte| byte == 0 || byte.is_ascii_control())
 }
 
-/// Durably replaces a file without ever following the destination if it is a symlink.
-///
-/// The caller is responsible for ensuring that the parent directory is private. The
-/// directory is opened once and all create/rename operations are relative to that
-/// descriptor, preventing a last-component swap during the replacement.
+/// Durably replaces a file, never following a symlink destination. The parent must already be
+/// private; operations go through one directory descriptor to stop a last-component swap.
 pub fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     atomic_write_private_inner(path, contents, false)
 }
@@ -198,8 +189,6 @@ pub fn remove_private_file_durable(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-/// Opens a private file without following symlinks, verifies it is regular,
-/// flushes its contents, and then flushes the containing directory.
 pub fn sync_private_file(path: &Path) -> Result<(), std::io::Error> {
     let (directory, file_name) = open_parent(path)?;
     let file = open_read_no_follow(&directory, file_name)?;

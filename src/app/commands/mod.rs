@@ -33,7 +33,6 @@ mod quarantine;
 mod repair_protected_secret;
 mod reset_metadata;
 
-/// Prints a failed command's error chain; the binary exits non-zero after this.
 pub fn report_error(error: &anyhow::Error) {
     term::error(error);
 }
@@ -281,8 +280,6 @@ impl Command {
     }
 }
 
-/// Restrict default permissions before the process creates logs, state, or
-/// runtime files. Explicitly requested modes can still be tightened further.
 pub fn set_safe_umask() {
     use rustix::fs::Mode;
 

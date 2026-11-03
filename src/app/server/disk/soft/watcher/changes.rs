@@ -32,7 +32,6 @@ impl SoftDiskWatcher {
         })
     }
 
-    /// Acknowledge only the captured registration and generation.
     pub(crate) fn acknowledge(&self, batch: &DirtyBatch) -> bool {
         let mut state = lock_recover(&self.shared.state);
         let Some(target) = state.targets.get_mut(&batch.target_id) else {
@@ -107,7 +106,6 @@ impl SoftDiskWatcher {
         self.shared.change_sequence.load(Ordering::Acquire)
     }
 
-    /// Drain coalesced work and sample its sequence under one lock.
     pub(crate) fn drain_changes(&self) -> WatcherChanges {
         let mut state = lock_recover(&self.shared.state);
         let global_reconcile = std::mem::take(&mut state.global_change_pending);

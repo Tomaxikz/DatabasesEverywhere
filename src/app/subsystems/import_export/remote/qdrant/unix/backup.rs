@@ -1,18 +1,6 @@
-//! Online Qdrant backups through the snapshot API.
-//!
-//! Capture snapshots every collection over the instance's always-on HTTP
-//! socket, downloads each one and deletes it from the instance before the next
-//! starts. A `collections.json` manifest records the Qdrant version, every
-//! collection's file, size and SHA-256, and the aliases. Each collection is
-//! consistent on its own; there is no common point across collections.
-//!
-//! Restore wipes the running instance and uploads the snapshots through the
-//! same path a remote import takes, rollback snapshots and quarantine
-//! included.
-//!
-//! Qdrant names its snapshots itself, so they cannot carry the backup job's
-//! ownership tag. A daemon crash between creating and deleting one leaves
-//! that single snapshot in the instance, listed by Qdrant's snapshot API.
+//! Online Qdrant backups through the snapshot API. Each collection is consistent on its own,
+//! with no common point across collections. A crash between creating and deleting a snapshot
+//! leaves that single snapshot in the instance.
 
 use std::{
     collections::HashSet,
@@ -140,7 +128,6 @@ impl CollectionsManifest {
     }
 }
 
-/// The instance's always-on HTTP socket, next to its gRPC socket.
 fn managed_http_socket(metadata: &InstanceMetadata) -> Result<PathBuf, ApiError> {
     let BackendEndpoint::UnixSocket { socket_path } = &metadata.backend else {
         return Err(ApiError::Conflict(
@@ -152,9 +139,6 @@ fn managed_http_socket(metadata: &InstanceMetadata) -> Result<PathBuf, ApiError>
         .ok_or_else(|| ApiError::Runtime("invalid qdrant backend socket path".to_string()))
 }
 
-/// Snapshots every collection into `output` (created here) within
-/// `max_bytes` and `deadline`. Leaves no snapshot in the instance unless the
-/// daemon itself stops mid-collection.
 pub(crate) async fn capture_collections(
     state: &AppState,
     metadata: &InstanceMetadata,
@@ -236,7 +220,6 @@ async fn capture_into(
             sha256,
         });
     }
-    // Aliases read last, limited to the collections captured.
     let captured = names.into_iter().collect::<HashSet<_>>();
     let aliases = selected_aliases(client.aliases().await?, &captured);
     let manifest = CollectionsManifest {
@@ -281,8 +264,6 @@ fn read_manifest(dir: &Path) -> Result<CollectionsManifest, String> {
     Ok(manifest)
 }
 
-/// Checks the manifest and that every snapshot file is present with its
-/// recorded size and SHA-256. Blocking.
 fn check_collections(dir: &Path) -> Result<CollectionsManifest, String> {
     let manifest = read_manifest(dir)?;
     for collection in &manifest.collections {
@@ -312,12 +293,10 @@ fn check_collections(dir: &Path) -> Result<CollectionsManifest, String> {
     Ok(manifest)
 }
 
-/// Blocking verification of a captured collection directory.
 pub(crate) fn verify_collections(dir: &Path) -> Result<CollectionsSummary, String> {
     check_collections(dir).map(|manifest| manifest.summary())
 }
 
-/// Moves the checked snapshots into the import staging layout.
 fn stage_snapshots(
     payload: &Path,
     staging: &Path,
@@ -334,8 +313,6 @@ fn stage_snapshots(
     Ok(())
 }
 
-/// Replaces every collection and alias of the running instance with the
-/// captured ones in `payload`, rolling back on failure.
 pub(crate) async fn restore_collections(
     state: &AppState,
     metadata: &InstanceMetadata,

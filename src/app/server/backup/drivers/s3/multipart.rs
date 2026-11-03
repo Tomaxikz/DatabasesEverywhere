@@ -1,15 +1,4 @@
-//! Multipart uploads, and removal of those whose publication did not settle.
-//!
-//! An upload id is journaled as soon as CreateMultipartUpload returns it, but
-//! an initiation whose response was lost, or a crash before the journal
-//! write, is found only by listing the in-progress uploads of the exact owned
-//! key. Every found upload is aborted and its removal confirmed with ListParts
-//! (`NoSuchUpload`) and a final relisting. AWS documents that a part upload in
-//! flight during an abort can still succeed, so an upload that is listed
-//! again is aborted again. `object_store` has no API for either listing, so
-//! those two requests are signed with its [`AwsAuthorizer`] here.
-//!
-//! [`AwsAuthorizer`]: object_store::aws::AwsAuthorizer
+//! Multipart uploads and removal of unsettled ones. Uploads lost before journaling are found by listing the owned key; aborts are confirmed via ListParts and relisting, since in-flight parts can outlive an abort.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -35,7 +24,6 @@ use crate::server::backup::{
     io_error,
 };
 
-/// Abort and confirm rounds before cleanup is left to a later recovery pass.
 const MAX_ABORT_ROUNDS: usize = 3;
 const MAX_LISTED_UPLOADS: usize = 10_000;
 const NO_SUCH_UPLOAD: &str = "NoSuchUpload";
@@ -60,9 +48,7 @@ impl S3BackupDriver {
             .create_multipart(&location)
             .await
             .map_err(|error| remote_error("initiate multipart upload", error))?;
-        // Parts are billable until aborted. Journal the id before any part
-        // exists so recovery can abort it after a crash; an initiation whose
-        // id never reached the journal is found by listing the key.
+        // Parts are billable until aborted: journal the id before any part exists.
         let resource = PublicationResource::S3MultipartUpload {
             key: key.to_string(),
             upload_id: upload_id.clone(),
@@ -92,8 +78,7 @@ impl S3BackupDriver {
         result
     }
 
-    /// Uploads the file part by part, hashing it on the way, and refuses to
-    /// hand back the parts unless the bytes match the recorded SHA-256.
+    /// Uploads part by part, hashing on the way; fails unless the bytes match the recorded SHA-256.
     async fn upload_parts(
         &self,
         location: &ObjectPath,
@@ -166,8 +151,7 @@ impl S3BackupDriver {
         }
     }
 
-    /// Aborts every in-progress upload of `key`, journaled or listed, and
-    /// succeeds only once none remains.
+    /// Aborts every in-progress upload of `key`, journaled or listed, until none remains.
     pub(super) async fn purge_multipart_uploads(
         &self,
         key: &str,
@@ -176,8 +160,7 @@ impl S3BackupDriver {
         let location = object_path(key)?;
         let mut known: BTreeSet<String> = journaled.iter().map(|id| (*id).to_string()).collect();
         let Some(uploads) = self.uploads.as_deref() else {
-            // A store without the S3 API offers neither listing; abort what
-            // the journal names.
+            // A store without the S3 API can only abort what the journal names.
             for upload_id in known {
                 self.abort_upload(&location, &upload_id).await?;
             }
@@ -202,8 +185,7 @@ impl S3BackupDriver {
         )))
     }
 
-    /// Aborts one upload. A 404 may mean it is already gone; ListParts then
-    /// tells `NoSuchUpload` apart from a missing bucket.
+    /// A 404 may mean already gone; ListParts tells `NoSuchUpload` from a missing bucket.
     async fn abort_upload(
         &self,
         location: &ObjectPath,
@@ -221,7 +203,6 @@ impl S3BackupDriver {
 }
 
 impl UploadAdmin {
-    /// Upload ids of in-progress multipart uploads of exactly `key`.
     async fn list_multipart_uploads(&self, key: &str) -> Result<Vec<String>, BackupStoreError> {
         let mut upload_ids = Vec::new();
         let mut marker: Option<(String, String)> = None;
@@ -299,8 +280,7 @@ fn error_code(body: &[u8]) -> Option<String> {
         .map(|document| document.code)
 }
 
-/// One ListMultipartUploads page requested with `encoding-type=url`, under
-/// which `Key` and `NextKeyMarker` are percent-encoded.
+/// One ListMultipartUploads page with `encoding-type=url` (`Key`, `NextKeyMarker` percent-encoded).
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ListUploadsDocument {
@@ -323,7 +303,6 @@ struct ListedUpload {
 struct UploadPage {
     /// Uploads of exactly the requested key; the prefix also matches longer keys.
     upload_ids: Vec<String>,
-    /// `(key-marker, upload-id-marker)` of the next page.
     next: Option<(String, String)>,
 }
 
@@ -392,7 +371,6 @@ mod tests {
 
     #[test]
     fn upload_pages_keep_only_the_exact_owned_key() {
-        // Shape of AWS's documented response, with `encoding-type=url`.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Bucket>bucket</Bucket>

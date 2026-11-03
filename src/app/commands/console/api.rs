@@ -277,7 +277,6 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
-/// True when the API answered 404.
 pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiStatusError>()
@@ -316,7 +315,6 @@ fn without_url(error: &reqwest::Error) -> String {
     message
 }
 
-/// A rustls client config that accepts exactly the configured certificate.
 fn pinned_tls(cert_path: &str) -> anyhow::Result<rustls::ClientConfig> {
     let certificate = CertificateDer::pem_file_iter(cert_path)
         .with_context(|| format!("cannot read the API certificate {cert_path}"))?
@@ -408,7 +406,6 @@ pub(super) struct SystemInfo {
 }
 
 impl SystemInfo {
-    /// Protocols whose `<protocol>_enabled` flag is set.
     pub(super) fn enabled_protocols(&self) -> Vec<Protocol> {
         Protocol::ALL
             .into_iter()
@@ -478,7 +475,6 @@ pub(super) struct Progress {
     pub message: String,
     #[serde(default)]
     pub percent: Option<f64>,
-    /// `running`, `completed` or `failed`.
     #[serde(default)]
     pub status: String,
     #[serde(default)]

@@ -1,5 +1,3 @@
-//! Physical archive workflows for Redis, Valkey, Qdrant, and backup restoration.
-
 use std::{
     path::{Path as FsPath, PathBuf},
     time::Duration,
@@ -157,7 +155,6 @@ struct PendingDataReplacement {
 #[derive(Clone, Copy)]
 struct PhysicalRestorePolicy<'a> {
     recover_current_after_preparation_failure: bool,
-    /// Engine recipe step run on the extracted tree before it is installed.
     preparation: Option<&'a dyn StagedDataPreparation>,
 }
 
@@ -209,9 +206,7 @@ pub(crate) async fn restore_bounded_archive(
     .await
 }
 
-/// Engine recipe step run on an extracted archive before it replaces the live
-/// data directory (for example recovery signal files). A failure leaves the
-/// current data untouched.
+/// Engine recipe step run on an extracted archive before it replaces the live data directory.
 pub(crate) trait StagedDataPreparation: Send + Sync {
     fn prepare<'a>(
         &'a self,
@@ -219,7 +214,6 @@ pub(crate) trait StagedDataPreparation: Send + Sync {
     ) -> futures::future::BoxFuture<'a, Result<(), ApiError>>;
 }
 
-/// Restores a data directory archive that needs a recipe step before install.
 pub(crate) async fn restore_prepared_archive(
     state: &AppState,
     instance_id: &str,

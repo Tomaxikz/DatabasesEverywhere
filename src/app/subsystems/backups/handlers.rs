@@ -55,9 +55,8 @@ pub async fn list_instance_backups(
     Ok(ApiResponse::ok(backups))
 }
 
-/// Backups in formats this daemon cannot read (for example a newer manifest
-/// schema). They are never restored or pruned; delete one explicitly with
-/// `DELETE /api/instances/{instance_id}/backups/{backup_id}`.
+/// Backups in formats this daemon cannot read (for example a newer manifest schema). They are never
+/// restored or pruned.
 pub async fn list_unsupported_backups(
     State(state): State<AppState>,
     auth: ApiRequestContext,

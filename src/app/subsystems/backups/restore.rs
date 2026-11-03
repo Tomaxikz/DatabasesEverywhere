@@ -43,8 +43,6 @@ pub(super) async fn restore_backup(
     // Resolve the restore recipe from the stored format before anything is
     // stopped or reserved; unknown recipes fail explicitly.
     let recipe = recipe_for(&stored)?;
-    // Engine-loaded captures (logical dumps, snapshot APIs) restore into the
-    // running instance instead of replacing its data directory.
     let after_start = recipe
         .as_ref()
         .is_some_and(|recipe| recipe.strategy.restore_kind() == RestoreKind::AfterStart);
@@ -59,10 +57,6 @@ pub(super) async fn restore_backup(
     } else {
         None
     };
-    // Physical archives may expand to the complete instance allocation, but a
-    // tenant-logical backup is already a bounded database dump. Charging a
-    // shared restore for the tenant's full disk allocation makes a tiny dump
-    // impossible to restore into a generously sized tenant.
     let restore_size_bytes =
         restore_input_bytes(stored.layout, stored.size_bytes, metadata.limits.disk_mib);
     let _execution = state
@@ -267,9 +261,7 @@ pub(super) async fn restore_backup(
     }))
 }
 
-/// Extracts an engine-loaded capture into a private workspace and lets its
-/// strategy load it into the running instance. The data directory is never
-/// replaced on this path.
+/// The data directory is never replaced on this path.
 async fn restore_into_running(
     state: &AppState,
     metadata: &crate::server::metadata::InstanceMetadata,
@@ -320,15 +312,12 @@ async fn restore_into_running(
     result
 }
 
-/// Strategy recipe resolved for an online capture.
 struct StrategyRecipe {
     strategy: &'static dyn OnlineBackupStrategy,
     recipe: RestoreRecipeRef,
     restore_target: PathBuf,
 }
 
-/// A recorded expansion larger than this instance's extraction cap would
-/// fail midway; refuse it before anything is stopped.
 fn check_expansion(stored: &StoredBackup, extracted_capacity: u64) -> Result<(), ApiError> {
     match stored
         .details
@@ -343,10 +332,6 @@ fn check_expansion(stored: &StoredBackup, extracted_capacity: u64) -> Result<(),
     }
 }
 
-/// Maps the stored format to its restore path, independent of placement.
-/// Built-in formats need no recipe step but must name a recipe version this
-/// build restores; strategy captures need their exact strategy and a recipe
-/// version this build can still restore. Runs before anything is stopped.
 fn recipe_for(stored: &StoredBackup) -> Result<Option<StrategyRecipe>, ApiError> {
     let (strategy_id, recipe, restore_target) = match stored.restore_format() {
         RestoreFormat::DataDirectoryArchive { .. } | RestoreFormat::LogicalDump { .. } => {
@@ -470,7 +455,6 @@ mod tests {
             check_expansion(&backup, 2047),
             Err(ApiError::Conflict(message)) if message.contains("2048")
         ));
-        // Backups without a recorded expansion keep the extraction-time cap.
         assert!(check_expansion(&stored(None), 1).is_ok());
     }
 

@@ -98,7 +98,6 @@ struct HttpHead<'a> {
     target: &'a str,
     minor_version: u8,
     headers: Vec<(&'a str, &'a str)>,
-    /// Offset of the first body byte.
     body_start: usize,
 }
 

@@ -82,8 +82,6 @@ fn chown_directory_fd(
     Ok(())
 }
 
-/// Keeps a daemon-owned directory non-listable while allowing one trusted
-/// runtime group to traverse known bind-mount paths beneath it.
 pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std::io::Result<()> {
     use rustix::{
         fs::{FileType, Mode, fchmod, fchown, fstat, open},
@@ -174,7 +172,6 @@ pub fn secure_private_dir_keeping_traversal(path: &Path) -> std::io::Result<()> 
     fchmod(&directory, mode).map_err(std::io::Error::from)
 }
 
-/// Fails unless `uid`/`gid` can traverse every ancestor of `path`.
 pub fn ensure_traversable(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

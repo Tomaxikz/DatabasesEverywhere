@@ -95,37 +95,20 @@ pub(crate) struct SharedSpecInput<'a> {
     pub socket_bridge_binary: PathBuf,
 }
 
-/// Certified online backup capability of a dedicated engine runtime.
-///
-/// Only strategies whose capture *and* restore satisfy the online contract
-/// (no planned write freeze, no restart, no silent downgrade) may be declared.
-/// The backup coordinator maps each variant to a
-/// `subsystems::backups::strategy::OnlineBackupStrategy`.
+/// Only strategies that satisfy the online contract (no write freeze, no restart, no silent downgrade) may be declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnlineBackup {
-    /// No certified strategy. Strict online requests fail with this reason.
     Unavailable { reason: &'static str },
-    /// `pg_basebackup -X stream` capture verified by `pg_verifybackup`.
     PostgresBaseBackup,
-    /// Diskless replication RDB snapshot verified by `check-rdb` and restored
-    /// as the base of a multi-part AOF.
     RespRdbSnapshot,
-    /// `mariadb-backup --backup` hot copy prepared with `--prepare`.
     MariadbBackup,
-    /// Atomic read-only snapshot of the instance's Btrfs subvolume or ZFS
-    /// dataset, recovered by the engine's own journal on restore. Volumes
-    /// without snapshots use `otherwise` when the engine has one.
     VolumeSnapshot { otherwise: Option<NativeOnline> },
 }
 
-/// Engine-native online capture for volumes without atomic snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeOnline {
-    /// `mysqldump --single-transaction`, restored through the importer.
     MysqlDump,
-    /// One Qdrant snapshot per collection, uploaded back on restore.
     QdrantSnapshots,
-    /// Per-table `ALTER TABLE ... FREEZE`, restored as a data directory.
     ClickhouseFreeze,
 }
 

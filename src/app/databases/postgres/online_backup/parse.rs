@@ -1,5 +1,3 @@
-//! `backup_label`, backup-manifest WAL ranges and staged checksum verification.
-
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
@@ -16,34 +14,10 @@ const MAX_LABEL_BYTES: u64 = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024 * 1024;
 const PG_CONTROL_MAX_BYTES: u64 = 8192;
 const PG_CONTROL_VERSION_OFFSET: usize = 8;
-/// LP64 `offsetof(ControlFileData, xlog_seg_size)` for PostgreSQL 14–18.
-///
-/// Same offset on x86_64 and aarch64 (GCC/Clang, 4-byte `enum`, `bool` is
-/// `char`). `CheckPoint` in 14–16 is 88 bytes: `fullPageWrites` is at 16 and
-/// the next `uint64` (`nextXid`) is at 24, leaving a 7-byte hole. PostgreSQL 17
-/// puts `wal_level` (`int`) at 20 inside that hole, so `sizeof(CheckPoint)` and
-/// every later offset stay put. `default_char_signedness` in 18 is after
-/// `data_checksum_version` and does not move this field. Offset 220 is
-/// `relseg_size`; 224 is `xlog_blcksz`.
-///
-/// `system_identifier` 0, `pg_control_version` 8, `catalog_version_no` 12,
-/// `state` 16, `time` 24, `checkPoint` 32, `checkPointCopy` 40,
-/// `unloggedLSN` 128, `minRecoveryPoint` 136, `minRecoveryPointTLI` 144,
-/// `backupStartPoint` 152, `backupEndPoint` 160, `backupEndRequired` 168,
-/// `wal_level` 172, `wal_log_hints` 176, `MaxConnections` 180,
-/// `max_worker_processes` 184, `max_wal_senders` 188, `max_prepared_xacts` 192,
-/// `max_locks_per_xact` 196, `track_commit_timestamp` 200, `maxAlign` 204,
-/// `floatFormat` 208, `blcksz` 216, `relseg_size` 220, `xlog_blcksz` 224,
-/// `xlog_seg_size` 228.
-///
-/// The CRC-32C in `controldata_utils.c` covers the bytes before `crc`
-/// (`INIT`/`FIN` are the Castagnoli `0xffffffff` xor). That offset is 288 for
-/// control versions 1300 (14–16) and 1700 (17). Version 1800 is 292 because
-/// `default_char_signedness` shifts the nonce by one byte.
+/// LP64 offset, identical on x86_64 and aarch64 and stable across PostgreSQL 14-18.
 const PG_CONTROL_XLOG_SEG_OFFSET: usize = 228;
 const PG_CONTROL_CRC_OFFSET_THROUGH_V17: usize = 288;
 const PG_CONTROL_CRC_OFFSET_V18: usize = 292;
-/// `WalSegMinSize` and `WalSegMaxSize` from `xlog_internal.h`.
 const MIN_WAL_SEGMENT_BYTES: u64 = 1024 * 1024;
 const MAX_WAL_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_WAL_SEGMENTS_PER_RANGE: u64 = 4096;
@@ -138,9 +112,7 @@ pub(crate) fn recovery_from_label_and_manifest(
     Ok(RecoveryCoordinates(coordinates))
 }
 
-/// Re-checks the staged tree against `backup_manifest`. `pg_verifybackup` has
-/// already accepted the container-visible copy; this checks the bytes that
-/// will be packaged.
+/// Checks the bytes that will be packaged, beyond `pg_verifybackup` on the container-visible copy.
 pub(crate) fn verify_staged_tree(pgdata: &Path) -> Result<usize, String> {
     let manifest_path = pgdata.join("backup_manifest");
     let bytes = read_bytes(&manifest_path, MAX_MANIFEST_BYTES)?;
@@ -272,14 +244,7 @@ fn check_file(path: &Path, file: &ManifestFile, len: u64) -> Result<(), String> 
     Ok(())
 }
 
-/// SHA-256 through the penultimate newline, inclusive. The last line is excluded.
-///
-/// PostgreSQL 14–18 `SendBackupManifest` sets `still_checksumming = false`
-/// after `AddWALInfoToBackupManifest` has written the `\n],\n` that closes
-/// `WAL-Ranges`, then appends `"Manifest-Checksum"`. `verify_manifest_checksum`
-/// in `src/common/parse_manifest.c` hashes `buffer[0 .. penultimate_newline]`
-/// inclusive and requires the file to end on the ultimate newline. The comma
-/// before `"Manifest-Checksum"` is inside the hash.
+/// The hash covers bytes through the penultimate newline, inclusive, matching PostgreSQL's `verify_manifest_checksum`; the comma before `"Manifest-Checksum"` is hashed.
 pub(crate) fn verify_manifest_checksum(bytes: &[u8]) -> Result<(), String> {
     if bytes.last() != Some(&b'\n') {
         return Err("backup manifest checksum trailer is malformed".to_string());
@@ -426,8 +391,7 @@ fn lsn_offset(lsn: (u32, u32)) -> u64 {
     (u64::from(lsn.0) << 32) | u64::from(lsn.1)
 }
 
-/// `XLByteToSeg` of the start LSN through `XLByteToPrevSeg` of the end LSN.
-/// An end LSN that falls on a segment boundary does not require the next file.
+/// An end LSN on a segment boundary does not require the next file.
 fn required_wal_segments(
     timeline: u32,
     start: u64,
@@ -492,8 +456,6 @@ fn wal_segment_bytes(pgdata: &Path) -> Result<u64, String> {
     Ok(size)
 }
 
-/// Control versions 1300 (PostgreSQL 14–16), 1700 (17) and 1800 (18).
-/// A byte-swapped header matches PostgreSQL's opposite-endian refusal.
 fn pg_control_crc_offset(version: u32) -> Result<usize, String> {
     if version.is_multiple_of(65536) && version / 65536 != 0 {
         return Err(format!(
@@ -509,7 +471,6 @@ fn pg_control_crc_offset(version: u32) -> Result<usize, String> {
     }
 }
 
-/// CRC-32C (Castagnoli), the `pg_crc32c` value stored in `pg_control`.
 fn crc32c(bytes: &[u8]) -> u32 {
     crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(bytes)
 }
@@ -616,7 +577,6 @@ mod tests {
     use std::fs;
 
     const LABEL_NAME: &str = "dbev-0123456789abcdef0123456789abcdef";
-    /// `DEFAULT_XLOG_SEG_SIZE` from `xlog.h`.
     const DEFAULT_WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
 
     #[test]
@@ -929,9 +889,7 @@ mod tests {
         hex::encode(Sha256::digest(bytes).as_slice())
     }
 
-    /// Byte layout emitted by `AddFileToBackupManifest` and
-    /// `AddWALInfoToBackupManifest` on PostgreSQL 14–18. The returned text ends
-    /// with the checksummed `\n],\n` and has no checksum line yet.
+    /// Matches `AddFileToBackupManifest`/`AddWALInfoToBackupManifest`; ends with the checksummed `\n],\n`, no checksum line yet.
     fn manifest_prefix(
         version: u8,
         system_id: Option<u64>,
@@ -995,9 +953,7 @@ mod tests {
         manifest
     }
 
-    /// Zero-filled `pg_control` with the LP64 field placement. `relseg_size`
-    /// (220) stays 131072 and `xlog_blcksz` (224) stays 8192 so a reader of the
-    /// wrong neighbor cannot accept this as a WAL segment size.
+    /// `relseg_size` and `xlog_blcksz` keep fixed values so a reader of the wrong neighbor cannot accept this as a WAL segment size.
     fn pg_control_fixture(version: u32, wal_segment_bytes: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; 8192];
         bytes[8..12].copy_from_slice(&version.to_le_bytes());

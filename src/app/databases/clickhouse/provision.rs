@@ -32,9 +32,6 @@ ALTER USER {username} DEFAULT ROLE {role};"#,
     )
 }
 
-/// Replaces database-scoped role privileges with the import-safe profile.
-/// View privileges remain part of the profile; destructive imports separately
-/// prove that the generated rollback stream can replay every current view.
 pub fn shared_grant_sql(database: &str, username: &str) -> String {
     shared_grant_sql_quoted(&quote_ident(database), &tenant_role_ident(username))
 }
@@ -64,10 +61,7 @@ pub fn terminate_tenant_sql(username: &str) -> String {
     format!("KILL QUERY WHERE user = {} SYNC;", quote_literal(username),)
 }
 
-/// Returns one on-disk byte count per database, in input order. Live table
-/// bytes and detached MergeTree parts are both charged to their owning tenant.
-/// Whole-table detach is not granted because a detached table disappears from
-/// both catalogs while its files remain on disk.
+/// Whole-table detach is not granted: a detached table vanishes from both catalogs while its files remain on disk.
 pub fn tenant_storage_sql(databases: &[&str]) -> String {
     databases
         .iter()
@@ -150,8 +144,7 @@ pub fn password_sql_fragments(sql: &str) -> Result<(&str, &str), ClickhouseProvi
         .ok_or(ClickhouseProvisionError::MissingPasswordPlaceholder)
 }
 
-/// Escapes a password for the protected stdin writer. Callers must never put
-/// this value in command arguments or diagnostics.
+/// Callers must never put this value in command arguments or diagnostics.
 pub fn password_literal(password: &str) -> String {
     quote_literal(password)
 }

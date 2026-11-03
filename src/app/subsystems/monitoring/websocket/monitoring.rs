@@ -59,8 +59,6 @@ pub(super) async fn stream_monitoring(
     let _monitor = state.resource_cache.register_monitor();
     let mut shutdown = state.daemon_shutdown.subscribe();
     let mut ticker = interval(MONITORING_TICK_INTERVAL);
-    // Monitoring snapshots are current state, not an event backlog. If a send
-    // is delayed, skip missed ticks instead of emitting catch-up bursts.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let expiration_deadline = jwt_expiration_deadline(jwt_exp);
     let expiration = sleep_until(expiration_deadline);
@@ -205,7 +203,6 @@ pub(super) async fn monitoring_snapshot(
 
     let mut install_progress = match authorization {
         InstanceAuthorization::All => state.install_progress.list(),
-        // Includes creations: their instance is not stored yet.
         InstanceAuthorization::Selected(_) => authorization
             .selected_ids()
             .into_iter()

@@ -76,7 +76,6 @@ impl QdrantHttp {
         )
     }
 
-    /// The managed instance over one of its host-side HTTP sockets.
     pub(super) fn target_socket(
         socket: &Path,
         api_key: &secrecy::SecretString,

@@ -61,9 +61,7 @@ impl ManagedContainerAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedContainerEvent {
-    /// Engine identity of the container which emitted the event. This lets
-    /// reconciliation distinguish delayed teardown events for a replaced
-    /// container from a failure of the currently managed container.
+    /// Distinguishes delayed teardown events of a replaced container from failures of the current one.
     pub container_id: Option<String>,
     pub instance_id: String,
     pub protocol: Protocol,
@@ -71,8 +69,7 @@ pub struct ManagedContainerEvent {
 }
 
 impl DockerRuntime {
-    /// Streams lifecycle transitions for DBE-owned containers. Health-status
-    /// events are intentionally ignored: readiness is checked only at startup.
+    /// Health-status events are ignored: readiness is checked only at startup.
     pub fn managed_container_events(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<ManagedContainerEvent, DockerError>> + Send + '_>> {

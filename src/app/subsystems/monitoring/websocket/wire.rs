@@ -4,8 +4,6 @@ use serde::{Serializer, ser::SerializeStruct};
 
 use super::{InstallProgress, ResourceReport, TenantActivity};
 
-// REST reports stay self-contained. Inside a stats item its identity and
-// activity network counters already have one authoritative location.
 pub(crate) fn resources<S: Serializer>(
     report: &Option<ResourceReport>,
     serializer: S,
@@ -53,8 +51,6 @@ pub(crate) struct ProgressDelta<'a> {
 }
 
 impl ProgressCursor {
-    /// Called only on the authorized snapshot. A new connection has no cursor
-    /// and receives all retained results, including completed/failed jobs.
     pub(crate) fn select<'a>(&mut self, entries: &[&'a InstallProgress]) -> ProgressDelta<'a> {
         let reset = !self.initialized;
         self.initialized = true;

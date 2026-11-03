@@ -13,7 +13,6 @@ use crate::{config::Config, databases::protocol::Protocol};
 
 const MAX_HOST_LEN: usize = 253;
 
-/// Facts about this machine that the wizard shows or depends on.
 #[derive(Debug, Clone)]
 pub(super) struct Environment {
     pub is_root: bool,
@@ -21,7 +20,6 @@ pub(super) struct Environment {
     pub hostname: String,
     pub kernel: Option<String>,
     pub config_path: PathBuf,
-    /// Container runtimes found on this machine.
     pub runtimes: Vec<ContainerRuntime>,
 }
 
@@ -38,7 +36,6 @@ pub(super) enum Step {
     Summary,
 }
 
-/// The standalone questions in order; the summary follows the last one.
 pub(super) const QUESTIONS: [Step; 6] = [
     Step::Engines,
     Step::PublicHost,
@@ -51,11 +48,8 @@ pub(super) const QUESTIONS: [Step; 6] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Finish {
     Quit,
-    /// Managed by a panel: print the steps and exit.
     Managed,
-    /// Standalone was chosen without root.
     NotRoot,
-    /// The summary was confirmed: write the config and set the node up.
     Write,
 }
 
@@ -118,7 +112,6 @@ impl Wizard {
         }
     }
 
-    /// 1-based position among the questions, for the step counter.
     pub(super) fn question_number(&self) -> Option<usize> {
         QUESTIONS
             .iter()
@@ -145,7 +138,6 @@ impl Wizard {
         };
     }
 
-    /// Applies one key. Returns what to do once the wizard is over.
     pub(super) fn on_key(&mut self, key: KeyEvent) -> Option<Finish> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(Finish::Quit);
@@ -179,7 +171,6 @@ impl Wizard {
         None
     }
 
-    /// Moves within the current step's choices.
     fn choose(&mut self, key: KeyEvent) {
         let forward = matches!(
             key.code,
@@ -264,7 +255,6 @@ impl Wizard {
     }
 }
 
-/// A DNS name or an IP address, as clients will type it.
 pub(super) fn validate_host(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("Enter the host clients use to reach this machine".to_string());

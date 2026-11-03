@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use crate::{gateway::sessions::TenantSessions, server::state::InstanceStore};
 
-/// Removes the tenant from every route index before closing its already-open
-/// gateway sockets. The ordering prevents a reconnect from racing the fence.
+/// Removes the tenant from route indexes before closing open sockets, so a reconnect can't race the fence.
 pub(crate) async fn fence(
     store: &InstanceStore,
     sessions: &TenantSessions,

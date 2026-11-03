@@ -16,7 +16,6 @@ use crate::{
     utils::limits::{bytes_to_mib_ceil, mib_to_bytes},
 };
 
-// API compatibility is versioned independently from the daemon binary release.
 pub const API_VERSION: &str = "0.17.0";
 
 #[derive(Debug, Serialize)]
@@ -392,9 +391,8 @@ mod tests {
             assert!(strings(&instance["required"]).contains(&field));
         }
 
-        // Limits returned by the daemon add two enforcement fields to the
-        // three request fields. Referencing LimitsRequest through allOf would
-        // make its additionalProperties=false reject those response fields.
+        // Referencing LimitsRequest through allOf would make its additionalProperties=false reject
+        // those response fields.
         let instance_limits = &schemas["InstanceLimits"];
         assert!(instance_limits["allOf"].is_null());
         assert_eq!(

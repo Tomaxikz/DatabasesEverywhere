@@ -102,12 +102,8 @@ impl PlacementRepository {
         }
     }
 
-    /// Returns the shared-pool capacity that is still charged to the pool
-    /// root. A tenant with a durable hard child quota contributes only its
-    /// pooled engine-global spill reserve; its data bytes are charged to the
-    /// child project. Missing or soft tenant metadata is counted in full, and
-    /// every reservation contributes to spill so interrupted provisioning or
-    /// migration remains conservative.
+    /// Shared-pool capacity still charged to the pool root: hard-quota tenants contribute only the pooled spill reserve,
+    /// while missing or soft tenant metadata counts in full.
     pub async fn root_charged_disk_mib(
         &self,
         runtime_id: &str,

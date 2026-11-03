@@ -38,12 +38,8 @@ impl ContainmentReport {
     }
 }
 
-/// Fails one shared runtime closed while its runtime operation lock is held.
-///
-/// Routes are removed before any fallible durable or container operation. A
-/// durable `Quarantined` state blocks ordinary startup. Boot recovery may only
-/// release it after full validation; the physical pool is force-stopped if
-/// graceful shutdown is inconclusive.
+/// Fails one shared runtime closed under its operation lock: routes are removed first, durable `Quarantined`
+/// blocks startup, and the pool is force-stopped if graceful shutdown is inconclusive.
 pub(crate) async fn contain_locked(
     state: &AppState,
     snapshot: &EngineRuntime,

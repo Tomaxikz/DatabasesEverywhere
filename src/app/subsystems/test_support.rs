@@ -11,7 +11,6 @@ use crate::{
     server::{manager::InstanceManager, state::InstanceStore},
 };
 
-/// Builds the common in-memory/offline API state used by handler tests.
 pub(crate) fn state(
     config: Config,
     config_path: PathBuf,

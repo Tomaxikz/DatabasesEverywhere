@@ -19,11 +19,9 @@ pub(super) async fn reject_duplicate_instance(
         )));
     }
 
-    // Instance ids and physical runtime ids share container and filesystem
-    // namespaces. A generated shared-pool id must therefore never be treated
-    // as an unowned, stale instance id: an explicitly authorized stale purge
-    // would otherwise be able to remove a live pool before creation reaches
-    // the metadata transaction that rejects the collision.
+    // A generated shared-pool id must therefore never be treated as an unowned, stale instance id:
+    // an explicitly authorized stale purge would otherwise be able to remove a live pool before
+    // creation reaches the metadata transaction that rejects the collision.
     if state
         .placements
         .get(&request.instance_id)

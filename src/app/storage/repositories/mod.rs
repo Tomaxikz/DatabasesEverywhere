@@ -39,7 +39,6 @@ impl InstanceRepository {
         })
     }
 
-    /// A repository over an already opened (e.g. read-only) pool and key.
     pub fn with_secrets(pool: SqlitePool, secrets: SecretStore) -> Self {
         Self {
             pool,

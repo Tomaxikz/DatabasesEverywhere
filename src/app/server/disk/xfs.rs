@@ -33,9 +33,7 @@ pub(super) async fn apply_in(
     let project = ProjectQuota::new(id, data_path);
 
     prepare_project_files(project.clone()).await?;
-    // Bound the pending ID before any inode leaves the aggregate/root
-    // project. Registry files remain for operator tooling, but traversal is
-    // descriptor-relative and does not delegate path resolution to xfs_quota.
+    // Cap the pending ID before any inode leaves the root project; traversal is descriptor-relative and does not use xfs_quota path resolution.
     set_limit(mount, project.id, disk_mib).await?;
     project_tree::assign(data_path, project.id).await?;
     project_id::activate_in(owner_id, registry_root, project.id).await?;
@@ -81,10 +79,7 @@ pub(super) async fn remove_in(
     }
     let project = ProjectQuota::new(claim.id, data_path);
 
-    // Keep the old cap active until every reachable inode has left the claim.
-    // A pending adoption can contain both source- and target-owned entries,
-    // so roll it back to the trusted source instead of treating it as a fully
-    // established active boundary.
+    // Keep the old cap until every inode has left the claim; a pending adoption holds source- and target-owned entries, so roll back to the source.
     project_tree::release_claimed_tree(data_path, claim).await?;
     project_usage::verify_unused(NativeProjectQuotaFs::Xfs, mount, claim.id).await?;
     clear_limit(mount, claim.id).await?;
@@ -153,9 +148,7 @@ fn rewrite_project_files(
     let projects = read_project_file(PROJECTS_FILE)?;
     let projid = read_project_file(PROJID_FILE)?;
 
-    // Plan and validate both updates before replacing either file. This makes a
-    // conflicting external allocation fail closed without modifying the other
-    // registry file.
+    // Plan and validate both updates before replacing either file so a conflicting allocation fails closed.
     let projects_update =
         plan_projects(&projects, project).map_err(project_file_error(PROJECTS_FILE))?;
     let projid_update = plan_projid(&projid, project).map_err(project_file_error(PROJID_FILE))?;

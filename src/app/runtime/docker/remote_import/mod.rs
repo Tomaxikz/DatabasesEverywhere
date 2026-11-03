@@ -25,10 +25,7 @@ const HELPER_STOP_TIMEOUT_SECONDS: i64 = 10;
 const MAX_HELPER_ENVIRONMENT_ENTRIES: usize = 64;
 const MAX_HELPER_ENVIRONMENT_BYTES: usize = 64 * 1024;
 
-/// Description of a one-shot import helper. Outbound acquisition helpers use
-/// an isolated bridge; shared restores join one verified pool's network
-/// namespace without mounting its data. `script` is stored in Docker's
-/// container configuration and therefore must never contain secrets.
+/// `script` is stored in Docker's container configuration and must never contain secrets.
 #[derive(Clone)]
 pub struct RemoteImportHelperSpec {
     pub image: String,

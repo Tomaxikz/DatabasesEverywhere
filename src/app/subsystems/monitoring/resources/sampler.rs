@@ -164,8 +164,6 @@ pub(super) fn parse_host_cpu(contents: &str) -> Result<HostCpuSample, std::io::E
     let stats = KernelStats::from_buf_read(contents.as_bytes(), procfs::current_system_info())
         .map_err(proc_error)?;
     let cpu = &stats.total;
-    // Linux user/nice counters already include guest time, so exclude the guest
-    // fields and sum user through steal only to avoid counting them twice.
     let total = [cpu.user, cpu.nice, cpu.system, cpu.idle]
         .into_iter()
         .chain(
@@ -360,9 +358,7 @@ struct RuntimeUsage {
     memory_usage_bytes: Option<u64>,
 }
 
-/// Collapses logical tenants onto their physical engine runtime. Dedicated
-/// instances still produce one target each because their runtime ID is their
-/// instance ID.
+/// Dedicated instances still produce one target each because their runtime ID is their instance ID.
 pub(super) fn runtime_targets(
     instances: &[InstanceMetadata],
     runtimes: &[EngineRuntime],
@@ -480,10 +476,8 @@ pub(super) async fn sample_shared_runtime_usage(
         .await
 }
 
-/// A native project counter on the shared-pool root deliberately excludes
-/// nested hard tenant projects. Add each hard child exactly once so node-level
-/// managed disk usage still describes the complete physical pool. Soft and
-/// FUSE-only pools have no hard children and are already complete at the root.
+/// A native project counter on the shared-pool root deliberately excludes nested hard tenant
+/// projects.
 async fn shared_runtime_disk_usage(
     state: &AppState,
     runtime: &EngineRuntime,
@@ -557,9 +551,6 @@ fn managed_disk_total(
     root_method: &str,
     children: impl IntoIterator<Item = Result<u64, String>>,
 ) -> Result<u64, String> {
-    // A FUSE boundary and non-nested native backends already account for the
-    // complete tree at the root. Only Linux project counters exclude files
-    // relabelled into child tenant projects.
     if !matches!(
         root_method,
         "host_xfs_project_quota" | "host_linux_project_quota"
@@ -768,9 +759,6 @@ async fn run_runtime_stats_worker(
     };
     let mut previous_cpu = None::<(u64, Instant)>;
     loop {
-        // Take one one-shot counter snapshot per second. Sleeping in
-        // parallel prevents a slow runtime request adding another full
-        // interval to the sample cadence.
         let (result, _) = tokio::join!(
             sampler.sample(),
             tokio::time::sleep(RUNTIME_STATS_POLL_INTERVAL)

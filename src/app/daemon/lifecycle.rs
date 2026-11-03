@@ -480,7 +480,6 @@ pub(crate) async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     server_result
 }
 
-/// Every folder whose paths end up in a container's mounts.
 fn host_path_roots(config: &Config) -> Vec<PathBuf> {
     let paths = &config.paths;
     [

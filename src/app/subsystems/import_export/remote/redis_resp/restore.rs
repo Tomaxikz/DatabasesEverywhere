@@ -14,8 +14,6 @@ use super::{
 };
 
 impl RespConnection {
-    /// Relays a binary DUMP response into RESTORE without buffering the serialized value.
-    ///
     /// Returns `false` when the source key disappeared before DUMP produced a value.
     pub async fn relay_restore_replace(
         &mut self,

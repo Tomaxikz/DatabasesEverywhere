@@ -71,8 +71,6 @@ enum CpuBurstError {
 }
 
 impl DockerRuntime {
-    /// Enforces DBE's fixed latency policy: every bounded managed database may
-    /// accumulate at most one additional quota window of CPU time.
     pub(crate) async fn apply_cpu_burst_policy(
         &self,
         protocol: Protocol,
@@ -112,9 +110,7 @@ impl DockerRuntime {
         }
     }
 
-    /// Clears an earlier burst before changing the quota. Linux rejects a new
-    /// quota smaller than the currently configured burst, so this must happen
-    /// before a downward CPU-limit update.
+    /// Linux rejects a quota smaller than the configured burst, so clear it before a downward CPU-limit update.
     pub(super) async fn clear_cpu_burst(&self, protocol: Protocol, instance_id: &str) {
         if let Err(error) = self
             .set_cpu_burst_policy(protocol, instance_id, CpuBurstMode::Disabled)

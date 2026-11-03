@@ -12,8 +12,7 @@ use crate::{
 };
 use tokio::sync::OwnedMutexGuard;
 
-/// Lock order: node placement -> nonwaiting job admission -> sorted tenants ->
-/// pool. Tenant workers never wait for a pool operation holding their own lock.
+/// Tenant workers never wait for a pool operation holding their own lock.
 pub(super) struct PoolGuard {
     _mutation: MutationPermit,
     _jobs: Vec<ImportExportJobPermit>,

@@ -1,5 +1,3 @@
-//! Staging, file transfer, compression, and artifact path hardening.
-
 use std::{
     io::Write,
     path::{Path as FsPath, PathBuf},
@@ -425,7 +423,6 @@ pub(super) fn has_allowed_artifact_extension(path: &FsPath) -> bool {
     .any(|suffix| filename.ends_with(suffix))
 }
 
-/// Durably removes an import recovery manifest once the import committed.
 pub(crate) async fn commit_recovery_manifest(path: &FsPath) -> Result<(), ApiError> {
     let path = path.to_path_buf();
     crate::routes::http::response::run_blocking(

@@ -36,7 +36,6 @@ use self::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const TICK_INTERVAL: Duration = Duration::from_millis(120);
-/// How long a freshly set-up daemon may take to answer.
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(120);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -73,7 +72,6 @@ pub(super) async fn run(config_path: PathBuf) -> anyhow::Result<()> {
     result
 }
 
-/// Polls a daemon that setup just started until its API answers.
 async fn wait_for_daemon(client: &ApiClient) -> anyhow::Result<api::SystemInfo> {
     println!("waiting for the daemon API at {}…", client.base_url());
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;

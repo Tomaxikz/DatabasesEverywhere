@@ -42,8 +42,7 @@ pub(crate) async fn prepare_socket_directory(
     Ok(())
 }
 
-/// Refresh only daemon-owned ClickHouse configuration for the next container
-/// start. An atomic replacement is not assumed to update a live file bind.
+/// Refreshes daemon-owned ClickHouse config; atomic replacement does not update a live file bind.
 pub(crate) async fn prepare_hosted_config(
     state: &AppState,
     runtime: &EngineRuntime,

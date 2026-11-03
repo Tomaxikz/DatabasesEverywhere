@@ -157,8 +157,7 @@ impl S3BackupDriver {
         }
     }
 
-    /// Every key under `prefix`, which must end with `/`. The whole listing
-    /// shares one request deadline.
+    /// Every key under `prefix` (ending `/`), sharing one request deadline.
     pub(super) async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, BackupStoreError> {
         let listing = async {
             let mut objects = self.store.list(Some(&object_path(prefix)?));
@@ -187,8 +186,7 @@ impl S3BackupDriver {
     }
 }
 
-/// The `object_store` path of an S3 key. Backup keys are always valid paths;
-/// one that is not would be stored under a different, re-encoded key.
+/// Backup keys are valid paths; an invalid one would be stored re-encoded.
 pub(super) fn object_path(key: &str) -> Result<ObjectPath, BackupStoreError> {
     let trimmed = key.strip_suffix('/').unwrap_or(key);
     match ObjectPath::parse(trimmed) {

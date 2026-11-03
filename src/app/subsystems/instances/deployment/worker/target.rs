@@ -128,9 +128,6 @@ pub(super) async fn run_dedicated_to_shared(
         },
     )
     .await?;
-    // Acquire execution capacity while the source route is still open. The
-    // permit then covers both structural scans, export, import, and target
-    // validation; no expensive manifest phase may bypass the scheduler.
     let copy_admission = admit_logical_copy(state, &source).await?;
     migration = advance_to(state, migration, MigrationStage::SourceFencing).await?;
     drain_source_sessions(state, &source).await?;
@@ -209,9 +206,7 @@ pub(super) async fn run_dedicated_to_shared(
         .await
         .map_err(migration_error)?;
 
-    // The cutover transaction attached the hard tenant metadata. Until that
-    // commit the provisional reservation remained charged to the root; only
-    // now is it safe to lower the root quota around the child project.
+    // Until that commit the provisional reservation remained charged to the root.
     runtime_ops::apply_root_disk_limit(&state.config, &state.placements, &target_runtime)
         .await
         .map_err(ApiError::Runtime)?;
@@ -306,9 +301,6 @@ pub(super) async fn run_shared_to_dedicated(
         .tenant_password
         .as_deref()
         .ok_or_else(|| ApiError::Conflict("source tenant credential disappeared".into()))?;
-    // The provisional dedicated engine exists at the same time as the source
-    // pool, so admit its full temporary footprint rather than treating this as
-    // an in-place resize.
     enforce_node_allocation_policy(
         state,
         migration.target_limits.as_ref().unwrap_or(&source.limits),
@@ -317,9 +309,7 @@ pub(super) async fn run_shared_to_dedicated(
     .await?;
 
     migration = advance_to(state, migration, MigrationStage::TargetPreparing).await?;
-    // This private engine has no gateway route until cutover. Bootstrap with
-    // the durable credential: changing it later would reapply shared grants
-    // and cannot work for ClickHouse's XML-managed dedicated account.
+    // This private engine has no gateway route until cutover.
     let mut request = dedicated_target_request(&source, &source_runtime)?;
     if let Some(limits) = &migration.target_limits {
         request.limits = Some(LimitsRequest {
@@ -330,9 +320,7 @@ pub(super) async fn run_shared_to_dedicated(
     }
     let target = build_dedicated_target(state, request, false).await?;
 
-    // Persist maintenance credentials before the first container process is
-    // launched. This updates only encrypted route-auth columns and leaves the
-    // authoritative shared placement and route untouched.
+    // Persist maintenance credentials before the first container process is launched.
     state
         .manager
         .stage_dedicated_admin_secrets(&target.metadata)

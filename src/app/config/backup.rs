@@ -44,7 +44,6 @@ impl Default for BackupConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DedicatedBackupMode {
     Online,
-    /// Legacy default for configurations that do not name a mode.
     #[default]
     Offline,
 }

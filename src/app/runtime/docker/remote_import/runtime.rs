@@ -52,10 +52,7 @@ impl DockerRuntime {
         &self,
         spec: &RemoteImportHelperSpec,
     ) -> Result<CommandOutput, DockerError> {
-        // The supervisor owns the helper lifecycle. Dropping the caller's
-        // future signals cancellation instead of detaching an unmonitored
-        // container, and the supervisor remains alive long enough to remove
-        // any container it may already have created.
+        // The supervisor owns the helper lifecycle: dropping the caller's future signals cancellation and the supervisor removes any container it created.
         let cancellation = Arc::new(HelperCancellation::default());
         let mut cancel_on_drop = CancelHelperOnDrop::new(cancellation.clone());
         let runtime = self.clone();
@@ -204,11 +201,7 @@ impl DockerRuntime {
         Ok(ResolvedHelperNetwork { mode })
     }
 
-    /// Removes helper containers left behind by an interrupted daemon process.
-    ///
-    /// Both the exact helper label and the generated name format must match.
-    /// This prevents reconciliation from touching managed database containers
-    /// or unrelated containers that happen to use a similar label or name.
+    /// Both the exact helper label and the generated name format must match, so managed database containers are never touched.
     pub async fn reconcile_import_helpers(&self) -> Result<usize, DockerError> {
         let node_id = self
             .node_id

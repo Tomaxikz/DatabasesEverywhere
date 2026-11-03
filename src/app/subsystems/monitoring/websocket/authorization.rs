@@ -36,8 +36,6 @@ impl InstanceAuthorization {
         }
     }
 
-    /// Progress is visible for the stored instance the token binds, or for
-    /// the creation attempt it binds, including that attempt's final record.
     pub(super) fn allows_progress(
         &self,
         progress: &crate::subsystems::instances::progress::InstallProgress,
@@ -55,7 +53,6 @@ impl InstanceAuthorization {
         }
     }
 
-    /// The instance IDs a selective token names.
     pub(super) fn selected_ids(&self) -> Vec<&str> {
         match self {
             Self::All => Vec::new(),
@@ -86,9 +83,6 @@ impl InstanceAuthorization {
     }
 }
 
-/// Generations a WebSocket token may bind for `instance_id`: the stored
-/// instance's `created_at`, and the attempt of a creation that is running or
-/// just finished. Either may be absent.
 pub(crate) struct BindableGenerations {
     pub stored: Option<String>,
     pub creating: Option<String>,
@@ -109,7 +103,6 @@ impl BindableGenerations {
         }
     }
 
-    /// What a newly minted token binds to: the stored instance when it exists.
     pub(crate) fn preferred(self) -> Option<String> {
         self.stored.or(self.creating)
     }

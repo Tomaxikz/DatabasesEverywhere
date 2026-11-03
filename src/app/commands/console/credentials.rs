@@ -20,7 +20,6 @@ use crate::{
 pub(super) struct RevealedCredentials {
     pub username: String,
     pub password: SecretString,
-    /// Engine superuser of a dedicated runtime, e.g. `MariaDB root`.
     pub admin: Option<(&'static str, SecretString)>,
 }
 

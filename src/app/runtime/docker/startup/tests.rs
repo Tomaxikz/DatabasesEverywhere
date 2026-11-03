@@ -70,7 +70,6 @@ async fn startup_budget_survives_boots_and_unrelated_metadata_writes() {
     runtime.startup_ready(ID).await.unwrap();
     runtime.check_autostart(ID).await.unwrap();
     assert!(runtime.check_autostart("pool_guard").await.is_err());
-    // Missing/deleted runtimes cannot be admitted for automatic recovery.
     assert!(runtime.note_start("deleted", true).await.is_err());
     reopened.close().await;
 }
@@ -247,7 +246,6 @@ async fn real_runtime_paths_count_starts_but_never_restart_a_readiness_probe() {
             assert_eq!(state.lock().unwrap().updates, 1);
             state.lock().unwrap().start_succeeds = true;
             runtime.start(Protocol::Postgres, ID).await.unwrap();
-            // Idempotent start of an already running engine consumes no attempt.
             runtime.start(Protocol::Postgres, ID).await.unwrap();
             assert_eq!(state.lock().unwrap().starts, 3);
             assert!(runtime.check_autostart(ID).await.is_err());

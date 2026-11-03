@@ -1,14 +1,4 @@
 //! Crash recovery for online backup jobs and unsettled publications.
-//!
-//! Only resources journaled by a job are touched, and generation-bound
-//! resources (sessions, temporary slots, in-container helpers) are cleaned
-//! only while the runtime still runs the generation that created them; after
-//! a restart they no longer exist. Helper containers are removed by the
-//! coordinator itself and must be confirmed gone. Staging is removed only
-//! once no owned resource remains. Unknown strategies, stopped runtimes,
-//! failed cleanups and uploaded objects that could not be removed leave the
-//! job `cleanup_pending` for a later attempt, and a new online backup of that
-//! instance refuses to start until it is resolved.
 
 use std::{
     collections::HashSet,
@@ -38,7 +28,6 @@ pub(crate) struct BackupRecoverySummary {
     pub cleanup_pending: usize,
 }
 
-/// Classifies every interrupted or cleanup-pending job at daemon startup.
 pub(crate) async fn recover_interrupted_backups(
     state: &AppState,
 ) -> Result<BackupRecoverySummary, ApiError> {
@@ -60,7 +49,6 @@ pub(crate) async fn recover_interrupted_backups(
             }
         }
     }
-    // Offline and shared backups, and publications whose job already ended.
     for resolution in publication::recover(state, None, false).await? {
         match resolution {
             Resolution::Published => summary.published += 1,
@@ -72,9 +60,6 @@ pub(crate) async fn recover_interrupted_backups(
     Ok(summary)
 }
 
-/// Startup keeps capture staging for recovery. Once jobs are recovered only
-/// `cleanup_pending` jobs, whose helpers may still exist, keep theirs; any
-/// other capture directory belongs to no live job and is removed.
 async fn sweep_capture_staging(state: &AppState) -> Result<(), ApiError> {
     let staging_root = PathBuf::from(state.config.paths.backups_root()).join(".staging");
     let keep: HashSet<PathBuf> = state
@@ -112,9 +97,6 @@ async fn sweep_capture_staging(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Retries cleanup for one instance before a new online backup. The caller
-/// holds the instance lock. Fails while any earlier job still owns
-/// resources or uploaded objects.
 pub(super) async fn recover_instance_jobs(
     state: &AppState,
     instance_id: &str,
@@ -135,8 +117,7 @@ pub(super) async fn recover_instance_jobs(
     Ok(())
 }
 
-/// Best-effort retry of this instance's unsettled publications before any
-/// backup. The caller holds the instance lock. Never blocks the backup.
+/// Never blocks the backup.
 pub(super) async fn recover_instance_publications(state: &AppState, instance_id: &str) {
     match publication::recover(state, Some(instance_id), true).await {
         Ok(resolutions) => {
@@ -209,7 +190,6 @@ async fn recover_job(state: &AppState, job: &BackupJobRecord) -> Result<BackupJo
         }
         None => release_generation_bound(state, &identity, generation_matches).await?,
     };
-    // A helper that may still exist could still be writing to staging.
     if remaining.is_empty() {
         remove_journaled_staging(state, job).await;
     }
@@ -244,8 +224,6 @@ async fn recover_job(state: &AppState, job: &BackupJobRecord) -> Result<BackupJo
     Ok(to)
 }
 
-/// Cleans every unreleased resource of a job that is provably still owned.
-/// Returns the resources that remain.
 pub(super) async fn cleanup_job_resources(
     state: &AppState,
     metadata: Option<&InstanceMetadata>,
@@ -270,7 +248,6 @@ pub(super) async fn cleanup_job_resources(
             remove_helper(state, &job_id, &resource.name).await
         } else {
             match (metadata, resource.survives_restart, generation_matches) {
-                // The creating process is gone; generation-bound state went with it.
                 (_, false, false) => true,
                 (Some(metadata), _, _) => {
                     let ctx = CleanupContext {
@@ -288,7 +265,6 @@ pub(super) async fn cleanup_job_resources(
                         }
                     }
                 }
-                // A surviving resource of a deleted instance needs its runtime.
                 (None, true, _) => false,
                 (None, false, true) => true,
             }
@@ -306,8 +282,6 @@ pub(super) async fn cleanup_job_resources(
     Ok(remaining)
 }
 
-/// Without the strategy in this build only generation-bound resources of a
-/// replaced runtime can be released.
 async fn release_generation_bound(
     state: &AppState,
     identity: &BackupJobIdentity,
@@ -340,8 +314,6 @@ async fn release_generation_bound(
     Ok(remaining)
 }
 
-/// Helper containers outlive the runtime and need no strategy: force-remove
-/// and confirm absence.
 async fn remove_helper(state: &AppState, job_id: &str, name: &str) -> bool {
     match state.docker.remove_backup_helper(name).await {
         Ok(()) => true,
@@ -371,7 +343,6 @@ async fn is_published(state: &AppState, job: &BackupJobRecord) -> bool {
     }
 }
 
-/// Removes the journaled capture staging, but only inside backup staging.
 async fn remove_journaled_staging(state: &AppState, job: &BackupJobRecord) {
     let staging_root = PathBuf::from(state.config.paths.backups_root()).join(".staging");
     let path = Path::new(&job.staging_path);
@@ -645,7 +616,6 @@ mod tests {
         let remaining = cleanup_job_resources(&state, Some(&metadata), &failing, &job, false)
             .await
             .unwrap();
-        // The replaced runtime took the session with it; the slot survives.
         assert_eq!(remaining, vec![foreign.clone(), slot.clone()]);
 
         let strategy = FakeStrategy {
@@ -701,7 +671,6 @@ mod tests {
     async fn unsettled_publications_are_removed_or_kept_pending() {
         let (_dir, state) = journal_state().await;
         let storage = crate::subsystems::backups::storage::backup_storage(&state).unwrap();
-        // A deleted instance's interrupted upload is removed by backup id.
         publication::begin(&state, &storage, "inst_gone", "a.physical.tar.gz", None)
             .await
             .unwrap();

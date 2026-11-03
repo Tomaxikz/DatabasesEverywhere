@@ -15,9 +15,8 @@ pub(super) async fn quiesce_upgrade_source(
     metadata: &InstanceMetadata,
     password: &str,
 ) -> Result<(), ApiError> {
-    // Removing the route blocks new sessions. Restarting the source then
-    // terminates every already-established gateway session before the dump,
-    // so writes cannot race the logical snapshot and disappear at cutover.
+    // Restarting the source then terminates every already-established gateway session before the
+    // dump, so writes cannot race the logical snapshot and disappear at cutover.
     crate::subsystems::instances::route_fence::fence(state, &metadata.instance_id).await;
     state
         .docker

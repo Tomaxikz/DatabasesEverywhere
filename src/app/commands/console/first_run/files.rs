@@ -10,8 +10,6 @@ use std::{
 
 use anyhow::{Context, bail};
 
-/// Refuses config paths `dbev --setup` would reject, before anything is
-/// written: it needs an absolute path in a dedicated directory.
 pub(super) fn check_location(path: &Path) -> anyhow::Result<()> {
     if !path.is_absolute()
         || path
@@ -51,8 +49,6 @@ pub(in crate::commands::console) fn exists(path: &Path) -> anyhow::Result<bool> 
     }
 }
 
-/// Writes a new private file atomically. `replace` allows an existing file
-/// to be swapped out; without it an existing file is an error.
 pub(super) fn write_private(
     path: &Path,
     contents: &str,

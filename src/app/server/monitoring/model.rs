@@ -55,8 +55,7 @@ impl OperationCounts {
     }
 }
 
-/// Exact counters measured at the DBEV gateway. Values are cumulative except
-/// for `active_connections`, which is a point-in-time gauge.
+/// Counters measured at the gateway; cumulative except the `active_connections` gauge.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayActivity {
     pub active_connections: u64,
@@ -71,8 +70,7 @@ pub struct ActivityCurrent {
     pub stats_epoch: String,
     pub sampled_at_unix: i64,
     pub accepted: OperationCounts,
-    /// Internal source state kept beside the matching operation snapshot so
-    /// REST and WebSocket responses cannot race the collector publication.
+    /// Source state kept beside the operation snapshot so REST/WS responses can't race the collector.
     #[serde(skip)]
     pub(crate) operations_measured: bool,
     pub rejected: OperationCounts,
@@ -80,32 +78,24 @@ pub struct ActivityCurrent {
     pub opened_connections: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
-    /// Cumulative CPU time observed by an engine-native collector. `None`
-    /// means the engine or collector cannot measure it; `Some(0)` is a real
-    /// measured zero.
+    /// Engine-reported CPU time; `None` is unmeasurable, `Some(0)` a measured zero.
     pub cpu_time_micros: Option<u64>,
-    /// Highest observed query memory since this process began tracking the
-    /// tenant. It is deliberately not presented as tenant RSS.
+    /// Highest query memory seen since tracking began; not tenant RSS.
     pub peak_query_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityBucket {
     pub instance_id: String,
-    /// Immutable incarnation of `instance_id`. This is kept out of the public
-    /// response, but prevents a delayed sampler write from being attached to
-    /// a deleted and recreated tenant with the same ID.
+    /// Incarnation of `instance_id`, hidden from the API, so a delayed write can't attach to a recreated tenant.
     #[serde(skip)]
     pub(crate) instance_generation: String,
     pub bucket_start_unix: i64,
     pub duration_seconds: u32,
     pub stats_epoch: String,
-    /// True marks a counter reset or another discontinuity. A gap bucket never
-    /// fabricates deltas from incompatible counter epochs.
+    /// Counter reset or discontinuity; gap buckets never fabricate deltas.
     pub gap: bool,
-    /// Whether the operation counters in this bucket came from a supported
-    /// observer. This distinguishes a measured all-zero interval from a metric
-    /// that was unavailable for the entire interval.
+    /// Whether operation counts came from a supported observer (measured zero vs unavailable).
     pub operations_observed: bool,
     pub accepted: OperationCounts,
     pub rejected: OperationCounts,

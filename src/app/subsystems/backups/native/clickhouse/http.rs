@@ -1,5 +1,3 @@
-//! Minimal ClickHouse HTTP client over the instance's always-on HTTP socket.
-
 use std::{path::Path, time::Duration};
 
 use reqwest::{Client, header::HeaderValue, redirect::Policy};
@@ -11,7 +9,6 @@ use crate::subsystems::backups::strategy::StrategyError;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 300;
 
-/// A failed query, with ClickHouse's error code when the server sent one.
 #[derive(Debug)]
 pub(super) struct QueryError {
     pub code: Option<u32>,
@@ -58,7 +55,6 @@ impl ClickhouseHttp {
         Ok(Self { client, user, key })
     }
 
-    /// Runs one statement and returns the whole response body.
     pub(super) async fn query(&self, sql: &str) -> Result<String, QueryError> {
         let mut response = self
             .client
@@ -90,7 +86,6 @@ impl ClickhouseHttp {
         })
     }
 
-    /// Runs a `FORMAT JSONEachRow` query and decodes every row.
     pub(super) async fn rows<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, QueryError> {
         self.query(sql)
             .await?
@@ -120,7 +115,6 @@ fn transport_error(error: reqwest::Error) -> QueryError {
     }
 }
 
-/// `Code: 60. DB::Exception: ...` → 60.
 pub(super) fn error_code(body: &str) -> Option<u32> {
     let rest = body.trim_start().strip_prefix("Code: ")?;
     rest.split(|byte: char| !byte.is_ascii_digit())

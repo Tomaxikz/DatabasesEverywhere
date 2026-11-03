@@ -65,8 +65,6 @@ pub(crate) use socket::{
 
 pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade {
     websocket
-        // Incoming traffic is mostly small controls/pings. Larger permitted
-        // frames are still assembled, with unchanged frame/message limits.
         .read_buffer_size(WEBSOCKET_READ_BUFFER_BYTES)
         .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
         .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES)
@@ -102,8 +100,6 @@ pub async fn logs(
                 protocol: metadata.protocol,
             }
         }
-        // A token bound to a creation attempt follows that creation's container,
-        // including after the instance was stored.
         _ => creating_log_target(&instance_id, progress, &authorization)?,
     };
     let connection = admit_websocket(&state, &claims).await?;

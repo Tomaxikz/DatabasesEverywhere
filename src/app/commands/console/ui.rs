@@ -471,7 +471,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// A centred popup `width` columns wide and `height` rows tall.
 pub(super) fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> Rect {
     let area = frame.area();
     let width = width.min(area.width.saturating_sub(2));

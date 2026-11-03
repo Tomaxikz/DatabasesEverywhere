@@ -85,9 +85,7 @@ impl DiskLimiter {
         }
     }
 
-    /// Reports whether the per-instance enforcement runtime can be reused
-    /// without interrupting its container. Non-FUSE modes have no persistent
-    /// helper process to recover.
+    /// Whether the enforcement runtime can be reused without interrupting its container.
     pub async fn runtime_is_healthy(&self, data_path: &Path) -> Result<bool, DiskLimitError> {
         match self.config.mode {
             DiskLimitMode::FuseQuota => {
@@ -98,9 +96,7 @@ impl DiskLimiter {
         }
     }
 
-    /// Detect a legacy FuseQuota mount independently of the per-protocol
-    /// effective mode. This is used to migrate Qdrant containers that predate
-    /// its FUSE safety exclusion without guessing from metadata.
+    /// Detects a legacy FuseQuota mount, used to migrate Qdrant containers that predate its FUSE exclusion.
     pub fn has_legacy_fuse_mount(&self, data_path: &Path) -> Result<bool, DiskLimitError> {
         let mount_path = fuse_quota::mount_path_with_root(data_path, self.fuse_root.as_deref())?;
         mounts::is_mountpoint(&mount_path)
@@ -149,10 +145,8 @@ impl DiskLimiter {
             .map(|_| ())
     }
 
-    /// Update the aggregate limit of an existing shared engine without
-    /// recursively adopting its nested tenant paths. Dedicated restore paths
-    /// must keep using [`Self::update_instance_limit`] so moved files are
-    /// adopted into the dedicated instance project.
+    /// Updates a shared engine's aggregate limit without adopting nested tenant paths.
+    /// Dedicated restore paths use [`Self::update_instance_limit`] so moved files are adopted.
     pub(crate) async fn update_shared_pool_limit(
         &self,
         runtime_id: &str,

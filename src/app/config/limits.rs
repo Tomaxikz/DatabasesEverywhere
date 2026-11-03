@@ -10,7 +10,6 @@ pub(crate) struct SharedBudgets {
     pub backup_materializations: Arc<Semaphore>,
 }
 
-/// Node admission controls. Scope is retained by each consumer; restart required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimits {
@@ -48,7 +47,6 @@ impl Default for RuntimeLimits {
 }
 
 impl RuntimeLimits {
-    /// Called after validation by RuntimeConfig, once per daemon run.
     pub(crate) fn shared_budgets(&self) -> SharedBudgets {
         SharedBudgets {
             gateway_handshakes: Arc::new(Semaphore::new(self.gateway_handshakes)),

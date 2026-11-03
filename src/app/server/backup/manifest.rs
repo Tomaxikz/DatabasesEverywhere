@@ -1,14 +1,4 @@
-//! Versioned backup manifest bodies.
-//!
-//! Schema 1 records only inventory facts (identity, layout, size, checksum).
-//! Schema 2 adds the restore contract: artifact format, capture method, scope,
-//! restore recipe, consistency level, capture interval, recovery coordinates,
-//! engine and tool versions, exclusions, checksums and validation results.
-//!
-//! Readers never invent guarantees for schema 1 records: their consistency is
-//! reported as unrecorded and they restore only through the legacy recipes
-//! matching their layout. Unknown schema versions are rejected explicitly
-//! rather than reinterpreted.
+//! Versioned backup manifest bodies. Schema 1 holds inventory facts; schema 2 adds the restore contract. Readers never invent guarantees for schema 1 and reject unknown versions.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -20,10 +10,7 @@ use super::{BackupLayout, BackupStoreError, is_sha256};
 pub const LEGACY_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
-/// Built-in recipe restoring a gzip tar of the complete instance data
-/// directory into a stopped dedicated runtime.
 pub const DATA_DIRECTORY_RECIPE: &str = "data_directory_archive";
-/// Built-in recipe replaying a shared tenant logical dump.
 pub const LOGICAL_DUMP_RECIPE: &str = "logical_dump";
 pub const BUILT_IN_RECIPE_VERSION: u32 = 1;
 
@@ -34,23 +21,16 @@ const MAX_LIST_ENTRIES: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactFormat {
-    /// gzip tar whose root is the instance data directory.
     DataDirectoryArchive,
-    /// Engine logical dump produced by the shared tenant export path.
     LogicalDump,
-    /// gzip tar of a strategy capture laid out like a data directory archive,
-    /// restorable only through the recorded strategy recipe.
     OnlineCapture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupMethod {
-    /// Files copied while the database process was stopped.
     OfflineCopy,
-    /// Tenant-scoped logical dump of a shared runtime.
     SharedLogicalDump,
-    /// Engine-native capture of a running database.
     OnlineStrategy,
 }
 
@@ -64,14 +44,9 @@ pub enum BackupScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsistencyLevel {
-    /// Data files of a cleanly stopped process.
     StoppedCopy,
-    /// One transactional snapshot of the captured scope.
     TransactionalSnapshot,
-    /// Physical files plus the log required to recover to one consistent
-    /// point (`recovery` records the coordinates).
     PhysicalRecoveryPoint,
-    /// Objects exported individually without one common transactional point.
     PerObject,
 }
 
@@ -101,14 +76,11 @@ impl RestoreRecipeRef {
         }
     }
 
-    /// Compact form used by tag projections, e.g. `logical_dump@1`.
     pub fn tag_value(&self) -> String {
         format!("{}@{}", self.id, self.version)
     }
 }
 
-/// Engine-specific recovery coordinates, e.g. `start_lsn`, `end_lsn`,
-/// `timeline`, `system_identifier`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RecoveryCoordinates(pub BTreeMap<String, String>);
@@ -127,7 +99,6 @@ pub struct EngineRecord {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// Immutable image id or digest of the runtime that produced the data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
 }
@@ -135,7 +106,6 @@ pub struct EngineRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileChecksum {
-    /// Path relative to the archive data root, or a sidecar name.
     pub path: String,
     pub size_bytes: u64,
     pub sha256: String,
@@ -150,7 +120,6 @@ pub struct ValidationRecord {
     pub detail: Option<String>,
 }
 
-/// Schema 2 restore contract. Present exactly when `schema_version == 2`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestDetails {
@@ -168,7 +137,6 @@ pub struct ManifestDetails {
     pub engine: EngineRecord,
     #[serde(default)]
     pub tool_versions: BTreeMap<String, String>,
-    /// Relative location of the captured tree inside the data directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_target: Option<String>,
     #[serde(default)]
@@ -177,22 +145,19 @@ pub struct ManifestDetails {
     pub checksums: Vec<FileChecksum>,
     #[serde(default)]
     pub validation: Vec<ValidationRecord>,
-    /// Bytes restore extraction charges for the archive (entry sizes plus
-    /// the per-entry allowance). Recorded for online captures, which are
-    /// rejected before publication when it exceeds what restore accepts.
+    /// Bytes restore extraction charges; online captures exceeding restore's limit are rejected before publication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded_bytes: Option<u64>,
 }
 
-/// How a stored backup must be restored, independent of current placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreFormat<'a> {
-    /// Complete data directory archive (schema 1 physical or schema 2
-    /// offline copy).
-    DataDirectoryArchive { legacy: bool },
-    /// Shared tenant logical dump (schema 1 logical or schema 2).
-    LogicalDump { legacy: bool },
-    /// Online strategy capture; only the named recipe may restore it.
+    DataDirectoryArchive {
+        legacy: bool,
+    },
+    LogicalDump {
+        legacy: bool,
+    },
     StrategyCapture {
         strategy: &'a str,
         recipe: &'a RestoreRecipeRef,
@@ -201,8 +166,7 @@ pub enum RestoreFormat<'a> {
 }
 
 impl ManifestDetails {
-    /// Contract for the built-in stopped-copy and shared logical formats.
-    /// `consistency` must describe what the producing tool actually guarantees.
+    /// `consistency` must reflect what the producing tool actually guarantees.
     pub fn built_in(
         layout: BackupLayout,
         consistency: ConsistencyLevel,
@@ -242,9 +206,7 @@ impl ManifestDetails {
         }
     }
 
-    /// Whether this build restores the built-in recipe version the manifest
-    /// names. Validation accepts any positive version so newer built-in
-    /// recipes are reported as unsupported rather than as corruption.
+    /// Validation accepts any positive version so newer recipes read as unsupported, not corrupt.
     pub fn built_in_recipe_supported(&self) -> bool {
         self.restore_recipe.version == BUILT_IN_RECIPE_VERSION
     }
@@ -360,7 +322,6 @@ impl ManifestDetails {
     }
 }
 
-/// Stable identifiers: lowercase ASCII, digits, `_`, `.`, `-`.
 pub(crate) fn is_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64

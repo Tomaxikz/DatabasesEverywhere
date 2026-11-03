@@ -33,10 +33,8 @@ pub enum ResourceScope {
 #[derive(Debug, Serialize)]
 pub struct PoolUsageReport {
     pub runtime_id: String,
-    /// Cgroup CPU capacity configured for the complete shared engine.
     pub cpu_limit_cores: f64,
     pub cpu_usage_percent: Option<f64>,
-    /// Cgroup memory capacity configured for the complete shared engine.
     pub memory_limit_bytes: u64,
     pub memory_usage_bytes: Option<u64>,
 }
@@ -58,12 +56,10 @@ pub struct MemoryReport {
 pub struct DiskReport {
     pub configured_mib: u64,
     pub limit_bytes: u64,
-    /// Null means no current measurement; it never means an empty database.
+    /// it never means an empty database.
     pub used_bytes: Option<u64>,
     pub enforced: bool,
     pub enforcement_method: String,
-    /// `hard` means writes are rejected by a filesystem quota; `soft` means
-    /// bounded predictive scanning with stop/kill enforcement.
     pub enforcement_strength: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanner_logical_bytes: Option<u64>,

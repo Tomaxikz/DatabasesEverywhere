@@ -26,9 +26,6 @@ pub struct DockerInstanceSpec {
 }
 
 impl DockerInstanceSpec {
-    /// A spec with the managed defaults (1 CPU, 1 GiB memory, 10 GiB disk,
-    /// image user, entrypoint and working directory, no extra mounts, bridges,
-    /// environment or command). Engines override fields with struct update.
     pub fn with_defaults(
         instance_id: &str,
         protocol: Protocol,
@@ -72,7 +69,6 @@ impl DockerEnv {
         }
     }
 
-    /// A non-secret value; it is still stored redacted like every entry.
     pub fn plain(key: &str, value: &str) -> Self {
         Self::new(key, SecretString::from(value.to_string()))
     }

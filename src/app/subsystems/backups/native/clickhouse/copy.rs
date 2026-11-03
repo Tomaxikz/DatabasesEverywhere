@@ -1,14 +1,3 @@
-//! Builds a restorable ClickHouse data directory from the live volume and the
-//! frozen parts.
-//!
-//! The live walk copies everything except runtime scratch (`shadow`, `tmp`,
-//! `flags`, `metadata_dropped`, `preprocessed_configs`, `status`) and every
-//! directory inside a table's store directory: parts, `detached` and
-//! in-flight temporaries. Each frozen table then gets its parts from
-//! `shadow/<name>`, which mirrors the data directory layout. Files that
-//! disappear while the server keeps working are skipped. Links are refused
-//! except the ones ClickHouse recreates itself; nothing is followed.
-
 use std::{
     collections::HashSet,
     fs, io,
@@ -27,7 +16,6 @@ const SKIPPED_TOP_LEVEL: [&str; 6] = [
     "preprocessed_configs",
     "status",
 ];
-/// `store/<xyz>/<uuid>/<entry>`: depth of a part directory.
 const PART_DEPTH: usize = 4;
 const DEADLINE_CHECK_INTERVAL: usize = 256;
 
@@ -89,8 +77,6 @@ fn vanished(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound
 }
 
-/// Copies `data` into the new directory `destination`, grafting the parts of
-/// `frozen` table directories from `shadow`.
 pub(super) fn copy_frozen(
     data: &Path,
     shadow: &Path,
@@ -162,7 +148,6 @@ fn graft_parts(
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            // Descend only into the store directories of frozen tables.
             let Ok(relative) = entry.path().strip_prefix(shadow) else {
                 return false;
             };
@@ -191,7 +176,6 @@ fn graft_parts(
         }
         let target = destination.join(relative);
         if entry.depth() == PART_DEPTH {
-            // A table dropped after its freeze has no directory to receive parts.
             if !target.parent().is_some_and(Path::is_dir) {
                 continue;
             }
@@ -210,8 +194,6 @@ fn graft_parts(
     Ok(())
 }
 
-/// Copies one walked entry. `live` entries may vanish mid-copy and may be
-/// engine-recreated links; frozen parts may be neither.
 fn copy_entry(
     source: &Path,
     relative: &Path,
@@ -285,8 +267,6 @@ fn copy_mode(source: &Path, target: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", target.display()))
 }
 
-/// Counts the grafted parts in a finished copy, requiring each to carry its
-/// `checksums.txt`.
 pub(super) fn count_parts(root: &Path) -> Result<u64, String> {
     let store = root.join("store");
     if fs::symlink_metadata(&store).is_err() {
@@ -318,7 +298,6 @@ pub(super) fn count_parts(root: &Path) -> Result<u64, String> {
     Ok(parts)
 }
 
-/// Removes `shadow/<name>` below the host data directory, refusing links.
 pub(super) fn remove_shadow(data: &Path, name: &str) -> Result<(), String> {
     let shadow = data.join("shadow");
     match fs::symlink_metadata(&shadow) {
@@ -357,8 +336,6 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    /// A live data directory with one table whose `all_2_2_0` part is newer
-    /// than the freeze and whose `all_1_1_0` was merged away after it.
     fn volume() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");

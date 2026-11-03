@@ -89,9 +89,7 @@ pub(super) async fn update_instance_image_normal(
     let container_data_path = disk_limiter
         .container_data_path(&paths.data)
         .map_err(|error| fail_image_update_runtime(&state, &metadata.instance_id, error))?;
-    // The encrypted credential is authoritative once present. The optional
-    // request field remains a compatibility fallback for legacy metadata that
-    // predates encrypted tenant credential storage.
+    // The encrypted credential is authoritative once present.
     let effective_password = metadata.tenant_password.clone().or(password);
     let rollback_image = state
         .docker
@@ -477,9 +475,7 @@ pub(super) async fn quarantine_image_update(
 ) -> Result<(), ApiError> {
     let quarantined = quarantine_image_metadata(metadata);
 
-    // Remove gateway routes before waiting for Docker or SQLite. A failed
-    // durable quarantine must not leave the process routing to an uncertain
-    // replacement during this daemon lifetime.
+    // Remove gateway routes before waiting for Docker or SQLite.
     state.instances.upsert(quarantined.clone()).await;
     clear_image_update_caches(state, &quarantined.instance_id).await;
 

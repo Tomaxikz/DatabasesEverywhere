@@ -16,9 +16,7 @@ use super::{
 
 impl EngineLifecycle for Mongodb {
     fn online_backup(&self) -> OnlineBackup {
-        // A standalone server has no hot-backup cursor and fsyncLock would
-        // freeze writes, but an atomic volume snapshot holds data and the
-        // WiredTiger journal at one instant, which mongod recovers on start.
+        // A standalone server has no hot-backup cursor and fsyncLock would freeze writes; a volume snapshot is recovered via the WiredTiger journal.
         OnlineBackup::VolumeSnapshot { otherwise: None }
     }
 

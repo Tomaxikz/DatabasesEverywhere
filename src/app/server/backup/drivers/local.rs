@@ -25,7 +25,6 @@ impl super::BackupCommit for LocalBackupDriver {
         &'a self,
         bundle: &'a BackupBundle,
         manifest: &'a StoredBackup,
-        // Local publication creates nothing beyond the backup id's files.
         _journal: &'a dyn super::PublicationJournal,
     ) -> BoxFuture<'a, Result<(), BackupStoreError>> {
         Box::pin(Self::commit(self, bundle, manifest))
@@ -88,8 +87,7 @@ impl LocalBackupDriver {
         if manifest.catalog_available {
             verify_regular_file(&bundle.catalog, "staged backup catalog").await?;
         }
-        // The archive is the inventory commit marker, so every sidecar and the
-        // archive contents must be durable before the archive becomes visible.
+        // The archive is the commit marker: make sidecars and contents durable first.
         sync_file(&bundle.archive, "staged backup archive").await?;
         sync_file(&bundle.metadata, "staged backup metadata").await?;
         if manifest.catalog_available {
@@ -120,8 +118,7 @@ impl LocalBackupDriver {
             remove_file_if_exists(&catalog).await;
             return Err(error);
         }
-        // A failure here leaves a complete, verifiable bundle whose directory
-        // entry may not yet be durable; report it rather than unpublishing.
+        // Bundle is complete but its directory entry may not be durable; report rather than unpublish.
         sync_file(&archive, "published backup archive").await
     }
 
@@ -165,8 +162,7 @@ impl LocalBackupDriver {
             }
             match self.load_manifest(instance_id, backup_id, &metadata).await {
                 Ok(manifest) => inventory.backups.push(manifest),
-                // Newer formats are listed opaquely and never interpreted;
-                // retention keeps them until an explicit delete.
+                // Newer formats are listed opaquely; retention keeps them until an explicit delete.
                 Err(BackupStoreError::UnsupportedFormat(reason)) => {
                     inventory.unsupported.push(UnsupportedBackup {
                         backup_id: backup_id.to_string(),
@@ -179,7 +175,6 @@ impl LocalBackupDriver {
         Ok(inventory)
     }
 
-    /// Removes the archive (the commit marker) first, then its sidecars.
     pub async fn purge_unpublished(
         &self,
         instance_id: &str,
@@ -564,7 +559,6 @@ mod tests {
         let root = temp.path().join("backups");
         let driver = LocalBackupDriver::new(root.clone());
         driver.preflight().await.unwrap();
-        // Nothing published yet: purging is a no-op.
         driver
             .purge_unpublished("inst_one", "partial.physical.tar.gz")
             .await

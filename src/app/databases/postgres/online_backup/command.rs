@@ -1,6 +1,3 @@
-//! Command lines, shell wrappers and the replication credential for
-//! `pg_basebackup`. The shell text never contains the password.
-
 use aws_lc_rs::hmac;
 use secrecy::SecretString;
 
@@ -25,8 +22,7 @@ pub(crate) const DATA_MOUNT: &str = "/var/lib/postgresql";
 const REPLICATION_PASSWORD_DOMAIN: &[u8] = b"dbe-postgres-replication-v1";
 const TAG_PREFIX: &str = "dbev_bk_";
 
-/// Hex HMAC-SHA256 of the administrator password. Empty input is refused so a
-/// missing credential cannot become a predictable replication secret.
+/// Empty input is refused so a missing credential cannot become a predictable replication secret.
 pub(crate) fn replication_password(admin_password: &str) -> Result<SecretString, &'static str> {
     if admin_password.is_empty() {
         return Err("PostgreSQL administrator credential is empty");
@@ -75,10 +71,8 @@ pub(crate) fn replication_role_state_sql() -> String {
     )
 }
 
-/// Read-only. One of `missing`, `owned`, `candidate`, or `foreign`.
-/// `candidate` is an unmarked role with exactly the daemon privilege bits, no
-/// memberships, and no database ownership. Anything else that already exists
-/// is `foreign` and must not be altered.
+/// `candidate` is an unmarked role with exactly the daemon privilege bits, no memberships and no database ownership.
+/// Anything else that exists is `foreign` and must not be altered.
 pub(crate) fn replication_role_ownership_sql() -> String {
     format!(
         "SELECT CASE WHEN r.oid IS NULL THEN 'missing' WHEN shobj_description(r.oid, 'pg_authid') = {comment} THEN 'owned' WHEN COALESCE(shobj_description(r.oid, 'pg_authid'), '') = '' AND {attributes} = {state} AND NOT EXISTS (SELECT 1 FROM pg_auth_members AS m WHERE m.roleid = r.oid OR m.\"member\" = r.oid) AND NOT EXISTS (SELECT 1 FROM pg_database AS db WHERE db.datdba = r.oid) THEN 'candidate' ELSE 'foreign' END FROM (SELECT 1) AS probe LEFT JOIN pg_roles AS r ON r.rolname = {role};",
@@ -97,7 +91,6 @@ pub(crate) fn replication_role_comment_sql() -> String {
     )
 }
 
-/// Value of [`replication_role_ownership_sql`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplicationRoleOwnership {
     Missing,
@@ -116,31 +109,22 @@ pub(crate) fn parse_replication_role_ownership(value: &str) -> Option<Replicatio
     }
 }
 
-/// Preflight key for [`replication_role_ownership_preflight_sql`].
-/// Capture must treat `foreign` as online capture disabled, not as a serving failure.
 pub(crate) const REPLICATION_OWNERSHIP_PREFLIGHT_KEY: &str = "role_ownership";
 
-/// `role_ownership=missing|owned|candidate|foreign`. One row, read-only.
 pub(crate) fn replication_role_ownership_preflight_sql() -> String {
     let body = replication_role_ownership_sql();
     let body = body.trim_end_matches(';');
     format!("SELECT '{REPLICATION_OWNERSHIP_PREFLIGHT_KEY}=' || ({body});")
 }
 
-/// Shown when a tenant already owns `dbe_replication`. Serving continues.
 pub(crate) fn foreign_replication_role_diagnostic() -> String {
     format!(
         "online backup capture is disabled because role {REPLICATION_ROLE} exists without ownership marker {REPLICATION_ROLE_COMMENT}; rename or drop that role, then rerun authentication hardening"
     )
 }
 
-/// Create or repair the replication role in one transaction.
-///
-/// `CREATE ROLE`, the SCRAM password and the ownership comment commit together.
-/// A crash rolls the role back instead of leaving an unmarked passwordless
-/// role. Callers set psql variable `replication_password` with `\getenv` and
-/// must not put the password in argv. Do not also pass `--single-transaction`;
-/// this script already has `BEGIN`/`COMMIT`. `ON_ERROR_STOP` must be on.
+/// Runs in one transaction so a crash cannot leave an unmarked passwordless role.
+/// Set `replication_password` with `\getenv`; do not pass `--single-transaction`; `ON_ERROR_STOP` must be on.
 pub(crate) fn ensure_replication_role_sql() -> String {
     let ident = quote_ident(REPLICATION_ROLE);
     format!(

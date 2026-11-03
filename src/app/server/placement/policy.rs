@@ -7,8 +7,7 @@ pub(crate) struct RuntimeTotals {
     pub disk_mib: u64,
 }
 
-/// Adds the hard limits of physical engines. This includes provisional
-/// migration targets that do not have a public instance route yet.
+/// Adds the hard limits of physical engines, including provisional migration targets.
 pub(crate) fn sum_runtime_limits<'a>(
     limits: impl IntoIterator<Item = &'a InstanceLimits>,
 ) -> RuntimeTotals {
@@ -37,10 +36,7 @@ pub(crate) fn engine_disk_overhead(protocol: Protocol) -> Option<u64> {
         .map(|pool| pool.disk_overhead_mib)
 }
 
-/// Reserves root-project space for files whose growth is caused by tenant
-/// writes but which the engine stores outside tenant child projects, such as
-/// WAL, redo/undo logs, and shared journals. The reserve is pooled because
-/// those files cannot be attributed reliably to one tenant.
+/// Root-project reserve for tenant-driven growth the engine stores outside child projects (WAL, redo/undo, journals); pooled because it can't be attributed.
 pub(crate) fn root_spill_mib(protocol: Protocol, tenant_disk_mib: u64) -> Option<u64> {
     engine_disk_overhead(protocol)?;
     let rounded = tenant_disk_mib.div_ceil(ROOT_SPILL_DIVISOR);

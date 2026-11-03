@@ -1,5 +1,3 @@
-//! Streaming SQL parser used by uploaded-dump inspection.
-
 use std::{collections::VecDeque, io::Read};
 
 use super::{

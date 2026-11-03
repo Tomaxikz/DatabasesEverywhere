@@ -86,7 +86,6 @@ impl ApiSocket {
         })
     }
 
-    /// Serves until `handle` shuts down, then removes the socket file.
     pub(super) async fn serve(
         self,
         router: Router,
@@ -180,7 +179,6 @@ fn remove_stale_socket(directory: &OwnedFd, name: &OsStr, path: &Path) -> anyhow
     Ok(())
 }
 
-/// The bound socket file, removed when serving ends unless it was replaced.
 struct SocketFile {
     path: PathBuf,
     device: u64,

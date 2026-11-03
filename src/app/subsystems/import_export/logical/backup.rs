@@ -69,8 +69,6 @@ pub(crate) async fn restore_shared_backup(
     .await
 }
 
-/// Restores a dedicated instance's online logical dump through the same
-/// wipe-and-import path, with a rollback dump taken first.
 pub(crate) async fn restore_dedicated_backup(
     state: &AppState,
     metadata: &InstanceMetadata,
@@ -100,9 +98,7 @@ pub(crate) async fn restore_dedicated_backup(
     .await
 }
 
-/// Capacity created below the logical staging root while restoring a source
-/// that already exists elsewhere. Shared restores pin the inspected source
-/// once, then create and pin one rollback dump before mutation.
+/// Capacity created below the logical staging root while restoring a source that already exists elsewhere.
 pub(crate) fn shared_restore_staging_bytes(
     source_bytes: u64,
     rollback_bytes: u64,
@@ -143,12 +139,8 @@ pub(crate) async fn import_for_deployment_migration(
     artifact_path: &FsPath,
 ) -> Result<(), ApiError> {
     let options = ImportOptions::recovery_restore(artifact_path, metadata.protocol);
-    // A migration target is provisional and disposable until the placement
-    // transaction commits. The migration worker owns target cleanup, so using
-    // the ordinary transactional batch path here would be both wasteful and
-    // unsafe: its rollback recovery republishes an existing instance route.
-    // Reuse the canonical inspected logical importer directly and leave every
-    // route decision to the durable migration state machine.
+    // A migration target is disposable until the placement transaction commits; reuse the inspected
+    // logical importer directly and leave route decisions to the migration state machine.
     import_logical_dump(
         state,
         metadata,

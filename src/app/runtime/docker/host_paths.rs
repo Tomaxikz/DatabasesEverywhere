@@ -1,7 +1,4 @@
-//! Host paths for a dbev running inside a container. Docker resolves bind
-//! sources on the host, so paths under dbev's own mounts are rewritten to
-//! their host side, the way Wings does it. Outside a container nothing
-//! changes.
+//! Docker resolves bind sources on the host, so paths under dbev's own mounts are rewritten to their host side when running in a container.
 
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +15,6 @@ const CONTAINER_MARKERS: [&str; 2] = ["/.dockerenv", "/run/.containerenv"];
 
 #[derive(Debug, Default)]
 struct HostPaths {
-    /// (inside, host), longest inside path first.
     mounts: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -46,8 +42,6 @@ impl HostPaths {
             .map(|(inside, rest)| inside.join(rest))
     }
 
-    /// What a foreign mount of `path` covers in here: the path itself, or
-    /// every mount below it when it's a parent folder like `/srv`.
     fn visible(&self, path: &Path) -> Vec<PathBuf> {
         if let Some(inside) = self.to_container(path) {
             return vec![inside];
@@ -77,12 +71,10 @@ fn host_paths() -> &'static HostPaths {
     HOST_PATHS.get_or_init(HostPaths::default)
 }
 
-/// Where Docker finds `path` on the host.
 pub(crate) fn to_host(path: &Path) -> PathBuf {
     host_paths().to_host(path)
 }
 
-/// A host path as dbev sees it, or `None` when it isn't mounted in here.
 pub(crate) fn to_container(path: &Path) -> Option<PathBuf> {
     host_paths().to_container(path)
 }
@@ -92,8 +84,6 @@ pub(crate) fn visible(path: &Path) -> Vec<PathBuf> {
 }
 
 impl DockerRuntime {
-    /// Learns dbev's own mounts when it runs in a container and refuses to
-    /// go on when one of `roots` isn't mounted from the host.
     pub(crate) async fn detect_host_paths(&self, roots: &[PathBuf]) -> anyhow::Result<()> {
         let Some(id) = own_container_id()? else {
             return Ok(());
@@ -154,7 +144,6 @@ fn own_container_id() -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-/// Docker and Podman bind `/etc/hostname` from the container's own folder.
 fn id_from_mountinfo(mountinfo: &str) -> Option<String> {
     mountinfo.lines().find_map(|line| {
         let mut fields = line.split(' ').skip(3);
@@ -170,7 +159,6 @@ fn id_from_mountinfo(mountinfo: &str) -> Option<String> {
     })
 }
 
-/// `docker-<id>.scope`, `libpod-<id>.scope` or `/docker/<id>`.
 fn id_from_cgroup(cgroup: &str) -> Option<String> {
     cgroup
         .lines()

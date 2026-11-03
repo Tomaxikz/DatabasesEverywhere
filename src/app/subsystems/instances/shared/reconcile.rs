@@ -57,11 +57,8 @@ pub(super) fn reconciled_tenant_status(
     if desired == DesiredInstanceState::Stopped {
         return InstanceStatus::Stopped;
     }
-    // A lifecycle or data operation may have deliberately left the route
-    // fenced after its session drain or rollback became uncertain. Reconcile
-    // must not turn a healthy pool observation into permission to republish
-    // that tenant; an explicit Start performs the credential checks needed to
-    // reopen it safely.
+    // A lifecycle or data operation may have deliberately left the route fenced after its session
+    // drain or rollback became uncertain.
     if route_fenced {
         return InstanceStatus::Failed;
     }

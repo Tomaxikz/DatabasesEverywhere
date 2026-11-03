@@ -23,7 +23,6 @@ const PROBE_NANO_CPUS: i64 = 250_000_000;
 const PROBE_PIDS_LIMIT: i64 = 32;
 
 impl DockerRuntime {
-    /// Called once before API startup, when this daemon owns no live probes.
     pub(crate) async fn cleanup_version_probes(&self) -> Result<usize, String> {
         let node = self
             .node_id
@@ -68,8 +67,7 @@ impl DockerRuntime {
         .map_err(|_| "version probe cleanup timed out".to_string())?
     }
 
-    /// Runs only the version command in a disposable, networkless container
-    /// with no host/database mounts. Resolve the tag once and return that ID.
+    /// Networkless and with no host or database mounts; the tag is resolved once and that ID returned.
     pub(crate) async fn probe_image_version(
         &self,
         protocol: Protocol,

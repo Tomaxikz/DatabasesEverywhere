@@ -76,8 +76,6 @@ fn image_update_blocked(pool: &crate::server::placement::EngineRuntime) -> bool 
     busy || quarantined_without_pending_image
 }
 
-/// Caller owns PoolGuard. Boot configuration repair and API image updates use
-/// the same journal, readiness checks, tenant fencing, and failure handling.
 pub(crate) async fn replace_image_locked(
     state: &AppState,
     pool: &mut crate::server::placement::EngineRuntime,
@@ -374,8 +372,6 @@ fn check_version(protocol: Protocol, current: &str, next: &str) -> Result<(), Ap
 
 fn numeric_version_components(protocol: Protocol, version: &str) -> Option<Vec<u64>> {
     let normalized = crate::server::compatibility::normalize_database_version(protocol, version)?;
-    // Attested versions retain vendor/package suffixes. Compare all numeric
-    // components (including ClickHouse's fourth), not the package build.
     let numeric = normalized.split(['-', ' ', '+']).next()?;
     numeric
         .split('.')

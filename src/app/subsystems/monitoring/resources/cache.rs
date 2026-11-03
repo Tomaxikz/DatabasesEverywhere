@@ -14,9 +14,6 @@ use std::sync::atomic::Ordering;
 use tokio::time::Instant;
 
 impl ResourceCache {
-    /// Invalidates samples tied to a physical runtime generation while keeping
-    /// the logical tenant's network/activity counters alive. Existing gateway
-    /// sessions may still hold those counters during reconcile or cutover.
     pub async fn invalidate_runtime(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
         inner.stats.remove(instance_id);
@@ -24,8 +21,6 @@ impl ResourceCache {
         invalidate_disk_locked(&mut inner, instance_id);
     }
 
-    /// Removes a logical metric identity after its route is fenced, sessions
-    /// are drained, and durable instance metadata has been deleted.
     pub async fn remove_tenant(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
         inner.stats.remove(instance_id);
@@ -36,9 +31,6 @@ impl ResourceCache {
         self.activity.remove(instance_id);
     }
 
-    /// Invalidates only storage telemetry. Shared-tenant operations use this
-    /// for their physical pool so one tenant resize cannot tear down the
-    /// pool's live CPU/memory sampler or reset unrelated network counters.
     pub(crate) async fn invalidate_disk(&self, instance_id: &str) {
         let mut inner = self.inner.lock().await;
         invalidate_disk_locked(&mut inner, instance_id);
@@ -50,9 +42,8 @@ impl ResourceCache {
         instance_id: &str,
         path: PathBuf,
     ) -> Result<CachedDiskUsage, String> {
-        // The Arc is also the cache generation. Deletion, migration, and
-        // recreation remove it, so a late scan from the old identity cannot
-        // repopulate the cache for the replacement.
+        // Deletion, migration, and recreation remove it, so a late scan from the old identity
+        // cannot repopulate the cache for the replacement.
         let refresh_lock = self.disk_refresh_lock(instance_id).await;
         if let Some(sample) = self
             .cached_disk_usage_for_lock(instance_id, &refresh_lock)

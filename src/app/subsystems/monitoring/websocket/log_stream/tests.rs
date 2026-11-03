@@ -33,7 +33,6 @@ fn history_and_live_data_are_emitted_once_and_reset_on_reconnect() {
     assert_eq!(event["stream"], "stderr");
     assert!(event.get("stdout").is_none());
     assert!(!event.to_string().contains("old line"));
-    // Reconnect starts with a fresh reset and follows the tail again.
     assert_eq!(LogRedactor::default().push("new line\n"), "new line\n");
 }
 

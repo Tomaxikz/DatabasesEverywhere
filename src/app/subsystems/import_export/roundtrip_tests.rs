@@ -1,4 +1,3 @@
-//! Extends the existing disposable-engine matrix through production transfers.
 use crate::{
     config::Config,
     routes::http::router::AppState,
@@ -64,7 +63,6 @@ pub(crate) async fn shared_roundtrip(
         "roundtrip.{}",
         super::files::dump_extension(runtime.protocol)
     ));
-    // Same logical paths used by exports and shared backup/restore endpoints.
     // Keep the original data recoverable until this fixture is torn down.
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
     let before = docker

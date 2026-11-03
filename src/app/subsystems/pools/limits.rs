@@ -17,8 +17,7 @@ pub(crate) struct PoolConfig {
     pub limits: PoolLimits,
 }
 
-/// Resizes the engine, never an individual tenant. Pool capacity is persisted
-/// before runtime mutation so restart recovery reapplies the same budget.
+/// Resizes the engine, never an individual tenant.
 pub(crate) async fn resize_pool(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -113,8 +112,6 @@ fn check_resize(pool: &EngineRuntime, limits: &PoolLimits) -> Result<(), ApiErro
             "shared_pool_unavailable: repair the server pool before resizing".into(),
         ));
     }
-    // Shrinking live shared storage or memory requires a separate drained
-    // maintenance operation, not an optimistic sample of current usage.
     if limits.memory_mib < pool.limits.memory_mib || limits.disk_mib < pool.limits.disk_mib {
         return Err(ApiError::Conflict(
             "live pool memory/disk shrinking is not supported; migrate tenants to reduce capacity"

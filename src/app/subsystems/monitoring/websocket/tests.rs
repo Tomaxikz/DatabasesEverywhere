@@ -539,7 +539,7 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
     assert!(delta.updates.is_empty());
     store.stage("tenant", "retry", "retrying");
     let mut changed = store.get("tenant").unwrap();
-    changed.updated_at = first.updated_at.clone(); // Revision still detects changes.
+    changed.updated_at = first.updated_at.clone();
     assert_eq!(cursor.select(&[&changed]).updates.len(), 1);
     assert_eq!(
         wire::ProgressCursor::default()
@@ -700,9 +700,8 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
         InstallProgressStatus::Running
     );
 
-    // The instance is stored and the creation completes before the socket
-    // connects: the attempt's token still connects and sees the final record,
-    // but never the stored instance itself.
+    // The instance is stored and the creation completes before the socket connects: the attempt's
+    // token still connects and sees the final record, but never the stored instance itself.
     state
         .instances
         .upsert(instance_metadata("creating_one", "2026-10-24T20:56:00Z"))
@@ -728,7 +727,6 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
         "new tokens bind the stored instance"
     );
 
-    // A later creation attempt under the same ID is a different generation.
     state.instances.remove("creating_one").await;
     state.install_progress.remove("creating_one");
     let _retry = state

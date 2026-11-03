@@ -1,5 +1,3 @@
-//! Engine-neutral import/export orchestration around per-engine transfer scripts.
-
 use std::time::Duration;
 
 use crate::{

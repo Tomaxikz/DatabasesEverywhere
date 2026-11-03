@@ -3,7 +3,6 @@ use bollard::models::{HealthConfig, HostConfigLogConfig, Mount, MountType};
 pub(super) const LOG_POLICY_LABEL: &str = "dbev.console-policy";
 pub(super) const LOG_POLICY_VERSION: &str = "1";
 
-/// One small runtime-owned history; DBEV streams it without keeping a copy.
 pub(super) fn log_config(engine: crate::config::DaemonEngine) -> HostConfigLogConfig {
     let (driver, options) = match engine {
         crate::config::DaemonEngine::Docker => (
@@ -33,11 +32,7 @@ pub(super) fn bind_mount(source: &std::path::Path, target: &str, read_only: bool
     }
 }
 
-/// Explicitly disables image-provided and daemon-managed healthchecks.
-///
-/// DBE performs a bounded readiness query while an instance starts. Keeping a
-/// Docker healthcheck after startup would run synthetic database traffic
-/// forever without providing any automatic recovery.
+/// A Docker healthcheck after startup would run synthetic traffic forever without providing recovery.
 pub(super) fn disabled_healthcheck() -> HealthConfig {
     HealthConfig {
         test: Some(vec!["NONE".to_string()]),

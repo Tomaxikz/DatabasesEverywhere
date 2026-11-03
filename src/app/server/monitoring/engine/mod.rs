@@ -30,12 +30,7 @@ const MAX_CONCURRENT_POOLS: usize = 4;
 const FAILURE_LOG_INTERVAL: u32 = 20;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
-/// Starts best-effort engine-native accounting for shared tenants.
-///
-/// This intentionally does not report PostgreSQL or MongoDB CPU/RSS: those
-/// engines have no defensible database-user attribution for those resources.
-/// Pool failures only make the optional measurements unavailable; they never
-/// restart, fence, or quarantine a shared runtime.
+/// Best-effort engine-native accounting for shared tenants. No PostgreSQL/MongoDB CPU/RSS (no defensible attribution); pool failures never restart, fence or quarantine a runtime.
 pub fn start_engine_activity_sampler(state: AppState) {
     let mut shutdown = state.gateway_supervisor.subscribe_shutdown();
     tokio::spawn(async move {
@@ -160,9 +155,7 @@ fn tenants_by_runtime(instances: &[InstanceMetadata]) -> HashMap<String, Vec<Ten
     grouped
 }
 
-/// A duplicate username is ambiguous at the engine accounting boundary. The
-/// placement repository prevents it, but excluding a corrupt duplicate is
-/// safer than assigning the same physical counters to two tenants.
+/// A duplicate username is ambiguous; exclude it rather than assign the same counters to two tenants.
 fn split_unique_tenants(
     tenants: Vec<TenantIdentity>,
     protocol: Protocol,
@@ -289,13 +282,11 @@ async fn sample_pool(
                 pool.clickhouse_checkpoint = Some(checkpoint);
             }
         }
-        // Preparation alone does not prove collection recovered. Preserve the
-        // failure streak until a complete, generation-stable sample succeeds.
+        // Preparation alone doesn't prove recovery; keep the failure streak until a generation-stable sample succeeds.
         Ok(None) => {}
         Err(error) => {
             if matches!(error, CollectError::NotReady) {
-                // The verified process explicitly reported that its in-memory
-                // accounting switch was disabled. Re-enable it after backoff.
+                // Process reported its accounting switch disabled; re-enable after backoff.
                 pool.prepared = false;
             }
             mark_unavailable(state, &tenants).await;
@@ -603,9 +594,7 @@ struct TenantBaseline {
     instance_generation: String,
     cpu: CounterBaseline,
     memory: PeakBaseline,
-    /// Query-log rows identify a username, not a DBEV instance generation.
-    /// Skip the first interval for a newly seen generation so retained rows
-    /// from a deleted tenant with the same username cannot be reassigned.
+    /// Query-log rows name a username, not a generation: skip a new generation's first interval so a deleted tenant's retained rows aren't reassigned.
     interval_ready: bool,
 }
 
@@ -651,10 +640,7 @@ impl PeakBaseline {
     fn observe_peak(&mut self, current: u64) -> (Option<u64>, bool) {
         let reset = self.0.is_some_and(|previous| current < previous);
         let observation = match self.0 {
-            // MySQL exposes a cumulative engine high-water mark. Its first
-            // value can predate this daemon process, so establish a baseline
-            // without attributing that historical value to the tenant's live
-            // series. A reset likewise starts a new baseline.
+            // MySQL's cumulative high-water mark may predate this daemon: baseline it rather than attribute it; a reset likewise rebaselines.
             None => None,
             Some(previous) if current > previous => Some(current),
             Some(previous) if current < previous => None,

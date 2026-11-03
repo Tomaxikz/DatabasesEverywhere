@@ -265,9 +265,6 @@ pub enum DockerError {
 }
 
 impl DockerError {
-    /// Returns true when DBE could not prove that an import helper stopped.
-    /// Callers must fence the affected tenant and must not start rollback work
-    /// that could race the helper.
     pub fn import_helper_state_uncertain(&self) -> bool {
         matches!(
             self,

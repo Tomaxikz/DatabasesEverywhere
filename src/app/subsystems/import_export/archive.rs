@@ -1,5 +1,3 @@
-//! Logical dump decompression and safe archive extraction.
-
 use std::{
     io::{Read, Write},
     path::{Component, Path as FsPath, PathBuf},
@@ -374,9 +372,7 @@ pub(super) fn find_dump_candidate(protocol: Protocol, root: &FsPath) -> Result<P
     ))
 }
 
-/// Regular files below `dir`, bounded like extraction itself: at most
-/// `MAX_ARCHIVE_ENTRIES` entries and `MAX_ARCHIVE_DEPTH` levels. Links are
-/// never followed.
+/// Regular files below `dir`, bounded by `MAX_ARCHIVE_ENTRIES` and `MAX_ARCHIVE_DEPTH`; links are never followed.
 pub(super) fn collect_regular_files(
     dir: &FsPath,
     files: &mut Vec<PathBuf>,

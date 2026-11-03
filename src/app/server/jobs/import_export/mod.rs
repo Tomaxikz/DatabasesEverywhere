@@ -157,9 +157,7 @@ impl ImportExportJobs {
         self.try_admit_kind(instance_id, false)
     }
 
-    /// Admit a synchronous maintenance operation only when the instance
-    /// has no queued data operation. While held, ordinary jobs are also
-    /// rejected so secrets and backup requests cannot pile up behind it.
+    /// Admit a maintenance operation only when no data operation is queued; ordinary jobs are rejected meanwhile.
     pub fn try_admit_exclusive(
         &self,
         instance_id: &str,
@@ -312,11 +310,7 @@ impl ImportExportJobs {
         Ok(counts)
     }
 
-    /// Returns every active export destination tracked by this daemon.
-    ///
-    /// Active jobs are never evicted by `prune_job_cache`, so this avoids
-    /// the public list endpoint's pagination limit when protecting
-    /// one-use outputs from the expiry sweeper.
+    /// Every active export destination; unpaginated, to protect one-use outputs from the expiry sweeper.
     pub async fn active_export_paths(&self) -> Vec<String> {
         self.inner
             .read()

@@ -93,7 +93,6 @@ pub async fn provision_shared_tenant_role(
     provision_role(docker, instance_id, role, admin_password, recovery, true).await
 }
 
-/// The tenant role a provisioning step creates or repairs.
 struct TenantRole<'a> {
     database: &'a str,
     username: &'a str,
@@ -367,10 +366,7 @@ async fn verify_tenant_scram(
         })
 }
 
-/// Rotate the DBEV-only administrator to a known protected candidate only when
-/// legacy local authentication demonstrably accepts a deliberately invalid
-/// password. This is a controlled migration out of `trust`; it never changes
-/// a tenant credential and cannot bypass an already enforced password policy.
+/// Only when legacy local auth accepts a deliberately invalid password; never changes a tenant credential.
 async fn repair_admin_password(
     docker: &DockerRuntime,
     instance_id: &str,

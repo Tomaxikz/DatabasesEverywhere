@@ -133,7 +133,6 @@ impl RuntimeConfig {
         })
     }
 
-    /// Read-only YAML settings for jobs that do not need runtime resources.
     pub fn snapshot(&self) -> Arc<Config> {
         Arc::clone(&self.settings)
     }

@@ -70,8 +70,7 @@ impl ActivityStore {
         activity_current(instance_id, entry.epoch.clone(), sampled_at_unix, snapshot)
     }
 
-    /// Takes all due rolling samples. Callers may invoke this more frequently
-    /// than once per minute; no bucket is emitted until 60 seconds elapsed.
+    /// Takes due rolling samples; no bucket is emitted until 60 seconds elapsed.
     pub fn sample(&self, sampled_at_unix: i64) -> Vec<ActivityBucket> {
         let mut state = lock(&self.inner);
         let mut buckets = Vec::new();
@@ -91,9 +90,7 @@ impl ActivityStore {
                 continue;
             }
 
-            // Capture the counters and roll over the interval peak under the
-            // same lock. An engine sample therefore belongs wholly to either
-            // this bucket or the next one.
+            // Capture counters and roll the peak under one lock so an engine sample lands wholly in one bucket.
             let (current, bucket_peak) = entry.counter.snapshot_and_take_bucket_peak();
             let duration_seconds = elapsed.clamp(BUCKET_SECONDS, i64::from(u32::MAX)) as u32;
             let continuity_changed = entry.sync_epoch(current);
@@ -136,9 +133,7 @@ impl ActivityStore {
         state.entries.len() != old_len
     }
 
-    /// Drops counters for deleted/recreated generations. Stale gateway handles
-    /// may still hold their `Arc`, but can no longer occupy sampler memory or
-    /// produce durable rows after the next reconciliation tick.
+    /// Drops counters of deleted/recreated generations so stale gateway handles can't produce durable rows.
     pub fn retain_generations(&self, generations: &[(String, String)]) {
         let generations = generations.iter().cloned().collect::<HashSet<_>>();
         lock(&self.inner)

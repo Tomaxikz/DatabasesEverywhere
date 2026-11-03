@@ -29,8 +29,7 @@ pub(crate) struct TenantTarget<'a> {
     pub username: &'a str,
 }
 
-/// Reconciles engine-wide isolation that cannot be expressed per tenant.
-/// This is intentionally a no-op for dedicated instances.
+/// Reconciles engine-wide isolation; a no-op for dedicated instances.
 pub(crate) async fn secure_pool(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -44,12 +43,7 @@ pub(crate) async fn secure_pool(
     Ok(())
 }
 
-/// Runs one bounded engine telemetry statement inside a shared runtime.
-///
-/// Telemetry uses the same private administrator channel as tenant lifecycle
-/// operations, but with a short timeout and shared-runtime recovery semantics:
-/// an exec failure is returned to the sampler and never restarts or fences the
-/// physical pool.
+/// Runs one bounded telemetry statement in a shared runtime; exec failures go to the sampler and never restart or fence the pool.
 pub(crate) async fn telemetry_sql(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -63,11 +57,7 @@ pub(crate) async fn telemetry_sql(
         .await
 }
 
-/// Reads one bounded ClickHouse query-log window from a shared runtime.
-///
-/// The cutoff is captured on the database server before its logs are flushed.
-/// A missing prior cutoff deliberately uses the new cutoff, establishing an
-/// empty first interval instead of charging retained history to the tenant.
+/// Reads one bounded ClickHouse query-log window; a missing prior cutoff reuses the new one so retained history isn't charged to the tenant.
 pub(crate) async fn clickhouse_telemetry_window(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -124,9 +114,7 @@ pub(crate) async fn unfence(
         .await
 }
 
-/// Fails closed when a MySQL-family tenant contains objects omitted from the
-/// tenant-only rollback dump. The caller must fence the route first so the
-/// catalog cannot change between this check and snapshot creation.
+/// Fails closed when a MySQL-family tenant has objects missing from the tenant-only rollback dump; fence the route first.
 pub(crate) async fn check_rollback_objects(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -221,10 +209,7 @@ pub(crate) async fn verify_password(
     Ok(())
 }
 
-/// Enables a fenced tenant and proves that its durable credential works before
-/// the caller republishes a gateway route. A failed check immediately fences
-/// the engine account again; if that rollback also fails the combined error
-/// tells the caller to contain the whole shared runtime.
+/// Enables a fenced tenant and proves its credential works before the route is republished; a failed check re-fences it.
 pub(crate) async fn open_verified(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -244,10 +229,7 @@ pub(crate) async fn open_verified(
     Ok(())
 }
 
-/// Measures tenant-owned database storage from the engine catalog. Shared
-/// tenants do not have separate host directories, so directory scans would
-/// either report zero or incorrectly expose the whole pool. Results preserve
-/// input order and fail closed if a client emits an unexpected shape.
+/// Measures tenant storage from the engine catalog (shared tenants have no host directory); fails closed on unexpected client output.
 pub(crate) async fn measure_storage(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,

@@ -110,8 +110,6 @@ pub(super) async fn maintain_pool_after_delete(state: &AppState, deleted_from: E
     }
 }
 
-/// Delete a physical shared pool only while its durable reservation count is
-/// zero. The caller holds the runtime lock across the final count and cleanup.
 pub(crate) async fn delete_empty_pool(
     state: &AppState,
     runtime_id: &str,

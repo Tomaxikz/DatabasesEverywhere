@@ -105,8 +105,7 @@ async fn reconcile_one(state: &AppState, snapshot: InstanceMetadata) -> Instance
             return attest_without_upgrade(state, metadata, false, Some(operation)).await;
         }
     };
-    // Retention repair must keep a panel-selected image, even when the node
-    // default points at a different database version.
+    // Retention repair keeps a panel-selected image even if the node default differs.
     let target_image = boot_image(&current_image, &configured_image, logging_upgrade).to_string();
     let runtime_spec_upgrade = runtime_spec_upgrade_required(&metadata).await || logging_upgrade;
     if logging_upgrade && !recreation_image_is_known(state, &metadata).await {
@@ -212,8 +211,7 @@ async fn replace_container_image(
 ) -> InstanceBootOutcome {
     let instance_id = metadata.instance_id.clone();
     let result = if logging_upgrade {
-        // The reference was read and verified from this managed container;
-        // this is not a request to deploy a newly selected image.
+        // Reference verified from this managed container; not a request to deploy a new image.
         crate::subsystems::instances::run_image_update(
             state.clone(),
             operation,
@@ -236,11 +234,7 @@ async fn replace_container_image(
         .await
     };
     let Err(error) = result else {
-        // Both image-update strategies force a compatibility probe
-        // before committing and republishing the replacement. Do not
-        // drop the operation lock and perform a redundant second
-        // probe: an API mutation could otherwise replace the
-        // container between those two checks.
+        // Both image-update strategies already force a probe; don't drop the operation lock for a second one, or an API mutation could swap the container in between.
         return InstanceBootOutcome {
             probed: true,
             upgraded: true,
@@ -379,8 +373,7 @@ fn failed_outcome(upgraded: bool) -> InstanceBootOutcome {
 async fn isolate_failure(state: &AppState, metadata: &InstanceMetadata, reason: &str) {
     let mut failed = metadata.clone();
     failed.status = InstanceStatus::Failed;
-    // Keep operator intent so a corrected image/configuration is retried on a
-    // later daemon boot; Failed instances are not published to route indexes.
+    // Keep operator intent so a corrected config retries on a later boot; Failed instances aren't published to route indexes.
     failed.desired_state = DesiredInstanceState::Running;
     failed.updated_at = now_rfc3339();
     state.instances.upsert(failed.clone()).await;

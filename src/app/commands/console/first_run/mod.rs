@@ -27,7 +27,6 @@ use super::settings::ConsoleSettings;
 use crate::utils::constants::defaults;
 
 pub(super) enum Next {
-    /// Setup ran; open the console once the daemon answers.
     OpenConsole,
     Exit,
 }

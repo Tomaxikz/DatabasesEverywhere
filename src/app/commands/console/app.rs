@@ -30,7 +30,6 @@ pub(super) enum Screen {
     Backups,
 }
 
-/// Text input inside a confirmation dialog.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Input {
     pub value: String,
@@ -102,7 +101,6 @@ pub(super) struct Message {
     at: Instant,
 }
 
-/// Work for the runner. Every variant is one API call (or the local reveal).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Job {
     Refresh,
@@ -125,7 +123,6 @@ pub(super) enum Job {
 }
 
 impl Job {
-    /// Short description shown while the job runs.
     pub(super) fn label(&self) -> Option<String> {
         Some(match self {
             Self::Refresh | Self::Progress(_) | Self::Logs(_) | Self::Backups(_) => return None,
@@ -143,27 +140,18 @@ pub(super) enum Outcome {
     System(SystemInfo),
     Instances(Vec<Instance>),
     Progress(String, StatusResponse),
-    /// The status of an instance being watched no longer exists.
     ProgressGone(String),
     Logs(String, String),
     Backups(String, Vec<Backup>),
     Revealed(Box<Revealed>),
-    Done {
-        label: String,
-        refresh: bool,
-    },
-    Failed {
-        label: String,
-        error: String,
-    },
-    /// A background refresh failed; shown without interrupting.
+    Done { label: String, refresh: bool },
+    Failed { label: String, error: String },
     RefreshFailed(String),
 }
 
 pub(super) struct App {
     pub system: Option<SystemInfo>,
     pub api_url: String,
-    /// Public host chosen at first run; suggested for new instances.
     pub public_host: String,
     pub instances: Vec<Instance>,
     pub loaded: bool,
@@ -182,7 +170,6 @@ pub(super) struct App {
     pub creating: BTreeSet<String>,
     /// On a standalone node, the port each gateway listens on now.
     pub gateway_ports: Vec<(Protocol, u16)>,
-    /// Labels of operations still running.
     pub running: Vec<String>,
     pub message: Option<Message>,
     pub refresh_error: Option<String>,
@@ -220,7 +207,6 @@ impl App {
         }
     }
 
-    /// Instances matching the filter, in display order.
     pub(super) fn visible(&self) -> Vec<&Instance> {
         let filter = self.filter.to_ascii_lowercase();
         self.instances
@@ -282,7 +268,6 @@ impl App {
             .map_or(stored, |(_, port)| *port)
     }
 
-    /// Reports how a creation that left the list ended.
     fn finish_creation(&mut self, id: &str, status: &StatusResponse) {
         let progress = status.progress.as_ref();
         let state = progress.map_or(status.status.as_str(), |progress| progress.status.as_str());
@@ -312,7 +297,6 @@ impl App {
         }
     }
 
-    /// Jobs for a periodic refresh: the list, plus progress of creations.
     pub(super) fn refresh_jobs(&mut self) -> Vec<Job> {
         if self.refreshing {
             return Vec::new();
@@ -325,7 +309,6 @@ impl App {
                 .filter(|instance| matches!(instance.status.as_str(), "creating" | "booting"))
                 .map(|instance| Job::Progress(instance.instance_id.clone())),
         );
-        // Creations that left the list: fetch their final status.
         jobs.extend(
             self.creating
                 .iter()
@@ -745,7 +728,6 @@ impl App {
     }
 }
 
-/// The API host when it is a real address; wildcard binds give no hint.
 fn default_public_host(system: &SystemInfo) -> String {
     match system.api_host.trim() {
         "" | "0.0.0.0" | "::" | "[::]" | "127.0.0.1" | "::1" | "localhost" => String::new(),

@@ -15,7 +15,6 @@ const DIRECTORY_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-/// Stable identity of an opened directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DirectoryIdentity {
     pub(crate) device: u64,
@@ -24,9 +23,7 @@ pub(crate) struct DirectoryIdentity {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectoryUsage {
-    /// Sum of apparent file lengths.
     pub logical_bytes: u64,
-    /// Allocated filesystem blocks (`st_blocks * 512`).
     pub physical_bytes: u64,
     pub entries: u64,
 }
@@ -110,7 +107,6 @@ struct DirectoryScanner {
 }
 
 impl DirectoryScanner {
-    /// Depth-first traversal keeps descriptor use at O(depth).
     fn scan_open_directory(
         &mut self,
         directory: &rustix::fd::OwnedFd,

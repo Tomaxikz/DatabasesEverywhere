@@ -1,20 +1,4 @@
-//! ClickHouse online backup on any filesystem: per-table `FREEZE`.
-//!
-//! `ALTER TABLE ... FREEZE WITH NAME '<job tag>'` hard-links a table's
-//! current parts into `shadow/<job tag>` in one step while the server keeps
-//! writing; it is the primitive clickhouse-backup builds on. Hard links cost
-//! no space up front, only the parts merges retire while the copy runs.
-//!
-//! Queries go over the instance's always-on HTTP socket, so nothing executes
-//! in the serving container. The daemon then builds a data directory on the
-//! host: the live volume without its parts, plus every frozen table's parts
-//! from the shadow. Each table is consistent at its own freeze; there is no
-//! common point across tables. Restore installs that directory like an
-//! offline backup and starts ClickHouse on it, rolling back if it does not
-//! come up.
-//!
-//! The shadow is journaled as an owned resource before the first freeze and
-//! removed host-side once copied; a crash leaves it to [`cleanup_owned`].
+//! a crash leaves it to [`cleanup_owned`].
 
 mod copy;
 mod http;
@@ -50,11 +34,8 @@ use inventory::{DATABASES_SQL, DatabaseRow, Plan, TABLES_SQL, TableRow};
 
 const RESTORE_RECIPE_ID: &str = "clickhouse.frozen_parts.directory";
 const RESTORE_RECIPE_VERSION: u32 = 1;
-/// Capture directory below the staging root.
 const DATA_ROOT: &str = "clickhouse";
-/// Where the copy sits in the archive; ClickHouse names no data entry like this.
 const RESTORE_TARGET: &str = "dbev-clickhouse-freeze";
-/// UNKNOWN_TABLE and UNKNOWN_DATABASE: dropped since the inventory.
 const DROPPED_CODES: [u32; 2] = [60, 81];
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -186,7 +167,6 @@ impl OnlineBackupStrategy for ClickhouseFreezeStrategy {
     }
 }
 
-/// The dedicated user and its password, which owns every privilege.
 fn static_gate(ctx: &OnlineBackupContext<'_>) -> Result<SecretString, StrategyError> {
     if ctx.metadata.deployment_mode == DeploymentMode::Shared
         || ctx.metadata.protocol != Protocol::Clickhouse
@@ -269,8 +249,6 @@ async fn capture_frozen(
         Err(error) => Err(error),
     };
 
-    // The shadow is no longer needed either way; a failed removal stays
-    // journaled and is retried by cleanup.
     let (data, name) = (ctx.paths.data.clone(), resource.name.clone());
     match blocking("remove the freeze shadow", move || {
         remove_shadow(&data, &name)
@@ -286,8 +264,6 @@ async fn capture_frozen(
     Ok(capture_result(version, tables, &plan, stats))
 }
 
-/// Freezes every planned table under `name`, returning the store directories
-/// that were frozen. Tables dropped since the inventory are skipped.
 async fn freeze_tables(
     ctx: &OnlineBackupContext<'_>,
     client: &ClickhouseHttp,
@@ -340,7 +316,6 @@ fn capture_result(version: String, tables: usize, plan: &Plan, stats: CopyStats)
     CaptureResult {
         data_root: PathBuf::from(DATA_ROOT),
         restore_target: PathBuf::from(RESTORE_TARGET),
-        // Each table is consistent at its own freeze.
         consistency: ConsistencyLevel::PerObject,
         recovery: RecoveryCoordinates(recovery),
         engine_version: (!version.is_empty()).then_some(version),

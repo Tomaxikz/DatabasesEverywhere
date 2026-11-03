@@ -57,8 +57,6 @@ async fn find_id_in_state(
         .map(|claim| claim.id))
 }
 
-/// Publish an allocated project ID as active only after its filesystem tree
-/// has been adopted and its hard limit has been installed successfully.
 pub(super) async fn activate_in(
     owner_id: &str,
     registry_root: &Path,

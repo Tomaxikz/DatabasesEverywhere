@@ -1,5 +1,3 @@
-//! Logical database import/export, transactional rollback, and recovery fencing.
-
 pub(super) mod prepared_support;
 
 mod staging;

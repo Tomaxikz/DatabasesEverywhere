@@ -5,8 +5,7 @@ use crate::{
     databases::protocol::Protocol, runtime::docker::DockerRuntime, server::placement::EngineRuntime,
 };
 
-/// Engine-specific collection only: generation checks, failure backoff, tenant
-/// attribution, and committing a successful checkpoint belong to the sampler.
+/// Engine-specific collection only; generation checks, backoff, attribution and checkpoints belong to the sampler.
 pub(crate) trait EngineTelemetry: Sync {
     fn requires_preparation(&self) -> bool;
 

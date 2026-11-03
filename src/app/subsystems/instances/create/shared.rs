@@ -220,9 +220,7 @@ pub(super) async fn create(
         ));
     }
 
-    // Persist the hard child-quota fact before removing this tenant from the
-    // root charge. Until this point the unattached reservation keeps its full
-    // disk allowance in the shared root, including across a crash.
+    // Persist the hard child-quota fact before removing this tenant from the root charge.
     if let Err(error) =
         shared_runtime::apply_root_disk_limit(&state.config, &state.placements, &runtime).await
     {

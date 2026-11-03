@@ -8,8 +8,7 @@ use crate::databases::protocol::Protocol;
 pub(crate) use boot::sync_compatibility;
 pub(crate) use probe::{cached_compatibility, probe_instance_compatibility};
 
-/// Increment when the probe command, normalization, or compatibility policy
-/// changes in a way that requires every managed container to be checked again.
+/// Increment when probe or policy changes require rechecking every managed container.
 pub(crate) const COMPATIBILITY_PROBE_REVISION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

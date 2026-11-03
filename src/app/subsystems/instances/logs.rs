@@ -34,7 +34,6 @@ pub async fn instance_logs(
     }))
 }
 
-/// The refusal for a shared tenant's logs, which are pool-wide.
 pub(crate) fn shared_logs_unavailable() -> ApiError {
     shared::reject_logs()
 }

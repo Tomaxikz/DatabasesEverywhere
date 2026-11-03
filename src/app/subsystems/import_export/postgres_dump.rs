@@ -1,5 +1,3 @@
-//! PostgreSQL `pg_dump` safety-wrapper discovery.
-
 use std::{
     io::{Error, ErrorKind, Read, Seek, SeekFrom},
     path::Path,

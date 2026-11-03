@@ -1,40 +1,7 @@
-//! Dedicated PostgreSQL 14–18 online physical backup.
+//! Dedicated PostgreSQL 14-18 online physical backup: `pg_basebackup` in a short-lived helper, then `pg_verifybackup` in a second.
 //!
-//! `pg_basebackup` runs in a short-lived helper container started from the
-//! instance's own immutable image, so its binaries match the server. The
-//! helper reaches the server through the instance socket directory (mounted
-//! read-only) and writes a plain directory straight into the job's
-//! disk-backed, coordinator-reserved staging. Nothing is staged on the socket
-//! mount, which is commonly tmpfs charged to the database's memory cgroup.
-//! The helper is journaled before it exists, has no network and its own CPU,
-//! memory and pid limits, and is removed (and confirmed gone) on completion,
-//! timeout, cancellation or once staging exceeds the native budget. That
-//! budget equals what restore will extract.
-//!
-//! The temporary replication slot is the one `pg_basebackup` creates itself.
-//! Retention starts when its WAL streamer creates `pg_basebackup_<pid>`,
-//! after the spread checkpoint has returned the start LSN and before file
-//! copy. Retention ends when that streamer has stored WAL through the stop
-//! LSN and disconnects. The server drops the temporary slot on disconnect,
-//! including when the helper is killed. This module does not pass
-//! `--no-slot` and does not create a second slot, so the slot is not an owned
-//! resource. The spread checkpoint has a short interval before the slot
-//! exists; that is PostgreSQL's own design, because the checkpoint's redo
-//! point is the backup start and its segment is not recycled by the
-//! checkpoint that created it.
-//!
-//! `verify` runs `pg_verifybackup` in a second helper against the final
-//! staged tree (mounted read-only), which also checks the streamed WAL
-//! against `WAL-Ranges`, and then rehashes the tree against
-//! `backup_manifest` in-process.
-//!
-//! The server inventory (versions, layout, roles, HBA, unlogged objects) needs
-//! database sessions, so it is not part of the side-effect-free pre-admission
-//! preflight. It runs after admission in its own journaled helper, never as an
-//! exec in the serving container, whose timeout cannot terminate it. The
-//! helper is removed with confirmation on timeout, cancellation or recovery,
-//! and its sessions carry statement and lock timeouts, so server-side work
-//! ends even after the client is killed.
+//! The temporary slot is created and dropped by `pg_basebackup` itself; this module neither passes `--no-slot` nor creates a slot.
+//! The inventory runs in its own journaled helper, never as an exec in the serving container, whose timeout cannot terminate it.
 
 mod command;
 mod parse;
@@ -84,7 +51,6 @@ use preflight::{decide, parse_report, sample_space, space_allows};
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(120);
 const PREFLIGHT_HELPER_SUFFIX: &str = "preflight";
-/// Written at the staging root and removed before the capture starts.
 const PREFLIGHT_REPORT: &str = "preflight.report";
 const MAX_PREFLIGHT_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 const PREFLIGHT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
@@ -164,7 +130,6 @@ impl OnlineBackupStrategy for PostgresBaseBackupStrategy {
     }
 }
 
-/// Checks that need no server session.
 fn static_gate(
     ctx: &OnlineBackupContext<'_>,
 ) -> Result<(SecretString, SecretString), StrategyError> {
@@ -177,7 +142,6 @@ fn static_gate(
     replication_secrets(ctx)
 }
 
-/// Runs the inventory in a supervised helper and decides the capture plan.
 async fn load_plan(
     ctx: &OnlineBackupContext<'_>,
     staging: &StagingArea,
@@ -217,8 +181,6 @@ async fn load_plan(
     decide(&report, ctx.metadata.deployment_mode, None).map_err(preflight::Gate::into_strategy)
 }
 
-/// The serving container's own bootstrap login, which the inventory uses.
-/// The official image defaults `POSTGRES_DB` to `POSTGRES_USER`.
 async fn bootstrap_login(ctx: &OnlineBackupContext<'_>) -> Result<(String, String), StrategyError> {
     let value = |key: &'static str| async move {
         ctx.state
@@ -239,10 +201,7 @@ async fn bootstrap_login(ctx: &OnlineBackupContext<'_>) -> Result<(String, Strin
     Ok((user, database))
 }
 
-/// The preflight script with its non-secret settings, writing its report to
-/// staging: helper stdout is redacted and truncated, the report must be
-/// neither. Secrets stay in the environment. The replication role ownership
-/// probe follows the inventory and is the report's final line.
+/// Helper stdout is redacted and truncated, so the report goes to staging. The ownership probe is the report's final line.
 fn preflight_exec_script(user: &str, database: &str) -> String {
     format!(
         "set -eu\numask 077\nexport POSTGRES_USER={} POSTGRES_DB={} PGCONNECT_TIMEOUT={PREFLIGHT_CONNECT_TIMEOUT_SECONDS} PGOPTIONS={}\nexec >{}\n{}PGPASSWORD=\"$DBE_POSTGRES_ADMIN_PASSWORD\" psql -X -h {} -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -v ON_ERROR_STOP=1 -Atq <<'SQL'\n{}\nSQL\n",
@@ -407,7 +366,6 @@ mod tests {
         assert!(capture.contains("exec "));
         assert!(!capture.contains("PGPASSWORD"));
         assert!(!capture.contains("rm -rf"));
-        // Nothing is written below the socket mount any more.
         assert!(!capture.contains(&format!("{POSTGRES_SOCKET_DIRECTORY}/dbev_bk_")));
         let verify = exec_script(&verifybackup_argv(&pgdata));
         assert!(verify.contains(&sh_quote("pg_verifybackup")));
@@ -427,7 +385,6 @@ mod tests {
             sh_quote(&format!("{BACKUP_HELPER_STAGING}/{PREFLIGHT_REPORT}"))
         )));
         assert!(script.contains(preflight_script()));
-        // The ownership probe is the report's last line, after the inventory.
         let probe = script.split(preflight_script()).nth(1).unwrap();
         assert!(probe.contains(&replication_role_ownership_preflight_sql()));
         assert!(probe.ends_with("\nSQL\n"));

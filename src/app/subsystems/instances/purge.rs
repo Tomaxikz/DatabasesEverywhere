@@ -34,9 +34,8 @@ pub(crate) async fn purge_runtime_paths(
     .await
 }
 
-/// Removes only a retired physical engine's private runtime state. Logical
-/// instance-owned artifacts and backups deliberately survive deployment-mode
-/// cutover because their ownership does not move with the container.
+/// Logical instance-owned artifacts and backups deliberately survive deployment-mode cutover
+/// because their ownership does not move with the container.
 pub(crate) async fn purge_retired_runtime_paths(
     state: &AppState,
     runtime: &crate::server::placement::EngineRuntime,
@@ -87,9 +86,6 @@ fn provisional_cleanup_limiter(
     if let Some(method) = disk_enforcement_method {
         return Ok(limiter.for_persisted_method(method));
     }
-    // Disk setup precedes the provisional runtime-row commit. If the daemon
-    // stops in that gap, the exact target mount is the only durable evidence
-    // of FuseQuota; the shared source's enforcement method is unrelated.
     let has_fuse_mount = limiter.has_legacy_fuse_mount(data_path)?;
     Ok(select_cleanup_limiter(limiter, protocol, has_fuse_mount))
 }
@@ -173,9 +169,7 @@ async fn purge_paths(
         .map_err(ApiError::runtime_context(
             "failed to discover retained instance volumes",
         ))?;
-    // Retained major-upgrade/restore volumes can themselves be Btrfs
-    // subvolumes or ZFS datasets. Remove their native quota object before the
-    // generic filesystem cleanup; `remove_dir_all` cannot delete those roots.
+    // Remove their native quota object before the generic filesystem cleanup.
     if let Some(disk_limiter) = &disk_limiter {
         for retained_volume in &retained_volumes {
             disk_limiter

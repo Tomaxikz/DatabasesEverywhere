@@ -106,9 +106,8 @@ pub(super) async fn prime(state: &AppState) -> usize {
     let groups = tenant_groups(state).await;
     let outcomes = stream::iter(groups.into_values())
         .map(|tenants| async move {
-            // Native hard quotas already reject writes in the kernel and do
-            // not need telemetry before a route can open. Prime only the soft
-            // guards whose safety depends on a successful catalog query.
+            // Native hard quotas already reject writes in the kernel and do not need telemetry
+            // before a route can open.
             let Err(error) = sample_runtime(state, tenants.clone(), false).await else {
                 return false;
             };
@@ -186,9 +185,7 @@ async fn sample_runtime(
         .await;
     }
 
-    // Soft enforcement is a measurement-and-fence transaction. Keep it under
-    // the physical runtime lock, then reload the complete pool so lifecycle
-    // changes made after the initial grouping cannot escape the decision.
+    // Soft enforcement is a measurement-and-fence transaction.
     let _runtime_operation = state.instance_locks.lock(&runtime_id).await;
     let tenants = state
         .instances
@@ -260,10 +257,10 @@ async fn load_runtime(
     Ok(runtime)
 }
 
-/// Reads one hard tenant's O(1) kernel project-quota counter. This deliberately
-/// does not take the runtime lifecycle lock: quota accounting is independent
-/// of the database engine, while an identity recheck prevents a late sample
-/// from being published after delete, migration, or recreation.
+/// Reads one hard tenant's O(1) kernel project-quota counter. This deliberately does not take the
+/// runtime lifecycle lock: quota accounting is independent of the database engine, while an
+/// identity recheck prevents a late sample from being published after delete, migration, or
+/// recreation.
 async fn refresh_hard_usage(
     state: &AppState,
     runtime: &EngineRuntime,
@@ -369,9 +366,8 @@ fn check_sample_count(runtime_id: &str, expected: usize, actual: usize) -> Resul
     ))
 }
 
-/// The caller holds the physical runtime lock from measurement through the
-/// fence/unfence decision, so this usage sample cannot race an import or a
-/// stale recovery decision.
+/// The caller holds the physical runtime lock from measurement through the fence/unfence decision,
+/// so this usage sample cannot race an import or a stale recovery decision.
 async fn enforce_quota_locked(state: &AppState, snapshot: InstanceMetadata, used_bytes: u64) {
     let runtime_id = snapshot.runtime_id().to_string();
     let Some(metadata) = state.instances.get(&snapshot.instance_id).await else {
@@ -441,10 +437,8 @@ async fn block_over_quota_tenant(
     metadata.disk_limit_blocked = true;
     metadata.updated_at = now_rfc3339();
     if let Err(error) = state.manager.upsert(metadata.clone()).await {
-        // Keep the blocked fact in memory even when durable storage is
-        // temporarily unavailable. The explicit route fence remains the
-        // authority, and a later low-usage sample can now recover instead
-        // of leaving this process permanently stuck closed.
+        // The explicit route fence remains the authority, and a later low-usage sample can now
+        // recover instead of leaving this process permanently stuck closed.
         state.instances.upsert_fenced(metadata.clone()).await;
         tracing::error!(
             event = "audit shared_tenant_disk_block_persist_failed",
@@ -527,11 +521,8 @@ fn sample_group_runtime(tenants: &[InstanceMetadata]) -> Option<String> {
         .map(|tenant| tenant.runtime_id().to_string())
 }
 
-/// Re-reads the whole pool after the failed sampler releases its runtime
-/// lock. This catches tenants created or changed to soft enforcement between
-/// the initial grouping and the failed query; using the stale input snapshot
-/// here could otherwise leave a newly soft tenant reachable without a
-/// measurable limit.
+/// using the stale input snapshot here could otherwise leave a newly soft tenant reachable without
+/// a measurable limit.
 async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &str) -> usize {
     let _runtime_operation = state.instance_locks.lock(runtime_id).await;
     let tenants = state

@@ -68,8 +68,7 @@ pub struct DockerInstanceInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedContainerIdentity {
     pub id: String,
-    /// Docker's immutable start generation for this container. A stop/start
-    /// keeps the container ID but changes this value.
+    /// A stop/start keeps the container ID but changes this value.
     pub started_at: String,
 }
 
@@ -79,9 +78,7 @@ pub(crate) struct ManagedContainerCompatibilityIdentity {
     pub image_id: String,
 }
 
-/// A stats reader bound to one verified managed-container generation. It is
-/// recreated after an engine error so a container restart cannot leave the
-/// sampler polling a stale container ID.
+/// Recreated after an engine error so a restart cannot leave the sampler polling a stale container ID.
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedStatsSampler {
     docker: Docker,

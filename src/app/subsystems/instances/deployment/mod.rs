@@ -28,9 +28,6 @@ pub struct StartDeploymentMigrationRequest {
     pub target_mode: DeploymentMode,
 }
 
-/// Persists the operation before launching an owned worker. The worker keeps
-/// the instance mutation lock and exclusive data-job admission until durable
-/// completion or a recovery-safe state.
 pub async fn start_deployment_migration(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -44,9 +41,7 @@ pub async fn start_deployment_migration(
                 .to_string(),
         ));
     }
-    // Data maintenance acquires exclusive job admission before the instance
-    // lock. Use the same order so a password/import worker waiting for this
-    // instance cannot deadlock a migration that is waiting for its permit.
+    // Data maintenance acquires exclusive job admission before the instance lock.
     let admission = state
         .import_export_jobs
         .try_admit_exclusive(&instance_id)

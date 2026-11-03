@@ -211,10 +211,7 @@ async fn reset_instance_password_inner(
 
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(ApiError::bad_request)?;
-    // Existing instances must keep using the bind source recorded in durable
-    // metadata. In particular, RESP ACL files must be read and replaced
-    // through a live FuseQuota mount rather than by mutating its raw backing
-    // directory behind the helper's cache.
+    // Existing instances must keep using the bind source recorded in durable metadata.
     let disk_limiter =
         DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
             .for_persisted_method(&metadata.limits.disk_enforcement_method);
@@ -396,9 +393,7 @@ fn requires_container_recreation(protocol: Protocol, previous: &PreviousCredenti
         // Both services read their public credential from immutable container
         // startup configuration and have no safe live reload mechanism.
         CredentialRollback::RecreateContainer => true,
-        // The running server must authenticate ACL LOAD with the current
-        // tenant. Legacy instances have no protected plaintext credential and
-        // therefore need one recreation before later rotations can be live.
+        // The running server must authenticate ACL LOAD with the current tenant.
         CredentialRollback::RespAcl => previous.environment.is_none(),
         CredentialRollback::PostgresVerifier
         | CredentialRollback::MysqlAuthString
@@ -592,12 +587,9 @@ async fn reset_password(
     }
 
     let no_progress = |_event| {};
-    // Every protocol reaching this path gets its credential from material
-    // prepared before startup: Redis/Valkey read the rewritten ACL, while
-    // ClickHouse/Qdrant read immutable container configuration. In particular,
-    // the ClickHouse image creates an XML-backed user that cannot be changed
-    // with ALTER USER. The launch readiness probe authenticates with the new
-    // container environment before this function can return success.
+    // Every protocol reaching this path gets its credential from material prepared before startup:
+    // Redis/Valkey read the rewritten ACL, while ClickHouse/Qdrant read immutable container
+    // configuration.
     launch_container_from_spec(
         state,
         new_spec,

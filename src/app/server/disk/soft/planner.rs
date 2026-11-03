@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub(crate) use super::usage_tree::RootIdentity;
 
-/// Monotonic time supplied by the caller for deterministic scheduling.
 pub(crate) type PlannerTick = Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +25,10 @@ impl PlannerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TargetSpec {
     pub id: String,
-    /// Hash of target properties that affect scan meaning.
     pub fingerprint: String,
     pub root_identity: Option<RootIdentity>,
     pub enabled: bool,
     pub watcher_trusted: bool,
-    /// Require an authoritative full scan at every base interval.
     pub force_periodic_full: bool,
 }
 
@@ -63,7 +60,6 @@ pub(crate) struct ScanCandidate {
     pub reason: ScanReason,
     pub fingerprint: String,
     pub root_identity: Option<RootIdentity>,
-    /// Highest watcher generation this scan is expected to cover.
     pub captured_generation: u64,
     pub revision: u64,
     pub token: u64,
@@ -75,7 +71,6 @@ pub(crate) enum ScanCompletion {
     Succeeded {
         performed: ScanKind,
     },
-    /// Incremental accounting was ambiguous; retry with a full scan.
     #[cfg(test)]
     NeedsFull,
     Failed,
@@ -278,7 +273,6 @@ impl HybridScanPlanner {
         true
     }
 
-    /// Record a monotonically increasing watcher generation.
     pub(crate) fn mark_dirty(
         &mut self,
         target_id: &str,
@@ -343,7 +337,6 @@ impl HybridScanPlanner {
         true
     }
 
-    /// Invalidates every enabled registration after a global watcher error.
     #[cfg(test)]
     pub(crate) fn mark_all_overflow(&mut self, now: PlannerTick) -> Vec<(String, u64)> {
         let mut affected = Vec::new();
@@ -410,7 +403,6 @@ impl HybridScanPlanner {
         })
     }
 
-    /// Returns the delay until non-running work is next eligible.
     pub(crate) fn next_wakeup(&self, now: PlannerTick) -> Option<Duration> {
         if self.shutdown {
             return None;

@@ -28,9 +28,7 @@ pub(super) async fn clear(root: &Path, project_id: u32) -> Result<(), DiskLimitE
     run(root, project_id, ProjectAction::Clear).await
 }
 
-/// Undo an interrupted project adoption. A pending claim may have moved only
-/// part of the tree to `project_id`; restore both the source- and target-owned
-/// entries to the boundary's original parent project before releasing it.
+/// Undoes an interrupted adoption by restoring source- and target-owned entries to the boundary's original parent project.
 pub(super) async fn rollback_pending(root: &Path, project_id: u32) -> Result<(), DiskLimitError> {
     run(root, project_id, ProjectAction::Rollback).await
 }
@@ -246,11 +244,7 @@ mod platform {
             _path: &Path,
             directory: bool,
         ) -> Result<(), std::io::Error> {
-            // Project inheritance is established before getdents. Anything
-            // created after this point is born inside the new project instead
-            // of escaping the in-progress adoption. During clear and rollback,
-            // source inheritance temporarily remains enabled and is restored
-            // only after the directory's existing children have been handled.
+            // Inheritance is set before getdents so later files are born inside the new project; during clear/rollback source inheritance stays on until children are handled.
             match self.action {
                 ProjectAction::Assign => assign_attrs(
                     fd,
@@ -343,9 +337,7 @@ mod platform {
         walk.walk_node(&root_fd, root, 0)?;
         let mut stable = walk.stable;
 
-        // Reopen only to validate that the caller's root name still selects
-        // the pinned inode. No mutation is ever performed through this second
-        // pathname lookup.
+        // Reopen only to validate the root name still selects the pinned inode; never mutate through it.
         match open_root(root) {
             Ok(current) => {
                 let stat = fstat(current).map_err(std::io::Error::from)?;
@@ -384,11 +376,7 @@ mod platform {
         let parent_fd = open_root(parent)?;
         let parent_attrs = get_attrs(parent_fd.as_fd()).map_err(|source| at(parent, source))?;
 
-        // A retry after an interrupted adoption can find the target ID on the
-        // root, and a retry after interrupted rollback can find the source ID
-        // with the traversal's temporary inheritance bit. The parent remains
-        // stable in both cases, so use it whenever it names the same source;
-        // only preserve a distinct pre-existing root project boundary.
+        // Retries can find the target ID (interrupted adoption) or source ID with the temporary inheritance bit (interrupted rollback); the stable parent wins when it names the same source.
         Ok(select_source(root_attrs, parent_attrs, target_id))
     }
 

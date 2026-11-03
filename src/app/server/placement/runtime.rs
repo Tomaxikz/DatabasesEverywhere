@@ -18,9 +18,7 @@ pub(crate) struct RuntimeProbe {
     pub compatibility: RuntimeCompatibility,
 }
 
-/// Attests one physical shared engine. The identity is checked on both sides
-/// of the command so a concurrent reconstruction cannot attach a result to a
-/// different container or image.
+/// Attests one shared engine, checking the container identity on both sides of the command.
 pub(crate) async fn probe_compatibility(
     docker: &DockerRuntime,
     runtime: &EngineRuntime,
@@ -60,9 +58,7 @@ pub(crate) async fn probe_compatibility(
     })
 }
 
-/// Applies aggregate CPU/memory reservations and the derived root disk charge
-/// to one physical shared engine. Tenant handlers must never call Docker limit
-/// APIs with a tenant id.
+/// Applies aggregate CPU/memory reservations and the root disk charge to one shared engine; never called with a tenant id.
 pub(crate) async fn apply_limits(
     docker: &DockerRuntime,
     config: &Config,
@@ -83,9 +79,7 @@ pub(crate) async fn apply_limits(
     Ok(())
 }
 
-/// Applies only the part of the shared engine's disk budget still charged to
-/// its root project. Hard tenant child projects carry their own limits and
-/// must not be counted a second time at the root.
+/// Applies only the disk budget still charged to the root; hard tenant child projects carry their own limits.
 pub(crate) async fn apply_root_disk_limit(
     config: &Config,
     placements: &PlacementRepository,

@@ -7,11 +7,7 @@ use super::{
 use crate::config::DiskLimitMode;
 
 impl DiskLimiter {
-    /// Release every storage object owned by an instance before its data
-    /// directory is deleted. Unlike [`Self::purge_instance_data`], this also
-    /// removes XFS/ext4/F2FS project labels, kernel limits, and registry
-    /// claims. Pending and active claims must be removed successfully before
-    /// callers may delete the backing path.
+    /// Releases every storage object owned by an instance, including project labels, kernel limits and registry claims, before its data directory is deleted.
     pub(crate) async fn release_instance_storage(
         &self,
         owner_id: &str,
@@ -47,8 +43,7 @@ impl DiskLimiter {
         }
     }
 
-    /// Stop the per-instance quota helper and unmount its runtime filesystem.
-    /// The persistent backing directory and its database files are retained.
+    /// Stops the quota helper and unmounts its runtime filesystem; backing files are kept.
     pub async fn teardown_instance_mount(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode == DiskLimitMode::FuseQuota {
             fuse_quota::destroy_with_root(data_path, self.fuse_root.as_deref()).await?;
@@ -56,15 +51,8 @@ impl DiskLimiter {
         Ok(())
     }
 
-    /// Verify that the generic directory-rename cutover used by major image
-    /// upgrades is safe for this instance's storage layout.
-    ///
-    /// Native quota backends attach enforcement identity to projects,
-    /// subvolumes, or datasets rather than only to a directory name. A generic
-    /// rename can retain the temporary upgrade identity, leave stale quota
-    /// registry entries, or fail outright for a mounted dataset. Fail before
-    /// export or old-container removal until each backend has a transactional
-    /// native cutover.
+    /// Checks that the generic directory-rename cutover of major image upgrades is safe for this layout;
+    /// native quota identity is attached to projects/subvolumes/datasets, not directory names.
     pub fn check_upgrade_cutover(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode != DiskLimitMode::ProjectQuota {
             return Ok(());
@@ -75,15 +63,8 @@ impl DiskLimiter {
         })
     }
 
-    /// Verify that a physical archive can replace the contents of this data
-    /// directory without losing native quota identity.
-    ///
-    /// The restore transaction stages files in a sibling directory and then
-    /// renames them into the instance directory. XFS/ext4/F2FS reapply the
-    /// project ID to every existing regular file and set inheritance on every
-    /// directory without following symlinks or crossing filesystems. Btrfs
-    /// and ZFS attach enforcement to a subvolume/dataset boundary, so those
-    /// layouts still reject a generic directory cutover.
+    /// Checks that a physical archive can replace this data directory without losing native quota identity;
+    /// Btrfs and ZFS still reject a generic directory cutover.
     pub fn check_restore_layout(&self, data_path: &Path) -> Result<(), DiskLimitError> {
         if self.config.mode != DiskLimitMode::ProjectQuota {
             return Ok(());

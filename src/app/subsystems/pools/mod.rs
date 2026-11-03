@@ -23,8 +23,6 @@ pub(crate) async fn load(state: &AppState, runtime_id: &str) -> Result<EngineRun
         .ok_or(ApiError::NotFound)
 }
 
-/// Reservations charge capacity before a child can be published. Only return
-/// published members; missing metadata without active work is still an error.
 pub(crate) async fn tenants(
     state: &AppState,
     pool: &EngineRuntime,
@@ -78,9 +76,6 @@ async fn lookup_published_tenant(
     if let Some(metadata) = state.instances.get(id).await {
         return Ok(TenantLookup::Found(Box::new(metadata)));
     }
-    // Re-read durable membership after the cache lookup: a writer may
-    // have completed creation, deletion or cutover between the reads.
-    // get_orphan also excludes journaled provisional migration targets.
     let orphan = state
         .placements
         .get_orphan(id)
@@ -96,9 +91,8 @@ async fn lookup_published_tenant(
     if orphan.is_some() {
         return Ok(TenantLookup::Missing);
     }
-    // A journaled shadow target or a deleted member has no public
-    // metadata. A real stored child missing from the cache must
-    // not disappear silently once its creation worker has ended.
+    // A real stored child missing from the cache must not disappear silently once its creation
+    // worker has ended.
     let stored = state
         .manager
         .get_persisted(id)

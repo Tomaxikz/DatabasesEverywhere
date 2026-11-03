@@ -1,11 +1,4 @@
-//! The multi-part AOF directory a captured snapshot is installed as.
-//!
-//! Redis 7+ and Valkey load `<appenddirname>/<appendfilename>.manifest` on an
-//! `--appendonly yes` start. A manifest naming only an RDB-format base is the
-//! same state a completed AOF rewrite leaves behind; the server loads the
-//! base and then opens a new incremental file itself. The instance runs with
-//! the default `appendonlydir` and `appendonly.aof` names, which the inventory
-//! confirms before capture.
+//! The captured snapshot is installed as a multi-part AOF directory: a manifest naming only an RDB base is the state a completed AOF rewrite leaves, so the server loads it and opens a new incremental file.
 
 use std::{fs, io::Read, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -15,10 +8,8 @@ pub(super) const AOF_DIRECTORY: &str = "appendonlydir";
 pub(super) const BASE_FILE: &str = "appendonly.aof.1.base.rdb";
 pub(super) const MANIFEST_FILE: &str = "appendonly.aof.manifest";
 const MANIFEST: &str = "file appendonly.aof.1.base.rdb seq 1 type b\n";
-/// `REDIS` plus a four-digit version, or `VALKEY` plus three digits.
 const MAGIC_LEN: usize = 9;
 
-/// Reads and validates the RDB header, returning it (e.g. `REDIS0012`).
 pub(super) fn read_rdb_format(path: &Path) -> Result<String, String> {
     require_regular_file(path)?;
     let mut header = [0_u8; MAGIC_LEN];
@@ -34,7 +25,6 @@ pub(super) fn read_rdb_format(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&header).into_owned())
 }
 
-/// Writes the manifest naming the snapshot as the only AOF part.
 pub(super) fn write_manifest(directory: &Path) -> Result<(), String> {
     let path = directory.join(MANIFEST_FILE);
     let mut file = fs::OpenOptions::new()
@@ -48,7 +38,6 @@ pub(super) fn write_manifest(directory: &Path) -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
-/// The directory holds exactly the manifest and an RDB base it names.
 pub(super) fn check_layout(directory: &Path) -> Result<(), String> {
     require_directory(directory)?;
     let mut names = fs::read_dir(directory)
@@ -79,8 +68,6 @@ pub(super) fn check_layout(directory: &Path) -> Result<(), String> {
     read_rdb_format(&directory.join(BASE_FILE)).map(|_| ())
 }
 
-/// Validates an extracted capture before it replaces the data directory.
-/// Nothing needs rewriting: the server loads the base on a normal start.
 pub(super) fn prepare_aof_restore(directory: &Path) -> Result<(), String> {
     check_layout(directory)
 }

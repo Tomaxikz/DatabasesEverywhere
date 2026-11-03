@@ -25,9 +25,7 @@ use crate::{
     },
 };
 
-// `--tags key:value` arguments name tags without a prefix; the CLI stores
-// them on the manifest under `tag:<key>`, which is what `snapshot list
-// --json` returns. See kopia v0.22 cli/command_snapshot_create.go getTags.
+// The CLI stores `--tags key:value` as `tag:<key>` (kopia v0.22 getTags).
 use snapshot::*;
 
 const STORED_TAG_PREFIX: &str = "tag:";
@@ -42,10 +40,7 @@ const TAG_CREATED_AT: &str = "dbev-created-at";
 const TAG_PROTOCOL: &str = "dbev-protocol";
 const TAG_CATALOG: &str = "dbev-catalog";
 const TAG_LAYOUT: &str = "dbev-layout";
-// Schema 2 projection. Legacy summary tags are deliberately absent from these
-// snapshots so a schema 1 daemon rejects them instead of reconstructing a
-// schema 1 manifest; the complete canonical manifest travels inside the
-// snapshot and is authenticated by its tagged SHA-256.
+// Schema 2 projection: no legacy summary tags, so a schema 1 daemon rejects it; the canonical manifest is authenticated by its tagged SHA-256.
 const TAG_MANIFEST_VERSION: &str = "dbev-manifest-version";
 const TAG_MANIFEST_SHA256: &str = "dbev-manifest-sha256";
 const TAG_V2_SIZE: &str = "dbev-v2-size";
@@ -65,8 +60,7 @@ const STICKY_BIT: u32 = 0o1000;
 pub struct KopiaBackupDriver {
     config: BackupKopiaConfig,
     config_file: PathBuf,
-    /// Scratch space for canonical manifest retrieval. It lives under backup
-    /// staging, which daemon startup removes.
+    /// Scratch space under backup staging, which daemon startup removes.
     scratch_root: PathBuf,
 }
 
@@ -99,7 +93,6 @@ struct KopiaSource {
     path: String,
 }
 
-/// One `kopia manifest list --json` entry.
 #[derive(Debug, Deserialize)]
 struct KopiaManifestEntry {
     id: String,
@@ -225,8 +218,7 @@ impl KopiaBackupDriver {
         manifest.validate(&manifest.instance_id)?;
         self.preflight().await?;
         let tags = self.commit_tags(bundle, manifest).await?;
-        // Periodic checkpoints are saved untagged while the upload runs, so
-        // the bundle's unique path is journaled before Kopia can save one.
+        // Checkpoints are saved untagged during upload, so journal the bundle path first.
         let source_path = snapshot_source_path(&bundle.directory)?;
         journal
             .record(&PublicationResource::KopiaSourcePath(source_path.clone()))
@@ -304,10 +296,7 @@ impl KopiaBackupDriver {
         Ok(inventory)
     }
 
-    /// Deletes every snapshot tagged with the backup id, whether or not its
-    /// canonical manifest exists, and every snapshot of the journaled source
-    /// paths, which includes untagged checkpoints. Succeeds only once a
-    /// relisting finds none of them.
+    /// Deletes every snapshot tagged with the id or of the journaled source paths (incl. untagged checkpoints); succeeds only when a relisting finds none.
     pub async fn purge_unpublished(
         &self,
         instance_id: &str,
@@ -349,9 +338,7 @@ impl KopiaBackupDriver {
         Ok(())
     }
 
-    /// Ids of every snapshot manifest, complete or not, whose source path is
-    /// exactly `path`. Kopia saves each checkpoint with the source labels, so
-    /// the path label finds them without tags or the client's user@host.
+    /// Ids of every snapshot manifest whose source path is exactly `path`, found by path label rather than tags.
     async fn source_snapshot_ids(&self, path: &str) -> Result<Vec<String>, BackupStoreError> {
         self.preflight().await?;
         let output = self
@@ -468,8 +455,7 @@ impl KopiaBackupDriver {
             .map_err(|source| io_error("read restored Kopia catalog", source))
     }
 
-    /// Tags for a new snapshot. Schema 2 manifests are projected onto
-    /// versioned tags and bound to the canonical sidecar by its SHA-256.
+    /// Tags for a new snapshot; schema 2 manifests are projected onto versioned tags.
     async fn commit_tags(
         &self,
         bundle: &BackupBundle,
@@ -493,9 +479,7 @@ impl KopiaBackupDriver {
         v2_manifest_tags(manifest, &crate::server::backup::sha256_bytes(&bytes))
     }
 
-    /// Reads one snapshot's manifest. Snapshots without a version tag are
-    /// legacy schema 1 records reconstructed from tags; schema 2 snapshots
-    /// are read only from their canonical sidecar.
+    /// Reads one manifest: snapshots without a version tag are legacy schema 1; schema 2 is read only from the sidecar.
     async fn load_record(
         &self,
         instance_id: &str,
@@ -599,9 +583,7 @@ impl KopiaBackupDriver {
                 "Kopia returned {MAX_LISTED_SNAPSHOTS} snapshots; narrow the repository or prune old DBEV backups"
             )));
         }
-        // `--incomplete` filters only the text listing; JSON always includes
-        // incomplete snapshots. A canceled upload keeps its tags and must
-        // never be read as a published backup.
+        // `--incomplete` filters only the text listing; JSON includes incomplete snapshots, which must not be read as published.
         Ok(snapshots
             .into_iter()
             .filter(|snapshot| include_incomplete || snapshot.incomplete.trim().is_empty())

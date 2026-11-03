@@ -10,7 +10,6 @@ use crate::{
     utils::time::now_rfc3339,
 };
 
-/// These are the decision points, not guesses based on text in an engine error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     Metadata,

@@ -1,5 +1,3 @@
-//! Certified online backup strategies compiled into this build.
-
 use std::sync::LazyLock;
 
 use super::strategy::{OnlineBackupStrategy, StrategyError};
@@ -13,19 +11,12 @@ use crate::{
     server::{metadata::InstanceMetadata, placement::DeploymentMode},
 };
 
-/// Manifest strategy id of the PostgreSQL `pg_basebackup` strategy.
 pub(crate) const POSTGRES_BASE_BACKUP: &str = "postgres.pg_basebackup";
-/// Manifest strategy id of the Redis and Valkey RDB snapshot strategy.
 pub(crate) const RESP_RDB_SNAPSHOT: &str = "resp.rdb_snapshot";
-/// Manifest strategy id of the MariaDB `mariadb-backup` strategy.
 pub(crate) const MARIADB_BACKUP: &str = "mariadb.mariadb_backup";
-/// Manifest strategy id of the Btrfs/ZFS volume snapshot strategy.
 pub(crate) const FILESYSTEM_SNAPSHOT: &str = "volume.snapshot";
-/// Manifest strategy id of the MySQL single-transaction dump strategy.
 pub(crate) const MYSQL_CONSISTENT_DUMP: &str = "mysql.consistent_dump";
-/// Manifest strategy id of the Qdrant per-collection snapshot strategy.
 pub(crate) const QDRANT_COLLECTION_SNAPSHOTS: &str = "qdrant.collection_snapshots";
-/// Manifest strategy id of the ClickHouse per-table freeze strategy.
 pub(crate) const CLICKHOUSE_FROZEN_PARTS: &str = "clickhouse.frozen_parts";
 
 static STRATEGIES: LazyLock<Vec<Box<dyn OnlineBackupStrategy>>> = LazyLock::new(|| {
@@ -40,8 +31,7 @@ static STRATEGIES: LazyLock<Vec<Box<dyn OnlineBackupStrategy>>> = LazyLock::new(
     ]
 });
 
-/// Selects the certified strategy for a backup source, or explains why
-/// strict online capture is unsupported. Never falls back.
+/// Never falls back.
 pub(crate) fn strategy_for(
     metadata: &InstanceMetadata,
 ) -> Result<&'static dyn OnlineBackupStrategy, StrategyError> {
@@ -63,7 +53,6 @@ pub(crate) fn strategy_for(
             )
             .is_some();
             match otherwise {
-                // Without either, the snapshot strategy explains the requirement.
                 Some(native) if !snapshots => native_strategy_id(native),
                 _ => FILESYSTEM_SNAPSHOT,
             }
@@ -84,7 +73,6 @@ fn native_strategy_id(native: NativeOnline) -> &'static str {
     }
 }
 
-/// Looks up a strategy recorded in a manifest or job journal.
 pub(crate) fn strategy_by_id(id: &str) -> Option<&'static dyn OnlineBackupStrategy> {
     STRATEGIES
         .iter()

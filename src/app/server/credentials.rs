@@ -9,12 +9,7 @@ pub(crate) struct CredentialUnavailable {
     message: String,
 }
 
-/// Short-lived environment values used by daemon-managed database clients.
-///
-/// These values come from encrypted metadata after it has been decrypted by
-/// the repository. Container environment variables are deliberately not used
-/// as an authority here because they are immutable and become stale after a
-/// password rotation.
+/// Short-lived env values for daemon-managed clients, from decrypted metadata; container env goes stale after password rotation.
 #[derive(Debug)]
 pub(crate) struct SecretEnvironment {
     values: Vec<(&'static str, SecretString)>,

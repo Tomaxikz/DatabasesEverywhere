@@ -130,8 +130,7 @@ impl BackupCatalog {
         }
 
         self.truncated = true;
-        // Preview data is optional and can dominate the catalog. Remove it in
-        // one pass instead of repeatedly serializing a large document per row.
+        // Preview data is optional and dominates the catalog; strip it in one pass.
         for object in &mut self.objects {
             if !object.preview_rows.is_empty() {
                 object.preview_rows.clear();
@@ -140,9 +139,7 @@ impl BackupCatalog {
         }
         encoded = serde_json::to_vec(&self)?;
 
-        // Preserve complete schema for a leading subset of objects. Estimate
-        // a proportional batch on each pass so a very large catalog requires
-        // only a handful of serializations rather than one per column/object.
+        // Keep full schema for a leading subset, sizing batches proportionally to need few serializations.
         while encoded.len() as u64 > max_bytes && !self.objects.is_empty() {
             if self.objects.len() == 1 && !self.objects[0].columns.is_empty() {
                 self.objects[0].columns.clear();
@@ -234,8 +231,7 @@ async fn capture_previews(
     if eligible.len() < previewable_objects {
         catalog.truncated = true;
     }
-    // Read one bounded sentinel row so callers can distinguish a complete
-    // small object from a preview that stopped at the configured limit.
+    // Read one extra row to tell a complete small object from a truncated preview.
     let capture_rows = policy.preview_rows_per_object.saturating_add(1);
     for (index, object) in eligible {
         let script = metadata.protocol.engine().catalog_preview_script(

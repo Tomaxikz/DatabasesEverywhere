@@ -22,9 +22,7 @@ pub struct InstancePaths {
     pub logs: PathBuf,
     pub sockets: PathBuf,
     pub artifacts: PathBuf,
-    /// Portable exports owned by this instance.
     pub exports: PathBuf,
-    /// Operator-staged imports owned by this instance.
     pub imports: PathBuf,
     /// Physical backups are created lazily, but remain owned by the instance.
     pub backups: PathBuf,
@@ -95,9 +93,7 @@ impl InstancePaths {
         chown_paths_in_background(paths, owner).await
     }
 
-    /// Makes only the paths mounted into rootless Podman containers belong to
-    /// the host account that owns the Podman service. Daemon-owned artifacts,
-    /// imports, exports, and backups remain root-private.
+    /// Hands only paths mounted into rootless Podman containers to the Podman service account; the rest stays root-private.
     pub async fn apply_rootless_owner(&self, uid: u32, gid: u32) -> Result<(), InstancePathError> {
         if uid == 0 {
             return Err(InstancePathError::InvalidRuntimeOwner);
@@ -110,8 +106,7 @@ impl InstancePaths {
         chown_paths_in_background(paths, HostOwner { uid, gid }).await
     }
 
-    /// Reapply the persistent data directory's existing owner after a
-    /// physical restore has created replacement entries as the daemon user.
+    /// Reapplies the data directory's owner after a physical restore created entries as the daemon user.
     pub async fn restore_data_owner(&self) -> Result<(), InstancePathError> {
         let owner = self.data_owner().await?;
         chown_paths_in_background(vec![self.data.clone()], owner).await

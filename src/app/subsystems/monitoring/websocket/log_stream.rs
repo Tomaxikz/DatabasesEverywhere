@@ -15,7 +15,6 @@ use futures::StreamExt;
 use serde::Serialize;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
-// A JSON control character expands to six bytes; leave room for the envelope.
 const LOG_CHUNK_BYTES: usize = 1536;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -56,7 +55,6 @@ enum LogIdentity<'a> {
     Pool { runtime_id: &'a str },
 }
 
-/// While a creation is running its container may not exist yet.
 const CONTAINER_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(crate) enum LogTarget {
@@ -65,8 +63,6 @@ pub(crate) enum LogTarget {
         created_at: String,
         protocol: crate::databases::protocol::Protocol,
     },
-    /// A dedicated instance whose creation attempt the token binds. Its
-    /// container appears partway through creation and keeps running after it.
     Creating {
         instance_id: String,
         generation: String,
@@ -123,7 +119,6 @@ impl LogTarget {
         }
     }
 
-    /// True while this target's creation runs and its container is not there yet.
     async fn awaits_container(&self, state: &AppState) -> bool {
         let Self::Creating { instance_id, .. } = self else {
             return false;
@@ -319,8 +314,6 @@ pub(crate) async fn stream_logs(
     }
 }
 
-/// Waits, without sending anything, until a creating instance's container
-/// exists or its creation stops running. Returns false once the socket closed.
 async fn wait_for_container(
     socket: &mut WebSocket,
     state: &AppState,

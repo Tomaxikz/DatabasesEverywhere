@@ -7,10 +7,7 @@ pub(super) async fn usage_bytes(
     registry_root: &Path,
     project_id: u32,
 ) -> Result<u64, DiskLimitError> {
-    // A project counter is authoritative only while this directory is still
-    // the verified inheritance boundary for the active claim. Check on both
-    // sides of the syscall so a concurrent relabel cannot publish a plausible
-    // counter for a boundary that no longer constrains new files.
+    // A counter is authoritative only while this directory is still the verified boundary; check on both sides of the syscall to catch concurrent relabels.
     project_tree::verify_root(&target.path, project_id).await?;
     let target = target.clone();
     let registry_root = registry_root.to_path_buf();
@@ -24,10 +21,7 @@ pub(super) async fn usage_bytes(
     Ok(usage)
 }
 
-/// Read the quota record back from the kernel and require the requested hard
-/// byte limit. Command success alone is insufficient: quota tooling can exit
-/// successfully while enforcement is disabled or a different record remains
-/// installed.
+/// Reads the quota back from the kernel and requires the requested hard limit; tool exit status alone is insufficient.
 pub(super) async fn verify_hard_limit(
     filesystem: NativeProjectQuotaFs,
     mountpoint: &Path,
@@ -42,10 +36,7 @@ pub(super) async fn verify_hard_limit(
     .map_err(|error| DiskLimitError::Task(error.to_string()))?
 }
 
-/// Require the kernel project record to account no remaining blocks before
-/// its hard limit and durable claim are removed. This deliberately queries by
-/// mount and project ID without requiring the boundary path: an unlinked file
-/// can remain charged after that path has safely disappeared.
+/// Requires zero remaining blocks before removal. Queries by mount and project ID because an unlinked file stays charged after its path is gone.
 pub(super) async fn verify_unused(
     filesystem: NativeProjectQuotaFs,
     mountpoint: &Path,

@@ -99,8 +99,6 @@ impl DockerRuntime {
             stop_timeout: Some(CONTAINER_STOP_TIMEOUT_SECONDS),
             host_config: Some(host_config),
             exposed_ports: None,
-            // Do not inherit image healthchecks. DBE runs a bounded readiness
-            // query during startup and then follows container lifecycle events.
             healthcheck: Some(disabled_healthcheck()),
             ..Default::default()
         })

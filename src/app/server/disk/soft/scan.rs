@@ -88,7 +88,6 @@ impl SoftDiskLimiter {
         })
     }
 
-    /// Perform a fresh scan before admitting a soft-limited start.
     pub async fn ensure_start_allowed(
         &self,
         target: &SoftDiskTarget,

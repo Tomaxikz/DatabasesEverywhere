@@ -90,7 +90,6 @@ impl PendingRetirements {
     }
 }
 
-/// Serializes blocking watcher operations without blocking the monitor.
 #[derive(Default)]
 pub(super) struct WatchOperationQueue {
     desired: BTreeMap<String, DesiredWatch>,

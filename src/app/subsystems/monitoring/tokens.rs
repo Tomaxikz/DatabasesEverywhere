@@ -99,7 +99,6 @@ async fn instance_generation_digest(
 ) -> Result<String, ApiError> {
     let mut generations = Vec::with_capacity(instance_ids.len());
     for instance_id in instance_ids {
-        // While an instance is being created the token binds to that attempt.
         let generation = BindableGenerations::of(state, instance_id)
             .await
             .preferred()

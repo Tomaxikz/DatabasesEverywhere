@@ -1,24 +1,6 @@
-//! Online backup through an atomic volume snapshot (Btrfs or ZFS).
-//!
-//! For engines whose images ship no hot-backup tool (MySQL, MongoDB,
-//! ClickHouse, Qdrant), the instance's own subvolume or dataset is snapshotted
-//! read-only in one atomic step while the database keeps serving. The
-//! snapshot is crash-consistent: data files plus the engine's journal (InnoDB
-//! redo, WiredTiger journal, MergeTree part renames, Qdrant WAL) at a single
-//! instant, which the engine recovers like after a power loss. No write
-//! freeze, no restart.
-//!
-//! The snapshot is journaled as an owned resource before it is created,
-//! copied into coordinator-reserved staging (bounded by the native budget),
-//! and destroyed right away; a crash leaves it to [`cleanup_owned`]. Restore
-//! installs the copy as the data directory, and the existing restore path
-//! starts the engine on it and rolls back if it does not come up, which is
-//! where journal recovery is exercised.
-//!
-//! Instances on directories without atomic snapshots (XFS/ext4 project
-//! quotas, FuseQuota, soft limits) are refused here: copying live files one
-//! by one would not be a consistent point. The registry sends MySQL,
-//! ClickHouse and Qdrant there to their strategies in `native`.
+//! The snapshot is crash-consistent: data files plus the engine's journal (InnoDB redo, WiredTiger
+//! journal, MergeTree part renames, Qdrant WAL) at a single instant, which the engine recovers like
+//! after a power loss.
 
 mod copy;
 
@@ -51,9 +33,7 @@ use copy::{CopyStats, copy_snapshot};
 
 const RESTORE_RECIPE_ID: &str = "volume.snapshot.directory";
 const RESTORE_RECIPE_VERSION: u32 = 1;
-/// Capture directory below the staging root.
 const DATA_ROOT: &str = "volume";
-/// Where the copy sits in the archive; no engine names a data entry like this.
 const RESTORE_TARGET: &str = "dbev-volume-snapshot";
 const SNAPSHOT_SUFFIX: &str = "snapshot";
 
@@ -194,7 +174,6 @@ fn backend_of(
     )
 }
 
-/// Checks that need no server session.
 fn static_gate(ctx: &OnlineBackupContext<'_>) -> Result<SnapshotBackend, StrategyError> {
     if ctx.metadata.deployment_mode == DeploymentMode::Shared {
         return Err(StrategyError::Unsupported(
@@ -247,8 +226,6 @@ async fn capture_snapshot(
     })
     .await;
 
-    // The snapshot is no longer needed either way; a failed removal stays
-    // journaled and is retried by cleanup.
     match snapshot::destroy(backend, &ctx.paths.data, &resource.name).await {
         Ok(()) => registrar.released(&resource).await?,
         Err(error) => {
@@ -265,7 +242,6 @@ async fn capture_snapshot(
     Ok(CaptureResult {
         data_root: PathBuf::from(DATA_ROOT),
         restore_target: PathBuf::from(RESTORE_TARGET),
-        // Data and journal at one instant, recovered by the engine on start.
         consistency: ConsistencyLevel::PhysicalRecoveryPoint,
         recovery: RecoveryCoordinates(recovery),
         engine_version,

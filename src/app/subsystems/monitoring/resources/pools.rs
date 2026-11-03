@@ -335,8 +335,6 @@ async fn inactive_runtime_diagnostic(
     state: &AppState,
     runtime: &EngineRuntime,
 ) -> Option<PublicDiagnostic> {
-    // Docker retains the OOM flag after exit, including across daemon
-    // restarts. Do not infer OOM from exit code 137 or stale metadata alone.
     if !matches!(
         runtime.status,
         EngineRuntimeStatus::Failed | EngineRuntimeStatus::Stopped
@@ -698,8 +696,6 @@ mod tests {
             state.placements.mark_provisioned("old").await.unwrap();
             state.manager.upsert(old).await.unwrap();
 
-            // Hold the real worker permit and runtime lock while pausing at
-            // the production reserve -> provision -> publish boundaries.
             let permit = state
                 .install_progress
                 .try_begin_creation("new", protocol, "test-image")

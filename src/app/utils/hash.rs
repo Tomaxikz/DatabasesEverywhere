@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
-/// Lowercase hex SHA-256 of everything `reader` yields.
 pub(crate) fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; READ_BUFFER_BYTES];

@@ -393,8 +393,6 @@ fn signed_requests_encode_keys_like_object_store() {
     );
 }
 
-/// A local stand-in for S3 that records each request and answers it with
-/// `respond`.
 struct MockS3 {
     endpoint: String,
     requests: Arc<Mutex<Vec<(String, String, HeaderMap)>>>,

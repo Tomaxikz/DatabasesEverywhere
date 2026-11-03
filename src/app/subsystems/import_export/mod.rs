@@ -28,12 +28,8 @@ const FAIL_CLOSED_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGICAL_ROLLBACK_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGICAL_STREAM_EXEC_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// Recovery policy for operator-requested logical imports and exports.
-///
-/// Backups never reach the `RestartRuntime` branch: dedicated backups run
-/// online strategies through `OnlineBackupContext::exec` (caller-owned,
-/// never restarting) or an explicitly selected offline copy,
-/// and shared tenant backups are always `CallerHandles`.
+/// Recovery policy for operator-requested logical imports and exports. Backups never reach
+/// `RestartRuntime`; shared tenant backups are always `CallerHandles`.
 pub(super) fn logical_exec_recovery(metadata: &InstanceMetadata) -> ExecRecovery {
     match metadata.deployment_mode {
         DeploymentMode::Dedicated => ExecRecovery::RestartRuntime,

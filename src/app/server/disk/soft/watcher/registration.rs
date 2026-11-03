@@ -205,7 +205,6 @@ impl SoftDiskWatcher {
         }
     }
 
-    /// Retire callback routing immediately and defer kernel cleanup.
     pub(crate) fn retire(&self, target_id: &str) -> Option<RetiredWatch> {
         let retired = {
             let mut state = lock_recover(&self.shared.state);

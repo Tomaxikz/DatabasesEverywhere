@@ -43,8 +43,6 @@ async fn lock_shared_runtime(
     })
 }
 
-/// Finishes records classified during early boot before shared quota priming
-/// or gateway publication can consume provisional reservations.
 pub(crate) async fn recover_on_boot(state: &AppState) -> Result<(), ApiError> {
     let active = state
         .placements
@@ -83,9 +81,8 @@ pub(crate) async fn recover_on_boot(state: &AppState) -> Result<(), ApiError> {
             )),
         };
         if let Err(error) = result {
-            // Recovery can briefly republish the authoritative source or target
-            // while verifying it. Any incomplete record must finish this attempt
-            // fenced, even when a later boot pass refreshes its cached metadata.
+            // Any incomplete record must finish this attempt fenced, even when a later boot pass
+            // refreshes its cached metadata.
             crate::subsystems::instances::route_fence::fence(state, &migration.instance_id).await;
             tracing::error!(
                 event = "audit deployment_migration_boot_recovery_failed",
@@ -122,9 +119,8 @@ async fn recover_one_on_boot(
     result
 }
 
-/// Reasserts every durable migration fence immediately before gateway
-/// listeners are published. Later boot reconciliation may refresh otherwise
-/// route-eligible metadata, so the migration repository remains authoritative.
+/// Later boot reconciliation may refresh otherwise route-eligible metadata, so the migration
+/// repository remains authoritative.
 pub(crate) async fn fence_active_routes_on_boot(state: &AppState) -> Result<usize, ApiError> {
     let active = state
         .placements
@@ -254,9 +250,7 @@ async fn finish_rollback(state: &AppState, migration: DeploymentMigration) -> Re
         MigrationFailure::RolledBackBeforeCutover
     };
     advance_with_failure(state, migration, MigrationStage::Failed, failure).await?;
-    // Boot recovery pins routes so ordinary metadata refreshes cannot reopen
-    // them. Clear that pin only after the rollback is durable and the source
-    // credential was verified above.
+    // Boot recovery pins routes so ordinary metadata refreshes cannot reopen them.
     state.instances.open_routes(source).await;
     clear_caches(state, &instance_id).await;
     Ok(())
@@ -424,9 +418,8 @@ async fn finish_forward_cleanup(
         }
     }
     advance_to(state, migration, MigrationStage::Completed).await?;
-    // Keep a boot-pinned route closed until source retirement and the terminal
-    // migration record are both durable. The target credential was verified
-    // before cleanup, so it is now safe to publish.
+    // Keep a boot-pinned route closed until source retirement and the terminal migration record
+    // are both durable.
     state.instances.open_routes(target).await;
     clear_caches(state, &instance_id).await;
     remove_artifact_root(state, &migration_id).await;

@@ -17,8 +17,6 @@ pub(super) fn cpu_percent_over_wall_time(
         return 0.0;
     }
 
-    // Match Calagopus wings-rs: one fully occupied core is 100%, and work
-    // spread across multiple cores can exceed 100%. Keep its 0.001% precision.
     ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
 }
 
@@ -29,9 +27,6 @@ pub(super) fn docker_compatible_memory_usage(stats: &ContainerStatsResponse) -> 
     }
 
     let usage = memory.usage?;
-    // Match `docker stats`: on Linux the CLI reports the working set rather
-    // than raw cgroup usage by subtracting inactive file cache. Docker uses
-    // total_inactive_file for cgroup v1 and inactive_file for cgroup v2.
     let inactive_file = memory
         .stats
         .as_ref()

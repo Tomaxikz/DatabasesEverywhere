@@ -104,11 +104,7 @@ async fn reconcile_snapshot_runtime(state: &AppState, runtime_id: String) -> any
     }
     let replay_running = inspection.status == DockerContainerStatus::Running;
     if replay_running {
-        // A snapshot is taken only after the container-event
-        // stream disconnects. Events may have been lost while it
-        // was down, and a Docker restart keeps the same container
-        // ID. Fence every live pool before probing, then replay
-        // tenant quotas and credentials before routes reopen.
+        // Events may have been lost while the stream was down and a Docker restart keeps container IDs: fence every pool, then replay quotas and credentials before reopening routes.
         fence_runtime(state, &runtime_id).await;
         if let Err(error) = state
             .docker

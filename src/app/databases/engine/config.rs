@@ -20,8 +20,6 @@ pub(crate) trait EngineConfig: EngineInfo {
     fn pids_limit(&self, limits: &PidsLimitConfig) -> Option<i64>;
 }
 
-/// Every engine reads its listener, image and pids settings from the config
-/// section named after it.
 macro_rules! section_config {
     ($($engine:ty => $section:ident),+ $(,)?) => {$(
         impl EngineConfig for $engine {

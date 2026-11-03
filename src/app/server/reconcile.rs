@@ -66,10 +66,7 @@ pub async fn reconcile_all(
     manager: &InstanceManager,
     docker: &DockerRuntime,
 ) -> Result<ReconcileSummary, anyhow::Error> {
-    // Shared tenants do not own containers. Their one physical runtime is
-    // reconciled by the shared-runtime boot path using `runtime_id`; passing a
-    // tenant id to Docker here could inspect or stop an unrelated container
-    // with a colliding legacy name.
+    // Shared tenants own no containers; passing a tenant id to Docker could touch an unrelated container with a colliding legacy name.
     let instances = manager.store().list().await.into_iter().filter(|metadata| {
         metadata.deployment_mode == crate::server::placement::DeploymentMode::Dedicated
     });
@@ -261,9 +258,7 @@ async fn quarantine_unisolated_instance(
 pub fn classify_status(status: DockerContainerStatus) -> InstanceStatus {
     match status {
         DockerContainerStatus::Running => InstanceStatus::Running,
-        // `created` means the replacement exists but has never been started.
-        // Classifying it as stopped lets durable desired-running boot recovery
-        // issue the missing start instead of stranding it as Booting forever.
+        // `created` is classified stopped so desired-running boot recovery issues the missing start instead of stranding Booting.
         DockerContainerStatus::Created => InstanceStatus::Stopped,
         DockerContainerStatus::Starting => InstanceStatus::Booting,
         DockerContainerStatus::Stopped => InstanceStatus::Stopped,

@@ -230,10 +230,7 @@ pub(in super::super) async fn resize(
             }
         }
     };
-    // Keep node admission serialized until the physical limits and final
-    // metadata are settled. In particular, a failed shrink must restore its
-    // larger reservation before another admission can consume the capacity it
-    // tentatively released.
+    // Keep node admission serialized until the physical limits and final metadata are settled.
 
     let apply = async {
         shared_runtime::apply_limits(&state.docker, &state.config, &state.placements, &runtime)

@@ -1,8 +1,4 @@
-//! Canonical dedicated-runtime preparation, launch, and publication.
-//!
-//! Preparation deliberately stops before the container is created. Deployment
-//! migration can therefore persist the generated maintenance credential before
-//! launch and keep the provisional runtime out of the gateway route store.
+//! Preparation deliberately stops before the container is created.
 
 use super::launch::launch_container_from_spec;
 use super::mongodb::provision_tenant as provision_mongodb_tenant_user;

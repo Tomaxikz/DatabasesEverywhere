@@ -113,7 +113,6 @@ impl CreateForm {
         self.protocols[self.protocol_index]
     }
 
-    /// Fields shown for the current engine and placement.
     pub(super) fn visible(&self) -> Vec<Field> {
         self.values
             .iter()
@@ -205,7 +204,6 @@ impl CreateForm {
         }
     }
 
-    /// Applies one key. Returns true when the form should be submitted.
     pub(super) fn on_key(&mut self, key: KeyEvent) -> bool {
         self.error = None;
         let visible = self.visible().len();
@@ -267,7 +265,6 @@ impl CreateForm {
         }
     }
 
-    /// Builds the API request, or explains the first invalid field.
     pub(super) fn request(&self) -> Result<CreateRequest, String> {
         let text = |field| self.value(field).trim().to_string();
         let required = |field: Field| {
@@ -365,7 +362,6 @@ fn valid_identifier(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// `<prefix>_` plus 10 random hex digits: a valid database or user name.
 fn random_identifier(prefix: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     format!("{prefix}_{}", &suffix[..10])
@@ -376,7 +372,6 @@ fn suggested_instance_id(protocol: Protocol) -> String {
     format!("cli_{}_{}", protocol.as_str(), &suffix[..8])
 }
 
-/// A uniformly random password from an unambiguous alphabet.
 pub(super) fn generate_password() -> String {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 

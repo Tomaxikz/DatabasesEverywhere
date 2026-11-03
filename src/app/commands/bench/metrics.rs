@@ -248,7 +248,6 @@ impl HttpPhaseReport {
     }
 }
 
-/// Request counters of one benchmark phase.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PhaseCounts {
     pub attempted_requests: usize,

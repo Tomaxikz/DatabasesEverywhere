@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-/// Returns the kernel-reported cgroup membership for either the unified
-/// hierarchy (`None`) or one named v1 controller.
 pub(crate) fn membership_path(contents: &str, controller: Option<&str>) -> Option<String> {
     contents.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -18,8 +16,6 @@ pub(crate) fn membership_path(contents: &str, controller: Option<&str>) -> Optio
     })
 }
 
-/// Converts a cgroup membership into a relative path without permitting it to
-/// escape a controller mount.
 pub(crate) fn safe_relative_path(value: &str) -> Option<PathBuf> {
     let mut path = PathBuf::new();
     for component in value.split('/') {
@@ -34,7 +30,6 @@ pub(crate) fn safe_relative_path(value: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Decodes the escapes used by `/proc/*/mountinfo` path fields.
 pub(crate) fn unescape_mountinfo(value: &str) -> String {
     value
         .replace("\\040", " ")

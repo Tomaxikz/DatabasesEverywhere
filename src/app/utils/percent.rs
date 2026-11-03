@@ -2,7 +2,6 @@
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, percent_encode};
 
-/// Every byte except the RFC 3986 unreserved characters `A-Z a-z 0-9 - _ . ~`.
 const RESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
@@ -10,21 +9,17 @@ const RESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 const RESERVED_EXCEPT_SLASH: &AsciiSet = &RESERVED.remove(b'/');
 
-/// Encodes everything but unreserved characters, with uppercase hex digits.
 pub(crate) fn encode_unreserved(bytes: &[u8]) -> String {
     percent_encode(bytes, RESERVED).to_string()
 }
 
-/// Like [`encode_unreserved`], but keeps `/` path separators.
 pub(crate) fn encode_path(bytes: &[u8]) -> String {
     percent_encode(bytes, RESERVED_EXCEPT_SLASH).to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeError {
-    /// A `%` not followed by two hex digits.
     Encoding,
-    /// The decoded bytes are not UTF-8.
     Utf8,
 }
 

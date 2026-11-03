@@ -69,9 +69,7 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// Persists an intermediate mutation state without republishing its
-    /// gateway routes. Callers must use [`Self::upsert`] only after engine
-    /// access and credentials have been verified.
+    /// Persists an intermediate state without republishing routes; call `upsert` only after access is verified.
     pub(crate) async fn upsert_fenced(
         &self,
         mut metadata: InstanceMetadata,
@@ -82,10 +80,7 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// Persists pool-derived metadata while preserving the route's current
-    /// open/fenced state. This prevents a runtime status transition from
-    /// bypassing the tenant-specific quota and credential replay that owns
-    /// route publication.
+    /// Persists pool metadata keeping the route's open/fenced state.
     pub(crate) async fn upsert_preserving_fence(
         &self,
         mut metadata: InstanceMetadata,
@@ -96,8 +91,6 @@ impl InstanceManager {
         Ok(())
     }
 
-    /// Commits live-verified replacement credentials and clears any protected
-    /// secret recovery marker in the same durable transaction.
     pub(crate) async fn upsert_recovered_secrets(
         &self,
         mut metadata: InstanceMetadata,
@@ -124,10 +117,7 @@ impl InstanceManager {
             .await
     }
 
-    /// Read the durable metadata directly instead of consulting the in-memory
-    /// route store. Mutation recovery uses this after an SQLite commit returns
-    /// an error: the transaction may have committed even though its
-    /// acknowledgement was lost, while the store is updated only on `Ok`.
+    /// Reads durable metadata directly: after an SQLite commit error the transaction may have committed while the store updates only on `Ok`.
     pub async fn get_persisted(
         &self,
         instance_id: &str,

@@ -22,13 +22,8 @@ const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MYSQL_MAX_DATABASE_CHARS: usize = 64;
 const CLICKHOUSE_MAX_DATABASE_CHARS: usize = 128;
 
-/// Safely rebases MySQL/MariaDB schema-qualified object references in place.
-///
-/// The input is parsed as bytes so dump contents do not need to be UTF-8. Replacement is
-/// performed through a private file in the same directory and committed with one durable
-/// rename. The original path is never followed when it is a symlink. Both the observed input
-/// length and the rewritten output are capped by `max_staged_bytes`, including file growth that
-/// happens after the initial metadata check.
+/// Rebases MySQL/MariaDB schema-qualified references in place via a private file and one durable
+/// rename. Symlinks are not followed; input and output are capped by `max_staged_bytes`.
 pub(super) async fn rewrite_mysql_schema_qualifiers(
     path: &Path,
     source_database: &str,

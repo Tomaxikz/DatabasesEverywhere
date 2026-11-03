@@ -1,34 +1,4 @@
-//! Dedicated Redis and Valkey online snapshot backup.
-//!
-//! A naive copy of the live data and AOF directories after `BGREWRITEAOF`
-//! does not establish a recoverable append-only state: file identity checks
-//! miss same-inode truncation (Redis `ftruncate`s short AOF writes) and
-//! configuration changes, and padding a shrinking file fabricates content.
-//! This strategy therefore captures one completed, immutable RDB instead.
-//!
-//! The CLI from the instance's own immutable image runs in a short-lived
-//! helper container that reaches the server through the instance socket
-//! directory (mounted read-only) and asks for an rdb-only replication
-//! transfer (`--rdb`). With `repl-diskless-sync yes` the server forks once and
-//! streams the snapshot to the helper, which writes it straight into
-//! coordinator-reserved staging. Nothing is written into the data volume, and
-//! a failed transfer never touches `lastbgsave_status`, so it cannot trip
-//! `stop-writes-on-bgsave-error`. The fork is the same copy-on-write fork an
-//! AOF rewrite already performs; an inventory in its own helper refuses the
-//! capture when the resident set leaves no headroom for it inside the
-//! container memory limit, when diskless sync is off, or when RDB checksums
-//! are disabled.
-//!
-//! `verify` runs the image's own `check-rdb` against the staged file (mounted
-//! read-only), which validates every object and the trailing CRC64.
-//!
-//! The staged tree is shaped as the default multi-part AOF directory: the
-//! snapshot is its base (`appendonly.aof.1.base.rdb`) and a manifest names
-//! it. Restore installs that directory into the data volume, the restore path
-//! rewrites `users.acl` from the current tenant credential, and the server
-//! starts with its normal `--appendonly yes` command line, loading the base
-//! and opening a fresh incremental file. No restore-time server and no
-//! appendonly toggling are needed.
+//! Dedicated Redis and Valkey online backup: one RDB snapshot streamed by the image's own CLI to staging, never a naive copy of live data and AOF files.
 
 mod aof;
 mod inventory;
@@ -67,10 +37,8 @@ const RESTORE_RECIPE_VERSION: u32 = 1;
 const INVENTORY_TIMEOUT: Duration = Duration::from_secs(60);
 const INVENTORY_HELPER_SUFFIX: &str = "inventory";
 const VERIFY_HELPER_SUFFIX: &str = "verify";
-/// Written at the staging root and removed before the capture starts.
 const INVENTORY_REPORT: &str = "inventory.report";
 const MAX_INVENTORY_REPORT_BYTES: u64 = 1024 * 1024;
-/// `check-rdb` prints this once every object and the checksum validated.
 const CHECK_RDB_OK: &str = "RDB looks OK";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -142,7 +110,6 @@ impl OnlineBackupStrategy for RespRdbSnapshotStrategy {
     }
 }
 
-/// Native tools of one RESP engine, all shipped in its official image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tools {
     cli: &'static str,
@@ -166,7 +133,6 @@ fn tools(protocol: Protocol) -> Result<Tools, StrategyError> {
     }
 }
 
-/// Checks that need no server session; returns the tenant login.
 fn static_gate(ctx: &OnlineBackupContext<'_>) -> Result<(String, SecretString), StrategyError> {
     if ctx.metadata.deployment_mode == DeploymentMode::Shared {
         return Err(StrategyError::Unsupported(
@@ -210,8 +176,7 @@ fn socket_mount(ctx: &OnlineBackupContext<'_>) -> BackupHelperSocket {
     }
 }
 
-/// The inventory script. CLI output goes to a report in staging: helper
-/// stdout is redacted and truncated, the report must be neither.
+/// Helper stdout is redacted and truncated, so CLI output goes to a report in staging.
 fn inventory_script(tools: Tools, socket: &str, username: &str) -> String {
     let cli = format!(
         "{} -s {} --user {}",
@@ -315,7 +280,6 @@ async fn capture_snapshot(
     Ok(CaptureResult {
         restore_target: data_root.clone(),
         data_root,
-        // One forked copy of the whole keyspace at a single instant.
         consistency: ConsistencyLevel::TransactionalSnapshot,
         recovery: RecoveryCoordinates(recovery),
         engine_version: Some(inventory.server_version.clone()),
@@ -330,7 +294,6 @@ async fn capture_snapshot(
     })
 }
 
-/// Creates the AOF directory in staging, then hands over to the CLI.
 fn capture_script(argv: &[String]) -> String {
     exec_script(argv).replacen(
         "exec ",

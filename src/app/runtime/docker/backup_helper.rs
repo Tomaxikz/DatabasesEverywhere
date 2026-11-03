@@ -1,24 +1,5 @@
-//! Short-lived backup helper containers.
-//!
-//! A helper runs an engine-native tool from the instance's own immutable
-//! image, so its binaries match the server version. It mounts only the
-//! instance socket directory (read-only, for the Unix-socket connection),
-//! optionally the instance data directory (read-only, for tools that copy
-//! live data files next to a server session), and one
-//! coordinator-reserved, disk-backed staging directory. It has no
-//! network, CPU, memory and pid limits of its own, a read-only root
-//! filesystem, no capabilities and `no-new-privileges`. Native output never
-//! lands on the socket mount, which is commonly tmpfs charged to the
-//! database's memory cgroup.
-//!
-//! The caller journals the helper name before [`DockerRuntime::run_backup_helper`]
-//! creates it. A supervisor task owns the container: dropping the caller's
-//! future cancels it, and the supervisor force-removes the container and
-//! confirms it no longer exists before it exits. Staging is measured while
-//! the helper runs and the helper is removed once it exceeds its budget.
-//! [`DockerRuntime::remove_backup_helper`] waits for a live supervisor, then
-//! force-removes and confirms absence, so journal cleanup never races a
-//! container that is still being created.
+//! Short-lived helpers run an engine-native tool from the instance's own image with read-only mounts, no network, no capabilities and a staging directory.
+//! A supervisor task owns the container: dropping the caller's future cancels it, and the container is force-removed and confirmed gone.
 
 use std::{
     collections::HashMap,
@@ -61,7 +42,6 @@ use crate::{
     },
 };
 
-/// Where the job's staging directory appears inside a helper.
 pub const BACKUP_HELPER_STAGING: &str = "/dbev/staging";
 const HELPER_LABEL: &str = "databases-everywhere.backup-helper";
 const INSTANCE_LABEL: &str = "databases-everywhere.backup-instance";
@@ -83,33 +63,25 @@ const OUTPUT_TAIL_CHARS: usize = 16 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_ENVIRONMENT_ENTRIES: usize = 16;
 
-/// Supervisors of helpers started by this process, keyed by container name.
-/// A supervisor holds its lock until the container is confirmed gone.
 static SUPERVISORS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(Default::default);
 
 #[derive(Clone)]
 pub struct BackupHelperSpec {
-    /// The job tag `dbev_bk_<32 hex>`, optionally followed by `_<suffix>`.
     pub name: String,
     pub instance_id: String,
-    /// Immutable image id of the running instance.
     pub image: String,
     pub socket: Option<BackupHelperSocket>,
-    /// Instance data directory, mounted read-only.
     pub data: Option<BackupHelperSocket>,
     pub staging_dir: PathBuf,
     pub staging_read_only: bool,
-    /// Shell script. It is stored in the container configuration and must
-    /// never contain a secret; pass those through `environment`.
+    /// Stored in the container configuration, so it must never contain secrets.
     pub script: String,
     pub environment: Vec<DockerEnv>,
     pub timeout: Duration,
-    /// The helper is removed once staging holds more than this many bytes.
     pub max_staging_bytes: u64,
 }
 
-/// An instance directory (socket or data), mounted read-only.
 #[derive(Clone, Debug)]
 pub struct BackupHelperSocket {
     pub source: PathBuf,
@@ -143,16 +115,12 @@ pub enum BackupHelperError {
 }
 
 impl BackupHelperError {
-    /// False only when the helper container may still exist.
     pub fn removal_confirmed(&self) -> bool {
         !matches!(self, Self::RemovalUnconfirmed { .. })
     }
 }
 
 impl DockerRuntime {
-    /// Runs one helper to completion and removes it. Errors other than
-    /// [`BackupHelperError::RemovalUnconfirmed`] guarantee the container no
-    /// longer exists.
     pub async fn run_backup_helper(
         &self,
         spec: &BackupHelperSpec,
@@ -186,9 +154,6 @@ impl DockerRuntime {
         })?
     }
 
-    /// Force-removes a journaled helper and confirms it no longer exists.
-    /// Waits for this process's supervisor first. Refuses a container with
-    /// the same name that is not a backup helper of this node.
     pub async fn remove_backup_helper(&self, name: &str) -> Result<(), BackupHelperError> {
         if !is_helper_name(name) {
             return Err(BackupHelperError::Invalid(format!(
@@ -398,11 +363,7 @@ impl DockerRuntime {
         })
     }
 
-    /// Rootless Podman maps container uid 0 to the service account, which
-    /// owns the socket directory; staging is handed to that account. Other
-    /// engines run the helper as the owner of the instance socket directory
-    /// (the database's own uid), which needs no capability to reach the
-    /// private socket mount, and staging is handed to the same owner.
+    /// Rootless Podman maps container uid 0 to the service account that owns the socket directory; other engines run as the socket directory's owner, which needs no capability to reach the private socket mount.
     async fn helper_user(&self, spec: &BackupHelperSpec) -> Result<String, BackupHelperError> {
         if let Some((uid, gid)) = self.rootless_podman_host_owner() {
             if !spec.staging_read_only {
@@ -428,8 +389,7 @@ impl DockerRuntime {
         Ok(format!("{}:{}", owner.uid, owner.gid))
     }
 
-    /// Removes a helper by name and confirms it is gone. A container with the
-    /// name but without this node's helper labels is never touched.
+    /// A container with the name but without this node's helper labels is never touched.
     async fn remove_helper_container(&self, name: &str) -> Result<(), String> {
         let node_id = self
             .node_id
@@ -627,7 +587,6 @@ fn validate_spec(spec: &BackupHelperSpec) -> Result<(), BackupHelperError> {
     Ok(())
 }
 
-/// `dbev_bk_<32 lowercase hex>` with an optional `_<lowercase suffix>`.
 fn is_helper_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(NAME_PREFIX) else {
         return false;
@@ -693,9 +652,7 @@ async fn check_budget(spec: &BackupHelperSpec) -> Result<(), BackupHelperError> 
     Ok(())
 }
 
-/// Apparent size of regular files below `root`, stopping once it exceeds
-/// `stop_after`. Symbolic links are not followed; entries that disappear
-/// while the tool runs (temporary names) are skipped.
+/// Symbolic links are not followed; entries that disappear while the tool runs are skipped.
 fn staging_bytes(root: &Path, stop_after: u64) -> Result<u64, IoError> {
     let mut total = 0_u64;
     for (index, entry) in walkdir::WalkDir::new(root)

@@ -55,12 +55,7 @@ fn build_spec(
     runtime_path: PathBuf,
 ) -> DockerInstanceSpec {
     let shared = tenant.is_none();
-    // The official image accepts precomputed native-password hashes. Supplying
-    // the exact verifier avoids version-dependent plaintext initialization and
-    // guarantees that DBE's gateway verifier matches the database account.
-    // DBE-prefixed plaintext values remain in the isolated container
-    // configuration for daemon maintenance commands and are never returned by
-    // the API.
+    // Precomputed native-password hashes avoid version-dependent plaintext init and keep the gateway verifier matching the account.
     let root_password_hash = docker_native_password_hash(root_password.expose_secret());
     let mut env = Vec::new();
     if let Some(tenant) = tenant {

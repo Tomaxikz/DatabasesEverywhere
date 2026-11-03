@@ -167,19 +167,14 @@ fn write_hosted_config_sync(
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // The host parent remains private, while the file itself must be
-        // readable by the non-root ClickHouse user through its read-only bind
-        // mount. Keeping the file read-only also prevents the container from
-        // modifying daemon-owned configuration.
+        // The host parent stays private; the file must be readable by the non-root ClickHouse user and read-only so the container cannot modify daemon-owned config.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
     }
     Ok(path)
 }
 
 fn hosted_config_xml(shared: bool) -> String {
-    // Shared engines must leave cgroup headroom for the bridge, clients and
-    // allocations outside query tracking. This mitigates, not guarantees
-    // against, OOM; the container's configured memory limit stays unchanged.
+    // Shared engines need cgroup headroom for the bridge and untracked allocations; this mitigates OOM, it does not prevent it.
     let shared_memory = if shared {
         r#"    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
     <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
@@ -254,7 +249,6 @@ fn hosted_config_xml(shared: bool) -> String {
     )
 }
 
-/// Used only after the managed container has adopted console-only logging.
 /// Keep unknown files and links; never walk or delete database directories.
 pub(crate) async fn remove_legacy_logs(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
     let path = path.to_path_buf();

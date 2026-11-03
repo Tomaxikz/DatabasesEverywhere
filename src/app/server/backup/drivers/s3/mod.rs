@@ -1,10 +1,4 @@
-//! S3 backup storage on top of `object_store`'s `AmazonS3`.
-//!
-//! Object reads, writes, listing, deletes, multipart uploads, SigV4 and
-//! retries come from `object_store`. This module keeps the backup layout,
-//! the security checks on what S3 returns, and the discovery of in-progress
-//! multipart uploads (ListMultipartUploads/ListParts), which `object_store`
-//! does not expose.
+//! S3 backup storage on `object_store`'s `AmazonS3`, adding backup layout, response security checks and multipart discovery.
 
 use std::{fmt, sync::Arc};
 
@@ -20,10 +14,8 @@ use crate::{
     },
 };
 
-/// Bound on every S3 API response body other than an object download.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
-/// Files at or above this size are uploaded in parts; smaller ones are
-/// buffered and sent in one PUT.
+/// Files at or above this size use multipart upload.
 const MULTIPART_THRESHOLD_BYTES: u64 = DEFAULT_MULTIPART_PART_BYTES;
 const DEFAULT_MULTIPART_PART_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MULTIPART_PARTS: u64 = 10_000;
@@ -50,7 +42,6 @@ use self::client::{S3Credentials, UploadAdmin};
 #[derive(Clone)]
 pub struct S3BackupDriver {
     config: BackupS3Config,
-    /// Endpoint as configured, kept for [`S3BackupDriver::identity`].
     base: Url,
     credentials: S3Credentials,
     store: Arc<dyn ObjectStore>,
@@ -155,8 +146,7 @@ impl S3BackupDriver {
 
 #[cfg(test)]
 impl S3BackupDriver {
-    /// A driver over `object_store`'s in-memory store, which has neither
-    /// network nor the multipart listing API.
+    /// Driver over `object_store`'s in-memory store (no network, no multipart listing).
     fn in_memory(config: BackupS3Config) -> (Self, Arc<object_store::memory::InMemory>) {
         let store = Arc::new(object_store::memory::InMemory::new());
         let driver = Self {

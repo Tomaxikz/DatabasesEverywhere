@@ -13,8 +13,6 @@ use crate::utils::ids::validate_instance_id;
 use crate::utils::limits::mib_to_bytes;
 
 pub(super) fn intentionally_stopped_backup(metadata: &InstanceMetadata) -> Option<BackupIssue> {
-    // Classify only the reconciled, locked state. A failed/quarantined instance,
-    // a runtime conflict, or an unexpected stop is a failure, not an exclusion.
     (metadata.status == InstanceStatus::Stopped
         && metadata.desired_state == DesiredInstanceState::Stopped)
         .then(|| BackupIssue {
@@ -126,9 +124,6 @@ pub(super) fn check_backup_layout(
     )))
 }
 
-/// Bytes a physical restore extracts into an instance with this disk limit.
-/// Online captures are budgeted to the same figure so every published
-/// capture fits the existing restore path.
 pub(super) fn physical_restore_capacity(disk_mib: u64) -> u64 {
     mib_to_bytes(disk_mib).clamp(
         1,

@@ -288,8 +288,6 @@ pub(super) async fn commit_staged_replacement(
     .await
     .map_err(|error| fail_image_update_api(state, &metadata.instance_id, error))?;
     // Only detach transient runtime state before moving the validated volume.
-    // `purge_instance_data` is deliberately destructive for Btrfs subvolumes
-    // and ZFS datasets and would erase the imported replacement here.
     DiskLimiter::with_fuse_root(state.config.disk.clone(), state.config.paths.fuse_root())
         .for_persisted_protocol(metadata.protocol, &metadata.limits.disk_enforcement_method)
         .teardown_instance_mount(&staged.paths.data)

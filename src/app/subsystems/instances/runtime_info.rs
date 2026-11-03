@@ -514,10 +514,7 @@ pub(super) fn classify_live_status(
     metadata: &InstanceMetadata,
     inspection: Option<&Result<DockerInstanceInspection, DockerError>>,
 ) -> InstanceStatus {
-    // Durable non-running states are also gateway-publication barriers. A
-    // container process may already exist while creation, startup hardening,
-    // recovery, or an explicit stop is still in progress; reporting `running`
-    // before that state is committed tells clients the route is ready when it
+    // reporting `running` before that state is committed tells clients the route is ready when it
     // deliberately is not.
     if metadata.status != InstanceStatus::Running {
         return metadata.status;

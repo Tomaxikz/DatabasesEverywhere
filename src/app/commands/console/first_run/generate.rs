@@ -15,7 +15,6 @@ use crate::databases::protocol::Protocol;
 
 const EXAMPLE_CONFIG: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config/example.yml"));
-/// The MongoDB 7 tag the example documents for kernels 6.19 and newer.
 pub(super) const MONGODB_KERNEL_FALLBACK: &str = "mongo:7.0.37";
 const SECRET_BYTES: usize = 32;
 const HEADER: &str = "\
@@ -26,9 +25,7 @@ const HEADER: &str = "\
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BindScope {
-    /// Only clients on this machine reach the gateways.
     Local,
-    /// Every interface; clients on the network reach the gateways.
     Network,
 }
 
@@ -50,7 +47,6 @@ pub(super) enum ContainerRuntime {
 impl ContainerRuntime {
     pub(super) const ALL: [Self; 2] = [Self::Docker, Self::Podman];
 
-    /// The `daemon.engine` value.
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Docker => "docker",
@@ -74,7 +70,6 @@ impl ContainerRuntime {
         }
     }
 
-    /// Runtimes whose CLI is on `PATH`, in [`Self::ALL`] order.
     pub(super) fn installed() -> Vec<Self> {
         let path = std::env::var_os("PATH").unwrap_or_default();
         Self::ALL
@@ -122,7 +117,6 @@ impl DiskMode {
     }
 }
 
-/// What the operator chose in the wizard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Choices {
     pub engines: Vec<Protocol>,
@@ -133,7 +127,6 @@ pub(super) struct Choices {
     pub api_enabled: bool,
 }
 
-/// Node identity and secrets; a panel generates these in managed mode.
 pub(super) struct NodeIdentity {
     pub uuid: String,
     pub token_id: String,
@@ -173,7 +166,6 @@ fn random_bytes(count: usize) -> Vec<u8> {
     bytes
 }
 
-/// The complete config document, ready to write.
 pub(super) fn render(
     choices: &Choices,
     identity: &NodeIdentity,
@@ -248,7 +240,6 @@ fn section<'a>(root: &'a mut Mapping, name: &str) -> anyhow::Result<&'a mut Mapp
         .ok_or_else(|| anyhow!("the example config has no {name} section"))
 }
 
-/// Keeps the example's port and replaces its address with the chosen scope.
 fn rebind(listener: &mut Mapping, key: &str, scope: BindScope) -> anyhow::Result<()> {
     let port = listener
         .get(key)
@@ -284,7 +275,6 @@ pub(super) fn mongodb_image<'a>(example: &'a str, kernel: Option<&str>) -> &'a s
     }
 }
 
-/// The MongoDB image the generated config will use on this kernel.
 pub(super) fn chosen_mongodb_image(kernel: Option<&str>) -> String {
     yaml_serde::from_str::<Value>(EXAMPLE_CONFIG)
         .ok()

@@ -73,8 +73,7 @@ impl TenantBackend for Mongodb {
                     mongo_script(docker, runtime, &script, &[]).await?;
                 }
                 TenantOperation::SetQuota { limits } => {
-                    // MongoDB quotas remain gateway/catalog policy, not an
-                    // engine-enforced limit. Keep that capability explicit.
+                    // Quotas are gateway/catalog policy, not engine-enforced.
                     let policy = databases::mongodb::provision::tenant_quota_policy(
                         databases::mongodb::provision::TenantQuota {
                             max_connections: policy::max_connections(limits),

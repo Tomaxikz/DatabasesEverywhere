@@ -11,11 +11,8 @@ use crate::{
 };
 
 impl DeploymentMigrationRepository {
-    /// Atomically moves a provisional shared-pool reservation onto the public
-    /// instance identity, swaps its normalized placement/backend metadata, and
-    /// records the cutover commit. The source dedicated runtime row is retained
-    /// until live target verification succeeds, so cleanup can move forward
-    /// after a restart without ever routing back to stale data.
+    /// Atomically moves a provisional shared-pool reservation onto the public instance identity and records the cutover.
+    /// The source dedicated runtime row stays until target verification so cleanup can only move forward.
     pub async fn commit_dedicated_to_shared(
         &self,
         migration_id: &str,
@@ -140,9 +137,8 @@ impl DeploymentMigrationRepository {
         self.get_existing(migration_id).await
     }
 
-    /// Atomically makes a prepared dedicated runtime authoritative and removes
-    /// the source shared reservation. The source tenant itself is retained in
-    /// its shared engine until live target verification and forward cleanup.
+    /// Atomically makes the prepared dedicated runtime authoritative and removes the source shared reservation;
+    /// the source tenant stays in its engine until verification and forward cleanup.
     pub async fn commit_shared_to_dedicated(
         &self,
         migration_id: &str,
@@ -236,10 +232,7 @@ impl DeploymentMigrationRepository {
             return Err(DeploymentMigrationError::SourcePlacementChanged);
         }
 
-        // Keep the source capacity reserved until its physical tenant has
-        // actually been dropped. The migration-owned id is excluded from
-        // orphan cleanup and keeps node admission honest during forward
-        // cleanup or manual recovery.
+        // Keep the source capacity reserved until its tenant is dropped; the migration-owned id is excluded from orphan cleanup.
         let retained = sqlx::query(
             r#"
             UPDATE engine_runtime_reservations

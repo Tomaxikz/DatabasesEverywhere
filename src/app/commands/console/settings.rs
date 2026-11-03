@@ -13,7 +13,6 @@ const FILE_NAME: &str = "console.yml";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ConsoleSettings {
-    /// Host put into connection strings of instances created here.
     pub public_host: String,
 }
 

@@ -61,8 +61,7 @@ impl S3BackupDriver {
                 )
                 .await
             {
-                // Include the catalog key because its PUT may have committed
-                // remotely before a transport error reached this process.
+                // Include the catalog key: its PUT may have committed before a transport error.
                 self.cleanup_incomplete(&archive_key, Some(&catalog_key), None)
                     .await;
                 return Err(error);
@@ -132,10 +131,7 @@ impl S3BackupDriver {
         Ok(inventory)
     }
 
-    /// Hides the metadata first, aborts every multipart upload of the archive
-    /// and catalog keys (journaled or listed) so none can complete into an
-    /// object later, then removes the catalog and archive. Every object may
-    /// already be absent.
+    /// Hides metadata first, aborts multipart uploads of archive and catalog, then removes both; any may be absent.
     pub async fn purge_unpublished(
         &self,
         instance_id: &str,
@@ -220,8 +216,7 @@ impl S3BackupDriver {
             .iter()
             .filter(|key| key.ends_with(METADATA_KEY_SUFFIX))
             .count();
-        // Hide published entries first, then remove archives, catalogs, and
-        // any crash-orphaned objects that never received metadata.
+        // Hide published entries first, then remove archives, catalogs and orphans.
         keys.sort_by_key(|key| !key.ends_with(METADATA_KEY_SUFFIX));
         for key in keys {
             self.delete_object(&key, true).await?;

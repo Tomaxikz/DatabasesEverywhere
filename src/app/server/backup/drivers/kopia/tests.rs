@@ -2,9 +2,7 @@ use super::*;
 
 const SOURCE: &str = "/var/lib/dbev/backups/.staging/inst_one/.0d9c.bundle";
 
-/// `kopia snapshot list --json` output (v0.22): user tags are stored
-/// under `tag:<key>`, and an untagged checkpoint of the same source is
-/// listed alongside the final snapshot.
+/// `snapshot list --json` (v0.22): user tags stored as `tag:<key>`, plus an untagged checkpoint.
 fn authentic_snapshot_list() -> String {
     format!(
         r#"[
@@ -155,8 +153,6 @@ fn restore_uses_the_snapshot_restore_command() {
     assert_eq!(arguments[2], "k123/archive");
 }
 
-/// A snapshot as `snapshot list --json` returns it after `snapshot create
-/// --tags <tag>...`: each `key:value` argument stored as `tag:key`.
 fn snapshot_with_tags(tags: Vec<String>) -> KopiaManifest {
     normalize_tags(KopiaManifest {
         id: "m456".to_string(),

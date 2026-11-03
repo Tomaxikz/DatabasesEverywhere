@@ -1,10 +1,4 @@
-//! Packages a completed online backup capture into a data directory archive.
-//!
-//! The source is daemon-owned staging written by a native backup tool that
-//! has already exited, never a live database directory. Every file must read
-//! back at exactly the size recorded in its tar header; a file that shrinks or
-//! grows while being packaged fails the archive instead of being padded or
-//! truncated, so the result never contains fabricated bytes.
+//! Packages a completed online capture into a data directory archive; every file must match its tar header size, so no bytes are fabricated.
 
 use std::{
     fs::File,
@@ -36,8 +30,6 @@ pub struct StagedDataArchive {
 }
 
 impl StagedDataArchive {
-    /// Starts an archive whose root entry is `root_name` (the restore target's
-    /// data directory name), using `root_reference` for its metadata.
     pub fn create(
         root_name: &str,
         root_reference: &Path,
@@ -79,8 +71,6 @@ impl StagedDataArchive {
         Ok(archive)
     }
 
-    /// Adds `archive_relative` and each missing parent as directory entries
-    /// carrying `reference` metadata.
     pub fn append_directory_chain(
         &mut self,
         archive_relative: &Path,
@@ -101,8 +91,7 @@ impl StagedDataArchive {
         Ok(())
     }
 
-    /// Recursively appends `source_dir` below `archive_relative`. Symlinks and
-    /// special files are refused; nothing in staging may disappear meanwhile.
+    /// Recursively appends `source_dir`; symlinks and special files are refused and nothing may vanish.
     pub fn append_tree(
         &mut self,
         source_dir: &Path,
@@ -215,7 +204,6 @@ impl Drop for StagedDataArchive {
     }
 }
 
-/// Reads exactly the header size; early EOF or trailing bytes are errors.
 struct ExactReader<R> {
     inner: R,
     remaining: u64,

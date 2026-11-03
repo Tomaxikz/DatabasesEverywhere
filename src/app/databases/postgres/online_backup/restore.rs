@@ -1,19 +1,9 @@
-//! Prepare a directory-format base backup so PostgreSQL replays its own WAL.
-
 use std::{fs, path::Path};
 
 use crate::io::files::{require_directory, require_regular_file};
 
-// INTEGRATION: `subsystems/backups/restore.rs` already calls
-// `OnlineBackupStrategy::prepare_restore` through `import_export/physical.rs`
-// `StagedDataPreparation` (`restore_prepared_archive`) after the archive is
-// extracted and before startup validation and rollback. That call must pass
-// the extracted PGDATA (`extracted_root.join(restore_target)`, for example
-// `<data-volume>/18/docker`) and only for recipe
-// `postgres.basebackup.directory` version 1. Do not send a crash-consistent
-// stopped tarball through this function. `backup_label` stays in place so
-// PostgreSQL replays the WAL stored in the backup; `recovery.signal` is not
-// required. Ownership is fixed later by `restore_instance_data_owner`.
+// INTEGRATION: the restore caller must pass the extracted PGDATA, only for recipe `postgres.basebackup.directory` v1, never a crash-consistent tarball.
+// `backup_label` stays so PostgreSQL replays the WAL stored in the backup.
 
 const SUPPORTED_MAJORS: std::ops::RangeInclusive<u32> = 14..=18;
 

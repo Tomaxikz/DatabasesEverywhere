@@ -1,22 +1,4 @@
-//! Durable online backup coordinator.
-//!
-//! Each capture is journaled in `backup_jobs` before anything is created and
-//! advances `admitted -> capturing -> captured -> validated -> published`.
-//! Owned server-side and helper resources are journaled by the strategy before
-//! creation; on failure, timeout or daemon restart only those resources, in
-//! the matching runtime generation, are cleaned up. The serving database is
-//! never stopped, frozen or restarted by this path.
-//!
-//! The caller holds the instance management lock from admission through
-//! [`capture_online`] (capture, native verification, packaging and structural
-//! validation) and releases it before publication; [`finish_publication`]
-//! then records the outcome.
-//!
-//! Admission applies the persisted backend's physical restore-layout gate,
-//! and the native budget equals what restore extracts, so every published
-//! capture is restorable by the existing path. Native tools run in helper
-//! containers; staging and its reservation are released only after every
-//! helper is confirmed gone.
+//! The serving database is never stopped, frozen or restarted by this path.
 
 use std::{
     path::{Path, PathBuf},
@@ -59,25 +41,18 @@ use crate::{
 };
 
 const ARCHIVE_STRUCTURE_CHECK: &str = "archive_structure";
-/// Strategies enforce the deadline themselves; past it the coordinator waits
-/// this long for their helpers to be removed before abandoning the work.
 const DEADLINE_GRACE: Duration = Duration::from_secs(3 * 60);
 const HELPER_RETRY_DELAY: Duration = Duration::from_secs(60);
 
-/// A capture that passed native verification and structural validation and
-/// is packaged at `bundle.archive`, ready for manifest construction.
 pub(super) struct ValidatedCapture {
     pub job_id: String,
     pub details: ManifestDetails,
 }
 
-/// Bytes needed in staging: native output plus the packaged archive.
 pub(super) fn staging_budget(native_bytes: u64, archive_bytes: u64) -> u64 {
     native_bytes.saturating_add(archive_bytes)
 }
 
-/// Limits of one online capture. `native_budget_bytes` is what restore
-/// extracts into the instance; nothing larger is published.
 pub(super) struct CaptureBudget {
     pub native_budget_bytes: u64,
     pub max_archive_bytes: u64,
@@ -90,12 +65,10 @@ pub(super) async fn capture_online(
     bundle: &BackupBundle,
     backup_id: &str,
     budget: CaptureBudget,
-    // Staging reservation. Kept past a failure while a helper may still exist.
     reservation: &mut Option<DiskCapacityReservation>,
 ) -> Result<ValidatedCapture, ApiError> {
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(ApiError::bad_request)?;
-    // Phase 1 is limited to layouts the existing physical restore accepts.
     crate::subsystems::import_export::check_restore_layout(state, metadata, &paths).map_err(
         |error| {
             ApiError::from(StrategyError::Unsupported(format!(
@@ -127,9 +100,8 @@ pub(super) async fn capture_online(
         job: &identity,
         deadline,
     };
-    // Preflight is side-effect free: what can be rejected without a server
-    // session fails before any journal entry, staging or server resource
-    // exists. Inventory that needs sessions runs during capture, in helpers.
+    // Preflight is side-effect free: what can be rejected without a server session fails before
+    // any journal entry, staging or server resource exists.
     strategy.preflight(&ctx).await.map_err(ApiError::from)?;
     let recipe = strategy.restore_recipe();
     if !strategy
@@ -208,9 +180,6 @@ pub(super) async fn capture_online(
     }
 }
 
-/// Records the publication outcome after the management lock was released.
-/// A failure whose uploaded objects could not be removed stays
-/// `cleanup_pending` until recovery removes them.
 pub(super) async fn finish_publication(
     state: &AppState,
     job_id: &str,
@@ -281,8 +250,6 @@ impl Job<'_> {
         .await?;
         let finished_at_unix = now_unix();
         self.advance(BackupJobState::Captured).await?;
-        // A strategy may leave cleanup to the coordinator; nothing it owns
-        // may outlive the capture.
         self.release_leftovers().await?;
 
         let checks = bounded(
@@ -366,10 +333,6 @@ impl Job<'_> {
         }
     }
 
-    /// Cleans up after a failed attempt and records the terminal state. The
-    /// primary error is preserved; cleanup failures are appended. Staging is
-    /// removed only once no owned resource remains; while a helper may still
-    /// exist, its staging reservation stays held.
     async fn fail(
         &self,
         error: ApiError,
@@ -404,7 +367,6 @@ impl Job<'_> {
                     hold_until_helpers_removed(self.state.clone(), helpers, held);
                 }
             }
-            // The journal itself failed; keep staging for recovery.
             Err(_) => {}
         }
         let (to, error) = match remaining {
@@ -492,10 +454,7 @@ impl OwnedResourceRegistrar for JournalRegistrar<'_> {
     }
 }
 
-/// Strategies stop their own helpers at the deadline and return once removal
-/// is confirmed. Only work that overruns the grace period is dropped; its
-/// helper supervisors keep running and owned cleanup waits for them before
-/// anything is released.
+/// Only work that overruns the grace period is dropped.
 async fn bounded<T>(
     ctx: &OnlineBackupContext<'_>,
     phase: &str,
@@ -510,9 +469,6 @@ async fn bounded<T>(
     }
 }
 
-/// Retries removal of helpers whose removal could not be confirmed and only
-/// then releases their staging reservation. Journal recovery removes the
-/// staging itself after the same confirmation.
 fn hold_until_helpers_removed(
     state: AppState,
     helpers: Vec<String>,
@@ -563,8 +519,8 @@ pub(super) async fn runtime_generation(
     Ok(format!("{}@{}", identity.id, identity.started_at))
 }
 
-/// Capture staging is a sibling of the bundle directory so storage drivers
-/// that snapshot the bundle (Kopia) never see raw native output.
+/// Capture staging is a sibling of the bundle directory so storage drivers that snapshot the bundle
+/// (Kopia) never see raw native output.
 fn capture_root_for(bundle: &BackupBundle, job_id: uuid::Uuid) -> Result<PathBuf, ApiError> {
     let parent = bundle
         .directory
@@ -573,8 +529,8 @@ fn capture_root_for(bundle: &BackupBundle, job_id: uuid::Uuid) -> Result<PathBuf
     Ok(parent.join(format!(".{}.capture", job_id.simple())))
 }
 
-/// Staging must not live inside the source data directory, where it would
-/// consume the database's own disk quota.
+/// Staging must not live inside the source data directory, where it would consume the database's
+/// own disk quota.
 async fn ensure_outside_source(data: &Path, capture_root: &Path) -> Result<(), ApiError> {
     let staging_parent = capture_root
         .parent()
@@ -663,10 +619,6 @@ async fn package_capture(
     .await
 }
 
-/// Re-reads the packaged archive: every entry must sit below the data
-/// directory root, the restore target must be present, and the archive must
-/// fit what restore extracts, using restore's own accounting (entry size plus
-/// a per-entry allowance, and its entry limit). Returns that expansion.
 async fn validate_archive_structure(
     paths: &InstancePaths,
     restore_target: &str,
@@ -721,7 +673,6 @@ async fn validate_archive_structure(
     ))
 }
 
-/// Rejects a capture the existing restore path would refuse to extract.
 fn check_restorable(entries: usize, expanded: u64, restore_capacity: u64) -> Result<(), ApiError> {
     if entries > MAX_DATA_ARCHIVE_ENTRIES {
         return Err(ApiError::Runtime(format!(
@@ -882,7 +833,6 @@ mod tests {
             .await
             .unwrap();
         assert!(check.passed);
-        // Every entry carries restore's per-entry allowance on top of its size.
         assert!(expanded >= 4096 + 3 + 4 * DATA_ARCHIVE_ENTRY_DISK_OVERHEAD_BYTES);
         assert!(
             validate_archive_structure(&paths, "18/docker", &archive, expanded - 1)

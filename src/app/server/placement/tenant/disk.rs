@@ -26,9 +26,7 @@ const SOFT_RECOVERY_PERCENT: u64 = 90;
 const SOFT_TENANT_ROOT: &str = "dbev-soft-tenants";
 const POSTGRES_STORAGE_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Reconciles durable tenant metadata with the boundary the host actually
-/// restored. A hard boundary is a one-way safety promise: losing it must keep
-/// the tenant fenced instead of silently relabelling the tenant as soft.
+/// Reconciles tenant metadata with the restored boundary; losing a hard boundary keeps the tenant fenced rather than relabelling it soft.
 pub(crate) fn update_state(
     limits: &mut InstanceLimits,
     disk_limit_blocked: &mut bool,
@@ -45,8 +43,6 @@ pub(crate) fn update_state(
     Ok(changed)
 }
 
-/// Validates a proposed boundary without mutating metadata. Resize and
-/// migration paths use this before committing a new limit record.
 pub(crate) fn check_transition(
     was_hard: bool,
     enforcement: &DiskEnforcement,
@@ -57,9 +53,7 @@ pub(crate) fn check_transition(
     Ok(())
 }
 
-/// Returns the durable blocked state for a catalog-enforced tenant. Once a
-/// tenant is blocked it must fall below the recovery watermark before being
-/// reopened, preventing fence/unfence churn around the exact limit.
+/// Durable blocked state for a catalog-enforced tenant; once blocked it must fall below the recovery watermark to reopen.
 pub(crate) fn soft_limit_blocked(used_bytes: u64, disk_mib: u64, already_blocked: bool) -> bool {
     let (limit_bytes, recovery_bytes) = soft_limit_bytes(disk_mib);
     if already_blocked {
@@ -75,10 +69,7 @@ pub(crate) fn soft_limit_bytes(disk_mib: u64) -> (u64, u64) {
     (limit_bytes, recovery_bytes)
 }
 
-/// Creates protocol storage that must exist before the engine creates the
-/// tenant database. PostgreSQL uses a daemon-owned tablespace so all relation
-/// files have one durable filesystem boundary. Other engines create their
-/// schema directory themselves and are finalized by [`set_limit`].
+/// Creates storage needed before the engine creates the tenant database (PostgreSQL uses a daemon-owned tablespace).
 pub(crate) async fn prepare(
     config: &Config,
     docker: &DockerRuntime,
@@ -109,11 +100,7 @@ pub(crate) async fn prepare(
         )
         .await?;
 
-    // Create through the source that is actually mounted into the pool. This
-    // matters for FuseQuota: writing its raw backing directory bypasses the
-    // helper's namespace/cache and the new path may not exist in the
-    // container. The raw path must still resolve to the same real directory,
-    // because native child quotas are deliberately attached there.
+    // Create through the source mounted into the pool: with FuseQuota the raw backing directory bypasses the helper's namespace; it must still resolve to the same real directory.
     require_dir_chain(&live.root, &live.path).await?;
     if live.path != boundary.path {
         require_dir_chain(&boundary.root, &boundary.path).await?;
@@ -140,8 +127,7 @@ pub(crate) async fn prepare(
     Ok(())
 }
 
-/// Applies or restores the tenant's disk boundary. Unsupported physical
-/// layouts keep the catalog guard and never claim hard enforcement.
+/// Applies or restores the tenant's disk boundary; unsupported layouts keep the catalog guard.
 pub(crate) async fn set_limit(
     config: &Config,
     docker: &DockerRuntime,
@@ -187,10 +173,7 @@ pub(crate) async fn set_limit(
     set_boundary_limit(config, &boundary, disk_mib).await
 }
 
-/// Reads the authoritative kernel project-quota counter for a hard-enforced
-/// tenant. This never traverses tenant files, includes charged-but-unlinked
-/// inodes, and is suitable for shrink admission and periodic telemetry.
-/// Soft/catalog-only layouts are rejected.
+/// Kernel project-quota counter for a hard-enforced tenant, without traversing files; soft/catalog-only layouts are rejected.
 pub(crate) async fn quota_usage_bytes(
     config: &Config,
     runtime: &EngineRuntime,
@@ -210,9 +193,8 @@ pub(crate) async fn quota_usage_bytes(
         .map_err(TenantDiskError::from)
 }
 
-/// Removes the marker that prevents a MySQL-family tenant from dropping and
-/// recreating its schema directory outside the assigned project. Call only
-/// after the gateway and engine account have been fenced and sessions drained.
+/// Removes the marker preventing a MySQL-family tenant from recreating its schema directory outside the project;
+/// call only after the gateway and account are fenced and sessions drained.
 pub(crate) async fn prepare_drop(
     config: &Config,
     runtime: &EngineRuntime,
@@ -231,9 +213,7 @@ pub(crate) async fn prepare_drop(
     Ok(())
 }
 
-/// Tears down the host quota after the engine database has been removed. The
-/// project-ID claim is intentionally retained as a tombstone, preventing an
-/// uncertain old quota from ever being reassigned to another tenant.
+/// Tears down the host quota after the engine database is removed; the project-ID claim stays as a tombstone.
 pub(crate) async fn remove(
     config: &Config,
     runtime: &EngineRuntime,
@@ -244,12 +224,7 @@ pub(crate) async fn remove(
     }
     let boundary = boundary(config, runtime, target)?;
     let live = live_boundary(config, runtime, &boundary)?;
-    // The engine drop must have removed the boundary, or left only an empty
-    // directory behind, before quota state is changed. Recreating a missing
-    // MySQL-family directory here would inherit the shared pool project and
-    // make strict project cleanup reject an otherwise successful drop.
-    // Accepting a non-empty directory would be worse: clearing its labels and
-    // releasing the project would leave tenant data outside its hard cap.
+    // The engine drop must have removed the boundary or left an empty directory: recreating it would inherit the pool project, and a non-empty one would leave data outside its cap.
     remove_empty_boundary(&live.path).await?;
     if live.path != boundary.path {
         require_absent(&boundary.path).await?;
@@ -413,9 +388,7 @@ fn postgres_storage_script(container_path: &str) -> String {
     )
 }
 
-/// MySQL maps punctuation to @hhhh in schema-directory names. DBE's public
-/// identifier policy permits only ASCII letters, digits, underscore, and dash,
-/// so dash is the only byte requiring filename encoding here.
+/// MySQL encodes punctuation as @hhhh in schema-directory names; dash is the only permitted identifier byte needing it.
 fn mysql_filename(database: &str) -> Result<String, TenantDiskError> {
     if database.is_empty()
         || !database

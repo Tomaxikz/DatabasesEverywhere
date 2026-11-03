@@ -24,14 +24,12 @@ const CACHE_DIRECTORY_LIMIT_MESSAGE: &str = "usage-tree directory cache limit ex
 const STAGING_DIRECTORY_BOUND_MESSAGE: &str =
     "the cumulative incremental cache directory bound was exceeded while staging dirty subtrees";
 
-/// Open `path` without following its final component and return its identity.
 pub(crate) fn root_identity(path: &Path) -> Result<RootIdentity, Error> {
     let (directory, identity, _) = open_root(path)?;
     drop(directory);
     Ok(identity)
 }
 
-/// A full baseline with directory-level aggregates bound to a target fingerprint.
 #[derive(Debug)]
 pub(crate) struct UsageTreeCache {
     root_identity: RootIdentity,
@@ -40,7 +38,6 @@ pub(crate) struct UsageTreeCache {
     nodes: HashMap<PathBuf, CachedDirectory>,
 }
 
-/// A bounded tree result; capped trees must fall back to streaming scans.
 #[derive(Debug)]
 pub(crate) enum BoundedFullScan {
     Cached(UsageTreeCache),
@@ -49,7 +46,6 @@ pub(crate) enum BoundedFullScan {
 
 #[derive(Debug)]
 struct CachedDirectory {
-    /// This directory plus its immediate non-directory entries.
     base: DirectoryUsage,
     total: DirectoryUsage,
     children: BTreeSet<OsString>,
@@ -57,7 +53,6 @@ struct CachedDirectory {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReconcileError {
-    /// The hint is ambiguous and requires a full scan.
     #[error("full disk reconciliation required: {0}")]
     FullScanRequired(String),
     #[error("partial disk reconciliation failed: {0}")]
@@ -82,7 +77,6 @@ impl From<Error> for ReconcileError {
 }
 
 impl UsageTreeCache {
-    /// Build an authoritative baseline.
     #[cfg(test)]
     pub(crate) fn scan_full(
         root: &Path,
@@ -97,7 +91,6 @@ impl UsageTreeCache {
         }
     }
 
-    /// Build a cache bounded by `max_cached_directories`.
     pub(crate) fn scan_full_bounded(
         root: &Path,
         target_generation: String,
@@ -153,7 +146,6 @@ impl UsageTreeCache {
         self.root_identity
     }
 
-    /// Reconcile clean, relative dirty subtrees as one transaction.
     pub(crate) fn reconcile(
         &mut self,
         root: &Path,

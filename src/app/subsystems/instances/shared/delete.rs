@@ -112,9 +112,6 @@ pub(super) async fn finish_delete(
     })
 }
 
-/// Finishes tenant deletion records that were made durable before a daemon
-/// restart. The same idempotent finisher is used by the API and recovery, so
-/// neither path can leave a second cleanup implementation behind.
 pub(crate) async fn recover_deleting(state: &AppState) -> usize {
     let snapshots = state
         .instances

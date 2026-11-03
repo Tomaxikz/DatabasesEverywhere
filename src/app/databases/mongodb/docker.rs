@@ -97,10 +97,7 @@ fn build_spec(
         "diagnosticDataCollectionEnabled=false".to_string(),
     ];
     if shared {
-        // Tenant workloads do not need server-side JavaScript. Disabling it on
-        // shared engines removes an avoidable cross-tenant resource-abuse and
-        // code-execution surface while mongosh maintenance scripts continue to
-        // run client-side.
+        // Disabling server-side JavaScript removes a cross-tenant abuse surface; mongosh scripts run client-side.
         command.push("--noscripting".to_string());
     }
 

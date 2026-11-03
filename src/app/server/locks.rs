@@ -27,7 +27,6 @@ impl InstanceLocks {
         lock.lock_owned().await
     }
 
-    /// Serializes create-time route checks and reservations across instance IDs.
     pub async fn lock_creation(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.creation).lock_owned().await
     }

@@ -3,7 +3,6 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-/// Removes an integration-test container even when its test panics.
 pub(super) struct DockerContainer {
     name: String,
 }
@@ -32,8 +31,6 @@ pub(super) fn assert_success(output: &Output, operation: &str) {
     );
 }
 
-/// Runs `command` in container `name` with `MYSQL_PWD` set, feeding `input`
-/// to its stdin.
 pub(super) fn exec_mysql_family_with_input(
     name: &str,
     password: &str,

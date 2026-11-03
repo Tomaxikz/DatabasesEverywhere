@@ -41,10 +41,6 @@ pub(super) async fn admit_logical_copy(
         .acquire_execution(JobResourceCost::estimate(JobEstimateInput {
             protocol: source.protocol,
             input_size_bytes: export_bytes,
-            // `export_bytes` is already a 2x/4x database-size bound plus the
-            // fixed logical allowance. Feeding that conservative bound into
-            // the import model covers the sequential manifest/export/import
-            // pipeline without falsely charging in-place rollback memory.
             rollback_size_bytes: 0,
             wipe: false,
             compressed: crate::server::jobs::import_export::protocol_uses_native_compression(
@@ -104,9 +100,8 @@ pub(super) async fn copy_logical_data(
         }
     };
     let artifact = artifact_path(state, &migration.migration_id)?;
-    // The daemon-owned artifact and its pinned restore snapshot coexist on
-    // the migration filesystem. Reserve both before writing either file so
-    // concurrent migrations cannot overcommit the host between phases.
+    // Reserve both before writing either file so concurrent migrations cannot overcommit the host
+    // between phases.
     let staging_bytes = migration_staging_bytes(export_bytes)?;
     let capacity = state
         .import_uploads

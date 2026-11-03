@@ -1,5 +1,3 @@
-//! Isolated native-client execution for untrusted shared-tenant restores.
-
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},

@@ -87,17 +87,14 @@ impl Default for DiskConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskLimitSelection {
-    /// Prefer native quotas; fall back to FuseQuota for compatible databases.
     #[default]
     Auto,
-    /// Force the FuseQuota fallback for compatible databases.
     FuseQuota,
     /// Scanner-enforced soft limits. `none` is accepted as a compatibility
     /// alias, but API metadata deliberately calls the active mechanism a
     /// soft scanner rather than implying that limits are disabled.
     #[serde(alias = "none")]
     SoftScanner,
-    /// Require a supported native filesystem quota implementation.
     ProjectQuota,
 }
 

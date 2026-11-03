@@ -46,12 +46,8 @@ pub struct ResolvedRemoteEndpoint {
 }
 
 impl ResolvedRemoteEndpoint {
-    /// Docker/Podman `HostConfig.ExtraHosts` entries that pin the validated
-    /// hostname to the exact addresses classified by this module.
-    ///
-    /// Literal IP requests need no hosts-file entry. TLS clients must continue
-    /// to use `host`, rather than a resolved address, so certificate identity
-    /// verification remains bound to the requested name.
+    /// `HostConfig.ExtraHosts` entries pinning the validated hostname to the classified addresses.
+    /// TLS clients must keep using `host` so certificate identity stays bound to the requested name.
     pub fn helper_extra_hosts(&self) -> Vec<String> {
         if self.host.parse::<IpAddr>().is_ok() {
             return Vec::new();

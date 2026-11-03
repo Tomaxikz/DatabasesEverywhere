@@ -1,23 +1,4 @@
-//! Dedicated MariaDB online physical backup.
-//!
-//! `mariadb-backup` from the instance's own immutable image runs in a
-//! short-lived helper container. It mounts the instance socket directory and
-//! the data directory read-only, copies the InnoDB files while it tails the
-//! redo log, and writes straight into coordinator-reserved staging, so
-//! nothing lands in the data volume. Every copied page is checksummed by the
-//! tool as it is read. The server coordinates through `BACKUP STAGE`: DDL is
-//! blocked while files are copied and commits pause only for the final
-//! `BLOCK_COMMIT` stage, which copies the redo tail and the crash-safe Aria
-//! system tables. The inventory refuses instances with non-InnoDB user
-//! tables, which would otherwise be copied under that commit block.
-//!
-//! A second helper runs `mariadb-backup --prepare` on the staged copy (no
-//! socket, no data mount), applying the redo up to the backup's end LSN so the
-//! tree is a consistent, directly startable data directory. `verify` checks
-//! the checkpoints the prepare recorded and the staged layout in-process.
-//!
-//! Restore moves the prepared tree into the data volume root; the server
-//! starts on it without crash recovery.
+//! Dedicated MariaDB online physical backup: `mariadb-backup` in a short-lived helper, then `--prepare` in a second helper.
 
 mod inventory;
 mod layout;
@@ -59,11 +40,8 @@ const INVENTORY_HELPER_SUFFIX: &str = "inventory";
 const PREPARE_HELPER_SUFFIX: &str = "prepare";
 const INVENTORY_REPORT: &str = "inventory.report";
 const MAX_INVENTORY_REPORT_BYTES: u64 = 64 * 1024;
-/// Bounds each inventory statement on the server.
 const INVENTORY_SESSION_TIMEOUT_SECONDS: u32 = 60;
-/// Within the helper's 512 MiB memory limit.
 const PREPARE_MEMORY: &str = "256M";
-/// Both `--backup` and `--prepare` end with this line on success.
 const COMPLETED_OK: &str = "completed OK!";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -151,7 +129,6 @@ impl OnlineBackupStrategy for MariadbBackupStrategy {
     }
 }
 
-/// Checks that need no server session; returns the root credential.
 fn static_gate(ctx: &OnlineBackupContext<'_>) -> Result<SecretString, StrategyError> {
     if ctx.metadata.deployment_mode == DeploymentMode::Shared {
         return Err(StrategyError::Unsupported(

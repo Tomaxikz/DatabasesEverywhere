@@ -108,9 +108,7 @@ pub(crate) async fn probe_instance_compatibility(
     }
 
     if force {
-        // A forced lifecycle trigger deliberately invalidates the previous
-        // proof before executing. If the command then fails, callers and the
-        // next boot see "not attested" rather than trusting stale evidence.
+        // A forced trigger invalidates the previous proof first, so a failure leaves "not attested".
         manager
             .delete_compatibility(&metadata.instance_id)
             .await

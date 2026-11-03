@@ -1,5 +1,4 @@
-//! Pure preflight decisions. The shell report is parsed here; nothing in this
-//! module contacts a database.
+//! Pure preflight decisions; nothing here contacts a database.
 
 use std::{
     collections::BTreeMap,
@@ -37,8 +36,6 @@ impl Gate {
     }
 }
 
-/// Free space on the disk-backed staging filesystem and the reserved native
-/// budget. The helper writes the only copy there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiskSpace {
     pub staging_available: u64,
@@ -71,8 +68,7 @@ pub(crate) fn capture_estimate(database_bytes: u64, wal_bytes: u64) -> Option<u6
         .checked_add(HEADROOM_BYTES)
 }
 
-/// The budget is what restore extracts, so an estimate above it would
-/// produce a backup the existing restore path refuses.
+/// The budget is what restore extracts; a larger estimate would produce a backup restore refuses.
 pub(crate) fn space_allows(estimate: u64, space: &DiskSpace) -> Result<(), String> {
     if space.budget_bytes < estimate {
         return Err(format!(
@@ -147,7 +143,6 @@ pub(crate) fn parse_report(stdout: &str) -> Result<PreflightReport, String> {
                 .push(value.to_string());
         }
     }
-    // The ownership probe runs after the inventory script, so it is last.
     if last_key != REPLICATION_OWNERSHIP_PREFLIGHT_KEY {
         return Err("preflight report did not finish".to_string());
     }
@@ -756,7 +751,6 @@ mod tests {
             decide_text(&foreign, None),
             Err(Gate::Unsupported(reason)) if reason == foreign_replication_role_diagnostic()
         ));
-        // The diagnostic wins over the HBA rule a foreign role never received.
         let unprovisioned =
             foreign.replace("hba=local|replication|dbe_replication|scram-sha-256\n", "");
         assert!(matches!(
@@ -865,7 +859,6 @@ mod tests {
         assert!(parse_report(&duplicate).is_err());
         let unknown = ready_text().replace("auth=ok", "surprise=1\nauth=ok");
         assert!(parse_report(&unknown).is_err());
-        // The inventory finished but the ownership probe did not run.
         let truncated = ready_text().replace("\nrole_ownership=owned", "");
         assert!(parse_report(&truncated).is_err());
         let bad = ready_text().replace("role_ownership=owned", "role_ownership=maybe");

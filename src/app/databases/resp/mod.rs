@@ -80,9 +80,7 @@ pub(crate) async fn write_acl_file(
     replace_acl_file(data_path, acl.into_bytes()).await
 }
 
-/// Restores previously captured ACL bytes during a failed credential
-/// rotation. The destination is replaced without following a container-made
-/// symlink and is durably committed before the database is restarted.
+/// Replaces the destination without following a container-made symlink and commits durably before restart.
 pub(crate) async fn restore_acl_file(
     data_path: &Path,
     acl: &[u8],

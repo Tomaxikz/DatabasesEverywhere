@@ -58,27 +58,19 @@ impl InstanceStore {
         state.upsert(metadata);
     }
 
-    /// Replaces cached metadata while keeping every gateway route fenced.
-    /// Mutation code uses this after durable intermediate commits and calls
-    /// [`Self::upsert`] only after engine access and credentials are verified.
+    /// Replaces cached metadata keeping every route fenced; call `upsert` only after access is verified.
     pub(crate) async fn upsert_fenced(&self, metadata: InstanceMetadata) {
         let mut state = self.inner.write().await;
         state.upsert_fenced(metadata);
     }
 
-    /// Replaces cached metadata without changing whether the tenant is
-    /// currently reachable through a gateway route. Runtime reconciliation
-    /// uses this while propagating pool status: an already-open tenant may
-    /// stay open, while a stopped or explicitly fenced tenant cannot become
-    /// reachable merely because its container changed to `Running`.
+    /// Replaces cached metadata without changing route reachability: open stays open, fenced doesn't open just because the container is `Running`.
     pub(crate) async fn upsert_preserving_fence(&self, metadata: InstanceMetadata) {
         let mut state = self.inner.write().await;
         state.upsert_preserving_fence(metadata);
     }
 
-    /// Publishes metadata after the durable operation that owned a pinned
-    /// recovery fence has reached a terminal state. Callers must verify the
-    /// runtime and its credential before opening the route.
+    /// Publishes metadata once the operation owning a pinned recovery fence is terminal; verify runtime and credential first.
     pub(crate) async fn open_routes(&self, metadata: InstanceMetadata) {
         let mut state = self.inner.write().await;
         state.pinned_fences.remove(&metadata.instance_id);
@@ -90,18 +82,13 @@ impl InstanceStore {
         state.remove(instance_id)
     }
 
-    /// Temporarily removes every gateway lookup for an instance while keeping
-    /// its metadata available to lifecycle and recovery code. The caller must
-    /// hold the per-instance operation lock and republish through `upsert`
-    /// only after the runtime is ready and its durable state is settled.
+    /// Temporarily removes gateway lookups but keeps metadata; caller holds the operation lock and republishes via `upsert` once settled.
     pub(crate) async fn fence_routes(&self, instance_id: &str) -> bool {
         let mut state = self.inner.write().await;
         state.fence_existing(instance_id)
     }
 
-    /// Fences a route until the instance is removed or the daemon rebuilds
-    /// its store from durable state. Ordinary metadata upserts cannot clear a
-    /// pinned recovery fence.
+    /// Fences a route until removal or store rebuild; ordinary upserts can't clear a pinned fence.
     pub(crate) async fn pin_routes_fenced(&self, instance_id: &str) -> bool {
         let mut state = self.inner.write().await;
         if !state.fence_existing(instance_id) {
@@ -111,9 +98,7 @@ impl InstanceStore {
         true
     }
 
-    /// Confirms that a route resolved before an async boundary still refers to
-    /// the currently published tenant identity. Lifecycle fencing and every
-    /// metadata republish advance this revision before changing route maps.
+    /// Confirms a route resolved before an await still matches the published tenant identity; fencing and republish advance the revision.
     pub(crate) async fn route_is_current(&self, instance_id: &str, revision: u64) -> bool {
         let state = self.inner.read().await;
         !state.fenced_instances.contains(instance_id)

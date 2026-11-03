@@ -37,15 +37,12 @@ pub struct BackupInfo {
     pub modified_at: String,
     pub sha256: String,
     pub manifest_schema_version: u32,
-    /// Recorded consistency guarantee; `null` for legacy backups, which never
-    /// recorded one.
+    /// `null` for legacy backups, which never recorded one.
     pub consistency: Option<ConsistencyLevel>,
-    /// Restore recipe as `id@version`; `null` for legacy backups.
     pub restore_recipe: Option<String>,
 }
 
-/// A stored backup this daemon cannot interpret. Retention never deletes it;
-/// it is removed only by an explicit delete of its id.
+/// Retention never deletes it.
 #[derive(Debug, Serialize)]
 pub struct UnsupportedBackupInfo {
     pub id: String,
@@ -56,8 +53,6 @@ pub struct UnsupportedBackupInfo {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RunBackupQuery {
-    /// Overrides `backups.dedicated_mode` for this request. Shared tenants
-    /// always use their logical dump.
     pub mode: Option<crate::config::DedicatedBackupMode>,
 }
 

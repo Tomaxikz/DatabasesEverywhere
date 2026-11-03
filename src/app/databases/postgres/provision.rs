@@ -27,10 +27,7 @@ pub fn provision_shared_tenant_role_sql(database: &str, username: &str) -> Strin
     )
 }
 
-/// Removes PostgreSQL's default PUBLIC access to databases that belong to the
-/// shared engine itself. Tenant roles receive CONNECT only on their own
-/// database, so leaving these defaults in place would bypass per-database
-/// timeouts and allow unaccounted temporary files in the system catalogs.
+/// Tenant roles get CONNECT only on their own database; leaving the PUBLIC defaults would bypass per-database timeouts and allow unaccounted temp files in system catalogs.
 pub fn shared_catalog_lockdown_sql() -> String {
     let databases = ["postgres", "template0", "template1", "dbe_control"];
     let revoke = databases
@@ -83,9 +80,7 @@ pub fn terminate_tenant_sql(database: &str, username: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDropSql {
-    /// Run while connected to the tenant database, before the maintenance SQL.
     pub database_sql: String,
-    /// Run from an administrator connection to a different database.
     pub maintenance_sql: String,
 }
 
@@ -109,9 +104,7 @@ pub fn drop_tenant_sql(database: &str, username: &str) -> TenantDropSql {
     }
 }
 
-/// Stable, engine-local name for the daemon-owned tablespace that contains one
-/// shared tenant database. The digest keeps the identifier below PostgreSQL's
-/// 63-byte limit and avoids exposing the public database name as a host path.
+/// The digest keeps the name under PostgreSQL's 63-byte limit and avoids exposing the public database name as a host path.
 pub fn tenant_tablespace_name(database: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -119,9 +112,7 @@ pub fn tenant_tablespace_name(database: &str) -> String {
     format!("dbev_ts_{suffix}")
 }
 
-/// Creates the daemon-owned tablespace idempotently and returns its canonical
-/// PostgreSQL-visible location as the final output row. The caller validates
-/// that row against the trusted bind root before provisioning the database.
+/// The caller validates the returned location against the trusted bind root.
 pub fn ensure_tenant_tablespace_sql(database: &str, location: &str) -> String {
     let name = tenant_tablespace_name(database);
     let name_ident = quote_ident(&name);
@@ -135,9 +126,7 @@ pub fn ensure_tenant_tablespace_sql(database: &str, location: &str) -> String {
     )
 }
 
-/// Reports the default tablespace location for a managed database. An empty
-/// row means pg_default and therefore a legacy shared layout that cannot be
-/// safely relabelled as a hard per-tenant boundary in place.
+/// An empty row means pg_default: a legacy shared layout that cannot be relabelled as a per-tenant boundary in place.
 pub fn tenant_tablespace_location_sql(database: &str) -> String {
     format!(
         "SELECT COALESCE(pg_tablespace_location(dattablespace), '') FROM pg_database WHERE datname = {};",
@@ -217,9 +206,7 @@ pub fn tenant_role_state_sql(username: &str) -> String {
     )
 }
 
-/// Returns one physical byte count per database, in input order. The control
-/// administrator owns shared databases, so `pg_database_size` is the engine's
-/// authoritative tenant measurement instead of a guessed host directory.
+/// `pg_database_size` is authoritative because the control administrator owns shared databases.
 pub fn tenant_storage_sql(databases: &[&str]) -> String {
     databases
         .iter()

@@ -222,10 +222,6 @@ pub(crate) async fn resource_report(
                 .map(|sample| sample.sampled_at.elapsed().as_secs()),
         },
         network: NetworkReport {
-            // Database containers have no network namespace attachment. Their
-            // traffic crosses DBE's authenticated host gateways and Unix
-            // sockets, so Docker's optional `networks` stats are not the source
-            // of truth. These counters are updated directly by the gateway.
             rx_bytes: Some(network_rx_bytes),
             tx_bytes: Some(network_tx_bytes),
         },

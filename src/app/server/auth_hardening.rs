@@ -1,9 +1,7 @@
 use super::{manager::InstanceManager, metadata::InstanceMetadata};
 use crate::runtime::docker::{DockerRuntime, ManagedContainerIdentity};
 
-/// Revision 1 attested local SCRAM. Revision 2 adds the daemon-owned
-/// replication role and its local HBA line, so a revision 1 attestation is
-/// stale and `harden_postgres` runs the script again on daemon upgrade.
+/// Revision 2 adds the replication role and its HBA line; older attestations are stale.
 pub(crate) const POSTGRES_HARDENING_REVISION: u32 = 2;
 pub(crate) const MYSQL_HARDENING_REVISION: u32 = 1;
 
@@ -62,8 +60,7 @@ pub(crate) async fn begin_attestation(
         Err(error) => (false, Some(error.to_string())),
     };
 
-    // The SQLite lookup above is an await point. Re-read Docker before a
-    // cached proof is allowed to skip live hardening.
+    // Re-read Docker: the SQLite lookup above is an await point.
     let confirmed = required_identity(docker, metadata).await?;
     let current = cached_as_current && confirmed == identity;
     if current {
@@ -101,9 +98,7 @@ pub(crate) async fn complete_attestation(
         .record_hardening_attestation(metadata, &generation.identity, generation.revision)
         .await
         .map_err(|error| AuthHardeningCompletionError::Storage(error.to_string()));
-    // A restart can race the SQLite write. A stale row is harmless because it
-    // is identity-bound, but the caller must not publish a route to the new
-    // generation as if the old process had been hardened.
+    // A restart can race the SQLite write; don't publish a route to the new generation as hardened.
     ensure_generation(docker, metadata, &generation.identity).await?;
     recorded?;
     tracing::info!(
@@ -177,8 +172,7 @@ mod tests {
         );
     }
 
-    /// `begin_attestation` reports `current: false` when this lookup is false.
-    /// That is the signal `harden_postgres` uses to run the script again.
+    /// `false` makes `begin_attestation` report `current: false`, so `harden_postgres` reruns.
     #[tokio::test]
     async fn revision_one_attestation_is_not_current() {
         let dir = tempfile::tempdir().unwrap();

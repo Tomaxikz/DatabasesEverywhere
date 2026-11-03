@@ -18,8 +18,7 @@ use crate::{
     utils::ids::validate_instance_id,
 };
 
-/// Schema version written by this daemon. Readers also accept
-/// [`manifest::LEGACY_MANIFEST_SCHEMA_VERSION`].
+/// Schema written by this daemon; readers also accept [`manifest::LEGACY_MANIFEST_SCHEMA_VERSION`].
 pub const BACKUP_MANIFEST_SCHEMA_VERSION: u32 = manifest::MANIFEST_SCHEMA_VERSION;
 pub(crate) const MAX_METADATA_BYTES: u64 = 64 * 1024;
 const PHYSICAL_SUFFIX: &str = ".physical.tar.gz";
@@ -41,16 +40,12 @@ pub struct StoredBackup {
     pub created_at_unix: i64,
     pub sha256: String,
     pub catalog_available: bool,
-    /// Restore contract; present exactly for schema 2 manifests. Schema 1
-    /// daemons reject it as an unknown field, which keeps them from
-    /// restoring formats they do not understand.
+    /// Present exactly for schema 2; schema 1 daemons reject the unknown field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<manifest::ManifestDetails>,
 }
 
-/// A stored backup in a format this daemon cannot interpret, such as a newer
-/// manifest schema. It is listed opaquely, never restored and never pruned
-/// by retention; only an explicit delete removes it.
+/// A backup in an unreadable format (e.g. newer schema): listed opaquely, never restored or pruned; only explicit delete removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedBackup {
     pub backup_id: String,
@@ -117,8 +112,7 @@ impl StoredBackup {
     ) -> Result<Self, BackupStoreError> {
         let value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| BackupStoreError::Corrupt(format!("invalid {label}: {error}")))?;
-        // Check the version before strict field parsing so a newer format is
-        // reported as unsupported rather than as corruption.
+        // Check the version first so a newer format reads as unsupported, not corrupt.
         if let Some(version) = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -138,7 +132,6 @@ impl StoredBackup {
         Ok(manifest)
     }
 
-    /// Restore path dictated by the stored format, never by placement.
     pub fn restore_format(&self) -> manifest::RestoreFormat<'_> {
         match (&self.details, self.layout) {
             (Some(details), _) => details.restore_format(),
@@ -149,7 +142,6 @@ impl StoredBackup {
         }
     }
 
-    /// Recorded consistency guarantee. Schema 1 records carry none.
     pub fn consistency(&self) -> Option<manifest::ConsistencyLevel> {
         self.details.as_ref().map(|details| details.consistency)
     }
@@ -229,12 +221,7 @@ impl BackupBundle {
     }
 }
 
-/// Lets the rootless runtime group `gid` bind-mount `staging`, a capture
-/// directory below `<backups_root>/.staging/<instance>`. The backups root and
-/// each staging ancestor become daemon-owned 0710: traversable, never
-/// listable. Private preparation keeps that grant, and everything else below
-/// the root (instance backup directories, bundles) keeps its private mode.
-/// Fails with the blocking ancestor when the runtime still cannot reach it.
+/// Lets the rootless runtime group `gid` bind-mount `staging`: the backups root and staging ancestors become daemon-owned 0710 (traversable, not listable). Fails with the blocking ancestor.
 pub async fn allow_staging_traversal(
     backups_root: &Path,
     staging: &Path,
@@ -252,10 +239,7 @@ pub async fn allow_staging_traversal(
     .map_err(|source| io_error("grant rootless runtime traversal to backup staging", source))
 }
 
-/// Removes incomplete bundles from an earlier run. Online capture
-/// directories (`.staging/<instance>/.<job>.capture`) are kept: a helper
-/// container may still write to one until journal recovery confirms it gone
-/// and removes the directory itself.
+/// Removes incomplete bundles from earlier runs; online capture dirs are kept until journal recovery confirms no helper container writes to them.
 pub async fn cleanup_staging(backups_root: &Path) -> Result<bool, BackupStoreError> {
     let staging = backups_root.join(".staging");
     match tokio::fs::symlink_metadata(&staging).await {
@@ -316,7 +300,6 @@ pub async fn cleanup_staging(backups_root: &Path) -> Result<bool, BackupStoreErr
     Ok(removed)
 }
 
-/// `.<job uuid>.capture`, the online capture staging of one job.
 pub(crate) fn is_capture_dir_name(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         name.strip_prefix('.')
@@ -378,7 +361,6 @@ impl Drop for MaterializedBackup {
         {
             tracing::warn!(path = %self.path.display(), %error, "failed to remove materialized backup")
         }
-        // Release reserved bytes only after the file has been unlinked.
         self.capacity.take();
     }
 }
@@ -428,8 +410,7 @@ impl BackupStorage {
         self.driver().commit(bundle, manifest, journal).await
     }
 
-    /// Identity of the storage target, recorded before publication so
-    /// cleanup never acts on a different target.
+    /// Identity of the storage target, recorded before publication so cleanup never targets another.
     pub fn identity(&self) -> String {
         match self {
             Self::Local(driver) => driver.identity(),
@@ -442,7 +423,6 @@ impl BackupStorage {
         Ok(self.inventory(instance_id).await?.backups)
     }
 
-    /// Readable backups, newest first, plus opaque unsupported entries.
     pub async fn inventory(&self, instance_id: &str) -> Result<BackupInventory, BackupStoreError> {
         let mut inventory = self.driver().inventory(instance_id).await?;
         inventory
@@ -454,8 +434,6 @@ impl BackupStorage {
         Ok(inventory)
     }
 
-    /// Idempotently removes every object of a backup id whose publication
-    /// did not settle, plus its journaled `resources`, and confirms removal.
     pub async fn purge_unpublished(
         &self,
         instance_id: &str,
@@ -521,9 +499,7 @@ impl BackupStorage {
         let driver = self.clone();
         let instance_id = instance_id.to_string();
         let backup_id = backup_id.to_string();
-        // A cancelled HTTP waiter must not race cleanup against a still-running
-        // file open or Kopia process. The bounded worker owns the spool and its
-        // reservation until the driver finishes, even when nobody awaits it.
+        // A cancelled HTTP waiter must not race cleanup: the bounded worker owns the spool and reservation until the driver finishes.
         tokio::spawn(async move {
             let _slot = slot;
             match driver {
@@ -774,7 +750,6 @@ pub enum BackupStoreError {
     InvalidConfiguration(String),
     #[error("backup data is corrupt: {0}")]
     Corrupt(String),
-    /// Written by a newer daemon in a format this build must not interpret.
     #[error("unsupported backup format: {0}")]
     UnsupportedFormat(String),
     #[error("backup storage operation failed: {0}")]

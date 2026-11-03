@@ -1,8 +1,4 @@
-//! Copies a read-only volume snapshot into backup staging.
-//!
-//! The copy never follows links. It omits only links an engine recreates by
-//! itself and refuses everything else that the backup archive could not hold
-//! (other links, sockets, devices), so a capture either restores or fails.
+//! The copy never follows links.
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
@@ -16,8 +12,6 @@ pub(super) struct CopyStats {
     pub omitted_links: u64,
 }
 
-/// Copies `source` (the snapshot root) to the new directory `destination`.
-/// Fails once more than `max_bytes` or `max_entries` would be copied.
 pub(super) fn copy_snapshot(
     source: &Path,
     destination: &Path,

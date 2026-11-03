@@ -18,8 +18,7 @@ use crate::{
 };
 
 const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;
-/// Prefix of a creation-attempt generation. Stored instances use their RFC 3339
-/// `created_at`, so the two kinds can never collide.
+/// Stored instances use their RFC 3339 `created_at`, so the two kinds can never collide.
 pub(crate) const CREATION_GENERATION_PREFIX: &str = "creating:";
 const MAX_PROGRESS_TEXT_CHARS: usize = 2_048;
 #[cfg(test)]
@@ -85,8 +84,6 @@ impl InstallProgressStore {
         );
     }
 
-    /// Admits an instance creation and gives it a unique attempt, so a
-    /// WebSocket token can follow this creation before the instance exists.
     pub fn try_begin_instance_creation(
         &self,
         instance_id: &str,
@@ -173,7 +170,6 @@ impl InstallProgressStore {
             .len()
     }
 
-    /// Worker lifetime, not a retained progress message that may outlive it.
     pub(crate) fn is_creating(&self, instance_id: &str) -> bool {
         self.active_creations
             .read()
@@ -386,23 +382,17 @@ pub struct InstallProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<PublicDiagnostic>,
     pub updated_at: String,
-    /// Set only for instance creations; pool creations stay unwatchable.
     #[serde(skip)]
     pub(crate) watch: Option<CreationWatch>,
 }
 
-/// Identity of one instance creation attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreationWatch {
     pub attempt: String,
-    /// Dedicated creations have a container of their own whose logs can be
-    /// followed; shared tenants live inside a pool.
     pub dedicated: bool,
 }
 
 impl InstallProgress {
-    /// The generation a WebSocket token binds to while this instance is being
-    /// created. It survives completion or failure of the same attempt.
     pub(crate) fn creation_generation(&self) -> Option<String> {
         self.watch
             .as_ref()

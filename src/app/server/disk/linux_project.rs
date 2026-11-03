@@ -30,9 +30,7 @@ pub(super) async fn apply_in(
     mount: &Path,
 ) -> Result<String, DiskLimitError> {
     let project_id = project_id::allocate_in(owner_id, registry_root, project_id_base).await?;
-    // Keep the pending project bounded before the first inode leaves the
-    // aggregate/root project. If relabeling is interrupted, retrying the
-    // pending claim remains safe and the partial tree is still capped.
+    // Cap the pending project before the first inode leaves the root project; retrying a pending claim is safe.
     set_project_quota(mount, project_id, disk_mib).await?;
     project_tree::assign(data_path, project_id).await?;
     project_id::activate_in(owner_id, registry_root, project_id).await?;
@@ -53,9 +51,7 @@ pub(super) async fn update_in(
             owner_id: owner_id.to_string(),
             registry_root: registry_root.to_path_buf(),
         })?;
-    // Updates and boot restoration are constant-time: adoption already
-    // verified the whole tree, while inheritance makes future descendants
-    // correct. Refuse an active claim whose root boundary was altered.
+    // Adoption already verified the tree and inheritance covers new files; refuse an active claim whose root boundary changed.
     project_tree::verify_root(data_path, project_id).await?;
     set_project_quota(mount, project_id, disk_mib).await?;
     Ok(METHOD.to_string())
@@ -75,10 +71,7 @@ pub(super) async fn remove_in(
     if claim.state == project_id::ProjectIdState::Released {
         return Ok(());
     }
-    // Keep the project cap in place until every reachable inode has left the
-    // claim. A pending adoption can contain both the trusted source ID and the
-    // new target ID, so restore it to that source rather than applying the
-    // stricter active-boundary clear.
+    // Keep the cap until every inode has left the claim; a pending adoption may hold both source and target IDs, so restore to the source.
     project_tree::release_claimed_tree(data_path, claim).await?;
     project_usage::verify_unused(NativeProjectQuotaFs::Ext4, mount, claim.id).await?;
     set_project_quota(mount, claim.id, 0).await?;

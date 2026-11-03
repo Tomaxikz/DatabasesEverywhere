@@ -1,10 +1,7 @@
-//! Parses the RESP inventory report and decides whether to capture.
-
 use std::collections::BTreeMap;
 
 use crate::subsystems::backups::strategy::StrategyError;
 
-/// Settings the capture and the restore layout depend on.
 pub(super) const CONFIG_KEYS: [&str; 4] = [
     "repl-diskless-sync",
     "rdbchecksum",
@@ -85,7 +82,6 @@ pub(super) fn parse_report(report: &str) -> Result<Inventory, String> {
     })
 }
 
-/// `CONFIG GET` prints alternating name and value lines.
 fn parse_config(lines: &[&str]) -> Result<BTreeMap<String, String>, String> {
     let lines: Vec<&str> = match lines.last() {
         Some(&"") => &lines[..lines.len() - 1],
@@ -121,8 +117,7 @@ impl Inventory {
         self.config.get(key).map_or("", String::as_str)
     }
 
-    /// Refuses layouts the strategy cannot capture *and* restore, and a fork
-    /// the container memory limit cannot absorb.
+    /// Refuses layouts the strategy cannot capture and restore, and forks the container memory limit cannot absorb.
     pub(super) fn decide(&self, memory_limit_mib: u64) -> Result<(), StrategyError> {
         let major = self
             .server_version
@@ -206,7 +201,6 @@ mod tests {
         assert_eq!(inventory.server_version, "8.8.0");
         assert_eq!(inventory.cli_version, "8.8.0");
         inventory.decide(1024).unwrap();
-        // 100 MiB resident needs 200 MiB for the fork.
         assert!(matches!(
             inventory.decide(199),
             Err(StrategyError::Failed(_))

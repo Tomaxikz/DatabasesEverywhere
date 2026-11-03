@@ -34,7 +34,6 @@ impl<A> ApiConnectionAcceptor<A> {
         }
     }
 
-    /// An acceptor for another API listener, drawing on the same capacity.
     pub(super) fn sharing<B>(&self, inner: B) -> ApiConnectionAcceptor<B> {
         ApiConnectionAcceptor {
             inner,

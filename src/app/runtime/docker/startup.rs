@@ -27,8 +27,7 @@ impl DockerRuntime {
         self
     }
 
-    /// Automatic boot recovery has a durable two-attempt budget. Explicit API
-    /// starts and restore/rollback operations remain possible after repair.
+    /// Automatic boot recovery has a durable two-attempt budget; explicit API starts and restore/rollback remain possible after repair.
     pub(crate) async fn check_autostart(&self, runtime_id: &str) -> Result<(), DockerError> {
         let Some(pool) = &self.startup_history else {
             return Ok(());
@@ -74,9 +73,7 @@ impl DockerRuntime {
         Ok(())
     }
 
-    /// DBEV alone controls boot activation, after mounts, quotas and operator
-    /// intent have been checked. Repair old externally configured restart loops
-    /// in place; do not recreate containers or touch their data.
+    /// Repair old externally configured restart loops in place; do not recreate containers or touch their data.
     pub(crate) async fn disable_restarts(
         &self,
         protocol: Protocol,

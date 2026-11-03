@@ -1,5 +1,3 @@
-//! Kopia command arguments, snapshot listing parsing and manifest tags.
-
 use super::*;
 
 pub(super) fn restore_arguments(object_path: &str, destination: &Path) -> Vec<OsString> {
@@ -25,9 +23,7 @@ pub(super) fn create_arguments(
         OsString::from("--json"),
         OsString::from("--description"),
         OsString::from(format!("DatabasesEverywhere backup {}", manifest.backup_id)),
-        // DBEV owns retention for these snapshots. Pinning prevents an
-        // unrelated Kopia source policy from expiring them behind DBEV.
-        // `--pin` takes a value; without one the CLI rejects the command.
+        // Pinning keeps Kopia source policy from expiring these snapshots; `--pin` requires a value.
         OsString::from("--pin"),
         OsString::from(DBEV_PIN),
     ];
@@ -51,8 +47,7 @@ pub(super) fn source_manifest_arguments(path: &str) -> Vec<OsString> {
     ]
 }
 
-/// The source path Kopia records for `directory`: `filepath.Clean` of the
-/// absolute path, without resolving symlinks.
+/// Source path Kopia records: `filepath.Clean` of the absolute path, symlinks unresolved.
 pub(super) fn snapshot_source_path(directory: &Path) -> Result<String, BackupStoreError> {
     use std::path::Component;
 
@@ -90,8 +85,7 @@ pub(super) fn parse_snapshot_list(stdout: &[u8]) -> Result<Vec<KopiaManifest>, B
         .collect()
 }
 
-/// The filter is evaluated by Kopia; a manifest is deleted only when its
-/// labels prove it is a snapshot of exactly `path`.
+/// Kopia evaluates the filter; delete only when labels prove the exact `path`.
 pub(super) fn source_entry_id(
     entry: KopiaManifestEntry,
     path: &str,
@@ -117,8 +111,7 @@ pub(super) fn parse_manifest_entries(
     })
 }
 
-/// Strips the stored `tag:` prefix. An unprefixed key is accepted as the
-/// same tag; one present in both forms with different values is ambiguous.
+/// Strips the `tag:` prefix; an unprefixed key is accepted, differing duplicates are ambiguous.
 pub(super) fn normalize_tags(
     mut snapshot: KopiaManifest,
 ) -> Result<KopiaManifest, BackupStoreError> {
@@ -194,8 +187,7 @@ pub(super) fn format_tag_value(format: ArtifactFormat) -> &'static str {
     }
 }
 
-/// Schema 2 tag projection: enough to locate and authenticate the canonical
-/// manifest and to cross-check it, never enough to reconstruct a recipe.
+/// Schema 2 tag projection: locates and authenticates the sidecar, never reconstructs a recipe.
 pub(super) struct V2Projection {
     pub(super) backup_id: String,
     pub(super) manifest_sha256: String,

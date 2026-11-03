@@ -8,10 +8,8 @@ use super::{
     words::{create_object, has_keyword, has_keyword_sequence, statement_words},
 };
 
-/// Applies only the physical-storage boundary required by a live shared
-/// MySQL/MariaDB session. Unlike dump admission, this deliberately permits
-/// ordinary application SQL while denying statements that can replace the
-/// routed database or place table data outside its managed directory.
+/// Physical-storage boundary for a live shared MySQL/MariaDB session: permits ordinary SQL but
+/// denies statements that replace the routed database or place table data outside its directory.
 pub(crate) fn validate_shared_mysql_command(
     sql: &[u8],
     protocol: Protocol,

@@ -1,5 +1,3 @@
-//! Bounded, side-effect-free inspection of uploaded database dumps.
-
 use std::{
     io::{self, Seek, SeekFrom},
     path::Path,
@@ -143,7 +141,6 @@ pub(crate) struct DumpInspection {
     pub selective_unavailable_reason: Option<String>,
 }
 
-/// Inspects an immutable uploaded dump without executing it or exposing its contents.
 #[cfg(test)]
 pub(crate) async fn inspect_uploaded_dump(
     path: &Path,

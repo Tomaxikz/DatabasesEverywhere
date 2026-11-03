@@ -123,8 +123,6 @@ fn post_runtime_lock_state_keeps_new_quota_blocks_for_repair() {
 
     assert!(same_shared_identity(&stale, &current));
     assert!(check_power_state(&stale).is_ok());
-    // Start is admitted far enough to reapply a hard boundary. If the
-    // result is still soft, the locked usage check rejects it later.
     assert!(check_power_state(&current).is_ok());
 
     current.runtime_id = "pool-b".to_string();

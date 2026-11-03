@@ -257,7 +257,6 @@ pub async fn method_not_allowed() -> ApiError {
     )
 }
 
-/// JSON extractor whose failures use the API's JSON error contract.
 #[derive(Debug)]
 pub struct ApiJson<T>(pub T);
 
@@ -313,7 +312,6 @@ fn declares_body(headers: &axum::http::HeaderMap) -> bool {
     has_nonzero_content_length || headers.contains_key(header::TRANSFER_ENCODING)
 }
 
-/// Path and query wrappers keep all extractor failures in the same JSON envelope.
 #[derive(Debug)]
 pub struct ApiPath<T>(pub T);
 

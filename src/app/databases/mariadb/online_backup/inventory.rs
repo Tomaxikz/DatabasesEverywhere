@@ -1,10 +1,7 @@
-//! Parses the MariaDB inventory report and decides whether to capture.
-
 use std::collections::BTreeMap;
 
 use crate::subsystems::backups::strategy::StrategyError;
 
-/// One `key=value` line per statement.
 pub(super) const SQL: &str = "SELECT CONCAT('version=', VERSION());
 SELECT CONCAT('datadir=', @@datadir);
 SELECT CONCAT('innodb_data_home_dir=', IFNULL(@@innodb_data_home_dir, ''));
@@ -65,7 +62,6 @@ pub(super) fn parse_report(report: &str) -> Result<Inventory, String> {
     })
 }
 
-/// `12.3.2-MariaDB-ubu2404` -> `(12, 3, 2)`.
 fn numeric(version: &str) -> Option<(u32, u32, u32)> {
     let mut parts = version
         .split(|character: char| !character.is_ascii_digit())

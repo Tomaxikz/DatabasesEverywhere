@@ -30,11 +30,7 @@ struct ExecPolicy {
     recovery: ExecRecovery,
 }
 
-/// Defines who owns recovery when Docker cannot prove an exec process stopped.
-///
-/// Dedicated data operations may need bounded container recovery. Shared
-/// operations and readiness probes return control to their lifecycle owner;
-/// probing a recovering container must never initiate another restart.
+/// Probing a recovering container must never initiate another restart, so shared operations and readiness probes return control to their lifecycle owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecRecovery {
     RestartRuntime,
@@ -162,10 +158,7 @@ impl DockerRuntime {
         .await
     }
 
-    /// Runs a shell command with short-lived, explicitly supplied secret
-    /// environment values. Secrets stay out of the command line and DBE's
-    /// diagnostics; Docker/Podman retains them only for the lifetime of the
-    /// exec operation.
+    /// Secrets stay out of the command line and DBE's diagnostics.
     pub async fn exec_shell_with_secrets(
         &self,
         protocol: Protocol,
@@ -211,9 +204,7 @@ impl DockerRuntime {
         .await
     }
 
-    /// Runs a bounded command inside a shared engine without ever restarting
-    /// that engine as timeout recovery. The caller must fence the tenant and
-    /// terminate its database sessions before deciding whether to retry.
+    /// The caller must fence the tenant and terminate its sessions before deciding to retry.
     pub async fn exec_tenant_shell(
         &self,
         protocol: Protocol,
@@ -237,9 +228,7 @@ impl DockerRuntime {
         .await
     }
 
-    /// Runs a quiet, read-only telemetry command against a shared runtime.
-    /// Failure never restarts the pool and is returned to the sampler, which
-    /// owns rate-limited diagnostics.
+    /// Failure never restarts the pool; the sampler owns rate-limited diagnostics.
     pub(crate) async fn exec_telemetry(
         &self,
         protocol: Protocol,

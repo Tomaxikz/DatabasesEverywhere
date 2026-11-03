@@ -76,7 +76,6 @@ impl Drop for CancellationSignal {
     }
 }
 
-/// A shell command run in a managed container with streamed stdin or stdout.
 pub struct ShellExec<'a> {
     pub protocol: Protocol,
     pub instance_id: &'a str,
@@ -86,14 +85,12 @@ pub struct ShellExec<'a> {
     pub recovery: ExecRecovery,
 }
 
-/// A private regular host file streamed to the command's stdin.
 pub struct ExecInputFile<'a> {
     pub path: &'a Path,
     pub max_bytes: u64,
     pub expected_sha256: Option<[u8; 32]>,
 }
 
-/// Everything the spawned streaming task owns.
 struct StreamJob {
     protocol: Protocol,
     instance_id: String,
@@ -105,12 +102,7 @@ struct StreamJob {
 }
 
 impl DockerRuntime {
-    /// Streams a private regular host file to the stdin of a shell command.
-    ///
-    /// The source is opened without following its final symlink, its descriptor
-    /// length is bounded before exec creation, and growth or truncation while it
-    /// is being read fails the operation. Secret values exist only in the exec
-    /// environment and are never included in diagnostics.
+    /// The source is opened without following its final symlink and its length is bounded; growth or truncation while reading fails the operation.
     pub async fn exec_shell_with_input(
         &self,
         exec: ShellExec<'_>,
@@ -124,11 +116,7 @@ impl DockerRuntime {
         self.exec_streaming(exec, direction).await
     }
 
-    /// Streams a shell command's stdout to a new private regular host file.
-    ///
-    /// The destination is create-new and mode 0600. It is removed through its
-    /// already-open parent descriptor unless the command exits successfully,
-    /// stays within `max_output_bytes`, and the file and directory are synced.
+    /// The destination is create-new, mode 0600, and removed unless the command succeeds within `max_output_bytes` and the file and directory are synced.
     pub async fn exec_shell_to_file(
         &self,
         exec: ShellExec<'_>,

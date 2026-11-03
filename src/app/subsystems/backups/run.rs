@@ -32,8 +32,7 @@ use crate::utils::time::now_unix;
 use std::path::Path as FsPath;
 use std::path::PathBuf;
 
-/// `mode` overrides `backups.dedicated_mode` for one request. An explicit or
-/// configured `online` never falls back to a cold copy.
+/// An explicit or configured `online` never falls back to a cold copy.
 pub(super) async fn backup_instance(
     state: &AppState,
     instance_id: &str,
@@ -47,14 +46,12 @@ pub(super) async fn backup_instance(
         .map_err(ApiError::runtime_context("backup task failed"))?
 }
 
-/// A complete local artifact that no longer depends on the source.
 struct PreparedBackup {
     storage: BackupStorage,
     bundle: BackupBundle,
     manifest: StoredBackup,
     protocol: Protocol,
     online_job: Option<String>,
-    // Scheduler budget stays charged through upload.
     _execution: ExecutionPermit,
 }
 
@@ -75,8 +72,6 @@ pub(super) async fn run_backup(
         Prepared::Ready(prepared) => prepared,
         Prepared::Skipped(issue) => return Ok(BackupAttempt::Skipped(issue)),
     };
-    // Management locks are released here: stop, delete or upgrade may proceed
-    // while the finished artifact uploads.
     let PreparedBackup {
         storage,
         bundle,
@@ -112,8 +107,6 @@ pub(super) async fn run_backup(
         .await
         .map_err(store_error);
     bundle.cleanup().await;
-    // Reacquires the instance lock to serialize the final existence check
-    // with deletion; a deleted instance's upload is removed.
     publication::finish(
         &state,
         &storage,
@@ -145,8 +138,6 @@ pub(super) async fn run_backup(
     Ok(BackupAttempt::Completed(backup_info(manifest)))
 }
 
-/// Captures and validates a backup under the instance (and shared runtime)
-/// management locks, which are released when this returns.
 async fn prepare_backup(
     state: &AppState,
     instance_id: &str,
@@ -232,9 +223,7 @@ async fn prepare_backup(
                 crate::server::jobs::import_export::MAX_DATA_ARCHIVE_BYTES,
             )
     };
-    // Online staging holds the native capture and the packaged archive at
-    // once; native verification reads in place. The native budget is what
-    // restore extracts, so a larger capture is never published.
+    // The native budget is what restore extracts, so a larger capture is never published.
     let native_budget = physical_restore_capacity(metadata.limits.disk_mib);
     let reserved_bytes = if strategy.is_some() {
         staging_budget(native_budget, output_capacity)
@@ -386,8 +375,6 @@ async fn write_bundle(
     finish_manifest(bundle, source, details).await
 }
 
-/// Only PostgreSQL's tenant dump runs in one repeatable-read snapshot; other
-/// engines' tenant exports promise no common transactional point.
 fn shared_dump_consistency(protocol: Protocol) -> ConsistencyLevel {
     if protocol == Protocol::Postgres {
         ConsistencyLevel::TransactionalSnapshot
@@ -438,8 +425,6 @@ async fn finish_manifest(
     Ok(manifest)
 }
 
-/// Explicitly selected offline copy: stops the database, archives its data
-/// directory and restarts it.
 pub(super) async fn create_physical_archive(
     state: &AppState,
     metadata: &InstanceMetadata,

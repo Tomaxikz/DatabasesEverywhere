@@ -38,9 +38,7 @@ impl DockerRuntime {
             .await?;
         Ok(log_policy_matches(&inspection, self.engine()))
     }
-    /// Returns the exact protocol-qualified container name when it belongs to
-    /// the requested DBE instance. A same-name container without the complete
-    /// ownership label tuple is treated as an untrusted collision.
+    /// A same-name container without the complete ownership label tuple is an untrusted collision.
     pub async fn verified_managed_container_name(
         &self,
         protocol: Protocol,
@@ -102,9 +100,7 @@ impl DockerRuntime {
         Ok(Some(response))
     }
 
-    /// Returns a hardening-safe runtime identity. Container IDs survive a
-    /// stop/start, so the start timestamp is included to distinguish a fresh
-    /// database process from a daemon-only restart.
+    /// Container IDs survive a stop/start, so the start timestamp distinguishes a fresh database process from a daemon-only restart.
     pub(crate) async fn verified_container_identity(
         &self,
         protocol: Protocol,
@@ -128,8 +124,7 @@ impl DockerRuntime {
         Ok(Some(ManagedContainerIdentity { id, started_at }))
     }
 
-    /// Reads both immutable IDs from one verified inspection. Callers re-read
-    /// this after probing to reject an external replacement during the exec.
+    /// Callers re-read this after probing to reject an external replacement during the exec.
     pub(crate) async fn verified_compatibility_identity(
         &self,
         protocol: Protocol,
@@ -405,9 +400,7 @@ impl DockerRuntime {
         ))
     }
 
-    /// Return the immutable image ID backing a managed container. Internal
-    /// safety migrations use this rather than a mutable tag so recreation
-    /// cannot silently switch database versions between stop and create.
+    /// Safety migrations use the immutable ID, not a mutable tag, so recreation cannot switch database versions.
     pub async fn container_immutable_image_id(
         &self,
         protocol: Protocol,
@@ -437,10 +430,7 @@ impl DockerRuntime {
             .map(|source| super::host_paths::to_container(&source).unwrap_or(source)))
     }
 
-    /// Fail closed when an existing managed container is not actually bound
-    /// to the data source selected by the effective disk-limit mode. Merely
-    /// preparing a quota mount cannot protect a container that still uses the
-    /// old raw path (or vice versa).
+    /// Merely preparing a quota mount cannot protect a container that still uses the old raw path (or vice versa).
     pub async fn verify_data_bind(
         &self,
         protocol: Protocol,
@@ -467,9 +457,7 @@ impl DockerRuntime {
         })
     }
 
-    /// Returns the original image reference only when it still resolves to the
-    /// exact image backing the managed container. This prevents a non-upgrade
-    /// recreation from silently pulling or switching to a retagged image.
+    /// Prevents a non-upgrade recreation from silently pulling or switching to a retagged image.
     pub async fn container_recreation_image(
         &self,
         protocol: Protocol,
@@ -499,8 +487,6 @@ impl DockerRuntime {
         Ok(resolves_to_current_image.then_some(reference))
     }
 
-    /// Reads one configured environment value without serializing or logging
-    /// the rest of the container configuration.
     pub async fn container_environment_value(
         &self,
         protocol: Protocol,
@@ -538,8 +524,6 @@ impl DockerRuntime {
             })
     }
 
-    /// Preserves the optional project ownership label across a same-image
-    /// container recreation.
     pub async fn container_project_id(
         &self,
         protocol: Protocol,

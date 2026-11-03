@@ -21,9 +21,7 @@ use crate::{
     },
 };
 
-/// Restores hard limits for physical shared pools. Tenant ids never reach a
-/// container or filesystem-limit API here: each placement row is visited once
-/// and all physical work is keyed by `runtime_id`.
+/// Restores hard limits per physical shared pool; tenant ids never reach container or filesystem-limit APIs.
 pub(crate) async fn restore_shared_limits(
     state: &AppState,
     disk_limiter: &DiskLimiter,
@@ -82,9 +80,7 @@ async fn restore_runtime_limits(
     Ok(())
 }
 
-/// Finishes deletion of pools that have no durable tenant reservations. This
-/// runs after migration recovery and before limits, reconciliation, or route
-/// publication, so an interrupted cleanup cannot revive an orphaned engine.
+/// Finishes deletion of pools with no tenant reservations, before limits, reconciliation or route publication.
 pub(crate) async fn recover_pool_deletions(state: &AppState) -> usize {
     let runtimes = match shared_runtimes(&state.placements).await {
         Ok(runtimes) => runtimes,
@@ -176,9 +172,7 @@ async fn restore_one_limit(
         needs_pool_adoption(limiter.mode(), &runtime.limits.disk_enforcement_method);
     let limiter_healthy = limiter.runtime_is_healthy(&paths.data).await?;
     if adopting_pool || !limiter_healthy {
-        // Native project adoption rewrites inode ownership throughout the
-        // existing pool. Freeze the engine even when its old soft limiter is
-        // healthy so no database write can race that one-time transition.
+        // Native adoption rewrites inode ownership across the pool; freeze the engine so no write races it.
         match docker.stop(runtime.protocol, &runtime.runtime_id).await {
             Ok(_) => {}
             Err(error) if error.is_not_found() || error.is_not_running() => {}
