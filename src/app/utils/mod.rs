@@ -9,5 +9,6 @@ pub(crate) mod percent;
 
 pub mod redaction;
 pub mod shell;
+pub mod term;
 pub mod time;
 pub(crate) mod tls;

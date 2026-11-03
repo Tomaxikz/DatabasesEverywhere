@@ -23,11 +23,24 @@ fn quarantine_inspection_is_bounded_and_supports_history_paging() {
     ])
     .unwrap();
     assert!(
-        matches!(cli.command, Some(super::Command::Quarantine { entity_id: Some(id), history: true, before: Some(42), limit: 50 }) if id == "pool_one")
+        matches!(cli.command, Some(super::Command::Quarantine { entity_id: Some(id), history: true, before: Some(42), limit: 50, .. }) if id == "pool_one")
     );
     for limit in ["0", "1001"] {
         assert!(Cli::try_parse_from(["dbev", "quarantine", "--limit", limit]).is_err());
     }
+}
+
+#[test]
+fn output_flags_are_global_and_quiet_conflicts_with_verbose() {
+    let cli =
+        Cli::try_parse_from(["dbev", "check-config", "--json", "-vv", "--color", "never"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(super::Command::CheckConfig { json: true })
+    ));
+    assert_eq!(cli.verbose, 2);
+    assert!(matches!(cli.color, ColorChoice::Never));
+    assert!(Cli::try_parse_from(["dbev", "migrate", "-q", "-v"]).is_err());
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::{
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -6,12 +7,15 @@ use std::{
 use anyhow::{Context, ensure};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+use crate::{storage::quarantine::QuarantineEvent, utils::term};
+
 pub(crate) async fn show(
     config_path: PathBuf,
     entity_id: Option<String>,
     history: bool,
     before: Option<i64>,
     limit: u32,
+    json: bool,
 ) -> anyhow::Result<()> {
     let config = crate::config::load::load_config(config_path)?;
     let path = crate::storage::sqlite::database_path(Path::new(&config.paths.metadata_root()));
@@ -19,9 +23,83 @@ pub(crate) async fn show(
     let records =
         crate::storage::quarantine::list(&pool, entity_id.as_deref(), history, before, limit)
             .await?;
-    println!("{}", serde_json::to_string_pretty(&records)?);
     pool.close().await;
+    if json || !io::stdout().is_terminal() {
+        return term::json(&records);
+    }
+    print_table(&records, history, limit);
     Ok(())
+}
+
+fn print_table(records: &[QuarantineEvent], history: bool, limit: u32) {
+    if records.is_empty() {
+        let scope = if history {
+            "quarantine events"
+        } else {
+            "open quarantine causes"
+        };
+        term::success(format_args!("no {scope}"));
+        return;
+    }
+    let rows: Vec<Vec<String>> = records
+        .iter()
+        .map(|record| {
+            vec![
+                record.event_id.to_string(),
+                record.entity_kind.clone(),
+                record.entity_id.clone(),
+                record.code.clone(),
+                record.recovery_class.clone(),
+                record.occurrences.to_string(),
+                record.last_seen.clone(),
+                match (&record.closed_at, &record.final_status) {
+                    (None, _) => "open".to_string(),
+                    (Some(_), Some(status)) => format!("closed ({status})"),
+                    (Some(_), None) => "closed".to_string(),
+                },
+            ]
+        })
+        .collect();
+    anstream::print!(
+        "{}",
+        term::table(
+            &[
+                "EVENT",
+                "KIND",
+                "ENTITY",
+                "CODE",
+                "RECOVERY",
+                "SEEN",
+                "LAST SEEN",
+                "STATUS"
+            ],
+            &rows,
+        )
+    );
+    let mut codes: Vec<(&str, &str)> = records
+        .iter()
+        .map(|record| (record.code.as_str(), record.guidance))
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    anstream::println!();
+    for (code, guidance) in codes {
+        anstream::println!(
+            "  {}{code}{}: {guidance}",
+            term::HEADER,
+            term::HEADER.render_reset()
+        );
+    }
+    if records.len() as u32 == limit
+        && let Some(last) = records.last()
+    {
+        anstream::println!(
+            "\n  {}more may exist; continue with --before {}{}",
+            term::DIM,
+            last.event_id,
+            term::DIM.render_reset()
+        );
+    }
 }
 
 async fn open_history(path: &Path) -> anyhow::Result<sqlx::SqlitePool> {

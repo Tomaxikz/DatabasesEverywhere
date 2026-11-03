@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Context;
 use secrecy::SecretString;
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -24,7 +25,7 @@ use crate::{
         repositories::{InstanceRepository, ProtectedSecretField},
         sqlite,
     },
-    utils::ids::validate_instance_id,
+    utils::{ids::validate_instance_id, term},
 };
 
 const MAX_PROTECTED_SECRET_STDIN_BYTES: u64 = 16 * 1024;
@@ -43,7 +44,7 @@ pub(crate) async fn migrate_metadata(config_path: PathBuf) -> anyhow::Result<()>
         .await
         .context("failed to initialize sqlite storage")?;
     pool.close().await;
-    println!("metadata migrations ok");
+    term::success("metadata migrations ok");
     Ok(())
 }
 
@@ -62,7 +63,7 @@ pub(crate) async fn dev_clean(config_path: PathBuf) -> anyhow::Result<()> {
         .remove_managed_containers()
         .await
         .context("failed to remove managed containers")?;
-    println!("removed {removed} managed containers");
+    term::success(format_args!("removed {removed} managed containers"));
     Ok(())
 }
 
@@ -85,7 +86,7 @@ pub(crate) async fn reset_metadata(config_path: PathBuf) -> anyhow::Result<()> {
         }
     }
 
-    println!("removed {removed} sqlite metadata files");
+    term::success(format_args!("removed {removed} sqlite metadata files"));
     Ok(())
 }
 
@@ -117,9 +118,9 @@ pub(crate) async fn repair_protected_secret(
         .context("protected-secret repair failed")?;
 
     if repaired.remaining_fields.is_empty() {
-        println!(
+        term::success(format_args!(
             "repaired {field} for {instance_id}; the instance remains stopped until explicitly started"
-        );
+        ));
     } else {
         let remaining = repaired
             .remaining_fields
@@ -127,9 +128,9 @@ pub(crate) async fn repair_protected_secret(
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
+        term::warning(format_args!(
             "repaired {field} for {instance_id}; the instance remains quarantined because these fields still require repair: {remaining}"
-        );
+        ));
     }
     Ok(())
 }
@@ -171,6 +172,7 @@ pub(crate) async fn migrate_paths(
     config_path: PathBuf,
     dry_run: bool,
     force: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let _daemon_lock = lock_daemon(&config).await?;
@@ -178,22 +180,41 @@ pub(crate) async fn migrate_paths(
     let plan = PathMigrationPlan::new(&config);
     let actions = plan.actions();
 
-    if actions.is_empty() {
-        println!("no path migration actions needed");
-        return Ok(());
-    }
-
-    println!(
-        "path migration {}",
-        if dry_run { "dry-run" } else { "execution" }
-    );
-    for action in &actions {
-        println!("{} -> {}", action.from.display(), action.to.display());
-    }
-
-    if dry_run {
-        println!("dry-run only; no files moved");
-        return Ok(());
+    if json {
+        let report = PathMigrationReport {
+            dry_run,
+            actions: &actions,
+        };
+        if dry_run || actions.is_empty() {
+            return term::json(&report);
+        }
+    } else {
+        if actions.is_empty() {
+            term::success("no path migration actions needed");
+            return Ok(());
+        }
+        term::heading(if dry_run {
+            "Path migration plan (dry run)"
+        } else {
+            "Path migration"
+        });
+        for action in &actions {
+            term::status(format_args!(
+                "  {} {}→{} {}",
+                action.from.display(),
+                term::DIM,
+                term::DIM.render_reset(),
+                action.to.display()
+            ));
+        }
+        if dry_run {
+            term::status(format_args!(
+                "{}dry run; no files moved{}",
+                term::DIM,
+                term::DIM.render_reset()
+            ));
+            return Ok(());
+        }
     }
 
     if !force {
@@ -206,15 +227,27 @@ pub(crate) async fn migrate_paths(
             .with_context(|| format!("failed to create migration target root {root}"))?;
     }
 
-    for action in actions {
-        migrate_path_action(&action, force)?;
+    for action in &actions {
+        migrate_path_action(action, force)?;
     }
 
-    println!("path migration complete");
+    if json {
+        return term::json(&PathMigrationReport {
+            dry_run,
+            actions: &actions,
+        });
+    }
+    term::success("path migration complete");
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize)]
+struct PathMigrationReport<'a> {
+    dry_run: bool,
+    actions: &'a [PathMigrationAction],
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct PathMigrationAction {
     from: PathBuf,
     to: PathBuf,
@@ -610,24 +643,24 @@ pub(super) async fn run_disk_test(
     let mut chunk = vec![0; DISK_TEST_CHUNK_BYTES];
     let mut seed = 0xD8E5_0001_u64;
 
-    println!(
+    term::status(format_args!(
         "disk test applying {quota_mib}MiB quota with method {} at {}",
         enforcement.method,
         write_path.display()
-    );
+    ));
 
     for written_mib in 0..write_mib {
         fill_probe_chunk(&mut chunk, &mut seed);
         match file.write_all(&chunk).await {
             Ok(_) => {
                 if written_mib == 0 || (written_mib + 1) % DISK_TEST_PROGRESS_INTERVAL_MIB == 0 {
-                    println!("disk test wrote {}MiB", written_mib + 1);
+                    term::status(format_args!("disk test wrote {}MiB", written_mib + 1));
                 }
             }
             Err(error) if is_quota_like_error(&error) => {
-                println!(
+                term::success(format_args!(
                     "disk test passed: write failed after about {written_mib}MiB with quota/full error: {error}"
-                );
+                ));
                 return Ok(());
             }
             Err(error) => {
@@ -663,9 +696,9 @@ pub(super) async fn cleanup_disk_test_path(limiter: &DiskLimiter, test_path: &Pa
     let _ = limiter.purge_instance_data(test_path).await;
     if let Err(error) = crate::io::files::ignore_missing(tokio::fs::remove_dir_all(test_path).await)
     {
-        eprintln!(
-            "warning: failed to remove disk test path {}: {error}",
+        term::warning(format_args!(
+            "failed to remove disk test path {}: {error}",
             test_path.display()
-        );
+        ));
     }
 }

@@ -1,7 +1,7 @@
 use crate::daemon::runtime_paths::{create_runtime_dirs, harden_runtime_dir};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufWriter, IsTerminal, Write},
+    io::{self, BufWriter, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -17,7 +17,10 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 
-use crate::{config::Config, utils::constants};
+use crate::{
+    config::Config,
+    utils::{constants, term},
+};
 
 const LOG_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_ARCHIVES: usize = 4;
@@ -77,15 +80,22 @@ fn log_queue() -> NonBlockingBuilder {
 }
 
 fn log_filter() -> EnvFilter {
-    EnvFilter::try_from_env(constants::RUST_LOG_ENV)
-        .unwrap_or_else(|_| EnvFilter::new("databases_everywhere=info,tower_http=info"))
+    let level = match (term::quiet(), term::verbosity()) {
+        (true, _) => "warn",
+        (false, 0) => "info",
+        (false, 1) => "debug",
+        (false, _) => "trace",
+    };
+    EnvFilter::try_from_env(constants::RUST_LOG_ENV).unwrap_or_else(|_| {
+        EnvFilter::new(format!("databases_everywhere={level},tower_http={level}"))
+    })
 }
 
 pub(crate) fn init_stdout_logging() {
     let _ = tracing_subscriber::registry()
         .with(InfoRateLimit::new())
         .with(log_filter())
-        .with(fmt::layer().with_ansi(io::stdout().is_terminal()))
+        .with(fmt::layer().with_ansi(term::stdout_color()))
         .try_init();
 }
 
@@ -104,7 +114,11 @@ pub(super) fn init_logging(config: &Config) -> anyhow::Result<WorkerGuard> {
         // The outer EnvFilter runs first; both outputs share this event budget.
         .with(InfoRateLimit::new())
         .with(log_filter())
-        .with(fmt::layer().with_ansi(io::stdout().is_terminal()))
+        .with(
+            fmt::layer()
+                .with_ansi(term::log_color())
+                .with_writer(term::log_writer),
+        )
         .with(fmt::layer().with_ansi(false).with_writer(file_writer))
         .try_init()
         .context("failed to initialize logging")?;

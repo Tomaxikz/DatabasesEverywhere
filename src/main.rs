@@ -7,14 +7,25 @@ compile_error!(
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
-fn main() -> anyhow::Result<()> {
-    databases_everywhere::commands::set_safe_umask();
+fn main() -> std::process::ExitCode {
+    use databases_everywhere::commands;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    commands::set_safe_umask();
+
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    let result = runtime.block_on(databases_everywhere::commands::run());
-
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-    result
+        .build()
+        .map_err(anyhow::Error::from)
+        .and_then(|runtime| {
+            let result = runtime.block_on(commands::run());
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            result
+        });
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            commands::report_error(&error);
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
