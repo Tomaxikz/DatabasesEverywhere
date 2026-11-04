@@ -60,7 +60,7 @@ pub async fn node_resource_summary(
         })
         .buffer_unordered(RESOURCE_FANOUT_LIMIT)
         .collect::<Vec<_>>();
-    let shared_runtime_usage = sampler::sample_shared_runtime_usage(&state, &runtimes, &instances);
+    let shared_runtime_usage = sampler::sample_shared_runtime_usage(&state, &runtimes);
     let volumes_root = state.config.paths.volumes_root();
     let (host_cpu, host_memory, host_disk, resource_reports, shared_runtime_usage) = tokio::join!(
         state.resource_cache.host_cpu_usage(),

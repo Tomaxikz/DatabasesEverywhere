@@ -672,7 +672,7 @@ fn managed_usage_counts_one_shared_runtime_once() {
         disk_usage: Ok(sampler::SharedDiskUsage {
             bytes: 350,
             sampled_at: Instant::now(),
-            source: sampler::SharedDiskUsageSource::FilesystemQuota,
+            source: sampler::SharedDiskUsageSource::FuseQuota,
         }),
     }];
 

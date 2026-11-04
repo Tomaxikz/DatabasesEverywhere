@@ -292,7 +292,6 @@ fn host_disk_from_statvfs(stats: &rustix::fs::StatVfs) -> Result<HostDiskSample,
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SharedDiskUsageSource {
-    FilesystemQuota,
     FuseQuota,
     ResourceDiskSampler,
 }
@@ -432,7 +431,6 @@ pub(super) fn runtime_targets(
 pub(super) async fn sample_shared_runtime_usage(
     state: &AppState,
     runtimes: &[EngineRuntime],
-    instances: &[InstanceMetadata],
 ) -> Vec<SharedRuntimeUsage> {
     let shared = runtimes
         .iter()
@@ -442,22 +440,13 @@ pub(super) async fn sample_shared_runtime_usage(
     futures::stream::iter(shared)
         .map(|runtime| {
             let state = state.clone();
-            let hard_tenants = instances
-                .iter()
-                .filter(|metadata| {
-                    metadata.deployment_mode == DeploymentMode::Shared
-                        && metadata.runtime_id() == runtime.runtime_id
-                        && metadata.limits.disk_enforced
-                })
-                .cloned()
-                .collect::<Vec<_>>();
             async move {
                 let runtime_stats = state
                     .resource_cache
                     .runtime_stats_snapshot(&runtime.runtime_id)
                     .await;
                 let stats = runtime_stats.fresh_sample();
-                let disk_usage = shared_runtime_disk_usage(&state, &runtime, hard_tenants).await;
+                let disk_usage = shared_runtime_disk_usage(&state, &runtime).await;
                 SharedRuntimeUsage {
                     runtime_id: runtime.runtime_id,
                     expects_live_sample: matches!(
@@ -476,17 +465,14 @@ pub(super) async fn sample_shared_runtime_usage(
         .await
 }
 
-/// A native project counter on the shared-pool root deliberately excludes nested hard tenant
-/// projects.
 async fn shared_runtime_disk_usage(
     state: &AppState,
     runtime: &EngineRuntime,
-    hard_tenants: Vec<InstanceMetadata>,
 ) -> Result<SharedDiskUsage, String> {
     let paths = InstancePaths::new(&state.config.paths, &runtime.runtime_id)
         .map_err(|error| error.to_string())?;
-    let (root_bytes, sampled_at, source) = if runtime.limits.disk_enforced {
-        let root_bytes = crate::server::disk::DiskLimiter::with_fuse_root(
+    let counter = if runtime.limits.disk_enforcement_method == "fuse_quota" {
+        crate::server::disk::DiskLimiter::with_fuse_root(
             state.config.disk.clone(),
             state.config.paths.fuse_root(),
         )
@@ -494,73 +480,25 @@ async fn shared_runtime_disk_usage(
         .instance_usage_bytes(&paths.data)
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "shared runtime {} claims a hard disk boundary without an authoritative usage counter",
-                runtime.runtime_id
-            )
-        })?;
-        let source = if runtime.limits.disk_enforcement_method == "fuse_quota" {
-            SharedDiskUsageSource::FuseQuota
-        } else {
-            SharedDiskUsageSource::FilesystemQuota
-        };
-        (root_bytes, Instant::now(), source)
     } else {
-        let sample = state
-            .resource_cache
-            .disk_usage(&state.config, &runtime.runtime_id, paths.data)
-            .await?;
-        (
-            sample.used_bytes,
-            sample.sampled_at,
-            SharedDiskUsageSource::ResourceDiskSampler,
-        )
+        None
     };
-
-    let child_usage = futures::stream::iter(hard_tenants)
-        .map(|metadata| {
-            let state = state.clone();
-            async move {
-                if metadata.protocol != runtime.protocol {
-                    return Err(format!(
-                        "shared runtime {} has a hard tenant with a mismatched protocol",
-                        runtime.runtime_id
-                    ));
-                }
-                super::shared_disk::usage(&state, &metadata).await
-            }
-        })
-        .buffer_unordered(RESOURCE_FANOUT_LIMIT)
-        .collect::<Vec<_>>()
-        .await;
-    let bytes = managed_disk_total(
-        root_bytes,
-        &runtime.limits.disk_enforcement_method,
-        child_usage,
-    )?;
-    Ok(SharedDiskUsage {
-        bytes,
-        sampled_at,
-        source,
-    })
-}
-
-fn managed_disk_total(
-    root_bytes: u64,
-    root_method: &str,
-    children: impl IntoIterator<Item = Result<u64, String>>,
-) -> Result<u64, String> {
-    if !matches!(
-        root_method,
-        "host_xfs_project_quota" | "host_linux_project_quota"
-    ) {
-        return Ok(root_bytes);
+    if let Some(bytes) = counter {
+        return Ok(SharedDiskUsage {
+            bytes,
+            sampled_at: Instant::now(),
+            source: SharedDiskUsageSource::FuseQuota,
+        });
     }
-    children.into_iter().try_fold(root_bytes, |total, child| {
-        total
-            .checked_add(child?)
-            .ok_or_else(|| "managed shared-pool disk usage overflowed u64".to_string())
+    // Native quotas have no pool-wide counter here; the scan includes nested tenants.
+    let sample = state
+        .resource_cache
+        .disk_usage(&state.config, &runtime.runtime_id, paths.data)
+        .await?;
+    Ok(SharedDiskUsage {
+        bytes: sample.used_bytes,
+        sampled_at: sample.sampled_at,
+        source: SharedDiskUsageSource::ResourceDiskSampler,
     })
 }
 
@@ -799,34 +737,50 @@ async fn run_runtime_stats_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::managed_disk_total;
+    use super::*;
+    use crate::config::Config;
+    use crate::subsystems::monitoring::resources::Protocol;
 
-    #[test]
-    fn shared_disk_total_counts_root_and_each_hard_child_once() {
-        assert_eq!(
-            managed_disk_total(100, "host_linux_project_quota", [Ok(20), Ok(30)]).unwrap(),
-            150
+    #[tokio::test]
+    async fn native_quota_pools_report_scanned_disk_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            remote: "https://panel.example.test".into(),
+            ..Default::default()
+        };
+        config.paths.backups = directory.path().join("backups").display().to_string();
+        let (state, _db) = crate::subsystems::test_support::database(config).await;
+        let mut pool = crate::server::placement::test_support::runtime(
+            "pool_native",
+            Protocol::Postgres,
+            "test-image",
         );
-    }
+        for method in [
+            "host_btrfs_qgroup",
+            "host_zfs_refquota",
+            "host_xfs_project_quota",
+            "host_linux_project_quota",
+        ] {
+            pool.limits.disk_enforced = true;
+            pool.limits.disk_enforcement_method = method.into();
+            state
+                .resource_cache
+                .store_disk_usage(
+                    pool.runtime_id.clone(),
+                    super::super::CachedDiskUsage {
+                        used_bytes: 42,
+                        sampled_at: Instant::now(),
+                    },
+                )
+                .await;
 
-    #[test]
-    fn complete_root_quota_is_not_double_counted() {
-        assert_eq!(
-            managed_disk_total(100, "fuse_quota", [Ok(20), Ok(30)]).unwrap(),
-            100
-        );
-    }
+            let usage = shared_runtime_disk_usage(&state, &pool).await.unwrap();
 
-    #[test]
-    fn incomplete_or_overflowing_shared_disk_totals_fail_closed() {
-        assert!(
-            managed_disk_total(
-                100,
-                "host_xfs_project_quota",
-                [Err("missing child".to_string())]
-            )
-            .is_err()
-        );
-        assert!(managed_disk_total(u64::MAX, "host_xfs_project_quota", [Ok(1)]).is_err());
+            assert_eq!(usage.bytes, 42, "{method}");
+            assert!(matches!(
+                usage.source,
+                SharedDiskUsageSource::ResourceDiskSampler
+            ));
+        }
     }
 }

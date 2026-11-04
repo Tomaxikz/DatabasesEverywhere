@@ -263,8 +263,7 @@ pub(crate) async fn pool_reports(
     state: &AppState,
     runtimes: &[EngineRuntime],
 ) -> Result<Vec<SharedPoolReport>, ApiError> {
-    let instances = state.instances.list().await;
-    let usage = sample_shared_runtime_usage(state, runtimes, &instances)
+    let usage = sample_shared_runtime_usage(state, runtimes)
         .await
         .into_iter()
         .map(|usage| (usage.runtime_id.clone(), usage))
@@ -495,11 +494,6 @@ fn disk_metric(
         Ok(sample) => sample,
         Err(error) => {
             let warming = error.contains("still in progress");
-            tracing::debug!(
-                %runtime_id,
-                %error,
-                "shared pool disk sample unavailable"
-            );
             let (state, code, message) = if warming {
                 (
                     PoolMetricState::Warming,
@@ -507,6 +501,7 @@ fn disk_metric(
                     "the shared pool disk scan is still in progress",
                 )
             } else {
+                tracing::warn!(%runtime_id, %error, "shared pool disk sample failed");
                 (
                     PoolMetricState::Failed,
                     "disk_sample_failed",
@@ -577,7 +572,6 @@ fn disk_source(runtime: &EngineRuntime) -> PoolMetricSource {
 impl From<SharedDiskUsageSource> for PoolMetricSource {
     fn from(source: SharedDiskUsageSource) -> Self {
         match source {
-            SharedDiskUsageSource::FilesystemQuota => Self::FilesystemQuota,
             SharedDiskUsageSource::FuseQuota => Self::FuseQuota,
             SharedDiskUsageSource::ResourceDiskSampler => Self::ResourceDiskSampler,
         }
@@ -971,16 +965,12 @@ mod tests {
         let fresh = Ok(SharedDiskUsage {
             bytes: 42,
             sampled_at: clock.instant - Duration::from_secs(1),
-            source: SharedDiskUsageSource::FilesystemQuota,
+            source: SharedDiskUsageSource::FuseQuota,
         });
-        let (usage, sample) = disk_metric(
-            "pool-a",
-            PoolMetricSource::FilesystemQuota,
-            Some(&fresh),
-            clock,
-        );
+        let (usage, sample) =
+            disk_metric("pool-a", PoolMetricSource::FuseQuota, Some(&fresh), clock);
         assert_eq!(usage, Some(42));
-        assert_eq!(sample.source, PoolMetricSource::FilesystemQuota);
+        assert_eq!(sample.source, PoolMetricSource::FuseQuota);
         assert_eq!(sample.state, PoolMetricState::Fresh);
         assert_eq!(sample.sampled_at_unix, Some(999));
 
