@@ -17,28 +17,58 @@ const DEFAULT_TTL_SECONDS: i64 = 900;
 const MAX_TTL_SECONDS: i64 = 3600;
 const MAX_TARGETS: usize = 256;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(
+    as = WsTokenRequest,
+    description = "Use either instances with instance scopes, or pools plus server_id with pool scopes."
+)]
 pub struct IssueWsTokenRequest {
     #[serde(default)]
+    #[schema(max_items = 256)]
     pub pools: Vec<String>,
     pub server_id: Option<String>,
     pub subject: String,
+    #[schema(schema_with = ws_scopes_schema)]
     pub scopes: Vec<String>,
     #[serde(default)]
+    #[schema(max_items = 256)]
     pub instances: Vec<String>,
     #[serde(default)]
     pub all_instances: bool,
+    #[schema(minimum = 1, maximum = 3600, default = 900)]
     pub ttl_seconds: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+fn ws_scopes_schema() -> utoipa::openapi::Array {
+    let scopes = [
+        scopes::MONITOR_READ,
+        scopes::LOGS_READ,
+        scopes::IMPORT_EXPORT_READ,
+        scopes::POOLS_MONITOR,
+        scopes::POOLS_LOGS,
+    ];
+    utoipa::openapi::Array::new(crate::routes::openapi::literal(scopes.map(Into::into)))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = WsTokenResponse)]
 pub struct IssueWsTokenResponse {
+    #[schema(schema_with = crate::routes::openapi::literals::bearer)]
     pub token_type: &'static str,
     pub token: String,
     pub expires_at_unix: i64,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/ws-token",
+    tag = "monitoring",
+    summary = "Issue short-lived WebSocket JWT for monitoring/log streams.",
+    extensions(("x-required-scope" = json!(scopes::WS_TOKENS_WRITE))),
+    request_body = IssueWsTokenRequest,
+    responses((status = 200, description = "WebSocket token.", body = IssueWsTokenResponse))
+)]
 pub async fn issue_ws_token(
     State(state): State<AppState>,
     auth: ApiRequestContext,

@@ -19,12 +19,18 @@ pub(super) struct SchedulerResourceSample {
     pub(super) cpu_valid: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportExportSchedulerCapacity)]
 pub struct SchedulerCapacity {
+    #[schema(inline)]
     pub mode: SchedulerMode,
+    #[schema(minimum = 1)]
     pub max_active_jobs: usize,
+    #[schema(minimum = 1)]
     pub memory_budget_mib: u64,
+    #[schema(minimum = 1)]
     pub io_budget_mib: u64,
+    #[schema(minimum = 1)]
     pub cpu_units: usize,
 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use databases_everywhere::{auth::scopes, subsystems::system::API_VERSION};
+use databases_everywhere::{auth::scopes, routes::openapi, subsystems::system::API_VERSION};
 use yaml_serde::Value;
 
 const INSTANCE_PATHS: &[&str] = &[
@@ -180,6 +180,13 @@ fn router_operations(source: &str) -> HashSet<String> {
         .collect()
 }
 
+fn literal(schema: &Value) -> Option<&str> {
+    match schema["enum"].as_sequence().map(Vec::as_slice) {
+        Some([value]) => value.as_str(),
+        _ => None,
+    }
+}
+
 fn property_names(schema: &Value) -> HashSet<&str> {
     schema["properties"]
         .as_mapping()
@@ -187,6 +194,20 @@ fn property_names(schema: &Value) -> HashSet<&str> {
         .keys()
         .map(|key| key.as_str().expect("property names must be strings"))
         .collect()
+}
+
+#[test]
+fn committed_openapi_matches_the_code() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/api/openapi.yml");
+    let generated = openapi::yaml();
+    if std::env::var_os("DBEV_WRITE_OPENAPI").is_some() {
+        std::fs::write(path, &generated).expect("openapi.yml must be writable");
+    }
+    let committed = std::fs::read_to_string(path).expect("openapi.yml must be readable");
+    assert!(
+        committed == generated,
+        "docs/api/openapi.yml is out of date; run `DBEV_WRITE_OPENAPI=1 cargo test --test openapi_contract`"
+    );
 }
 
 #[test]
@@ -426,7 +447,7 @@ fn openapi_describes_the_current_response_contract() {
     assert!(!system_properties.contains("daemon_disk_enforcement_method"));
     assert!(system_properties.contains("gateways"));
     assert_eq!(
-        schemas["SystemResponse"]["properties"]["api_readiness"]["const"].as_str(),
+        literal(&schemas["SystemResponse"]["properties"]["api_readiness"]),
         Some("ready")
     );
     assert_eq!(
@@ -473,7 +494,7 @@ fn openapi_describes_the_current_response_contract() {
         .collect();
     assert!(protocols.contains("mysql"));
     assert_eq!(
-        schemas["HeartbeatResponse"]["properties"]["status"]["const"].as_str(),
+        literal(&schemas["HeartbeatResponse"]["properties"]["status"]),
         Some("ok")
     );
     let instance_statuses: HashSet<&str> = schemas["Instance"]["properties"]["status"]["enum"]

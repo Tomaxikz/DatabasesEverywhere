@@ -3,11 +3,16 @@ use serde::Serialize;
 use super::MIB;
 use crate::{databases::protocol::Protocol, utils::limits::bytes_to_mib_ceil};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportExportJobResourceCost)]
 pub struct JobResourceCost {
+    #[schema(minimum = 1)]
     pub input_size_bytes: u64,
+    #[schema(minimum = 1)]
     pub memory_mib: u64,
+    #[schema(minimum = 1)]
     pub io_mib: u64,
+    #[schema(minimum = 1)]
     pub cpu_units: usize,
 }
 

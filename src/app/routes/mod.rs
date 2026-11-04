@@ -14,3 +14,4 @@ pub(crate) fn router() -> Router<AppState> {
 }
 
 pub mod http;
+pub mod openapi;

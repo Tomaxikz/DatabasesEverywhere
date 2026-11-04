@@ -238,11 +238,13 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorBody {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = Error)]
+pub(crate) struct ErrorBody {
     error: String,
     code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(format = Uuid)]
     error_id: Option<String>,
 }
 

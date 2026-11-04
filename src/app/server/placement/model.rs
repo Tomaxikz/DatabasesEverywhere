@@ -10,8 +10,13 @@ use crate::{
 
 pub const ENGINE_RUNTIME_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
+#[schema(
+    description = "Shared is available only for PostgreSQL, MySQL, MariaDB, MongoDB, and ClickHouse."
+)]
 pub enum DeploymentMode {
     #[default]
     Dedicated,

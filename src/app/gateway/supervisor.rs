@@ -36,8 +36,10 @@ struct GatewayState {
     failure: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[schema(as = GatewayReadiness)]
 pub struct GatewayReadinessSnapshot {
+    #[schema(schema_with = crate::routes::openapi::literals::gateway_status)]
     pub status: &'static str,
     pub expected_listeners: usize,
     pub ready_listeners: usize,

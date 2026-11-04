@@ -49,14 +49,15 @@ pub use self::cost::{
 };
 use self::dispatch::{dispatch, release};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerMode {
     Dynamic,
     Manual,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportExportSchedulerSnapshot)]
 pub struct SchedulerSnapshot {
     pub capacity: SchedulerCapacity,
     pub active_jobs: usize,

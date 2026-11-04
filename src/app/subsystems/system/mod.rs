@@ -18,20 +18,25 @@ use crate::{
 
 pub const API_VERSION: &str = "0.17.0";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DeploymentCapability {
     pub protocol: Protocol,
     pub enabled: bool,
+    #[schema(min_items = 1)]
     pub modes: Vec<DeploymentMode>,
+    #[schema(required, schema_with = crate::routes::openapi::literals::shared_pool_scope)]
     pub shared_pool_scope: Option<&'static str>,
     pub server_private_pools: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SystemResponse {
+    #[schema(schema_with = crate::routes::openapi::literals::databases_everywhere)]
     pub service: &'static str,
     pub version: &'static str,
+    #[schema(example = "0.17.0")]
     pub api_version: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::ready)]
     pub api_readiness: &'static str,
     pub uuid: String,
     pub token_id: String,
@@ -40,11 +45,16 @@ pub struct SystemResponse {
     pub api_port: u16,
     pub api_bind: String,
     pub api_ssl_enabled: bool,
+    #[schema(minimum = 1)]
     pub api_rate_limit_per_minute: u32,
+    #[schema(schema_with = crate::routes::openapi::literals::credential_and_peer_ip)]
     pub api_rate_limit_scope: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::daemon_engine)]
     pub daemon_engine: &'static str,
     pub daemon_socket: String,
+    #[schema(schema_with = crate::routes::openapi::literals::none)]
     pub database_container_network_mode: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::unix_socket)]
     pub database_backend_transport: &'static str,
     pub daemon_disk_limits_enforced: bool,
     pub disk_mode: &'static str,
@@ -67,6 +77,17 @@ pub struct SystemResponse {
     pub gateways: crate::gateway::supervisor::GatewayReadinessSnapshot,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system",
+    tag = "system",
+    summary = "Get daemon runtime/configuration summary.",
+    extensions(("x-required-scope" = json!(scopes::SYSTEM_READ))),
+    responses(
+        (status = 200, description = "System status.", body = SystemResponse),
+        (status = 401, response = crate::routes::openapi::Unauthorized),
+    )
+)]
 pub async fn system(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -138,37 +159,70 @@ fn clickhouse_http_port(bind: &str) -> u16 {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct HeartbeatResponse {
+    #[schema(schema_with = crate::routes::openapi::literals::ok)]
     pub status: &'static str,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/heartbeat",
+    tag = "system",
+    summary = "Lightweight authenticated API liveness check.",
+    description = "Returns success when the authenticated management API is reachable, independently of database instance and gateway readiness.",
+    extensions(("x-required-scope" = json!(scopes::SYSTEM_READ))),
+    responses((status = 200, description = "Heartbeat response.", body = HeartbeatResponse))
+)]
 pub async fn heartbeat(auth: ApiRequestContext) -> ApiResult<HeartbeatResponse> {
     auth.require_scope(scopes::SYSTEM_READ)?;
     Ok(ApiResponse::ok(HeartbeatResponse { status: "ok" }))
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct ImportExportSchedulerEstimateQuery {
+    #[param(value_type = Option<Protocol>)]
     pub protocol: Option<String>,
+    #[param(schema_with = crate::routes::openapi::literals::action, default = "import")]
     pub action: Option<String>,
+    #[param(minimum = 1, maximum = 68719476736_u64)]
     pub size_bytes: Option<u64>,
+    #[param(minimum = 1)]
     pub target_disk_mib: Option<u64>,
+    #[param(schema_with = crate::routes::openapi::literals::transfer_mode, default = "merge")]
     pub mode: Option<String>,
+    #[param(default = false)]
     pub compressed: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportExportSchedulerRecommendation)]
 pub struct ImportExportSchedulerRecommendationResponse {
     pub scheduler: crate::server::jobs::import_export::SchedulerSnapshot,
     pub estimate: crate::server::jobs::import_export::JobResourceCost,
     pub recommended_active_jobs: usize,
     pub admitted_jobs: usize,
+    #[schema(minimum = 1)]
     pub max_queued_jobs: usize,
+    #[schema(minimum = 1)]
     pub max_queued_jobs_per_instance: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/import-export-scheduler/recommendation",
+    tag = "system",
+    summary = "Inspect live import/export scheduling capacity and estimate representative concurrency.",
+    description = "The recommendation is a conservative resource model, not a measured throughput guarantee. A result of zero means the live memory budget cannot safely fit one modelled job and must not be coerced to one. CPU and I/O are concurrency weights; a memory-safe job that exceeds either whole weight budget may run only as one isolated job. A compressed logical import is charged at the configured prepared-data ceiling because its expansion ratio is not trusted before bounded extraction; compressed Redis, Valkey, and Qdrant physical imports are charged at the target disk allocation, capped by the physical archive limit. MongoDB, Redis, Valkey, and Qdrant are always modelled as natively compressed. action=export with mode=wipe is invalid.",
+    extensions(("x-required-scope" = json!(scopes::SYSTEM_READ))),
+    params(ImportExportSchedulerEstimateQuery),
+    responses(
+        (status = 200, description = "Live scheduler snapshot and model-based recommendation.", body = ImportExportSchedulerRecommendationResponse),
+        (status = 401, response = crate::routes::openapi::Unauthorized),
+    )
+)]
 pub async fn scheduler_recommendation(
     State(state): State<AppState>,
     auth: ApiRequestContext,

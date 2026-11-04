@@ -11,6 +11,14 @@ use crate::{
     server::jobs::import_export::ImportExportStatus,
 };
 
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "system",
+    summary = "Get Prometheus metrics for the daemon.",
+    extensions(("x-required-scope" = json!(scopes::METRICS_READ))),
+    responses((status = 200, description = "Prometheus text exposition.", body = String, content_type = "text/plain"))
+)]
 pub async fn metrics(
     State(state): State<AppState>,
     auth: ApiRequestContext,

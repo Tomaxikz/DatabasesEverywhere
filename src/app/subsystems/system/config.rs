@@ -31,7 +31,7 @@ const FORBIDDEN_PATCH_PATHS: &[&[&str]] = &[
     &["backups", "storage", "kopia", "config_file"],
 ];
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ConfigPatchResponse {
     pub applied: bool,
     pub restart_required: bool,
@@ -53,6 +53,16 @@ impl ConfigPatchCoordinator {
     }
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/system/config",
+    tag = "system",
+    summary = "Merge a validated config patch into the daemon config file.",
+    description = "Writes config.yml and returns restart_required=true. Refuses identity/token, managed-path, container-image, S3-endpoint, executable-helper, and Fuse helper edits, including replacement or removal of their ancestors. The allocation.prevent_cpu_overallocation, allocation.prevent_memory_overallocation, and allocation.prevent_disk_overallocation booleans may be changed independently; all default to true.",
+    extensions(("x-required-scope" = json!(scopes::CONFIG_ADMIN))),
+    request_body = std::collections::HashMap<String, Value>,
+    responses((status = 200, description = "Config patch applied.", body = ConfigPatchResponse))
+)]
 pub async fn patch_config(
     State(state): State<AppState>,
     auth: ApiRequestContext,
