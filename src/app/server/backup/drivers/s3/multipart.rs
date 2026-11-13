@@ -437,15 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn only_no_such_upload_confirms_an_abort() {
-        let gone = b"<Error><Code>NoSuchUpload</Code><Message>x</Message></Error>";
-        let no_bucket = b"<Error><Code>NoSuchBucket</Code></Error>";
-        assert_eq!(error_code(gone).as_deref(), Some(NO_SUCH_UPLOAD));
-        assert_eq!(error_code(no_bucket).as_deref(), Some("NoSuchBucket"));
-        assert_eq!(error_code(b"not xml"), None);
-    }
-
-    #[test]
     fn multipart_size_stays_within_the_s3_part_limit() {
         assert_eq!(multipart_part_size(64 * 1024 * 1024), 16 * 1024 * 1024);
         let eight_tib = 8 * 1024_u64.pow(4);

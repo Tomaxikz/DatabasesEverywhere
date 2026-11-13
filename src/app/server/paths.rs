@@ -427,10 +427,6 @@ mod tests {
             })
         );
         assert_eq!(default_owner_for(1001, 1002), None);
-    }
-
-    #[test]
-    fn physical_restore_reapplies_the_data_roots_existing_owner() {
         assert_eq!(
             existing_owner_for(1001, 1002),
             HostOwner {

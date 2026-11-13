@@ -218,23 +218,6 @@ fn exposes_the_open_root_device_and_inode_without_following_a_symlink() {
 }
 
 #[test]
-fn cache_retains_the_caller_target_generation_and_root_identity() {
-    let temporary = tempfile::tempdir().unwrap();
-    let cache = UsageTreeCache::scan_full(
-        temporary.path(),
-        "opaque-instance-fingerprint".to_string(),
-        limits(),
-    )
-    .unwrap();
-
-    assert_eq!(cache.target_generation, "opaque-instance-fingerprint");
-    assert_eq!(
-        cache.root_identity,
-        root_identity(temporary.path()).unwrap()
-    );
-}
-
-#[test]
 fn modifying_a_nested_file_reconciles_only_its_dirty_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("data");
@@ -701,69 +684,45 @@ fn cached_directory_count_tracks_subtree_creation_and_deletion() {
 }
 
 #[test]
-fn a_missing_cached_child_requires_full_reconciliation_without_mutation() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("data");
-    fs::create_dir_all(root.join("a/b")).unwrap();
-    let mut cache = baseline(&root);
-    cache.nodes.remove(Path::new("a/b"));
-    let before = cache.usage();
+fn a_corrupted_cache_requires_full_reconciliation_without_mutation() {
+    type Corrupt = fn(&mut UsageTreeCache);
+    let corruptions: [(&str, &str, Corrupt); 4] = [
+        ("missing child", "a/b", |cache| {
+            cache.nodes.remove(Path::new("a/b"));
+        }),
+        ("inconsistent aggregate", "a", |cache| {
+            cache
+                .nodes
+                .get_mut(Path::new(""))
+                .unwrap()
+                .total
+                .logical_bytes += 1;
+        }),
+        ("missing root", "a", |cache| {
+            cache.nodes.remove(Path::new(""));
+        }),
+        ("unsafe child component", "a", |cache| {
+            cache
+                .nodes
+                .get_mut(Path::new(""))
+                .unwrap()
+                .children
+                .insert(OsString::from("../escape"));
+        }),
+    ];
+    for (name, tree, corrupt) in corruptions {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("data");
+        fs::create_dir_all(root.join(tree)).unwrap();
+        let mut cache = baseline(&root);
+        corrupt(&mut cache);
+        let before = cache.usage();
 
-    let error = reconcile(&mut cache, &root, &["a"]).unwrap_err();
+        let error = reconcile(&mut cache, &root, &["a"]).unwrap_err();
 
-    assert!(error.requires_full_scan());
-    assert_eq!(cache.usage(), before);
-}
-
-#[test]
-fn an_inconsistent_cached_aggregate_requires_full_reconciliation() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("data");
-    fs::create_dir_all(root.join("a")).unwrap();
-    let mut cache = baseline(&root);
-    cache
-        .nodes
-        .get_mut(Path::new(""))
-        .unwrap()
-        .total
-        .logical_bytes += 1;
-    let before = cache.usage();
-
-    let error = reconcile(&mut cache, &root, &["a"]).unwrap_err();
-
-    assert!(error.requires_full_scan());
-    assert_eq!(cache.usage(), before);
-}
-
-#[test]
-fn a_missing_root_cache_node_requires_full_reconciliation() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("data");
-    fs::create_dir_all(root.join("a")).unwrap();
-    let mut cache = baseline(&root);
-    cache.nodes.remove(Path::new(""));
-
-    let error = reconcile(&mut cache, &root, &["a"]).unwrap_err();
-
-    assert!(error.requires_full_scan());
-}
-
-#[test]
-fn an_unsafe_cached_child_component_requires_full_reconciliation() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path().join("data");
-    fs::create_dir_all(root.join("a")).unwrap();
-    let mut cache = baseline(&root);
-    cache
-        .nodes
-        .get_mut(Path::new(""))
-        .unwrap()
-        .children
-        .insert(OsString::from("../escape"));
-
-    let error = reconcile(&mut cache, &root, &["a"]).unwrap_err();
-
-    assert!(error.requires_full_scan());
+        assert!(error.requires_full_scan(), "{name}");
+        assert_eq!(cache.usage(), before, "{name}");
+    }
 }
 
 #[test]

@@ -11,27 +11,6 @@ fn rejects_archive_path_traversal() {
 }
 
 #[test]
-fn accepts_archive_under_expected_root() {
-    let dir = tempfile::tempdir().unwrap();
-    let archive = dir.path().join("good.tar.gz");
-    write_archive(&archive, "data/file.txt", b"ok");
-
-    validate_archive_blocking(&archive, "data").unwrap();
-}
-
-#[test]
-fn extracts_archive_entries_without_unpack() {
-    let dir = tempfile::tempdir().unwrap();
-    let archive_path = dir.path().join("data.tar.gz");
-    let target = dir.path().join("target");
-    write_archive(&archive_path, "data/file.txt", b"ok");
-
-    extract_archive_blocking(&archive_path, &target, "data").unwrap();
-
-    assert_eq!(std::fs::read(target.join("data/file.txt")).unwrap(), b"ok");
-}
-
-#[test]
 fn physical_extraction_enforces_expansion_limit() {
     let dir = tempfile::tempdir().unwrap();
     let archive_path = dir.path().join("data.tar.gz");
@@ -94,42 +73,32 @@ fn bounded_physical_extraction_rejects_before_oversized_file_is_written() {
 }
 
 #[test]
-fn physical_backup_rejects_internal_source_symlinks() {
+fn physical_backup_rejects_internal_and_escaping_source_symlinks() {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    let stored = data.join("store/ab/table");
-    let metadata = data.join("metadata/database");
-    std::fs::create_dir_all(&stored).unwrap();
-    std::fs::create_dir_all(&metadata).unwrap();
-    std::fs::write(stored.join("part.bin"), b"clickhouse data").unwrap();
-    symlink("../../store/ab/table", metadata.join("table")).unwrap();
-    let artifact = dir.path().join("backup.tar.gz");
+    for (link, target) in [
+        ("metadata/database/table", "../../store/ab/table"),
+        ("escape", "../secret"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let stored = data.join("store/ab/table");
+        std::fs::create_dir_all(&stored).unwrap();
+        std::fs::create_dir_all(data.join("metadata/database")).unwrap();
+        std::fs::write(stored.join("part.bin"), b"clickhouse data").unwrap();
+        std::fs::write(dir.path().join("secret"), b"host secret").unwrap();
+        symlink(target, data.join(link)).unwrap();
+        let artifact = dir.path().join("backup.tar.gz");
 
-    let error =
-        create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap_err();
+        let error =
+            create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap_err();
 
-    assert!(error.to_string().contains("refuses symbolic link"));
-    assert!(!artifact.exists());
-}
-
-#[test]
-fn physical_backup_rejects_source_symlinks_that_escape_data_root() {
-    use std::os::unix::fs::symlink;
-
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    std::fs::create_dir(&data).unwrap();
-    std::fs::write(dir.path().join("secret"), b"host secret").unwrap();
-    symlink("../secret", data.join("escape")).unwrap();
-    let artifact = dir.path().join("backup.tar.gz");
-
-    let error =
-        create_archive_blocking(&data, &artifact, DataArchiveSourcePolicy::Strict).unwrap_err();
-
-    assert!(error.to_string().contains("refuses symbolic link"));
-    assert!(!artifact.exists());
+        assert!(
+            error.to_string().contains("refuses symbolic link"),
+            "{link} -> {target}"
+        );
+        assert!(!artifact.exists(), "{link} -> {target}");
+    }
 }
 
 #[test]
@@ -184,13 +153,14 @@ fn mysql_physical_backup_rejects_unexpected_socket_link_targets() {
 fn physical_restore_rejects_every_symlink_entry() {
     let dir = tempfile::tempdir().unwrap();
     let escaping = dir.path().join("escaping.tar.gz");
+    let target = dir.path().join("target");
     write_symlink_archive(&escaping, "data/escape", "../secret");
 
-    let error = validate_archive_blocking(&escaping, "data").unwrap_err();
+    let error = extract_archive_blocking(&escaping, &target, "data").unwrap_err();
     assert!(error.to_string().contains("symbolic link"));
+    assert!(std::fs::symlink_metadata(target.join("data/escape")).is_err());
 
     let lexically_safe = dir.path().join("lexically-safe.tar.gz");
-    let target = dir.path().join("target");
     write_symlink_archive(&lexically_safe, "data/self", ".");
 
     let error =

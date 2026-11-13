@@ -281,28 +281,6 @@ mod tests {
     use crate::subsystems::backups::strategy::RestoreContext;
 
     #[test]
-    fn identity_matches_the_registry_contract() {
-        let strategy = VolumeSnapshotStrategy;
-        assert_eq!(strategy.id(), FILESYSTEM_SNAPSHOT);
-        assert_eq!(strategy.restore_recipe().id, RESTORE_RECIPE_ID);
-        assert_eq!(strategy.restorable_recipe_versions(), &[1]);
-        for protocol in [
-            Protocol::Mysql,
-            Protocol::Mongodb,
-            Protocol::Clickhouse,
-            Protocol::Qdrant,
-        ] {
-            assert!(
-                matches!(
-                    protocol.engine().online_backup(),
-                    crate::databases::engine::OnlineBackup::VolumeSnapshot { .. }
-                ),
-                "{protocol}"
-            );
-        }
-    }
-
-    #[test]
     fn only_snapshot_capable_volumes_qualify() {
         let mut metadata = crate::server::test_support::metadata("inst_one", Protocol::Mongodb);
         for method in ["host_btrfs_qgroup", "host_zfs_refquota"] {

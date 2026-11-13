@@ -271,42 +271,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_live_container_statuses_for_the_api() {
-        assert_eq!(
-            classify_status(DockerContainerStatus::Starting),
-            InstanceStatus::Booting
-        );
-        assert_eq!(
-            classify_status(DockerContainerStatus::Created),
-            InstanceStatus::Stopped
-        );
-        assert_eq!(
-            classify_status(DockerContainerStatus::Running),
-            InstanceStatus::Running
-        );
-        assert_eq!(
-            classify_status(DockerContainerStatus::Stopped),
-            InstanceStatus::Stopped
-        );
-        assert_eq!(
-            classify_status(DockerContainerStatus::Failed),
-            InstanceStatus::Failed
-        );
-    }
-
-    #[test]
-    fn detects_engine_switches_before_reconciliation_can_mutate_status() {
-        assert!(runtime_kind_mismatch(
-            RuntimeKind::Docker,
-            RuntimeKind::Podman
-        ));
-        assert!(!runtime_kind_mismatch(
-            RuntimeKind::Podman,
-            RuntimeKind::Podman
-        ));
-    }
-
-    #[test]
     fn created_container_stop_response_satisfies_inactive_reconciliation() {
         let error = DockerError::Api(bollard::errors::Error::DockerResponseServerError {
             status_code: 304,

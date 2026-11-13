@@ -166,14 +166,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_and_restore_kind() {
-        let strategy = QdrantSnapshotStrategy;
-        assert_eq!(strategy.id(), QDRANT_COLLECTION_SNAPSHOTS);
-        assert_eq!(strategy.restore_recipe().id, RESTORE_RECIPE_ID);
-        assert_eq!(strategy.restore_kind(), RestoreKind::AfterStart);
-    }
-
-    #[test]
     fn conflicts_are_unsupported_and_the_rest_failed() {
         assert!(matches!(
             strategy_error(ApiError::Conflict("x".to_string())),

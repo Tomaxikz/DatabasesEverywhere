@@ -6,7 +6,7 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 mod catalog;
 mod checks;
-mod handlers;
+pub(crate) mod handlers;
 pub(crate) mod native;
 mod online;
 mod publication;

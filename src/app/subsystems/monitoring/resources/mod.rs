@@ -37,7 +37,7 @@ mod network;
 
 mod sampler;
 
-mod pools;
+pub(crate) mod pools;
 
 mod shared_disk;
 
@@ -110,7 +110,7 @@ pub(crate) struct CachedDiskUsage {
 mod background;
 mod cache;
 mod disk;
-mod handlers;
+pub(crate) mod handlers;
 mod reports;
 pub(crate) use background::prime_shared_disk_quotas;
 pub use background::start_resource_sampler;

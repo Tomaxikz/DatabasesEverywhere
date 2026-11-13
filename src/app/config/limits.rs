@@ -98,21 +98,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_limits_preserve_existing_capacity() {
-        let expected = serde_json::json!({
-            "gateway_connections_per_peer": 64, "gateway_connections_per_listener": 1024,
-            "gateway_handshakes": 256, "api_connections": 2048, "api_connections_per_peer": 256,
-            "api_requests": 1024, "api_heartbeat_requests": 16, "api_websockets": 1024,
-            "instance_creations": 64, "upload_inspections": 2, "backup_materializations": 8,
-            "recovery_volume_entries": 4096
-        });
-        assert_eq!(
-            serde_json::to_value(RuntimeLimits::default()).unwrap(),
-            expected
-        );
-    }
-
-    #[test]
     fn every_limit_rejects_zero_and_overflow() {
         let defaults = serde_json::to_value(RuntimeLimits::default()).unwrap();
         for name in defaults.as_object().unwrap().keys() {

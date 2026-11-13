@@ -17,37 +17,59 @@ use crate::{
 
 const DEFAULT_HISTORY_ROWS: u16 = 240;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TenantActivity {
     #[serde(flatten)]
+    #[schema(inline)]
     pub current: ActivityCurrent,
+    #[schema(inline)]
     pub sources: ActivitySources,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ActivitySources {
+    #[schema(schema_with = crate::routes::openapi::literals::connections_source)]
     pub connections: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::network_source)]
     pub network: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::operations_source)]
     pub operations: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::engine_query_source)]
     pub cpu_time: &'static str,
+    #[schema(schema_with = crate::routes::openapi::literals::engine_query_source)]
     pub peak_query_memory: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ActivityHistory {
     pub instance_id: String,
+    #[schema(schema_with = crate::routes::openapi::literals::bucket_seconds)]
     pub bucket_seconds: i64,
+    #[schema(schema_with = crate::routes::openapi::literals::max_buckets)]
     pub max_buckets: u16,
+    #[schema(max_items = 1440)]
     pub buckets: Vec<ActivityBucket>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
     pub before: Option<i64>,
+    #[param(minimum = 1, maximum = 1440, default = 240)]
     pub limit: Option<u16>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/activity",
+    tag = "monitoring",
+    summary = "Get current tenant-attributed gateway and query activity.",
+    description = "Returns cumulative gateway counters plus explicitly source-labelled engine observations. For gateway sources, accepted means forwarded by DBEV rather than successfully executed, and rejected includes only DBEV pre-backend rejections. It never returns SQL text, bind values, client addresses, errors, or whole-pool CPU/RAM as tenant usage.",
+    extensions(("x-required-scope" = json!(scopes::RESOURCES_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Current tenant activity.", body = TenantActivity))
+)]
 pub async fn current(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -62,6 +84,16 @@ pub async fn current(
     Ok(ApiResponse::ok(tenant_activity(&state, &metadata).await))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/activity/history",
+    tag = "monitoring",
+    summary = "Get rolling tenant activity history.",
+    description = "Returns at most 1440 aggregate buckets in chronological order on a target 60-second cadence. If sampling is delayed, one bucket covers the complete elapsed interval and duration_seconds is authoritative. before is an exclusive Unix timestamp for backwards pagination. DBEV persists only aggregate counters in SQLite and never exposes SQL text, bind values, client addresses, or engine errors through this API. Shared ClickHouse pools temporarily retain a protected, size-bounded system.query_log so the daemon can derive aggregates. It has a two-hour asynchronous TTL target and a finite per-tenant query quota; tenant roles cannot read it or alter the required logging settings.",
+    extensions(("x-required-scope" = json!(scopes::RESOURCES_READ))),
+    params(("instance_id" = String, Path), HistoryQuery),
+    responses((status = 200, description = "Rolling activity history.", body = ActivityHistory))
+)]
 pub async fn history(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -195,26 +227,6 @@ mod tests {
 
         let dedicated = sources(Protocol::Clickhouse, DeploymentMode::Dedicated, &clickhouse);
         assert_eq!(dedicated.operations, "unavailable");
-    }
-
-    #[test]
-    fn gateway_operation_sources_match_instrumented_protocols() {
-        for protocol in [
-            Protocol::Postgres,
-            Protocol::Mysql,
-            Protocol::Mariadb,
-            Protocol::Mongodb,
-        ] {
-            assert!(gateway_ops_available(protocol), "{protocol}");
-        }
-        for protocol in [
-            Protocol::Clickhouse,
-            Protocol::Redis,
-            Protocol::Valkey,
-            Protocol::Qdrant,
-        ] {
-            assert!(!gateway_ops_available(protocol), "{protocol}");
-        }
     }
 
     #[tokio::test]

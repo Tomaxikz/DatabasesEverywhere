@@ -26,44 +26,49 @@ impl DownloadKind {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = StoredArtifact)]
 pub struct ArtifactInfo {
     pub id: String,
     pub instance_id: String,
     pub size_bytes: u64,
+    #[schema(format = DateTime)]
     pub modified_at: String,
     pub sha256: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RetentionResponse {
     pub deleted: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DeleteArtifactResponse {
     pub id: String,
     pub deleted: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateDownloadRequest {
     #[serde(default)]
+    #[schema(nullable = false, minimum = 1, maximum = 900, default = 120)]
     pub expires_in_seconds: Option<i64>,
     #[serde(default)]
+    #[schema(nullable = false, default = true)]
     pub single_use: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DownloadUrlResponse {
     pub url: String,
     pub expires_at_unix: i64,
     pub single_use: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct DownloadQuery {
     pub token: String,
 }

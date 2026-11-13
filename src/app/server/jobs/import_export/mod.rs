@@ -48,7 +48,7 @@ use self::create::{
 #[cfg(test)]
 use self::extract::{
     DeadlineBoundedReader, extract_archive_blocking, extract_archive_entries,
-    extract_bounded_archive_blocking, validate_archive_blocking, validate_archive_path,
+    extract_bounded_archive_blocking, validate_archive_path,
 };
 
 pub const MAX_DATA_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;

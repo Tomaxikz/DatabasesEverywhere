@@ -20,7 +20,7 @@ impl OperationKind {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OperationCounts {
     pub read: u64,
     pub write: u64,
@@ -64,7 +64,7 @@ pub struct GatewayActivity {
     pub tx_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActivityCurrent {
     pub instance_id: String,
     pub stats_epoch: String,
@@ -79,18 +79,21 @@ pub struct ActivityCurrent {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     /// Engine-reported CPU time; `None` is unmeasurable, `Some(0)` a measured zero.
+    #[schema(required)]
     pub cpu_time_micros: Option<u64>,
     /// Highest query memory seen since tracking began; not tenant RSS.
+    #[schema(required)]
     pub peak_query_memory_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActivityBucket {
     pub instance_id: String,
     /// Incarnation of `instance_id`, hidden from the API, so a delayed write can't attach to a recreated tenant.
     #[serde(skip)]
     pub(crate) instance_generation: String,
     pub bucket_start_unix: i64,
+    #[schema(minimum = 60)]
     pub duration_seconds: u32,
     pub stats_epoch: String,
     /// Counter reset or discontinuity; gap buckets never fabricate deltas.
@@ -103,7 +106,9 @@ pub struct ActivityBucket {
     pub opened_connections: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    #[schema(required)]
     pub cpu_time_micros: Option<u64>,
+    #[schema(required)]
     pub peak_query_memory_bytes: Option<u64>,
 }
 

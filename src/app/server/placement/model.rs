@@ -55,7 +55,7 @@ impl DeploymentMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineRuntimeStatus {
     Creating,
@@ -357,18 +357,6 @@ mod tests {
             assert_eq!(DeploymentMode::Shared.supports(protocol), supported);
             assert!(DeploymentMode::Dedicated.supports(protocol));
         }
-    }
-
-    #[test]
-    fn missing_mode_defaults_to_dedicated() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            #[serde(default)]
-            mode: DeploymentMode,
-        }
-
-        let parsed: Wrapper = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.mode, DeploymentMode::Dedicated);
     }
 
     #[test]

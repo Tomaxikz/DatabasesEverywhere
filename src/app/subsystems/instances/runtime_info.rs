@@ -172,17 +172,20 @@ impl InstanceRuntimeInfoCache {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct InstanceStatusResponse {
     pub instance_id: String,
+    #[schema(inline)]
     pub status: InstanceStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub progress: Option<InstallProgress>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CreateInstanceAcceptedResponse {
     pub instance_id: String,
+    #[schema(schema_with = crate::routes::openapi::literals::creating)]
     pub status: InstanceStatus,
     pub status_url: String,
 }
@@ -193,36 +196,42 @@ pub struct ReconcileResponse {
     pub status: InstanceStatus,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = DeleteInstanceResponse)]
 pub struct DeleteResponse {
     pub instance_id: String,
     pub deleted: bool,
     pub purged: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LogsResponse {
     pub instance_id: String,
     pub stdout: String,
     pub stderr: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct LogsQuery {
+    #[param(minimum = 1, maximum = 2000, default = 200)]
     pub tail: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateInstanceImageRequest {
+    #[schema(example = "mongo:8.3.4")]
     pub image: String,
+    #[schema(format = Password, write_only)]
     pub password: Option<String>,
     #[serde(default)]
+    #[schema(default = false)]
     pub major_upgrade: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UpdateInstanceImageResponse {
     pub instance: InstanceMetadata,
     pub image: String,
@@ -235,32 +244,45 @@ pub struct UpdateInstanceImageResponse {
     pub old_volume_backup_retained: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageUpdateStrategy {
     InPlaceRecreate,
     MajorUpgradeMigration,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PowerRequest {
+    #[schema(inline)]
     pub action: LifecycleAction,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PowerResponse {
     pub instance: InstanceMetadata,
+    #[schema(inline)]
     pub action: LifecycleAction,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteInstanceQuery {
+    #[param(required, schema_with = crate::routes::openapi::literals::yes)]
     pub confirm: bool,
+    #[param(required, min_length = 1, max_length = 512)]
     pub reason: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances",
+    tag = "instances",
+    summary = "List database instances with route-safe live status classification.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_READ))),
+    responses((status = 200, description = "Instance list.", body = Vec<InstanceMetadata>))
+)]
 pub async fn list_instances(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -274,6 +296,21 @@ pub async fn list_instances(
     Ok(ApiResponse::ok(instances))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances",
+    tag = "instances",
+    summary = "Create a database instance.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    request_body = CreateInstanceRequest,
+    responses(
+        (status = 202, description = "Instance creation accepted and continuing in the background.", body = CreateInstanceAcceptedResponse, headers(("Location" = String, description = "Origin-relative instance creation status URL."))),
+        (status = 400, description = "Invalid create request, including a disabled protocol or a shared deployment requested for Redis, Valkey, or Qdrant.", body = crate::routes::http::response::ErrorBody),
+        (status = 422, description = "Request JSON does not match the create schema, for example an unknown deployment_mode value or a missing required field.", body = crate::routes::http::response::ErrorBody),
+        (status = 409, description = "Instance ID already exists."),
+        (status = 503, description = "Creation admission is closed or the bounded creation queue is full."),
+    )
+)]
 pub async fn create_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -361,6 +398,18 @@ pub async fn create_instance(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}",
+    tag = "instances",
+    summary = "Get one instance with route-safe live status classification.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_READ))),
+    params(("instance_id" = String, Path)),
+    responses(
+        (status = 200, description = "Instance metadata.", body = InstanceMetadata),
+        (status = 404, response = crate::routes::openapi::NotFound),
+    )
+)]
 pub async fn get_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -607,6 +656,15 @@ pub(super) fn fail_image_update_runtime(
     fail_image_update_api(state, instance_id, ApiError::Runtime(error.to_string()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/status",
+    tag = "instances",
+    summary = "Get instance status.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Status response.", body = InstanceStatusResponse))
+)]
 pub async fn get_instance_status(
     State(state): State<AppState>,
     auth: ApiRequestContext,

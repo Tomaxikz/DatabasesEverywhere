@@ -6,7 +6,7 @@ use crate::{
         response::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResponse, ApiResult},
         router::AppState,
     },
-    server::placement::{DeploymentMode, PoolLimits, PoolOwner, PoolSpec},
+    server::placement::{DeploymentMode, EngineRuntimeStatus, PoolLimits, PoolOwner, PoolSpec},
     subsystems::instances::{
         self,
         progress::{InstallProgress, InstallProgressStatus},
@@ -16,22 +16,35 @@ use crate::{
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = CreatePoolRequest)]
 pub(crate) struct CreatePool {
+    #[schema(min_length = 1, max_length = 128, pattern = "^[A-Za-z0-9_.-]+$")]
     pub server_id: String,
     pub protocol: Protocol,
     pub image: Option<String>,
     pub limits: PoolLimits,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolAccepted {
     runtime_id: String,
+    #[schema(schema_with = crate::routes::openapi::literals::pool_accepted_status)]
     status: &'static str,
     status_url: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/pools",
+    tag = "pools",
+    summary = "Create a persistent engine pool.",
+    description = "Creates an empty, persistent server-owned pool. Only PostgreSQL, MySQL, MariaDB, MongoDB and ClickHouse. One per authenticated panel namespace, server_id and engine; duplicates fail asynchronously. Poll status_url after 202.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_WRITE))),
+    request_body = CreatePool,
+    responses((status = 202, description = "Operation result.", body = PoolAccepted, headers(("Location" = String, description = "Pool status URL."))))
+)]
 pub(crate) async fn create(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -132,14 +145,26 @@ async fn create_pool(state: &AppState, pool: &PoolSpec, runtime_id: &str) -> Res
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolStatus {
     runtime_id: String,
+    #[schema(value_type = EngineRuntimeStatus, inline)]
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     progress: Option<InstallProgress>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pools/{runtime_id}/status",
+    tag = "pools",
+    summary = "Get pool state and retained operation progress.",
+    description = "Get pool state and retained operation progress.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_READ))),
+    params(("runtime_id" = String, Path)),
+    responses((status = 200, description = "Operation result.", body = PoolStatus))
+)]
 pub(crate) async fn status(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -174,18 +199,38 @@ fn pool_status_from_progress(progress: &InstallProgress) -> &'static str {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = CreatePoolDatabaseRequest)]
 pub(crate) struct CreateDatabase {
     instance_id: String,
     database: String,
     username: String,
+    #[schema(format = Password, write_only)]
     password: String,
     public_host: String,
     public_port: Option<u16>,
+    #[schema(minimum = 1)]
     disk_mib: u64,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct DeletePoolResponse {
+    runtime_id: String,
+    deleted: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/pools/{runtime_id}/instances",
+    tag = "pools",
+    summary = "Create a child database.",
+    description = "Creates a child in this explicit pool using the existing instance provisioning path. Protocol, owner and image come from the pool. Returns the child instance_id/status_url, not another pool.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("runtime_id" = String, Path)),
+    request_body = CreateDatabase,
+    responses((status = 202, description = "Operation result.", body = instances::CreateInstanceAcceptedResponse, headers(("Location" = String, description = "Child instance status URL."))))
+)]
 pub(crate) async fn create_database(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -227,12 +272,22 @@ pub(crate) async fn create_database(
     instances::create_instance(State(state), auth, ApiJson(request)).await
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/pools/{runtime_id}",
+    tag = "pools",
+    summary = "Delete an empty pool.",
+    description = "Requires confirm=true and a nonempty reason. Only an empty pool without active work can be deleted. Deleting its last child never deletes the pool automatically.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_WRITE))),
+    params(("runtime_id" = String, Path), instances::DeleteInstanceQuery),
+    responses((status = 200, description = "Operation result.", body = DeletePoolResponse))
+)]
 pub(crate) async fn delete(
     State(state): State<AppState>,
     auth: ApiRequestContext,
     ApiPath(runtime_id): ApiPath<String>,
     ApiQuery(query): ApiQuery<instances::DeleteInstanceQuery>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<DeletePoolResponse> {
     auth.require_scope(scopes::POOLS_WRITE)?;
     DestructiveActionPolicy::authorize(
         "pool deletion",
@@ -256,14 +311,26 @@ pub(crate) async fn delete(
             ));
         }
         let deleted = instances::delete_empty_pool(&state, &runtime_id).await?;
-        Ok(ApiResponse::ok(
-            serde_json::json!({"runtime_id":runtime_id,"deleted":deleted}),
-        ))
+        Ok(ApiResponse::ok(DeletePoolResponse {
+            runtime_id,
+            deleted,
+        }))
     })
     .await
     .map_err(ApiError::runtime)?
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/pools/{runtime_id}/power",
+    tag = "pools",
+    summary = "Change whole-pool power state.",
+    description = "Start, stop, restart or kill the physical engine, affecting all its databases. Active data jobs/migrations and pending image recovery reject the action. Stop intent survives daemon restart.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_WRITE))),
+    params(("runtime_id" = String, Path)),
+    request_body = instances::PowerRequest,
+    responses((status = 200, description = "Operation result.", body = PoolStatus))
+)]
 pub(crate) async fn power(
     State(state): State<AppState>,
     auth: ApiRequestContext,

@@ -40,18 +40,6 @@ struct RecordingWatcher {
 }
 
 impl RecordingWatcher {
-    fn failing(fail_unwatch: bool) -> Self {
-        Self {
-            watch_failure: InjectedWatchFailure::Generic,
-            unwatch_failure: if fail_unwatch {
-                InjectedUnwatchFailure::Generic
-            } else {
-                InjectedUnwatchFailure::None
-            },
-            operations: Vec::new(),
-        }
-    }
-
     fn with_failures(
         watch_failure: InjectedWatchFailure,
         unwatch_failure: InjectedUnwatchFailure,
@@ -123,68 +111,55 @@ fn acknowledge_initial(watcher: &SoftDiskWatcher, target_id: &str) {
 }
 
 #[test]
-fn failed_recursive_watch_immediately_unwinds_partial_registration() {
-    let mut watcher = RecordingWatcher::failing(false);
+fn recursive_watch_install_unwinds_failures_and_reports_contamination() {
+    let unwound: &[&str] = &["watch", "unwatch"];
+    let installed: &[&str] = &["watch"];
+    for (name, watch_failure, unwatch_failure, expected, operations) in [
+        (
+            "failed watch unwinds cleanly",
+            InjectedWatchFailure::Generic,
+            InjectedUnwatchFailure::None,
+            RecursiveWatchInstall::FailedCleanly,
+            unwound,
+        ),
+        (
+            "cleanup failure contaminates the backend",
+            InjectedWatchFailure::Generic,
+            InjectedUnwatchFailure::Generic,
+            RecursiveWatchInstall::BackendContaminated,
+            unwound,
+        ),
+        (
+            "deleted root without an installed watch fails cleanly",
+            InjectedWatchFailure::PathNotFound,
+            InjectedUnwatchFailure::WatchNotFound,
+            RecursiveWatchInstall::FailedCleanly,
+            unwound,
+        ),
+        (
+            "watch limit without proven rollback contaminates the backend",
+            InjectedWatchFailure::MaxFiles,
+            InjectedUnwatchFailure::WatchNotFound,
+            RecursiveWatchInstall::BackendContaminated,
+            unwound,
+        ),
+        (
+            "successful watch is not unwound",
+            InjectedWatchFailure::None,
+            InjectedUnwatchFailure::None,
+            RecursiveWatchInstall::Installed,
+            installed,
+        ),
+    ] {
+        let mut watcher = RecordingWatcher::with_failures(watch_failure, unwatch_failure);
 
-    assert_eq!(
-        install_recursive_watch(&mut watcher, Path::new("/target")),
-        RecursiveWatchInstall::FailedCleanly
-    );
-    assert_eq!(watcher.operations, ["watch", "unwatch"]);
-}
-
-#[test]
-fn recursive_watch_cleanup_failure_marks_backend_contaminated() {
-    let mut watcher = RecordingWatcher::failing(true);
-
-    assert_eq!(
-        install_recursive_watch(&mut watcher, Path::new("/target")),
-        RecursiveWatchInstall::BackendContaminated
-    );
-    assert_eq!(watcher.operations, ["watch", "unwatch"]);
-}
-
-#[test]
-fn deleted_root_without_an_installed_watch_is_a_clean_target_failure() {
-    let mut watcher = RecordingWatcher::with_failures(
-        InjectedWatchFailure::PathNotFound,
-        InjectedUnwatchFailure::WatchNotFound,
-    );
-
-    assert_eq!(
-        install_recursive_watch(&mut watcher, Path::new("/target")),
-        RecursiveWatchInstall::FailedCleanly
-    );
-    assert_eq!(watcher.operations, ["watch", "unwatch"]);
-}
-
-#[test]
-fn watch_limit_failure_without_proven_rollback_contaminates_the_backend() {
-    let mut watcher = RecordingWatcher::with_failures(
-        InjectedWatchFailure::MaxFiles,
-        InjectedUnwatchFailure::WatchNotFound,
-    );
-
-    assert_eq!(
-        install_recursive_watch(&mut watcher, Path::new("/target")),
-        RecursiveWatchInstall::BackendContaminated
-    );
-    assert_eq!(watcher.operations, ["watch", "unwatch"]);
-}
-
-#[test]
-fn successful_recursive_watch_is_not_unwound() {
-    let mut watcher = RecordingWatcher {
-        watch_failure: InjectedWatchFailure::None,
-        unwatch_failure: InjectedUnwatchFailure::None,
-        operations: Vec::new(),
-    };
-
-    assert_eq!(
-        install_recursive_watch(&mut watcher, Path::new("/target")),
-        RecursiveWatchInstall::Installed
-    );
-    assert_eq!(watcher.operations, ["watch"]);
+        assert_eq!(
+            install_recursive_watch(&mut watcher, Path::new("/target")),
+            expected,
+            "{name}"
+        );
+        assert_eq!(watcher.operations, operations, "{name}");
+    }
 }
 
 fn data_event(path: impl Into<PathBuf>) -> Event {
@@ -425,62 +400,44 @@ fn unregister_is_idempotent_and_drops_late_events() {
 }
 
 #[test]
-fn file_changes_are_reduced_to_root_relative_parent_directories() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
+fn file_changes_are_reduced_to_minimal_root_relative_parent_directories() {
+    let cases: [(&str, &[&str], &[&str]); 4] = [
+        (
+            "file maps to its parent",
+            &["database/table/part.bin"],
+            &["database/table"],
+        ),
+        (
+            "ancestor subsumes descendants",
+            &["a/b/c/file-one", "a/b/file-two"],
+            &["a/b"],
+        ),
+        (
+            "later ancestor replaces descendants",
+            &["a/b/file-one", "a/c/file-two", "a/file-three"],
+            &["a"],
+        ),
+        (
+            "siblings remain independent",
+            &["alpha/file", "beta/file"],
+            &["alpha", "beta"],
+        ),
+    ];
+    for (name, changed, expected) in cases {
+        let (watcher, _temporary, root) = watcher_and_root(32);
 
-    inject(&watcher, data_event(root.join("database/table/part.bin")));
-    let batch = watcher.capture(TARGET).unwrap();
+        for path in changed {
+            inject(&watcher, data_event(root.join(path)));
+        }
+        let batch = watcher.capture(TARGET).unwrap();
 
-    assert!(!batch.requires_full_reconcile());
-    assert_eq!(batch.relative_paths(), [PathBuf::from("database/table")]);
-    assert!(batch.relative_paths()[0].is_relative());
-}
-
-#[test]
-fn a_direct_child_maps_to_the_relative_root() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-
-    inject(&watcher, data_event(root.join("root-file.db")));
-    let batch = watcher.capture(TARGET).unwrap();
-
-    assert_eq!(batch.relative_paths(), [PathBuf::new()]);
-}
-
-#[test]
-fn an_ancestor_dirty_directory_subsumes_descendants() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-
-    inject(&watcher, data_event(root.join("a/b/c/file-one")));
-    inject(&watcher, data_event(root.join("a/b/file-two")));
-    let batch = watcher.capture(TARGET).unwrap();
-
-    assert_eq!(batch.relative_paths(), [PathBuf::from("a/b")]);
-}
-
-#[test]
-fn a_later_ancestor_replaces_existing_descendants() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-
-    inject(&watcher, data_event(root.join("a/b/file-one")));
-    inject(&watcher, data_event(root.join("a/c/file-two")));
-    inject(&watcher, data_event(root.join("a/file-three")));
-    let batch = watcher.capture(TARGET).unwrap();
-
-    assert_eq!(batch.relative_paths(), [PathBuf::from("a")]);
-}
-
-#[test]
-fn sibling_dirty_directories_remain_independent() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-
-    inject(&watcher, data_event(root.join("alpha/file")));
-    inject(&watcher, data_event(root.join("beta/file")));
-    let batch = watcher.capture(TARGET).unwrap();
-
-    assert_eq!(
-        batch.relative_paths(),
-        [PathBuf::from("alpha"), PathBuf::from("beta")]
-    );
+        assert!(!batch.requires_full_reconcile(), "{name}");
+        assert_eq!(
+            batch.relative_paths(),
+            expected.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -847,24 +804,14 @@ fn a_two_root_rename_dirties_both_targets() {
 }
 
 #[test]
-fn access_only_events_are_ignored() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-    let event = Event::new(EventKind::Access(AccessKind::Read)).add_path(root.join("file"));
+fn access_only_and_ordinary_other_events_are_ignored() {
+    for kind in [EventKind::Access(AccessKind::Read), EventKind::Other] {
+        let (watcher, _temporary, root) = watcher_and_root(32);
 
-    inject(&watcher, event);
+        inject(&watcher, Event::new(kind).add_path(root.join("file")));
 
-    assert!(watcher.capture(TARGET).is_none());
-}
-
-#[test]
-fn ordinary_other_events_are_ignored() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-    inject(
-        &watcher,
-        Event::new(EventKind::Other).add_path(root.join("file")),
-    );
-
-    assert!(watcher.capture(TARGET).is_none());
+        assert!(watcher.capture(TARGET).is_none(), "{kind:?}");
+    }
 }
 
 #[test]
@@ -981,29 +928,23 @@ fn create_and_remove_events_both_dirty_the_parent() {
 }
 
 #[test]
-fn root_removal_requires_full_reconcile_and_watch_retry() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
+fn root_removal_or_rename_requires_full_reconcile_and_watch_retry() {
+    for kind in [
+        EventKind::Remove(RemoveKind::Any),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+    ] {
+        let (watcher, _temporary, root) = watcher_and_root(32);
 
-    inject(&watcher, remove_event(root));
-    let status = watcher.status(TARGET).unwrap();
+        inject(&watcher, Event::new(kind).add_path(root));
+        let status = watcher.status(TARGET).unwrap();
 
-    assert_eq!(status.status, RegistrationStatus::Degraded);
-    assert!(status.full_reconcile_pending);
-    assert!(watcher.capture(TARGET).unwrap().requires_full_reconcile());
-}
-
-#[test]
-fn root_rename_requires_full_reconcile_and_watch_retry() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-    let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From))).add_path(root);
-
-    inject(&watcher, event);
-
-    assert_eq!(
-        watcher.status(TARGET).unwrap().status,
-        RegistrationStatus::Degraded
-    );
-    assert!(watcher.capture(TARGET).unwrap().requires_full_reconcile());
+        assert_eq!(status.status, RegistrationStatus::Degraded, "{kind:?}");
+        assert!(status.full_reconcile_pending, "{kind:?}");
+        assert!(
+            watcher.capture(TARGET).unwrap().requires_full_reconcile(),
+            "{kind:?}"
+        );
+    }
 }
 
 #[test]

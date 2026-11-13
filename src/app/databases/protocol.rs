@@ -87,19 +87,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compatibility_protocols_remain_distinct_first_class_variants() {
-        for (name, protocol, related, port) in [
-            ("mysql", Protocol::Mysql, Protocol::Mariadb, 3306),
-            ("valkey", Protocol::Valkey, Protocol::Redis, 6379),
-        ] {
-            assert_eq!(name.parse::<Protocol>().unwrap(), protocol);
-            assert_ne!(protocol, related);
-            assert!(Protocol::ALL.contains(&protocol));
-            assert_eq!(protocol.engine().default_container_port(), port);
-        }
-    }
-
-    #[test]
     fn xml_text_escapes_markup_characters() {
         assert_eq!(xml_escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
     }

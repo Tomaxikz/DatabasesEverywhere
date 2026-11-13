@@ -63,10 +63,7 @@ fn zero_base_interval_is_normalized_and_full_interval_never_precedes_it() {
     });
     assert_eq!(planner.config().scan_interval, Duration::from_nanos(1));
     assert_eq!(planner.config().full_scan_interval, Duration::from_nanos(1));
-}
 
-#[test]
-fn shorter_full_interval_is_raised_to_the_base_interval() {
     let planner = HybridScanPlanner::new(PlannerConfig {
         scan_interval: seconds(120),
         full_scan_interval: seconds(90),
@@ -654,15 +651,6 @@ fn losing_watcher_trust_invalidates_an_in_flight_partial() {
         planner.next_candidate(seconds(22)).unwrap().kind,
         ScanKind::Full
     );
-}
-
-#[test]
-fn target_can_have_at_most_one_scan_in_flight() {
-    let mut planner = HybridScanPlanner::new(config());
-    planner.upsert_target(Duration::ZERO, target("a"));
-    assert!(planner.next_candidate(Duration::ZERO).is_some());
-    assert!(planner.next_candidate(seconds(100)).is_none());
-    assert!(planner.target_status("a").unwrap().in_flight);
 }
 
 #[test]

@@ -13,71 +13,56 @@ struct BenchCli {
 }
 
 #[test]
-fn benchmark_options_require_benchmark_mode() {
-    let defaults = BenchCli::try_parse_from(["dbev"]).unwrap();
-    assert!(!defaults.bench.bench);
-    assert!(BenchCli::try_parse_from(["dbev", "--bench-instance", "perf-postgres"]).is_err());
-    let enabled = BenchCli::try_parse_from([
-        "dbev",
-        "--bench",
-        "--bench-instance",
-        "perf-postgres",
-        "--bench-import-export",
-    ])
-    .unwrap();
-    assert!(enabled.bench.bench_import_export);
-}
-
-#[test]
-fn manual_active_job_recommendation_requires_destructive_instance_benchmark() {
-    assert!(
-        BenchCli::try_parse_from(["dbev", "--bench", "--bench-recommend-manual-active-jobs",])
-            .is_err()
-    );
-    let parsed = BenchCli::try_parse_from([
-        "dbev",
-        "--bench",
-        "--bench-instance",
-        "perf-mongodb",
-        "--bench-import-export",
-        "--bench-recommend-manual-active-jobs",
-    ])
-    .unwrap();
-    assert!(parsed.bench.bench_recommend_manual_active_jobs);
-}
-
-#[test]
-fn benchmark_accepts_friendly_time_and_instance_aliases() {
-    let parsed =
-        BenchCli::try_parse_from(["dbev", "--bench", "--time", "5", "--max_instances", "3"])
-            .unwrap();
-
-    assert_eq!(parsed.bench.bench_time_minutes, Some(5));
-    assert_eq!(parsed.bench.bench_max_instances, 3);
-}
-
-#[test]
-fn unthrottled_timed_load_requires_an_explicit_duration() {
-    assert!(BenchCli::try_parse_from(["dbev", "--bench", "--bench-unthrottled"]).is_err());
-    let parsed =
-        BenchCli::try_parse_from(["dbev", "--bench", "--time", "2", "--bench-unthrottled"])
-            .unwrap();
-    assert!(parsed.bench.bench_unthrottled);
-}
-
-#[test]
-fn automatic_and_explicit_instance_selection_are_mutually_exclusive() {
-    assert!(
-        BenchCli::try_parse_from([
-            "dbev",
+fn benchmark_arguments_enforce_mode_duration_and_selection_constraints() {
+    let rejected: [&[&str]; 4] = [
+        &["--bench-instance", "perf-postgres"],
+        &["--bench", "--bench-recommend-manual-active-jobs"],
+        &["--bench", "--bench-unthrottled"],
+        &[
             "--bench",
             "--bench-instance",
             "perf-postgres",
             "--max_instances",
             "2",
+        ],
+    ];
+    for arguments in rejected {
+        assert!(
+            BenchCli::try_parse_from(std::iter::once("dbev").chain(arguments.iter().copied()))
+                .is_err(),
+            "accepted {arguments:?}"
+        );
+    }
+
+    let parse = |arguments: &[&str]| {
+        BenchCli::try_parse_from(std::iter::once("dbev").chain(arguments.iter().copied()))
+            .unwrap()
+            .bench
+    };
+    assert!(!parse(&[]).bench);
+    assert!(
+        parse(&[
+            "--bench",
+            "--bench-instance",
+            "perf-postgres",
+            "--bench-import-export",
         ])
-        .is_err()
+        .bench_import_export
     );
+    assert!(
+        parse(&[
+            "--bench",
+            "--bench-instance",
+            "perf-mongodb",
+            "--bench-import-export",
+            "--bench-recommend-manual-active-jobs",
+        ])
+        .bench_recommend_manual_active_jobs
+    );
+    let timed = parse(&["--bench", "--time", "5", "--max_instances", "3"]);
+    assert_eq!(timed.bench_time_minutes, Some(5));
+    assert_eq!(timed.bench_max_instances, 3);
+    assert!(parse(&["--bench", "--time", "2", "--bench-unthrottled"]).bench_unthrottled);
 }
 
 #[test]

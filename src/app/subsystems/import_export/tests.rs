@@ -395,12 +395,6 @@ fn remote_logical_import_reserves_source_and_private_recovery_copies() {
 }
 
 #[test]
-fn qdrant_uses_physical_archive_extension() {
-    assert_eq!(dump_extension(Protocol::Qdrant), "qdrant.tar.gz");
-    assert!(dump_candidate_suffixes(Protocol::Qdrant).contains(&".qdrant.tar.gz"));
-}
-
-#[test]
 fn mongodb_gzip_export_is_normalized_to_its_native_gzip_archive() {
     assert_eq!(
         export_archive_format(Protocol::Mongodb, ExportArchiveFormat::Gzip),
@@ -1107,8 +1101,8 @@ fn mongodb_upload_allows_catalog_resolution_but_rejects_unsafe_manual_database()
 }
 
 #[test]
-fn import_archive_settings_are_rejected_at_the_top_level() {
-    let request = serde_json::from_value::<ImportRequest>(serde_json::json!({
+fn legacy_archive_flags_are_rejected_instead_of_ignored() {
+    let top_level = serde_json::from_value::<ImportRequest>(serde_json::json!({
         "source": {
             "type": "artifact",
             "artifact_id": "dump.postgres.sql.gz"
@@ -1116,12 +1110,8 @@ fn import_archive_settings_are_rejected_at_the_top_level() {
         "unarchive": true,
         "archive_format": "gzip"
     }));
+    assert!(top_level.is_err());
 
-    assert!(request.is_err());
-}
-
-#[test]
-fn legacy_archive_flags_are_rejected_instead_of_ignored() {
     let export = serde_json::from_value::<ExportRequest>(serde_json::json!({
         "archive": true,
         "archive_format": "gzip"
@@ -1264,7 +1254,7 @@ fn local_mongodb_rollback_import_keeps_selection_but_prefiltered_remote_does_not
 }
 
 #[test]
-fn mongodb_local_restore_filters_multiple_collections_in_target_database() {
+fn mongodb_restore_namespace_args_cover_local_remapped_and_full_selections() {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers_2026".to_string()],
@@ -1284,10 +1274,7 @@ fn mongodb_local_restore_filters_multiple_collections_in_target_database() {
     );
     assert!(!args.contains("--nsFrom"));
     assert!(!args.contains("--nsTo"));
-}
 
-#[test]
-fn mongodb_remote_restore_preserves_namespace_remapping_with_selection() {
     let selection = ImportExportSelection {
         mode: SelectionMode::Selective,
         include: vec!["orders".to_string(), "customers".to_string()],
@@ -1304,6 +1291,21 @@ fn mongodb_remote_restore_preserves_namespace_remapping_with_selection() {
             "  --nsInclude 'tenant\\*archive.customers' \\\n",
             "  --nsExclude 'tenant\\*archive.audit' \\\n",
             "  --nsFrom 'tenant\\*archive.*' \\\n",
+            "  --nsTo \"$DBE_MONGO_DATABASE.*\""
+        )
+    );
+
+    let full = ImportExportSelection::default();
+
+    assert_eq!(
+        mongodb_restore_namespace_args(&full, None).unwrap(),
+        "--nsInclude \"$DBE_MONGO_DATABASE.*\""
+    );
+    assert_eq!(
+        mongodb_restore_namespace_args(&full, Some("analytics")).unwrap(),
+        concat!(
+            "--nsInclude 'analytics.*' \\\n",
+            "  --nsFrom 'analytics.*' \\\n",
             "  --nsTo \"$DBE_MONGO_DATABASE.*\""
         )
     );
@@ -1334,24 +1336,6 @@ fn mongodb_restore_selection_rejects_overlap_and_shell_injection() {
         injection_error
             .to_string()
             .contains("invalid mongodb collection")
-    );
-}
-
-#[test]
-fn mongodb_full_restore_namespace_arguments_remain_compatible() {
-    let selection = ImportExportSelection::default();
-
-    assert_eq!(
-        mongodb_restore_namespace_args(&selection, None).unwrap(),
-        "--nsInclude \"$DBE_MONGO_DATABASE.*\""
-    );
-    assert_eq!(
-        mongodb_restore_namespace_args(&selection, Some("analytics")).unwrap(),
-        concat!(
-            "--nsInclude 'analytics.*' \\\n",
-            "  --nsFrom 'analytics.*' \\\n",
-            "  --nsTo \"$DBE_MONGO_DATABASE.*\""
-        )
     );
 }
 

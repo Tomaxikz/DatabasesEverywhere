@@ -13,6 +13,17 @@ use crate::server::metadata::{DesiredInstanceState, InstanceMetadata, InstanceSt
 use crate::subsystems::instances::images::{check_image_allowed, validate_image};
 use axum::extract::State;
 
+#[utoipa::path(
+    patch,
+    path = "/api/instances/{instance_id}/image",
+    tag = "instances",
+    summary = "Pull and switch an instance to a new database image.",
+    description = "Dedicated instances only. Same-major updates recreate the owned runtime on its existing volume. Major version changes require major_upgrade=true and run the safer export/import migration workflow where supported. Shared tenants return 409 because pool images are selected through placement and deployment migration.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = UpdateInstanceImageRequest,
+    responses((status = 200, description = "Image update result.", body = UpdateInstanceImageResponse))
+)]
 pub async fn update_instance_image(
     State(state): State<AppState>,
     auth: ApiRequestContext,

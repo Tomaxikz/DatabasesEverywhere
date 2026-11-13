@@ -63,7 +63,7 @@ mod tests {
     use crate::databases::protocol::Protocol;
 
     #[test]
-    fn mariadb_readiness_uses_the_stable_internal_admin() {
+    fn readiness_scripts_use_internal_admins_and_local_endpoints() {
         let script = Protocol::Mariadb.engine().startup_readiness_script();
 
         assert!(script.contains("/proc/1/comm"));
@@ -72,26 +72,17 @@ mod tests {
         assert!(!script.contains("DBE_MARIADB_PASSWORD:-"));
         assert!(script.contains("SELECT 1"));
         assert!(!script.contains("mariadb-admin ping"));
-    }
 
-    #[test]
-    fn mongodb_readiness_uses_the_stable_internal_admin() {
         let script = Protocol::Mongodb.engine().startup_readiness_script();
 
         assert!(script.contains("DBE_MONGO_ROOT_USER"));
         assert!(script.contains("DBE_MONGO_ROOT_PASSWORD"));
         assert!(!script.contains("DBE_MONGO_PASSWORD\""));
-    }
 
-    #[test]
-    fn clickhouse_readiness_never_resolves_the_container_hostname() {
         let script = Protocol::Clickhouse.engine().startup_readiness_script();
 
         assert!(script.contains("--host 127.0.0.1"));
-    }
 
-    #[test]
-    fn postgres_readiness_allows_boot_hardening_to_repair_legacy_auth() {
         let script = Protocol::Postgres.engine().startup_readiness_script();
 
         assert!(script.contains("-h /var/run/postgresql"));

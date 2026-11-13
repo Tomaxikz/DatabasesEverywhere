@@ -20,37 +20,54 @@ const MAX_IDENTIFIER_LENGTH: usize = 63;
 const MAX_DISK_MIB: u64 = u64::MAX / (1024 * 1024);
 const HEAVY_ENGINE_MIN_MIB: u64 = 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateInstanceRequest {
+    #[schema(min_length = 1, max_length = 128, pattern = "^[A-Za-z0-9_.-]+$")]
     pub server_id: Option<String>,
     pub pool_id: Option<String>,
     #[serde(skip)]
     pub(crate) owner: Option<crate::server::placement::PoolOwner>,
+    #[schema(example = "inst_server_123_pg")]
     pub instance_id: String,
     pub protocol: Protocol,
     #[serde(default)]
+    #[schema(default = "dedicated")]
     pub deployment_mode: DeploymentMode,
+    #[schema(example = "server_123")]
     pub database: String,
+    #[schema(example = "app_server_123")]
     pub username: String,
+    #[schema(format = Password, write_only, min_length = 1, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
     pub password: String,
+    #[schema(example = "db.example.com")]
     pub public_host: String,
+    #[schema(example = 5434)]
     pub public_port: Option<u16>,
+    #[schema(example = "server-123")]
     pub project_id: Option<String>,
+    #[schema(example = "postgres:18.4")]
     pub image: Option<String>,
     pub limits: Option<LimitsRequest>,
     #[serde(default)]
+    #[schema(default = false)]
     pub purge_stale_resources: bool,
     pub purge_stale_resources_confirmation: Option<DestructiveActionConfirmation>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(
+    description = "Dedicated requests require positive CPU and memory. Shared create/resize accepts disk_mib only; CPU and memory are configured on the parent pool."
+)]
 pub struct LimitsRequest {
     #[serde(default)]
+    #[schema(minimum = 0, maximum = 1024, example = 0.5)]
     pub cpu_cores: f64,
     #[serde(default)]
+    #[schema(minimum = 0, maximum = 1048576, example = 512)]
     pub memory_mib: u64,
+    #[schema(minimum = 1, example = 1024)]
     pub disk_mib: u64,
 }
 
@@ -377,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_cpu_limits() {
+    fn rejects_non_finite_cpu_and_overflowing_memory_limits() {
         for cpu_cores in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let error = validate_limits(&LimitsRequest {
                 cpu_cores,
@@ -388,10 +405,7 @@ mod tests {
 
             assert!(error.to_string().contains("finite"));
         }
-    }
 
-    #[test]
-    fn rejects_memory_limit_that_would_overflow_docker_bytes() {
         let error = validate_limits(&LimitsRequest {
             cpu_cores: 1.0,
             memory_mib: 1_u64 << 44,

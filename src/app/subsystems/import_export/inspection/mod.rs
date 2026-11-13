@@ -53,7 +53,7 @@ const UNIX_FILE_TYPE_MASK: u32 = 0o170_000;
 const UNIX_REGULAR_FILE: u32 = 0o100_000;
 const UNIX_DIRECTORY: u32 = 0o040_000;
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DumpArchiveFormat {
     Plain,
@@ -101,7 +101,7 @@ impl DumpArchiveFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DumpSelectionKind {
     Tables,
@@ -109,35 +109,44 @@ pub(crate) enum DumpSelectionKind {
     FullOnly,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DumpObjectKind {
     Table,
     Collection,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub(crate) struct DumpSelectableObject {
+    #[schema(inline)]
     pub kind: DumpObjectKind,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub namespace: Option<String>,
     pub selection_key: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub(crate) struct DumpInspection {
     pub protocol: Protocol,
+    #[schema(pattern = "^[0-9a-f]{64}$")]
     pub sha256: String,
+    #[schema(minimum = 1)]
     pub source_size_bytes: u64,
+    #[schema(inline)]
     pub detected_archive_format: DumpArchiveFormat,
+    #[schema(inline)]
     pub selection_kind: DumpSelectionKind,
     pub selective_supported: bool,
     pub catalog_complete: bool,
+    #[schema(max_items = 512)]
     pub namespaces: Vec<String>,
+    #[schema(max_items = 512)]
     pub objects: Vec<DumpSelectableObject>,
     pub unselectable_object_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub selective_unavailable_reason: Option<String>,
 }
 

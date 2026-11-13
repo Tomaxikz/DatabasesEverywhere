@@ -719,17 +719,13 @@ mod tests {
     }
 
     #[test]
-    fn clickhouse_incomplete_handshakes_are_expected_client_failures() {
+    fn only_incomplete_clickhouse_handshakes_are_expected_client_failures() {
         assert!(expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::IncompleteNativeHello
         )));
         assert!(expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::IncompleteHttpRequest
         )));
-    }
-
-    #[test]
-    fn clickhouse_real_route_errors_remain_warnings() {
         assert!(!expected_client_failure(&ListenerError::Clickhouse(
             clickhouse::ClickhouseParseError::InvalidNativeHello
         )));

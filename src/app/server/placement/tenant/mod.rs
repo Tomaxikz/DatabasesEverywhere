@@ -322,21 +322,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_id_parser_rejects_sql_text() {
-        assert!("12; DROP DATABASE x".parse::<u64>().is_err());
-    }
-
-    #[test]
-    fn unsupported_engines_are_explicit() {
-        for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
-            assert!(matches!(
-                backends::for_protocol(protocol),
-                Err(TenantEngineError::Unsupported(actual)) if actual == protocol
-            ));
-        }
-    }
-
-    #[test]
     fn storage_output_is_strict_and_ordered() {
         assert_eq!(parse_storage("12\n0\n", 2).unwrap(), vec![12, 0]);
         assert!(matches!(

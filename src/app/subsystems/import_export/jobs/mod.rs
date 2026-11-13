@@ -56,6 +56,22 @@ fn scheduler_capacity_error() -> ApiError {
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/export",
+    tag = "import-export",
+    summary = "Export one instance to a protocol-native dump artifact.",
+    description = "Queues an export using the node artifact policy. Retained mode stores the result in the instance artifact inventory. Stream-only mode exposes the same job artifact_id through a forced single-use download and deletes its private spool when streaming finishes, disconnects, or expires. Shared tenants always use a tenant-scoped logical dump and never expose the pool filesystem or another tenant's data.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = Option<ExportRequest>,
+    responses((
+        status = 202,
+        description = "Queued export job.",
+        body = ImportExportJobResponse,
+        headers(("Location" = String, description = "Origin-relative job status URL."))
+    ))
+)]
 pub async fn export_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -358,6 +374,15 @@ async fn close_unclaimed_upload_job(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/import-export/jobs/{job_id}",
+    tag = "import-export",
+    summary = "Get one import/export job belonging to an instance.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ))),
+    params(("instance_id" = String, Path), ("job_id" = String, Path)),
+    responses((status = 200, description = "Job.", body = ImportExportJobResponse))
+)]
 pub async fn get_import_export_job(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -381,6 +406,15 @@ pub async fn get_import_export_job(
     Ok(ApiResponse::ok(public_job_response(job).await))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/import-export/jobs",
+    tag = "import-export",
+    summary = "List import/export jobs for one instance.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ))),
+    params(("instance_id" = String, Path), JobListQuery),
+    responses((status = 200, description = "Job list.", body = Vec<ImportExportJobResponse>))
+)]
 pub async fn list_import_export_jobs(
     State(state): State<AppState>,
     auth: ApiRequestContext,

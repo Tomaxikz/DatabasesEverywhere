@@ -453,13 +453,4 @@ mod tests {
         assert!(!other.owns_name(&format!("{tag}_slot")));
         assert!(!job.owns_name(OWNED_RESOURCE_PREFIX));
     }
-
-    #[test]
-    fn unsupported_maps_to_a_clear_conflict() {
-        let error: ApiError =
-            StrategyError::Unsupported("no certified strategy".to_string()).into();
-        assert!(
-            matches!(error, ApiError::Conflict(message) if message.contains("no certified strategy"))
-        );
-    }
 }

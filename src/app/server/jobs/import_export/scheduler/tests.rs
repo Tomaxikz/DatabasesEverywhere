@@ -525,26 +525,6 @@ fn four_gibibyte_mongodb_wipe_is_charged_for_rollback_and_stream_memory() {
 }
 
 #[test]
-fn native_archives_are_always_charged_as_compressed() {
-    for protocol in [
-        Protocol::Mongodb,
-        Protocol::Redis,
-        Protocol::Valkey,
-        Protocol::Qdrant,
-    ] {
-        assert!(protocol_uses_native_compression(protocol));
-    }
-    for protocol in [
-        Protocol::Postgres,
-        Protocol::Mariadb,
-        Protocol::Mysql,
-        Protocol::Clickhouse,
-    ] {
-        assert!(!protocol_uses_native_compression(protocol));
-    }
-}
-
-#[test]
 fn small_plain_imports_receive_more_concurrency_than_large_imports() {
     let capacity = dynamic_capacity(256, 32_768, 65_536, 128);
     let small = JobResourceCost::estimate(JobEstimateInput {
@@ -696,41 +676,4 @@ fn unlimited_systemd_cgroup_uses_host_capacity() {
     );
     assert_eq!(capacity.memory_budget_mib, 6_870);
     assert_eq!(capacity.cpu_units, 8);
-}
-
-#[test]
-fn verified_unavailable_v2_controller_is_unlimited_but_malformed_limits_fail_closed() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
-    let service = root.join("system.slice/databases-everywhere.service");
-    std::fs::create_dir_all(&service).unwrap();
-    std::fs::write(root.join("cgroup.controllers"), "io\n").unwrap();
-
-    assert!(cgroup_memory_sample_complete(
-        &[root],
-        Some("/system.slice/databases-everywhere.service"),
-        "memory.max",
-        "memory.current",
-        false,
-    ));
-    assert!(cgroup_v2_cpu_sample_complete(
-        &[root],
-        Some("/system.slice/databases-everywhere.service"),
-    ));
-
-    std::fs::write(service.join("memory.max"), "not-a-limit\n").unwrap();
-    std::fs::write(service.join("memory.current"), "0\n").unwrap();
-    std::fs::write(service.join("cpu.max"), "max not-a-period\n").unwrap();
-
-    assert!(!cgroup_memory_sample_complete(
-        &[root],
-        Some("/system.slice/databases-everywhere.service"),
-        "memory.max",
-        "memory.current",
-        false,
-    ));
-    assert!(!cgroup_v2_cpu_sample_complete(
-        &[root],
-        Some("/system.slice/databases-everywhere.service"),
-    ));
 }

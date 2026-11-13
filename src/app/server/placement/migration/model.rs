@@ -3,12 +3,15 @@ use serde::Serialize;
 use super::MigrationStage;
 use crate::{databases::protocol::Protocol, server::placement::DeploymentMode};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct DeploymentMigration {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub target_pool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub target_limits: Option<crate::utils::limits::InstanceLimits>,
+    #[schema(format = Uuid)]
     pub migration_id: String,
     pub instance_id: String,
     pub protocol: Protocol,
@@ -16,17 +19,26 @@ pub struct DeploymentMigration {
     pub target_mode: DeploymentMode,
     pub source_runtime_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub target_runtime_id: Option<String>,
     pub stage: MigrationStage,
     pub revision: u64,
     pub source_fenced: bool,
     pub cutover_committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = failure_code_schema)]
     pub failure_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub failure_message: Option<String>,
+    #[schema(format = DateTime)]
     pub created_at: String,
+    #[schema(format = DateTime)]
     pub updated_at: String,
+}
+
+fn failure_code_schema() -> utoipa::openapi::Object {
+    crate::routes::openapi::literal(MigrationFailure::ALL.map(|failure| failure.code().into()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -19,6 +19,14 @@ use crate::subsystems::artifacts::DeleteArtifactResponse;
 use axum::extract::State;
 use std::path::Path as FsPath;
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/backups/status",
+    tag = "admin",
+    summary = "Get automatic backup configuration status.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_ADMIN))),
+    responses((status = 200, description = "Backup status.", body = BackupStatusResponse))
+)]
 pub async fn backup_status(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -37,6 +45,15 @@ pub async fn backup_status(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/backups",
+    tag = "backups",
+    summary = "List backups belonging to one instance.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Backup artifact list.", body = Vec<BackupInfo>))
+)]
 pub async fn list_instance_backups(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -55,6 +72,16 @@ pub async fn list_instance_backups(
     Ok(ApiResponse::ok(backups))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/unsupported-backups",
+    tag = "backups",
+    summary = "List backups of one instance that this daemon cannot read.",
+    description = "Backups written in a format this daemon does not understand, such as a newer manifest schema. They are never restored or removed by retention; upgrade the daemon to use them, or remove one explicitly with DELETE /api/instances/{instance_id}/backups/{backup_id}.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Unsupported backup entries.", body = Vec<UnsupportedBackupInfo>))
+)]
 /// Backups in formats this daemon cannot read (for example a newer manifest schema). They are never
 /// restored or pruned.
 pub async fn list_unsupported_backups(
@@ -79,6 +106,16 @@ pub async fn list_unsupported_backups(
     Ok(ApiResponse::ok(entries))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/backups/{backup_id}/contents",
+    tag = "backups",
+    summary = "Browse the bounded schema catalog and captured row previews stored with a backup.",
+    description = "Existing backups created before catalog capture return catalog_available=false. The endpoint never starts a restored database or executes queries against backup files.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_READ))),
+    params(("instance_id" = String, Path), ("backup_id" = String, Path), BackupContentsQuery),
+    responses((status = 200, description = "Backup catalog, with an optional bounded preview selection.", body = BackupContentsResponse))
+)]
 pub async fn browse_instance_backup(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -167,6 +204,16 @@ pub async fn browse_instance_backup(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/backups",
+    tag = "backups",
+    summary = "Run a backup for one instance.",
+    description = "Dedicated instances use their protocol's physical backup layout where supported. Shared tenants always use tenant-scoped logical backups and never capture the pool filesystem or another tenant's data.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_WRITE))),
+    params(("instance_id" = String, Path), RunBackupQuery),
+    responses((status = 200, description = "Completed backup artifact.", body = BackupInfo))
+)]
 pub async fn run_instance_backup(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -180,6 +227,14 @@ pub async fn run_instance_backup(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/backups/run",
+    tag = "admin",
+    summary = "Run backups for all eligible instances.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_ADMIN))),
+    responses((status = 200, description = "Completed backups and skipped instances.", body = RunBackupResponse))
+)]
 pub async fn run_all_backups(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -188,6 +243,16 @@ pub async fn run_all_backups(
     Ok(ApiResponse::ok(backup_all_instances(&state).await))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/instances/{instance_id}/backups/{backup_id}",
+    tag = "backups",
+    summary = "Delete one backup belonging to an instance.",
+    description = "Also removes a backup listed under unsupported-backups; that is the only way such a backup is deleted.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_WRITE))),
+    params(("instance_id" = String, Path), ("backup_id" = String, Path)),
+    responses((status = 200, description = "Delete result.", body = DeleteArtifactResponse))
+)]
 pub async fn delete_instance_backup(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -212,6 +277,20 @@ pub async fn delete_instance_backup(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/backups/{backup_id}/restore",
+    tag = "backups",
+    summary = "Restore one backup into the same instance that owns it.",
+    description = "A backup is bound to the deployment layout that created it. After a dedicated/shared migration, older backups remain downloadable but restore returns 409 until the instance uses the matching physical or logical layout again.",
+    extensions(("x-required-scope" = json!(scopes::RECOVERY_ADMIN))),
+    params(("instance_id" = String, Path), ("backup_id" = String, Path)),
+    request_body = DestructiveActionConfirmation,
+    responses(
+        (status = 200, description = "Completed restore result.", body = RestoreBackupResponse),
+        (status = 409, description = "The backup protocol or physical/logical layout does not match the instance's current protocol and deployment mode, another data operation blocks restore, or the backup is loaded into the running engine (MySQL and Qdrant online backups taken without a volume snapshot) and the instance is stopped; start it first.", body = crate::routes::http::response::ErrorBody),
+    )
+)]
 pub async fn restore_instance_backup(
     State(state): State<AppState>,
     auth: ApiRequestContext,

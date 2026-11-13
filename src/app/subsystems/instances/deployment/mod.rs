@@ -19,7 +19,7 @@ mod worker;
 
 const TARGET_POOL_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StartDeploymentMigrationRequest {
     pub server_id: Option<String>,
@@ -28,6 +28,25 @@ pub struct StartDeploymentMigrationRequest {
     pub target_mode: DeploymentMode,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/deployment-migrations",
+    tag = "instances",
+    summary = "Start a crash-recoverable deployment migration.",
+    description = "Migrations in both directions, dedicated-to-shared and shared-to-dedicated, run asynchronously through a tenant-scoped logical export/import, target validation, atomic placement cutover, and source cleanup. A successful start returns 202 immediately; poll the returned Location for durable progress. The source remains authoritative until cutover, and crash recovery records a safe rollback, cleanup, or manual-intervention stage.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = StartDeploymentMigrationRequest,
+    responses(
+        (status = 202, description = "Migration accepted and durably queued.", body = DeploymentMigration, headers(("Location" = String, description = "Origin-relative migration status URL."))),
+        (status = 400, description = "A valid shared target was requested for an unsupported protocol."),
+        (status = 404, response = crate::routes::openapi::NotFound),
+        (status = 409, description = "Source is not ready, already uses the target mode, lacks a current encrypted tenant credential, has active data work, or already has an active migration."),
+        (status = 422, description = "Request JSON does not match the migration schema, for example target_mode is missing or is not dedicated/shared.", body = crate::routes::http::response::ErrorBody),
+        (status = 429, description = "The import/export scheduler has no global capacity for the migration."),
+        (status = 503, description = "Daemon shutdown or mutation draining has started; no migration was accepted."),
+    )
+)]
 pub async fn start_deployment_migration(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -169,6 +188,18 @@ pub async fn start_deployment_migration(
     Ok(ApiResponse::accepted_at(migration, location))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/deployment-migrations",
+    tag = "instances",
+    summary = "List durable deployment-migration attempts for an instance.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_READ))),
+    params(("instance_id" = String, Path)),
+    responses(
+        (status = 200, description = "Migration history, newest first.", body = Vec<DeploymentMigration>),
+        (status = 404, response = crate::routes::openapi::NotFound),
+    )
+)]
 pub async fn list_deployment_migrations(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -187,6 +218,18 @@ pub async fn list_deployment_migrations(
     Ok(ApiResponse::ok(migrations))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/deployment-migrations/{migration_id}",
+    tag = "instances",
+    summary = "Get one durable deployment-migration attempt.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_READ))),
+    params(("instance_id" = String, Path), ("migration_id" = String, Path, format = Uuid)),
+    responses(
+        (status = 200, description = "Migration state.", body = DeploymentMigration),
+        (status = 404, response = crate::routes::openapi::NotFound),
+    )
+)]
 pub async fn get_deployment_migration(
     State(state): State<AppState>,
     auth: ApiRequestContext,

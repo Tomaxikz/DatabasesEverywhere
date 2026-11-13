@@ -12,18 +12,23 @@ use crate::{
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(as = Instance)]
 pub struct InstanceMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub owner: Option<crate::server::placement::PoolOwner>,
     pub schema_version: u32,
     pub instance_id: String,
     #[serde(default)]
+    #[schema(required)]
     pub deployment_mode: DeploymentMode,
-    /// Empty only for metadata JSON written before placement existed.
+    // Empty only for metadata JSON written before placement existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schema(required)]
     pub runtime_id: String,
     pub protocol: Protocol,
+    #[schema(inline)]
     pub status: InstanceStatus,
     /// Durable operator intent; omitted from API JSON and never inferred from container state.
     #[serde(skip)]
@@ -31,13 +36,18 @@ pub struct InstanceMetadata {
     /// Restart hysteresis owned by the predictive disk limiter; omitted from API JSON.
     #[serde(skip)]
     pub(crate) disk_limit_blocked: bool,
+    #[schema(inline)]
     pub public: PublicEndpoint,
+    #[schema(inline)]
     pub backend: BackendEndpoint,
+    #[schema(inline)]
     pub runtime: RuntimeMetadata,
+    #[schema(inline)]
     pub database: DatabaseIdentity,
-    /// Keyed HMAC-SHA256 used only as the Qdrant gateway route index. The
-    /// legacy field name is retained for durable/API compatibility.
+    // Keyed HMAC-SHA256 used only as the Qdrant gateway route index. The
+    // legacy field name is retained for durable/API compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub route_key_sha256: Option<String>,
     #[serde(default, skip_serializing)]
     pub mariadb_native_password_sha1_stage2: Option<String>,
@@ -56,10 +66,14 @@ pub struct InstanceMetadata {
     pub tenant_password: Option<String>,
     pub limits: InstanceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(inline, nullable = false)]
     pub image: Option<InstanceImageStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(inline, nullable = false)]
     pub database_version: Option<InstanceDatabaseVersion>,
+    #[schema(format = DateTime)]
     pub created_at: String,
+    #[schema(format = DateTime)]
     pub updated_at: String,
 }
 
@@ -150,20 +164,26 @@ impl DesiredInstanceState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct InstanceImageStatus {
+    #[schema(required)]
     pub current: Option<String>,
     pub configured: String,
     pub update_available: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(
+    description = "Durable engine-version compatibility attestation for the exact managed container and immutable image. Instance read endpoints never execute a version command."
+)]
 pub struct InstanceDatabaseVersion {
+    #[schema(required)]
     pub current: Option<String>,
+    #[schema(required)]
     pub error: Option<PublicDiagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InstanceStatus {
     Creating,
@@ -189,20 +209,22 @@ impl InstanceStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PublicEndpoint {
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RuntimeMetadata {
+    #[schema(inline)]
     pub kind: RuntimeKind,
     pub container_name: String,
+    #[schema(schema_with = crate::routes::openapi::literals::none)]
     pub network_mode: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     Docker,
@@ -292,7 +314,7 @@ impl From<DaemonEngine> for RuntimeKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DatabaseIdentity {
     pub name: String,
     pub username: String,

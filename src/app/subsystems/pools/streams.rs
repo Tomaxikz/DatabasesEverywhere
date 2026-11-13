@@ -45,12 +45,29 @@ fn grant_for(claims: &Claims, pool: &EngineRuntime) -> Result<PoolGrant, ApiErro
         .ok_or(ApiError::Unauthorized)
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct PoolLogs {
+    runtime_id: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/pools/{runtime_id}/logs",
+    tag = "pools",
+    summary = "Read recent redacted pool logs.",
+    description = "Read recent redacted pool logs.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_LOGS))),
+    params(("runtime_id" = String, Path), LogsQuery),
+    responses((status = 200, description = "Operation result.", body = PoolLogs))
+)]
 pub(crate) async fn logs(
     State(state): State<AppState>,
     auth: ApiRequestContext,
     ApiPath(id): ApiPath<String>,
     ApiQuery(query): ApiQuery<LogsQuery>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<PoolLogs> {
     auth.require_scope(scopes::POOLS_LOGS)?;
     let pool = super::load(&state, &id).await?;
     let logs = state
@@ -58,16 +75,32 @@ pub(crate) async fn logs(
         .logs(pool.protocol, &id, query.tail)
         .await
         .map_err(ApiError::runtime)?;
-    Ok(ApiResponse::ok(serde_json::json!({"runtime_id":id,
-        "stdout":crate::utils::redaction::redact_connection_url(&logs.stdout),
-        "stderr":crate::utils::redaction::redact_connection_url(&logs.stderr)})))
+    Ok(ApiResponse::ok(PoolLogs {
+        runtime_id: id,
+        stdout: crate::utils::redaction::redact_connection_url(&logs.stdout),
+        stderr: crate::utils::redaction::redact_connection_url(&logs.stderr),
+    }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/pools/{runtime_id}/logs",
+    tag = "pools",
+    summary = "Stream whole-pool logs.",
+    description = "Requires an owner-and-generation-bound pools:logs JWT, not logs:read. Pool-wide logs can contain data from every child database. Same reset/append/end protocol as dedicated logs, with runtime_id instead of instance_id. Reconnect with a fresh one-use JWT. No query-token authentication.",
+    extensions(
+        ("x-required-scope" = json!(scopes::POOLS_LOGS)),
+        ("x-websocket" = json!(true)),
+        ("x-websocket-message" = json!({"$ref": "#/components/schemas/PoolLogEvent"}))
+    ),
+    params(("runtime_id" = String, Path), websocket::LogsQuery),
+    responses((status = 101, description = "WebSocket upgrade."))
+)]
 pub(crate) async fn log_socket(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,
     ApiPath(id): ApiPath<String>,
-    ApiQuery(query): ApiQuery<LogsQuery>,
+    ApiQuery(query): ApiQuery<websocket::LogsQuery>,
     socket: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let claims = auth.require_scope(scopes::POOLS_LOGS, None)?;
@@ -91,6 +124,20 @@ pub(crate) async fn log_socket(
         }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/pools/{runtime_id}/monitoring",
+    tag = "pools",
+    summary = "Stream whole-pool metrics.",
+    description = "Requires an owner-and-generation-bound pools:monitor JWT minted with pools plus server_id. No instance token grants this access. Sends one unbatched pool_stats snapshot per second; progress is change-only. Merge reset/removals/updates and reconnect with a fresh one-use JWT after a sequence gap. Values are already percentage points/bytes; keep null and sample freshness.",
+    extensions(
+        ("x-required-scope" = json!(scopes::POOLS_MONITOR)),
+        ("x-websocket" = json!(true)),
+        ("x-websocket-message" = json!({"$ref": "#/components/schemas/PoolStats"}))
+    ),
+    params(("runtime_id" = String, Path)),
+    responses((status = 101, description = "WebSocket upgrade."))
+)]
 pub(crate) async fn monitoring(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,
@@ -109,9 +156,11 @@ pub(crate) async fn monitoring(
         }))
 }
 
-#[derive(Serialize)]
-struct PoolStats<'a> {
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct PoolStats<'a> {
+    #[schema(schema_with = crate::routes::openapi::literals::pool_stats)]
     r#type: &'static str,
+    #[schema(minimum = 1)]
     sequence: u64,
     sampled_at_unix: i64,
     pool: SharedPoolReport,
@@ -220,6 +269,16 @@ async fn send_pool_stats(
         .is_ok()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pools/{runtime_id}/backups",
+    tag = "pools",
+    summary = "List backups of the pool's databases.",
+    description = "Lists existing per-database backups for this pool. Requires pools:read and backups:read. These remain independent backups, not a simultaneous whole-engine snapshot.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_READ))),
+    params(("runtime_id" = String, Path)),
+    responses((status = 200, description = "Operation result.", body = Vec<crate::subsystems::backups::BackupInfo>))
+)]
 pub(crate) async fn backups(
     State(state): State<AppState>,
     auth: ApiRequestContext,

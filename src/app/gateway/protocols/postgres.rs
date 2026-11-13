@@ -192,17 +192,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_user_and_database() {
+    fn parses_user_and_optional_database() {
         let packet = startup_packet(&[("user", "app"), ("database", "app_db")]);
 
         let route = parse_startup_route(&packet).unwrap();
 
         assert_eq!(route.user, "app");
         assert_eq!(route.database.as_deref(), Some("app_db"));
-    }
 
-    #[test]
-    fn preserves_an_omitted_database_for_unique_username_routing() {
         let packet = startup_packet(&[("user", "app")]);
 
         let route = parse_startup_route(&packet).unwrap();

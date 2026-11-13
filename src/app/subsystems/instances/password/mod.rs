@@ -51,9 +51,10 @@ use supervision::{
     reset_live_password, resolve_password_metadata_commit, rollback_or_fail, run_password_worker,
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResetInstancePasswordRequest {
+    #[schema(format = Password, write_only, min_length = 1, max_length = 4096, pattern = r"^[^\u0000\r\n]+$")]
     pub password: String,
 }
 
@@ -71,7 +72,7 @@ pub(crate) async fn verify_resp_credential(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ResetInstancePasswordResponse {
     pub instance: InstanceMetadata,
     pub restarted: bool,
@@ -88,6 +89,17 @@ struct PreviousCredential {
     acl: Option<Vec<u8>>,
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/instances/{instance_id}/password",
+    tag = "instances",
+    summary = "Reset an instance tenant password or API key.",
+    description = "Atomically rotates and validates the tenant credential and attempts to restore the previous credential if any step fails. Shared mode changes only the selected tenant and never recreates or restarts the pool. Dedicated mode normally rotates in place but may recreate its owned runtime when the engine stores immutable startup credentials. The instance must be running and experiences a brief connection interruption.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = ResetInstancePasswordRequest,
+    responses((status = 200, description = "Credential reset result. The password is never included.", body = ResetInstancePasswordResponse))
+)]
 pub async fn reset_instance_password(
     State(state): State<AppState>,
     auth: ApiRequestContext,

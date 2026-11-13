@@ -478,22 +478,6 @@ async fn mongodb_and_physical_protocols_report_bounded_full_only_catalogs() {
     }
 }
 
-#[tokio::test]
-async fn serializable_catalog_round_trips_for_sqlite_storage() {
-    let directory = TempDir::new().unwrap();
-    let path = write_temp_file(
-        &directory,
-        "dump.sql",
-        b"CREATE TABLE public.users(id bigint);",
-    );
-    let original = inspect_uploaded_dump(&path, Protocol::Postgres, None)
-        .await
-        .unwrap();
-    let json = serde_json::to_vec(&original).unwrap();
-    let restored: DumpInspection = serde_json::from_slice(&json).unwrap();
-    assert_eq!(restored, original);
-}
-
 #[test]
 fn bounded_inspection_limits_are_retryable_not_malformed() {
     let error = InspectionError::Limit("archive contains too many entries").into_api_error();

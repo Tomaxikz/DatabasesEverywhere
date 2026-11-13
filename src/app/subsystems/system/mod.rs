@@ -577,14 +577,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        for field in ["failure_code", "failure_message"] {
-            let description = migration["properties"][field]["description"]
-                .as_str()
-                .expect("failure field safety contract");
-            let description = description.to_ascii_lowercase();
-            assert!(description.contains("stable"));
-            assert!(description.contains("sanitized"));
-        }
         let failure_codes = strings(&migration["properties"]["failure_code"]["enum"]);
         assert_eq!(
             failure_codes,

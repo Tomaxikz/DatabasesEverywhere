@@ -288,7 +288,7 @@ async fn failed_legacy_mysql_is_removed_without_affecting_healthy_mysql_routes()
 }
 
 #[test]
-fn allocation_guard_rejects_pool_and_free_reserve_overcommit() {
+fn allocation_guard_rejects_overcommit_but_allows_decreases() {
     for (resource, allocated, requested, pool, free, reserve, diagnostic) in [
         (
             "memory",
@@ -323,10 +323,7 @@ fn allocation_guard_rejects_pool_and_free_reserve_overcommit() {
         assert!(matches!(error, ApiError::ServiceUnavailable(_)));
         assert!(error.to_string().contains(diagnostic));
     }
-}
 
-#[test]
-fn allocation_guard_allows_decreases_while_node_is_over_capacity() {
     enforce_resource_allocation(
         "memory",
         mib_to_bytes(10_000),
@@ -340,7 +337,7 @@ fn allocation_guard_allows_decreases_while_node_is_over_capacity() {
 }
 
 #[test]
-fn cpu_allocation_guard_rejects_projected_overcommit() {
+fn cpu_allocation_guard_rejects_overcommit_but_allows_decreases() {
     let error = enforce_cpu_allocation(7.5, 0.0, 1.0, 8).unwrap_err();
 
     assert!(matches!(error, ApiError::ServiceUnavailable(_)));
@@ -350,10 +347,7 @@ fn cpu_allocation_guard_rejects_projected_overcommit() {
             .contains("projected allocation 8.50 cores")
     );
     assert!(error.to_string().contains("detected 8-core capacity"));
-}
 
-#[test]
-fn cpu_allocation_guard_allows_decreases_while_overcommitted() {
     enforce_cpu_allocation(12.0, 4.0, 2.0, 8).unwrap();
 }
 

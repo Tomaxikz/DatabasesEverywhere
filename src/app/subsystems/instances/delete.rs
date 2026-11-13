@@ -12,6 +12,16 @@ use crate::server::metadata::{DesiredInstanceState, InstanceStatus};
 use crate::utils::time::now_rfc3339;
 use axum::extract::State;
 
+#[utoipa::path(
+    delete,
+    path = "/api/instances/{instance_id}",
+    tag = "instances",
+    summary = "Irreversibly delete one instance, its jobs, artifacts, backups, recovery data, and database contents.",
+    description = "Dedicated deletion removes the owned engine runtime. Shared deletion removes only the logical tenant and removes the pool runtime only when its final tenant is gone.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path), DeleteInstanceQuery),
+    responses((status = 200, description = "Delete result.", body = DeleteResponse))
+)]
 pub async fn delete_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,

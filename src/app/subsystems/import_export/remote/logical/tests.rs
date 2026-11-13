@@ -16,17 +16,9 @@ use crate::{
 };
 
 #[test]
-fn option_file_escapes_quotes_and_backslashes() {
+fn credential_files_escape_separators_and_reject_line_injection() {
     assert_eq!(mysql_option_value("a\"b\\c").unwrap(), "\"a\\\"b\\\\c\"");
-}
-
-#[test]
-fn pgpass_escapes_field_separators() {
     assert_eq!(pgpass_value(r"a:b\c").unwrap(), r"a\:b\\c");
-}
-
-#[test]
-fn pgpass_rejects_line_and_nul_injection() {
     for value in ["secret\nother", "secret\rother", "secret\0other"] {
         assert!(matches!(pgpass_value(value), Err(ApiError::BadRequest(_))));
     }

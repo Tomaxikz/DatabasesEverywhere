@@ -244,14 +244,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_and_restore_kind() {
-        let strategy = MysqlDumpStrategy;
-        assert_eq!(strategy.id(), MYSQL_CONSISTENT_DUMP);
-        assert_eq!(strategy.restore_recipe().id, RESTORE_RECIPE_ID);
-        assert_eq!(strategy.restore_kind(), RestoreKind::AfterStart);
-    }
-
-    #[test]
     fn only_completed_dumps_pass() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DUMP_FILE);

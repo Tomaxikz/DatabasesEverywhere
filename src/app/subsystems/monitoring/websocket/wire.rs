@@ -1,21 +1,56 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::{Serializer, ser::SerializeStruct};
+use serde::{Serialize, Serializer};
 
 use super::{InstallProgress, ResourceReport, TenantActivity};
+use crate::{
+    server::monitoring::OperationCounts,
+    subsystems::monitoring::{
+        activity::ActivitySources,
+        resources::{CpuReport, DiskReport, MemoryReport},
+    },
+};
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct MonitoringResources<'a> {
+    #[schema(inline)]
+    cpu: &'a CpuReport,
+    #[schema(inline)]
+    memory: &'a MemoryReport,
+    #[schema(inline)]
+    disk: &'a DiskReport,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(crate) struct MonitoringActivity<'a> {
+    stats_epoch: &'a str,
+    sampled_at_unix: i64,
+    accepted: OperationCounts,
+    rejected: OperationCounts,
+    active_connections: u64,
+    opened_connections: u64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    #[schema(required)]
+    cpu_time_micros: Option<u64>,
+    #[schema(required)]
+    peak_query_memory_bytes: Option<u64>,
+    #[schema(inline)]
+    sources: &'a ActivitySources,
+}
 
 pub(crate) fn resources<S: Serializer>(
     report: &Option<ResourceReport>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    let Some(report) = report else {
-        return serializer.serialize_none();
-    };
-    let mut fields = serializer.serialize_struct("MonitoringResources", 3)?;
-    fields.serialize_field("cpu", &report.cpu)?;
-    fields.serialize_field("memory", &report.memory)?;
-    fields.serialize_field("disk", &report.disk)?;
-    fields.end()
+    report
+        .as_ref()
+        .map(|report| MonitoringResources {
+            cpu: &report.cpu,
+            memory: &report.memory,
+            disk: &report.disk,
+        })
+        .serialize(serializer)
 }
 
 pub(crate) fn activity<S: Serializer>(
@@ -23,19 +58,20 @@ pub(crate) fn activity<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     let current = &activity.current;
-    let mut fields = serializer.serialize_struct("MonitoringActivity", 11)?;
-    fields.serialize_field("stats_epoch", &current.stats_epoch)?;
-    fields.serialize_field("sampled_at_unix", &current.sampled_at_unix)?;
-    fields.serialize_field("accepted", &current.accepted)?;
-    fields.serialize_field("rejected", &current.rejected)?;
-    fields.serialize_field("active_connections", &current.active_connections)?;
-    fields.serialize_field("opened_connections", &current.opened_connections)?;
-    fields.serialize_field("rx_bytes", &current.rx_bytes)?;
-    fields.serialize_field("tx_bytes", &current.tx_bytes)?;
-    fields.serialize_field("cpu_time_micros", &current.cpu_time_micros)?;
-    fields.serialize_field("peak_query_memory_bytes", &current.peak_query_memory_bytes)?;
-    fields.serialize_field("sources", &activity.sources)?;
-    fields.end()
+    MonitoringActivity {
+        stats_epoch: &current.stats_epoch,
+        sampled_at_unix: current.sampled_at_unix,
+        accepted: current.accepted,
+        rejected: current.rejected,
+        active_connections: current.active_connections,
+        opened_connections: current.opened_connections,
+        rx_bytes: current.rx_bytes,
+        tx_bytes: current.tx_bytes,
+        cpu_time_micros: current.cpu_time_micros,
+        peak_query_memory_bytes: current.peak_query_memory_bytes,
+        sources: &activity.sources,
+    }
+    .serialize(serializer)
 }
 
 #[derive(Default)]

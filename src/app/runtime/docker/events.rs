@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_managed_lifecycle_events() {
+    fn parses_managed_lifecycle_events_across_engine_spellings() {
         let parsed = ManagedContainerEvent::from_message(event("die"), Some("node-a")).unwrap();
 
         assert_eq!(parsed.instance_id, "inst_pg_1");
@@ -172,10 +172,7 @@ mod tests {
             parsed.action,
             ManagedContainerAction::Exited { exit_code: None }
         );
-    }
 
-    #[test]
-    fn accepts_podman_compatibility_lifecycle_spellings() {
         assert!(matches!(
             ManagedContainerEvent::from_message(event("died"), None)
                 .unwrap()
@@ -187,6 +184,17 @@ mod tests {
                 .unwrap()
                 .action,
             ManagedContainerAction::Destroyed
+        );
+
+        let mut unidentified = event("die");
+        unidentified.actor.as_mut().unwrap().id = None;
+
+        let parsed = ManagedContainerEvent::from_message(unidentified, None).unwrap();
+
+        assert!(parsed.container_id.is_none());
+        assert_eq!(
+            parsed.action,
+            ManagedContainerAction::Exited { exit_code: None }
         );
     }
 
@@ -212,20 +220,6 @@ mod tests {
         );
         assert!(parsed.action.indicates_unexpected_failure());
         assert!(parsed.action.deactivates_container());
-    }
-
-    #[test]
-    fn preserves_events_when_an_engine_omits_the_actor_id() {
-        let mut unidentified = event("die");
-        unidentified.actor.as_mut().unwrap().id = None;
-
-        let parsed = ManagedContainerEvent::from_message(unidentified, None).unwrap();
-
-        assert!(parsed.container_id.is_none());
-        assert_eq!(
-            parsed.action,
-            ManagedContainerAction::Exited { exit_code: None }
-        );
     }
 
     #[test]

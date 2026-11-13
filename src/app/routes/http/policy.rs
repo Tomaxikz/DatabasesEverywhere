@@ -226,10 +226,12 @@ fn websocket_protocol_token(headers: &HeaderMap) -> Option<&str> {
         .find_map(|protocol| protocol.strip_prefix("dbe.jwt."))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DestructiveActionConfirmation {
+    #[schema(schema_with = crate::routes::openapi::literals::yes)]
     pub confirm: bool,
+    #[schema(min_length = 1, max_length = 512)]
     pub reason: String,
 }
 

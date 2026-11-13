@@ -262,17 +262,13 @@ mod tests {
     }
 
     #[test]
-    fn node_wide_scope_must_be_explicit_and_unambiguous() {
+    fn instance_scope_must_be_explicit_unambiguous_and_unique() {
         assert!(matches!(
             validate_request(&request(Vec::new(), false)),
             Err(ApiError::BadRequest(_))
         ));
         validate_request(&request(Vec::new(), true)).unwrap();
         assert!(validate_request(&request(vec!["inst_one"], true)).is_err());
-    }
-
-    #[test]
-    fn selected_instance_ids_must_be_unique() {
         assert!(matches!(
             validate_request(&request(vec!["inst_one", "inst_one"], false)),
             Err(ApiError::BadRequest(_))

@@ -299,27 +299,31 @@ pub(super) async fn download_ticket_for_job(
     }
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct ImportExportSnapshot {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ImportExportSnapshot {
+    #[schema(schema_with = crate::routes::openapi::literals::import_export_snapshot)]
     r#type: &'static str,
     pub(super) jobs: Vec<ImportExportJobUpdate>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct ImportExportJobEvent {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ImportExportJobEvent {
+    #[schema(schema_with = crate::routes::openapi::literals::import_export_job_event)]
     r#type: &'static str,
     pub(super) job: ImportExportJobUpdate,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct ImportExportJobUpdate {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ImportExportJobUpdate {
     #[serde(flatten)]
     pub(super) job: ImportExportJobResponse,
+    #[schema(required)]
     pub(super) download: Option<DownloadUrlResponse>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct ImportExportLaggedEvent {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct ImportExportLaggedEvent {
+    #[schema(schema_with = crate::routes::openapi::literals::import_export_lagged)]
     r#type: &'static str,
     pub(super) skipped: u64,
 }

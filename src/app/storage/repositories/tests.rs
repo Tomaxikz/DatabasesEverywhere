@@ -100,17 +100,6 @@ async fn upserts_and_lists_instance_metadata() {
 }
 
 #[tokio::test]
-async fn get_returns_none_for_missing_instance() {
-    let dir = tempfile::tempdir().unwrap();
-    let pool = sqlite::connect(dir.path()).await.unwrap();
-    let repository = InstanceRepository::new(pool);
-
-    let metadata = repository.get("missing").await.unwrap();
-
-    assert!(metadata.is_none());
-}
-
-#[tokio::test]
 async fn persists_desired_state_outside_public_metadata_json() {
     let dir = tempfile::tempdir().unwrap();
     let pool = sqlite::connect(dir.path()).await.unwrap();

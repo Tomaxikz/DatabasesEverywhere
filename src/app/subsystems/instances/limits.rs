@@ -18,6 +18,21 @@ use crate::utils::limits::mib_to_bytes;
 use crate::utils::time::now_rfc3339;
 use axum::extract::State;
 
+#[utoipa::path(
+    patch,
+    path = "/api/instances/{instance_id}/limits",
+    tag = "instances",
+    summary = "Update CPU, memory, and disk limits for an instance.",
+    description = "Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. They never resize pool CPU/RAM/disk. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = LimitsRequest,
+    responses(
+        (status = 200, description = "Updated instance metadata.", body = InstanceMetadata),
+        (status = 409, description = "A shared tenant disk decrease is below its current physical usage, or the tenant could not be fenced and drained safely for the shrink check. The existing limit remains unchanged."),
+        (status = 503, description = "An enabled CPU, memory, or disk allocation guard rejected a limit increase. Capacity guards do not reject decreases; shared disk decreases can separately return 409 when current data does not fit."),
+    )
+)]
 pub async fn update_instance_limits(
     State(state): State<AppState>,
     auth: ApiRequestContext,

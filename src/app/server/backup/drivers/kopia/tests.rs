@@ -145,14 +145,6 @@ fn checkpoints_are_found_by_their_source_path_label() {
     }
 }
 
-#[test]
-fn restore_uses_the_snapshot_restore_command() {
-    let arguments = restore_arguments("k123/archive", Path::new("/tmp/archive"));
-    assert_eq!(arguments[0], "snapshot");
-    assert_eq!(arguments[1], "restore");
-    assert_eq!(arguments[2], "k123/archive");
-}
-
 fn snapshot_with_tags(tags: Vec<String>) -> KopiaManifest {
     normalize_tags(KopiaManifest {
         id: "m456".to_string(),

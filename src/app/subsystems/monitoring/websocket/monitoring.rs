@@ -33,6 +33,19 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tokio::time::{MissedTickBehavior, interval, sleep_until};
 
+#[utoipa::path(
+    get,
+    path = "/ws/monitoring",
+    tag = "monitoring",
+    summary = "WebSocket stream of instance resource snapshots.",
+    description = "Requires monitor:read on a short-lived generation-bound WebSocket JWT. Browser authentication uses Sec-WebSocket-Protocol [\"dbe.jwt\", \"<jwt>\"]; query tokens are rejected. One full authorized instance snapshot is produced per second, split into bounded messages with sequence, sampled_at_unix, batch_index and batch_count. Assemble every batch before applying a sequence. Reconnect with a fresh JWT on a missing/incomplete sequence; skipping progress deltas loses updates. API 0.16 instance identity lives only on the outer item: instance_id, runtime_id, deployment_mode, resource_scope, protocol, status, runtime. resources contains only cpu, memory and disk (or null with resource_error); REST resource responses remain self-contained. activity omits instance_id and is the only WebSocket location for rx_bytes and tx_bytes. install_progress contains changed records only. After assembling a sequence, clear the progress cache if progress_reset is true, remove install_progress_removed IDs, and upsert install_progress by instance_id. Missing progress is not deletion or a creating state. New connections receive a complete retained progress snapshot with progress_reset=true. Reset sequence/batch state on reconnect; keep explicit null values, source labels, timestamps and stats_epoch discontinuities. CPU remains percentage points (11.0 means 11%). Shared tenant CPU/RAM remains null, never whole-pool consumption. Sampling, generation checks, authorization and 16-KiB batch limits are unchanged.",
+    extensions(
+        ("x-required-scope" = json!(scopes::MONITOR_READ)),
+        ("x-websocket" = json!(true)),
+        ("x-websocket-message" = json!({"$ref": "#/components/schemas/MonitoringBatch"}))
+    ),
+    responses((status = 101, description = "WebSocket upgrade."))
+)]
 pub async fn monitoring(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,
@@ -390,35 +403,45 @@ pub(super) fn chunk_serialized<T: Serialize>(
     Ok(chunks)
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct MonitoringBatch<'a> {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct MonitoringBatch<'a> {
     pub(super) progress_reset: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) install_progress_removed: Vec<String>,
+    #[schema(schema_with = crate::routes::openapi::literals::stats)]
     r#type: &'static str,
+    #[schema(minimum = 1)]
     pub(super) sequence: u64,
     pub(super) sampled_at_unix: i64,
     pub(super) batch_index: u32,
+    #[schema(minimum = 1)]
     pub(super) batch_count: u32,
     pub(super) instances: Vec<&'a MonitoringInstance>,
     pub(super) install_progress: Vec<&'a InstallProgress>,
 }
 
-#[derive(Debug, Serialize)]
-pub(super) struct MonitoringInstance {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub(crate) struct MonitoringInstance {
     pub(super) instance_id: String,
     #[serde(skip)]
     pub(super) instance_generation: String,
     pub(super) runtime_id: String,
     pub(super) deployment_mode: crate::server::placement::DeploymentMode,
+    #[schema(inline)]
     pub(super) resource_scope: ResourceScope,
+    #[schema(value_type = crate::databases::protocol::Protocol)]
     pub(super) protocol: String,
+    #[schema(value_type = crate::server::metadata::InstanceStatus, inline)]
     pub(super) status: String,
+    #[schema(schema_with = crate::routes::openapi::literals::daemon_engine)]
     pub(super) runtime: &'static str,
     #[serde(serialize_with = "wire::activity")]
+    #[schema(value_type = wire::MonitoringActivity)]
     pub(super) activity: TenantActivity,
     #[serde(serialize_with = "wire::resources")]
+    #[schema(value_type = Option<wire::MonitoringResources>, required)]
     pub(super) resources: Option<ResourceReport>,
+    #[schema(required)]
     pub(super) resource_error: Option<PublicDiagnostic>,
 }
 

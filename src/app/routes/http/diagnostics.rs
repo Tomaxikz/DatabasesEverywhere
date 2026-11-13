@@ -7,12 +7,14 @@ use super::response::ApiError;
 
 const MAX_PUBLIC_DIAGNOSTIC_CHARS: usize = 512;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PublicDiagnostic {
     pub code: String,
+    #[schema(max_length = 512)]
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(format = Uuid, nullable = false)]
     pub error_id: Option<String>,
 }
 

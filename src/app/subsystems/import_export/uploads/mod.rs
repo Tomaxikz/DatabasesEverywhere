@@ -168,7 +168,7 @@ pub(super) struct ImportStagingPermit {
 
 pub(crate) use crate::server::disk::capacity::DiskCapacityReservation;
 
-mod handlers;
+pub(crate) mod handlers;
 pub(crate) use handlers::{
     delete_import_upload, get_import_catalog, get_import_upload, import_entry,
     inspect_import_upload, list_import_uploads,
@@ -183,26 +183,38 @@ mod storage;
 use storage::capacity_api_error;
 pub(super) use storage::{harden_upload_source, remove_upload_file, upload_file_path};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportUpload)]
 pub(crate) struct ImportUploadResponse {
+    #[schema(pattern = "^upl_[0-9a-f]{32}$")]
     pub upload_id: String,
     pub instance_id: String,
+    #[schema(max_length = 180)]
     pub original_filename: String,
     pub protocol: Protocol,
+    #[schema(required, schema_with = crate::routes::openapi::literals::import_archive_format)]
     pub archive_format: Option<&'static str>,
+    #[schema(schema_with = crate::routes::openapi::literals::upload_state)]
     pub state: &'static str,
+    #[schema(minimum = 1)]
     pub size_bytes: u64,
+    #[schema(required, pattern = "^[0-9a-f]{64}$")]
     pub sha256: Option<String>,
     pub catalog_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub error: Option<String>,
+    #[schema(format = DateTime)]
     pub created_at: String,
+    #[schema(format = DateTime)]
     pub updated_at: String,
+    #[schema(format = DateTime)]
     pub expires_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct ImportUploadDeleteResponse {
+    #[schema(pattern = "^upl_[0-9a-f]{32}$")]
     pub upload_id: String,
     pub deleted: bool,
 }

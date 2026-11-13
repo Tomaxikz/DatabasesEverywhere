@@ -25,34 +25,71 @@ pub(crate) use qdrant::{backup as qdrant_backup, cleanup_stale_bridge, import_qd
 pub(crate) use redis::import_resp;
 pub use security::RemoteEndpointRequest;
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[schema(default = "merge")]
 pub enum ImportMode {
     #[default]
     Merge,
     Wipe,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(
+    as = RemoteImportSource,
+    description = "Protocol-specific remote credentials. Qdrant imports also migrate aliases attached to selected source collections; source aliases win same-name conflicts."
+)]
 pub struct RemoteImportRequest {
+    #[schema(min_length = 1, max_length = 253, example = "source-db.example.com")]
     pub host: String,
     #[serde(default)]
+    #[schema(minimum = 1, maximum = 65535)]
     pub port: Option<u16>,
     #[serde(default = "default_true")]
+    #[schema(default = true)]
     pub tls: bool,
     #[serde(default)]
+    #[schema(
+        min_length = 1,
+        max_length = 256,
+        pattern = r"^[^\u0000-\u001F\u007F-\u009F]+$"
+    )]
     pub database: Option<String>,
     #[serde(default)]
+    #[schema(
+        min_length = 1,
+        max_length = 256,
+        pattern = r"^[^\u0000-\u001F\u007F-\u009F]+$"
+    )]
     pub username: Option<String>,
     #[serde(default)]
+    #[schema(schema_with = password_schema)]
     pub password: Option<SecretString>,
     #[serde(default)]
+    #[schema(
+        min_length = 1,
+        max_length = 256,
+        pattern = r"^[^\u0000-\u001F\u007F-\u009F]+$"
+    )]
     pub authentication_database: Option<String>,
     #[serde(default)]
+    #[schema(maximum = 4294967295_u64)]
     pub database_index: Option<u32>,
     #[serde(default)]
+    #[schema(value_type = Option<String>, format = Password, max_length = 4096, write_only)]
     pub api_key: Option<SecretString>,
+}
+
+fn password_schema() -> utoipa::openapi::Object {
+    use utoipa::openapi::{KnownFormat, ObjectBuilder, SchemaFormat, Type, schema::SchemaType};
+    ObjectBuilder::new()
+        .schema_type(SchemaType::from_iter([Type::String, Type::Null]))
+        .format(Some(SchemaFormat::KnownFormat(KnownFormat::Password)))
+        .max_length(Some(4096))
+        .write_only(true)
+        .description(Some("Not stored in durable job records or metadata; acquisition may place it in a mode-0600 job-private temporary file removed after the helper exits."))
+        .build()
 }
 
 impl std::fmt::Debug for RemoteImportRequest {

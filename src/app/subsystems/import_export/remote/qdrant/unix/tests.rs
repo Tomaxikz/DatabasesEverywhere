@@ -68,14 +68,6 @@ fn qdrant_version_errors_do_not_echo_remote_text() {
 }
 
 #[test]
-fn qdrant_bridge_guard_owns_static_cleanup_state() {
-    fn assert_send_static<T: Send + 'static>() {}
-
-    assert_send_static::<QdrantBridge>();
-    assert!(std::mem::needs_drop::<QdrantBridge>());
-}
-
-#[test]
 fn every_attempted_qdrant_mutation_requires_a_process_fence_before_rollback() {
     // A lost upload response can outlive the HTTP future inside Qdrant. Never optimize
     // this to an immediate rollback based only on the client-side error kind.

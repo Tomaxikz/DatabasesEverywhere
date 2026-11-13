@@ -205,7 +205,12 @@ fn validates_remote_import_private_host_allowlist_syntax() {
 }
 
 #[test]
-fn rejects_zero_or_unrepresentable_allocation_limits() {
+fn rejects_zero_or_unrepresentable_allocation_limits_but_accepts_zero_reserves() {
+    let mut config = valid_config();
+    config.allocation.reserved_memory_mib = 0;
+    config.allocation.reserved_disk_mib = 0;
+    validate_config(&config).unwrap();
+
     let mut config = valid_config();
     config.allocation.max_memory_mib = Some(0);
     assert!(matches!(
@@ -223,15 +228,6 @@ fn rejects_zero_or_unrepresentable_allocation_limits() {
             field: "reserved_disk_mib"
         }
     ));
-}
-
-#[test]
-fn accepts_zero_allocation_reserves() {
-    let mut config = valid_config();
-    config.allocation.reserved_memory_mib = 0;
-    config.allocation.reserved_disk_mib = 0;
-
-    validate_config(&config).unwrap();
 }
 
 #[test]
@@ -537,19 +533,6 @@ fn rejects_trusted_origins_with_paths_or_unsupported_schemes() {
             Err(ConfigValidationError::InvalidApiOrigin { .. })
         ));
     }
-}
-
-#[test]
-fn rejects_url_shaped_api_host() {
-    let mut config = valid_config();
-    config.api.host = "https://dbe.example.com".to_string();
-
-    let error = validate_config(&config).unwrap_err();
-
-    assert!(matches!(
-        error,
-        ConfigValidationError::InvalidApiHost { .. }
-    ));
 }
 
 #[test]

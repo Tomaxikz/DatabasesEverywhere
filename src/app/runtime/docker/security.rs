@@ -348,20 +348,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_docker_socket_mount() {
-        let mut spec = test_spec();
-        spec.data_path = PathBuf::from("/var/run/docker.sock");
-
-        let error = DockerSecurityPolicy::default()
-            .validate_spec(&spec)
-            .unwrap_err();
-
-        assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
-    }
-
-    #[test]
-    fn rejects_system_and_rootless_podman_socket_mounts() {
+    fn rejects_docker_and_podman_socket_mounts() {
         for path in [
+            "/var/run/docker.sock",
             "/run/podman/podman.sock",
             "/run/user/1000/podman/podman.sock",
         ] {
@@ -404,57 +393,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forbidden_extra_mount_source() {
-        let mut spec = test_spec();
-        spec.extra_mounts.push(super::super::DockerMount {
-            source: PathBuf::from("/etc"),
-            target: "/mnt/config".to_string(),
-            read_only: true,
-        });
+    fn rejects_unsafe_extra_mount_sources_and_targets() {
+        for (source, target) in [
+            ("/etc", "/mnt/config"),
+            ("/tmp", "relative"),
+            ("/tmp", "/etc/database"),
+        ] {
+            let mut spec = test_spec();
+            spec.extra_mounts.push(super::super::DockerMount {
+                source: PathBuf::from(source),
+                target: target.to_string(),
+                read_only: true,
+            });
 
-        let error = DockerSecurityPolicy::default()
-            .validate_spec(&spec)
-            .unwrap_err();
+            let error = DockerSecurityPolicy::default()
+                .validate_spec(&spec)
+                .unwrap_err();
 
-        assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }));
-    }
-
-    #[test]
-    fn rejects_relative_extra_mount_target() {
-        let mut spec = test_spec();
-        spec.extra_mounts.push(super::super::DockerMount {
-            source: PathBuf::from("/tmp"),
-            target: "relative".to_string(),
-            read_only: true,
-        });
-
-        let error = DockerSecurityPolicy::default()
-            .validate_spec(&spec)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            DockerSecurityError::InvalidMountTarget { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_forbidden_extra_mount_target() {
-        let mut spec = test_spec();
-        spec.extra_mounts.push(super::super::DockerMount {
-            source: PathBuf::from("/tmp"),
-            target: "/etc/database".to_string(),
-            read_only: true,
-        });
-
-        let error = DockerSecurityPolicy::default()
-            .validate_spec(&spec)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            DockerSecurityError::ForbiddenMountTarget { .. }
-        ));
+            match target {
+                "/mnt/config" => {
+                    assert!(matches!(error, DockerSecurityError::ForbiddenMount { .. }))
+                }
+                "relative" => assert!(matches!(
+                    error,
+                    DockerSecurityError::InvalidMountTarget { .. }
+                )),
+                _ => assert!(matches!(
+                    error,
+                    DockerSecurityError::ForbiddenMountTarget { .. }
+                )),
+            }
+        }
     }
 
     #[test]

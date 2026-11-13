@@ -42,12 +42,16 @@ pub fn validate_runtime_limits(cpu_cores: f64, memory_mib: u64) -> Result<(), Re
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct InstanceLimits {
+    #[schema(minimum = 0.01, maximum = 1024, example = 0.5)]
     pub cpu_cores: f64,
+    #[schema(minimum = 1, maximum = 1048576, example = 512)]
     pub memory_mib: u64,
+    #[schema(minimum = 1, example = 1024)]
     pub disk_mib: u64,
     pub disk_enforced: bool,
+    #[schema(example = "host_filesystem_quota")]
     pub disk_enforcement_method: String,
 }
 

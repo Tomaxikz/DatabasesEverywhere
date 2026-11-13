@@ -14,14 +14,23 @@ use crate::{
     },
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreArtifactRequest {
     pub artifact_id: String,
     pub confirm: bool,
+    #[schema(min_length = 1, max_length = 512)]
     pub reason: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/recovery/failed-jobs",
+    tag = "admin",
+    summary = "List failed import/export jobs across the node.",
+    extensions(("x-required-scope" = json!(scopes::RECOVERY_ADMIN))),
+    responses((status = 200, description = "Failed job list.", body = Vec<ImportExportJobResponse>))
+)]
 pub async fn failed_jobs(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -39,6 +48,20 @@ pub async fn failed_jobs(
     Ok(ApiResponse::ok(response))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/recovery/jobs/{job_id}/retry",
+    tag = "import-export",
+    summary = "Retry a failed export or artifact import from its sanitized replay options. Credential imports and legacy jobs must be resubmitted.",
+    extensions(("x-required-scope" = json!(scopes::RECOVERY_ADMIN))),
+    params(("instance_id" = String, Path), ("job_id" = String, Path)),
+    responses((
+        status = 202,
+        description = "Replacement job.",
+        body = ImportExportJobResponse,
+        headers(("Location" = String, description = "Origin-relative replacement job status URL."))
+    ))
+)]
 pub async fn retry_job(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -68,6 +91,21 @@ pub async fn retry_job(
     replay_failed_job(&state, &job).await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/recovery/restore",
+    tag = "import-export",
+    summary = "Restore an export artifact belonging to the same instance.",
+    extensions(("x-required-scope" = json!(scopes::RECOVERY_ADMIN))),
+    params(("instance_id" = String, Path)),
+    request_body = inline(RestoreArtifactRequest),
+    responses((
+        status = 202,
+        description = "Queued restore job.",
+        body = ImportExportJobResponse,
+        headers(("Location" = String, description = "Origin-relative restore job status URL."))
+    ))
+)]
 pub async fn restore_artifact(
     State(state): State<AppState>,
     auth: ApiRequestContext,

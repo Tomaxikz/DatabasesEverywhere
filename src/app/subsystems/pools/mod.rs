@@ -1,6 +1,6 @@
 pub(crate) mod image;
-mod limits;
-mod operations;
+pub(crate) mod limits;
+pub(crate) mod operations;
 mod power;
 mod provision;
 pub(crate) mod streams;

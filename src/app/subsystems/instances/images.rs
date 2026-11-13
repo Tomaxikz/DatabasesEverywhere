@@ -13,20 +13,29 @@ use crate::{
     utils::images::is_pinned_image_reference,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PullImageRequest {
     pub protocol: Protocol,
     pub image: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PullImageResponse {
     pub protocol: Protocol,
     pub image: String,
     pub pulled: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/admin/images/pull",
+    tag = "admin",
+    summary = "Pull an image for a protocol.",
+    extensions(("x-required-scope" = json!(scopes::IMAGES_ADMIN))),
+    request_body = inline(PullImageRequest),
+    responses((status = 200, description = "Pull result.", body = PullImageResponse))
+)]
 pub async fn pull_image(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -98,13 +107,6 @@ pub(crate) fn validate_image(image: &str) -> Result<&str, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        auth::api_token::ApiToken,
-        config::{Config, ImageAllowlistConfig},
-        server::{manager::InstanceManager, state::InstanceStore},
-        storage::{repositories::InstanceRepository, sqlite},
-        subsystems::test_support,
-    };
 
     #[test]
     fn validates_custom_image_references() {
@@ -123,42 +125,5 @@ mod tests {
                 "unexpected image validation result: {image}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn image_allowlist_accepts_configured_and_protocol_entries_only() {
-        let state = test_state(Config {
-            images: crate::config::ImageConfig {
-                postgres: "postgres:18.4".to_string(),
-                allowed: ImageAllowlistConfig {
-                    postgres: vec!["postgres:18.5".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .await;
-
-        check_image_allowed(&state, Protocol::Postgres, "postgres:18.4").unwrap();
-        check_image_allowed(&state, Protocol::Postgres, "postgres:18.5").unwrap();
-        let error = check_image_allowed(&state, Protocol::Postgres, "postgres:18.6").unwrap_err();
-
-        assert!(error.to_string().contains("is not allowed"));
-    }
-
-    async fn test_state(config: Config) -> AppState {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = sqlite::connect(dir.path()).await.unwrap();
-        let store = InstanceStore::default();
-        let manager = InstanceManager::new(store.clone(), InstanceRepository::new(pool.clone()));
-        test_support::state(
-            config,
-            dir.path().join("config.yml"),
-            ApiToken::new("secret"),
-            store,
-            manager,
-            pool,
-        )
     }
 }

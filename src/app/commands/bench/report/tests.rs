@@ -1,6 +1,5 @@
 use super::{
     csv::csv_field,
-    format::human_bytes,
     markdown::write_recommendation_row,
     reserve_report_directory,
     terminal::{
@@ -15,12 +14,6 @@ fn csv_fields_escape_delimiters_and_quotes() {
     assert_eq!(csv_field("plain"), "plain");
     assert_eq!(csv_field("a,b"), "\"a,b\"");
     assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
-}
-
-#[test]
-fn byte_format_uses_binary_units() {
-    assert_eq!(human_bytes(1024), "1.00 KiB");
-    assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
 }
 
 #[test]

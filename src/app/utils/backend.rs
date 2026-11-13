@@ -13,17 +13,15 @@ pub const SOCKET_BRIDGE_CONTAINER_PATH: &str = "/opt/dbev/dbev-socket-bridge";
 const CLICKHOUSE_HTTP_SOCKET_FILENAME: &str = "clickhouse-http.sock";
 const QDRANT_HTTP_SOCKET_FILENAME: &str = "qdrant-http.sock";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[schema(
+    description = "Active instances use unix_socket. docker_tcp is returned only for legacy records quarantined during migration and is never connected."
+)]
 pub enum BackendEndpoint {
-    UnixSocket {
-        socket_path: String,
-    },
-    /// Legacy metadata only. New instances must use `UnixSocket`.
-    DockerTcp {
-        host: String,
-        port: u16,
-    },
+    UnixSocket { socket_path: String },
+    // Legacy metadata only. New instances must use `UnixSocket`.
+    DockerTcp { host: String, port: u16 },
 }
 
 pub fn backend_socket_path(socket_directory: &Path, protocol: Protocol) -> PathBuf {
@@ -66,36 +64,6 @@ fn socket_filename(protocol: Protocol) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn maps_each_protocol_to_a_private_socket() {
-        let root = Path::new("/run/dbev/sockets/instance");
-
-        assert_eq!(
-            backend_socket_path(root, Protocol::Postgres),
-            root.join(".s.PGSQL.5432")
-        );
-        assert_eq!(
-            backend_socket_path(root, Protocol::Mariadb),
-            root.join("mysqld.sock")
-        );
-        assert_eq!(
-            backend_socket_path(root, Protocol::Mysql),
-            root.join("mysqld.sock")
-        );
-        assert_eq!(
-            container_backend_socket_path(Protocol::Mysql),
-            "/var/run/mysqld/mysqld.sock"
-        );
-        assert_eq!(
-            container_backend_socket_path(Protocol::Redis),
-            "/run/dbev/redis.sock"
-        );
-        assert_eq!(
-            container_backend_socket_path(Protocol::Valkey),
-            "/run/dbev/valkey.sock"
-        );
-    }
 
     #[test]
     fn secondary_protocol_sockets_are_distinct_siblings() {

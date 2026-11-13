@@ -9,6 +9,19 @@ use crate::server::metadata::InstanceMetadata;
 use crate::utils::redaction;
 use axum::extract::State;
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/logs",
+    tag = "instances",
+    summary = "Get recent logs for one instance.",
+    description = "Available only for dedicated instances. Shared-engine logs are pool-wide and are rejected with 409 because they can contain activity from other tenants.",
+    extensions(("x-required-scope" = json!(scopes::LOGS_READ))),
+    params(("instance_id" = String, Path), LogsQuery),
+    responses(
+        (status = 200, description = "Log output.", body = LogsResponse),
+        (status = 409, description = "Shared-engine logs are pool-wide and cannot be exposed through a tenant-scoped route."),
+    )
+)]
 pub async fn instance_logs(
     State(state): State<AppState>,
     auth: ApiRequestContext,

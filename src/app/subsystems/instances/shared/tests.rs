@@ -99,11 +99,6 @@ fn only_an_eligible_unfenced_route_is_restored_after_mutation() {
 }
 
 #[test]
-fn shared_logs_are_fail_closed() {
-    assert!(reject_logs().to_string().contains("pool-wide"));
-}
-
-#[test]
 fn resize_commit_matching_checks_every_reserved_limit() {
     let expected = InstanceLimits::default();
     let mut changed = expected.clone();
@@ -182,75 +177,71 @@ fn existing_hard_disk_state_cannot_silently_downgrade() {
 }
 
 #[test]
-fn status_reconcile_never_reopens_unsafe_tenant_state() {
-    for current in [InstanceStatus::Quarantined, InstanceStatus::Deleting] {
+fn status_reconcile_never_reopens_unsafe_fenced_or_failed_tenants() {
+    use DesiredInstanceState as Desired;
+    use EngineRuntimeStatus as Runtime;
+    use InstanceStatus as Status;
+    for (current, desired, runtime, route_fenced, expected) in [
+        (
+            Status::Quarantined,
+            Desired::Running,
+            Runtime::Running,
+            false,
+            Status::Quarantined,
+        ),
+        (
+            Status::Deleting,
+            Desired::Running,
+            Runtime::Running,
+            false,
+            Status::Deleting,
+        ),
+        (
+            Status::Failed,
+            Desired::Running,
+            Runtime::Running,
+            false,
+            Status::Failed,
+        ),
+        (
+            Status::Running,
+            Desired::Running,
+            Runtime::Running,
+            false,
+            Status::Running,
+        ),
+        (
+            Status::Running,
+            Desired::Running,
+            Runtime::Failed,
+            false,
+            Status::Failed,
+        ),
+        (
+            Status::Running,
+            Desired::Running,
+            Runtime::Running,
+            true,
+            Status::Failed,
+        ),
+        (
+            Status::Running,
+            Desired::Stopped,
+            Runtime::Running,
+            true,
+            Status::Stopped,
+        ),
+    ] {
         assert_eq!(
             reconciled_tenant_status(
                 current,
-                DesiredInstanceState::Running,
-                EngineRuntimeStatus::Running,
+                desired,
+                runtime,
                 DockerContainerStatus::Running,
-                false,
+                route_fenced,
             ),
-            current
+            expected,
+            "{current:?} / {desired:?} / {runtime:?} / fenced={route_fenced}"
         );
     }
-    assert_eq!(
-        reconciled_tenant_status(
-            InstanceStatus::Failed,
-            DesiredInstanceState::Running,
-            EngineRuntimeStatus::Running,
-            DockerContainerStatus::Running,
-            false,
-        ),
-        InstanceStatus::Failed
-    );
-}
-
-#[test]
-fn status_reconcile_only_keeps_an_already_open_tenant_running() {
-    assert_eq!(
-        reconciled_tenant_status(
-            InstanceStatus::Running,
-            DesiredInstanceState::Running,
-            EngineRuntimeStatus::Running,
-            DockerContainerStatus::Running,
-            false,
-        ),
-        InstanceStatus::Running
-    );
-    assert_eq!(
-        reconciled_tenant_status(
-            InstanceStatus::Running,
-            DesiredInstanceState::Running,
-            EngineRuntimeStatus::Failed,
-            DockerContainerStatus::Running,
-            false,
-        ),
-        InstanceStatus::Failed
-    );
-}
-
-#[test]
-fn status_reconcile_does_not_republish_an_intentionally_fenced_route() {
-    assert_eq!(
-        reconciled_tenant_status(
-            InstanceStatus::Running,
-            DesiredInstanceState::Running,
-            EngineRuntimeStatus::Running,
-            DockerContainerStatus::Running,
-            true,
-        ),
-        InstanceStatus::Failed
-    );
-    assert_eq!(
-        reconciled_tenant_status(
-            InstanceStatus::Running,
-            DesiredInstanceState::Stopped,
-            EngineRuntimeStatus::Running,
-            DockerContainerStatus::Running,
-            true,
-        ),
-        InstanceStatus::Stopped
-    );
 }

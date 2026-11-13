@@ -215,10 +215,7 @@ mod tests {
             Path::new("/var/lib/dbev/volumes/abc")
         );
         assert_eq!(paths.to_container(Path::new("/var/lib/docker/x")), None);
-    }
 
-    #[test]
-    fn without_mounts_nothing_changes() {
         let paths = HostPaths::default();
         assert_eq!(
             paths.to_host(Path::new("/var/lib/dbev")),

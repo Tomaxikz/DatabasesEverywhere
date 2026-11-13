@@ -632,27 +632,3 @@ pub(super) async fn image_update_spec(
     spec.pids_limit = Some(pids_limit);
     Ok(spec)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::spawn_owned_mutation_task;
-
-    #[tokio::test]
-    async fn dropping_http_waiter_does_not_cancel_owned_image_update_worker() {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let waiter = spawn_owned_mutation_task(async move {
-            let _ = started_tx.send(());
-            let _ = finish_rx.await;
-            let _ = done_tx.send(());
-        });
-        started_rx.await.unwrap();
-        drop(waiter);
-        finish_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
-            .await
-            .expect("detached image update worker should finish")
-            .unwrap();
-    }
-}

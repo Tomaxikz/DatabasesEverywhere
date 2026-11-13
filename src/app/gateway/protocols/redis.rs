@@ -357,17 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_bytes_for_exact_initial_route_parse() {
+    fn initial_frame_boundaries_are_exact() {
         let error = parse_initial_route(
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n",
         )
         .unwrap_err();
 
         assert!(matches!(error, RedisParseError::Unsupported));
-    }
 
-    #[test]
-    fn frame_parser_accepts_complete_first_frame_with_trailing_bytes() {
         let (route, consumed) = parse_initial_frame_route(
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n*1\r\n$4\r\nPING\r\n",
         )
@@ -379,24 +376,15 @@ mod tests {
             consumed,
             b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npass\r\n".len()
         );
-    }
 
-    #[test]
-    fn frame_parser_waits_for_complete_bulk_payload() {
         let result = parse_initial_frame_route(b"*3\r\n$4\r\nAUTH\r\n$3\r\napp\r\n$4\r\npa");
 
         assert_eq!(result.unwrap(), None);
-    }
 
-    #[test]
-    fn rejects_bulk_length_mismatch() {
         let error = parse_initial_frame_route(b"*2\r\n$4\r\nAUTH\r\n$4\r\npassx\r\n").unwrap_err();
 
         assert!(matches!(error, RedisParseError::Unsupported));
-    }
 
-    #[test]
-    fn rejects_inline_auth() {
         let error = parse_initial_route(b"AUTH pass\r\n").unwrap_err();
 
         assert!(matches!(error, RedisParseError::Unsupported));

@@ -18,6 +18,14 @@ use crate::utils::limits::mib_to_bytes;
 use axum::extract::State;
 use futures::{StreamExt, TryStreamExt};
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/resources",
+    tag = "admin",
+    summary = "List resource usage for all instances.",
+    extensions(("x-required-scope" = json!(scopes::RESOURCES_ADMIN))),
+    responses((status = 200, description = "Resource reports.", body = Vec<ResourceReport>))
+)]
 pub async fn list_resources(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -34,6 +42,15 @@ pub async fn list_resources(
     Ok(ApiResponse::ok(reports))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/admin/resources/summary",
+    tag = "admin",
+    summary = "Get node capacity, allocation, and whole-host resource pressure.",
+    description = "Allocation includes all managed instances, including stopped instances that may be restarted. Host usage covers the entire Linux node. Managed usage is null when any running or booting instance could not be sampled. Disk totals describe the filesystem backing paths.volumes.",
+    extensions(("x-required-scope" = json!(scopes::RESOURCES_ADMIN))),
+    responses((status = 200, description = "Node-wide resource summary for scheduling and capacity decisions.", body = NodeResourceSummary))
+)]
 pub async fn node_resource_summary(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -112,6 +129,15 @@ pub async fn node_resource_summary(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/resources",
+    tag = "monitoring",
+    summary = "Get resource usage for one instance.",
+    extensions(("x-required-scope" = json!(scopes::RESOURCES_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Resource report.", body = ResourceReport))
+)]
 pub async fn instance_resources(
     State(state): State<AppState>,
     auth: ApiRequestContext,

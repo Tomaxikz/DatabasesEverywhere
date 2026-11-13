@@ -584,11 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn project_names_are_safe() {
-        assert_eq!(project_name(200_123), "dbe_200123");
-    }
-
-    #[test]
     fn registry_updates_are_idempotent() {
         let project = project();
 

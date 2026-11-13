@@ -206,7 +206,7 @@ fn shared_pool_logs_are_never_available_through_any_api_transport() {
 }
 
 #[test]
-fn major_upgrade_commit_resolution_accepts_only_the_exact_intended_row() {
+fn major_upgrade_commit_resolution_accepts_only_exact_intended_or_previous_rows() {
     let previous = sample_lifecycle_metadata();
     let mut intended = previous.clone();
     intended.updated_at = "2026-01-02T00:00:00Z".to_string();
@@ -223,13 +223,6 @@ fn major_upgrade_commit_resolution_accepts_only_the_exact_intended_row() {
         classify_upgrade_commit(&mismatched_secret, &previous, &intended),
         MajorUpgradeCommitResolution::Uncertain(_)
     ));
-}
-
-#[test]
-fn major_upgrade_commit_resolution_rolls_back_only_the_exact_previous_row() {
-    let previous = sample_lifecycle_metadata();
-    let mut intended = previous.clone();
-    intended.updated_at = "2026-01-02T00:00:00Z".to_string();
 
     assert_eq!(
         classify_upgrade_commit(&previous, &previous, &intended),
@@ -323,31 +316,21 @@ fn deletion_preserves_quarantine_to_avoid_claiming_a_duplicate_route() {
 }
 
 #[test]
-fn parses_major_version_from_common_image_tags() {
-    assert_eq!(image_major_version("mongo:7.0.37"), Some(7));
-    assert_eq!(
-        image_major_version("docker.io/library/postgres:18.4"),
-        Some(18)
-    );
-    assert_eq!(
-        image_major_version("registry.example.com:5000/db/mariadb:12.3.2"),
-        Some(12)
-    );
-    assert_eq!(image_major_version("mysql:8.4"), Some(8));
-}
-
-#[test]
-fn rejects_unpinned_images_for_existing_instance_updates() {
-    assert!(image_major_version("mongo:latest").is_none());
-    assert!(image_major_version("mongo@sha256:abc").is_none());
-    assert!(image_major_version("mongo").is_none());
-}
-
-#[test]
-fn parses_major_version_values() {
-    assert_eq!(parse_major_version("8.3"), Some(8));
-    assert_eq!(parse_major_version("v7.0"), None);
-    assert_eq!(parse_major_version("latest"), None);
+fn major_versions_parse_only_from_pinned_image_tags() {
+    for (image, expected) in [
+        ("mongo:7.0.37", Some(7)),
+        ("docker.io/library/postgres:18.4", Some(18)),
+        ("registry.example.com:5000/db/mariadb:12.3.2", Some(12)),
+        ("mysql:8.4", Some(8)),
+        ("mongo:latest", None),
+        ("mongo@sha256:abc", None),
+        ("mongo", None),
+    ] {
+        assert_eq!(image_major_version(image), expected, "{image}");
+    }
+    for (value, expected) in [("8.3", Some(8)), ("v7.0", None), ("latest", None)] {
+        assert_eq!(parse_major_version(value), expected, "{value}");
+    }
 }
 
 #[test]
@@ -358,31 +341,21 @@ fn classifies_major_version_changes() {
     let change =
         classify_image_update(Protocol::Postgres, "postgres:18.3", "postgres:18.4").unwrap();
     assert_eq!(change, ImageVersionChange::SameMajorOrUnknown);
-}
 
-#[test]
-fn requires_parseable_tags_for_different_existing_images() {
     let error =
         classify_image_update(Protocol::Mongodb, "mongo:7.0.37", "mongo:latest").unwrap_err();
     assert!(error.to_string().contains("cannot compare requested image"));
 }
 
 #[test]
-fn major_upgrade_path_blocks_downgrades() {
+fn major_upgrade_path_blocks_downgrades_and_skipped_mongodb_versions() {
     let error = validate_upgrade_path(Protocol::Postgres, 18, 17).unwrap_err();
     assert!(error.to_string().contains("downgrade is blocked"));
-}
 
-#[test]
-fn mongodb_major_upgrade_path_blocks_skipped_versions() {
     let error = validate_upgrade_path(Protocol::Mongodb, 6, 8).unwrap_err();
     assert!(error.to_string().contains("cannot skip versions"));
 
     assert!(validate_upgrade_path(Protocol::Mongodb, 7, 8).is_ok());
-}
-
-#[test]
-fn non_mongodb_dump_upgrade_path_allows_skipped_versions() {
     assert!(validate_upgrade_path(Protocol::Postgres, 14, 18).is_ok());
 }
 

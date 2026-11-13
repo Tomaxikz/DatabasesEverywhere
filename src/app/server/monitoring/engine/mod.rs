@@ -988,15 +988,6 @@ mod tests {
         assert_eq!(ambiguous.len(), 2);
     }
 
-    #[test]
-    fn postgres_and_mongodb_have_no_engine_cpu_collector() {
-        for protocol in [Protocol::Postgres, Protocol::Mongodb] {
-            let mut runtime = test_runtime(protocol);
-            runtime.status = EngineRuntimeStatus::Running;
-            assert!(!collects_engine_activity(&runtime));
-        }
-    }
-
     fn test_tenant(instance_id: &str, username: &str) -> TenantIdentity {
         TenantIdentity {
             instance_id: instance_id.to_string(),

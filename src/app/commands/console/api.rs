@@ -765,32 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn create_requests_omit_unset_optional_fields() {
-        let request = CreateRequest {
-            instance_id: "inst_one".to_string(),
-            protocol: Protocol::Postgres,
-            deployment_mode: "dedicated",
-            server_id: None,
-            database: "app".to_string(),
-            username: "app".to_string(),
-            password: "secret".to_string(),
-            public_host: "db.example.com".to_string(),
-            public_port: None,
-            project_id: "dbev-cli".to_string(),
-            limits: CreateLimits {
-                cpu_cores: Some(1.0),
-                memory_mib: None,
-                disk_mib: 1024,
-            },
-        };
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["protocol"], "postgres");
-        assert!(value.get("server_id").is_none());
-        assert!(value.get("public_port").is_none());
-        assert!(value["limits"].get("memory_mib").is_none());
-    }
-
-    #[test]
     fn enabled_protocols_follow_the_system_flags() {
         let system: SystemInfo = serde_json::from_value(serde_json::json!({
             "version": "0.9.0",

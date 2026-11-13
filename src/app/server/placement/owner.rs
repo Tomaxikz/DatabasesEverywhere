@@ -10,11 +10,12 @@ pub(crate) struct PoolSpec {
     pub limits: PoolLimits,
 }
 
-/// The panel namespace comes from the authenticated daemon token, never JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// The panel namespace comes from the authenticated daemon token, never JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PoolOwner {
     pub panel_id: String,
+    #[schema(min_length = 1, max_length = 128, pattern = "^[A-Za-z0-9_.-]+$")]
     pub server_id: String,
 }
 
@@ -39,12 +40,16 @@ fn is_valid_owner_key(value: &str) -> bool {
 }
 
 /// Fixed physical engine capacity, charged once, not once per database.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PoolLimits {
+    #[schema(minimum = 0.01, maximum = 1024)]
     pub cpu_cores: f64,
+    #[schema(minimum = 1, maximum = 1048576)]
     pub memory_mib: u64,
+    #[schema(minimum = 1)]
     pub disk_mib: u64,
+    #[schema(minimum = 1, maximum = 1024)]
     pub max_tenants: u32,
 }
 

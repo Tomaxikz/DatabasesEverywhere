@@ -29,6 +29,38 @@ use super::{
     storage::remove_upload_file,
 };
 
+#[derive(utoipa::ToSchema)]
+#[schema(format = Binary)]
+#[allow(dead_code)]
+struct DumpBytes(String);
+
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/import",
+    tag = "import-export",
+    summary = "Upload a temporary dump or queue an import into one instance.",
+    description = "application/octet-stream stores, hashes, and returns a temporary upload without starting an import. application/json queues an import from an artifact, typed remote source, or ready temporary upload. Temporary uploads are separate from generated artifacts. Shared tenants accept only tenant-scoped logical imports; physical restores and database-level statements that could affect the pool or another tenant are rejected.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_WRITE))),
+    params(
+        ("instance_id" = String, Path),
+        ("Content-Length" = Option<u64>, Header, nullable = false, minimum = 1, description = "Required for application/octet-stream and must exactly equal the bytes sent."),
+        ("X-DBEV-Filename" = Option<String>, Header, nullable = false, description = "Required for application/octet-stream. Percent-encoded UTF-8 flat filename, at most 180 decoded bytes, with a supported native dump extension. Paths and traversal components are rejected."),
+        ("X-DBEV-SHA256" = Option<String>, Header, nullable = false, pattern = "^[0-9a-f]{64}$", description = "Optional expected digest for application/octet-stream; exactly 64 lowercase hexadecimal characters."),
+    ),
+    request_body(content(
+        (ImportRequest = "application/json"),
+        (inline(DumpBytes) = "application/octet-stream"),
+    )),
+    responses(
+        (status = 201, description = "Temporary upload committed, hashed, and ready for inspection or full import; no import job was started.", body = ImportUploadResponse),
+        (
+            status = 202,
+            description = "Queued import job.",
+            body = crate::subsystems::import_export::ImportExportJobResponse,
+            headers(("Location" = String, description = "Origin-relative job status URL."))
+        ),
+    )
+)]
 pub(crate) async fn import_entry(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -67,6 +99,16 @@ pub(super) fn request_media_type(headers: &HeaderMap) -> String {
         .to_ascii_lowercase()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/import/uploads",
+    tag = "import-export",
+    summary = "List active temporary import uploads for one instance.",
+    description = "Returns at most 100 instance-owned records. Temporary uploads never appear in the artifact inventory.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Temporary upload list.", body = Vec<ImportUploadResponse>))
+)]
 pub(crate) async fn list_import_uploads(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -85,6 +127,15 @@ pub(crate) async fn list_import_uploads(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/import/uploads/{upload_id}",
+    tag = "import-export",
+    summary = "Get one temporary import upload belonging to an instance.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ))),
+    params(("instance_id" = String, Path), ("upload_id" = String, Path, pattern = "^upl_[0-9a-f]{32}$")),
+    responses((status = 200, description = "Temporary upload summary including catalog_available, without catalog contents.", body = ImportUploadResponse))
+)]
 pub(crate) async fn get_import_upload(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -96,6 +147,16 @@ pub(crate) async fn get_import_upload(
     Ok(ApiResponse::ok(public_upload(upload)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/import/uploads/{upload_id}/catalog",
+    tag = "import-export",
+    summary = "Inspect a ready temporary dump and cache its bounded catalog.",
+    description = "Validates the archive wrapper and extracts a bounded metadata-only catalog without executing dump content. Inspection is lazy and idempotent once cached. The selective_supported response field is the authoritative capability; formats that report it as false are full-import only. A concurrency rejection or bounded inspection limit leaves the upload ready, so a full import remains available.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_WRITE))),
+    params(("instance_id" = String, Path), ("upload_id" = String, Path, pattern = "^upl_[0-9a-f]{32}$")),
+    responses((status = 200, description = "DumpInspection at the JSON root, not wrapped in an upload summary.", body = DumpInspection))
+)]
 pub(crate) async fn inspect_import_upload(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -161,6 +222,16 @@ pub(crate) async fn inspect_import_upload(
     Ok(ApiResponse::ok(upload_catalog(&upload)?))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/instances/{instance_id}/import/uploads/{upload_id}",
+    tag = "import-export",
+    summary = "Cancel and durably delete one temporary import upload.",
+    description = "Importing uploads return a conflict. Deletion never removes a DBEV-generated artifact or operator-staged import file.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_WRITE))),
+    params(("instance_id" = String, Path), ("upload_id" = String, Path, pattern = "^upl_[0-9a-f]{32}$")),
+    responses((status = 200, description = "Upload deleted.", body = ImportUploadDeleteResponse))
+)]
 pub(crate) async fn delete_import_upload(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -204,6 +275,16 @@ pub(crate) async fn delete_import_upload(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/import/uploads/{upload_id}/catalog",
+    tag = "import-export",
+    summary = "Read a cached upload catalog without running inspection.",
+    description = "Returns DumpInspection at the JSON root. Returns 409 when no catalog is cached; POST to this endpoint performs bounded inspection.",
+    extensions(("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ))),
+    params(("instance_id" = String, Path), ("upload_id" = String, Path, pattern = "^upl_[0-9a-f]{32}$")),
+    responses((status = 200, description = "Cached catalog.", body = DumpInspection))
+)]
 pub(crate) async fn get_import_catalog(
     State(state): State<AppState>,
     auth: ApiRequestContext,

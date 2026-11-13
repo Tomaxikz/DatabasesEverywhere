@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_digest_and_target_are_checked_before_mutation() {
+    fn shared_digest_and_target_are_checked_but_dedicated_needs_no_digest() {
         let expected = target("one", DeploymentMode::Shared);
         let missing = artifact(expected.clone(), None);
         let error = match check_batch(&expected, Protocol::Postgres, &[missing]) {
@@ -365,6 +365,10 @@ mod tests {
 
         let wrong = artifact(target("two", DeploymentMode::Shared), Some([7; 32]));
         assert!(check_batch(&expected, Protocol::Postgres, &[wrong]).is_err());
+
+        let dedicated = target("one", DeploymentMode::Dedicated);
+        let prepared = artifact(dedicated.clone(), None);
+        assert!(check_batch(&dedicated, Protocol::Postgres, &[prepared]).is_ok());
     }
 
     #[test]
@@ -378,13 +382,6 @@ mod tests {
             20
         );
         assert!(staging_reservation_bytes(DeploymentMode::Shared, u64::MAX, 1).is_err());
-    }
-
-    #[test]
-    fn dedicated_restore_does_not_require_an_inspection_digest() {
-        let expected = target("one", DeploymentMode::Dedicated);
-        let prepared = artifact(expected.clone(), None);
-        assert!(check_batch(&expected, Protocol::Postgres, &[prepared]).is_ok());
     }
 
     #[test]

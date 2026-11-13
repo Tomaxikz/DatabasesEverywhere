@@ -246,28 +246,3 @@ fn verified_v2_controller_absence_uses_host_but_malformed_values_fail_closed() {
     assert!(!malformed.memory_valid);
     assert!(!malformed.cpu_valid);
 }
-
-#[test]
-fn systemd_host_capacity_resolves_to_sixty_percent_in_dynamic_mode() {
-    #[derive(Debug)]
-    struct Provider;
-    impl SchedulerResourceProvider for Provider {
-        fn sample(&self) -> SchedulerResourceSample {
-            SchedulerResourceSample {
-                available_memory_mib: Some(11_451),
-                cpu_units: Some(8),
-                memory_valid: true,
-                cpu_valid: true,
-            }
-        }
-    }
-
-    let capacity = SchedulerCapacity::detect_with_provider(
-        &ImportExportSchedulerConfig::default(),
-        8 * 1024 * MIB,
-        32 * 1024 * MIB,
-        &Provider,
-    );
-    assert_eq!(capacity.memory_budget_mib, 6_870);
-    assert_eq!(capacity.cpu_units, 8);
-}

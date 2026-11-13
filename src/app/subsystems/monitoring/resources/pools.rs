@@ -20,50 +20,64 @@ use crate::{
     utils::limits::InstanceLimits,
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct SharedPoolReport {
+    #[schema(required)]
     pub owner: Option<crate::server::placement::PoolOwner>,
     pub runtime_id: String,
     pub protocol: Protocol,
+    #[schema(inline)]
     pub status: EngineRuntimeStatus,
+    #[schema(schema_with = crate::routes::openapi::literals::desired_state)]
     pub desired_state: &'static str,
     pub image: String,
+    #[schema(required)]
     pub pending_image: Option<String>,
+    #[schema(required)]
     pub database_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub diagnostic: Option<PublicDiagnostic>,
     pub tenant_count: u32,
+    #[schema(minimum = 1)]
     pub max_tenants: u32,
+    #[schema(inline)]
     pub cpu: PoolCpu,
+    #[schema(inline)]
     pub memory: PoolMemory,
+    #[schema(inline)]
     pub disk: PoolDisk,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolCpu {
+    #[schema(minimum = 0)]
     pub limit_cores: f64,
+    #[schema(required, minimum = 0)]
     pub usage_percent: Option<f64>,
     pub sample: PoolMetricSample,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolMemory {
     pub limit_bytes: u64,
+    #[schema(required)]
     pub usage_bytes: Option<u64>,
     pub sample: PoolMetricSample,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolDisk {
     pub limit_bytes: u64,
     pub reserved_bytes: u64,
+    #[schema(required)]
     pub usage_bytes: Option<u64>,
     pub enforced: bool,
     pub enforcement_method: String,
     pub sample: PoolMetricSample,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PoolMetricSource {
     ContainerCpu,
@@ -73,7 +87,7 @@ pub(crate) enum PoolMetricSource {
     ResourceDiskSampler,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PoolMetricState {
     Fresh,
@@ -83,22 +97,28 @@ pub(crate) enum PoolMetricState {
     Failed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolMetricSample {
+    #[schema(inline)]
     pub source: PoolMetricSource,
+    #[schema(inline)]
     pub state: PoolMetricState,
+    #[schema(required)]
     pub sampled_at_unix: Option<i64>,
+    #[schema(required)]
     pub sample_age_seconds: Option<u64>,
     pub fresh: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub diagnostic: Option<PublicDiagnostic>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct SharedPoolTenant {
     pub instance_id: String,
     pub database: String,
     pub username: String,
+    #[schema(inline)]
     pub status: InstanceStatus,
     pub limits: InstanceLimits,
     pub resources: super::ResourceReport,
@@ -183,6 +203,15 @@ pub(super) async fn load_pool_capacity(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pools",
+    tag = "pools",
+    summary = "List server-owned pools.",
+    description = "Pool CPU and memory are whole-engine cgroup measurements, not individual tenant usage. Null means unavailable, not zero. Panel backends must filter inventory to the authorized server before exposing it.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_READ))),
+    responses((status = 200, description = "Operation result.", body = Vec<SharedPoolReport>))
+)]
 pub(crate) async fn list_shared_pools(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -193,6 +222,16 @@ pub(crate) async fn list_shared_pools(
     Ok(ApiResponse::ok(reports))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pools/{runtime_id}",
+    tag = "pools",
+    summary = "Get pool metrics and configuration.",
+    description = "Pool CPU and memory are whole-engine cgroup measurements, not individual tenant usage. Null means unavailable, not zero. Panel backends must filter inventory to the authorized server before exposing it.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_READ))),
+    params(("runtime_id" = String, Path)),
+    responses((status = 200, description = "Operation result.", body = SharedPoolReport))
+)]
 pub(crate) async fn get_shared_pool(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -209,6 +248,16 @@ pub(crate) async fn get_shared_pool(
         .map(ApiResponse::ok)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/pools/{runtime_id}/instances",
+    tag = "pools",
+    summary = "List child databases.",
+    description = "Lists published child databases. In-flight creations and provisional migration targets are omitted until published; use the creation status_url for progress. Unexplained orphan reservations and ownership mismatches still fail rather than being silently adopted.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_READ))),
+    params(("runtime_id" = String, Path)),
+    responses((status = 200, description = "Operation result.", body = Vec<SharedPoolTenant>))
+)]
 pub(crate) async fn list_pool_tenants(
     State(state): State<AppState>,
     auth: ApiRequestContext,

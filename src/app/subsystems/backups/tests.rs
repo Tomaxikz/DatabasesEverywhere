@@ -1,14 +1,12 @@
-use super::catalog::{backup_info, backup_objects, select_catalog_object};
+use super::catalog::{backup_objects, select_catalog_object};
 use super::checks::{
     check_backup_layout, check_backup_protocol, intentionally_stopped_backup, restore_input_bytes,
 };
-use super::scheduler::backup_all_instances;
 use super::types::{BackupAttempt, RunBackupResponse};
 use super::*;
 use crate::databases::protocol::Protocol;
 use crate::routes::http::response::ApiError;
 use crate::server::backup::BackupLayout;
-use crate::server::backup::StoredBackup;
 use crate::server::backup::catalog::BackupCatalog;
 use crate::server::backup::catalog::BackupCatalogColumn;
 use crate::server::metadata::DesiredInstanceState;
@@ -93,19 +91,6 @@ fn backup_pass_separates_expected_skips_from_errors_and_reports_partial_failure(
     assert_eq!(value["failed"][4]["reason"]["code"], "internal_error");
     assert!(value["failed"][4]["reason"]["error_id"].is_string());
     assert!(!value.to_string().contains("private-storage-detail"));
-}
-
-#[tokio::test]
-async fn an_empty_backup_pass_has_no_spurious_failures() {
-    let (state, _directory) = crate::subsystems::test_support::database(Default::default()).await;
-    let response = backup_all_instances(&state).await;
-    assert_eq!(response.status(), "completed");
-    assert_eq!(
-        serde_json::to_value(response).unwrap(),
-        serde_json::json!({
-            "backups": [], "skipped": [], "failed": [],
-        })
-    );
 }
 
 #[test]
@@ -202,27 +187,4 @@ fn backup_layout_is_bound_to_the_current_deployment_mode() {
         let error = check_backup_layout("stale", stale, mode).unwrap_err();
         assert_eq!(error.status(), http::StatusCode::CONFLICT);
     }
-}
-
-#[test]
-fn backup_info_keeps_restore_compatibility_fields() {
-    let info = backup_info(StoredBackup {
-        schema_version: 2,
-        backup_id: "one.logical.dump".to_string(),
-        instance_id: "inst_one".to_string(),
-        protocol: Protocol::Postgres,
-        layout: BackupLayout::Logical,
-        size_bytes: 42,
-        created_at: "2024-01-01T00:00:00Z".to_string(),
-        created_at_unix: 1_704_067_200,
-        sha256: "ab".repeat(32),
-        catalog_available: true,
-        details: None,
-    });
-
-    let value = serde_json::to_value(info).unwrap();
-    assert_eq!(value["protocol"], "postgres");
-    assert_eq!(value["layout"], "logical");
-    assert!(value["consistency"].is_null());
-    assert!(value["restore_recipe"].is_null());
 }

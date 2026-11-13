@@ -18,6 +18,7 @@ use crate::{
     subsystems::import_export::remote::{ImportMode, RemoteImportRequest, RemoteImportSource},
 };
 use serde::{Deserialize, Serialize};
+use utoipa::openapi::{Ref, RefOr, Schema, schema::Discriminator, schema::OneOfBuilder};
 
 pub(crate) const MAX_UNARCHIVED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
@@ -37,38 +38,101 @@ pub(super) fn logical_exec_recovery(metadata: &InstanceMetadata) -> ExecRecovery
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportRequest {
     pub selection: Option<ImportExportSelection>,
     #[serde(default)]
+    #[schema(schema_with = crate::routes::openapi::literals::export_archive_format)]
     pub archive_format: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImportRequest {
+    #[schema(inline)]
     pub source: ImportSource,
     #[serde(default)]
+    #[schema(inline)]
     pub mode: ImportMode,
     #[serde(default)]
     pub selection: Option<ImportExportSelection>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImportSource {
-    Artifact {
-        artifact_id: String,
-        #[serde(default)]
-        archive_format: Option<String>,
-    },
-    Upload {
-        upload_id: String,
-        #[serde(default)]
-        source_database: Option<String>,
-    },
+    Artifact(ArtifactImportSource),
+    Upload(UploadImportSource),
     Remote(RemoteImportRequest),
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactImportSource {
+    pub artifact_id: String,
+    #[serde(default)]
+    #[schema(schema_with = crate::routes::openapi::literals::import_archive_format)]
+    pub archive_format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(
+    description = "A temporary dump received through the octet-stream form of this instance's import endpoint."
+)]
+pub struct UploadImportSource {
+    #[schema(pattern = "^upl_[0-9a-f]{32}$")]
+    pub upload_id: String,
+    #[serde(default)]
+    #[schema(
+        nullable = false,
+        min_length = 1,
+        max_length = 63,
+        example = "legacy_tenant"
+    )]
+    pub source_database: Option<String>,
+}
+
+impl utoipa::PartialSchema for ImportSource {
+    fn schema() -> RefOr<Schema> {
+        let variants = [
+            ("artifact", "ArtifactImportSource"),
+            ("remote", "RemoteImportSource"),
+            ("upload", "UploadImportSource"),
+        ];
+        let mut discriminator = Discriminator::new("type");
+        let mut one_of = OneOfBuilder::new();
+        for (tag, name) in variants {
+            discriminator
+                .mapping
+                .insert(tag.into(), format!("#/components/schemas/{name}"));
+            one_of = one_of.item(Ref::from_schema_name(name));
+        }
+        one_of.discriminator(Some(discriminator)).into()
+    }
+}
+
+impl utoipa::ToSchema for ImportSource {
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        schemas.extend([
+            tagged::<ArtifactImportSource>("artifact"),
+            tagged::<RemoteImportRequest>("remote"),
+            tagged::<UploadImportSource>("upload"),
+        ]);
+    }
+}
+
+fn tagged<T: utoipa::ToSchema>(tag: &str) -> (String, RefOr<Schema>) {
+    let mut schema = T::schema();
+    if let RefOr::T(Schema::Object(object)) = &mut schema {
+        let literal = crate::routes::openapi::literal([tag.into()]);
+        object
+            .properties
+            .shift_insert(0, "type".into(), literal.into());
+        object.required.insert(0, "type".into());
+    }
+    (T::name().into_owned(), schema)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -276,10 +340,10 @@ impl From<&ImportRequest> for ImportOptions {
     fn from(request: &ImportRequest) -> Self {
         let selection = request.selection.clone().unwrap_or_default();
         match &request.source {
-            ImportSource::Artifact {
+            ImportSource::Artifact(ArtifactImportSource {
                 artifact_id,
                 archive_format,
-            } => Self {
+            }) => Self {
                 archive_format: archive_format.clone(),
                 source: ImportSourceOptions::Artifact(PathBuf::from(artifact_id)),
                 source_database: None,
@@ -287,10 +351,10 @@ impl From<&ImportRequest> for ImportOptions {
                 selection,
                 upload_staging: None,
             },
-            ImportSource::Upload {
+            ImportSource::Upload(UploadImportSource {
                 upload_id,
                 source_database,
-            } => Self {
+            }) => Self {
                 archive_format: None,
                 source: ImportSourceOptions::Upload {
                     upload_id: upload_id.clone(),
@@ -313,23 +377,32 @@ impl From<&ImportRequest> for ImportOptions {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct JobListQuery {
     pub status: Option<String>,
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[schema(as = ImportExportJob)]
 pub struct ImportExportJobResponse {
     pub job_id: String,
     pub instance_id: String,
+    #[schema(inline)]
     pub action: ImportExportAction,
+    #[schema(inline)]
     pub status: ImportExportStatus,
+    #[schema(required)]
     pub artifact_id: Option<String>,
+    #[schema(required)]
     pub artifact_size_bytes: Option<u64>,
+    #[schema(required)]
     pub error: Option<PublicDiagnostic>,
+    #[schema(format = DateTime)]
     pub created_at: String,
+    #[schema(format = DateTime)]
     pub updated_at: String,
 }
 
@@ -344,7 +417,7 @@ mod protocol;
 mod shared_restore;
 mod shared_security;
 mod upload_recovery;
-mod uploads;
+pub(crate) mod uploads;
 
 pub(crate) use crate::server::disk::capacity::DiskCapacityReservation;
 pub(crate) use files::logical_staging_root;

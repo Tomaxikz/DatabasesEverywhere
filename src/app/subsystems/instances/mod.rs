@@ -4,13 +4,13 @@ pub mod progress;
 pub mod requests;
 
 pub(crate) use crate::server::placement::containment;
-mod deployment;
+pub(crate) mod deployment;
 pub(crate) mod major_upgrade;
 mod normal_image_update;
-mod password;
+pub(crate) mod password;
 mod purge;
 pub(crate) mod route_fence;
-mod runtime_info;
+pub(crate) mod runtime_info;
 mod shared;
 pub(crate) use shared::{
     delete_empty_pool, recover_deleting as recover_shared_deletions, reload_after_runtime_lock,
@@ -66,11 +66,11 @@ pub(crate) use purge::{
 const IMAGE_UPDATE_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(180);
 const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(120);
 
-mod delete;
-mod image_update;
+pub(crate) mod delete;
+pub(crate) mod image_update;
 mod lifecycle;
-mod limits;
-mod logs;
+pub(crate) mod limits;
+pub(crate) mod logs;
 mod start_checks;
 mod startup;
 pub use delete::delete_instance;
@@ -83,6 +83,16 @@ pub use limits::update_instance_limits;
 pub use logs::instance_logs;
 pub(crate) use logs::{check_logs_available, shared_logs_unavailable};
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/reconcile",
+    tag = "instances",
+    summary = "Reconcile stored instance status with its engine runtime.",
+    description = "Dedicated mode inspects its owned runtime. Shared mode also verifies the pool placement while preserving tenant-only route and lifecycle state.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Reconciled instance status.", body = InstanceStatusResponse))
+)]
 pub async fn reconcile_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -126,6 +136,17 @@ pub(crate) async fn reconcile_instance_locked(
     Ok(metadata)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/power",
+    tag = "instances",
+    summary = "Unified power API for start, stop, restart, and kill.",
+    description = "Dedicated actions control the owned engine runtime. Shared actions fence or restore only this tenant's login, routes, and sessions; they never stop or kill the shared pool for another tenant.",
+    extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
+    params(("instance_id" = String, Path)),
+    request_body = PowerRequest,
+    responses((status = 200, description = "Power action result.", body = PowerResponse))
+)]
 pub async fn power_instance(
     State(state): State<AppState>,
     auth: ApiRequestContext,

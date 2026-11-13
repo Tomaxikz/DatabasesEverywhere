@@ -17,7 +17,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
 const LOG_CHUNK_BYTES: usize = 1536;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 enum LogStream {
     Stdout,
@@ -53,6 +53,40 @@ struct LogEvent<'a> {
 enum LogIdentity<'a> {
     Instance { instance_id: &'a str },
     Pool { runtime_id: &'a str },
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[schema(as = LogEvent)]
+pub(crate) struct InstanceLogEvent {
+    #[schema(schema_with = crate::routes::openapi::literals::logs)]
+    r#type: String,
+    instance_id: String,
+    sequence: u64,
+    #[schema(schema_with = crate::routes::openapi::literals::log_event)]
+    event: String,
+    #[schema(inline, nullable = false)]
+    stream: Option<LogStream>,
+    #[schema(max_length = 1536, nullable = false)]
+    data: Option<String>,
+    #[schema(nullable = false)]
+    error: Option<PublicDiagnostic>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[schema(as = PoolLogEvent)]
+pub(crate) struct PoolLogEvent {
+    #[schema(schema_with = crate::routes::openapi::literals::logs)]
+    r#type: String,
+    runtime_id: String,
+    sequence: u64,
+    #[schema(schema_with = crate::routes::openapi::literals::log_event)]
+    event: String,
+    #[schema(inline, nullable = false)]
+    stream: Option<LogStream>,
+    #[schema(max_length = 1536, nullable = false)]
+    data: Option<String>,
+    #[schema(nullable = false)]
+    error: Option<PublicDiagnostic>,
 }
 
 const CONTAINER_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);

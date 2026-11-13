@@ -6,7 +6,7 @@ use super::supervision::{
 use super::*;
 
 #[test]
-fn password_validation_rejects_empty_multiline_and_oversized_secrets() {
+fn password_validation_rejects_empty_multiline_oversized_and_non_header_secrets() {
     assert!(validate_password(Protocol::Postgres, &SecretString::from("")).is_err());
     assert!(validate_password(Protocol::Postgres, &SecretString::from("line1\nline2")).is_err());
     assert!(
@@ -16,16 +16,8 @@ fn password_validation_rejects_empty_multiline_and_oversized_secrets() {
         )
         .is_err()
     );
-}
-
-#[test]
-fn mariadb_rollback_uses_the_persisted_native_verifier_not_stale_environment() {
-    assert!(
-        Protocol::Mariadb
-            .engine()
-            .tenant_password_env_keys()
-            .is_empty()
-    );
+    assert!(validate_password(Protocol::Qdrant, &SecretString::from("valid-api-key")).is_ok());
+    assert!(validate_password(Protocol::Qdrant, &SecretString::from("invalid\u{7f}")).is_err());
 }
 
 #[test]
@@ -46,12 +38,6 @@ fn resp_acl_path_follows_persisted_fuse_enforcement() {
 
     assert_ne!(credential_data_path, raw_data);
     assert!(credential_data_path.starts_with(fuse_root.join("instances")));
-}
-
-#[test]
-fn qdrant_password_must_be_a_valid_header_value() {
-    assert!(validate_password(Protocol::Qdrant, &SecretString::from("valid-api-key")).is_ok());
-    assert!(validate_password(Protocol::Qdrant, &SecretString::from("invalid\u{7f}")).is_err());
 }
 
 #[test]

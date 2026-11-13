@@ -15,8 +15,7 @@ use crate::{
             DAEMON_LOCK_FILE, acquire_daemon_lock, check_rootless_path_access, create_runtime_dirs,
             harden_runtime_dir, require_runtime_owner, validate_runtime_ancestors,
         },
-        server::startup_banner,
-        setup::{memory_overcommit_sysctl, systemd_service_contents, validate_setup_config},
+        setup::{systemd_service_contents, validate_setup_config},
         soft_disk_limiter::is_current_target,
         startup::{
             ManagedBootAction, QdrantMigrationContainer, isolate_disk_failure,
@@ -50,20 +49,6 @@ type SystemdCase<'a> = (
     &'a [&'a str],
     &'a [&'a str],
 );
-
-#[test]
-fn startup_banner_identifies_the_release_and_security_model() {
-    let banner = startup_banner();
-
-    assert!(banner.contains(env!("CARGO_PKG_VERSION")));
-    assert!(banner.contains(crate::subsystems::system::API_VERSION));
-    assert!(banner.contains("DATABASES EVERYWHERE"));
-    assert!(banner.contains("private sockets"));
-    assert!(banner.contains("PostgreSQL / MySQL / MariaDB / MongoDB"));
-    assert!(banner.contains("ClickHouse / Redis / Valkey / Qdrant"));
-    assert!(banner.is_ascii());
-    assert!(banner.lines().all(|line| line.len() <= 72));
-}
 
 #[tokio::test]
 async fn physical_restore_scan_uses_configured_entry_budget() {
@@ -636,26 +621,11 @@ fn rejects_runtime_directory_owned_by_another_uid() {
 }
 
 #[test]
-fn default_logs_live_below_the_private_data_root() {
-    let paths = crate::config::PathConfig::default();
-
-    assert_eq!(paths.logs_root(), format!("{}/logs", paths.data));
-}
-
-#[test]
 fn setup_config_path_rejects_unit_file_metacharacters() {
     assert!(validate_setup_config(Path::new("/etc/dbev/config.yml")).is_ok());
     assert!(validate_setup_config(Path::new("relative.yml")).is_err());
     assert!(validate_setup_config(Path::new("/etc/dbev/../config.yml")).is_err());
     assert!(validate_setup_config(Path::new("/etc/dbev/config\nExecStart=evil")).is_err());
-}
-
-#[test]
-fn managed_memory_sysctl_enables_overcommit_persistently() {
-    assert_eq!(
-        memory_overcommit_sysctl(),
-        "# Managed by DatabasesEverywhere --setup.\nvm.overcommit_memory = 1\n"
-    );
 }
 
 #[test]

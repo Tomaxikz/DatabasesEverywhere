@@ -739,18 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn succeeded_exact_job_is_consumed_without_replay() {
+    fn interrupted_import_consumes_success_releases_known_failure_and_blocks_otherwise() {
         let upload = upload();
-        let job = job(ImportExportStatus::Succeeded, None);
+        let succeeded = job(ImportExportStatus::Succeeded, None);
         assert_eq!(
-            interrupted_import_action(&upload, Some(&job), false),
+            interrupted_import_action(&upload, Some(&succeeded), false),
             InterruptedImportAction::Consume
         );
-    }
 
-    #[test]
-    fn known_failed_job_releases_upload_but_restart_failure_blocks_it() {
-        let upload = upload();
         let ordinary_failure = job(ImportExportStatus::Failed, Some("dump was rejected"));
         assert_eq!(
             interrupted_import_action(&upload, Some(&ordinary_failure), false),
@@ -762,11 +758,7 @@ mod tests {
             interrupted_import_action(&upload, Some(&interrupted), false),
             InterruptedImportAction::Block
         );
-    }
 
-    #[test]
-    fn missing_mismatched_or_active_job_fails_closed() {
-        let upload = upload();
         assert_eq!(
             interrupted_import_action(&upload, None, false),
             InterruptedImportAction::Block

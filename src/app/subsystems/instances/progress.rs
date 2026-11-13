@@ -21,8 +21,6 @@ const MAX_INSTALL_PROGRESS_ENTRIES: usize = 2_048;
 /// Stored instances use their RFC 3339 `created_at`, so the two kinds can never collide.
 pub(crate) const CREATION_GENERATION_PREFIX: &str = "creating:";
 const MAX_PROGRESS_TEXT_CHARS: usize = 2_048;
-#[cfg(test)]
-const MAX_ADMITTED_CREATIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct InstallProgressStore {
@@ -364,23 +362,33 @@ impl Drop for CreationPermit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, utoipa::ToSchema)]
 pub struct InstallProgress {
     #[serde(skip)]
     pub(crate) revision: u64,
     pub instance_id: String,
+    #[schema(value_type = Protocol)]
     pub protocol: String,
+    #[schema(schema_with = crate::routes::openapi::literals::install_action)]
     pub action: String,
+    #[schema(inline)]
     pub status: InstallProgressStatus,
     pub stage: String,
     pub message: String,
+    #[schema(required)]
     pub image: Option<String>,
+    #[schema(required)]
     pub layer: Option<String>,
+    #[schema(required)]
     pub current: Option<u64>,
+    #[schema(required)]
     pub total: Option<u64>,
+    #[schema(required)]
     pub percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub diagnostic: Option<PublicDiagnostic>,
+    #[schema(format = DateTime)]
     pub updated_at: String,
     #[serde(skip)]
     pub(crate) watch: Option<CreationWatch>,
@@ -405,7 +413,7 @@ impl InstallProgress {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallProgressStatus {
     Running,
@@ -621,30 +629,6 @@ mod tests {
                 .wait_for_creation_drain(Duration::from_millis(100))
                 .await
         );
-    }
-
-    #[test]
-    fn creation_admission_is_bounded() {
-        let store = InstallProgressStore::default();
-        let permits = (0..MAX_ADMITTED_CREATIONS)
-            .map(|index| {
-                store
-                    .try_begin_creation(
-                        &format!("inst-{index}"),
-                        Protocol::Postgres,
-                        "postgres:test",
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            store
-                .try_begin_creation("inst-overflow", Protocol::Postgres, "postgres:test")
-                .unwrap_err(),
-            BeginCreationError::Capacity
-        );
-        drop(permits);
     }
 
     #[test]

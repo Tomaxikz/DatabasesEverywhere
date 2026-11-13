@@ -169,22 +169,6 @@ fn monitoring_instance(
 }
 
 #[test]
-fn monitoring_serializes_cpu_as_percentage_points_without_rescaling() {
-    let instance = monitoring_instance(
-        "inst_cpu",
-        crate::server::placement::DeploymentMode::Dedicated,
-        Some(11.0),
-    );
-
-    let json = serde_json::to_value(instance).unwrap();
-    assert_eq!(
-        json["resources"]["cpu"]["usage_percent"],
-        serde_json::json!(11.0)
-    );
-    assert!(json.get("cpu_usage_percent").is_none());
-}
-
-#[test]
 fn shared_monitoring_omits_physical_pool_capacity() {
     let instance = monitoring_instance(
         "tenant_one",

@@ -127,7 +127,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_shared_engines_accept_nonempty_sources_without_guessing_expansion() {
+    fn post_restore_capacity_check_is_exact_and_fail_closed() {
+        assert!(check_usage(99, 100, "after import").is_ok());
+        assert!(check_usage(100, 100, "after import").is_err());
+        assert!(check_usage(101, 100, "after import").is_err());
+    }
+
+    #[test]
+    fn shared_sources_must_be_nonempty_and_unsupported_protocols_fail_closed() {
         for protocol in [
             Protocol::Postgres,
             Protocol::Mariadb,
@@ -137,17 +144,6 @@ mod tests {
         ] {
             assert!(check_source(protocol, 1).is_ok());
         }
-    }
-
-    #[test]
-    fn post_restore_capacity_check_is_exact_and_fail_closed() {
-        assert!(check_usage(99, 100, "after import").is_ok());
-        assert!(check_usage(100, 100, "after import").is_err());
-        assert!(check_usage(101, 100, "after import").is_err());
-    }
-
-    #[test]
-    fn unsupported_shared_protocols_fail_closed() {
         for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
             assert!(check_source(protocol, 1).is_err());
         }

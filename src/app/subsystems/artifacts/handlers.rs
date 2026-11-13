@@ -17,6 +17,16 @@ use std::net::SocketAddr;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/artifacts",
+    tag = "artifacts",
+    summary = "List retained export artifacts belonging to one instance.",
+    description = "One-use stream-only export spools never appear in this inventory.",
+    extensions(("x-required-scope" = json!(scopes::ARTIFACTS_READ))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Artifact list.", body = Vec<ArtifactInfo>))
+)]
 pub async fn list_instance_artifacts(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -29,6 +39,15 @@ pub async fn list_instance_artifacts(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/instances/{instance_id}/artifacts/{artifact_id}",
+    tag = "artifacts",
+    summary = "Delete one retained artifact or pending one-use export belonging to an instance.",
+    extensions(("x-required-scope" = json!(scopes::ARTIFACTS_WRITE))),
+    params(("instance_id" = String, Path), ("artifact_id" = String, Path)),
+    responses((status = 200, description = "Delete result.", body = DeleteArtifactResponse))
+)]
 pub async fn delete_artifact(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -54,6 +73,15 @@ pub async fn delete_artifact(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/artifacts/retention",
+    tag = "artifacts",
+    summary = "Apply artifact retention for one instance.",
+    extensions(("x-required-scope" = json!(scopes::ARTIFACTS_WRITE))),
+    params(("instance_id" = String, Path)),
+    responses((status = 200, description = "Deleted artifact IDs.", body = RetentionResponse))
+)]
 pub async fn apply_retention(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -93,6 +121,16 @@ pub async fn apply_retention(
     Ok(ApiResponse::ok(RetentionResponse { deleted }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/artifacts/{artifact_id}/download",
+    tag = "artifacts",
+    summary = "Create a temporary download URL for one instance artifact.",
+    extensions(("x-required-scope" = json!(scopes::ARTIFACTS_READ))),
+    params(("instance_id" = String, Path), ("artifact_id" = String, Path)),
+    request_body = CreateDownloadRequest,
+    responses((status = 200, description = "Temporary download URL.", body = DownloadUrlResponse))
+)]
 pub async fn create_artifact_download(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -110,6 +148,16 @@ pub async fn create_artifact_download(
     .await
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/instances/{instance_id}/backups/{backup_id}/download",
+    tag = "backups",
+    summary = "Create a temporary download URL for one instance backup.",
+    extensions(("x-required-scope" = json!(scopes::BACKUPS_READ))),
+    params(("instance_id" = String, Path), ("backup_id" = String, Path)),
+    request_body = CreateDownloadRequest,
+    responses((status = 200, description = "Temporary download URL.", body = DownloadUrlResponse))
+)]
 pub async fn create_backup_download(
     State(state): State<AppState>,
     auth: ApiRequestContext,
@@ -148,6 +196,16 @@ pub(crate) async fn artifact_download_url(
     .map(ApiResponse::into_body)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/artifacts/{artifact_id}/download",
+    tag = "artifacts",
+    summary = "Download an artifact using its temporary URL.",
+    description = "The stream is admitted under node-wide and transport-peer concurrency caps. A 429 response does not consume a single-use ticket. A stream-only export is deleted when this response finishes or disconnects.",
+    security(),
+    params(("instance_id" = String, Path), ("artifact_id" = String, Path), DownloadQuery),
+    responses((status = 200, description = "Artifact file stream."))
+)]
 pub async fn download_artifact(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -165,6 +223,16 @@ pub async fn download_artifact(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/instances/{instance_id}/backups/{backup_id}/download",
+    tag = "backups",
+    summary = "Download a backup using its temporary URL.",
+    description = "The stream is admitted under node-wide and transport-peer concurrency caps. A 429 response does not consume a single-use ticket.",
+    security(),
+    params(("instance_id" = String, Path), ("backup_id" = String, Path), DownloadQuery),
+    responses((status = 200, description = "Backup file stream."))
+)]
 pub async fn download_backup(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

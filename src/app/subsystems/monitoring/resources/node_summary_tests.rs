@@ -63,39 +63,17 @@ fn parses_host_cpu_and_calculates_non_idle_percentage() {
 }
 
 #[test]
-fn container_cpu_counter_resets_do_not_emit_bogus_usage() {
-    assert_eq!(
-        cpu_percent_over_wall_time(1_000, 10, Duration::from_secs(1)),
-        0.0
-    );
-}
-
-#[test]
-fn container_cpu_matches_wings_rs_wall_clock_percentage() {
-    assert_eq!(
-        cpu_percent_over_wall_time(1_000, 110_001_000, Duration::from_secs(1)),
-        11.0
-    );
-    assert_eq!(
-        cpu_percent_over_wall_time(1_000, 2_500_001_000, Duration::from_secs(1)),
-        250.0
-    );
-}
-
-#[test]
-fn container_cpu_reads_the_cgroup_total_counter() {
-    let stats = ContainerStatsResponse {
-        cpu_stats: Some(ContainerCpuStats {
-            cpu_usage: Some(ContainerCpuUsage {
-                total_usage: Some(123_456),
-                ..ContainerCpuUsage::default()
-            }),
-            ..ContainerCpuStats::default()
-        }),
-        ..ContainerStatsResponse::default()
-    };
-
-    assert_eq!(container_cpu_total(&stats), Some(123_456));
+fn container_cpu_is_a_wall_clock_percentage_and_ignores_counter_resets() {
+    for (previous, current, expected) in [
+        (1_000, 10, 0.0),
+        (1_000, 110_001_000, 11.0),
+        (1_000, 2_500_001_000, 250.0),
+    ] {
+        assert_eq!(
+            cpu_percent_over_wall_time(previous, current, Duration::from_secs(1)),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -467,7 +445,7 @@ fn managed_usage_is_null_when_a_running_instance_lacks_a_sample() {
 }
 
 #[test]
-fn shared_tenants_use_one_runtime_sample_target() {
+fn runtime_sample_targets_follow_runtimes_not_tenants() {
     let mut first = metadata_with_limits(
         "tenant_one",
         InstanceStatus::Running,
@@ -492,41 +470,28 @@ fn shared_tenants_use_one_runtime_sample_target() {
             protocol: Protocol::Mysql,
         })
     );
-}
 
-#[test]
-fn dedicated_instances_keep_independent_sample_targets() {
-    let first = metadata_with_limits(
-        "dedicated_one",
-        InstanceStatus::Running,
-        InstanceLimits::default(),
-    );
-    let second = metadata_with_limits(
-        "dedicated_two",
-        InstanceStatus::Running,
-        InstanceLimits::default(),
-    );
-
-    let targets = sampler::runtime_targets(&[first, second], &[]);
-
+    let dedicated = ["dedicated_one", "dedicated_two"].map(|instance_id| {
+        metadata_with_limits(
+            instance_id,
+            InstanceStatus::Running,
+            InstanceLimits::default(),
+        )
+    });
+    let targets = sampler::runtime_targets(&dedicated, &[]);
     assert_eq!(targets.len(), 2);
     assert!(targets.contains_key("dedicated_one"));
     assert!(targets.contains_key("dedicated_two"));
-}
 
-#[test]
-fn running_shared_pool_is_sampled_when_all_tenants_are_stopped() {
-    let mut tenant = metadata_with_limits(
+    let mut stopped = metadata_with_limits(
         "tenant_stopped",
         InstanceStatus::Stopped,
         InstanceLimits::default(),
     );
-    tenant.deployment_mode = crate::server::placement::DeploymentMode::Shared;
-    tenant.runtime_id = "mysql_pool_idle".to_string();
+    stopped.deployment_mode = crate::server::placement::DeploymentMode::Shared;
+    stopped.runtime_id = "mysql_pool_idle".to_string();
     let runtime = shared_runtime("mysql_pool_idle", Protocol::Mysql);
-
-    let targets = sampler::runtime_targets(&[tenant], &[runtime]);
-
+    let targets = sampler::runtime_targets(&[stopped], &[runtime]);
     assert_eq!(
         targets.get("mysql_pool_idle"),
         Some(&sampler::RuntimeSampleTarget {

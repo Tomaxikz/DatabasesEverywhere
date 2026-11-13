@@ -183,39 +183,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_mount_without_project_quota_option() {
-        let error = require_project_quota(
-            Path::new("/var/lib/databases-everywhere"),
-            Path::new("/"),
-            "/dev/vda3",
-            "ext4",
-            &["rw".to_string(), "errors=remount-ro".to_string()],
-        )
-        .unwrap_err();
+    fn requires_a_project_quota_mount_option_alias() {
+        for (fstype, option, enabled) in [
+            ("ext4", "errors=remount-ro", false),
+            ("ext4", "prjquota", true),
+            ("f2fs", "pquota", true),
+        ] {
+            let result = require_project_quota(
+                Path::new("/var/lib/databases-everywhere"),
+                Path::new("/"),
+                "/dev/vda3",
+                fstype,
+                &["rw".to_string(), option.to_string()],
+            );
 
-        assert!(matches!(
-            error,
-            DiskLimitError::ProjectQuotaNotEnabled { .. }
-        ));
-    }
-
-    #[test]
-    fn accepts_project_quota_mount_option_aliases() {
-        require_project_quota(
-            Path::new("/var/lib/databases-everywhere"),
-            Path::new("/"),
-            "/dev/vda3",
-            "ext4",
-            &["rw".to_string(), "prjquota".to_string()],
-        )
-        .unwrap();
-        require_project_quota(
-            Path::new("/var/lib/databases-everywhere"),
-            Path::new("/"),
-            "/dev/vda3",
-            "f2fs",
-            &["rw".to_string(), "pquota".to_string()],
-        )
-        .unwrap();
+            if enabled {
+                result.unwrap();
+            } else {
+                assert!(matches!(
+                    result.unwrap_err(),
+                    DiskLimitError::ProjectQuotaNotEnabled { .. }
+                ));
+            }
+        }
     }
 }

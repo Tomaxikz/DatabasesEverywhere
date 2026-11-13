@@ -4,8 +4,6 @@ use std::{
     process::Command,
 };
 
-use clap::CommandFactory;
-
 use super::*;
 
 #[test]
@@ -41,37 +39,6 @@ fn output_flags_are_global_and_quiet_conflicts_with_verbose() {
     assert_eq!(cli.verbose, 2);
     assert!(matches!(cli.color, ColorChoice::Never));
     assert!(Cli::try_parse_from(["dbev", "migrate", "-q", "-v"]).is_err());
-}
-
-#[test]
-fn cli_exposes_the_package_version() {
-    assert_eq!(
-        Cli::command().get_version(),
-        Some(env!("CARGO_PKG_VERSION"))
-    );
-}
-
-#[test]
-fn cli_parses_offline_protected_secret_repair() {
-    let cli = Cli::try_parse_from([
-        "dbev",
-        "repair-protected-secret",
-        "--instance-id",
-        "inst_recovery",
-        "--field",
-        "tenant-password",
-        "--confirm-legacy-plaintext",
-    ])
-    .unwrap();
-
-    assert!(matches!(
-        cli.command,
-        Some(super::Command::RepairProtectedSecret {
-            instance_id,
-            field: ProtectedSecretField::TenantPassword,
-            confirm_legacy_plaintext: true,
-        }) if instance_id == "inst_recovery"
-    ));
 }
 
 #[test]

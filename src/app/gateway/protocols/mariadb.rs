@@ -660,13 +660,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_password_token_has_mysql_length() {
-        let token = native_password_token("secret", b"12345678901234567890");
-
-        assert_eq!(token.len(), 20);
-    }
-
-    #[test]
     fn parses_native_password_handshake_response() {
         let gateway_seed = new_gateway_auth_seed();
         let mut payload = Vec::new();

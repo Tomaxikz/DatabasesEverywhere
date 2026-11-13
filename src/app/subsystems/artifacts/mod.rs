@@ -17,7 +17,7 @@ const DOWNLOAD_STREAM_BUFFER_BYTES: usize = 128 * 1024;
 mod checksum;
 mod download;
 mod files;
-mod handlers;
+pub(crate) mod handlers;
 mod stream;
 mod tickets;
 mod types;

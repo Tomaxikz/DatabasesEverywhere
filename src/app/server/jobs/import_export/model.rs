@@ -16,7 +16,7 @@ pub struct ImportExportJob {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportExportAction {
     Import,
@@ -40,7 +40,7 @@ impl ImportExportAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportExportStatus {
     Queued,

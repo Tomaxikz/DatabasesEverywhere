@@ -349,10 +349,12 @@ fn usage_lines(app: &App, instance: &Instance, width: u16) -> Vec<Line<'static>>
         .filter(|(id, _)| *id == instance.instance_id)
         .map(|(_, usage)| usage);
     let Some(usage) = usage else {
-        let detail = if instance.status == "running" {
-            "sampling…"
-        } else {
+        let detail = if instance.status != "running" {
             "–"
+        } else if app.usage.is_none() && !app.sampling {
+            "unavailable"
+        } else {
+            "sampling…"
         };
         return gauges(&empty_rows(detail), width);
     };

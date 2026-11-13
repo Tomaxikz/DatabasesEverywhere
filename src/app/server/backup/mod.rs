@@ -58,7 +58,7 @@ pub struct BackupInventory {
     pub unsupported: Vec<UnsupportedBackup>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupLayout {
     #[default]

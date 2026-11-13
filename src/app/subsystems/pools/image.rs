@@ -15,14 +15,28 @@ use crate::{
 use axum::extract::State;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = PoolImageRequest)]
 pub(crate) struct ImageRequest {
     image: String,
+    #[schema(schema_with = crate::routes::openapi::literals::yes)]
     confirm: bool,
+    #[schema(min_length = 1, max_length = 512)]
     reason: String,
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/pools/{runtime_id}/image",
+    tag = "pools",
+    summary = "Update a pool image within its release line.",
+    description = "Requires pools:write and images:admin, confirm=true and a reason. Take backups first. Uses a disposable no-data-mount version probe, then preserves volumes and verifies the replacement before routing. Rejects downgrades and different release lines. Interrupted updates are quarantined; retry only the same immutable image.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_WRITE))),
+    params(("runtime_id" = String, Path)),
+    request_body = ImageRequest,
+    responses((status = 202, description = "Operation result.", body = super::operations::PoolAccepted, headers(("Location" = String, description = "Pool status URL."))))
+)]
 pub(crate) async fn update(
     State(state): State<AppState>,
     auth: ApiRequestContext,

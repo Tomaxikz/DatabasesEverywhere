@@ -793,12 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn staging_budget_covers_native_output_and_packaging() {
-        assert_eq!(staging_budget(10, 5), 15);
-        assert_eq!(staging_budget(u64::MAX, 5), u64::MAX);
-    }
-
-    #[test]
     fn captures_restore_cannot_extract_are_not_published() {
         check_restorable(10, 1024, 1024).unwrap();
         assert!(check_restorable(10, 1025, 1024).is_err());

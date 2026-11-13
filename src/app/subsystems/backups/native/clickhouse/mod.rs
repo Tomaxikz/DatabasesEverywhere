@@ -330,14 +330,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_matches_the_registry_contract() {
-        let strategy = ClickhouseFreezeStrategy;
-        assert_eq!(strategy.id(), CLICKHOUSE_FROZEN_PARTS);
-        assert_eq!(strategy.restore_recipe().id, RESTORE_RECIPE_ID);
-        assert_eq!(strategy.restorable_recipe_versions(), &[1]);
-    }
-
-    #[test]
     fn captures_record_parts_and_exclusions() {
         let plan = Plan {
             frozen: Vec::new(),

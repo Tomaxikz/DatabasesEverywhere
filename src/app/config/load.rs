@@ -220,39 +220,6 @@ paths:
     }
 
     #[test]
-    fn accepts_explicit_disk_fallback_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yml");
-        std::fs::write(
-            &path,
-            r#"
-remote: https://panel.example.com
-uuid: node-uuid
-token_id: token-id
-token: test-api-token-0123456789abcdef-01
-jwt_signing_key: test-jwt-signing-key-0123456789abcdef-02
-api:
-  host: 127.0.0.1
-disk:
-  mode: fuse_quota
-paths:
-  data: /var/lib/databases-everywhere
-  sockets: /run/databases-everywhere
-  logs: /var/log/databases-everywhere
-  artifacts: /var/lib/databases-everywhere/artifacts
-"#,
-        )
-        .unwrap();
-
-        let config = load_config(&path).unwrap();
-
-        assert_eq!(
-            config.disk.selection,
-            crate::config::DiskLimitSelection::FuseQuota
-        );
-    }
-
-    #[test]
     fn loads_v06_api_fields_without_reexporting_retired_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yml");

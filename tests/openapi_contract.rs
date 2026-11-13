@@ -180,6 +180,20 @@ fn router_operations(source: &str) -> HashSet<String> {
         .collect()
 }
 
+fn uses_nullable_keyword(value: &Value) -> bool {
+    match value {
+        Value::Mapping(mapping) => mapping.iter().any(|(key, value)| match key.as_str() {
+            Some("nullable") => true,
+            Some("properties") => value
+                .as_mapping()
+                .is_some_and(|properties| properties.values().any(uses_nullable_keyword)),
+            _ => uses_nullable_keyword(value),
+        }),
+        Value::Sequence(sequence) => sequence.iter().any(uses_nullable_keyword),
+        _ => false,
+    }
+}
+
 fn literal(schema: &Value) -> Option<&str> {
     match schema["enum"].as_sequence().map(Vec::as_slice) {
         Some([value]) => value.as_str(),
@@ -268,7 +282,7 @@ fn openapi_and_router_use_only_the_scoped_contract() {
     assert!(!source.contains("artifact_path"));
     assert!(!source.contains("export_artifact_path"));
     assert!(!source.contains("old_volume_backup_path"));
-    assert!(!source.contains("nullable:"));
+    assert!(!uses_nullable_keyword(&document));
 
     assert!(document["paths"]["/api/heartbeat"]["get"].is_mapping());
     assert!(document["paths"]["/api/heartbeat"]["post"].is_null());

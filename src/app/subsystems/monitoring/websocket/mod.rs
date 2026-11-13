@@ -23,14 +23,17 @@ use crate::{
     },
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct LogsQuery {
+    #[param(minimum = 1, maximum = 2000, default = 100)]
     pub tail: Option<usize>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct ImportExportQuery {
     pub job_id: Option<String>,
 }
@@ -50,8 +53,8 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const BATCH_ENVELOPE_BYTES: usize = 256;
 
 mod authorization;
-mod import_export;
-mod monitoring;
+pub(crate) mod import_export;
+pub(crate) mod monitoring;
 mod socket;
 pub(crate) use authorization::BindableGenerations;
 use authorization::resolve_instance_authorization;
@@ -72,6 +75,23 @@ pub(crate) fn upgrade_websocket(websocket: WebSocketUpgrade) -> WebSocketUpgrade
         .max_write_buffer_size(WEBSOCKET_MAX_WRITE_BUFFER_BYTES)
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/instances/{instance_id}/logs",
+    tag = "monitoring",
+    summary = "WebSocket stream of container logs for one instance.",
+    description = "Requires logs:read on a generation-bound WebSocket JWT. Dedicated instances only; shared logs return 409. API 0.16 sends type=logs with event=reset and sequence=0, then event=append with stream=stdout|stderr and data containing new text only. One Docker follow request delivers the requested tail followed by live output. Append to a bounded client buffer; never replace it for append events. event=end terminates the stream, optionally with a public error. Sequence numbers are per connection. Reconnect clears local sequence state and receives a new reset/tail, not guaranteed lossless history. Complete records are redacted across runtime chunks, then split into UTF-8-safe messages below 16 KiB. An incomplete final secret value is omitted. Records exceeding the 128-KiB redaction budget end the stream with log_record_limit; do not retry that error in a tight loop. Heartbeats use Ping/Pong every 30 seconds and never resend log text. Expiry, shutdown and generation fencing remain enforced.",
+    extensions(
+        ("x-required-scope" = json!(scopes::LOGS_READ)),
+        ("x-websocket" = json!(true)),
+        ("x-websocket-message" = json!({"$ref": "#/components/schemas/LogEvent"}))
+    ),
+    params(("instance_id" = String, Path), LogsQuery),
+    responses(
+        (status = 101, description = "WebSocket upgrade."),
+        (status = 409, description = "Shared-engine logs are pool-wide and cannot be exposed through a tenant-scoped WebSocket."),
+    )
+)]
 pub async fn logs(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,
@@ -134,6 +154,24 @@ fn creating_log_target(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/ws/instances/{instance_id}/import-export",
+    tag = "import-export",
+    summary = "WebSocket stream of import/export jobs for one instance.",
+    description = "Requires a short-lived WebSocket JWT with import-export:read and access to the instance in the path. Messages and frames are limited to 16 KiB.",
+    extensions(
+        ("x-required-scope" = json!(scopes::IMPORT_EXPORT_READ)),
+        ("x-websocket" = json!(true)),
+        ("x-websocket-message" = json!({"oneOf": [
+            {"$ref": "#/components/schemas/ImportExportSnapshot"},
+            {"$ref": "#/components/schemas/ImportExportJobEvent"},
+            {"$ref": "#/components/schemas/ImportExportLaggedEvent"}
+        ]}))
+    ),
+    params(("instance_id" = String, Path), ImportExportQuery),
+    responses((status = 101, description = "WebSocket upgrade."))
+)]
 pub async fn import_export(
     State(state): State<AppState>,
     auth: WebSocketRequestContext,

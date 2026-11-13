@@ -10,7 +10,7 @@ use crate::{
     server::placement::{DeploymentMode, EngineRuntime, EngineRuntimeStatus, PoolLimits, runtime},
 };
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct PoolConfig {
     pub runtime_id: String,
     pub owner: crate::server::placement::PoolOwner,
@@ -18,6 +18,17 @@ pub(crate) struct PoolConfig {
 }
 
 /// Resizes the engine, never an individual tenant.
+#[utoipa::path(
+    patch,
+    path = "/api/pools/{runtime_id}",
+    tag = "pools",
+    summary = "Resize fixed pool capacity.",
+    description = "Requires pools:write. Fixed capacity; memory and disk may grow but cannot shrink online. max_tenants cannot fall below reservations. No automatic growth or overflow pool.",
+    extensions(("x-required-scope" = json!(scopes::POOLS_WRITE))),
+    params(("runtime_id" = String, Path)),
+    request_body = PoolLimits,
+    responses((status = 200, description = "Operation result.", body = PoolConfig))
+)]
 pub(crate) async fn resize_pool(
     State(state): State<AppState>,
     auth: ApiRequestContext,

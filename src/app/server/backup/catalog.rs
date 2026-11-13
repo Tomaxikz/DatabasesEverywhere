@@ -51,12 +51,13 @@ pub struct BackupCatalogObject {
     pub preview_truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackupCatalogColumn {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+    #[schema(minimum = 1)]
     pub ordinal: usize,
 }
 

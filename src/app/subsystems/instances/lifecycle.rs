@@ -17,7 +17,7 @@ use crate::utils::time::now_rfc3339;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
     Start,

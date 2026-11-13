@@ -70,31 +70,6 @@ pub(super) fn extract_bounded_archive_blocking(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn validate_archive_blocking(
-    artifact_path: &Path,
-    expected_root: &str,
-) -> Result<(), ImportExportError> {
-    let file = File::open(artifact_path)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    let started = Instant::now();
-    let mut entries = 0_usize;
-    let mut bytes = 0_u64;
-    for entry in archive.entries()? {
-        let entry = entry?;
-        let path = entry.path()?;
-        entries += 1;
-        validate_archive_limits(started, entries, bytes, DATA_ARCHIVE_LIMITS)?;
-        validate_archive_path(&path, expected_root, DATA_ARCHIVE_LIMITS.depth)?;
-        let entry_type = entry.header().entry_type();
-        validate_entry_type(entry_type)?;
-        bytes = account_extracted_entry(bytes, entry.header().size()?)?;
-        validate_archive_limits(started, entries, bytes, DATA_ARCHIVE_LIMITS)?;
-    }
-    Ok(())
-}
-
 pub(super) fn validate_archive_path(
     path: &Path,
     expected_root: &str,

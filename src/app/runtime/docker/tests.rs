@@ -28,14 +28,19 @@ use crate::{
 
 #[test]
 fn create_body_does_not_publish_backend_ports_by_default() {
-    let runtime = test_runtime();
-    let body = runtime.create_body(&postgres_spec()).unwrap();
-    let host_config = body.host_config.unwrap();
+    let rootless_podman = test_runtime_with_engine(
+        crate::config::DaemonEngine::Podman,
+        "/run/user/1000/podman/podman.sock",
+    );
+    for runtime in [test_runtime(), rootless_podman] {
+        let body = runtime.create_body(&postgres_spec()).unwrap();
+        let host_config = body.host_config.unwrap();
 
-    assert!(host_config.port_bindings.is_none());
-    assert!(body.exposed_ports.is_none());
-    assert_eq!(host_config.network_mode, Some("none".to_string()));
-    assert_eq!(body.stop_timeout, Some(30));
+        assert!(host_config.port_bindings.is_none());
+        assert!(body.exposed_ports.is_none());
+        assert_eq!(host_config.network_mode, Some("none".to_string()));
+        assert_eq!(body.stop_timeout, Some(30));
+    }
 }
 
 #[test]
@@ -97,10 +102,21 @@ fn clickhouse_uses_a_loopback_resolvable_hostname_with_network_disabled() {
 #[test]
 fn create_body_includes_limits_labels_and_security() {
     let runtime = test_runtime().with_node_id("node-test");
-    let body = runtime.create_body(&postgres_spec()).unwrap();
+    let mut spec = postgres_spec();
+    spec.pids_limit = Some(4096);
+    let body = runtime.create_body(&spec).unwrap();
     let host_config = body.host_config.unwrap();
     let labels = body.labels.unwrap();
 
+    assert_eq!(host_config.pids_limit, Some(4096));
+    assert!(host_config.mounts.as_ref().unwrap().iter().any(|mount| {
+        mount.target.as_deref() == Some("/var/lib/postgresql")
+            && mount
+                .source
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("/data")
+    }));
     assert_eq!(host_config.nano_cpus, Some(1_000_000_000));
     assert_eq!(host_config.memory, Some(512 * 1024 * 1024));
     assert_eq!(
@@ -121,32 +137,6 @@ fn create_body_includes_limits_labels_and_security() {
         host_config.security_opt,
         Some(vec!["no-new-privileges".to_string()])
     );
-}
-
-#[test]
-fn create_body_allows_database_specific_pids_limit() {
-    let runtime = test_runtime();
-    let mut spec = postgres_spec();
-    spec.pids_limit = Some(4096);
-    let body = runtime.create_body(&spec).unwrap();
-
-    assert_eq!(body.host_config.unwrap().pids_limit, Some(4096));
-}
-
-#[test]
-fn create_body_uses_database_specific_mount_target() {
-    let runtime = test_runtime();
-    let body = runtime.create_body(&postgres_spec()).unwrap();
-    let mounts = body.host_config.unwrap().mounts.unwrap();
-
-    assert!(mounts.iter().any(|mount| {
-        mount.target.as_deref() == Some("/var/lib/postgresql")
-            && mount
-                .source
-                .as_deref()
-                .unwrap_or_default()
-                .ends_with("/data")
-    }));
 }
 
 #[test]
@@ -197,27 +187,11 @@ async fn create_preflight_rejects_missing_read_only_file_mount() {
 }
 
 #[test]
-fn rootless_podman_is_detected_from_user_socket() {
+fn rootless_podman_sets_user_and_keep_id_per_protocol() {
     let runtime = test_runtime_with_engine(
         crate::config::DaemonEngine::Podman,
         "/run/user/1000/podman/podman.sock",
     );
-    let rootful = test_runtime_with_engine(
-        crate::config::DaemonEngine::Podman,
-        "/run/podman/podman.sock",
-    );
-
-    assert!(runtime.uses_rootless_podman());
-    assert!(!rootful.uses_rootless_podman());
-}
-
-#[test]
-fn rootless_podman_uses_protocol_specific_users() {
-    let runtime = test_runtime_with_engine(
-        crate::config::DaemonEngine::Podman,
-        "/run/user/1000/podman/podman.sock",
-    );
-
     for protocol in [
         Protocol::Postgres,
         Protocol::Mariadb,
@@ -228,44 +202,6 @@ fn rootless_podman_uses_protocol_specific_users() {
             runtime.rootless_podman_container_user(protocol),
             Some("999:999")
         );
-    }
-    for protocol in [
-        Protocol::Redis,
-        Protocol::Valkey,
-        Protocol::Clickhouse,
-        Protocol::Qdrant,
-    ] {
-        assert_eq!(
-            runtime.rootless_podman_container_user(protocol),
-            Some("0:0")
-        );
-    }
-}
-
-#[test]
-fn rootless_podman_also_uses_network_none_without_published_ports() {
-    let runtime = test_runtime_with_engine(
-        crate::config::DaemonEngine::Podman,
-        "/run/user/1000/podman/podman.sock",
-    );
-    let body = runtime.create_body(&postgres_spec()).unwrap();
-    let host_config = body.host_config.unwrap();
-    assert!(host_config.port_bindings.is_none());
-    assert_eq!(host_config.network_mode.as_deref(), Some("none"));
-}
-
-#[test]
-fn rootless_podman_sets_keep_id_for_postgres_like_images() {
-    let runtime = test_runtime_with_engine(
-        crate::config::DaemonEngine::Podman,
-        "/run/user/1000/podman/podman.sock",
-    );
-    for protocol in [
-        Protocol::Postgres,
-        Protocol::Mariadb,
-        Protocol::Mysql,
-        Protocol::Mongodb,
-    ] {
         let mut spec = postgres_spec();
         spec.protocol = protocol;
         let body = runtime.create_body(&spec).unwrap();
@@ -281,6 +217,10 @@ fn rootless_podman_sets_keep_id_for_postgres_like_images() {
         Protocol::Clickhouse,
         Protocol::Qdrant,
     ] {
+        assert_eq!(
+            runtime.rootless_podman_container_user(protocol),
+            Some("0:0")
+        );
         let mut spec = postgres_spec();
         spec.protocol = protocol;
         let body = runtime.create_body(&spec).unwrap();
@@ -305,16 +245,13 @@ fn unsafe_instance_id_is_rejected() {
 }
 
 #[test]
-fn update_limits_body_uses_docker_api_units() {
+fn limit_conversion_uses_docker_api_units_and_rejects_overflow() {
     let body = DockerRuntime::update_limits_body(2.0, 2048).unwrap();
 
     assert_eq!(body.nano_cpus, Some(2_000_000_000));
     assert_eq!(body.memory, Some(2048 * 1024 * 1024));
     assert_eq!(body.memory_swap, body.memory);
-}
 
-#[test]
-fn docker_limit_conversion_rejects_overflow_and_non_finite_cpu() {
     assert_eq!(mib_to_bytes(1_u64 << 44), None);
     assert_eq!(cpu_to_nano(f64::NAN), None);
     assert_eq!(cpu_to_nano(f64::INFINITY), None);
@@ -324,10 +261,7 @@ fn docker_limit_conversion_rejects_overflow_and_non_finite_cpu() {
 
     let cpu_error = DockerRuntime::update_limits_body(f64::INFINITY, 1024).unwrap_err();
     assert!(matches!(cpu_error, DockerError::ResourceLimit(_)));
-}
 
-#[test]
-fn docker_byte_conversion_checks_i64_boundary() {
     const BYTES_PER_MIB: u64 = 1024 * 1024;
     let largest_mib = (i64::MAX as u64) / BYTES_PER_MIB;
 
@@ -385,10 +319,7 @@ fn managed_container_verification_requires_the_exact_ownership_tuple() {
         verify_managed_instance_labels(&labels, container, Protocol::Postgres, "inst_test", None,)
             .is_err()
     );
-}
 
-#[test]
-fn managed_container_verification_rejects_a_different_node_owner() {
     let labels = HashMap::from([
         (MANAGED_LABEL.to_string(), "true".to_string()),
         (INSTANCE_LABEL.to_string(), "inst_test".to_string()),
