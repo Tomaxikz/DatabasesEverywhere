@@ -12,6 +12,7 @@ mod credentials;
 mod first_run;
 mod form;
 mod settings;
+mod theme;
 mod ui;
 
 use std::{
@@ -109,7 +110,7 @@ async fn event_loop(
         config,
         sender,
     };
-    for job in app.refresh_jobs() {
+    for job in app.refresh_jobs().into_iter().chain(app.sample_job()) {
         runner.spawn(&mut app, job);
     }
 
@@ -127,7 +128,11 @@ async fn event_loop(
                 None => break,
             },
             Some(outcome) = outcomes.recv() => app.on_outcome(outcome),
-            _ = refresh.tick() => app.refresh_jobs(),
+            _ = refresh.tick() => {
+                let mut jobs = app.refresh_jobs();
+                jobs.extend(app.sample_job());
+                jobs
+            }
             _ = tick.tick() => {
                 app.tick();
                 Vec::new()
@@ -226,6 +231,18 @@ async fn execute(
                 error: format!("{error:#}"),
             },
         },
+        Job::Sample(id) => {
+            let usage = async {
+                let id = id?;
+                let usage = client.usage(&id).await.ok()?;
+                Some((id, usage))
+            };
+            let (node, usage) = tokio::join!(client.node_summary(), usage);
+            Outcome::Sampled {
+                node: node.ok(),
+                usage,
+            }
+        }
         Job::Reveal(id) => {
             let Some(instance) = instances.iter().find(|instance| instance.instance_id == id)
             else {

@@ -3,9 +3,8 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 use super::{
@@ -14,12 +13,18 @@ use super::{
     wizard::{QUESTIONS, Step, Wizard},
 };
 use crate::{
-    commands::console::ui::{ACCENT, input_line_with_cursor, key_hints, popup},
+    commands::console::{
+        theme::{
+            self, ACCENT, BORDER, ERROR, MUTED, TEXT, WARN, bold, fg, key_hints_fit, muted, panel,
+            tag,
+        },
+        ui::{input_line_with_cursor, popup},
+    },
     databases::protocol::Protocol,
     utils::constants::ports,
 };
 
-const WIDTH: u16 = 84;
+const WIDTH: u16 = 96;
 
 pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
     let [header, _, footer] = Layout::vertical([
@@ -28,23 +33,19 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
         Constraint::Length(2),
     ])
     .areas(frame.area());
-    let title = Line::from(vec![
-        Span::styled(
-            " ◆ dbev console ",
-            Style::default().fg(Color::Black).bg(ACCENT).bold(),
-        ),
-        Span::styled("  first-run setup", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("  ·  {}", wizard.environment.config_path.display()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
     frame.render_widget(
-        Paragraph::new(title).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        ),
+        panel("")
+            .title_top(theme::brand("first-run setup"))
+            .title_top(
+                tag(
+                    vec![Span::styled(
+                        wizard.environment.config_path.display().to_string(),
+                        fg(MUTED),
+                    )],
+                    BORDER,
+                )
+                .right_aligned(),
+            ),
         header,
     );
 
@@ -64,12 +65,17 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
     };
     if let Some(error) = &wizard.error {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            format!("✖ {error}"),
-            Style::default().fg(Color::Red),
-        )));
+        lines.push(Line::from(Span::styled(format!("✖ {error}"), fg(ERROR))));
     }
-    let inner = popup(frame, &title, WIDTH, lines.len() as u16 + 4);
+    let text_width = WIDTH
+        .min(frame.area().width.saturating_sub(2))
+        .saturating_sub(6)
+        .max(1) as usize;
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(text_width).max(1))
+        .sum();
+    let inner = popup(frame, &title, WIDTH, rows as u16 + 4);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner.inner(ratatui::layout::Margin::new(1, 1)),
@@ -96,7 +102,11 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
             ("q", "quit"),
         ],
     };
-    frame.render_widget(Paragraph::new(key_hints(hints)), keys);
+    frame.render_widget(
+        Paragraph::new(key_hints_fit(hints, keys.width as usize)),
+        keys,
+    );
+    theme::finish(frame.buffer_mut());
 }
 
 fn question_title(step: Step) -> &'static str {
@@ -112,29 +122,22 @@ fn question_title(step: Step) -> &'static str {
 }
 
 fn dim(text: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(
-        text.into(),
-        Style::default().fg(Color::DarkGray),
-    ))
+    muted(text)
 }
 
 fn option(selected: bool, title: &str, detail: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!(" {} {title:<28}", if selected { "●" } else { "○" }),
-            Style::default()
-                .fg(if selected { ACCENT } else { Color::Gray })
-                .bold(),
-        ),
-        Span::styled(detail.to_string(), Style::default().fg(Color::DarkGray)),
-    ])
+    crate::commands::console::ui::option(selected, title, detail, 28)
 }
 
 fn field(label: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<15}"), Style::default().fg(Color::DarkGray)),
-        Span::raw(value.into()),
+        Span::styled(format!("{label:<15}"), fg(MUTED)),
+        Span::styled(value.into(), fg(TEXT)),
     ])
+}
+
+fn warning(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, fg(WARN)))
 }
 
 fn start(wizard: &Wizard) -> Vec<Line<'static>> {
@@ -160,10 +163,7 @@ fn start(wizard: &Wizard) -> Vec<Line<'static>> {
     lines.push(if wizard.environment.is_root {
         dim("Nothing is written until you confirm the summary.")
     } else {
-        Line::from(Span::styled(
-            "Standalone setup needs root; rerun with sudo dbev --cli to choose it.",
-            Style::default().fg(Color::Yellow),
-        ))
+        warning("Standalone setup needs root; rerun with sudo dbev --cli to choose it.")
     });
     lines
 }
@@ -174,7 +174,12 @@ fn managed(wizard: &Wizard) -> Vec<Line<'static>> {
         managed_steps(&wizard.environment.config_path)
             .into_iter()
             .enumerate()
-            .map(|(index, step)| Line::from(format!(" {}. {step}", index + 1))),
+            .map(|(index, step)| {
+                Line::from(vec![
+                    Span::styled(format!(" {}. ", index + 1), bold(ACCENT)),
+                    Span::styled(step, fg(TEXT)),
+                ])
+            }),
     );
     lines.push(Line::default());
     lines.push(dim("These steps are printed again when the console exits."));
@@ -191,10 +196,7 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
             for (index, (protocol, enabled)) in wizard.engines.iter().enumerate() {
                 let focused = index == wizard.engine_cursor;
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        if focused { "› " } else { "  " },
-                        Style::default().fg(ACCENT),
-                    ),
+                    Span::styled(if focused { "› " } else { "  " }, bold(ACCENT)),
                     Span::styled(
                         format!(
                             "[{}] {}",
@@ -202,11 +204,11 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
                             engine_name(*protocol)
                         ),
                         if focused {
-                            Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52))
+                            theme::selected()
                         } else if *enabled {
-                            Style::default().fg(Color::Gray)
+                            fg(theme::engine_color(*protocol))
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            fg(MUTED)
                         },
                     ),
                 ]));
@@ -365,7 +367,7 @@ fn summary(wizard: &Wizard) -> Vec<Line<'static>> {
             Span::raw("Enter writes "),
             Span::styled(
                 wizard.environment.config_path.display().to_string(),
-                Style::default().fg(ACCENT),
+                bold(ACCENT),
             ),
             Span::raw(" (root, mode 0600)"),
         ]),
@@ -373,10 +375,7 @@ fn summary(wizard: &Wizard) -> Vec<Line<'static>> {
     lines.push(if wizard.environment.systemd {
         Line::from("then runs setup, which installs and starts the databases-everywhere service.")
     } else {
-        Line::from(Span::styled(
-            "systemd is not running here, so only the config is written; you start the daemon.",
-            Style::default().fg(Color::Yellow),
-        ))
+        warning("systemd is not running here, so only the config is written; you start the daemon.")
     });
     lines
 }

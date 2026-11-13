@@ -128,6 +128,26 @@ impl ApiClient {
         Ok(())
     }
 
+    pub(super) async fn node_summary(&self) -> anyhow::Result<NodeSummary> {
+        self.send(
+            Method::GET,
+            "/api/admin/resources/summary",
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(super) async fn usage(&self, id: &str) -> anyhow::Result<InstanceUsage> {
+        self.send(
+            Method::GET,
+            &format!("/api/instances/{}/resources", segment(id)),
+            None,
+            REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
     pub(super) async fn progress(&self, id: &str) -> anyhow::Result<StatusResponse> {
         self.send(
             Method::GET,
@@ -457,6 +477,62 @@ pub(super) struct Limits {
     pub disk_mib: u64,
     #[serde(default)]
     pub disk_enforced: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct NodeSummary {
+    pub cpu: NodeCpu,
+    pub memory: NodeCapacity,
+    pub disk: NodeCapacity,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct NodeCpu {
+    pub total_cores: u64,
+    pub allocated_cores: f64,
+    pub host_usage_percent: f64,
+    pub managed_usage_cores: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct NodeCapacity {
+    pub total_bytes: u64,
+    pub allocated_bytes: u64,
+    pub host_used_bytes: u64,
+    pub managed_used_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct InstanceUsage {
+    pub cpu: CpuUsage,
+    pub memory: MemoryUsage,
+    pub disk: DiskUsage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct CpuUsage {
+    pub configured_cores: f64,
+    pub usage_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct MemoryUsage {
+    pub configured_mib: u64,
+    pub usage_bytes: Option<u64>,
+    pub limit_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(super) struct DiskUsage {
+    pub limit_bytes: u64,
+    pub used_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

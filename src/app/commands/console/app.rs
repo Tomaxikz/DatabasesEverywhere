@@ -13,7 +13,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use secrecy::{ExposeSecret, SecretString};
 
 use super::{
-    api::{Backup, BackupMode, CreateRequest, Instance, PowerAction, StatusResponse, SystemInfo},
+    api::{
+        Backup, BackupMode, CreateRequest, Instance, InstanceUsage, NodeSummary, PowerAction,
+        StatusResponse, SystemInfo,
+    },
     form::CreateForm,
 };
 use crate::databases::protocol::Protocol;
@@ -120,6 +123,7 @@ pub(super) enum Job {
         reason: String,
     },
     Reveal(String),
+    Sample(Option<String>),
 }
 
 impl Job {
@@ -131,7 +135,7 @@ impl Job {
             Self::Delete { instance_id, .. } => format!("deleting {instance_id}"),
             Self::Backup(id, mode) => format!("{} backup of {id}", mode.as_str()),
             Self::Restore { instance_id, .. } => format!("restoring {instance_id}"),
-            Self::Reveal(_) => return None,
+            Self::Reveal(_) | Self::Sample(_) => return None,
         })
     }
 }
@@ -144,9 +148,19 @@ pub(super) enum Outcome {
     Logs(String, String),
     Backups(String, Vec<Backup>),
     Revealed(Box<Revealed>),
-    Done { label: String, refresh: bool },
-    Failed { label: String, error: String },
+    Done {
+        label: String,
+        refresh: bool,
+    },
+    Failed {
+        label: String,
+        error: String,
+    },
     RefreshFailed(String),
+    Sampled {
+        node: Option<NodeSummary>,
+        usage: Option<(String, InstanceUsage)>,
+    },
 }
 
 pub(super) struct App {
@@ -174,6 +188,10 @@ pub(super) struct App {
     pub message: Option<Message>,
     pub refresh_error: Option<String>,
     pub refreshing: bool,
+    pub node: Option<NodeSummary>,
+    pub usage: Option<(String, InstanceUsage)>,
+    pub sampling: bool,
+    pub node_stale: bool,
     pub ticks: u64,
     pub quit: bool,
 }
@@ -202,6 +220,10 @@ impl App {
             message: None,
             refresh_error: None,
             refreshing: false,
+            node: None,
+            usage: None,
+            sampling: false,
+            node_stale: false,
             ticks: 0,
             quit: false,
         }
@@ -323,6 +345,14 @@ impl App {
         jobs
     }
 
+    pub(super) fn sample_job(&mut self) -> Option<Job> {
+        if self.sampling {
+            return None;
+        }
+        self.sampling = true;
+        Some(Job::Sample(self.current_id()))
+    }
+
     pub(super) fn started(&mut self, job: &Job) {
         if let Some(label) = job.label() {
             self.say(Level::Info, format!("{label}…"));
@@ -415,6 +445,14 @@ impl App {
             Outcome::RefreshFailed(error) => {
                 self.refreshing = false;
                 self.refresh_error = Some(error);
+            }
+            Outcome::Sampled { node, usage } => {
+                self.sampling = false;
+                self.node_stale = node.is_none();
+                if node.is_some() {
+                    self.node = node;
+                }
+                self.usage = usage;
             }
         }
         Vec::new()
@@ -865,6 +903,25 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.visible().len(), 1);
         assert_eq!(app.current().unwrap().instance_id, "b_redis");
+    }
+
+    #[test]
+    fn sampling_never_overlaps_and_marks_failed_samples() {
+        let mut app = loaded();
+        let selected = app.current().map(|instance| instance.instance_id.clone());
+        assert_eq!(app.sample_job(), Some(Job::Sample(selected.clone())));
+        assert_eq!(app.sample_job(), None);
+        app.on_outcome(Outcome::Sampled {
+            node: Some(NodeSummary::default()),
+            usage: selected.map(|id| (id, InstanceUsage::default())),
+        });
+        assert!(app.sample_job().is_some());
+        app.on_outcome(Outcome::Sampled {
+            node: None,
+            usage: None,
+        });
+        assert!(app.node.is_some() && app.node_stale);
+        assert!(app.usage.is_none());
     }
 
     #[test]

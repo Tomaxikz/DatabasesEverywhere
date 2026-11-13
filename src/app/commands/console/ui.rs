@@ -3,11 +3,11 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, TableState, Wrap,
+        Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+        TableState, Wrap,
     },
 };
 use secrecy::ExposeSecret;
@@ -16,19 +16,25 @@ use super::{
     api::{Instance, PowerAction},
     app::{App, Level, Modal, REVEAL_TTL, Revealed, Screen, connection_string},
     form::{CreateForm, Field},
+    theme::{
+        self, ACCENT, BORDER, ERROR, Gauge, LABEL, MUTED, OK, TEXT, WARN, bold, fg, gauges,
+        human_bytes, key_hints, muted, panel, ratio, tag,
+    },
 };
 
-pub(super) const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+const MIB: u64 = 1024 * 1024;
 
 pub(super) fn draw(frame: &mut Frame, app: &App) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(5),
+    let area = frame.area();
+    let node_height = if area.height >= 15 { 5 } else { 2 };
+    let [node, body, footer] = Layout::vertical([
+        Constraint::Length(node_height),
+        Constraint::Min(3),
         Constraint::Length(2),
     ])
-    .areas(frame.area());
-    draw_header(frame, app, header);
+    .areas(area);
+    draw_node(frame, app, node);
     match app.screen {
         Screen::Instances => draw_instances(frame, app, body),
         Screen::Logs => draw_logs(frame, app, body),
@@ -60,41 +66,10 @@ pub(super) fn draw(frame: &mut Frame, app: &App) {
         Some(Modal::Help) => draw_help(frame),
         None => {}
     }
+    theme::finish(frame.buffer_mut());
 }
 
-fn panel(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
-}
-
-fn status_style(status: &str) -> Style {
-    let color = match status {
-        "running" => Color::Green,
-        "creating" | "booting" => Color::Yellow,
-        "stopped" => Color::DarkGray,
-        "deleting" => Color::Magenta,
-        _ => Color::Red,
-    };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn status_symbol(status: &str) -> &'static str {
-    match status {
-        "running" => "●",
-        "creating" | "booting" => "◐",
-        "stopped" => "○",
-        "deleting" => "◌",
-        _ => "✖",
-    }
-}
-
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_node(frame: &mut Frame, app: &App, area: Rect) {
     let version = app
         .system
         .as_ref()
@@ -104,38 +79,126 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     for instance in &app.instances {
         *counts.entry(instance.status.as_str()).or_default() += 1;
     }
-    let mut spans = vec![
-        Span::styled(
-            " ◆ dbev console ",
-            Style::default().fg(Color::Black).bg(ACCENT).bold(),
-        ),
-        Span::raw("  "),
-        Span::styled(version, Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("  ·  {}", app.api_url),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("    "),
-    ];
+    let mut summary = Vec::new();
     for (status, count) in counts {
-        spans.push(Span::styled(
-            format!("{} {count} {status}  ", status_symbol(status)),
-            status_style(status),
+        if !summary.is_empty() {
+            summary.push(Span::raw("  "));
+        }
+        summary.push(Span::styled(
+            format!("{} {count} {status}", theme::status_symbol(status)),
+            bold(theme::status_color(status)),
         ));
     }
-    if !app.running.is_empty() {
+    if summary.is_empty() {
+        summary.push(Span::styled("no instances", fg(MUTED)));
+    }
+    let summary = tag(summary, BORDER);
+    let room = (area.width as usize).saturating_sub(summary.width() + 10);
+    let mut block = panel("")
+        .title_top(theme::brand(version))
+        .title_top(tag(vec![Span::styled(app.api_url.clone(), fg(MUTED))], BORDER).right_aligned())
+        .title_bottom(summary.right_aligned());
+    if !app.running.is_empty() && room > 8 {
         let spinner = SPINNER[(app.ticks as usize) % SPINNER.len()];
-        spans.push(Span::styled(
-            format!("{spinner} {}", app.running.join(", ")),
-            Style::default().fg(Color::Yellow),
-        ));
+        let mut running = format!("{spinner} {}", app.running.join(", "));
+        if running.chars().count() > room {
+            running = running.chars().take(room - 1).collect::<String>() + "…";
+        }
+        block = block.title_bottom(tag(vec![Span::styled(running, bold(WARN))], BORDER));
     }
-    let header = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    frame.render_widget(header, area.inner(Margin::new(0, 0)));
+    if app.node_stale && app.node.is_some() {
+        block = block.title_top(tag(vec![Span::styled("stale", bold(WARN))], BORDER));
+    }
+    let inner = block.inner(area).inner(Margin::new(1, 0));
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let width = inner.width;
+    let rows = match &app.node {
+        Some(node) => vec![
+            cpu_row(&node.cpu),
+            capacity_row("MEM", &node.memory),
+            capacity_row("DISK", &node.disk),
+        ],
+        None => {
+            let detail = if app.sampling {
+                "sampling…"
+            } else {
+                "unavailable"
+            };
+            empty_rows(detail)
+        }
+    };
+    let lines = gauges(&rows, width);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn empty_rows(detail: &str) -> Vec<Gauge> {
+    ["CPU", "MEM", "DISK"]
+        .into_iter()
+        .map(|label| Gauge::new(label, None, detail))
+        .collect()
+}
+
+/// Live container use in level colours, other host load in grey, and a tick
+/// where the allocations end; the detail reads the same way.
+fn live_row(
+    label: &'static str,
+    managed: Option<f64>,
+    host: f64,
+    allocated: f64,
+    total: f64,
+    show: impl Fn(f64) -> String,
+) -> Gauge {
+    let share = |value: f64| (total > 0.0).then(|| value / total);
+    let used = managed.unwrap_or(host);
+    let mut detail = vec![Span::styled(
+        format!(
+            "{} {}",
+            if managed.is_some() { "dbev" } else { "host" },
+            show(used)
+        ),
+        bold(share(used).map_or(MUTED, theme::level_color)),
+    )];
+    if managed.is_some() {
+        detail.push(Span::styled(format!(" · host {}", show(host)), fg(LABEL)));
+    }
+    detail.extend([
+        Span::styled(format!(" · alloc {}", show(allocated)), fg(ACCENT)),
+        Span::styled(format!(" / {}", show(total)), fg(MUTED)),
+    ]);
+    Gauge {
+        label,
+        used: share(used),
+        other: managed.and(share(host)),
+        mark: share(allocated),
+        detail,
+    }
+}
+
+fn cpu_row(cpu: &super::api::NodeCpu) -> Gauge {
+    let total = cpu.total_cores as f64;
+    live_row(
+        "CPU",
+        cpu.managed_usage_cores,
+        cpu.host_usage_percent / 100.0 * total,
+        cpu.allocated_cores,
+        total,
+        |cores| format!("{cores:.1}c"),
+    )
+}
+
+fn capacity_row(label: &'static str, capacity: &super::api::NodeCapacity) -> Gauge {
+    let bytes = |value: u64| value as f64;
+    live_row(
+        label,
+        capacity.managed_used_bytes.map(bytes),
+        bytes(capacity.host_used_bytes),
+        bytes(capacity.allocated_bytes),
+        bytes(capacity.total_bytes),
+        |value| human_bytes(value as u64),
+    )
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -143,27 +206,25 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let line = if let Some(message) = &app.message {
         let (symbol, color) = match message.level {
-            Level::Info => ("›", Color::Gray),
-            Level::Success => ("✔", Color::Green),
-            Level::Error => ("✖", Color::Red),
+            Level::Info => ("›", LABEL),
+            Level::Success => ("✔", OK),
+            Level::Error => ("✖", ERROR),
         };
-        Line::from(Span::styled(
-            format!(" {symbol} {}", message.text),
-            Style::default().fg(color),
-        ))
+        Line::from(vec![
+            Span::styled(format!(" {symbol} "), bold(color)),
+            Span::styled(message.text.clone(), fg(color)),
+        ])
     } else if let Some(error) = &app.refresh_error {
-        Line::from(Span::styled(
-            format!(" ✖ refresh failed: {error}"),
-            Style::default().fg(Color::Red),
-        ))
+        Line::from(vec![
+            Span::styled(" ✖ ", bold(ERROR)),
+            Span::styled(format!("refresh failed: {error}"), fg(ERROR)),
+        ])
     } else if app.filtering || !app.filter.is_empty() {
         Line::from(vec![
-            Span::styled(" filter: ", Style::default().fg(ACCENT)),
-            Span::raw(app.filter.clone()),
-            Span::styled(
-                if app.filtering { "▏" } else { "" },
-                Style::default().fg(ACCENT),
-            ),
+            Span::styled(" / ", bold(ACCENT)),
+            Span::styled("filter ", fg(LABEL)),
+            Span::styled(app.filter.clone(), bold(TEXT)),
+            Span::styled(if app.filtering { "▏" } else { "" }, fg(ACCENT)),
         ])
     } else {
         Line::default()
@@ -191,63 +252,75 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("Esc", "back"),
         ],
     };
-    frame.render_widget(Paragraph::new(key_hints(hints)), keys);
+    frame.render_widget(
+        Paragraph::new(theme::key_hints_fit(hints, keys.width as usize)),
+        keys,
+    );
 }
 
-pub(super) fn key_hints(hints: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    for (key, label) in hints {
-        spans.push(Span::styled(
-            format!(" {key} "),
-            Style::default().fg(Color::Black).bg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}  "),
-            Style::default().fg(Color::Gray),
-        ));
-    }
-    Line::from(spans)
+fn table_header(cells: &[&'static str]) -> Row<'static> {
+    Row::new(cells.to_vec())
+        .style(bold(LABEL).add_modifier(Modifier::UNDERLINED))
+        .bottom_margin(1)
+}
+
+fn highlight_symbol() -> Text<'static> {
+    Text::from(Span::styled("▌", fg(ACCENT)))
 }
 
 fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let [list, details] =
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
     let visible = app.visible();
+    let medium = list.width >= 56;
+    let wide = list.width >= 84;
     let rows = visible.iter().map(|instance| {
-        Row::new(vec![
+        let mut cells = vec![
+            Cell::from(theme::status(&instance.status)),
+            Cell::from(Span::styled(instance.instance_id.clone(), fg(TEXT))),
             Cell::from(Span::styled(
-                format!("{} {}", status_symbol(&instance.status), instance.status),
-                status_style(&instance.status),
+                instance.protocol.as_str(),
+                fg(theme::engine_color(instance.protocol)),
             )),
-            Cell::from(instance.instance_id.clone()),
-            Cell::from(instance.protocol.as_str()),
-            Cell::from(instance.deployment_mode.clone()),
-            Cell::from(format!(
-                "{}:{}",
-                instance.public.host,
-                app.connect_port(instance.protocol, instance.public.port)
-            )),
-        ])
+        ];
+        if medium {
+            cells.push(Cell::from(Span::styled(
+                instance.deployment_mode.clone(),
+                fg(LABEL),
+            )));
+        }
+        if wide {
+            cells.push(Cell::from(Span::styled(
+                format!(
+                    "{}:{}",
+                    instance.public.host,
+                    app.connect_port(instance.protocol, instance.public.port)
+                ),
+                fg(LABEL),
+            )));
+        }
+        Row::new(cells)
     });
-    let title = format!("Instances ({}/{})", visible.len(), app.instances.len());
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(13),
-            Constraint::Fill(2),
-            Constraint::Length(10),
-            Constraint::Length(9),
-            Constraint::Fill(2),
-        ],
-    )
-    .header(
-        Row::new(["Status", "Instance", "Engine", "Mode", "Endpoint"])
-            .style(Style::default().fg(ACCENT).bold())
-            .bottom_margin(1),
-    )
-    .block(panel(&title))
-    .row_highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)).bold())
-    .highlight_symbol("▌ ");
+    let title = format!("instances {}/{}", visible.len(), app.instances.len());
+    let mut widths = vec![
+        Constraint::Length(12),
+        Constraint::Fill(2),
+        Constraint::Length(10),
+    ];
+    let mut header = vec!["Status", "Instance", "Engine"];
+    if medium {
+        widths.push(Constraint::Length(9));
+        header.push("Mode");
+    }
+    if wide {
+        widths.push(Constraint::Fill(2));
+        header.push("Endpoint");
+    }
+    let table = Table::new(rows, widths)
+        .header(table_header(&header))
+        .block(panel(&title))
+        .row_highlight_style(theme::selected())
+        .highlight_symbol(highlight_symbol());
     let mut state =
         TableState::default().with_selected((!visible.is_empty()).then_some(app.selected));
     frame.render_stateful_widget(table, list, &mut state);
@@ -262,36 +335,96 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(empty)
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(fg(MUTED)),
             list.inner(Margin::new(2, 4)),
         );
     }
     draw_details(frame, app, app.current(), details);
 }
 
+fn usage_lines(app: &App, instance: &Instance, width: u16) -> Vec<Line<'static>> {
+    let usage = app
+        .usage
+        .as_ref()
+        .filter(|(id, _)| *id == instance.instance_id)
+        .map(|(_, usage)| usage);
+    let Some(usage) = usage else {
+        let detail = if instance.status == "running" {
+            "sampling…"
+        } else {
+            "–"
+        };
+        return gauges(&empty_rows(detail), width);
+    };
+    let limits = &instance.limits;
+    let cores = usage.cpu.configured_cores.max(limits.cpu_cores);
+    let memory_limit = usage
+        .memory
+        .limit_bytes
+        .unwrap_or(usage.memory.configured_mib.saturating_mul(MIB));
+    let disk_limit = if usage.disk.limit_bytes > 0 {
+        usage.disk.limit_bytes
+    } else {
+        limits.disk_mib.saturating_mul(MIB)
+    };
+    let bytes = |used: Option<u64>, limit: u64| -> (Option<f64>, String) {
+        match used {
+            Some(used) => (
+                ratio(used, limit),
+                format!("{} / {}", human_bytes(used), human_bytes(limit)),
+            ),
+            None => (None, "–".to_string()),
+        }
+    };
+    let (memory_ratio, memory) = bytes(usage.memory.usage_bytes, memory_limit);
+    let (disk_ratio, disk) = bytes(usage.disk.used_bytes, disk_limit);
+    let cpu_ratio = usage
+        .cpu
+        .usage_percent
+        .filter(|_| cores > 0.0)
+        .map(|percent| percent / (cores * 100.0));
+    gauges(
+        &[
+            Gauge::new("CPU", cpu_ratio, format!("{cores} cores")),
+            Gauge::new("MEM", memory_ratio, memory),
+            Gauge::new("DISK", disk_ratio, disk),
+        ],
+        width,
+    )
+}
+
 fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area: Rect) {
     let Some(instance) = instance else {
-        frame.render_widget(panel("Details"), area);
+        frame.render_widget(panel("details"), area);
         return;
     };
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
-            Span::raw(value),
+            Span::styled(format!("{label:<12}"), fg(MUTED)),
+            Span::styled(value, fg(TEXT)),
         ])
     };
     let port = app.connect_port(instance.protocol, instance.public.port);
+    let block = panel("details");
+    let width = block.inner(area).width.saturating_sub(2);
     let mut lines = vec![
-        Line::from(Span::styled(
-            instance.instance_id.clone(),
-            Style::default().fg(Color::White).bold(),
-        )),
-        Line::from(Span::styled(
-            format!("{} {}", status_symbol(&instance.status), instance.status),
-            status_style(&instance.status),
-        )),
+        Line::from(vec![
+            Span::styled(instance.instance_id.clone(), bold(TEXT)),
+            Span::raw("  "),
+            theme::status(&instance.status),
+        ]),
         Line::default(),
-        field("Engine", instance.protocol.to_string()),
+    ];
+    lines.extend(usage_lines(app, instance, width));
+    lines.extend([
+        Line::default(),
+        Line::from(vec![
+            Span::styled(format!("{:<12}", "Engine"), fg(MUTED)),
+            Span::styled(
+                instance.protocol.to_string(),
+                bold(theme::engine_color(instance.protocol)),
+            ),
+        ]),
         field("Placement", instance.deployment_mode.clone()),
         field("Database", instance.database.name.clone()),
         field("Username", instance.database.username.clone()),
@@ -301,8 +434,8 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
             format!(
                 "{} CPU · {} RAM · {} disk{}",
                 instance.limits.cpu_cores,
-                human_bytes(instance.limits.memory_mib.saturating_mul(1024 * 1024)),
-                human_bytes(instance.limits.disk_mib.saturating_mul(1024 * 1024)),
+                human_bytes(instance.limits.memory_mib.saturating_mul(MIB)),
+                human_bytes(instance.limits.disk_mib.saturating_mul(MIB)),
                 if instance.limits.disk_enforced {
                     ""
                 } else {
@@ -310,14 +443,11 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
                 }
             ),
         ),
-    ];
+    ]);
     if port != instance.public.port {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{:12}created on :{}; the gateway now listens on :{port}",
-                "", instance.public.port
-            ),
-            Style::default().fg(Color::DarkGray),
+        lines.push(muted(format!(
+            "{:12}created on :{}; the gateway now listens on :{port}",
+            "", instance.public.port
         )));
     }
     if let Some(project) = &instance.project_id {
@@ -338,32 +468,32 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
             .unwrap_or_default();
         lines.push(field("Progress", format!("{}{percent}", progress.stage)));
         if !progress.message.is_empty() {
-            lines.push(Line::from(Span::styled(
-                progress.message.clone(),
-                Style::default().fg(Color::Yellow),
-            )));
+            lines.push(Line::from(Span::styled(progress.message.clone(), fg(WARN))));
         }
     }
     lines.extend([
         Line::default(),
-        Line::from(Span::styled("Connect", Style::default().fg(ACCENT).bold())),
-        Line::from(connection_string(
-            instance.protocol,
-            &instance.public.host,
-            port,
-            &instance.database.name,
-            &instance.database.username,
-            None,
+        theme::heading("Connect"),
+        Line::from(Span::styled(
+            connection_string(
+                instance.protocol,
+                &instance.public.host,
+                port,
+                &instance.database.name,
+                &instance.database.username,
+                None,
+            ),
+            fg(LABEL),
         )),
         Line::default(),
-        Line::from(Span::styled(
-            "Press p to reveal the password (root only).",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![
+            Span::styled("p", bold(ACCENT)),
+            Span::styled(" reveals the password (root only)", fg(MUTED)),
+        ]),
     ]);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel("Details"))
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -371,32 +501,51 @@ fn draw_details(frame: &mut Frame, app: &App, instance: Option<&Instance>, area:
 
 fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     let Some((id, lines)) = &app.logs else {
-        frame.render_widget(Paragraph::new("Loading logs…").block(panel("Logs")), area);
+        frame.render_widget(
+            Paragraph::new(muted("Loading logs…")).block(panel("logs")),
+            area,
+        );
         return;
     };
     let height = area.height.saturating_sub(2) as usize;
     let start = app.log_scroll.saturating_sub(height.saturating_sub(1));
     let text: Vec<Line> = lines
         .iter()
+        .enumerate()
         .skip(start)
         .take(height)
-        .map(|line| {
+        .map(|(index, line)| {
             let lower = line.to_ascii_lowercase();
-            let style = if lower.contains("error") || lower.contains("fatal") {
-                Style::default().fg(Color::Red)
+            let color = if lower.contains("error") || lower.contains("fatal") {
+                ERROR
             } else if lower.contains("warn") {
-                Style::default().fg(Color::Yellow)
+                WARN
+            } else if lower.contains("debug") || lower.contains("trace") {
+                MUTED
             } else {
-                Style::default()
+                Color::Reset
             };
-            Line::from(Span::styled(line.clone(), style))
+            Line::from(vec![
+                Span::styled(format!("{:>5} ", index + 1), fg(BORDER)),
+                Span::styled(line.clone(), fg(color)),
+            ])
         })
         .collect();
-    let title = format!("Logs · {id} · {} lines", lines.len());
-    frame.render_widget(Paragraph::new(text).block(panel(&title)), area);
+    let block = panel(&format!("logs · {id}")).title_bottom(
+        tag(
+            vec![Span::styled(format!("{} lines", lines.len()), fg(MUTED))],
+            BORDER,
+        )
+        .right_aligned(),
+    );
+    frame.render_widget(Paragraph::new(text).block(block), area);
     let mut scroll = ScrollbarState::new(lines.len()).position(app.log_scroll);
     frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(fg(ACCENT))
+            .track_style(fg(BORDER))
+            .begin_symbol(None)
+            .end_symbol(None),
         area.inner(Margin::new(0, 1)),
         &mut scroll,
     );
@@ -405,26 +554,27 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_backups(frame: &mut Frame, app: &App, area: Rect) {
     let Some((id, backups)) = &app.backups else {
         frame.render_widget(
-            Paragraph::new("Loading backups…").block(panel("Backups")),
+            Paragraph::new(muted("Loading backups…")).block(panel("backups")),
             area,
         );
         return;
     };
     let rows = backups.iter().map(|backup| {
         Row::new(vec![
-            Cell::from(backup.modified_at.clone()),
-            Cell::from(backup.layout.clone()),
+            Cell::from(Span::styled(backup.modified_at.clone(), fg(TEXT))),
+            Cell::from(Span::styled(backup.layout.clone(), fg(LABEL))),
+            Cell::from(match &backup.consistency {
+                Some(consistency) => Span::styled(consistency.clone(), fg(OK)),
+                None => Span::styled("—", fg(MUTED)),
+            }),
             Cell::from(
-                backup
-                    .consistency
-                    .clone()
-                    .unwrap_or_else(|| "—".to_string()),
+                Line::from(Span::styled(human_bytes(backup.size_bytes), bold(ACCENT)))
+                    .right_aligned(),
             ),
-            Cell::from(human_bytes(backup.size_bytes)),
-            Cell::from(backup.id.clone()),
+            Cell::from(Span::styled(backup.id.clone(), fg(MUTED))),
         ])
     });
-    let title = format!("Backups · {id} · {}", backups.len());
+    let title = format!("backups · {id} · {}", backups.len());
     let table = Table::new(
         rows,
         [
@@ -435,14 +585,17 @@ fn draw_backups(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Fill(1),
         ],
     )
-    .header(
-        Row::new(["Taken", "Layout", "Consistency", "Size", "Backup ID"])
-            .style(Style::default().fg(ACCENT).bold())
-            .bottom_margin(1),
-    )
+    .column_spacing(2)
+    .header(table_header(&[
+        "Taken",
+        "Layout",
+        "Consistency",
+        "      Size",
+        "Backup ID",
+    ]))
     .block(panel(&title))
-    .row_highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)).bold())
-    .highlight_symbol("▌ ");
+    .row_highlight_style(theme::selected())
+    .highlight_symbol(highlight_symbol());
     let mut state =
         TableState::default().with_selected((!backups.is_empty()).then_some(app.backup_selected));
     frame.render_stateful_widget(table, area, &mut state);
@@ -450,28 +603,17 @@ fn draw_backups(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new("No backups yet. Press n to take one.")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(fg(MUTED)),
             area.inner(Margin::new(2, 4)),
         );
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+pub(super) fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> Rect {
+    popup_framed(frame, title, width, height, ACCENT)
 }
 
-pub(super) fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> Rect {
+fn popup_framed(frame: &mut Frame, title: &str, width: u16, height: u16, color: Color) -> Rect {
     let area = frame.area();
     let width = width.min(area.width.saturating_sub(2));
     let height = height.min(area.height.saturating_sub(2));
@@ -482,7 +624,7 @@ pub(super) fn popup(frame: &mut Frame, title: &str, width: u16, height: u16) -> 
         height,
     };
     frame.render_widget(Clear, rect);
-    let block = panel(title).border_style(Style::default().fg(ACCENT));
+    let block = theme::framed(title, color);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner.inner(Margin::new(1, 0))
@@ -499,14 +641,14 @@ pub(super) fn input_line_with_cursor(
     cursor: bool,
 ) -> Line<'static> {
     let style = if focused {
-        Style::default().fg(Color::White).bg(Color::Rgb(40, 44, 52))
+        theme::selected().remove_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        fg(LABEL)
     };
     Line::from(vec![
         Span::styled(
             format!("{} {label:<13}", if focused { "›" } else { " " }),
-            Style::default().fg(if focused { ACCENT } else { Color::DarkGray }),
+            if focused { bold(ACCENT) } else { fg(MUTED) },
         ),
         Span::styled(format!(" {value}{} ", if cursor { "▏" } else { "" }), style),
     ])
@@ -514,7 +656,7 @@ pub(super) fn input_line_with_cursor(
 
 fn draw_create(frame: &mut Frame, form: &CreateForm) {
     let fields = form.visible();
-    let inner = popup(frame, "New instance", 76, fields.len() as u16 + 8);
+    let inner = popup(frame, "new instance", 82, fields.len() as u16 + 8);
     let focused = form.focused();
     let mut lines = vec![Line::default()];
     for field in &fields {
@@ -535,20 +677,14 @@ fn draw_create(frame: &mut Frame, form: &CreateForm) {
     lines.push(Line::default());
     let hint = form.hint(focused);
     if !hint.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {hint}"),
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(muted(format!("  {hint}")));
     }
     if let Some(error) = &form.error {
-        lines.push(Line::from(Span::styled(
-            format!("  ✖ {error}"),
-            Style::default().fg(Color::Red),
-        )));
+        lines.push(Line::from(Span::styled(format!("  ✖ {error}"), fg(ERROR))));
     } else if focused == Field::Password {
         lines.push(Line::from(Span::styled(
             "  Save this password now; the API never returns it.",
-            Style::default().fg(Color::Yellow),
+            fg(WARN),
         )));
     }
     lines.push(Line::default());
@@ -563,11 +699,11 @@ fn draw_create(frame: &mut Frame, form: &CreateForm) {
 }
 
 fn draw_confirm_delete(frame: &mut Frame, id: &str, typed: &str, reason: &str, on_reason: bool) {
-    let inner = popup(frame, "Delete instance", 70, 12);
+    let inner = popup_framed(frame, "delete instance", 70, 12, ERROR);
     let lines = vec![
         Line::from(Span::styled(
             format!("Permanently delete {id}?"),
-            Style::default().fg(Color::Red).bold(),
+            bold(ERROR),
         )),
         Line::from("Its data, backups, jobs and exports are removed. This cannot be undone."),
         Line::default(),
@@ -575,15 +711,9 @@ fn draw_confirm_delete(frame: &mut Frame, id: &str, typed: &str, reason: &str, o
         input_line("Reason", reason, on_reason),
         Line::default(),
         if typed == id && !reason.trim().is_empty() {
-            Line::from(Span::styled(
-                "Press Enter to delete.",
-                Style::default().fg(Color::Red),
-            ))
+            Line::from(Span::styled("Press Enter to delete.", bold(ERROR)))
         } else {
-            Line::from(Span::styled(
-                "Type the instance ID and an audit reason.",
-                Style::default().fg(Color::DarkGray),
-            ))
+            muted("Type the instance ID and an audit reason.")
         },
         Line::default(),
         key_hints(&[
@@ -596,41 +726,44 @@ fn draw_confirm_delete(frame: &mut Frame, id: &str, typed: &str, reason: &str, o
 }
 
 fn draw_confirm_power(frame: &mut Frame, id: &str, action: PowerAction) {
-    let inner = popup(frame, "Confirm", 56, 7);
+    let inner = popup_framed(frame, "confirm", 56, 7, WARN);
     let lines = vec![
-        Line::from(format!("{} {id}?", capitalize(action.as_str()))),
-        Line::from(Span::styled(
-            "Clients are disconnected while it is down.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(vec![
+            Span::styled(capitalize(action.as_str()), bold(WARN)),
+            Span::styled(format!(" {id}?"), fg(TEXT)),
+        ]),
+        muted("Clients are disconnected while it is down."),
         Line::default(),
         key_hints(&[("y", "yes"), ("any key", "cancel")]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+pub(super) fn option(selected: bool, title: &str, detail: &str, width: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {} {title:<width$}", if selected { "●" } else { "○" }),
+            if selected { bold(ACCENT) } else { fg(LABEL) },
+        ),
+        Span::styled(detail.to_string(), fg(MUTED)),
+    ])
+}
+
 fn draw_backup_mode(frame: &mut Frame, id: &str, online: bool) {
-    let inner = popup(frame, "New backup", 64, 10);
-    let option = |selected: bool, title: &str, detail: &str| {
-        Line::from(vec![
-            Span::styled(
-                format!(" {} {title:<9}", if selected { "●" } else { "○" }),
-                Style::default()
-                    .fg(if selected { ACCENT } else { Color::Gray })
-                    .bold(),
-            ),
-            Span::styled(detail.to_string(), Style::default().fg(Color::DarkGray)),
-        ])
-    };
+    let inner = popup(frame, "new backup", 72, 10);
     let lines = vec![
-        Line::from(format!("Back up {id}")),
+        Line::from(vec![
+            Span::styled("Back up ", fg(LABEL)),
+            Span::styled(id.to_string(), bold(TEXT)),
+        ]),
         Line::default(),
         option(
             online,
             "Online",
             "keeps serving; fails if the engine has no strategy",
+            9,
         ),
-        option(!online, "Offline", "stops the database for a cold copy"),
+        option(!online, "Offline", "stops the database for a cold copy", 9),
         Line::default(),
         key_hints(&[("←→", "choose"), ("Enter", "start"), ("Esc", "cancel")]),
     ];
@@ -638,11 +771,11 @@ fn draw_backup_mode(frame: &mut Frame, id: &str, online: bool) {
 }
 
 fn draw_confirm_restore(frame: &mut Frame, id: &str, backup: &str, reason: &str) {
-    let inner = popup(frame, "Restore backup", 72, 10);
+    let inner = popup_framed(frame, "restore backup", 72, 10, ERROR);
     let lines = vec![
         Line::from(Span::styled(
             format!("Replace the data of {id} with {backup}?"),
-            Style::default().fg(Color::Red).bold(),
+            bold(ERROR),
         )),
         Line::from("The instance is stopped and its current data is replaced."),
         Line::default(),
@@ -655,28 +788,18 @@ fn draw_confirm_restore(frame: &mut Frame, id: &str, backup: &str, reason: &str)
 
 fn draw_reveal(frame: &mut Frame, app: &App, revealed: &Revealed) {
     let height = if revealed.admin.is_some() { 14 } else { 12 };
-    let inner = popup(frame, "Credentials", 86, height);
+    let inner = popup_framed(frame, "credentials", 86, height, WARN);
     let remaining = REVEAL_TTL
         .saturating_sub(revealed.shown_at.elapsed())
         .as_secs();
     let field = |label: &str, value: String, secret: bool| {
         Line::from(vec![
-            Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                value,
-                if secret {
-                    Style::default().fg(Color::Yellow).bold()
-                } else {
-                    Style::default()
-                },
-            ),
+            Span::styled(format!("{label:<12}"), fg(MUTED)),
+            Span::styled(value, if secret { bold(WARN) } else { fg(TEXT) }),
         ])
     };
     let mut lines = vec![
-        Line::from(Span::styled(
-            revealed.instance_id.clone(),
-            Style::default().bold(),
-        )),
+        Line::from(Span::styled(revealed.instance_id.clone(), bold(TEXT))),
         Line::default(),
         field(
             "Host",
@@ -700,25 +823,25 @@ fn draw_reveal(frame: &mut Frame, app: &App, revealed: &Revealed) {
     }
     lines.extend([
         Line::default(),
-        Line::from(connection_string(
-            revealed.protocol,
-            &revealed.host,
-            app.connect_port(revealed.protocol, revealed.port),
-            &revealed.database,
-            &revealed.username,
-            Some(&revealed.password),
+        Line::from(Span::styled(
+            connection_string(
+                revealed.protocol,
+                &revealed.host,
+                app.connect_port(revealed.protocol, revealed.port),
+                &revealed.database,
+                &revealed.username,
+                Some(&revealed.password),
+            ),
+            fg(LABEL),
         )),
         Line::default(),
-        Line::from(Span::styled(
-            format!("Hidden again in {remaining}s · any key closes"),
-            Style::default().fg(Color::DarkGray),
-        )),
+        muted(format!("Hidden again in {remaining}s · any key closes")),
     ]);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn draw_help(frame: &mut Frame) {
-    let inner = popup(frame, "Keys", 64, 22);
+    let inner = popup(frame, "keys", 64, 22);
     let rows: &[(&str, &str)] = &[
         ("↑/↓ j/k", "move selection"),
         ("PgUp/PgDn g/G", "page / first / last"),
@@ -738,15 +861,14 @@ fn draw_help(frame: &mut Frame) {
     let mut text = Text::default();
     for (key, action) in rows {
         text.lines.push(Line::from(vec![
-            Span::styled(format!("{key:<16}"), Style::default().fg(ACCENT).bold()),
-            Span::raw(*action),
+            Span::styled(format!("{key:<16}"), bold(ACCENT)),
+            Span::styled(*action, fg(TEXT)),
         ]));
     }
     text.lines.push(Line::default());
-    text.lines.push(Line::from(Span::styled(
+    text.lines.push(muted(
         "Instances created here are tagged project_id = dbev-cli; the panel does not know about them.",
-        Style::default().fg(Color::DarkGray),
-    )));
+    ));
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
@@ -777,12 +899,5 @@ mod tests {
                 terminal.draw(|frame| draw(frame, &app)).unwrap();
             }
         }
-    }
-
-    #[test]
-    fn sizes_are_human_readable() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(10 * 1024 * 1024 * 1024), "10.0 GiB");
     }
 }
