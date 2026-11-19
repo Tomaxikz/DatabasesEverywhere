@@ -30,7 +30,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout
+      - &checkout
+        name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -43,7 +44,7 @@ jobs:
           pyflakes: false
 
       - name: Lint shell scripts
-        run: shellcheck .github/ci/check.sh .github/ci/check-source-size.sh .github/ci/podman-smoke.sh .github/ci/build-release-target.sh .github/ci/mysql-driver-matrix.sh .github/ci/shared-pool-isolation.sh .github/ci/project-quota-smoke.sh .github/ci/online-backup-e2e.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
+        run: shellcheck .github/ci/*.sh tests/real_drivers/mysql/run.sh .githooks/pre-push
 
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
@@ -72,7 +73,8 @@ jobs:
           tool: cargo-machete@0.9.2
           fallback: none
 
-      - name: Cache Rust builds
+      - &cache-debug-builds
+        name: Cache Rust builds
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: dbev-debug
@@ -87,12 +89,10 @@ jobs:
     timeout-minutes: 10
     needs: global_lint
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
+      - &install-rust
+        name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.99.0
@@ -112,10 +112,7 @@ jobs:
     timeout-minutes: 30
     needs: global_lint
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -201,21 +198,11 @@ jobs:
             image: mariadb:12.3
             connector: 26.7.0
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Select hosted Java 21 and verify client toolchains
         run: |
@@ -256,21 +243,11 @@ jobs:
     timeout-minutes: 15
     needs: global_lint
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Prepare the hosted rootless Podman runtime
         run: |
@@ -299,21 +276,11 @@ jobs:
     timeout-minutes: 10
     needs: global_lint
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Build documentation
         env:
@@ -337,10 +304,7 @@ jobs:
           - rust
           - actions
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
       - name: Install Rust
         if: matrix.language == 'rust'
@@ -380,10 +344,7 @@ jobs:
             rust_target: riscv64gc-unknown-linux-gnu
             rust_targets: riscv64gc-unknown-linux-gnu,riscv64gc-unknown-linux-musl
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
       - name: Build and verify binary
         uses: ./.github/actions/build-binary
@@ -410,21 +371,11 @@ jobs:
           - mongodb
           - clickhouse
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Verify hosted Docker
         run: docker info >/dev/null
@@ -445,21 +396,11 @@ jobs:
     needs: global_lint
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Install project-quota tools
         run: |
@@ -489,21 +430,11 @@ jobs:
           - mysql
           - mariadb
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      - *checkout
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          toolchain: 1.99.0
+      - *install-rust
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: dbev-debug
-          cache-on-failure: false
+      - *cache-debug-builds
 
       - name: Install project-quota tools
         run: |
