@@ -251,7 +251,7 @@ pub(super) async fn acquire_upload_staging(
     let root = logical_staging_root(state).await?;
     state
         .import_uploads
-        .acquire_staging(&root, requested.max(1))
+        .acquire_staging_on_existing_root(&root, requested.max(1))
         .await
         .map(Some)
 }
@@ -266,7 +266,7 @@ async fn acquire_validated_upload_staging(
             let root = logical_staging_root(state).await?;
             state
                 .import_uploads
-                .acquire_staging(&root, budget.reservation_bytes)
+                .acquire_staging_on_existing_root(&root, budget.reservation_bytes)
                 .await
                 .map(Some)
         }

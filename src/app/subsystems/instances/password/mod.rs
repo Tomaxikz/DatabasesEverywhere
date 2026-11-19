@@ -586,16 +586,14 @@ async fn reset_password(
 ) -> Result<(), ApiError> {
     if metadata.protocol.engine().family().is_resp() {
         write_resp_acl(
+            state,
             metadata.protocol,
+            paths,
             credential_data_path,
             &metadata.database.username,
             new_password,
         )
         .await?;
-        paths
-            .restore_data_owner()
-            .await
-            .map_err(ApiError::runtime)?;
     }
 
     let no_progress = |_event| {};

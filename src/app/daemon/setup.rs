@@ -12,7 +12,7 @@ use crate::{
     daemon::runtime_paths::{
         log_disk_mode, prepare_rootless_paths, prepare_runtime_dirs, validate_runtime_support,
     },
-    runtime::docker::DockerRuntime,
+    runtime::docker::{DockerRuntime, rootless_preflight},
     utils::constants::defaults,
 };
 
@@ -30,14 +30,20 @@ pub(crate) async fn setup_system(config_path: PathBuf) -> anyhow::Result<()> {
     require_existing_config(&config_path)?;
     let mut config = load_config(&config_path)?;
     check_setup_commands(&config.daemon)?;
-    install_current_binary(Path::new(INSTALL_PATH))?;
+    preflight_rootless_podman(&config.daemon)?;
+    // The config is verified and locked down before anything acts on the
+    // account or socket it names. Socket preparation then runs before any
+    // runtime directory is re-secured: it can stop setup and ask for a
+    // maintenance window, and a running daemon must keep its rootless
+    // traversal grants while that is pending.
     secure_config_file(&config_path)?;
+    prepare_podman_socket(&config.daemon)?;
+    install_current_binary(Path::new(INSTALL_PATH))?;
     prepare_system_dirs(&config).await?;
     configure_overcommit()?;
     log_disk_mode(&mut config)?;
     configure_fuse_host(&config)?;
     remove_old_sudoers()?;
-    prepare_podman_socket(&config.daemon)?;
     validate_runtime_support(&config).await?;
     check_container_engine(&config).await?;
     write_systemd_service(&config_path, &config.daemon)?;
@@ -145,9 +151,180 @@ fn rootless_podman_uid(config: &crate::config::DaemonConfig) -> Option<u32> {
 }
 
 fn uses_rootful_podman_socket(config: &crate::config::DaemonConfig) -> bool {
-    config
-        .configured_socket_path()
-        .is_none_or(|socket| socket == ROOTFUL_PODMAN_SOCKET)
+    config.configured_socket_path().is_none_or(|socket| {
+        socket == ROOTFUL_PODMAN_SOCKET || socket == "/var/run/podman/podman.sock"
+    })
+}
+
+fn preflight_rootless_podman(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
+    let Some(uid) = rootless_podman_uid(config) else {
+        return Ok(());
+    };
+    let username = username_for_uid(uid)?;
+    for helper in ["newuidmap", "newgidmap"] {
+        if !command_exists(helper)? {
+            anyhow::bail!(
+                "rootless Podman needs {helper} on PATH; install the package that provides it (usually uidmap or shadow-utils)"
+            );
+        }
+    }
+    match rootless_preflight::subordinate_status(Some(&username), uid) {
+        rootless_preflight::SubordinateStatus::Sufficient => {}
+        rootless_preflight::SubordinateStatus::Insufficient { subuid, subgid }
+            if rootless_preflight::uses_nss_subid_provider() =>
+        {
+            println!(
+                "warning: {username} has {subuid} subordinate UIDs and {subgid} subordinate GIDs in /etc/subuid and /etc/subgid; /etc/nsswitch.conf names another subid provider, so the ranges were not verified"
+            );
+        }
+        rootless_preflight::SubordinateStatus::Insufficient { subuid, subgid } => {
+            anyhow::bail!("{}", subordinate_range_remedy(&username, subuid, subgid));
+        }
+        rootless_preflight::SubordinateStatus::Unknown(reason) => {
+            println!("warning: could not verify subordinate ID ranges for {username}: {reason}");
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn subordinate_range_remedy(username: &str, subuid: u64, subgid: u64) -> String {
+    format!(
+        "rootless Podman account {username} has {subuid} subordinate UIDs and {subgid} subordinate GIDs in /etc/subuid and /etc/subgid, but needs at least {required} of each. Pick a range that does not overlap any existing entry in those files and add it with `usermod --add-subuids START-END --add-subgids START-END {username}`, then run `podman system migrate` as {username}",
+        required = rootless_preflight::REQUIRED_SUBORDINATE_IDS
+    )
+}
+
+pub(super) fn delegation_drop_in_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/etc/systemd/system/user@{uid}.service.d/dbev-delegate.conf"
+    ))
+}
+
+/// Installs a drop-in for this one account's user manager. An existing file
+/// is kept as it is, provided only root can have written it.
+fn install_delegation_drop_in(uid: u32) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = delegation_drop_in_path(uid);
+    let directory = path
+        .parent()
+        .context("cgroup delegation drop-in has no parent directory")?;
+    for ancestor in ["/etc", "/etc/systemd", "/etc/systemd/system"] {
+        validate_setup_parent(Path::new(ancestor), "systemd")?;
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            validate_setup_parent(directory, "cgroup delegation drop-in")?;
+            validate_replace_target(&path, "cgroup delegation drop-in")?;
+            if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+                anyhow::bail!(
+                    "cgroup delegation drop-in {} must be owned by root and not writable by group or others",
+                    path.display()
+                );
+            }
+            return Ok(path);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect cgroup delegation drop-in"),
+    }
+    match fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("failed to create cgroup delegation directory"),
+    }
+    validate_setup_parent(directory, "cgroup delegation drop-in")?;
+    replace_setup_file(&path, 0o644, "cgroup delegation drop-in", |file| {
+        file.write_all(b"[Service]\nDelegate=cpu memory pids\n")
+    })?;
+    println!("installed cgroup delegation drop-in: {}", path.display());
+    Ok(path)
+}
+
+/// What `systemctl is-active` says about the account's user manager.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UserManagerState {
+    /// Positively inactive: setup may configure it and start it.
+    Inactive,
+    /// Running: setup verifies it in place and never starts or restarts it.
+    Active,
+    /// Failed, starting, stopping or unknown: setup leaves it alone, since
+    /// starting it could override an operator's stop.
+    Unsettled(String),
+}
+
+pub(super) fn user_manager_state(is_active_output: &str) -> UserManagerState {
+    match is_active_output.trim() {
+        "inactive" => UserManagerState::Inactive,
+        "active" => UserManagerState::Active,
+        "" => UserManagerState::Unsettled("unknown".to_string()),
+        other => UserManagerState::Unsettled(other.to_string()),
+    }
+}
+
+fn query_user_manager_state(user_unit: &str) -> UserManagerState {
+    match StdCommand::new("systemctl")
+        .args(["is-active", user_unit])
+        .output()
+    {
+        Ok(output) => user_manager_state(&String::from_utf8_lossy(&output.stdout)),
+        Err(error) => UserManagerState::Unsettled(format!("unknown ({error})")),
+    }
+}
+
+fn managed_delegation_status(uid: u32, user_unit: &str) -> rootless_preflight::ControllerStatus {
+    use std::os::unix::fs::MetadataExt;
+
+    let output = StdCommand::new("systemctl")
+        .args([
+            "show",
+            user_unit,
+            "--property=ControlGroup",
+            "--property=Delegate",
+            "--property=DelegateControllers",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => rootless_preflight::managed_controller_status(
+            &String::from_utf8_lossy(&output.stdout),
+            uid,
+            |path| fs::read_to_string(path),
+            |path| fs::symlink_metadata(path).map(|metadata| metadata.uid()),
+        ),
+        Ok(output) => rootless_preflight::ControllerStatus::Unknown(format!(
+            "systemctl show {user_unit} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => rootless_preflight::ControllerStatus::Unknown(format!(
+            "failed to run systemctl show {user_unit}: {error}"
+        )),
+    }
+}
+
+/// Setup never restarts a user manager: that would stop the account's user
+/// services and containers. It verifies delegation and otherwise stops with
+/// what the operator has to do.
+fn verify_controller_delegation(uid: u32, user_unit: &str) -> anyhow::Result<()> {
+    match managed_delegation_status(uid, user_unit) {
+        rootless_preflight::ControllerStatus::Delegated => Ok(()),
+        rootless_preflight::ControllerStatus::Missing(missing) => {
+            let path = install_delegation_drop_in(uid)?;
+            run_setup_command("systemctl", &["daemon-reload"])?;
+            anyhow::bail!(
+                "{}",
+                delegation_restart_guidance(user_unit, &missing.join(", "), &path)
+            )
+        }
+        rootless_preflight::ControllerStatus::Unknown(reason) => anyhow::bail!(
+            "could not verify that {user_unit} delegates the cpu, memory and pids cgroup controllers ({reason}); rootless Podman needs them to enforce instance limits"
+        ),
+    }
+}
+
+pub(super) fn delegation_restart_guidance(user_unit: &str, missing: &str, path: &Path) -> String {
+    format!(
+        "{user_unit} lacks {missing}. {} is in place and applies when that user manager next starts. Restarting it stops the account's user services and running containers, so do it in a maintenance window with `systemctl restart {user_unit}`, then run dbev --setup again. If the controllers are still missing after that, a parent cgroup such as user.slice does not enable them",
+        path.display()
+    )
 }
 
 fn prepare_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result<()> {
@@ -166,9 +343,22 @@ fn prepare_podman_socket(config: &crate::config::DaemonConfig) -> anyhow::Result
         return Ok(());
     };
     let username = username_for_uid(uid)?;
-    run_setup_command("loginctl", &["enable-linger", &username])?;
     let user_unit = format!("user@{uid}.service");
-    run_setup_command("systemctl", &["start", &user_unit])?;
+    match query_user_manager_state(&user_unit) {
+        UserManagerState::Inactive => {
+            // Configured before its first start, so the drop-in applies
+            // without any restart.
+            install_delegation_drop_in(uid)?;
+            run_setup_command("systemctl", &["daemon-reload"])?;
+            run_setup_command("systemctl", &["start", &user_unit])?;
+        }
+        UserManagerState::Active => {}
+        UserManagerState::Unsettled(state) => anyhow::bail!(
+            "{user_unit} is {state}; setup only starts a user manager that is inactive and only verifies one that is active. Wait for it to settle or repair it, then run dbev --setup again"
+        ),
+    }
+    verify_controller_delegation(uid, &user_unit)?;
+    run_setup_command("loginctl", &["enable-linger", &username])?;
     let runtime = format!("XDG_RUNTIME_DIR=/run/user/{uid}");
     let bus = format!("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus");
     run_setup_command(

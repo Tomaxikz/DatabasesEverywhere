@@ -452,12 +452,14 @@ async fn rollback_in_place_password_reset(
         let acl = context.previous.acl.as_deref().ok_or_else(|| {
             ApiError::Runtime("previous RESP ACL was not captured for rollback".to_string())
         })?;
-        restore_resp_acl(context.metadata.protocol, context.credential_data_path, acl).await?;
-        context
-            .paths
-            .restore_data_owner()
-            .await
-            .map_err(ApiError::runtime)?;
+        restore_resp_acl(
+            context.state,
+            context.metadata.protocol,
+            context.paths,
+            context.credential_data_path,
+            acl,
+        )
+        .await?;
         let previous_password = context.previous.environment.as_ref().ok_or_else(|| {
             ApiError::Runtime("previous RESP credential was not captured for rollback".to_string())
         })?;
@@ -637,11 +639,7 @@ async fn rollback_password_reset(
         let acl = previous.acl.as_deref().ok_or_else(|| {
             ApiError::Runtime("previous RESP ACL was not captured for rollback".to_string())
         })?;
-        restore_resp_acl(metadata.protocol, credential_data_path, acl).await?;
-        paths
-            .restore_data_owner()
-            .await
-            .map_err(ApiError::runtime)?;
+        restore_resp_acl(state, metadata.protocol, paths, credential_data_path, acl).await?;
     }
 
     let no_progress = |_event| {};

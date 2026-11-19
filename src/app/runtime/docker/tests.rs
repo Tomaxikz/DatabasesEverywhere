@@ -509,3 +509,40 @@ fn postgres_spec() -> DockerInstanceSpec {
         command: Vec::new(),
     }
 }
+
+#[test]
+fn a_missing_podman_socket_is_reported_with_the_unit_that_provides_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let expect_unit = |socket_path: String, unit: &str| {
+        let config = crate::config::DaemonConfig {
+            engine: crate::config::DaemonEngine::Podman,
+            socket_path: socket_path.clone(),
+            ..Default::default()
+        };
+        match DockerRuntime::new(&config, false) {
+            Err(DockerError::PodmanSocketMissing { path, unit: named }) => {
+                assert_eq!(path, socket_path);
+                assert!(named.contains(unit), "{named}");
+            }
+            other => panic!("expected a missing-socket error, got {:?}", other.err()),
+        }
+    };
+    expect_unit(
+        directory.path().join("podman.sock").display().to_string(),
+        "externally managed",
+    );
+    expect_unit(
+        "/run/user/4294967294/podman/podman.sock".to_string(),
+        "user manager for uid 4294967294",
+    );
+
+    // Docker keeps bollard's own error for a missing socket.
+    let docker = crate::config::DaemonConfig {
+        socket_path: directory.path().join("docker.sock").display().to_string(),
+        ..Default::default()
+    };
+    assert!(!matches!(
+        DockerRuntime::new(&docker, false),
+        Err(DockerError::PodmanSocketMissing { .. })
+    ));
+}

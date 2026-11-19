@@ -23,7 +23,7 @@ use crate::{
     },
     routes::http::{response::ApiError, router::AppState},
     runtime::docker::{DockerError, ExecRecovery},
-    server::metadata::InstanceMetadata,
+    server::{metadata::InstanceMetadata, paths::InstancePaths},
     subsystems::instances::docker_error,
     utils::shell::sh_quote,
 };
@@ -39,17 +39,14 @@ pub(super) async fn reset_password_in_place(
 ) -> Result<(), ApiError> {
     if context.metadata.protocol.engine().family().is_resp() {
         write_resp_acl(
+            context.state,
             context.metadata.protocol,
+            context.paths,
             context.credential_data_path,
             &context.metadata.database.username,
             context.new_password,
         )
         .await?;
-        context
-            .paths
-            .restore_data_owner()
-            .await
-            .map_err(ApiError::runtime)?;
         activate_resp_acl(
             context.state,
             context.metadata,
@@ -242,7 +239,9 @@ pub(super) async fn verify_tenant_credential(
 }
 
 pub(super) async fn write_resp_acl(
+    state: &AppState,
     protocol: Protocol,
+    paths: &InstancePaths,
     data_path: &std::path::Path,
     username: &str,
     password: &SecretString,
@@ -254,11 +253,14 @@ pub(super) async fn write_resp_acl(
     }
     databases::resp::write_acl_file(data_path, username, password)
         .await
-        .map_err(ApiError::runtime)
+        .map_err(ApiError::runtime)?;
+    crate::subsystems::import_export::restore_instance_data_owner(state, paths).await
 }
 
 pub(super) async fn restore_resp_acl(
+    state: &AppState,
     protocol: Protocol,
+    paths: &InstancePaths,
     data_path: &std::path::Path,
     acl: &[u8],
 ) -> Result<(), ApiError> {
@@ -269,7 +271,8 @@ pub(super) async fn restore_resp_acl(
     }
     databases::resp::restore_acl_file(data_path, acl)
         .await
-        .map_err(ApiError::runtime)
+        .map_err(ApiError::runtime)?;
+    crate::subsystems::import_export::restore_instance_data_owner(state, paths).await
 }
 
 pub(super) async fn capture_maintenance_credential(

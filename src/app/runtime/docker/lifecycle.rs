@@ -1,3 +1,4 @@
+use super::CONTAINER_STOP_TIMEOUT_SECONDS;
 use crate::{
     config::DaemonEngine,
     databases::protocol::Protocol,
@@ -13,11 +14,27 @@ use crate::{
 use bollard::{
     models::ContainerSummary,
     query_parameters::{
-        KillContainerOptions, ListContainersOptionsBuilder, StartContainerOptions,
-        StopContainerOptions,
+        KillContainerOptions, ListContainersOptionsBuilder, RestartContainerOptions,
+        StartContainerOptions, StopContainerOptions,
     },
 };
 use std::time::Duration;
+
+/// Grace period for `restart`. Create stores the same number as `StopTimeout`.
+/// Ordinary stop omits `t`, and both engines then use that stored value. Podman
+/// treats an omitted restart `t` as zero and sends SIGKILL immediately.
+pub(super) fn restart_container_options() -> RestartContainerOptions {
+    RestartContainerOptions {
+        signal: None,
+        t: Some(managed_container_stop_seconds()),
+    }
+}
+
+pub(super) fn managed_container_stop_seconds() -> i32 {
+    i32::try_from(CONTAINER_STOP_TIMEOUT_SECONDS)
+        .unwrap_or(i32::MAX)
+        .max(1)
+}
 
 impl DockerRuntime {
     pub async fn start(
@@ -92,7 +109,9 @@ impl DockerRuntime {
             .await?;
         self.disable_restarts(protocol, instance_id).await?;
         self.note_start(instance_id, false).await?;
-        self.docker.restart_container(&name, None).await?;
+        self.docker
+            .restart_container(&name, Some(restart_container_options()))
+            .await?;
         self.enforce_cpu_burst_policy(protocol, instance_id).await;
         Ok(CommandOutput::empty())
     }
@@ -202,5 +221,25 @@ impl DockerRuntime {
             .into_iter()
             .filter(|container| is_owned_managed_container(container.labels.as_ref(), node_id))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_uses_the_stop_timeout_stored_at_create() {
+        let options = restart_container_options();
+
+        assert_eq!(options.signal, None);
+        assert_eq!(
+            options.t,
+            Some(
+                i32::try_from(CONTAINER_STOP_TIMEOUT_SECONDS)
+                    .expect("stop timeout fits in the restart query")
+            )
+        );
+        assert!(options.t.is_some_and(|seconds| seconds >= 1));
     }
 }

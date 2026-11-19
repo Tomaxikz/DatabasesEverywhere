@@ -14,6 +14,7 @@ mod lifecycle;
 mod mounts;
 mod podman_api;
 mod remote_import;
+pub(crate) mod rootless_preflight;
 mod security;
 mod spec;
 mod startup;
@@ -122,6 +123,13 @@ pub struct DockerImagePullProgress {
 impl DockerRuntime {
     pub fn new(config: &DaemonConfig, enforce_disk_limits: bool) -> Result<Self, DockerError> {
         let connection = DaemonEngineConnection::from_config(config);
+        if let Some(error) = connection
+            .socket_path
+            .as_deref()
+            .and_then(|path| missing_podman_socket(connection.engine, path))
+        {
+            return Err(error);
+        }
         Ok(Self::from_client(
             connection.connect()?,
             connection.engine,
@@ -227,6 +235,9 @@ impl DockerRuntime {
     }
 
     pub async fn refresh_engine_info(&mut self) -> Result<(), DockerError> {
+        if let Some(error) = missing_podman_socket(self.engine, &self.socket_path) {
+            return Err(error);
+        }
         let negotiated = self.docker.clone().negotiate_version().await?;
         let (version, info) = tokio::try_join!(negotiated.version(), negotiated.info())?;
         let reports_podman = engine::reports_podman(&version);
@@ -252,6 +263,13 @@ impl DockerRuntime {
                     detected: detected.to_string(),
                     minimum: engine::MINIMUM_PODMAN_VERSION,
                 });
+            }
+            if !engine::is_recommended_podman_version(detected) {
+                tracing::warn!(
+                    version = detected,
+                    recommended = engine::RECOMMENDED_PODMAN_VERSION,
+                    "older Podman may not persist live CPU and memory updates across container restarts and may lack the legacy restart-policy repair route"
+                );
             }
         }
         self.docker = negotiated;
@@ -288,6 +306,9 @@ impl DockerRuntime {
         if self.rootless_podman && info.cgroup_version != Some(SystemInfoCgroupVersionEnum::_2) {
             return Err(DockerError::RootlessPodmanRequiresCgroupV2);
         }
+        if self.rootless_podman {
+            rootless_preflight::log_startup_advisories(socket_owner.uid);
+        }
         Ok(())
     }
 
@@ -317,3 +338,29 @@ mod tests;
 
 #[cfg(test)]
 mod podman_live_tests;
+
+/// A Podman socket that is confirmed absent, with the unit that provides it.
+/// An inspection error is left for the connection attempt to report.
+fn missing_podman_socket(engine: DaemonEngine, socket_path: &str) -> Option<DockerError> {
+    if engine != DaemonEngine::Podman
+        || !matches!(std::fs::symlink_metadata(socket_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    let unit = if let Some(uid) = rootless_uid_from_socket(socket_path) {
+        format!(
+            "podman.socket in the user manager for uid {uid} (systemctl --user enable --now podman.socket as that account)"
+        )
+    } else if matches!(
+        socket_path,
+        "/run/podman/podman.sock" | "/var/run/podman/podman.sock"
+    ) {
+        "the system podman.socket (systemctl enable --now podman.socket)".to_string()
+    } else {
+        "the service that provides this externally managed socket".to_string()
+    };
+    Some(DockerError::PodmanSocketMissing {
+        path: socket_path.to_string(),
+        unit,
+    })
+}

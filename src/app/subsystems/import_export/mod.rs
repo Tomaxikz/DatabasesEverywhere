@@ -429,7 +429,7 @@ pub use jobs::{export_instance, get_import_export_job, list_import_export_jobs};
 pub(crate) use logical::quarantine_uncertain_import;
 pub(crate) use physical::{
     StagedDataPreparation, check_restore_layout, finish_physical_change, restore_bounded_archive,
-    restore_prepared_archive, rollback_from_archive,
+    restore_instance_data_owner, restore_prepared_archive, rollback_from_archive,
 };
 pub(crate) use upload_recovery::{reconcile_import_uploads, run_upload_sweeper};
 pub(crate) use uploads::ImportUploadService;

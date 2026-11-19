@@ -13,7 +13,7 @@ pub enum DockerError {
     RestartPolicyNotDisabled(String),
     #[error(transparent)]
     InvalidId(#[from] crate::utils::ids::IdError),
-    #[error("docker api error: {0}")]
+    #[error("container engine api error: {0}")]
     Api(#[from] BollardError),
     #[error("podman api {operation} request failed: {reason}")]
     PodmanApiRequest {
@@ -51,15 +51,15 @@ pub enum DockerError {
         detected: String,
         minimum: &'static str,
     },
-    #[error("docker security policy rejected spec: {0}")]
+    #[error("container security policy rejected spec: {0}")]
     Security(#[from] security::DockerSecurityError),
     #[error("invalid container resource limits: {0}")]
     ResourceLimit(#[from] ResourceLimitError),
-    #[error("cpu limit {cpu_cores} cannot be represented in Docker nano-CPU units")]
+    #[error("cpu limit {cpu_cores} cannot be represented in container engine nano-CPU units")]
     CpuLimitConversion { cpu_cores: f64 },
     #[error("managed container {instance_id} CPU burst policy failed: {reason}")]
     CpuBurstPolicy { instance_id: String, reason: String },
-    #[error("memory limit {memory_mib} MiB cannot be represented in Docker bytes")]
+    #[error("memory limit {memory_mib} MiB cannot be represented in container memory bytes")]
     MemoryLimitConversion { memory_mib: u64 },
     #[error("failed to prepare bind mount source {path}: {source}")]
     MountSourceIo {
@@ -167,9 +167,9 @@ pub enum DockerError {
         container: String,
         timeout_seconds: u64,
     },
-    #[error("docker stats stream ended without data")]
+    #[error("container stats stream ended without data")]
     EmptyStatsStream,
-    #[error("docker image pull failed for {image}: {message}")]
+    #[error("container image pull failed for {image}: {message}")]
     ImagePullFailed { image: String, message: String },
     #[error("container image {image} has no command for the socket bridge to supervise")]
     MissingImageCommand { image: String },
@@ -183,7 +183,7 @@ pub enum DockerError {
         readiness_error: Option<String>,
     },
     #[error(
-        "docker exec failed in {container} with exit code {exit_code}: {operation}; output: {failure_output}"
+        "container exec failed in {container} with exit code {exit_code}: {operation}; output: {failure_output}"
     )]
     ExecFailed {
         container: String,
@@ -230,7 +230,7 @@ pub enum DockerError {
     ExecStreamCancelled { container: String },
     #[error("streaming exec task failed: {0}")]
     ExecStreamTask(String),
-    #[error("docker exec timeout must be greater than zero")]
+    #[error("container exec timeout must be greater than zero")]
     InvalidExecTimeout,
     #[error(
         "PostgreSQL tenant role {username} in instance {instance_id} is the immutable bootstrap superuser; export the database and recreate the instance with purge before opening its gateway"
@@ -249,19 +249,27 @@ pub enum DockerError {
     #[error("PostgreSQL authentication hardening failed for instance {instance_id}: {reason}")]
     PostgresAuthHardeningFailed { instance_id: String, reason: String },
     #[error(
-        "docker exec timed out after {timeout_seconds} seconds in {container}: {operation}; runtime-isolation recovery was applied"
+        "container exec timed out after {timeout_seconds} seconds in {container}: {operation}; runtime-isolation recovery was applied"
     )]
     ExecTimedOut {
         container: String,
         operation: String,
         timeout_seconds: u64,
     },
-    #[error("failed to recover from timed-out docker exec in {container} ({operation}): {reason}")]
+    #[error(
+        "failed to recover from timed-out container exec in {container} ({operation}): {reason}"
+    )]
     ExecRecoveryFailed {
         container: String,
         operation: String,
         reason: String,
     },
+    #[error(
+        "rootless Podman uid {uid} is missing delegated cgroup controllers: {missing}; delegate cpu, memory and pids to user@{uid}.service with a systemd drop-in, run systemctl daemon-reload, then restart that user manager in a maintenance window"
+    )]
+    RootlessControllersMissing { uid: u32, missing: String },
+    #[error("Podman socket {path} does not exist; start {unit}")]
+    PodmanSocketMissing { path: String, unit: String },
 }
 
 impl DockerError {

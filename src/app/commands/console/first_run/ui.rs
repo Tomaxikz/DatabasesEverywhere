@@ -8,9 +8,9 @@ use ratatui::{
 };
 
 use super::{
-    generate::{BindScope, ContainerRuntime, DiskMode, chosen_mongodb_image},
+    generate::{BindScope, ContainerRuntime, DiskMode, chosen_mongodb_image, rootless_socket},
     managed_steps,
-    wizard::{QUESTIONS, Step, Wizard},
+    wizard::{PodmanSocket, Step, Wizard},
 };
 use crate::{
     commands::console::{
@@ -57,7 +57,7 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
             format!(
                 "Standalone · {}/{} · {}",
                 wizard.question_number().unwrap_or_default(),
-                QUESTIONS.len(),
+                wizard.questions().len(),
                 question_title(step)
             ),
             question(wizard),
@@ -93,7 +93,13 @@ pub(super) fn draw(frame: &mut Frame, wizard: &Wizard) {
             ("Esc", "back"),
         ],
         Step::PublicHost => &[("Enter", "next"), ("Ctrl+U", "clear"), ("Esc", "back")],
-        Step::Scope | Step::Runtime | Step::Disk | Step::Api => {
+        Step::PodmanSocket if wizard.podman_selected() == PodmanSocket::Other => &[
+            ("↑↓", "choose"),
+            ("Enter", "next"),
+            ("Ctrl+U", "clear"),
+            ("Esc", "back"),
+        ],
+        Step::Scope | Step::Runtime | Step::PodmanSocket | Step::Disk | Step::Api => {
             &[("↑↓", "choose"), ("Enter", "next"), ("Esc", "back")]
         }
         Step::Summary => &[
@@ -115,6 +121,7 @@ fn question_title(step: Step) -> &'static str {
         Step::PublicHost => "Public host",
         Step::Scope => "Listen on",
         Step::Runtime => "Container engine",
+        Step::PodmanSocket => "Podman socket",
         Step::Disk => "Disk limits",
         Step::Api => "Network API",
         Step::Start | Step::Managed | Step::Summary => "",
@@ -252,12 +259,16 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
         ],
         Step::Runtime => {
             let mut lines = vec![
-                Line::from("Which container runtime runs the databases?"),
+                Line::from("Which container engine runs the databases?"),
                 Line::default(),
             ];
             lines.extend(ContainerRuntime::ALL.iter().map(|runtime| {
                 let found = if wizard.environment.runtimes.contains(runtime) {
                     "installed"
+                } else if *runtime == ContainerRuntime::Docker
+                    && wizard.environment.docker_is_podman
+                {
+                    "docker on PATH is a Podman shim"
                 } else {
                     "not found on PATH"
                 };
@@ -270,7 +281,7 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
             lines.push(Line::default());
             if wizard.environment.runtimes.contains(&wizard.runtime) {
                 lines.push(dim(
-                    "Don't switch runtimes later on a node that has databases.",
+                    "Don't switch engines later on a node that has databases.",
                 ));
             } else {
                 lines.push(dim(format!(
@@ -280,6 +291,7 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
             }
             lines
         }
+        Step::PodmanSocket => podman_socket(wizard),
         Step::Disk => {
             let mut lines = vec![
                 Line::from("How should per-database disk limits be enforced?"),
@@ -322,6 +334,56 @@ fn question(wizard: &Wizard) -> Vec<Line<'static>> {
     }
 }
 
+fn podman_socket(wizard: &Wizard) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("Which Podman socket should dbev use?"),
+        Line::default(),
+    ];
+    for (index, socket) in wizard.podman_options().into_iter().enumerate() {
+        let selected = index == wizard.podman_cursor;
+        lines.push(match socket {
+            PodmanSocket::System => option(
+                selected,
+                "System (rootful)",
+                "/run/podman/podman.sock, Podman itself runs as root",
+            ),
+            PodmanSocket::User(uid) => {
+                let found = wizard.environment.user_sockets.contains(&uid);
+                let sudo = wizard.environment.sudo_uid == Some(uid);
+                option(
+                    selected,
+                    &format!("Rootless, uid {uid}"),
+                    &format!(
+                        "{}{}",
+                        rootless_socket(uid),
+                        match (sudo, found) {
+                            (true, true) => " (you, socket found)",
+                            (true, false) => " (you, no socket yet; setup starts it)",
+                            (false, _) => " (socket found)",
+                        }
+                    ),
+                )
+            }
+            PodmanSocket::Other => {
+                if selected {
+                    input_line_with_cursor("Another user", &wizard.podman_other, true, true)
+                } else {
+                    option(
+                        false,
+                        "Another user",
+                        "type a uid or the path of its podman.sock",
+                    )
+                }
+            }
+        });
+    }
+    lines.push(Line::default());
+    lines.push(dim(
+        "Rootless needs subuid/subgid ranges for the account and lingering; dbev --setup enables the user's podman.socket.",
+    ));
+    lines
+}
+
 fn summary(wizard: &Wizard) -> Vec<Line<'static>> {
     let choices = wizard.choices();
     let engines = choices
@@ -338,7 +400,13 @@ fn summary(wizard: &Wizard) -> Vec<Line<'static>> {
         field("Engines", engines),
         field("Public host", choices.public_host.clone()),
         field("Listen on", scope),
-        field("Containers", choices.runtime.label()),
+        field(
+            "Container engine",
+            match (choices.runtime, choices.socket_path.as_str()) {
+                (ContainerRuntime::Podman, socket) => podman_socket_summary(socket),
+                (runtime, _) => runtime.label().to_string(),
+            },
+        ),
         field("Disk limits", choices.disk.as_str()),
         field(
             "Network API",
@@ -393,6 +461,19 @@ pub(super) fn engine_name(protocol: Protocol) -> &'static str {
     }
 }
 
+/// How the summary names a Podman socket. Only the standard per-user path is
+/// called rootless; setup leaves any other custom path to its own service.
+fn podman_socket_summary(socket: &str) -> String {
+    let user_socket = crate::runtime::docker::rootless_uid_from_socket(socket).is_some();
+    match socket {
+        "" | "/run/podman/podman.sock" | "/var/run/podman/podman.sock" => {
+            "Podman (system socket)".to_string()
+        }
+        _ if user_socket => format!("Podman, rootless: {socket}"),
+        _ => format!("Podman, externally managed socket: {socket}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -417,6 +498,9 @@ mod tests {
                     kernel: Some("7.0.0".to_string()),
                     config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
                     runtimes: Vec::new(),
+                    docker_is_podman: true,
+                    user_sockets: vec![1000],
+                    sudo_uid: Some(1001),
                 },
                 NodeIdentity::generate(),
             );
@@ -429,6 +513,7 @@ mod tests {
                 Step::PublicHost,
                 Step::Scope,
                 Step::Runtime,
+                Step::PodmanSocket,
                 Step::Disk,
                 Step::Api,
                 Step::Summary,
@@ -443,6 +528,47 @@ mod tests {
         }
     }
 
+    fn screen(wizard: &Wizard) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, wizard)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_socket_question_lists_users_and_the_rootless_requirements() {
+        let mut wizard = Wizard::new(
+            Environment {
+                is_root: true,
+                systemd: true,
+                hostname: "node-1".to_string(),
+                kernel: None,
+                config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
+                runtimes: vec![ContainerRuntime::Podman],
+                docker_is_podman: false,
+                user_sockets: vec![1000],
+                sudo_uid: Some(1001),
+            },
+            NodeIdentity::generate(),
+        );
+        wizard.runtime = ContainerRuntime::Podman;
+        wizard.step = Step::PodmanSocket;
+        let text = screen(&wizard);
+        assert!(text.contains("System (rootful)"));
+        assert!(text.contains("/run/user/1001/podman/podman.sock"));
+        assert!(text.contains("Rootless, uid 1000"));
+        assert!(text.contains("subuid/subgid"));
+        assert!(text.contains("5/7"));
+        wizard.podman_cursor = 1;
+        wizard.step = Step::Summary;
+        assert!(screen(&wizard).contains("Podman, rootless: /run/user/1001/podman/podman.sock"));
+    }
+
     #[test]
     fn the_summary_shows_identity_but_never_the_secrets() {
         use secrecy::ExposeSecret;
@@ -455,6 +581,9 @@ mod tests {
                 kernel: None,
                 config_path: PathBuf::from("/etc/databases-everywhere/config.yml"),
                 runtimes: vec![ContainerRuntime::Podman],
+                docker_is_podman: false,
+                user_sockets: Vec::new(),
+                sudo_uid: None,
             },
             NodeIdentity::generate(),
         );
@@ -471,5 +600,28 @@ mod tests {
         assert!(screen.contains(&wizard.identity.uuid));
         assert!(screen.contains("systemd is not running"));
         assert!(!screen.contains(&wizard.identity.token.expose_secret()[..16]));
+    }
+
+    #[test]
+    fn only_the_standard_user_socket_is_summarised_as_rootless() {
+        assert_eq!(podman_socket_summary(""), "Podman (system socket)");
+        assert_eq!(
+            podman_socket_summary("/var/run/podman/podman.sock"),
+            "Podman (system socket)"
+        );
+        assert_eq!(
+            podman_socket_summary("/run/user/1001/podman/podman.sock"),
+            "Podman, rootless: /run/user/1001/podman/podman.sock"
+        );
+        for socket in [
+            "/srv/engine/podman.sock",
+            "/run/user/0/podman/podman.sock",
+            "/run/user/01001/podman/podman.sock",
+        ] {
+            assert_eq!(
+                podman_socket_summary(socket),
+                format!("Podman, externally managed socket: {socket}")
+            );
+        }
     }
 }

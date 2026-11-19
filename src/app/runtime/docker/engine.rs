@@ -8,6 +8,7 @@ use crate::io::ownership::HostOwner;
 const API_TIMEOUT_SECONDS: u64 = 120;
 const PODMAN_SYSTEM_SOCKET: &str = "/run/podman/podman.sock";
 pub(super) const MINIMUM_PODMAN_VERSION: &str = "4.3.0";
+pub(super) const RECOMMENDED_PODMAN_VERSION: &str = "5.1.0";
 const PODMAN_COMPAT_API_VERSION: &ClientVersion = &ClientVersion {
     major_version: 1,
     minor_version: 40,
@@ -66,7 +67,13 @@ pub fn rootless_uid_from_socket(path: &str) -> Option<u32> {
             && *podman == "podman"
             && *socket == "podman.sock" =>
         {
-            uid.to_str()?.parse::<u32>().ok().filter(|uid| *uid != 0)
+            // Only the exact canonical path: a zero-padded uid, a trailing
+            // slash or a "/./" names another path than the one that account's
+            // user manager creates, so it is an externally managed socket.
+            uid.to_str()?
+                .parse::<u32>()
+                .ok()
+                .filter(|uid| *uid != 0 && format!("/run/user/{uid}/podman/podman.sock") == path)
         }
         _ => None,
     }
@@ -103,6 +110,10 @@ pub(super) fn reports_podman(version: &SystemVersion) -> bool {
 
 pub(super) fn is_supported_podman_version(version: &str) -> bool {
     parse_version_triplet(version).is_some_and(|version| version >= (4, 3, 0))
+}
+
+pub(super) fn is_recommended_podman_version(version: &str) -> bool {
+    parse_version_triplet(version).is_some_and(|version| version >= (5, 1, 0))
 }
 
 fn parse_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
@@ -150,32 +161,8 @@ fn engine_socket(config: &DaemonConfig) -> Option<String> {
 
     match config.engine {
         DaemonEngine::Docker => None,
-        DaemonEngine::Podman => discover_podman_socket(),
+        DaemonEngine::Podman => Some(PODMAN_SYSTEM_SOCKET.to_string()),
     }
-}
-
-fn discover_podman_socket() -> Option<String> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let socket = format!("{runtime_dir}/podman/podman.sock");
-        if Path::new(&socket).exists() {
-            return Some(socket);
-        }
-    }
-
-    use std::os::unix::fs::MetadataExt;
-
-    if let Ok(metadata) = std::fs::metadata("/proc/self") {
-        let socket = format!("/run/user/{}/podman/podman.sock", metadata.uid());
-        if Path::new(&socket).exists() {
-            return Some(socket);
-        }
-    }
-
-    if Path::new(PODMAN_SYSTEM_SOCKET).exists() {
-        return Some(PODMAN_SYSTEM_SOCKET.to_string());
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -185,12 +172,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_podman_socket_uses_the_system_service_socket() {
+        let config = DaemonConfig {
+            engine: DaemonEngine::Podman,
+            ..Default::default()
+        };
+        let connection = DaemonEngineConnection::from_config(&config);
+        assert_eq!(
+            connection.socket_path.as_deref(),
+            Some(PODMAN_SYSTEM_SOCKET)
+        );
+    }
+
+    #[test]
     fn recognizes_only_the_standard_rootless_podman_socket_shape() {
         assert_eq!(
             rootless_uid_from_socket("/run/user/1001/podman/podman.sock"),
             Some(1001)
         );
         assert_eq!(rootless_uid_from_socket("/run/podman/podman.sock"), None);
+        for ambiguous in [
+            "/run/user/01001/podman/podman.sock",
+            "/run/user/1001/podman/podman.sock/",
+            "/run/user/1001//podman/podman.sock",
+            "/run/user/1001/./podman/podman.sock",
+        ] {
+            assert_eq!(rootless_uid_from_socket(ambiguous), None, "{ambiguous}");
+        }
         assert_eq!(
             rootless_uid_from_socket("/run/user/0/podman/podman.sock"),
             None
@@ -227,5 +235,7 @@ mod tests {
         assert!(is_supported_podman_version("v4.3.1-dev"));
         assert!(is_supported_podman_version("5.6"));
         assert!(!is_supported_podman_version("unknown"));
+        assert!(!is_recommended_podman_version("4.9.0"));
+        assert!(is_recommended_podman_version("5.1.0"));
     }
 }

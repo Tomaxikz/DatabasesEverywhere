@@ -86,28 +86,35 @@ pub(super) fn prepare_rootless_paths(
     let Some((uid, gid)) = docker.rootless_podman_host_owner() else {
         return Ok(());
     };
+    prepare_rootless_paths_for_owner(config, uid, gid)
+}
+
+pub(super) fn prepare_rootless_paths_for_owner(
+    config: &Config,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
     anyhow::ensure!(uid != 0, "rootless Podman host uid must not be 0");
 
-    let metadata = PathBuf::from(config.paths.metadata_root());
-    let fuse = PathBuf::from(config.paths.fuse_root());
-    let tmp = PathBuf::from(config.paths.tmp_root());
-    let logs = PathBuf::from(&config.paths.logs_root());
-    let paths = std::collections::BTreeSet::from([
-        PathBuf::from(&config.paths.data),
-        PathBuf::from(config.paths.volumes_root()),
-        logs.clone(),
-        PathBuf::from(&config.paths.sockets_root()),
-        metadata.clone(),
-        metadata.join("runtime"),
-        metadata.join("runtime/bin"),
-        metadata.join("runtime-configs"),
-        fuse.clone(),
-        fuse.join("instances"),
-        fuse.join("mounts"),
-        tmp.clone(),
-        tmp.join("remote-import"),
-    ]);
+    let paths = rootless_traversal_paths(config);
     let daemon_uid = rustix::process::geteuid().as_raw();
+    if let Some(run) = private_run_ancestor(config) {
+        create_runtime_dirs(&run).with_context(|| {
+            format!(
+                "failed to create rootless Podman traversal path {}",
+                run.display()
+            )
+        })?;
+        crate::io::ownership::allow_directory_traversal(&run, daemon_uid, gid).with_context(
+            || {
+                format!(
+                    "failed to grant rootless Podman gid {gid} traversal access to {}",
+                    run.display()
+                )
+            },
+        )?;
+        crate::io::ownership::register_traversal_grant(&run, gid);
+    }
     for path in &paths {
         create_runtime_dirs(path).with_context(|| {
             format!(
@@ -127,6 +134,7 @@ pub(super) fn prepare_rootless_paths(
     }
     for path in &paths {
         check_rootless_path_access(path, uid, gid)?;
+        crate::io::ownership::register_traversal_grant(path, gid);
     }
     tracing::info!(
         uid,
@@ -134,6 +142,42 @@ pub(super) fn prepare_rootless_paths(
         "rootless Podman bind-mount path traversal prepared"
     );
     Ok(())
+}
+
+/// The run root when it is the parent of the sockets root and a dedicated
+/// dbev directory. It then always carries the grant, so the API socket bound
+/// below it keeps that mode. A shared or protected run root (`/run`, `/root`)
+/// is never re-moded; if the rootless account cannot search it, the access
+/// check that follows names it.
+pub(super) fn private_run_ancestor(config: &Config) -> Option<PathBuf> {
+    let run = config.paths.run_root();
+    let sockets = PathBuf::from(config.paths.sockets_root());
+    let dedicated = crate::config::path_policy::is_dedicated_root(&run);
+    let run = PathBuf::from(run);
+    (dedicated && sockets != run && sockets.starts_with(&run)).then_some(run)
+}
+
+pub(super) fn rootless_traversal_paths(config: &Config) -> std::collections::BTreeSet<PathBuf> {
+    let metadata = PathBuf::from(config.paths.metadata_root());
+    let fuse = PathBuf::from(config.paths.fuse_root());
+    let tmp = PathBuf::from(config.paths.tmp_root());
+    let logs = PathBuf::from(&config.paths.logs_root());
+    std::collections::BTreeSet::from([
+        PathBuf::from(&config.paths.data),
+        PathBuf::from(config.paths.volumes_root()),
+        logs,
+        PathBuf::from(&config.paths.sockets_root()),
+        metadata.clone(),
+        metadata.join("runtime"),
+        metadata.join("runtime/bin"),
+        metadata.join("runtime-configs"),
+        fuse.clone(),
+        fuse.join("instances"),
+        fuse.join("mounts"),
+        tmp.clone(),
+        tmp.join("import-export"),
+        tmp.join("remote-import"),
+    ])
 }
 
 pub(super) fn check_rootless_path_access(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {

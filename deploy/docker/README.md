@@ -1,7 +1,7 @@
 # Docker deployment
 
 DBEV uses host networking and the host runtime socket. Socket access is
-**host-root-equivalent**; use a trusted host/VM. See [node setup](../../docs/operations/setup.md).
+**host-root-equivalent**; use a trusted host/VM.
 
 ## Start
 
