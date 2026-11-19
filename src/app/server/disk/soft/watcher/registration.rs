@@ -230,13 +230,4 @@ impl SoftDiskWatcher {
         let now = Instant::now();
         self.unwatch_or_abandon_backend(&retired.root, now);
     }
-
-    #[cfg(test)]
-    pub(crate) fn unregister(&self, target_id: &str) -> bool {
-        let Some(retired) = self.retire(target_id) else {
-            return false;
-        };
-        self.unwatch_retired(&retired);
-        true
-    }
 }

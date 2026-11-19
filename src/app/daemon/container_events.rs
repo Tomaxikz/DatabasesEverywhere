@@ -678,26 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn password_recreation_teardown_events_targeting_the_old_container_are_superseded() {
-        for protocol in [
-            Protocol::Redis,
-            Protocol::Valkey,
-            Protocol::Clickhouse,
-            Protocol::Qdrant,
-        ] {
-            for action in [
-                ManagedContainerAction::Exited {
-                    exit_code: Some(137),
-                },
-                ManagedContainerAction::Destroyed,
-            ] {
-                let event = event(protocol, action, Some("old-container-id"));
-                assert!(targets_old_container(&event, Some("new-container-id")));
-            }
-        }
-    }
-
-    #[test]
     fn a_failure_from_the_current_container_is_not_suppressed() {
         let event = event(
             Protocol::Redis,

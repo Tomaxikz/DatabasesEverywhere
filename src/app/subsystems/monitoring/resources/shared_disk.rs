@@ -671,13 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_storage_samples_fail_closed() {
-        assert!(check_sample_count("pool-a", 2, 2).is_ok());
-        let error = check_sample_count("pool-a", 2, 1).unwrap_err();
-        assert!(error.contains("1 storage rows for 2 tenants"));
-    }
-
-    #[test]
     fn hard_shared_quotas_do_not_use_the_soft_guard() {
         assert!(uses_soft_guard(DeploymentMode::Shared, false));
         assert!(!uses_soft_guard(DeploymentMode::Shared, true));

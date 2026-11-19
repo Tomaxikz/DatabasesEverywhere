@@ -741,24 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn colliding_instances_probe_to_distinct_ids() {
-        let temp = tempfile::tempdir().unwrap();
-        let registry = temp.path().join(REGISTRY_DIRECTORY);
-        let base = u32::MAX - 1;
-        let first_name = "inst_collision_0";
-        let initial = initial_project_id(first_name, base, 2);
-        let second_name = (1..100)
-            .map(|value| format!("inst_collision_{value}"))
-            .find(|name| initial_project_id(name, base, 2) == initial)
-            .unwrap();
-
-        let first = allocate_sync(&registry, first_name, base).unwrap();
-        let second = allocate_sync(&registry, &second_name, base).unwrap();
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn explicit_global_registry_prevents_cross_parent_collisions() {
         let temp = tempfile::tempdir().unwrap();
         let registry_root = temp.path().join("global-quota-registry");

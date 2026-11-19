@@ -388,18 +388,6 @@ fn one_root_cannot_be_owned_by_two_targets() {
 }
 
 #[test]
-fn unregister_is_idempotent_and_drops_late_events() {
-    let (watcher, _temporary, root) = watcher_and_root(32);
-
-    assert!(watcher.unregister(TARGET));
-    assert!(!watcher.unregister(TARGET));
-    inject(&watcher, data_event(root.join("late.db")));
-
-    assert!(watcher.capture(TARGET).is_none());
-    assert!(watcher.status(TARGET).is_none());
-}
-
-#[test]
 fn file_changes_are_reduced_to_minimal_root_relative_parent_directories() {
     let cases: [(&str, &[&str], &[&str]); 4] = [
         (

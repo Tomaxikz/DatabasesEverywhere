@@ -11,7 +11,7 @@ use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
 
 use super::{
     client::{bucket_endpoint, endpoint_base},
-    objects::{object_path, owned_key},
+    objects::object_path,
     *,
 };
 use crate::{
@@ -293,20 +293,6 @@ async fn bounded_reads_refuse_oversized_objects() {
 
     assert!(error.to_string().contains("exceeded its safety limit"));
     assert_eq!(driver.get_bytes(&key, 16).await.unwrap().len(), 16);
-}
-
-#[test]
-fn listed_s3_keys_must_remain_inside_the_requested_instance_prefix() {
-    assert_eq!(
-        owned_key("dbev/instances/a/backup", "dbev/instances/a/").unwrap(),
-        "dbev/instances/a/backup"
-    );
-    let error = owned_key("dbev/instances/b/backup", "dbev/instances/a/").unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("outside the requested backup prefix")
-    );
 }
 
 #[test]

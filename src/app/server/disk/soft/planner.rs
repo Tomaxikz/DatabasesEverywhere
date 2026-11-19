@@ -42,8 +42,6 @@ pub(crate) enum ScanKind {
 pub(crate) enum ScanReason {
     Initial,
     TargetChanged,
-    #[cfg(test)]
-    ConfigurationChanged,
     Dirty,
     Overflow,
     WatcherFallback,
@@ -68,11 +66,7 @@ pub(crate) struct ScanCandidate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanCompletion {
-    Succeeded {
-        performed: ScanKind,
-    },
-    #[cfg(test)]
-    NeedsFull,
+    Succeeded { performed: ScanKind },
     Failed,
 }
 
@@ -221,19 +215,6 @@ impl HybridScanPlanner {
         self.config
     }
 
-    #[cfg(test)]
-    pub(crate) fn reconfigure(&mut self, now: PlannerTick, config: PlannerConfig) -> bool {
-        let config = config.normalized();
-        if self.config == config {
-            return false;
-        }
-        self.config = config;
-        for target in self.targets.values_mut() {
-            target.reset(now, ScanReason::ConfigurationChanged);
-        }
-        true
-    }
-
     pub(crate) fn upsert_target(
         &mut self,
         now: PlannerTick,
@@ -335,24 +316,6 @@ impl HybridScanPlanner {
             reason: ScanReason::Overflow,
         });
         true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_all_overflow(&mut self, now: PlannerTick) -> Vec<(String, u64)> {
-        let mut affected = Vec::new();
-        for (id, target) in &mut self.targets {
-            if !target.spec.enabled {
-                continue;
-            }
-            target.dirty_generation = target.dirty_generation.saturating_add(1).max(1);
-            target.full_requirement = Some(FullRequirement {
-                due_at: now,
-                generation: target.dirty_generation,
-                reason: ScanReason::Overflow,
-            });
-            affected.push((id.clone(), target.dirty_generation));
-        }
-        affected
     }
 
     pub(crate) fn next_candidate(&mut self, now: PlannerTick) -> Option<ScanCandidate> {
@@ -465,17 +428,6 @@ impl HybridScanPlanner {
                         Self::record_full_scan(target, now, candidate, self.config);
                     }
                 }
-            }
-            #[cfg(test)]
-            ScanCompletion::NeedsFull => {
-                Self::require_full_after(
-                    target,
-                    now,
-                    candidate,
-                    ScanReason::PartialFallback,
-                    self.config.debounce,
-                    self.config.scan_interval,
-                );
             }
             ScanCompletion::Failed => {
                 let retry_at = add_tick(now, self.config.scan_interval);

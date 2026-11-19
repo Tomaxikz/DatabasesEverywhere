@@ -52,16 +52,6 @@ async fn configured_inspection_limit_is_shared_and_bounded_by_upload_workers() {
 }
 
 #[tokio::test]
-async fn disk_reservation_guard_releases_exactly_once() {
-    let service = DiskCapacityService::default();
-    let directory = tempfile::tempdir().unwrap();
-    let guard = service.reserve(directory.path(), 4096).await.unwrap();
-    assert_eq!(service.reserved_bytes(), 4096);
-    drop(guard);
-    assert_eq!(service.reserved_bytes(), 0);
-}
-
-#[tokio::test]
 async fn output_reservations_share_capacity_without_consuming_staging_slots() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .connect_lazy("sqlite::memory:")

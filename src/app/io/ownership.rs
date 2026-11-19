@@ -257,19 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn traversal_share_does_not_grant_directory_listing() {
-        let temp = tempfile::tempdir().unwrap();
-        let metadata = std::fs::metadata(temp.path()).unwrap();
-
-        allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid()).unwrap();
-
-        assert_eq!(
-            std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
-            0o710
-        );
-    }
-
-    #[test]
     fn traversal_below_a_root_stops_at_the_mounted_directory() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("backups");

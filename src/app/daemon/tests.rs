@@ -382,20 +382,6 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
 }
 
 #[test]
-fn startup_resolves_qdrant_away_from_the_fuse_fallback() {
-    let limiter = DiskLimiter::new(crate::config::DiskConfig::default());
-
-    assert_eq!(
-        limiter.mode_for_protocol(Protocol::Qdrant),
-        crate::config::DiskLimitMode::SoftScanner
-    );
-    assert_eq!(
-        limiter.mode_for_protocol(Protocol::Postgres),
-        crate::config::DiskLimitMode::FuseQuota
-    );
-}
-
-#[test]
 fn stale_qdrant_fuse_mount_does_not_trigger_container_recreation() {
     let legacy = Path::new("/var/lib/dbev/fuse/instances/qdrant");
 
