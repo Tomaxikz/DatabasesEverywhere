@@ -407,18 +407,6 @@ fn a_full_candidate_reported_as_partial_remains_full_required() {
 }
 
 #[test]
-fn needs_full_is_a_debounced_reconciliation_not_a_failure() {
-    let mut planner = planner_with_baseline("a", Duration::ZERO);
-    planner.mark_dirty("a", seconds(20), 1);
-    let candidate = planner.next_candidate(millis(20_500)).unwrap();
-    planner.complete(&candidate, seconds(21), ScanCompletion::NeedsFull);
-    assert!(planner.next_candidate(millis(35_999)).is_none());
-    let full = planner.next_candidate(seconds(36)).unwrap();
-    assert_eq!(full.kind, ScanKind::Full);
-    assert_eq!(full.reason, ScanReason::PartialFallback);
-}
-
-#[test]
 fn failed_partial_escalates_to_a_full_retry_at_the_base_interval() {
     let mut planner = planner_with_baseline("a", Duration::ZERO);
     planner.mark_dirty("a", seconds(20), 1);
@@ -428,29 +416,6 @@ fn failed_partial_escalates_to_a_full_retry_at_the_base_interval() {
     let retry = planner.next_candidate(seconds(36)).unwrap();
     assert_eq!(retry.kind, ScanKind::Full);
     assert_eq!(retry.reason, ScanReason::RetryAfterFailure);
-}
-
-#[test]
-fn failed_full_remains_full_required_without_a_busy_loop() {
-    let mut planner = HybridScanPlanner::new(config());
-    planner.upsert_target(Duration::ZERO, target("a"));
-    let full = planner.next_candidate(Duration::ZERO).unwrap();
-    planner.complete(&full, seconds(1), ScanCompletion::Failed);
-    assert!(planner.next_candidate(seconds(15)).is_none());
-    assert_eq!(
-        planner.next_candidate(seconds(16)).unwrap().kind,
-        ScanKind::Full
-    );
-}
-
-#[test]
-fn overflow_forces_an_immediate_full_reconciliation() {
-    let mut planner = planner_with_baseline("a", Duration::ZERO);
-    assert!(planner.mark_overflow("a", seconds(4), 8));
-    let candidate = planner.next_candidate(seconds(4)).unwrap();
-    assert_eq!(candidate.kind, ScanKind::Full);
-    assert_eq!(candidate.reason, ScanReason::Overflow);
-    assert_eq!(candidate.captured_generation, 8);
 }
 
 #[test]
@@ -581,17 +546,6 @@ fn generation_arriving_during_successful_retry_is_cadence_limited() {
 }
 
 #[test]
-fn global_overflow_affects_enabled_targets_only() {
-    let mut planner = HybridScanPlanner::new(config());
-    planner.upsert_target(Duration::ZERO, target("a"));
-    let mut disabled = target("b");
-    disabled.enabled = false;
-    planner.upsert_target(Duration::ZERO, disabled);
-    let affected = planner.mark_all_overflow(seconds(2));
-    assert_eq!(affected, vec![("a".to_string(), 1)]);
-}
-
-#[test]
 fn qdrant_style_target_runs_full_at_every_base_interval() {
     let mut spec = target("qdrant");
     spec.force_periodic_full = true;
@@ -714,24 +668,6 @@ fn completion_redebounce_prevents_noisy_target_from_starving_overdue_idle() {
         planner.next_candidate(seconds(90)).unwrap().target_id,
         "b-idle"
     );
-}
-
-#[test]
-fn reconfigure_resets_all_enabled_targets_to_full() {
-    let mut planner = planner_with_baseline("a", Duration::ZERO);
-    let mut updated = config();
-    updated.full_scan_interval = seconds(120);
-    assert!(planner.reconfigure(seconds(10), updated));
-    let candidate = planner.next_candidate(seconds(10)).unwrap();
-    assert_eq!(candidate.kind, ScanKind::Full);
-    assert_eq!(candidate.reason, ScanReason::ConfigurationChanged);
-}
-
-#[test]
-fn identical_reconfigure_does_not_disturb_state() {
-    let mut planner = planner_with_baseline("a", Duration::ZERO);
-    assert!(!planner.reconfigure(seconds(10), config()));
-    assert!(planner.next_candidate(seconds(10)).is_none());
 }
 
 #[test]

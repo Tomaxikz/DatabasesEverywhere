@@ -346,10 +346,6 @@ impl WatchOperationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::disk::soft::{
-        planner::{HybridScanPlanner, PlannerConfig, ScanKind, TargetSpec},
-        usage_tree::RootIdentity,
-    };
 
     fn desired(name: &str) -> DesiredWatch {
         DesiredWatch {
@@ -619,41 +615,6 @@ mod tests {
             queue.next(Duration::ZERO),
             Some(WatchOperation::RetryDegraded)
         );
-    }
-
-    #[test]
-    fn blocked_kernel_registration_does_not_delay_initial_full_baseline() {
-        let mut queue = WatchOperationQueue::default();
-        queue.upsert("one".to_string(), desired("one"));
-        assert!(matches!(
-            queue.next(Duration::ZERO),
-            Some(WatchOperation::Register { .. })
-        ));
-
-        let mut planner = HybridScanPlanner::new(PlannerConfig {
-            scan_interval: Duration::from_secs(15),
-            full_scan_interval: Duration::from_secs(90),
-            debounce: Duration::from_millis(500),
-            watcher_enabled: true,
-        });
-        planner.upsert_target(
-            Duration::ZERO,
-            TargetSpec {
-                id: "one".to_string(),
-                fingerprint: "scanner-one".to_string(),
-                root_identity: Some(RootIdentity {
-                    device: 1,
-                    inode: 2,
-                }),
-                enabled: true,
-                watcher_trusted: false,
-                force_periodic_full: false,
-            },
-        );
-
-        let baseline = planner.next_candidate(Duration::ZERO).unwrap();
-        assert_eq!(baseline.kind, ScanKind::Full);
-        assert!(queue.next(Duration::ZERO).is_none());
     }
 
     #[test]

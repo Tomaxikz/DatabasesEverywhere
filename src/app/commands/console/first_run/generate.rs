@@ -64,21 +64,8 @@ impl ContainerRuntime {
     pub(super) fn description(self) -> &'static str {
         match self {
             Self::Docker => "the Docker Engine at /var/run/docker.sock",
-            Self::Podman => {
-                "rootful Podman at /run/podman/podman.sock; setup enables podman.socket"
-            }
+            Self::Podman => "Podman, rootful or rootless; setup enables podman.socket",
         }
-    }
-
-    pub(super) fn installed() -> Vec<Self> {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        Self::ALL
-            .into_iter()
-            .filter(|runtime| {
-                std::env::split_paths(&path)
-                    .any(|directory| directory.join(runtime.as_str()).is_file())
-            })
-            .collect()
     }
 }
 
@@ -123,8 +110,15 @@ pub(super) struct Choices {
     pub public_host: String,
     pub scope: BindScope,
     pub runtime: ContainerRuntime,
+    /// Rootless Podman's user socket; empty selects the engine's root socket.
+    pub socket_path: String,
     pub disk: DiskMode,
     pub api_enabled: bool,
+}
+
+/// The user socket of a rootless Podman account.
+pub(super) fn rootless_socket(uid: u32) -> String {
+    format!("/run/user/{uid}/podman/podman.sock")
 }
 
 pub(super) struct NodeIdentity {
@@ -222,7 +216,7 @@ pub(super) fn standalone_config(
     let daemon = section(&mut root, "daemon")?;
     daemon.insert("engine".into(), choices.runtime.as_str().into());
     // Empty selects the runtime's standard root socket.
-    daemon.insert("socket_path".into(), "".into());
+    daemon.insert("socket_path".into(), choices.socket_path.as_str().into());
     section(&mut root, "disk")?.insert("mode".into(), choices.disk.as_str().into());
     let images = section(&mut root, "images")?;
     let mongodb = images
@@ -306,6 +300,7 @@ mod tests {
             public_host: "db.example.com".to_string(),
             scope: BindScope::Network,
             runtime: ContainerRuntime::Podman,
+            socket_path: String::new(),
             disk: DiskMode::SoftScanner,
             api_enabled: false,
         }
@@ -450,17 +445,44 @@ mod tests {
     }
 
     #[test]
+    fn the_socket_follows_the_engine_choice() {
+        for (runtime, socket_path, engine) in [
+            (ContainerRuntime::Docker, "", "docker"),
+            (ContainerRuntime::Podman, "", "podman"),
+            (
+                ContainerRuntime::Podman,
+                "/run/user/1000/podman/podman.sock",
+                "podman",
+            ),
+        ] {
+            let mut choices = choices();
+            choices.runtime = runtime;
+            choices.socket_path = socket_path.to_string();
+            let config = generated(&choices, None);
+            assert_eq!(text(&config, &["daemon", "engine"]), engine);
+            assert_eq!(text(&config, &["daemon", "socket_path"]), socket_path);
+        }
+        assert_eq!(rootless_socket(1001), "/run/user/1001/podman/podman.sock");
+    }
+
+    #[test]
     fn generated_configs_pass_validation() {
         let kernel = kernel_release();
         // Validation inspects the configured host paths; keep it off this
         // machine's real (possibly root-only) /var/lib/dbev.
         let root = tempfile::tempdir().unwrap();
+        let engines = [
+            (ContainerRuntime::Docker, String::new()),
+            (ContainerRuntime::Podman, String::new()),
+            (ContainerRuntime::Podman, rootless_socket(1000)),
+        ];
         for api_enabled in [false, true] {
-            for runtime in ContainerRuntime::ALL {
+            for (runtime, socket_path) in &engines {
                 for disk in DiskMode::ALL {
                     let mut choices = choices();
                     choices.api_enabled = api_enabled;
-                    choices.runtime = runtime;
+                    choices.runtime = *runtime;
+                    choices.socket_path = socket_path.clone();
                     choices.disk = disk;
                     let mut config = generated(&choices, kernel.as_deref());
                     let paths = config["paths"].as_mapping_mut().unwrap();
@@ -470,6 +492,8 @@ mod tests {
                     }
                     let config: Config = yaml_serde::from_value(config).unwrap();
                     crate::config::validate::validate_config(&config).unwrap();
+                    assert_eq!(config.daemon.engine.as_str(), runtime.as_str());
+                    assert_eq!(config.daemon.socket_path, *socket_path);
                 }
             }
         }

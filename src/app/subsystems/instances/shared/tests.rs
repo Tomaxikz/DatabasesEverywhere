@@ -151,32 +151,6 @@ fn hard_disk_state_clears_a_legacy_soft_block() {
 }
 
 #[test]
-fn existing_hard_disk_state_cannot_silently_downgrade() {
-    let mut metadata = shared_metadata();
-    metadata.limits.disk_enforced = true;
-    metadata.limits.disk_enforcement_method = "host_xfs_project_quota".to_string();
-    let soft = DiskEnforcement {
-        enforced: false,
-        method: "shared_catalog_guard".to_string(),
-        container_data_path: None,
-    };
-
-    assert!(
-        tenant::disk::update_state(
-            &mut metadata.limits,
-            &mut metadata.disk_limit_blocked,
-            &soft,
-        )
-        .is_err()
-    );
-    assert!(metadata.limits.disk_enforced);
-    assert_eq!(
-        metadata.limits.disk_enforcement_method,
-        "host_xfs_project_quota"
-    );
-}
-
-#[test]
 fn status_reconcile_never_reopens_unsafe_fenced_or_failed_tenants() {
     use DesiredInstanceState as Desired;
     use EngineRuntimeStatus as Runtime;

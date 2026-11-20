@@ -12,7 +12,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, broadcast};
 use crate::storage::import_export_jobs::{ImportExportJobRepository, ImportExportJobStorageError};
 pub use crate::utils::time::now_rfc3339;
 #[cfg(test)]
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::{Compression, write::GzEncoder};
 #[cfg(test)]
 use std::{fs::File, path::Path, time::Instant};
 #[cfg(test)]
@@ -47,8 +47,8 @@ use self::create::{
 };
 #[cfg(test)]
 use self::extract::{
-    DeadlineBoundedReader, extract_archive_blocking, extract_archive_entries,
-    extract_bounded_archive_blocking, validate_archive_path,
+    DeadlineBoundedReader, extract_archive_blocking, extract_bounded_archive_blocking,
+    validate_archive_path,
 };
 
 pub const MAX_DATA_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;

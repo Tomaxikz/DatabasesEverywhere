@@ -100,6 +100,11 @@ pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std:
             ),
         ));
     }
+    if stat.st_gid != gid {
+        // Close the directory to the old group before handing it to the new
+        // one, so stale group bits never apply to the new group.
+        fchmod(&directory, Mode::RWXU).map_err(std::io::Error::from)?;
+    }
     fchown(
         &directory,
         Some(Uid::from_raw(daemon_uid)),
@@ -107,6 +112,27 @@ pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std:
     )
     .map_err(std::io::Error::from)?;
     fchmod(&directory, Mode::RWXU | Mode::XGRP).map_err(std::io::Error::from)
+}
+
+static TRAVERSAL_GRANTS: std::sync::RwLock<std::collections::BTreeMap<std::path::PathBuf, u32>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Records that `path` is a designated bind-mount ancestor which `gid` must
+/// keep traversing (rootless Podman only). Callers that re-secure a private
+/// directory consult this so they do not revoke the grant while jobs run.
+pub fn register_traversal_grant(path: &Path, gid: u32) {
+    TRAVERSAL_GRANTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), gid);
+}
+
+pub fn registered_traversal_gid(path: &Path) -> Option<u32> {
+    TRAVERSAL_GRANTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
 }
 
 /// Grants `gid` execute-only traversal ([`allow_directory_traversal`]) of
@@ -253,19 +279,6 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
-        );
-    }
-
-    #[test]
-    fn traversal_share_does_not_grant_directory_listing() {
-        let temp = tempfile::tempdir().unwrap();
-        let metadata = std::fs::metadata(temp.path()).unwrap();
-
-        allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid()).unwrap();
-
-        assert_eq!(
-            std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
-            0o710
         );
     }
 

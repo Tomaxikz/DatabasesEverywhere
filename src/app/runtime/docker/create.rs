@@ -76,6 +76,19 @@ impl DockerRuntime {
         };
         self.security.apply(&mut host_config);
         if let Some(userns_mode) = self.rootless_podman_userns_mode(spec.protocol) {
+            if let Some(configured) = host_config
+                .userns_mode
+                .as_deref()
+                .filter(|value| !value.is_empty() && *value != userns_mode)
+            {
+                tracing::warn!(
+                    instance_id = %spec.instance_id,
+                    protocol = %spec.protocol,
+                    configured_userns_mode = configured,
+                    userns_mode,
+                    "replacing configured container user namespace {configured} with {userns_mode} for rootless Podman"
+                );
+            }
             host_config.userns_mode = Some(userns_mode.to_string());
         }
         if let Some(pids_limit) = spec.pids_limit {
@@ -161,6 +174,18 @@ impl DockerRuntime {
                 body,
             )
             .await?;
+        for warning in response
+            .warnings
+            .iter()
+            .filter(|warning| !warning.is_empty())
+        {
+            tracing::warn!(
+                container = %name,
+                instance_id = %spec.instance_id,
+                warning,
+                "container create warning"
+            );
+        }
         Ok(CommandOutput {
             stdout: response.id,
             stderr: response.warnings.join("\n"),
@@ -230,7 +255,7 @@ impl DockerRuntime {
     ) -> Result<(), DockerError> {
         match self.docker.inspect_image(image).await {
             Ok(_) => {
-                tracing::debug!(image, "docker image already present");
+                tracing::debug!(image, "container image already present");
                 report_pull_progress(progress, image, "image already present");
                 return Ok(());
             }
@@ -240,7 +265,7 @@ impl DockerRuntime {
             Err(error) => return Err(error.into()),
         }
 
-        tracing::info!(image, "pulling missing docker image");
+        tracing::info!(image, "pulling missing container image");
         let mut logged = HashSet::new();
         let mut stream = self.docker.create_image(
             Some(
@@ -287,13 +312,13 @@ impl DockerRuntime {
                     status,
                     current = current.unwrap_or_default(),
                     total = total.unwrap_or_default(),
-                    "docker image pull progress"
+                    "container image pull progress"
                 );
             }
         }
 
         self.docker.inspect_image(image).await?;
-        tracing::info!(image, "docker image pull complete");
+        tracing::info!(image, "container image pull complete");
         report_pull_progress(progress, image, "image pull complete");
         Ok(())
     }

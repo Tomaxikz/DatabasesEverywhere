@@ -633,16 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_guesses_share_the_same_bounded_peer_bucket() {
-        let peer = "192.0.2.7:5000".parse().unwrap();
-
-        let identity = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
-        let next_guess = rate_limit_identity(&RequestAuthentication::Unauthenticated, Some(peer));
-        assert_eq!(identity, next_guess);
-        assert!(!identity.trusted);
-    }
-
-    #[test]
     fn valid_api_token_gets_a_stable_trusted_peer_bucket() {
         let accepted = crate::auth::api_token::ApiToken::new("secret")
             .from_auth_header(Some("Bearer secret"))

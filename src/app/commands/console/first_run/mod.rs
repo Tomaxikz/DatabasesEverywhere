@@ -6,6 +6,7 @@
 //! `dbev --setup` with its output on the terminal, and then hands over to the
 //! normal console once the daemon answers.
 
+mod detect;
 mod files;
 mod generate;
 mod ui;
@@ -33,6 +34,7 @@ pub(super) enum Next {
 
 pub(super) async fn run(config_path: &Path) -> anyhow::Result<Next> {
     files::check_location(config_path)?;
+    let (runtimes, docker_is_podman) = detect::installed();
     let environment = Environment {
         is_root: super::credentials::is_root(),
         systemd: Path::new("/run/systemd/system").is_dir(),
@@ -41,7 +43,10 @@ pub(super) async fn run(config_path: &Path) -> anyhow::Result<Next> {
             .unwrap_or_default(),
         kernel: generate::kernel_release(),
         config_path: config_path.to_path_buf(),
-        runtimes: generate::ContainerRuntime::installed(),
+        runtimes,
+        docker_is_podman,
+        user_sockets: detect::detected_user_sockets(),
+        sudo_uid: detect::sudo_uid(),
     };
     let mut wizard = Wizard::new(environment, NodeIdentity::generate());
     let mut terminal = ratatui::try_init().context("failed to prepare the terminal")?;

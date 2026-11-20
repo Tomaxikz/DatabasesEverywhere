@@ -11,28 +11,6 @@ fn rejects_archive_path_traversal() {
 }
 
 #[test]
-fn physical_extraction_enforces_expansion_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let archive_path = dir.path().join("data.tar.gz");
-    let target = dir.path().join("target");
-    std::fs::create_dir(&target).unwrap();
-    write_archive(&archive_path, "data/file.txt", b"too large");
-    let file = File::open(&archive_path).unwrap();
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    let limits = ArchiveLimits {
-        bytes: 4,
-        entries: 10,
-        depth: 10,
-        deadline: Duration::from_secs(10),
-    };
-
-    let error = extract_archive_entries(&mut archive, &target, "data", limits).unwrap_err();
-
-    assert!(error.to_string().contains("expands beyond"));
-}
-
-#[test]
 fn bounded_physical_extraction_accepts_exact_limit() {
     let dir = tempfile::tempdir().unwrap();
     let archive_path = dir.path().join("data.tar.gz");

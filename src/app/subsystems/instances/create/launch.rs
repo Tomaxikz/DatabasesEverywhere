@@ -45,7 +45,7 @@ where
     if report_install_progress {
         state
             .install_progress
-            .stage(instance_id, "create_container", "creating Docker container");
+            .stage(instance_id, "create_container", "creating container");
     }
     state
         .docker

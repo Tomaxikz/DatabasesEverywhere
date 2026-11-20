@@ -25,7 +25,7 @@ the check matrix; [release](../workflows/release.yml) independently validates
 versions and repeats required checks before publishing. Release runs are serialized.
 Protect the `production-release` environment with reviewers and main/version-tag refs.
 
-The [Linux build workflow](../workflows/build-binaries.yml) handles architecture packaging.
+The Linux build workflow handles architecture packaging.
 Use the workflows as the source for tool versions, matrices, and deadlines.
 
 ## Socket
@@ -84,7 +84,7 @@ Requires Linux, Docker, Maven, JDK 21, and OpenSSL:
 bash .github/ci/mysql-driver-matrix.sh mysql mysql:8.4 26.7.0
 ```
 
-The [matrix](../workflows/mysql-driver-matrix.yml) is shared by CI and release.
+The MySQL driver matrix is shared by CI and release.
 It checks CLI/JDBC/Hikari, explicit/deferred catalogs, and TLS.
 
 ## Shared-pool isolation
@@ -104,7 +104,7 @@ bash .github/ci/shared-pool-isolation.sh all
 
 These cover tenant isolation and backup/restore with peer-data preservation.
 Local `all` runs sequentially; cleanup targets managed test containers only.
-The [workflow](../workflows/shared-pool-isolation.yml) runs weekly/manually,
+The shared-pool isolation workflow runs weekly/manually,
 **not as an ordinary push/release gate**.
 
 ## Online backups without volume snapshots
@@ -163,10 +163,30 @@ bash .github/ci/project-quota-smoke.sh xfs
 bash .github/ci/project-quota-smoke.sh ext4
 ```
 
-The [weekly/manual workflow](../workflows/project-quota-smoke.yml) checks
+The weekly/manual project quota workflow checks
 adoption, isolation, accounting, exhaustion, resize, and cleanup, temporarily
 backing up/restoring XFS project files. Optional `f2fs` needs kernel support
 and `f2fs-tools`; use `all` for every backend.
+
+## Rootless Podman smoke
+
+The `podman_smoke` job in [CI](../workflows/ci.yml) (named "Rootless Podman
+compatibility") runs `.github/ci/podman-smoke.sh` on Linux. The script starts
+`podman system service` on `$XDG_RUNTIME_DIR/podman/podman.sock` with
+`--cgroup-manager=cgroupfs`, waits for the API to answer `_ping`, then runs the
+ignored test `rootless_podman_compatibility_smoke` against it, with a 10-minute
+timeout. The test uses one Alpine container. The CI gate requires this job.
+
+To run it locally, use an unprivileged account with Podman 4.3 or newer, the
+`newuidmap`/`newgidmap` tools, and a subuid/subgid range, plus the pinned Rust
+toolchain:
+
+```bash
+bash .github/ci/podman-smoke.sh
+```
+
+The job uses the cgroupfs manager, so it does not prove that resource limits
+are enforced. It checks API compatibility only.
 
 ## Release notes
 

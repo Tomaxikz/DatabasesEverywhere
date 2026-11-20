@@ -125,6 +125,13 @@ impl HostPathPolicy {
     }
 }
 
+/// True when `value` satisfies the rules of a managed runtime root, so the
+/// daemon may own and re-mode it. Shared or protected directories such as
+/// `/run` or `/root` do not.
+pub fn is_dedicated_root(value: &str) -> bool {
+    validate_root("paths.run", value).is_ok()
+}
+
 fn validate_root(field: &'static str, value: &str) -> Result<PathBuf, HostPathPolicyError> {
     let path = Path::new(value);
     if !path.is_absolute() {

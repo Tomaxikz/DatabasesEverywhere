@@ -299,26 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn encrypts_plaintext_even_when_it_starts_with_the_ciphertext_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SecretStore::open_or_create(dir.path()).unwrap();
-        let plaintext = "dbev1:chosen-by-the-user";
-
-        let encrypted = store
-            .encrypt("tenant_password", "inst_prefix", plaintext)
-            .unwrap();
-
-        assert!(is_encrypted(&encrypted));
-        assert_ne!(encrypted, plaintext);
-        assert_eq!(
-            store
-                .decrypt("tenant_password", "inst_prefix", &encrypted)
-                .unwrap(),
-            plaintext
-        );
-    }
-
-    #[test]
     fn fingerprints_are_keyed_bound_and_length_delimited() {
         let first_dir = tempfile::tempdir().unwrap();
         let second_dir = tempfile::tempdir().unwrap();

@@ -280,16 +280,21 @@ daemon:
   # Intentionally stopped pools are not started. No pool-ID allowlist is needed.
   # docker or podman. Both use the Docker-compatible container API.
   engine: docker
-  # Optional. Docker uses its normal local socket when empty. A root-run Podman
-  # daemon uses /run/podman/podman.sock when this is empty.
-  # For a rootless service managed by dbev --setup, configure the exact
-  # standard path explicitly, for example /run/user/1000/podman/podman.sock.
+  # Optional. Docker uses its normal local socket when empty. Rootful Podman
+  # uses /run/podman/podman.sock when this is empty.
+  # Rootless Podman: set the exact path /run/user/<uid>/podman/podman.sock,
+  # where <uid> is the numeric uid of the service account, for example
+  # /run/user/1000/podman/podman.sock. The socket must be owned by that uid.
+  # dbev --setup manages that account's socket when this path is set.
   socket_path: ""
   # Database containers always use network_mode=none. The daemon reaches
   # each backend through its private, instance-specific Unix socket.
   # Optional container HostConfig hardening knobs. Podman automatically gets
   # label=disable unless an explicit label=... security option is supplied.
   container_read_only_rootfs: false
+  # Overridden under rootless Podman, where the daemon picks the mapping per
+  # engine: keep-id for PostgreSQL, MySQL, MariaDB and MongoDB, and the host
+  # mapping with user 0:0 for Redis, Valkey, ClickHouse and Qdrant.
   container_userns_mode: ''
   container_seccomp_profile: ''
   container_apparmor_profile: ''

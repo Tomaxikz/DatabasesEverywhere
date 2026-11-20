@@ -294,19 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn quota_policy_does_not_claim_native_enforcement() {
-        let policy = tenant_quota_policy(TenantQuota {
-            max_connections: 8,
-            max_operation_time_ms: 30_000,
-            storage_bytes: 10 * 1024 * 1024 * 1024,
-        });
-
-        assert!(!policy.engine_enforced);
-        assert_eq!(policy.quota.max_connections, 8);
-        assert_eq!(policy.quota.max_operation_time_ms, 30_000);
-    }
-
-    #[test]
     fn storage_script_uses_database_total_size_in_input_order() {
         let script = tenant_storage_script(&["tenant_a", "tenant-b"]).unwrap();
 

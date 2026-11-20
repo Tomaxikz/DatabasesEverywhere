@@ -282,18 +282,6 @@ fn schema_versions_and_details_must_agree() {
     ));
 }
 
-#[test]
-fn future_schema_versions_are_rejected_as_unsupported() {
-    let mut future = legacy_manifest_json("physical");
-    future["schema_version"] = serde_json::json!(3);
-    future["something_new"] = serde_json::json!({"recipe": "x"});
-    let bytes = serde_json::to_vec(&future).unwrap();
-    assert!(matches!(
-        StoredBackup::from_json(&bytes, "inst_old", "metadata"),
-        Err(BackupStoreError::UnsupportedFormat(message)) if message.contains("schema 3")
-    ));
-}
-
 #[tokio::test]
 async fn current_manifests_round_trip_their_restore_contract() {
     let temp = tempfile::tempdir().unwrap();

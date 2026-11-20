@@ -22,8 +22,49 @@ const COMPRESSION_FIXED_OVERHEAD_BYTES: u64 = 1024 * 1024;
 const EXPORT_GZIP_LEVEL: u32 = 3;
 
 pub(crate) async fn logical_staging_root(state: &AppState) -> Result<PathBuf, ApiError> {
-    let root = PathBuf::from(state.config.paths.tmp_root()).join("import-export");
-    prepare_private_dir(&root, "logical import/export staging directory").await?;
+    prepare_logical_staging_root(
+        FsPath::new(&state.config.paths.tmp_root()),
+        state.docker.rootless_podman_host_owner(),
+    )
+    .await
+}
+
+pub(super) async fn prepare_logical_staging_root(
+    tmp_root: &FsPath,
+    rootless_owner: Option<(u32, u32)>,
+) -> Result<PathBuf, ApiError> {
+    let root = tmp_root.join("import-export");
+    let Some((_, gid)) = rootless_owner else {
+        prepare_private_dir(&root, "logical import/export staging directory").await?;
+        return Ok(root);
+    };
+    // Rootless Podman must keep traversing both directories while jobs run.
+    // The parent is verified first (real directory, daemon-owned, opened
+    // without following a link), so a replaced tmp root is rejected before
+    // anything below it is created or changed. Each path is registered only
+    // after its own grant succeeded.
+    let parent = tmp_root.to_path_buf();
+    let staging_root = root.clone();
+    let daemon_uid = rustix::process::geteuid().as_raw();
+    let granted = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        crate::io::ownership::allow_directory_traversal(&parent, daemon_uid, gid)?;
+        crate::io::ownership::register_traversal_grant(&parent, gid);
+        if !staging_root.is_dir() {
+            create_private_dir(&staging_root)?;
+        }
+        crate::io::ownership::allow_directory_traversal(&staging_root, daemon_uid, gid)?;
+        crate::io::ownership::register_traversal_grant(&staging_root, gid);
+        Ok(())
+    })
+    .await;
+    let describe = |error: &dyn std::fmt::Display| {
+        ApiError::Runtime(format!(
+            "failed to grant rootless traversal to logical import/export staging directory: {error}"
+        ))
+    };
+    granted
+        .map_err(|error| describe(&error))?
+        .map_err(|error| describe(&error))?;
     Ok(root)
 }
 
@@ -251,12 +292,26 @@ pub(super) async fn cleanup_path(path: &FsPath) {
     }
 }
 
+/// Creates or re-secures a private directory (0700). A directory registered as
+/// a rootless bind-mount ancestor keeps its owner-checked 0710 grant instead.
 pub(super) async fn prepare_private_dir(path: &FsPath, label: &str) -> Result<(), ApiError> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || create_private_dir(&path))
-        .await
-        .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))?
-        .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))
+    tokio::task::spawn_blocking(move || {
+        let Some(gid) = crate::io::ownership::registered_traversal_gid(&path) else {
+            return create_private_dir(&path);
+        };
+        if !path.is_dir() {
+            create_private_dir(&path)?;
+        }
+        crate::io::ownership::allow_directory_traversal(
+            &path,
+            rustix::process::geteuid().as_raw(),
+            gid,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))?
+    .map_err(|error| ApiError::Runtime(format!("failed to secure {label}: {error}")))
 }
 
 pub(super) fn create_private_file_sync(path: &FsPath) -> Result<std::fs::File, std::io::Error> {
@@ -430,4 +485,105 @@ pub(crate) async fn commit_recovery_manifest(path: &FsPath) -> Result<(), ApiErr
         move || crate::io::files::remove_private_file_durable(&path),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn logical_staging_root_preserves_0700_on_docker_and_grants_0710_on_rootless_podman() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(temp.path()).unwrap();
+        crate::io::ownership::allow_directory_traversal(
+            temp.path(),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .unwrap();
+
+        let docker_tmp = temp.path().join("docker-tmp");
+        let docker_staging = prepare_logical_staging_root(&docker_tmp, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&docker_staging)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let rootless_tmp = temp.path().join("rootless-tmp");
+        // Daemon boot creates the tmp root; a missing or replaced one is
+        // refused instead of being created here.
+        assert!(
+            prepare_logical_staging_root(&rootless_tmp, Some((1, 1)))
+                .await
+                .is_err()
+        );
+        std::fs::create_dir(&rootless_tmp).unwrap();
+        let rootless_uid = metadata.uid().max(1);
+        let rootless_gid = metadata.gid();
+        let rootless_staging =
+            prepare_logical_staging_root(&rootless_tmp, Some((rootless_uid, rootless_gid)))
+                .await
+                .unwrap();
+        for directory in [&rootless_tmp, &rootless_staging] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o710,
+                "{}",
+                directory.display()
+            );
+        }
+
+        // Later calls on the registered root and its parent (job staging,
+        // copies, rollback dumps) must not strip the grant, not even briefly.
+        for directory in [&rootless_tmp, &rootless_staging] {
+            prepare_private_dir(directory, "logical import staging directory")
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o710,
+                "{}",
+                directory.display()
+            );
+        }
+        // An unregistered sibling stays strictly private.
+        let sibling = rootless_tmp.join("unrelated");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o710)).unwrap();
+        prepare_private_dir(&sibling, "unrelated directory")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&sibling).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let source = temp.path().join("dump.sql");
+        std::fs::write(&source, b"SELECT 1;").unwrap();
+        let digest: [u8; 32] = Sha256::digest(b"SELECT 1;").into();
+        let pinned =
+            super::super::shared_restore::pin_input(&source, &rootless_staging, 9, &digest)
+                .await
+                .unwrap();
+        assert_eq!(
+            std::fs::metadata(&pinned.root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        crate::io::ownership::ensure_traversable(&pinned.root, rootless_uid, rootless_gid).unwrap();
+        pinned.cleanup().await.unwrap();
+    }
 }

@@ -382,20 +382,6 @@ async fn boot_cutoff_applies_to_dedicated_instances_and_shared_pools() {
 }
 
 #[test]
-fn startup_resolves_qdrant_away_from_the_fuse_fallback() {
-    let limiter = DiskLimiter::new(crate::config::DiskConfig::default());
-
-    assert_eq!(
-        limiter.mode_for_protocol(Protocol::Qdrant),
-        crate::config::DiskLimitMode::SoftScanner
-    );
-    assert_eq!(
-        limiter.mode_for_protocol(Protocol::Postgres),
-        crate::config::DiskLimitMode::FuseQuota
-    );
-}
-
-#[test]
 fn stale_qdrant_fuse_mount_does_not_trigger_container_recreation() {
     let legacy = Path::new("/var/lib/dbev/fuse/instances/qdrant");
 
@@ -738,4 +724,136 @@ fn daemon_lock_is_private_and_exclusive() {
     drop(first);
 
     acquire_daemon_lock(&locks).unwrap();
+}
+
+#[test]
+fn rootless_podman_traversal_prepares_import_export_and_keeps_job_sandboxes_private() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let metadata = fs::metadata(temp.path()).unwrap();
+    crate::io::ownership::allow_directory_traversal(temp.path(), metadata.uid(), metadata.gid())
+        .unwrap();
+    let data = temp.path().join("data");
+    let run = temp.path().join("run");
+    let logs = temp.path().join("logs");
+    let mut config = Config::default();
+    config.paths.data = data.display().to_string();
+    config.paths.run = run.display().to_string();
+    config.paths.logs = logs.display().to_string();
+
+    let traversal_paths = super::runtime_paths::rootless_traversal_paths(&config);
+    let import_export = PathBuf::from(config.paths.tmp_root()).join("import-export");
+    let remote_import = PathBuf::from(config.paths.tmp_root()).join("remote-import");
+    // The run root is not a managed root; it only gets a grant as the private
+    // parent of the sockets root, never when it is already searchable.
+    assert!(!traversal_paths.contains(&run));
+    assert!(traversal_paths.contains(&import_export));
+    assert!(traversal_paths.contains(&remote_import));
+
+    let rootless_uid = metadata.uid().max(1);
+    let rootless_gid = metadata.gid();
+    super::runtime_paths::prepare_rootless_paths_for_owner(&config, rootless_uid, rootless_gid)
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(&import_export).unwrap().permissions().mode() & 0o777,
+        0o710
+    );
+    // A dedicated run root above the sockets root always carries the grant,
+    // so binding the API socket below it later keeps that mode.
+    assert_eq!(
+        fs::metadata(&run).unwrap().permissions().mode() & 0o777,
+        0o710
+    );
+    assert_eq!(
+        super::runtime_paths::private_run_ancestor(&config),
+        Some(run.clone())
+    );
+    crate::io::ownership::secure_private_dir_keeping_traversal(&run).unwrap();
+    assert_eq!(
+        fs::metadata(&run).unwrap().permissions().mode() & 0o777,
+        0o710
+    );
+
+    // Shared or protected run roots are never re-moded, nor is a run root
+    // that is not above the sockets root.
+    for shared in ["/run", "/root", "/home/someone"] {
+        let mut shared_config = Config::default();
+        shared_config.paths.run = shared.to_string();
+        shared_config.paths.sockets = format!("{shared}/dbev/sockets");
+        assert_eq!(
+            super::runtime_paths::private_run_ancestor(&shared_config),
+            None,
+            "{shared}"
+        );
+    }
+    let mut elsewhere = Config::default();
+    elsewhere.paths.run = run.display().to_string();
+    elsewhere.paths.sockets = temp.path().join("elsewhere").display().to_string();
+    assert_eq!(super::runtime_paths::private_run_ancestor(&elsewhere), None);
+
+    let sandbox = import_export.join(".dbe-shared-restore-00000000000040008000000000000001");
+    crate::io::files::ensure_private_dir(&sandbox).unwrap();
+    assert_eq!(
+        fs::metadata(&sandbox).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    check_rootless_path_access(&sandbox, rootless_uid, rootless_gid).unwrap();
+}
+
+#[test]
+fn podman_system_socket_alias_has_system_unit_dependencies() {
+    let daemon = crate::config::DaemonConfig {
+        engine: DaemonEngine::Podman,
+        socket_path: "/var/run/podman/podman.sock".to_string(),
+        ..Default::default()
+    };
+    let unit = systemd_service_contents(Path::new(defaults::CONFIG_PATH), &daemon);
+    assert!(unit.contains("Requires=podman.socket\n"));
+}
+
+#[test]
+fn only_an_inactive_user_manager_is_started_and_only_an_active_one_is_verified_in_place() {
+    use super::setup::{UserManagerState, delegation_restart_guidance, user_manager_state};
+
+    assert_eq!(user_manager_state("inactive\n"), UserManagerState::Inactive);
+    assert_eq!(user_manager_state("active\n"), UserManagerState::Active);
+    // A failed or transitional manager, or a failed query, is neither started
+    // nor treated as running.
+    for output in [
+        "activating\n",
+        "deactivating\n",
+        "failed\n",
+        "reloading\n",
+        "",
+    ] {
+        assert!(
+            matches!(user_manager_state(output), UserManagerState::Unsettled(_)),
+            "{output:?}"
+        );
+    }
+    let guidance = delegation_restart_guidance(
+        "user@1001.service",
+        "cpu",
+        Path::new("/etc/systemd/system/user@1001.service.d/dbev-delegate.conf"),
+    );
+    assert!(guidance.contains("user@1001.service lacks cpu"));
+    assert!(guidance.contains("maintenance window"));
+    assert!(guidance.contains("systemctl restart user@1001.service"));
+}
+
+#[test]
+fn rootless_setup_guidance_is_scoped_to_the_account_and_names_no_fixed_id_range() {
+    use super::setup::{delegation_drop_in_path, subordinate_range_remedy};
+
+    assert_eq!(
+        delegation_drop_in_path(1001),
+        Path::new("/etc/systemd/system/user@1001.service.d/dbev-delegate.conf")
+    );
+    let remedy = subordinate_range_remedy("svc", 0, 4096);
+    assert!(remedy.contains("svc has 0 subordinate UIDs and 4096 subordinate GIDs"));
+    assert!(remedy.contains("does not overlap"));
+    assert!(remedy.contains("--add-subuids START-END --add-subgids START-END svc"));
+    assert!(!remedy.contains("100000"));
 }

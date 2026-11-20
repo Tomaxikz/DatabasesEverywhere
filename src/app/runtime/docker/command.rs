@@ -363,7 +363,7 @@ impl DockerRuntime {
                 %operation,
                 exit_code,
                 %failure_output,
-                "docker exec failed"
+                "container exec failed"
             );
         }
         Err(DockerError::ExecFailed {
@@ -438,7 +438,7 @@ impl DockerRuntime {
             %container,
             %operation,
             timeout_seconds = timeout.as_secs(),
-            "docker exec timed out; restarting the managed container to stop the command and preserve runtime availability"
+            "container exec timed out; restarting the managed container to stop the command and preserve runtime availability"
         );
         self.restart_after_exec(
             protocol,
@@ -461,7 +461,7 @@ impl DockerRuntime {
         tracing::warn!(
             %container,
             %operation,
-            "docker exec was interrupted before exit could be confirmed; restarting the managed container"
+            "container exec was interrupted before exit could be confirmed; restarting the managed container"
         );
         self.restart_after_exec(
             protocol,
@@ -513,7 +513,7 @@ impl DockerRuntime {
         tracing::info!(
             %container,
             %operation,
-            "managed container recovered after interrupted docker exec"
+            "managed container recovered after interrupted container exec"
         );
         Ok(())
     }

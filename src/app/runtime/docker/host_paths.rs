@@ -118,7 +118,7 @@ impl DockerRuntime {
         for (inside, host) in &paths.mounts {
             tracing::debug!(inside = %inside.display(), host = %host.display(), "container mount");
         }
-        tracing::info!(container = %id, mounts = paths.mounts.len(), "translating host paths for Docker");
+        tracing::info!(container = %id, mounts = paths.mounts.len(), "translating host paths for the container");
         if HOST_PATHS.set(paths).is_err() {
             bail!("host paths were already detected");
         }

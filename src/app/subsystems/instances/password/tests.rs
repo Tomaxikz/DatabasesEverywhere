@@ -1,4 +1,7 @@
-use super::rotation::{is_password_rejection, needs_postgres_hardening, protected_value_matches};
+use super::rotation::{
+    is_password_rejection, needs_postgres_hardening, protected_value_matches, restore_resp_acl,
+    write_resp_acl,
+};
 use super::supervision::{
     PasswordMetadataCommitResolution, PasswordWorkerPanicRecoveryPlan, apply_new_route_auth,
     classify_password_commit, plan_panic_recovery, quarantined_metadata, run_password_worker,
@@ -386,4 +389,78 @@ fn test_metadata(protocol: Protocol) -> InstanceMetadata {
     metadata.database.name = "app_db".to_string();
     metadata.database.username = "app_user".to_string();
     metadata
+}
+
+#[tokio::test]
+async fn resp_password_rotation_and_rollback_use_rootless_podman_host_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let host_meta = std::fs::metadata(temp.path()).unwrap();
+    let mut config = crate::config::Config::default();
+    config.paths.data = temp.path().join("data").display().to_string();
+    config.paths.run = temp.path().join("run").display().to_string();
+    config.paths.logs = temp.path().join("logs").display().to_string();
+    let paths = InstancePaths::new(&config.paths, "inst_resp_owner").unwrap();
+    paths.create_dirs().await.unwrap();
+
+    let (base_state, _db_dir) = crate::subsystems::test_support::database(config).await;
+    let target_uid = host_meta.uid().saturating_add(100);
+    let mut rootless_data = (*base_state).clone();
+    rootless_data.docker = crate::runtime::docker::DockerRuntime::offline_for_tests(
+        &crate::config::DaemonConfig {
+            engine: crate::config::DaemonEngine::Podman,
+            socket_path: format!("/run/user/{target_uid}/podman/podman.sock"),
+            ..Default::default()
+        },
+        false,
+    );
+    let rootless_state = AppState::new(rootless_data);
+    assert_eq!(
+        rootless_state.docker.rootless_podman_host_owner(),
+        Some((target_uid, target_uid))
+    );
+
+    let rotation = write_resp_acl(
+        &rootless_state,
+        Protocol::Redis,
+        &paths,
+        &paths.data,
+        "app_user",
+        &SecretString::from("rotated-password"),
+    )
+    .await;
+    if host_meta.uid() == 0 {
+        rotation.unwrap();
+        let acl_meta = std::fs::metadata(paths.data.join("users.acl")).unwrap();
+        assert_eq!((acl_meta.uid(), acl_meta.gid()), (target_uid, target_uid));
+    } else {
+        // An unprivileged test caller cannot chown to target_uid, proving rotation attempted to
+        // apply the rootless Podman host owner rather than keeping the directory's current owner.
+        let error = rotation.unwrap_err().to_string();
+        assert!(
+            error.contains("failed to set container owner"),
+            "unexpected rotation error: {error}"
+        );
+    }
+
+    let rollback = restore_resp_acl(
+        &rootless_state,
+        Protocol::Redis,
+        &paths,
+        &paths.data,
+        b"user dbe_health on nopass -@all +ping\nuser app_user on #0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ~* &* +@all\n",
+    )
+    .await;
+    if host_meta.uid() == 0 {
+        rollback.unwrap();
+        let acl_meta = std::fs::metadata(paths.data.join("users.acl")).unwrap();
+        assert_eq!((acl_meta.uid(), acl_meta.gid()), (target_uid, target_uid));
+    } else {
+        let error = rollback.unwrap_err().to_string();
+        assert!(
+            error.contains("failed to set container owner"),
+            "unexpected rollback error: {error}"
+        );
+    }
 }

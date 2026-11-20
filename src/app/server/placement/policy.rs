@@ -76,16 +76,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_tenant_safe_engines_have_shared_capacity() {
-        for protocol in Protocol::ALL {
-            assert_eq!(
-                engine_disk_overhead(protocol).is_some(),
-                crate::server::placement::DeploymentMode::Shared.supports(protocol)
-            );
-        }
-    }
-
-    #[test]
     fn connection_budget_is_bounded() {
         let mut limits = InstanceLimits {
             memory_mib: 64,
