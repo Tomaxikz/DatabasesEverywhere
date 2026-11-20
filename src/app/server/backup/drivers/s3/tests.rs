@@ -1,14 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use axum::{
-    Router,
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::Response,
-};
-use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-
 use super::{
     client::{bucket_endpoint, endpoint_base},
     objects::object_path,
@@ -22,6 +13,20 @@ use crate::{
         test_details,
     },
 };
+use axum::{
+    Router,
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
+
+mod fixture;
+mod listing;
+mod retries;
+mod wire;
+
+use fixture::Fixture;
 
 const PREFIX: &str = "dbev/instances/inst_one/backups/";
 
@@ -76,22 +81,10 @@ pub(super) async fn bundle_with_archive(
     (bundle, manifest)
 }
 
-async fn keys(store: &InMemory) -> Vec<String> {
-    use futures::TryStreamExt;
-    let mut keys: Vec<String> = store
-        .list(None)
-        .map_ok(|meta| meta.location.to_string())
-        .try_collect()
-        .await
-        .unwrap();
-    keys.sort();
-    keys
-}
-
 #[tokio::test]
 async fn round_trips_a_backup_with_its_catalog() {
     let temp = tempfile::tempdir().unwrap();
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     let (bundle, manifest) = bundle_with_archive(temp.path(), "inst_one", b"archive", true).await;
     let id = manifest.backup_id.clone();
 
@@ -101,7 +94,7 @@ async fn round_trips_a_backup_with_its_catalog() {
         .unwrap();
 
     assert_eq!(
-        keys(&store).await,
+        store.keys(),
         vec![
             format!("{PREFIX}{id}"),
             format!("{PREFIX}{id}.catalog.json"),
@@ -123,7 +116,7 @@ async fn round_trips_a_backup_with_its_catalog() {
     assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"archive");
 
     driver.delete("inst_one", &id).await.unwrap();
-    assert!(keys(&store).await.is_empty());
+    assert!(store.keys().is_empty());
     assert!(matches!(
         driver.find("inst_one", &id).await,
         Err(BackupStoreError::NotFound)
@@ -133,7 +126,7 @@ async fn round_trips_a_backup_with_its_catalog() {
 #[tokio::test]
 async fn commit_refuses_an_archive_that_does_not_match_its_manifest() {
     let temp = tempfile::tempdir().unwrap();
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     let (bundle, mut manifest) =
         bundle_with_archive(temp.path(), "inst_one", b"archive", false).await;
     manifest.sha256 = "00".repeat(32);
@@ -144,13 +137,13 @@ async fn commit_refuses_an_archive_that_does_not_match_its_manifest() {
         .unwrap_err();
 
     assert!(error.to_string().contains("SHA-256"), "{error}");
-    assert!(keys(&store).await.is_empty());
+    assert!(store.keys().is_empty());
 }
 
 #[tokio::test]
 async fn large_archives_use_a_journaled_verified_multipart_upload() {
     let temp = tempfile::tempdir().unwrap();
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     let archive: Vec<u8> = (0..MULTIPART_THRESHOLD_BYTES + 1)
         .map(|index| (index % 251) as u8)
         .collect();
@@ -166,13 +159,7 @@ async fn large_archives_use_a_journaled_verified_multipart_upload() {
         [PublicationResource::S3MultipartUpload { key, upload_id }]
             if *key == archive_key && !upload_id.is_empty()
     ));
-    let stored = store
-        .get(&ObjectPath::parse(&archive_key).unwrap())
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
+    let stored = store.get(&archive_key);
     assert_eq!(stored.as_ref(), archive.as_slice());
 
     // A changed source fails before the upload completes, and nothing stays.
@@ -181,8 +168,8 @@ async fn large_archives_use_a_journaled_verified_multipart_upload() {
     manifest.sha256 = "00".repeat(32);
     assert!(driver.commit(&bundle, &manifest, &journal).await.is_err());
     assert!(
-        !keys(&store)
-            .await
+        !store
+            .keys()
             .contains(&format!("{PREFIX}{}", manifest.backup_id))
     );
 }
@@ -190,7 +177,7 @@ async fn large_archives_use_a_journaled_verified_multipart_upload() {
 #[tokio::test]
 async fn inventory_stays_inside_the_instance_prefix() {
     let temp = tempfile::tempdir().unwrap();
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     for instance in ["inst_one", "inst_one_b", "inst_two"] {
         let (bundle, manifest) = bundle_with_archive(temp.path(), instance, b"a", false).await;
         driver
@@ -199,30 +186,16 @@ async fn inventory_stays_inside_the_instance_prefix() {
             .unwrap();
     }
     // Newer metadata is listed opaquely; a stray object is never a backup.
-    let mut newer: serde_json::Value = serde_json::from_slice(
-        &driver
-            .get_bytes(&keys(&store).await[1], 1 << 20)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let mut newer: serde_json::Value =
+        serde_json::from_slice(&driver.get_bytes(&store.keys()[1], 1 << 20).await.unwrap())
+            .unwrap();
     newer["schema_version"] = 99.into();
     newer["backup_id"] = "zz-newer.physical.tar.gz".into();
-    store
-        .put(
-            &ObjectPath::parse(format!("{PREFIX}zz-newer.physical.tar.gz.metadata.json")).unwrap(),
-            serde_json::to_vec(&newer).unwrap().into(),
-        )
-        .await
-        .unwrap();
-    store
-        .put(
-            &ObjectPath::parse(format!("{PREFIX}orphan")).unwrap(),
-            "x".into(),
-        )
-        .await
-        .unwrap();
-
+    store.insert(
+        format!("{PREFIX}zz-newer.physical.tar.gz.metadata.json"),
+        serde_json::to_vec(&newer).unwrap().into(),
+    );
+    store.insert(format!("{PREFIX}orphan"), "x".into());
     let inventory = driver.inventory("inst_one").await.unwrap();
 
     assert_eq!(inventory.backups.len(), 1);
@@ -234,7 +207,7 @@ async fn inventory_stays_inside_the_instance_prefix() {
     );
 
     assert_eq!(driver.delete_instance("inst_one").await.unwrap(), 2);
-    let remaining = keys(&store).await;
+    let remaining = store.keys();
     assert!(remaining.iter().all(|key| !key.starts_with(PREFIX)));
     assert_eq!(remaining.len(), 4);
 }
@@ -242,15 +215,17 @@ async fn inventory_stays_inside_the_instance_prefix() {
 #[tokio::test]
 async fn purge_aborts_journaled_uploads_and_removes_every_object() {
     let temp = tempfile::tempdir().unwrap();
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     let (bundle, manifest) = bundle_with_archive(temp.path(), "inst_one", b"a", false).await;
     driver
         .commit(&bundle, &manifest, &DiscardJournal)
         .await
         .unwrap();
     let archive = format!("{PREFIX}{}", manifest.backup_id);
-    let upload_id = store
-        .create_multipart(&ObjectPath::parse(&archive).unwrap())
+    let upload_id = driver.client.create_multipart(&archive).await.unwrap();
+    driver
+        .client
+        .put_part(&archive, &upload_id, 1, "x".into())
         .await
         .unwrap();
     let resources = [PublicationResource::S3MultipartUpload {
@@ -263,16 +238,14 @@ async fn purge_aborts_journaled_uploads_and_removes_every_object() {
         .await
         .unwrap();
 
-    assert!(keys(&store).await.is_empty());
-    let aborted = store
-        .put_part(
-            &ObjectPath::parse(&archive).unwrap(),
-            &upload_id,
-            0,
-            "x".into(),
-        )
-        .await;
-    assert!(aborted.is_err());
+    assert!(store.keys().is_empty());
+    assert!(
+        driver
+            .client
+            .upload_gone(&archive, &upload_id)
+            .await
+            .unwrap()
+    );
     // With no upload left, a repeated purge only confirms absence.
     driver
         .purge_unpublished("inst_one", &manifest.backup_id, &[])
@@ -282,13 +255,9 @@ async fn purge_aborts_journaled_uploads_and_removes_every_object() {
 
 #[tokio::test]
 async fn bounded_reads_refuse_oversized_objects() {
-    let (driver, store) = S3BackupDriver::in_memory(config());
+    let (driver, store) = Fixture::start().await;
     let key = format!("{PREFIX}big");
-    store
-        .put(&ObjectPath::parse(&key).unwrap(), vec![0_u8; 16].into())
-        .await
-        .unwrap();
-
+    store.insert(key.clone(), vec![0_u8; 16].into());
     let error = driver.get_bytes(&key, 15).await.unwrap_err();
 
     assert!(error.to_string().contains("exceeded its safety limit"));
@@ -297,11 +266,8 @@ async fn bounded_reads_refuse_oversized_objects() {
 
 #[test]
 fn keys_must_be_normalized_object_paths() {
-    assert_eq!(
-        object_path(PREFIX).unwrap().as_ref(),
-        PREFIX.trim_end_matches('/')
-    );
-    assert_eq!(object_path("a/b c+d").unwrap().as_ref(), "a/b c+d");
+    assert_eq!(object_path(PREFIX).unwrap(), PREFIX.trim_end_matches('/'));
+    assert_eq!(object_path("a/b c+d").unwrap(), "a/b c+d");
     for key in ["a//b", "a/../b", "/a", "a/\u{1}"] {
         assert!(object_path(key).is_err(), "{key}");
     }
@@ -357,7 +323,7 @@ fn config_maps_onto_identity_and_bucket_endpoints() {
 }
 
 #[test]
-fn signed_requests_encode_keys_like_object_store() {
+fn signed_requests_preserve_s3_key_and_query_encoding() {
     let config = BackupS3Config {
         endpoint: "http://minio:9000".to_string(),
         path_style: true,
@@ -365,7 +331,7 @@ fn signed_requests_encode_keys_like_object_store() {
         ..config()
     };
     let driver = S3BackupDriver::new(config).unwrap();
-    let uploads = driver.uploads.as_deref().unwrap();
+    let uploads = &driver.client;
     assert_eq!(
         uploads
             .url("dbev/a b+c", &[("max-parts", "1"), ("uploadId", "x/y")])
@@ -402,11 +368,8 @@ async fn mock_s3(respond: fn(&str, &str) -> (StatusCode, Vec<u8>)) -> MockS3 {
                 .unwrap()
         }
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
     MockS3 {
-        endpoint: format!("http://{address}"),
+        endpoint: wire::serve(app).await,
         requests,
     }
 }
@@ -493,12 +456,12 @@ async fn server_errors_are_retried_up_to_max_retries() {
     assert_eq!(mock.requests.lock().unwrap().len(), 3);
 
     mock.requests.lock().unwrap().clear();
-    let uploads = driver.uploads.as_deref().unwrap();
-    let (status, _) = uploads
-        .send(reqwest::Method::GET, "", &[("uploads", "")], "list")
+    let uploads = &driver.client;
+    let response = uploads
+        .discovery_get("", &[("uploads", "")], "list")
         .await
         .unwrap();
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(mock.requests.lock().unwrap().len(), 3);
 }
 
@@ -538,7 +501,7 @@ async fn only_no_such_upload_confirms_an_abort() {
     })
     .await;
     let driver = mock_driver(&mock, 0);
-    let uploads = driver.uploads.as_deref().unwrap();
+    let uploads = &driver.client;
 
     assert!(
         uploads

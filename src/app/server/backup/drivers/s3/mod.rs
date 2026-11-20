@@ -1,9 +1,8 @@
-//! S3 backup storage on `object_store`'s `AmazonS3`, adding backup layout, response security checks and multipart discovery.
+//! S3 backup storage with signed requests and journaled multipart uploads.
 
 use std::{fmt, sync::Arc};
 
 use futures::future::BoxFuture;
-use object_store::{ObjectStore, multipart::MultipartStore};
 use reqwest::Url;
 
 use crate::{
@@ -28,26 +27,26 @@ const MAX_RETRY_BACKOFF_EXPONENT: u32 = 4;
 const METADATA_KEY_SUFFIX: &str = ".metadata.json";
 
 mod client;
+mod download;
 mod keys;
+mod listing;
 #[cfg(test)]
 mod minio_tests;
 mod multipart;
+mod multipart_api;
 mod objects;
 mod operations;
+mod signing;
 #[cfg(test)]
 mod tests;
 
-use self::client::{S3Credentials, UploadAdmin};
+use self::client::S3Client;
 
 #[derive(Clone)]
 pub struct S3BackupDriver {
     config: BackupS3Config,
     base: Url,
-    credentials: S3Credentials,
-    store: Arc<dyn ObjectStore>,
-    multipart: Arc<dyn MultipartStore>,
-    /// Absent only for stores without an S3 API (tests on `InMemory`).
-    uploads: Option<Arc<UploadAdmin>>,
+    client: Arc<S3Client>,
 }
 
 impl fmt::Debug for S3BackupDriver {
@@ -125,42 +124,11 @@ impl S3BackupDriver {
         let credentials = client::credentials(&config)?;
         let base = client::endpoint_base(&config)?;
         let bucket_endpoint = client::bucket_endpoint(&base, &config);
-        let http = client::http_client(&config)?;
-        let store = Arc::new(client::amazon_s3(
-            &config,
-            &credentials,
-            &bucket_endpoint,
-            http.clone(),
-        )?);
-        let uploads = UploadAdmin::new(&config, &credentials, &bucket_endpoint, http);
+        let client = Arc::new(S3Client::new(&config, credentials, bucket_endpoint)?);
         Ok(Self {
             config,
             base,
-            credentials,
-            store: store.clone(),
-            multipart: store,
-            uploads: Some(Arc::new(uploads)),
+            client,
         })
-    }
-}
-
-#[cfg(test)]
-impl S3BackupDriver {
-    /// Driver over `object_store`'s in-memory store (no network, no multipart listing).
-    fn in_memory(config: BackupS3Config) -> (Self, Arc<object_store::memory::InMemory>) {
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let driver = Self {
-            base: client::endpoint_base(&config).unwrap(),
-            credentials: S3Credentials {
-                access_key_id: "AKID".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
-            },
-            config,
-            store: store.clone(),
-            multipart: store.clone(),
-            uploads: None,
-        };
-        (driver, store)
     }
 }

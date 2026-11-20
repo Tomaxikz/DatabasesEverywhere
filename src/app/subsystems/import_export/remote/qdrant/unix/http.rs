@@ -38,7 +38,7 @@ impl QdrantHttp {
         source: &RemoteImportSource,
         policy: &crate::config::RemoteImportSecurityConfig,
     ) -> Result<Self, ApiError> {
-        let mut builder = Client::builder()
+        let mut builder = crate::utils::tls::http_client_builder()
             .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
             .no_proxy()
             .redirect(Policy::none())
@@ -81,7 +81,7 @@ impl QdrantHttp {
         api_key: &secrecy::SecretString,
         timeout: Duration,
     ) -> Result<Self, ApiError> {
-        let client = Client::builder()
+        let client = crate::utils::tls::http_client_builder()
             .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
             .no_proxy()
             .redirect(Policy::none())

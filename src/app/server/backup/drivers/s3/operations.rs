@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{METADATA_KEY_SUFFIX, S3BackupDriver};
+use super::{METADATA_KEY_SUFFIX, S3BackupDriver, multipart::UploadScope};
 use crate::server::backup::{
     BackupBundle, BackupInventory, BackupStoreError, MAX_METADATA_BYTES, StoredBackup,
     UnsupportedBackup,
@@ -10,8 +10,8 @@ use crate::server::backup::{
 
 impl S3BackupDriver {
     pub async fn preflight(&self) -> Result<(), BackupStoreError> {
-        if self.credentials.access_key_id.is_empty()
-            || self.credentials.secret_access_key.is_empty()
+        if self.client.credentials.access_key_id().is_empty()
+            || self.client.credentials.secret_access_key().is_empty()
         {
             return Err(BackupStoreError::InvalidConfiguration(
                 "S3 credentials are empty".to_string(),
@@ -112,15 +112,12 @@ impl S3BackupDriver {
                             diagnostic: reason,
                         }),
                         None => tracing::warn!(
-                            object_key = %key,
-                            %reason,
                             "ignored unsupported S3 backup metadata with an invalid key"
                         ),
                     }
                 }
                 Err(error @ (BackupStoreError::InvalidBackupId | BackupStoreError::Corrupt(_))) => {
                     tracing::warn!(
-                        object_key = %key,
                         %error,
                         "ignored invalid S3 backup metadata"
                     )
@@ -144,12 +141,12 @@ impl S3BackupDriver {
         let journaled = journaled_uploads(resources, &[&archive, &catalog])?;
         self.delete_object(&metadata, true).await?;
         for key in [&archive, &catalog] {
-            let upload_ids = journaled
+            let uploads = journaled
                 .iter()
                 .filter(|(upload_key, _)| upload_key == key)
-                .map(|(_, upload_id)| *upload_id)
-                .collect::<Vec<_>>();
-            self.purge_multipart_uploads(key, &upload_ids).await?;
+                .map(|(_, upload_id)| (key.clone(), (*upload_id).to_owned()));
+            self.purge_multipart_uploads(UploadScope::Exact(key), uploads)
+                .await?;
         }
         for key in [catalog, archive] {
             self.delete_object(&key, true).await?;
@@ -211,7 +208,19 @@ impl S3BackupDriver {
 
     pub async fn delete_instance(&self, instance_id: &str) -> Result<usize, BackupStoreError> {
         let prefix = self.instance_prefix(instance_id)?;
-        let mut keys = self.list_keys(&prefix).await?;
+        // Uploads go first, so a completion that wins the abort race is still listed below.
+        // A store that refuses multipart listing (missing permission, unsupported call) must
+        // not keep the instance's stored backups alive: remove the objects, then report it.
+        let uploads = self
+            .purge_multipart_uploads(UploadScope::InstancePrefix(&prefix), [])
+            .await;
+        let objects = self.delete_instance_objects(&prefix).await;
+        uploads?;
+        objects
+    }
+
+    async fn delete_instance_objects(&self, prefix: &str) -> Result<usize, BackupStoreError> {
+        let mut keys = self.list_keys(prefix).await?;
         let published = keys
             .iter()
             .filter(|key| key.ends_with(METADATA_KEY_SUFFIX))
@@ -230,7 +239,17 @@ impl S3BackupDriver {
         key: &str,
     ) -> Result<StoredBackup, BackupStoreError> {
         let bytes = self.get_bytes(key, MAX_METADATA_BYTES).await?;
-        let manifest = StoredBackup::from_json(&bytes, instance_id, "S3 backup metadata")?;
+        let manifest = StoredBackup::from_json(&bytes, instance_id, "S3 backup metadata").map_err(
+            |error| match error {
+                BackupStoreError::Corrupt(_) => {
+                    BackupStoreError::Corrupt("invalid S3 backup metadata".into())
+                }
+                BackupStoreError::UnsupportedFormat(_) => BackupStoreError::UnsupportedFormat(
+                    "unsupported S3 backup metadata format".into(),
+                ),
+                other => other,
+            },
+        )?;
         if self.metadata_key(instance_id, &manifest.backup_id)? != key {
             return Err(BackupStoreError::Corrupt(
                 "S3 backup metadata key does not match its backup id".to_string(),
@@ -254,9 +273,9 @@ fn journaled_uploads<'a>(
             {
                 Ok((key.as_str(), upload_id.as_str()))
             }
-            other => Err(BackupStoreError::Corrupt(format!(
-                "publication journal holds {other:?}, which this S3 backup does not own"
-            ))),
+            _ => Err(BackupStoreError::Corrupt(
+                "publication journal holds a resource this S3 backup does not own".into(),
+            )),
         })
         .collect()
 }

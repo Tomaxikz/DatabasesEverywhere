@@ -1,45 +1,25 @@
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::time::{Duration, SystemTime};
 
+use aws_credential_types::Credentials;
 use bytes::Bytes;
-use http_body::{Body, Frame, SizeHint};
-use object_store::{
-    BackoffConfig, ClientOptions, RetryConfig,
-    aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer, AwsCredential},
-    client::{
-        HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpRequestBody,
-        HttpResponse, HttpResponseBody, HttpService,
-    },
-};
-use reqwest::{Method, StatusCode, Url};
+use http::{HeaderMap, Method, Request, StatusCode, header};
+use reqwest::{Response, Url};
+use serde::Deserialize;
+use tokio::time::Instant;
 
 use super::{
     MAX_CONNECT_TIMEOUT_SECONDS, MAX_RESPONSE_BYTES, MAX_RETRY_BACKOFF_EXPONENT,
     RETRY_BASE_DELAY_MILLIS,
+    objects::object_path,
+    signing::{ReplayBody, sign_request},
 };
-use crate::{config::BackupS3Config, server::backup::BackupStoreError};
+use crate::{
+    config::BackupS3Config,
+    server::backup::BackupStoreError,
+    utils::percent::{encode_path, encode_unreserved},
+};
 
-#[derive(Clone)]
-pub(super) struct S3Credentials {
-    pub(super) access_key_id: String,
-    pub(super) secret_access_key: String,
-    pub(super) session_token: Option<String>,
-}
-
-impl S3Credentials {
-    fn aws(&self) -> AwsCredential {
-        AwsCredential {
-            key_id: self.access_key_id.clone(),
-            secret_key: self.secret_access_key.clone(),
-            token: self.session_token.clone(),
-        }
-    }
-}
-
-pub(super) fn credentials(config: &BackupS3Config) -> Result<S3Credentials, BackupStoreError> {
+pub(super) fn credentials(config: &BackupS3Config) -> Result<Credentials, BackupStoreError> {
     let configured_or_env = |configured: &str, variable: &str| {
         let value = if configured.is_empty() {
             std::env::var(variable).unwrap_or_default()
@@ -67,11 +47,24 @@ pub(super) fn credentials(config: &BackupS3Config) -> Result<S3Credentials, Back
     }
     .map(|token| token.trim().to_string())
     .filter(|token| !token.is_empty());
-    Ok(S3Credentials {
+    // These values are interpolated into HTTP headers by the signer.
+    for value in [access_key_id.as_str(), config.region.trim()]
+        .into_iter()
+        .chain(session_token.as_deref())
+    {
+        if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+            return Err(BackupStoreError::InvalidConfiguration(
+                "S3 signing header contains an invalid character".into(),
+            ));
+        }
+    }
+    Ok(Credentials::new(
         access_key_id,
         secret_access_key,
         session_token,
-    })
+        None,
+        "dbev",
+    ))
 }
 
 /// Service endpoint; its string form is part of the storage identity and must stay stable.
@@ -113,239 +106,346 @@ pub(super) fn bucket_endpoint(base: &Url, config: &BackupS3Config) -> String {
     endpoint
 }
 
-pub(super) fn http_client(config: &BackupS3Config) -> Result<HttpClient, BackupStoreError> {
-    let timeout = Duration::from_secs(config.request_timeout_seconds);
-    let client = reqwest::Client::builder()
-        .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
-        .https_only(!config.allow_http)
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(
-            timeout.as_secs().min(MAX_CONNECT_TIMEOUT_SECONDS),
-        ))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
-    Ok(HttpClient::new(BoundedService(client)))
-}
-
-pub(super) fn amazon_s3(
-    config: &BackupS3Config,
-    credentials: &S3Credentials,
-    bucket_endpoint: &str,
-    http: HttpClient,
-) -> Result<AmazonS3, BackupStoreError> {
-    let timeout = Duration::from_secs(config.request_timeout_seconds);
-    let attempts = u32::try_from(config.max_retries.saturating_add(1)).unwrap_or(u32::MAX);
-    let mut builder = AmazonS3Builder::new()
-        .with_bucket_name(config.bucket.trim())
-        .with_region(config.region.trim())
-        // The endpoint already names the bucket in either addressing style.
-        .with_endpoint(bucket_endpoint)
-        .with_virtual_hosted_style_request(true)
-        .with_access_key_id(&credentials.access_key_id)
-        .with_secret_access_key(&credentials.secret_access_key)
-        .with_allow_http(config.allow_http)
-        // Single-object DELETE is the one every S3-compatible store supports.
-        .with_disable_bulk_delete(true)
-        .with_retry(retry_config(
-            config.max_retries,
-            timeout.saturating_mul(attempts),
-        ))
-        .with_http_connector(FixedConnector(http));
-    if let Some(token) = &credentials.session_token {
-        builder = builder.with_token(token);
-    }
-    builder
-        .build()
-        .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))
-}
-
-fn retry_config(max_retries: usize, retry_timeout: Duration) -> RetryConfig {
-    RetryConfig {
-        backoff: BackoffConfig {
-            init_backoff: Duration::from_millis(RETRY_BASE_DELAY_MILLIS),
-            max_backoff: Duration::from_millis(
-                RETRY_BASE_DELAY_MILLIS << MAX_RETRY_BACKOFF_EXPONENT,
-            ),
-            base: 2.0,
-        },
-        max_retries,
-        retry_timeout,
-    }
-}
-
-pub(super) fn remote_error(operation: &str, error: object_store::Error) -> BackupStoreError {
-    BackupStoreError::Remote(format!("S3 {operation} failed: {error}"))
-}
-
-/// Hands `object_store` our client so TLS roots and timeouts stay ours.
-#[derive(Debug)]
-struct FixedConnector(HttpClient);
-
-impl HttpConnector for FixedConnector {
-    fn connect(&self, _options: &ClientOptions) -> object_store::Result<HttpClient> {
-        Ok(self.0.clone())
-    }
-}
-
-/// Caps response bodies except object downloads at [`MAX_RESPONSE_BYTES`], against hostile endpoints.
-#[derive(Debug)]
-struct BoundedService(reqwest::Client);
-
-#[async_trait::async_trait]
-impl HttpService for BoundedService {
-    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
-        let object_get = request.method() == Method::GET && request.uri().query().is_none();
-        let response = self.0.call(request).await?;
-        if object_get && response.status().is_success() {
-            return Ok(response);
-        }
-        let (parts, body) = response.into_parts();
-        let body = HttpResponseBody::new(BoundedBody {
-            inner: body,
-            remaining: MAX_RESPONSE_BYTES,
-        });
-        Ok(HttpResponse::from_parts(parts, body))
-    }
-}
-
-struct BoundedBody {
-    inner: HttpResponseBody,
-    remaining: u64,
-}
-
-impl Body for BoundedBody {
-    type Data = Bytes;
-    type Error = HttpError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, HttpError>>> {
-        let frame = match Pin::new(&mut self.inner).poll_frame(context) {
-            Poll::Ready(Some(Ok(frame))) => frame,
-            other => return other,
-        };
-        let length = frame.data_ref().map_or(0, |data| data.len() as u64);
-        match self.remaining.checked_sub(length) {
-            Some(remaining) => {
-                self.remaining = remaining;
-                Poll::Ready(Some(Ok(frame)))
-            }
-            None => Poll::Ready(Some(Err(HttpError::new(
-                HttpErrorKind::Decode,
-                std::io::Error::other("S3 response exceeded its safety limit"),
-            )))),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-pub(super) struct UploadAdmin {
-    http: HttpClient,
-    credential: AwsCredential,
+pub(super) struct S3Client {
+    http: reqwest::Client,
+    pub(super) credentials: Credentials,
     region: String,
     bucket_endpoint: String,
     max_retries: usize,
+    pub(super) signing_time: fn() -> SystemTime,
+    timeout: Duration,
 }
 
-impl UploadAdmin {
+pub(super) struct RetryBudget {
+    remaining: usize,
+    deadline: Option<Instant>,
+    delay_ms: u64,
+}
+
+impl RetryBudget {
+    pub(super) async fn retry(&mut self) -> bool {
+        let delay = Duration::from_millis(self.delay_ms);
+        if self.remaining == 0
+            || self
+                .deadline
+                .is_some_and(|end| Instant::now() + delay >= end)
+        {
+            return false;
+        }
+        self.remaining -= 1;
+        let doubled = self.delay_ms * 2;
+        // Object operations use decorrelated jitter. Multipart discovery and confirmation
+        // retain their deterministic backoff and per-request timeout.
+        self.delay_ms = if self.deadline.is_some() {
+            let mut random = [0; 4];
+            let _ = aws_lc_rs::rand::fill(&mut random);
+            RETRY_BASE_DELAY_MILLIS
+                + u32::from_ne_bytes(random) as u64 % (doubled - RETRY_BASE_DELAY_MILLIS)
+        } else {
+            doubled
+        }
+        .min(RETRY_BASE_DELAY_MILLIS << MAX_RETRY_BACKOFF_EXPONENT);
+        tokio::time::sleep(delay).await;
+        true
+    }
+}
+
+impl S3Client {
     pub(super) fn new(
         config: &BackupS3Config,
-        credentials: &S3Credentials,
-        bucket_endpoint: &str,
-        http: HttpClient,
-    ) -> Self {
-        Self {
+        credentials: Credentials,
+        bucket_endpoint: String,
+    ) -> Result<Self, BackupStoreError> {
+        Self::with_builder(
+            config,
+            credentials,
+            bucket_endpoint,
+            crate::utils::tls::http_client_builder(),
+        )
+    }
+
+    pub(super) fn with_builder(
+        config: &BackupS3Config,
+        credentials: Credentials,
+        bucket_endpoint: String,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, BackupStoreError> {
+        let timeout = Duration::from_secs(config.request_timeout_seconds);
+        // reqwest retries remote HTTP/2 REFUSED_STREAM and graceful GOAWAY (NO_ERROR).
+        // The application retry budget covers all other retries.
+        let http = builder
+            .tls_certs_only(crate::utils::tls::mozilla_root_certificates())
+            .https_only(!config.allow_http)
+            .timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(MAX_CONNECT_TIMEOUT_SECONDS)))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
+        Ok(Self {
             http,
-            credential: credentials.aws(),
-            region: config.region.trim().to_string(),
-            bucket_endpoint: bucket_endpoint.to_string(),
+            signing_time: SystemTime::now,
+            credentials,
+            bucket_endpoint,
+            region: config.region.trim().into(),
+            timeout,
             max_retries: config.max_retries,
-        }
+        })
     }
 
-    /// Sends a signed request, retrying throttling, server errors and transport failures; returns status and bounded body.
-    pub(super) async fn send(
-        &self,
-        method: Method,
-        key: &str,
-        query: &[(&str, &str)],
-        operation: &str,
-    ) -> Result<(StatusCode, Bytes), BackupStoreError> {
-        let url = self.url(key, query)?;
-        let mut attempt = 0;
-        loop {
-            let retry = attempt < self.max_retries;
-            match self.send_once(method.clone(), &url).await {
-                Ok(response) if retry && retryable_status(response.status()) => {}
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.into_body().bytes().await.map_err(|error| {
-                        BackupStoreError::Remote(format!(
-                            "failed to read S3 {operation} response: {error}"
-                        ))
-                    })?;
-                    return Ok((status, body));
-                }
-                Err(error) if retry && retryable_error(&error) => {}
-                Err(error) => {
-                    return Err(BackupStoreError::Remote(format!(
-                        "S3 {operation} request failed: {error}"
-                    )));
-                }
-            }
-            let factor = 1_u64 << attempt.min(MAX_RETRY_BACKOFF_EXPONENT as usize);
-            tokio::time::sleep(Duration::from_millis(RETRY_BASE_DELAY_MILLIS * factor)).await;
-            attempt += 1;
+    pub(super) fn budget(&self) -> RetryBudget {
+        let attempts = u32::try_from(self.max_retries.saturating_add(1)).unwrap_or(u32::MAX);
+        RetryBudget {
+            remaining: self.max_retries,
+            deadline: Instant::now().checked_add(self.timeout.saturating_mul(attempts)),
+            delay_ms: RETRY_BASE_DELAY_MILLIS,
         }
-    }
-
-    async fn send_once(&self, method: Method, url: &Url) -> Result<HttpResponse, HttpError> {
-        let mut request = HttpRequest::new(HttpRequestBody::empty());
-        *request.method_mut() = method;
-        *request.uri_mut() = url
-            .as_str()
-            .parse()
-            .map_err(|error| HttpError::new(HttpErrorKind::Request, error))?;
-        AwsAuthorizer::new(&self.credential, "s3", &self.region)
-            .try_authorize(&mut request, None)
-            .map_err(|error| HttpError::new(HttpErrorKind::Unknown, error))?;
-        self.http.execute(request).await
     }
 
     pub(super) fn url(&self, key: &str, query: &[(&str, &str)]) -> Result<Url, BackupStoreError> {
         let mut url = self.bucket_endpoint.clone();
         if !key.is_empty() {
+            object_path(key)?;
             url.push('/');
-            url.push_str(&crate::utils::percent::encode_path(key.as_bytes()));
+            url.push_str(&encode_path(key.as_bytes()));
         }
-        let mut url = Url::parse(&url)
-            .map_err(|error| BackupStoreError::InvalidConfiguration(error.to_string()))?;
-        if !query.is_empty() {
-            url.query_pairs_mut().extend_pairs(query);
+        for (index, (name, value)) in query.iter().enumerate() {
+            url.push(if index == 0 { '?' } else { '&' });
+            url.push_str(&encode_unreserved(name.as_bytes()));
+            url.push('=');
+            url.push_str(&encode_unreserved(value.as_bytes()));
         }
-        Ok(url)
+        Url::parse(&url).map_err(|e| BackupStoreError::InvalidConfiguration(e.to_string()))
+    }
+
+    pub(super) fn request(
+        &self,
+        method: Method,
+        key: &str,
+        query: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<Request<ReplayBody>, BackupStoreError> {
+        let mut builder = Request::builder().uri(self.url(key, query)?.as_str());
+        if method == Method::PUT || method == Method::POST {
+            builder = builder.header(header::CONTENT_LENGTH, body.len());
+        }
+        builder
+            .method(method)
+            .body(ReplayBody::new(body))
+            .map_err(|e| BackupStoreError::InvalidConfiguration(e.to_string()))
+    }
+
+    pub(super) async fn execute(
+        &self,
+        request: &Request<ReplayBody>,
+        budget: &mut RetryBudget,
+        operation: &str,
+    ) -> Result<Response, BackupStoreError> {
+        loop {
+            let signed = sign_request(
+                request.clone(),
+                &self.credentials,
+                &self.region,
+                (self.signing_time)(),
+            )?;
+            match self.http.execute(signed).await {
+                Ok(response) => {
+                    let status = response.status();
+                    if !(status == StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                        || (budget.deadline.is_some() && status == StatusCode::REQUEST_TIMEOUT))
+                        || !budget.retry().await
+                    {
+                        return Ok(response);
+                    }
+                }
+                Err(error) => {
+                    if !retryable_transport(&error, request.method()) || !budget.retry().await {
+                        return Err(BackupStoreError::Remote(format!(
+                            "S3 {operation} request failed: {}",
+                            error.without_url()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) async fn control(
+        &self,
+        request: &Request<ReplayBody>,
+        budget: &mut RetryBudget,
+        operation: &str,
+    ) -> Result<ControlResponse, BackupStoreError> {
+        let response = self.execute(request, budget, operation).await?;
+        ControlResponse::read(response, operation).await
+    }
+
+    pub(super) async fn send(
+        &self,
+        method: Method,
+        key: &str,
+        query: &[(&str, &str)],
+        body: Bytes,
+        operation: &str,
+    ) -> Result<ControlResponse, BackupStoreError> {
+        let request = self.request(method, key, query, body)?;
+        self.control(&request, &mut self.budget(), operation).await
+    }
+
+    pub(super) async fn discovery_get(
+        &self,
+        key: &str,
+        query: &[(&str, &str)],
+        operation: &str,
+    ) -> Result<ControlResponse, BackupStoreError> {
+        let request = self.request(Method::GET, key, query, Bytes::new())?;
+        let mut budget = self.budget();
+        budget.deadline = None;
+        self.control(&request, &mut budget, operation).await
     }
 }
 
-fn retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+/// Closed or incomplete requests can be retried on all operations. For a timeout
+/// or interrupted connection, retain the single DELETE attempt used by the old driver.
+fn retryable_transport(error: &reqwest::Error, method: &Method) -> bool {
+    use std::{error::Error, io::ErrorKind};
+    let replay = method != Method::DELETE;
+    if error.is_timeout() {
+        return replay;
+    }
+    if error.is_connect() {
+        return true;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(http) = cause.downcast_ref::<hyper::Error>() {
+            if http.is_closed() || http.is_incomplete_message() || http.is_body_write_aborted() {
+                return true;
+            }
+            if http.is_timeout() {
+                return replay;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        {
+            return replay;
+        }
+        source = cause.source();
+    }
+    false
 }
 
-fn retryable_error(error: &HttpError) -> bool {
-    matches!(
-        error.kind(),
-        HttpErrorKind::Connect
-            | HttpErrorKind::Request
-            | HttpErrorKind::Timeout
-            | HttpErrorKind::Interrupted
-    )
+pub(super) struct ControlResponse {
+    pub(super) status: StatusCode,
+    headers: HeaderMap,
+    pub(super) body: Vec<u8>,
+}
+
+impl ControlResponse {
+    pub(super) async fn read(
+        mut response: Response,
+        operation: &str,
+    ) -> Result<Self, BackupStoreError> {
+        let too_large = || {
+            BackupStoreError::Corrupt(format!("S3 {operation} response exceeded its safety limit"))
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            BackupStoreError::Remote(format!(
+                "failed to read S3 {operation} response: {}",
+                e.without_url()
+            ))
+        })? {
+            if chunk.len() > MAX_RESPONSE_BYTES as usize - body.len() {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Self {
+            status: response.status(),
+            headers: std::mem::take(response.headers_mut()),
+            body,
+        })
+    }
+
+    pub(super) fn etag(&self, operation: &str) -> Result<&str, BackupStoreError> {
+        self.headers
+            .get(header::ETAG)
+            .and_then(|h| h.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                BackupStoreError::Corrupt(format!("S3 {operation} response has no valid ETag"))
+            })
+    }
+
+    pub(super) fn success(self, operation: &str) -> Result<Self, BackupStoreError> {
+        if self.status.is_success() {
+            Ok(self)
+        } else {
+            Err(self.error(operation))
+        }
+    }
+
+    pub(super) fn error_code(&self) -> Option<&'static str> {
+        #[derive(Deserialize)]
+        enum ErrorDocument {
+            Error {
+                #[serde(rename = "Code")]
+                code: String,
+            },
+        }
+
+        quick_xml::de::from_reader::<_, ErrorDocument>(self.body.as_slice())
+            .ok()
+            .and_then(|ErrorDocument::Error { code }| known_code(&code))
+    }
+
+    pub(super) fn error(&self, operation: &str) -> BackupStoreError {
+        service_error(operation, self.status, self.error_code())
+    }
+}
+
+pub(super) fn known_code(code: &str) -> Option<&'static str> {
+    [
+        "AccessDenied",
+        "EntityTooSmall",
+        "InternalError",
+        "InvalidAccessKeyId",
+        "InvalidPart",
+        "InvalidPartOrder",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "NoSuchUpload",
+        "RequestTimeout",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+    ]
+    .into_iter()
+    .find(|known| *known == code)
+}
+
+pub(super) fn service_error(
+    operation: &str,
+    status: StatusCode,
+    code: Option<&'static str>,
+) -> BackupStoreError {
+    let mut message = format!("S3 {operation} returned HTTP {status}");
+    if let Some(code) = code {
+        message.push_str(&format!(" ({code})"));
+    }
+    BackupStoreError::Remote(message)
 }

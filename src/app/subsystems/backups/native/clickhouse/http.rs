@@ -34,7 +34,7 @@ impl ClickhouseHttp {
         password: &SecretString,
         timeout: Duration,
     ) -> Result<Self, StrategyError> {
-        let client = Client::builder()
+        let client = crate::utils::tls::http_client_builder()
             .no_proxy()
             .redirect(Policy::none())
             .timeout(timeout)

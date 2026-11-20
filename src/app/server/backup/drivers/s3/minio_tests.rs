@@ -9,8 +9,6 @@
 //! `DBEV_S3_E2E_ACCESS_KEY` (`dbevtest`) and `DBEV_S3_E2E_SECRET_KEY`
 //! (`dbevtestsecret`).
 
-use object_store::path::Path as ObjectPath;
-
 use super::{
     tests::{RecordingJournal, bundle_with_archive},
     *,
@@ -143,28 +141,18 @@ async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() {
         .unwrap();
     let archive = driver.archive_key(&instance, &id).unwrap();
     let catalog = driver.catalog_key(&instance, &id).unwrap();
-    let archive_path = ObjectPath::parse(&archive).unwrap();
-    let catalog_path = ObjectPath::parse(&catalog).unwrap();
     // One upload the journal knows about, one it never recorded (a crash
     // between create and journal write), each with a part already sent.
-    let journaled = driver
-        .multipart
-        .create_multipart(&archive_path)
-        .await
-        .unwrap();
+    let journaled = driver.client.create_multipart(&archive).await.unwrap();
     driver
-        .multipart
-        .put_part(&archive_path, &journaled, 0, vec![1_u8; 1024].into())
+        .client
+        .put_part(&archive, &journaled, 1, vec![1_u8; 1024].into())
         .await
         .unwrap();
-    let unjournaled = driver
-        .multipart
-        .create_multipart(&catalog_path)
-        .await
-        .unwrap();
+    let unjournaled = driver.client.create_multipart(&catalog).await.unwrap();
     driver
-        .multipart
-        .put_part(&catalog_path, &unjournaled, 0, vec![2_u8; 1024].into())
+        .client
+        .put_part(&catalog, &unjournaled, 1, vec![2_u8; 1024].into())
         .await
         .unwrap();
     let resources = [PublicationResource::S3MultipartUpload {
@@ -181,15 +169,8 @@ async fn purge_aborts_journaled_and_unjournaled_uploads_on_minio() {
         driver.find(&instance, &id).await,
         Err(BackupStoreError::NotFound)
     ));
-    for (path, upload) in [(&archive_path, &journaled), (&catalog_path, &unjournaled)] {
-        assert!(
-            driver
-                .multipart
-                .put_part(path, upload, 1, vec![3_u8; 1024].into())
-                .await
-                .is_err(),
-            "upload {upload} on {path} must be aborted"
-        );
+    for (path, upload) in [(&archive, &journaled), (&catalog, &unjournaled)] {
+        assert!(driver.client.upload_gone(path, upload).await.unwrap());
     }
     driver
         .purge_unpublished(&instance, &id, &resources)
