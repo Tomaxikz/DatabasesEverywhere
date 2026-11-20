@@ -179,7 +179,7 @@ fn inject(watcher: &SoftDiskWatcher, event: Event) {
 }
 
 fn insert_logical_target(watcher: &SoftDiskWatcher, target_id: &str, root: PathBuf) {
-    let mut state = lock_recover(&watcher.shared.state);
+    let mut state = watcher.shared.state.lock();
     state.next_registration_generation = next_nonzero(state.next_registration_generation);
     let target = TargetState {
         fingerprint: format!("fingerprint-{target_id}"),

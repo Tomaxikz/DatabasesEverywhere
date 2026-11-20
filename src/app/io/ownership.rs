@@ -114,25 +114,18 @@ pub fn allow_directory_traversal(path: &Path, daemon_uid: u32, gid: u32) -> std:
     fchmod(&directory, Mode::RWXU | Mode::XGRP).map_err(std::io::Error::from)
 }
 
-static TRAVERSAL_GRANTS: std::sync::RwLock<std::collections::BTreeMap<std::path::PathBuf, u32>> =
-    std::sync::RwLock::new(std::collections::BTreeMap::new());
+static TRAVERSAL_GRANTS: parking_lot::RwLock<std::collections::BTreeMap<std::path::PathBuf, u32>> =
+    parking_lot::RwLock::new(std::collections::BTreeMap::new());
 
 /// Records that `path` is a designated bind-mount ancestor which `gid` must
 /// keep traversing (rootless Podman only). Callers that re-secure a private
 /// directory consult this so they do not revoke the grant while jobs run.
 pub fn register_traversal_grant(path: &Path, gid: u32) {
-    TRAVERSAL_GRANTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(path.to_path_buf(), gid);
+    TRAVERSAL_GRANTS.write().insert(path.to_path_buf(), gid);
 }
 
 pub fn registered_traversal_gid(path: &Path) -> Option<u32> {
-    TRAVERSAL_GRANTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(path)
-        .copied()
+    TRAVERSAL_GRANTS.read().get(path).copied()
 }
 
 /// Grants `gid` execute-only traversal ([`allow_directory_traversal`]) of

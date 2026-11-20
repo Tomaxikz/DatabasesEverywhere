@@ -1,10 +1,5 @@
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    num::NonZeroU32,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use parking_lot::Mutex;
+use std::{collections::HashMap, net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use governor::{
     Quota, RateLimiter,
@@ -54,7 +49,7 @@ pub struct GatewayConnectionPermit<C: Clock = DefaultClock> {
 
 impl<C: Clock> Drop for GatewayConnectionPermit<C> {
     fn drop(&mut self) {
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.lock();
         let Some(active) = state.active.get_mut(&self.peer) else {
             return;
         };
@@ -104,7 +99,7 @@ impl<C: Clock> GatewayConnectionLimiter<C> {
         ip: IpAddr,
     ) -> Result<GatewayConnectionPermit<C>, GatewayConnectionRejection> {
         let peer = GatewayPeer::from_ip(ip);
-        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.inner.lock();
         let now = state.limiter.clock().now();
         state.evict_idle_peers(now);
 
@@ -279,7 +274,7 @@ mod tests {
 
         clock.advance(DB_CONNECTION_WINDOW);
         drop(limiter.try_acquire("192.0.2.42".parse().unwrap()).unwrap());
-        let state = limiter.inner.lock().unwrap();
+        let state = limiter.inner.lock();
         assert!(!state.peers.contains_key(&GatewayPeer::from_ip(idle)));
         assert!(state.peers.contains_key(&GatewayPeer::from_ip(busy)));
         assert_eq!(state.limiter.len(), 1);

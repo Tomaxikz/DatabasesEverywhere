@@ -34,7 +34,7 @@ pub(super) struct UsageTreeState {
 
 #[derive(Debug)]
 pub(super) struct UsageTreeSlot {
-    pub(super) state: std::sync::Mutex<UsageTreeSlotState>,
+    pub(super) state: parking_lot::Mutex<UsageTreeSlotState>,
     pub(super) cached_directories: Arc<AtomicUsize>,
     global_directory_limit: usize,
 }
@@ -49,7 +49,7 @@ pub(super) struct UsageTreeSlotState {
 impl UsageTreeSlot {
     pub(super) fn new(cached_directories: Arc<AtomicUsize>, global_directory_limit: usize) -> Self {
         Self {
-            state: std::sync::Mutex::new(UsageTreeSlotState::default()),
+            state: parking_lot::Mutex::new(UsageTreeSlotState::default()),
             cached_directories,
             global_directory_limit,
         }
@@ -114,10 +114,7 @@ impl UsageTreeSlot {
 
 impl Drop for UsageTreeSlot {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.state.get_mut();
         release_cached_directories(&self.cached_directories, state.cached_directory_count);
         state.cached_directory_count = 0;
     }

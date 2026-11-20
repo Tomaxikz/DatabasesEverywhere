@@ -154,10 +154,7 @@ impl SoftDiskLimiter {
             let Some(slot) = cache else {
                 return streaming_full_scan(&scan_path, limits);
             };
-            let mut state = slot
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = slot.state.lock();
             if state.streaming_only {
                 return streaming_full_scan(&scan_path, limits);
             }

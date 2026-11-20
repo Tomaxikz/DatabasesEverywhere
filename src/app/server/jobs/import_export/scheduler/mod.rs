@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -8,8 +9,6 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 
 use crate::config::ImportExportSchedulerConfig;
-
-use super::lock_unpoisoned;
 
 #[cfg(test)]
 use crate::databases::protocol::Protocol;
@@ -182,7 +181,7 @@ impl ImportExportScheduler {
         let (ready, receiver) = oneshot::channel();
         let sequence;
         {
-            let mut state = lock_unpoisoned(&self.shared.state);
+            let mut state = self.shared.state.lock();
             if !state.accepting {
                 return Err(SchedulerAcquireError::Closed);
             }
@@ -211,7 +210,7 @@ impl ImportExportScheduler {
     }
 
     pub fn close(&self) {
-        let mut state = lock_unpoisoned(&self.shared.state);
+        let mut state = self.shared.state.lock();
         state.accepting = false;
         for waiting in state.waiting.drain(..) {
             let _ = waiting.ready.send(Err(SchedulerAcquireError::Closed));
@@ -219,7 +218,7 @@ impl ImportExportScheduler {
     }
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
-        let mut state = lock_unpoisoned(&self.shared.state);
+        let mut state = self.shared.state.lock();
         dispatch(&self.shared, &mut state);
         SchedulerSnapshot {
             capacity: state.capacity,
@@ -248,7 +247,7 @@ impl Drop for ExecutionPermit {
         let Some(cost) = self.cost.take() else {
             return;
         };
-        let mut state = lock_unpoisoned(&self.shared.state);
+        let mut state = self.shared.state.lock();
         release(&mut state, cost);
         dispatch(&self.shared, &mut state);
     }
@@ -259,7 +258,7 @@ impl Drop for WaitingRegistration {
         if !self.armed {
             return;
         }
-        let mut state = lock_unpoisoned(&self.shared.state);
+        let mut state = self.shared.state.lock();
         if let Some(index) = state
             .waiting
             .iter()

@@ -1,7 +1,5 @@
-use std::{
-    collections::HashMap,
-    sync::{OnceLock, RwLock},
-};
+use parking_lot::RwLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -54,10 +52,7 @@ pub(crate) struct CancelRegistration {
 impl Drop for CancelRegistration {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
-            cancel_targets()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
+            cancel_targets().write().remove(&key);
         }
     }
 }
@@ -115,9 +110,7 @@ impl Startup {
         network: &NetworkCounter,
     ) -> Result<CancelRegistration, PostgresSessionError> {
         if let Some(key) = &self.key {
-            let mut targets = cancel_targets()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut targets = cancel_targets().write();
             if targets.contains_key(key) {
                 return Err(PostgresSessionError::RegistryCollision);
             }
@@ -145,11 +138,7 @@ pub(crate) async fn forward_cancel(
     key: CancelKey,
     packet: &[u8],
 ) -> Result<bool, PostgresSessionError> {
-    let target = cancel_targets()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .cloned();
+    let target = cancel_targets().read().get(&key).cloned();
     let Some(target) = target else {
         return Ok(false);
     };
@@ -389,7 +378,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(!cancel_targets().read().unwrap().contains_key(&key));
+            assert!(!cancel_targets().read().contains_key(&key));
             let registration = startup
                 .finish(
                     &mut proxy,
@@ -416,7 +405,7 @@ mod tests {
             received.read_to_end(&mut bytes).await.unwrap();
             assert_eq!(bytes, packet);
             drop(registration);
-            assert!(!cancel_targets().read().unwrap().contains_key(&key));
+            assert!(!cancel_targets().read().contains_key(&key));
         }
     }
 }

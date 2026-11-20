@@ -6,7 +6,6 @@ use super::{
     capacity::{SchedulerCapacity, memory_budget_from_available},
     cost::JobResourceCost,
 };
-use crate::server::jobs::import_export::lock_unpoisoned;
 
 fn refresh_capacity(shared: &Shared, state: &mut SchedulerState) {
     if !shared.refreshes_capacity() {
@@ -129,7 +128,7 @@ fn schedule_capacity_refresh(shared: &Arc<Shared>, state: &mut SchedulerState) {
     runtime.spawn(async move {
         tokio::time::sleep(delay).await;
         if let Some(shared) = shared.upgrade() {
-            let mut state = lock_unpoisoned(&shared.state);
+            let mut state = shared.state.lock();
             state.refresh_wakeup_scheduled = false;
             dispatch(&shared, &mut state);
         }

@@ -1,10 +1,10 @@
 use crate::daemon::runtime_paths::{create_runtime_dirs, harden_runtime_dir};
+use parking_lot::Mutex;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -63,10 +63,7 @@ impl InfoRateLimit {
 
 impl<S: Subscriber> Layer<S> for InfoRateLimit {
     fn event_enabled(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) -> bool {
-        let mut window = self
-            .window
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut window = self.window.lock();
         // Count actual events, not spans or enabled! probes. Read time under the
         // lock so concurrent callers cannot reset the window out of order.
         window.allows(event.metadata().level(), Instant::now())
@@ -299,7 +296,7 @@ mod tests {
 
         impl Write for Capture {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
+                self.0.lock().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
 
@@ -343,8 +340,8 @@ mod tests {
             tracing::warn!("warning");
             tracing::error!("error");
         });
-        let first = first.0.lock().unwrap();
-        assert_eq!(*first, *second.0.lock().unwrap());
+        let first = first.0.lock();
+        assert_eq!(*first, *second.0.lock());
         let output = std::str::from_utf8(&first).unwrap();
         assert_eq!(output.lines().count(), 3);
         assert!(output.contains("allowed"));
@@ -356,7 +353,7 @@ mod tests {
 
     #[test]
     fn file_queue_stays_bounded_when_disk_writes_stall() {
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::{Arc, mpsc};
         struct StalledWriter {
             started: Option<mpsc::SyncSender<()>>,
             resume: mpsc::Receiver<()>,
@@ -368,7 +365,7 @@ mod tests {
                     started.send(()).map_err(io::Error::other)?;
                     self.resume.recv().map_err(io::Error::other)?;
                 }
-                self.output.lock().unwrap().extend_from_slice(bytes);
+                self.output.lock().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> io::Result<()> {
@@ -396,7 +393,7 @@ mod tests {
         ready.unwrap();
         assert_eq!(dropped, 1);
         assert_eq!(
-            output.lock().unwrap().len(),
+            output.lock().len(),
             b"first\n".len() + LOG_QUEUE_LINES * b"line\n".len()
         );
     }

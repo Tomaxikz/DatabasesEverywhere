@@ -1,17 +1,17 @@
 use super::{MAX_ACTIVE_DOWNLOADS, MAX_ACTIVE_DOWNLOADS_PER_PEER, MAX_CONSUMED_DOWNLOAD_TICKETS};
 use crate::routes::http::response::ApiError;
 use crate::utils::time::now_unix;
+use parking_lot::Mutex as SyncMutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone)]
 pub struct ArtifactDownloadTickets {
     pub(super) consumed: Arc<Mutex<HashMap<String, i64>>>,
     pub(super) active_downloads: Arc<Semaphore>,
-    pub(super) active_by_peer: Arc<StdMutex<HashMap<DownloadPeer, usize>>>,
+    pub(super) active_by_peer: Arc<SyncMutex<HashMap<DownloadPeer, usize>>>,
 }
 
 impl Default for ArtifactDownloadTickets {
@@ -48,10 +48,7 @@ impl ArtifactDownloadTickets {
             .try_acquire_owned()
             .map_err(|_| ApiError::RateLimited)?;
         let peer = DownloadPeer::from_socket(peer);
-        let mut active = self
-            .active_by_peer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut active = self.active_by_peer.lock();
         let count = active.entry(peer).or_default();
         if *count >= MAX_ACTIVE_DOWNLOADS_PER_PEER {
             return Err(ApiError::RateLimited);
@@ -94,15 +91,12 @@ impl DownloadPeer {
 pub(super) struct ArtifactDownloadPermit {
     pub(super) _global: OwnedSemaphorePermit,
     pub(super) peer: DownloadPeer,
-    pub(super) active_by_peer: Arc<StdMutex<HashMap<DownloadPeer, usize>>>,
+    pub(super) active_by_peer: Arc<SyncMutex<HashMap<DownloadPeer, usize>>>,
 }
 
 impl Drop for ArtifactDownloadPermit {
     fn drop(&mut self) {
-        let mut active = self
-            .active_by_peer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut active = self.active_by_peer.lock();
         let Some(count) = active.get_mut(&self.peer) else {
             return;
         };

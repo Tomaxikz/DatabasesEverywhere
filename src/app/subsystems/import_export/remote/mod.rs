@@ -3,10 +3,11 @@ mod redis;
 pub mod redis_resp;
 pub mod security;
 
+use parking_lot::Mutex as SyncMutex;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex as StdMutex},
+    sync::{Arc, LazyLock},
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -784,7 +785,7 @@ struct RemoteImportLimiter {
 
 #[derive(Debug, Default)]
 struct RemoteJobAdmission {
-    state: Arc<StdMutex<RemoteJobAdmissionState>>,
+    state: Arc<SyncMutex<RemoteJobAdmissionState>>,
 }
 
 #[derive(Debug, Default)]
@@ -796,10 +797,7 @@ struct RemoteJobAdmissionState {
 impl RemoteJobAdmission {
     fn try_acquire(&self, instance_id: &str, maximum: usize) -> Option<RemoteJobAdmissionPermit> {
         let maximum = maximum.max(1);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock();
         if state.active >= maximum || state.instances.contains(instance_id) {
             return None;
         }
@@ -814,16 +812,13 @@ impl RemoteJobAdmission {
 
 #[derive(Debug)]
 pub(crate) struct RemoteJobAdmissionPermit {
-    state: Arc<StdMutex<RemoteJobAdmissionState>>,
+    state: Arc<SyncMutex<RemoteJobAdmissionState>>,
     instance_id: String,
 }
 
 impl Drop for RemoteJobAdmissionPermit {
     fn drop(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.lock();
         let removed = state.instances.remove(&self.instance_id);
         debug_assert!(removed, "remote job admission instance was missing");
         state.active = state.active.saturating_sub(usize::from(removed));

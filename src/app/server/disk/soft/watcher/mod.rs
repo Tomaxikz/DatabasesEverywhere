@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64},
     },
     time::{Duration, Instant},
@@ -25,7 +26,7 @@ mod types;
 
 use self::helpers::create_backend;
 #[cfg(test)]
-use self::helpers::{install_recursive_watch, lock_recover, next_nonzero};
+use self::helpers::{install_recursive_watch, next_nonzero};
 use self::state::{BackendState, RetryPolicy, Shared, WatchState};
 #[cfg(test)]
 use self::state::{RecursiveWatchInstall, RegistrationPause, TargetState, WatchHealth};
@@ -122,7 +123,7 @@ impl SoftDiskWatcher {
             installed: Barrier::new(2),
             resume: Barrier::new(2),
         });
-        *lock_recover(&self.registration_pause) = Some(Arc::clone(&pause));
+        *self.registration_pause.lock() = Some(Arc::clone(&pause));
         pause
     }
 }

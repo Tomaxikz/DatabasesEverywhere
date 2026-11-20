@@ -1,10 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -15,8 +13,8 @@ use notify::{Event, EventKind, RecommendedWatcher};
 use tokio::sync::Notify;
 
 use super::helpers::{
-    is_strict_descendant, lock_recover, nearest_recorded_ancestor, next_nonzero,
-    root_watch_may_be_lost, route_path, safe_relative_parent,
+    is_strict_descendant, nearest_recorded_ancestor, next_nonzero, root_watch_may_be_lost,
+    route_path, safe_relative_parent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +135,7 @@ impl Shared {
     }
 
     pub(super) fn force_full_all(&self) {
-        let mut state = lock_recover(&self.state);
+        let mut state = self.state.lock();
         self.enqueue_global_change(&mut state);
         drop(state);
         self.signal_change();
@@ -147,7 +145,7 @@ impl Shared {
         let now = Instant::now();
         self.backend_rebuild_requested
             .store(true, Ordering::Release);
-        let mut state = lock_recover(&self.state);
+        let mut state = self.state.lock();
         for target in state.targets.values_mut() {
             target.degrade(now, self.retry_policy);
         }
@@ -200,7 +198,7 @@ impl Shared {
         }
 
         let now = Instant::now();
-        let mut state = lock_recover(&self.state);
+        let mut state = self.state.lock();
         let mut changed_targets = HashSet::new();
         for event_path in &event.paths {
             let Some((target_id, root)) = route_path(&state.roots, event_path) else {

@@ -1,11 +1,12 @@
 //! Short-lived helpers run an engine-native tool from the instance's own image with read-only mounts, no network, no capabilities and a staging directory.
 //! A supervisor task owns the container: dropping the caller's future cancels it, and the container is force-removed and confirmed gone.
 
+use parking_lot::Mutex as SyncMutex;
 use std::{
     collections::HashMap,
     io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -63,7 +64,7 @@ const OUTPUT_TAIL_CHARS: usize = 16 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_ENVIRONMENT_ENTRIES: usize = 16;
 
-static SUPERVISORS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+static SUPERVISORS: LazyLock<SyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(Default::default);
 
 #[derive(Clone)]
@@ -131,7 +132,7 @@ impl DockerRuntime {
             .try_lock_owned()
             .map_err(|_| BackupHelperError::Invalid("helper lock is contended".to_string()))?;
         {
-            let mut supervisors = SUPERVISORS.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut supervisors = SUPERVISORS.lock();
             if supervisors.contains_key(&spec.name) {
                 return Err(BackupHelperError::Invalid(format!(
                     "helper {} is already supervised",
@@ -160,11 +161,7 @@ impl DockerRuntime {
                 "{name} is not a backup helper name"
             )));
         }
-        let supervisor = SUPERVISORS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .cloned();
+        let supervisor = SUPERVISORS.lock().get(name).cloned();
         let _settled = match supervisor {
             Some(lock) => Some(
                 tokio::time::timeout(SUPERVISOR_WAIT, lock.lock_owned())
@@ -619,10 +616,7 @@ fn is_cancelled(cancelled: &mut oneshot::Receiver<()>) -> bool {
 }
 
 fn forget_supervisor(name: &str) {
-    SUPERVISORS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(name);
+    SUPERVISORS.lock().remove(name);
 }
 
 async fn chown_staging(path: &Path, owner: HostOwner) -> Result<(), BackupHelperError> {

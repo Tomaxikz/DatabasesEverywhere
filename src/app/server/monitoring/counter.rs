@@ -1,7 +1,5 @@
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::{GatewayActivity, OperationCounts, OperationKind};
 
@@ -301,10 +299,8 @@ impl ActivityCounter {
         add(&self.continuity, 1);
     }
 
-    fn lock_sample(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.sample_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock_sample(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.sample_lock.lock()
     }
 }
 

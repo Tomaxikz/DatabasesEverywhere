@@ -67,10 +67,7 @@ async fn cache_state(limiter: &SoftDiskLimiter, instance_id: &str) -> Option<(us
         .get(instance_id)
         .map(|state| Arc::clone(&state.slot));
     slot.map(|slot| {
-        let state = slot
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = slot.state.lock();
         (state.cached_directory_count, state.streaming_only)
     })
 }

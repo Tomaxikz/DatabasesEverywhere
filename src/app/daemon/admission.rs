@@ -1,10 +1,11 @@
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     future::Future,
     io::{self, ErrorKind},
     net::IpAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context as TaskContext, Poll},
 };
 
@@ -142,10 +143,7 @@ impl ApiConnectionLimiter {
         // permit is released automatically if the peer bucket is already full.
         let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
         let peer_ip = canonical_peer_ip(peer_ip);
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = self.active.lock();
         let count = active.entry(peer_ip).or_default();
         if *count >= self.max_active_per_peer {
             return None;
@@ -168,11 +166,7 @@ struct ApiConnectionPermit {
 
 impl Drop for ApiConnectionPermit {
     fn drop(&mut self) {
-        let mut active = self
-            .limiter
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = self.limiter.active.lock();
         let Some(count) = active.get_mut(&self.peer_ip) else {
             return;
         };

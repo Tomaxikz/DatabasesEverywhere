@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use super::{
     SoftDiskWatcher,
-    helpers::{health_status, lock_recover},
+    helpers::health_status,
     state::WatchHealth,
     types::{DirtyBatch, TargetWatchStatus, WatcherChanges},
 };
@@ -10,7 +10,7 @@ use super::{
 impl SoftDiskWatcher {
     pub(crate) fn capture(&self, target_id: &str) -> Option<DirtyBatch> {
         let global_generation = self.shared.global_generation.load(Ordering::Acquire);
-        let state = lock_recover(&self.shared.state);
+        let state = self.shared.state.lock();
         let target = state.targets.get(target_id)?;
         if !target.pending(global_generation) {
             return None;
@@ -33,7 +33,7 @@ impl SoftDiskWatcher {
     }
 
     pub(crate) fn acknowledge(&self, batch: &DirtyBatch) -> bool {
-        let mut state = lock_recover(&self.shared.state);
+        let mut state = self.shared.state.lock();
         let Some(target) = state.targets.get_mut(&batch.target_id) else {
             return false;
         };
@@ -60,7 +60,7 @@ impl SoftDiskWatcher {
     #[cfg(test)]
     pub(crate) fn force_full(&self, target_id: &str) -> bool {
         {
-            let mut state = lock_recover(&self.shared.state);
+            let mut state = self.shared.state.lock();
             let Some(target) = state.targets.get_mut(target_id) else {
                 return false;
             };
@@ -78,7 +78,7 @@ impl SoftDiskWatcher {
 
     pub(crate) fn status(&self, target_id: &str) -> Option<TargetWatchStatus> {
         let global_generation = self.shared.global_generation.load(Ordering::Acquire);
-        let state = lock_recover(&self.shared.state);
+        let state = self.shared.state.lock();
         let target = state.targets.get(target_id)?;
         Some(TargetWatchStatus {
             status: health_status(target.health),
@@ -90,7 +90,9 @@ impl SoftDiskWatcher {
     }
 
     pub(crate) fn is_watching(&self, target_id: &str, fingerprint: &str) -> bool {
-        lock_recover(&self.shared.state)
+        self.shared
+            .state
+            .lock()
             .targets
             .get(target_id)
             .is_some_and(|target| {
@@ -99,7 +101,7 @@ impl SoftDiskWatcher {
     }
 
     pub(crate) fn backend_available(&self) -> bool {
-        lock_recover(&self.backend).watcher.is_some()
+        self.backend.lock().watcher.is_some()
     }
 
     pub(crate) fn current_change_sequence(&self) -> u64 {
@@ -107,7 +109,7 @@ impl SoftDiskWatcher {
     }
 
     pub(crate) fn drain_changes(&self) -> WatcherChanges {
-        let mut state = lock_recover(&self.shared.state);
+        let mut state = self.shared.state.lock();
         let global_reconcile = std::mem::take(&mut state.global_change_pending);
         let target_ids = if global_reconcile {
             state.changed_targets.clear();

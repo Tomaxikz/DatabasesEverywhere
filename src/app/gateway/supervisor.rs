@@ -1,6 +1,7 @@
+use parking_lot::RwLock;
 use std::{
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -294,14 +295,12 @@ impl GatewaySupervisor {
         }
     }
 
-    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, GatewayState> {
-        self.state.read().unwrap_or_else(|error| error.into_inner())
+    fn read_state(&self) -> parking_lot::RwLockReadGuard<'_, GatewayState> {
+        self.state.read()
     }
 
-    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, GatewayState> {
-        self.state
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
+    fn write_state(&self) -> parking_lot::RwLockWriteGuard<'_, GatewayState> {
+        self.state.write()
     }
 }
 

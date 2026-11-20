@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -180,7 +181,7 @@ impl ImportExportJobs {
                     tokio::sync::TryAcquireError::Closed => JobAdmissionError::ShuttingDown,
                     tokio::sync::TryAcquireError::NoPermits => JobAdmissionError::GlobalCapacity,
                 })?;
-        let mut admitted = lock_unpoisoned(&self.admitted_by_instance);
+        let mut admitted = self.admitted_by_instance.lock();
         if !self.accepting.load(Ordering::Acquire) {
             return Err(JobAdmissionError::ShuttingDown);
         }
@@ -212,7 +213,7 @@ impl ImportExportJobs {
     }
 
     pub fn close_admission(&self) {
-        let _admitted = lock_unpoisoned(&self.admitted_by_instance);
+        let _admitted = self.admitted_by_instance.lock();
         self.accepting.store(false, Ordering::Release);
         self.admission.close();
         self.execution_scheduler.close();
@@ -391,7 +392,7 @@ impl ImportExportJobs {
 
 impl Drop for ImportExportJobPermit {
     fn drop(&mut self) {
-        let mut admitted = lock_unpoisoned(&self.admitted_by_instance);
+        let mut admitted = self.admitted_by_instance.lock();
         if let Some(instance) = admitted.get_mut(&self.instance_id) {
             instance.count = instance.count.saturating_sub(1);
             if instance.count == 0 {
@@ -403,12 +404,6 @@ impl Drop for ImportExportJobPermit {
             self.drain_notify.notify_one();
         }
     }
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn prune_job_cache(cache: &mut HashMap<String, ImportExportJob>) {

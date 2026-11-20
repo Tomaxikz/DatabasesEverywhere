@@ -23,10 +23,7 @@ fn remote_job_admission_is_nonblocking_bounded_and_releases() {
     drop(first);
     let replacement = admission.try_acquire("instance-e", 4).unwrap();
     drop((second, third, fourth, replacement));
-    let state = admission
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = admission.state.lock();
     assert_eq!(state.active, 0);
     assert!(state.instances.is_empty());
 }

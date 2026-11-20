@@ -1,8 +1,5 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+use parking_lot::{Mutex, MutexGuard};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -19,9 +16,7 @@ struct ReservationState {
 
 impl ReservationState {
     fn lock_reserved_totals(&self) -> MutexGuard<'_, HashMap<FilesystemIdentity, u64>> {
-        self.reserved_bytes_by_filesystem
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.reserved_bytes_by_filesystem.lock()
     }
 }
 

@@ -1,7 +1,8 @@
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -68,7 +69,7 @@ impl InstallProgressStore {
 impl InstallProgressStore {
     pub fn begin(&self, instance_id: &str, protocol: Protocol, image: &str) {
         let progress = creation_progress(instance_id, protocol, image);
-        let mut entries = self.inner.write().expect("install progress lock poisoned");
+        let mut entries = self.inner.write();
         if entries.get(instance_id).is_some_and(|existing| {
             existing.action == "create" && existing.status == InstallProgressStatus::Running
         }) {
@@ -107,14 +108,11 @@ impl InstallProgressStore {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(BeginCreationError::ShuttingDown);
         }
-        let mut entries = self.inner.write().expect("install progress lock poisoned");
+        let mut entries = self.inner.write();
         if !self.accepting.load(Ordering::Acquire) {
             return Err(BeginCreationError::ShuttingDown);
         }
-        let mut active = self
-            .active_creations
-            .write()
-            .expect("creation lock poisoned");
+        let mut active = self.active_creations.write();
         if entries
             .get(instance_id)
             .is_some_and(|progress| progress.status == InstallProgressStatus::Running)
@@ -142,37 +140,24 @@ impl InstallProgressStore {
     }
 
     pub fn get(&self, instance_id: &str) -> Option<InstallProgress> {
-        self.inner
-            .read()
-            .expect("install progress lock poisoned")
-            .get(instance_id)
-            .cloned()
+        self.inner.read().get(instance_id).cloned()
     }
 
     pub fn remove(&self, instance_id: &str) {
-        self.inner
-            .write()
-            .expect("install progress lock poisoned")
-            .remove(instance_id);
+        self.inner.write().remove(instance_id);
     }
 
     pub fn close_creation_admission(&self) {
-        let _entries = self.inner.write().expect("install progress lock poisoned");
+        let _entries = self.inner.write();
         self.accepting.store(false, Ordering::Release);
     }
 
     pub fn active_creation_count(&self) -> usize {
-        self.active_creations
-            .read()
-            .expect("creation lock poisoned")
-            .len()
+        self.active_creations.read().len()
     }
 
     pub(crate) fn is_creating(&self, instance_id: &str) -> bool {
-        self.active_creations
-            .read()
-            .expect("creation lock poisoned")
-            .contains(instance_id)
+        self.active_creations.read().contains(instance_id)
     }
 
     pub async fn wait_for_creation_drain(&self, deadline: Duration) -> bool {
@@ -309,19 +294,13 @@ impl InstallProgressStore {
     }
 
     pub fn list(&self) -> Vec<InstallProgress> {
-        let mut values = self
-            .inner
-            .read()
-            .expect("install progress lock poisoned")
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut values = self.inner.read().values().cloned().collect::<Vec<_>>();
         values.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
         values
     }
 
     fn set(&self, progress: InstallProgress) {
-        let mut entries = self.inner.write().expect("install progress lock poisoned");
+        let mut entries = self.inner.write();
         let _ = set_progress(
             &mut entries,
             progress,
@@ -335,7 +314,7 @@ impl InstallProgressStore {
     }
 
     fn update(&self, instance_id: &str, update: impl FnOnce(&mut InstallProgress)) {
-        let mut progress = self.inner.write().expect("install progress lock poisoned");
+        let mut progress = self.inner.write();
         if let Some(progress) = progress.get_mut(instance_id) {
             let before = progress.clone();
             update(progress);
@@ -349,10 +328,7 @@ impl InstallProgressStore {
 impl Drop for CreationPermit {
     fn drop(&mut self) {
         let empty = {
-            let mut active = self
-                .active_creations
-                .write()
-                .expect("creation lock poisoned");
+            let mut active = self.active_creations.write();
             active.remove(&self.instance_id);
             active.is_empty()
         };

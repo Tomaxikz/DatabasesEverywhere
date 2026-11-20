@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
     time::Instant,
 };
 
@@ -162,10 +162,4 @@ pub(super) fn is_strict_descendant(path: &Path, ancestor: &Path) -> bool {
 pub(super) fn next_nonzero(value: u64) -> u64 {
     let next = value.wrapping_add(1);
     if next == 0 { 1 } else { next }
-}
-
-pub(super) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

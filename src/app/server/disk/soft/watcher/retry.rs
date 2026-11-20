@@ -2,17 +2,17 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use super::{
     SoftDiskWatcher,
-    helpers::{abandon_backend, ensure_backend, install_recursive_watch, lock_recover},
+    helpers::{abandon_backend, ensure_backend, install_recursive_watch},
     state::{RecursiveWatchInstall, RetryCandidate, WatchHealth},
     types::RetrySummary,
 };
 
 impl SoftDiskWatcher {
     pub(crate) fn retry_degraded(&self) -> RetrySummary {
-        let _gate = lock_recover(&self.registration_gate);
+        let _gate = self.registration_gate.lock();
         let now = Instant::now();
         let retry_targets = {
-            let state = lock_recover(&self.shared.state);
+            let state = self.shared.state.lock();
             state
                 .targets
                 .iter()
@@ -30,7 +30,7 @@ impl SoftDiskWatcher {
         };
         let mut summary = RetrySummary::default();
 
-        let mut backend = lock_recover(&self.backend);
+        let mut backend = self.backend.lock();
         if self
             .shared
             .backend_rebuild_requested
@@ -55,7 +55,7 @@ impl SoftDiskWatcher {
             }
             let succeeded = outcome == RecursiveWatchInstall::Installed;
             let target_id = candidate.target_id;
-            let mut state = lock_recover(&self.shared.state);
+            let mut state = self.shared.state.lock();
             let Some(target) = state.targets.get_mut(&target_id) else {
                 continue;
             };
@@ -78,7 +78,10 @@ impl SoftDiskWatcher {
         summary.backend_available = backend.watcher.is_some();
         drop(backend);
 
-        summary.still_degraded = lock_recover(&self.shared.state)
+        summary.still_degraded = self
+            .shared
+            .state
+            .lock()
             .targets
             .values()
             .filter(|target| target.health == WatchHealth::Degraded)

@@ -9,7 +9,7 @@ use std::{
 use super::{
     SoftDiskWatcher,
     helpers::{
-        abandon_backend, ensure_backend, install_recursive_watch, lock_recover, next_nonzero,
+        abandon_backend, ensure_backend, install_recursive_watch, next_nonzero,
         registration_result, validate_registration,
     },
     state::{RecursiveWatchInstall, TargetState, WatchHealth},
@@ -24,7 +24,7 @@ impl SoftDiskWatcher {
         root: &Path,
     ) -> Result<WatchRegistration, WatchRegistrationError> {
         validate_registration(target_id, fingerprint, root)?;
-        let _gate = lock_recover(&self.registration_gate);
+        let _gate = self.registration_gate.lock();
 
         if let Some(unchanged) = self.unchanged_registration(target_id, fingerprint, root)? {
             return Ok(unchanged);
@@ -38,7 +38,7 @@ impl SoftDiskWatcher {
         let watch_succeeded = self.install_registration_watch(root, old_root.as_deref(), now);
 
         #[cfg(test)]
-        if watch_succeeded && let Some(pause) = lock_recover(&self.registration_pause).take() {
+        if watch_succeeded && let Some(pause) = self.registration_pause.lock().take() {
             pause.installed.wait();
             pause.resume.wait();
         }
@@ -66,7 +66,7 @@ impl SoftDiskWatcher {
         fingerprint: &str,
         root: &Path,
     ) -> Result<Option<WatchRegistration>, WatchRegistrationError> {
-        let state = lock_recover(&self.shared.state);
+        let state = self.shared.state.lock();
         if let Some(existing) = state.targets.get(target_id)
             && existing.fingerprint == fingerprint
             && existing.root == root
@@ -89,7 +89,7 @@ impl SoftDiskWatcher {
         fingerprint: &str,
         root: &Path,
     ) -> (Option<PathBuf>, u64) {
-        let mut state = lock_recover(&self.shared.state);
+        let mut state = self.shared.state.lock();
         let old_root = state.targets.remove(target_id).map(|target| target.root);
         if let Some(old_root) = &old_root {
             state.roots.remove(old_root);
@@ -126,7 +126,7 @@ impl SoftDiskWatcher {
         old_root: Option<&Path>,
         now: Instant,
     ) -> bool {
-        let mut backend = lock_recover(&self.backend);
+        let mut backend = self.backend.lock();
         let outcome = if self
             .shared
             .backend_rebuild_requested
@@ -166,7 +166,7 @@ impl SoftDiskWatcher {
         watch_succeeded: bool,
         now: Instant,
     ) -> (WatchRegistration, bool) {
-        let mut state = lock_recover(&self.shared.state);
+        let mut state = self.shared.state.lock();
         let (result, stale_watch_installed) = match state.targets.get_mut(target_id) {
             Some(target)
                 if target.registration_generation == registration_generation
@@ -195,7 +195,7 @@ impl SoftDiskWatcher {
     }
 
     fn unwatch_or_abandon_backend(&self, root: &Path, now: Instant) {
-        let mut backend = lock_recover(&self.backend);
+        let mut backend = self.backend.lock();
         if backend
             .watcher
             .as_mut()
@@ -207,7 +207,7 @@ impl SoftDiskWatcher {
 
     pub(crate) fn retire(&self, target_id: &str) -> Option<RetiredWatch> {
         let retired = {
-            let mut state = lock_recover(&self.shared.state);
+            let mut state = self.shared.state.lock();
             let target = state.targets.remove(target_id)?;
             state.roots.remove(&target.root);
             state.changed_targets.remove(target_id);
@@ -220,11 +220,8 @@ impl SoftDiskWatcher {
 
     /// Clean up a retired watch without unwatching a reused root.
     pub(crate) fn unwatch_retired(&self, retired: &RetiredWatch) {
-        let _gate = lock_recover(&self.registration_gate);
-        if lock_recover(&self.shared.state)
-            .roots
-            .contains_key(&retired.root)
-        {
+        let _gate = self.registration_gate.lock();
+        if self.shared.state.lock().roots.contains_key(&retired.root) {
             return;
         }
         let now = Instant::now();

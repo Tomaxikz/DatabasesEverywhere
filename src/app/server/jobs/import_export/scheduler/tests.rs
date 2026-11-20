@@ -272,7 +272,7 @@ fn dropping_receiver_after_dispatch_releases_sent_permit() {
     let scheduler = fixed_dynamic_scheduler(dynamic_capacity(1, 100, 100, 1));
     let (ready, receiver) = oneshot::channel();
     {
-        let mut state = lock_unpoisoned(&scheduler.shared.state);
+        let mut state = scheduler.shared.state.lock();
         state.waiting.push_back(WaitingJob {
             sequence: 0,
             queued_at: Instant::now(),
@@ -349,7 +349,7 @@ async fn automatic_dynamic_budget_times_out_instead_of_retaining_admission_forev
     assert!(!oversized.is_finished());
     drop(fitting);
     {
-        let mut state = lock_unpoisoned(&scheduler.shared.state);
+        let mut state = scheduler.shared.state.lock();
         state.waiting.front_mut().unwrap().queued_at =
             Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
     }

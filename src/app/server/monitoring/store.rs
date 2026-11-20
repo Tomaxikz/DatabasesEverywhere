@@ -1,6 +1,7 @@
+use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
 };
 
 use uuid::Uuid;
@@ -22,7 +23,7 @@ impl ActivityStore {
     ) -> Arc<ActivityCounter> {
         let instance_id = instance_id.into();
         let instance_generation = instance_generation.into();
-        let mut state = lock(&self.inner);
+        let mut state = self.inner.lock();
         state
             .entries
             .entry((instance_id, instance_generation))
@@ -37,7 +38,7 @@ impl ActivityStore {
         instance_generation: &str,
         sampled_at_unix: i64,
     ) -> Option<ActivityCurrent> {
-        let mut state = lock(&self.inner);
+        let mut state = self.inner.lock();
         let entry = state
             .entries
             .get_mut(&(instance_id.to_string(), instance_generation.to_string()))?;
@@ -59,7 +60,7 @@ impl ActivityStore {
         rx_bytes: u64,
         tx_bytes: u64,
     ) -> ActivityCurrent {
-        let mut state = lock(&self.inner);
+        let mut state = self.inner.lock();
         let entry = state
             .entries
             .entry((instance_id.to_string(), instance_generation.to_string()))
@@ -72,7 +73,7 @@ impl ActivityStore {
 
     /// Takes due rolling samples; no bucket is emitted until 60 seconds elapsed.
     pub fn sample(&self, sampled_at_unix: i64) -> Vec<ActivityBucket> {
-        let mut state = lock(&self.inner);
+        let mut state = self.inner.lock();
         let mut buckets = Vec::new();
 
         for ((instance_id, instance_generation), entry) in &mut state.entries {
@@ -127,7 +128,7 @@ impl ActivityStore {
     }
 
     pub fn remove(&self, instance_id: &str) -> bool {
-        let mut state = lock(&self.inner);
+        let mut state = self.inner.lock();
         let old_len = state.entries.len();
         state.entries.retain(|(id, _), _| id != instance_id);
         state.entries.len() != old_len
@@ -136,7 +137,8 @@ impl ActivityStore {
     /// Drops counters of deleted/recreated generations so stale gateway handles can't produce durable rows.
     pub fn retain_generations(&self, generations: &[(String, String)]) {
         let generations = generations.iter().cloned().collect::<HashSet<_>>();
-        lock(&self.inner)
+        self.inner
+            .lock()
             .entries
             .retain(|key, _| generations.contains(key));
     }
@@ -252,10 +254,4 @@ impl Entry {
 struct Baseline {
     sampled_at_unix: i64,
     snapshot: CounterSnapshot,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

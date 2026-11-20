@@ -1,9 +1,10 @@
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     future::Future,
     io::{Error as IoError, ErrorKind},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Instant as StdInstant,
 };
@@ -134,7 +135,7 @@ const MAX_ROUTING_HANDSHAKE_BYTES: usize = 64 * 1024;
 const BACKEND_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKEND_FAILURE_LOG_KEYS: usize = 4_096;
 
-static BACKEND_FAILURE_LOGS: OnceLock<StdMutex<HashMap<String, BackendFailureLogWindow>>> =
+static BACKEND_FAILURE_LOGS: OnceLock<Mutex<HashMap<String, BackendFailureLogWindow>>> =
     OnceLock::new();
 
 #[derive(Debug)]
@@ -543,9 +544,8 @@ fn backend_log_permit(protocol: &str, instance_id: &str) -> Option<u64> {
     let now = StdInstant::now();
     let key = format!("{protocol}\0{instance_id}");
     let mut windows = BACKEND_FAILURE_LOGS
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock();
     if windows.len() >= MAX_BACKEND_FAILURE_LOG_KEYS && !windows.contains_key(&key) {
         windows.retain(|_, window| {
             now.duration_since(window.last_logged) < BACKEND_FAILURE_WARNING_INTERVAL

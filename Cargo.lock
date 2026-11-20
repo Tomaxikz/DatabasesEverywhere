@@ -911,6 +911,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "notify",
+ "parking_lot",
  "percent-encoding",
  "procfs",
  "quick-xml",
