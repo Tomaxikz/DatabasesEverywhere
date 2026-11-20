@@ -144,8 +144,10 @@ pub(super) fn run_jdbc_smoke(
         .expect("run real JDBC/Hikari compatibility smoke test");
     assert!(
         output.status.success(),
-        "real JDBC/Hikari compatibility smoke test failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "real JDBC/Hikari compatibility smoke test failed ({}):\nstderr: {}\nstdout: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
