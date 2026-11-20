@@ -118,7 +118,7 @@ pub(crate) fn issue_ws_token(
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(secret),
+        &EncodingKey::from_secret(secret)?,
     )?;
     Ok((token, exp))
 }
@@ -171,7 +171,7 @@ pub fn validate_ws_token(
 pub fn validate_ws_token_claims(token: &str, secret: &[u8]) -> Result<Claims, JwtAuthError> {
     let token = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(secret),
+        &DecodingKey::from_secret(secret)?,
         &strict_hs256_validation(),
     )?;
     Ok(token.claims)
@@ -183,7 +183,7 @@ pub fn validate_ws_token_claims(token: &str, secret: &[u8]) -> Result<Claims, Jw
 pub(crate) fn validated_token_jti(token: &str, secret: &[u8]) -> Result<String, JwtAuthError> {
     let token = decode::<TokenIdentityClaims>(
         token,
-        &DecodingKey::from_secret(secret),
+        &DecodingKey::from_secret(secret)?,
         &strict_hs256_validation(),
     )?;
     Ok(token.claims.jti)
@@ -210,7 +210,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims(scopes::MONITOR_READ, "inst_abc", 3600),
-            &EncodingKey::from_secret(secret),
+            &EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
@@ -226,7 +226,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims(scopes::LOGS_READ, "inst_abc", 3600),
-            &EncodingKey::from_secret(secret),
+            &EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
@@ -245,7 +245,7 @@ mod tests {
             let token = encode(
                 &Header::default(),
                 &claims,
-                &EncodingKey::from_secret(secret),
+                &EncodingKey::from_secret(secret).unwrap(),
             )
             .unwrap();
             assert!(matches!(
@@ -264,7 +264,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(secret),
+            &EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
@@ -277,7 +277,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims(scopes::MONITOR_READ, "inst_abc", -1),
-            &EncodingKey::from_secret(secret),
+            &EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
@@ -293,7 +293,7 @@ mod tests {
         let token = encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(b"other-secret"),
+            &EncodingKey::from_secret(b"other-secret").unwrap(),
         )
         .unwrap();
 

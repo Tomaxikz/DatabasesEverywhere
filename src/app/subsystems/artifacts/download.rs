@@ -71,7 +71,8 @@ pub(super) async fn create_download_url(
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
+        &EncodingKey::from_secret(state.config.websocket_jwt_secret())
+            .map_err(ApiError::runtime_context("failed to issue download token"))?,
     )
     .map_err(ApiError::runtime_context("failed to issue download token"))?;
     // Keep the credential-bearing URL origin-relative. Building an absolute URL
@@ -219,7 +220,8 @@ pub(super) fn validate_download_token(
 ) -> Result<DownloadClaims, ApiError> {
     let claims = decode::<DownloadClaims>(
         token,
-        &DecodingKey::from_secret(state.config.websocket_jwt_secret()),
+        &DecodingKey::from_secret(state.config.websocket_jwt_secret())
+            .map_err(|_| ApiError::Unauthorized)?,
         &crate::auth::jwt::strict_hs256_validation(),
     )
     .map_err(|_| ApiError::Unauthorized)?

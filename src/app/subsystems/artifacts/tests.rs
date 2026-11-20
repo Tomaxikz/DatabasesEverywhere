@@ -183,7 +183,7 @@ async fn temporary_download_url_rejects_expired_token_without_leeway() {
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(state.config.websocket_jwt_secret()),
+        &EncodingKey::from_secret(state.config.websocket_jwt_secret()).unwrap(),
     )
     .unwrap();
 
