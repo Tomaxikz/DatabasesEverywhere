@@ -123,6 +123,20 @@ fn rejects_engine_level_database_creation() {
 }
 
 #[test]
+fn postgres_accepts_only_the_pg_dump_search_path_reset() {
+    let reset = "SELECT pg_catalog.set_config('search_path', '', false)";
+    assert!(validate(Protocol::Postgres, reset).is_ok());
+    for other in [
+        reset.replace("''", "'public'"),
+        reset.replace("search_path", "application_name"),
+        reset.replace("false", "true"),
+        format!("{reset}, 1"),
+    ] {
+        assert!(validate(Protocol::Postgres, &other).is_err());
+    }
+}
+
+#[test]
 fn rejects_cross_database_and_system_namespaces() {
     for (protocol, sql, issue) in [
         (

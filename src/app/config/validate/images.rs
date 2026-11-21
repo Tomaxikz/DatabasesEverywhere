@@ -54,7 +54,7 @@ pub(super) fn validate_image_reference(
     })
 }
 
-pub(super) fn check_mongodb_kernel(image: &str) -> Result<(), ConfigValidationError> {
+pub(crate) fn check_mongodb_kernel(image: &str) -> Result<(), ConfigValidationError> {
     let Some(kernel) = linux_kernel_release() else {
         return Ok(());
     };

@@ -66,7 +66,12 @@ fn build_spec(
         }],
         env,
         command: vec![
-            "--skip-networking=ON".to_string(),
+            if database.is_none() {
+                "--bind-address=127.0.0.1"
+            } else {
+                "--skip-networking=ON"
+            }
+            .to_string(),
             "--skip-name-resolve".to_string(),
             "--skip-mysqlx".to_string(),
             "--skip-log-bin".to_string(),

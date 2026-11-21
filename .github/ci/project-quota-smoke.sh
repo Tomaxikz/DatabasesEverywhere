@@ -29,12 +29,12 @@ fi
 case_timeout="${DBE_PROJECT_QUOTA_TEST_TIMEOUT:-6m}"
 build_timeout="${DBE_PROJECT_QUOTA_BUILD_TIMEOUT:-12m}"
 if [[ -n "$engine_protocol" ]]; then
-  test_name='placement::tenant::integration_tests::real_shared_engine_project_quota_enforces_tenant_writes'
+  test_name='server::placement::tenant::integration_tests::real_shared_engine_project_quota_enforces_tenant_writes'
 else
-  test_name='disk::project_quota_integration_tests::real_project_quota_enforces_tenant_boundary'
+  test_name='server::disk::project_quota_integration_tests::real_project_quota_enforces_tenant_boundary'
 fi
 
-for command in cargo sudo timeout truncate mount umount findmnt find grep; do
+for command in cargo sudo timeout truncate mount umount findmnt setpriv jq grep; do
   command -v "$command" >/dev/null || {
     echo "project-quota smoke test requires $command" >&2
     exit 1
@@ -46,19 +46,16 @@ sudo -n true || {
 }
 
 echo "==> Compiling the ignored native project-quota smoke test"
-timeout --kill-after=15s "$build_timeout" \
-  cargo test --locked --lib "$test_name" --no-run
-test_binary=""
-while IFS= read -r -d '' candidate; do
-  if "$candidate" --list | grep -F "$test_name" >/dev/null; then
-    test_binary="$(pwd -P)/$candidate"
-    break
-  fi
-done < <(find target/debug/deps -maxdepth 1 -type f -name 'databases_everywhere-*' -perm -u+x -print0)
-[[ -n "$test_binary" ]] || {
-  echo "could not locate the compiled DBEV library test binary" >&2
+test_binary="$(
+  timeout --kill-after=15s "$build_timeout" \
+    cargo test --locked --lib --no-run --message-format=json-render-diagnostics |
+    jq -er 'select(.reason == "compiler-artifact" and .profile.test and
+                   (.target.kind | index("lib")) and .executable) | .executable'
+)"
+if ! "$test_binary" --ignored --exact "$test_name" --list | grep -Fx "$test_name: test" >/dev/null; then
+  echo "project-quota test is missing from the Rust test catalog: $test_name" >&2
   exit 1
-}
+fi
 
 run_case() (
   local fs="$1"
@@ -207,12 +204,15 @@ run_case() (
   sudo mkdir "$test_root"
   sudo chmod 0755 "$mount_dir" "$test_root"
   echo "==> Exercising DBEV's canonical project-quota lifecycle on $fs"
+  # Retain quota administration privileges, but exercise writes without the
+  # CAP_SYS_RESOURCE exemption from ext4/F2FS hard block limits.
   sudo env \
       DBE_PROJECT_QUOTA_TEST_ROOT="$test_root" \
       DBE_PROJECT_QUOTA_TEST_FS="$fs" \
       DBE_PROJECT_QUOTA_ENGINE_PROTOCOL="$engine_protocol" \
+      DBE_PROJECT_QUOTA_ENGINE_IMAGE="${DBE_PROJECT_QUOTA_ENGINE_IMAGE:-}" \
     timeout --kill-after=15s "$case_timeout" \
-      "$test_binary" --exact --ignored --nocapture --test-threads=1 "$test_name"
+      setpriv --bounding-set=-sys_resource "$test_binary" --exact --ignored --nocapture --test-threads=1 "$test_name"
 )
 
 if [[ "$filesystem" == all ]]; then

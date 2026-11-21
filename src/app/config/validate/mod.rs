@@ -17,7 +17,8 @@ mod tests;
 use backups::validate_backups;
 use disk::validate_disk;
 pub use error::ConfigValidationError;
-use images::{check_mongodb_kernel, validate_images};
+pub(crate) use images::check_mongodb_kernel;
+use images::validate_images;
 use network::{
     validate_absolute_path, validate_api_tls, validate_clickhouse, validate_listener,
     validate_security,

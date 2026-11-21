@@ -57,7 +57,14 @@ fn helper_body_has_only_the_work_mount_and_strict_sandboxing() -> anyhow::Result
     )?;
 
     assert_eq!(body.image.as_deref(), Some("postgres:18.4"));
-    assert_eq!(body.user.as_deref(), Some("0:0"));
+    assert_eq!(
+        body.user,
+        Some(format!(
+            "{}:{}",
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw()
+        ))
+    );
     assert_eq!(body.working_dir.as_deref(), Some(HELPER_WORK_DIR));
     assert_eq!(
         body.entrypoint.as_deref(),

@@ -189,6 +189,32 @@ pub(super) struct RestoreRequest<'a> {
     pub(super) timeout: Duration,
 }
 
+/// Older SQL pools were socket-only. Verify the helper's connection before
+/// staging a destructive import or wiping any tenant objects.
+pub(super) async fn check_loopback_access(
+    state: &AppState,
+    metadata: &InstanceMetadata,
+) -> Result<(), ApiError> {
+    let probe = match metadata.protocol {
+        Protocol::Postgres => {
+            r#"PGPASSWORD="$DBE_POSTGRES_PASSWORD" psql -X -w -h 127.0.0.1 -U "$DBE_POSTGRES_USER" -d "$POSTGRES_DB" -c 'SELECT 1'"#
+        }
+        Protocol::Mysql => {
+            r#"MYSQL_PWD="$DBE_IMPORT_PASSWORD" mysql --protocol=TCP -h 127.0.0.1 -u "$DBE_IMPORT_USER" "$MYSQL_DATABASE" -e 'SELECT 1'"#
+        }
+        Protocol::Mariadb => {
+            r#"MYSQL_PWD="$DBE_MARIADB_PASSWORD" mariadb --protocol=TCP -h 127.0.0.1 -u "$MARIADB_USER" "$MARIADB_DATABASE" -e 'SELECT 1'"#
+        }
+        _ => return Ok(()),
+    };
+    let credentials = crate::server::credentials::logical_import_env(metadata, false)
+        .map_err(ApiError::conflict)?;
+    state.docker.exec_tenant_shell(metadata.protocol, metadata.runtime_id(), probe, &credentials.references(), Duration::from_secs(10)).await.map_err(|error| {
+        ApiError::Conflict(format!("shared restore requires tenant access over pool loopback; older socket-only pool containers need to be recreated with their existing data: {error}"))
+    })?;
+    Ok(())
+}
+
 pub(super) async fn run(state: &AppState, request: RestoreRequest<'_>) -> Result<(), RestoreError> {
     let RestoreRequest {
         metadata,

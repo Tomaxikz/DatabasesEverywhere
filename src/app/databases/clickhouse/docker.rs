@@ -176,7 +176,8 @@ fn write_hosted_config_sync(
 fn hosted_config_xml(shared: bool) -> String {
     // Shared engines need cgroup headroom for the bridge and untracked allocations; this mitigates OOM, it does not prevent it.
     let shared_memory = if shared {
-        r#"    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+        r#"    <background_schedule_pool_size>16</background_schedule_pool_size>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
     <memory_worker_correct_memory_tracker>1</memory_worker_correct_memory_tracker>
     <memory_worker_use_cgroup>1</memory_worker_use_cgroup>
 "#
@@ -455,6 +456,9 @@ mod tests {
         assert!(config.contains("toStartOfHour(event_time)"));
         assert!(config.contains("event_time + INTERVAL 2 HOUR DELETE"));
         assert!(!config.contains("<query_log remove=\"1\"/>"));
+        assert!(
+            config.contains("<background_schedule_pool_size>16</background_schedule_pool_size>")
+        );
         assert!(config.contains(
             "<max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>"
         ));

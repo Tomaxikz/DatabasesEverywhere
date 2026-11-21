@@ -75,6 +75,7 @@ fn build_spec(
             ),
         },
     ];
+    let shared = tenant.is_none();
     if let Some(tenant) = tenant {
         env.extend([
             DockerEnv::new(
@@ -88,7 +89,12 @@ fn build_spec(
     let command = vec![
         "postgres".to_string(),
         "-c".to_string(),
-        "listen_addresses=".to_string(),
+        if shared {
+            "listen_addresses=127.0.0.1"
+        } else {
+            "listen_addresses="
+        }
+        .to_string(),
         "-c".to_string(),
         "password_encryption=scram-sha-256".to_string(),
     ];

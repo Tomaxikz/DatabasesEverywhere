@@ -92,7 +92,12 @@ fn build_spec(
     }
 
     let mut command = vec![
-        "--skip-networking=ON".to_string(),
+        if shared {
+            "--bind-address=127.0.0.1"
+        } else {
+            "--skip-networking=ON"
+        }
+        .to_string(),
         "--skip-name-resolve".to_string(),
         "--skip-symbolic-links".to_string(),
         "--skip-log-bin".to_string(),

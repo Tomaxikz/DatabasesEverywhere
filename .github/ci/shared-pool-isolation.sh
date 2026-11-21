@@ -62,11 +62,11 @@ trap cleanup_active EXIT
 
 run_case() {
   local protocol="$1"
-  local test_name="placement::tenant::integration_tests::${protocol}_shared_pool_enforces_two_tenant_lifecycle_isolation"
+  local test_name="server::placement::tenant::integration_tests::${protocol}_shared_pool_enforces_two_tenant_lifecycle_isolation"
   local status
 
   if [ -z "$test_catalog" ]; then
-    test_catalog="$(cargo test --locked --lib -- --list)"
+    test_catalog="$(cargo test --locked --lib -- --ignored --list)"
   fi
   if ! grep -Fqx "$test_name: test" <<<"$test_catalog"; then
     echo "shared-pool isolation test is missing from the Rust test catalog: $test_name" >&2

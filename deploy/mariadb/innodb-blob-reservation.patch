@@ -1,0 +1,69 @@
+--- a/storage/innobase/include/btr0btr.h
++++ b/storage/innobase/include/btr0btr.h
+@@ -392,8 +392,7 @@
+ 	mtr_t*		mtr);	/*!< in: mtr */
+ 
+ /**************************************************************//**
+-Allocates a new file page to be used in an index tree. NOTE: we assume
+-that the caller has made the reservation for free extents!
++Allocates a new file page to be used in an index tree.
+ @retval NULL if no page could be allocated */
+ buf_block_t*
+ btr_page_alloc(
+@@ -409,7 +408,8 @@
+ 	mtr_t*		init_mtr,	/*!< in/out: mini-transaction
+ 					for x-latching and initializing
+ 					the page */
+-	dberr_t*	err)		/*!< out: error code */
++	dberr_t*	err,		/*!< out: error code */
++	bool		has_reserved_extents = true) /*!< in: caller reserved free extents */
+ 	MY_ATTRIBUTE((warn_unused_result));
+ /** Empty an index page (possibly the root page). @see btr_page_create().
+ @param[in,out]	block		page to be emptied
+--- a/storage/innobase/btr/btr0btr.cc
++++ b/storage/innobase/btr/btr0btr.cc
+@@ -569,8 +569,7 @@
+ }
+ 
+ /**************************************************************//**
+-Allocates a new file page to be used in an index tree. NOTE: we assume
+-that the caller has made the reservation for free extents!
++Allocates a new file page to be used in an index tree.
+ @retval NULL if no page could be allocated */
+ MY_ATTRIBUTE((nonnull, warn_unused_result))
+ buf_block_t*
+@@ -586,7 +585,8 @@
+ 	mtr_t*		init_mtr,	/*!< in/out: mtr or another
+ 					mini-transaction in which the
+ 					page should be initialized. */
+-	dberr_t*	err)		/*!< out: error code */
++	dberr_t*	err,		/*!< out: error code */
++	bool		has_reserved_extents) /*!< in: caller reserved free extents */
+ {
+   ut_ad(level < BTR_MAX_NODE_LEVEL);
+ 
+@@ -596,7 +596,7 @@
+   fseg_header_t *seg_header= root->page.frame +
+     (level ? PAGE_HEADER + PAGE_BTR_SEG_TOP : PAGE_HEADER + PAGE_BTR_SEG_LEAF);
+   return fseg_alloc_free_page_general(seg_header, hint_page_no, file_direction,
+-                                      true, mtr, init_mtr, err);
++                                      has_reserved_extents, mtr, init_mtr, err);
+ }
+ 
+ /** Free an index page.
+--- a/storage/innobase/btr/btr0cur.cc
++++ b/storage/innobase/btr/btr0cur.cc
+@@ -5928,9 +5928,12 @@
+ 				hint_prev = rec_block->page.id().page_no();
+ 			}
+ 
++			/* Each external page has its own mini-transaction.
++			Reserve space before allocating so a failed write
++			leaves the cleaning reserve available for rollback. */
+ 			block = btr_page_alloc(index, hint_prev + 1,
+ 					       FSP_NO_DIR, 0, &mtr, &mtr,
+-					       &error);
++					       &error, false);
+ 
+ 			DBUG_EXECUTE_IF("btr_page_alloc_fail",
+ 					block= nullptr;

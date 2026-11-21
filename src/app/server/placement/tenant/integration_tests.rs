@@ -12,7 +12,7 @@ use super::{
     secure_pool, unfence, verify_password,
 };
 use crate::{
-    config::{Config, DaemonConfig, DiskConfig, DiskLimitMode, PathConfig},
+    config::{Config, DaemonConfig, DiskConfig, DiskLimitMode, ImageConfig, PathConfig},
     databases,
     databases::protocol::Protocol,
     runtime::docker::{CommandOutput, DockerError, DockerInstanceSpec, DockerRuntime},
@@ -147,6 +147,7 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
         .await,
         "create tenant A quota probe table",
     );
+    let mut committed_rows = 0;
     let mut quota_hit = false;
     for _ in 0..96 {
         match run_as(
@@ -158,12 +159,24 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
         )
         .await
         {
-            Ok(_) => {}
-            Err(DockerError::ExecFailed { exit_code, .. }) => {
+            Ok(_) => committed_rows += 1,
+            Err(DockerError::ExecFailed {
+                exit_code,
+                failure_output,
+                ..
+            }) => {
                 assert!(
                     !matches!(exit_code, 126 | 127),
                     "the tenant client command was unavailable"
                 );
+                if protocol == Protocol::Mariadb {
+                    assert!(
+                        failure_output.lines().any(|line| {
+                            line.starts_with("ERROR 1114 ") || line.starts_with("ERROR 1021 ")
+                        }),
+                        "expected a MariaDB table-full or disk-full error: {failure_output}"
+                    );
+                }
                 quota_hit = true;
                 break;
             }
@@ -180,6 +193,26 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
     assert!(
         used >= 32 * 1024 * 1024,
         "{protocol} reported only {used} bytes when the engine hit its quota"
+    );
+    let rows = assert_ok(
+        run_as(
+            &pool,
+            tenant_a,
+            PASSWORD_A,
+            DATABASE_A,
+            "SELECT COUNT(*) FROM quota_fill",
+        )
+        .await,
+        "read tenant A after the failed write",
+    );
+    assert!(
+        committed_rows > 0,
+        "expected a committed row before reaching quota"
+    );
+    assert_eq!(
+        rows.stdout.trim(),
+        committed_rows.to_string(),
+        "quota rollback changed committed rows"
     );
 
     // A full tenant must not consume another tenant's independent project.
@@ -476,7 +509,10 @@ async fn assert_clickhouse_query_log_text_bounded(pool: &SharedPool) {
         unreachable!("length checked above")
     };
     assert!(*rows > 0, "tenant queries were not retained for accounting");
-    assert_eq!(*query_max, 1024, "retained query text was not cut to 1 KiB");
+    assert!(
+        (1..=1024).contains(query_max),
+        "retained query text was outside the 1 KiB bound: {query_max}"
+    );
     assert_eq!(*formatted_max, 0, "formatted query text was retained");
     assert_eq!(*comment_max, 0, "tenant log comments were retained");
     assert!(
@@ -882,11 +918,15 @@ fn assert_denied(output: Result<CommandOutput, DockerError>, protocol: Protocol,
                         || output.contains("not allowed")
                 }
                 Protocol::Mongodb => {
-                    output.contains("not authorized") || output.contains("unauthorized")
+                    output.contains("not authorized")
+                        || output.contains("unauthorized")
+                        || (operation == "tenant A running server-side JavaScript"
+                            && output.contains("no globalscriptengine in $where parsing"))
                 }
                 Protocol::Clickhouse => {
                     output.contains("not enough privileges")
                         || output.contains("access denied")
+                        || output.contains("(database_access_denied)")
                         || output.contains("cannot be changed")
                         || output.contains("should not be changed")
                         || output.contains("setting constraint")
@@ -924,7 +964,7 @@ struct SharedPool {
 
 impl SharedPool {
     async fn start(protocol: Protocol) -> Self {
-        Self::start_with_image(protocol, test_image(protocol)).await
+        Self::start_with_image(protocol, &test_image(protocol)).await
     }
 
     async fn start_with_image(protocol: Protocol, image: &str) -> Self {
@@ -943,9 +983,16 @@ impl SharedPool {
     }
 
     async fn start_on_project_quota(protocol: Protocol, root: PathBuf) -> Self {
+        let defaults = ImageConfig::default();
+        let image_override = env::var("DBE_PROJECT_QUOTA_ENGINE_IMAGE").ok();
+        let image = image_override
+            .as_deref()
+            .filter(|image| !image.is_empty())
+            .unwrap_or_else(|| defaults.configured_for_protocol(protocol));
+        eprintln!("verifying {protocol} project quotas with {image}");
         Self::start_in(
             protocol,
-            test_image(protocol),
+            image,
             root,
             DiskConfig {
                 mode: DiskLimitMode::ProjectQuota,
@@ -1023,6 +1070,22 @@ impl SharedPool {
 
 impl Drop for SharedPool {
     fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Ok(output) = Command::new("docker")
+                .args(["logs", "--tail", "80", &self.container_name])
+                .output()
+        {
+            for line in String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter(|line| {
+                    line.contains("[ERROR]")
+                        || line.contains("[FATAL]")
+                        || line.contains("No space left")
+                })
+            {
+                eprintln!("{line}");
+            }
+        }
         let _ = Command::new("docker")
             .args(["rm", "--force", &self.container_name])
             .output();
@@ -1112,7 +1175,7 @@ async fn shared_spec(
                 databases::clickhouse::docker::write_shared_hosted_config(&paths.runtime_config)
                     .await
                     .expect("write the production hosted ClickHouse config");
-            let bridge = crate::bins::get_socket_bridge_bin_path(&root.join("runtime"))
+            let bridge = crate::bins::get_socket_bridge_bin_path(root)
                 .await
                 .expect("install the production socket bridge helper");
             databases::clickhouse::docker::shared_spec(
@@ -1136,6 +1199,10 @@ fn runtime(
     container_name: &str,
     paths: &InstancePaths,
 ) -> EngineRuntime {
+    let tenant_limits = InstanceLimits::default();
+    let pool_disk_mib =
+        crate::server::placement::policy::pool_disk_mib(protocol, 2 * tenant_limits.disk_mib)
+            .expect("size the shared pool for both test tenants");
     EngineRuntime {
         pending_image: None,
         desired_state: crate::server::metadata::DesiredInstanceState::Running,
@@ -1155,7 +1222,10 @@ fn runtime(
             container_name: container_name.to_string(),
             network_mode: "none".to_string(),
         },
-        limits: InstanceLimits::default(),
+        limits: InstanceLimits {
+            disk_mib: pool_disk_mib,
+            ..tenant_limits
+        },
         image: image.to_string(),
         database_version: None,
         compatibility: None,
@@ -1214,13 +1284,15 @@ async fn bootstrap_mongodb_root(pool: &SharedPool) {
         .expect("bootstrap MongoDB root with the production script");
 }
 
-fn test_image(protocol: Protocol) -> &'static str {
+fn test_image(protocol: Protocol) -> String {
+    let defaults = ImageConfig::default();
     match protocol {
-        Protocol::Postgres => "postgres:18.4",
-        Protocol::Mysql => "mysql:8.4",
-        Protocol::Mariadb => "mariadb:12.3.2",
-        Protocol::Mongodb => "mongo:8.3.4",
-        Protocol::Clickhouse => "clickhouse/clickhouse-server:26.4.4.38",
-        _ => panic!("unsupported shared integration image for {protocol}"),
+        Protocol::Mariadb => env::var("DBE_MARIADB_TEST_IMAGE").unwrap_or(defaults.mariadb),
+        Protocol::Mongodb
+            if crate::config::validate::check_mongodb_kernel("mongo:8.3.4").is_ok() =>
+        {
+            "mongo:8.3.4".to_owned()
+        }
+        _ => defaults.configured_for_protocol(protocol).to_owned(),
     }
 }

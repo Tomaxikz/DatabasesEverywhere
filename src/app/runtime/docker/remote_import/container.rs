@@ -64,14 +64,33 @@ pub(super) async fn remove_import_helper(
     docker: &Docker,
     name_or_id: &str,
 ) -> Result<(), DockerError> {
-    let remove = docker.remove_container(
-        name_or_id,
-        Some(RemoveContainerOptions {
-            v: true,
-            force: true,
-            ..Default::default()
-        }),
-    );
+    let remove = async {
+        loop {
+            let result = docker
+                .remove_container(
+                    name_or_id,
+                    Some(RemoveContainerOptions {
+                        v: true,
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            // Docker can already be auto-removing an exited helper. Confirm
+            // removal within the same deadline before allowing a rollback.
+            if matches!(
+                result,
+                Err(BollardError::DockerResponseServerError {
+                    status_code: 409,
+                    ..
+                })
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return result;
+        }
+    };
     match tokio::time::timeout(HELPER_CLEANUP_TIMEOUT, remove).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(BollardError::DockerResponseServerError {
@@ -201,7 +220,16 @@ pub(super) fn import_helper_body(options: ImportHelperCreateOptions<'_>) -> Cont
 
     ContainerCreateBody {
         image: Some(spec.image.clone()),
-        user: Some("0:0".to_string()),
+        user: Some(if rootless_podman {
+            "0:0".to_string()
+        } else {
+            // Private inputs and the work directory belong to the daemon.
+            format!(
+                "{}:{}",
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw()
+            )
+        }),
         working_dir: Some(HELPER_WORK_DIR.to_string()),
         entrypoint: Some(vec!["/bin/sh".to_string()]),
         cmd: Some(vec!["-c".to_string(), spec.script.clone()]),

@@ -84,14 +84,14 @@ async fn real_project_quota_enforces_tenant_boundary() {
     assert_ne!(tenant_a_project, tenant_b_project);
 
     let a_data = tenant_a.join("quota-fill.bin");
-    append_until_edquot(&a_data, 2 * RESIZED_LIMIT_MIB as usize);
+    append_until_quota(&a_data, 2 * RESIZED_LIMIT_MIB as usize, &filesystem);
     let a_usage_before_resize = limiter
         .path_quota_usage_bytes("quota-smoke-tenant-a", &tenant_a, &registry_root)
         .await
         .expect("read tenant A kernel-accounted usage");
     assert!(
         a_usage_before_resize >= INITIAL_LIMIT_MIB.saturating_sub(2) * MIB as u64,
-        "tenant A hit EDQUOT but reported only {a_usage_before_resize} bytes"
+        "tenant A hit its limit but reported only {a_usage_before_resize} bytes"
     );
 
     // Exhausting A must not consume B's independent budget.
@@ -184,21 +184,21 @@ fn canonical_test_root(raw: &str) -> PathBuf {
     root
 }
 
-fn append_until_edquot(path: &Path, maximum_mib: usize) {
+fn append_until_quota(path: &Path, maximum_mib: usize, filesystem: &str) {
     let mut file = open_append(path);
     let chunk = vec![0xA5; MIB];
     for _ in 0..maximum_mib {
         if let Err(error) = file.write_all(&chunk) {
-            assert_edquot(error, path);
+            assert_quota_error(error, path, filesystem);
             return;
         }
         if let Err(error) = file.sync_data() {
-            assert_edquot(error, path);
+            assert_quota_error(error, path, filesystem);
             return;
         }
     }
     panic!(
-        "{} accepted {maximum_mib} MiB without returning EDQUOT",
+        "{} accepted {maximum_mib} MiB without reaching its project quota",
         path.display()
     );
 }
@@ -225,11 +225,13 @@ fn open_append(path: &Path) -> fs::File {
         .unwrap_or_else(|error| panic!("open {} failed: {error}", path.display()))
 }
 
-fn assert_edquot(error: io::Error, path: &Path) {
-    assert_eq!(
-        error.raw_os_error(),
-        Some(libc::EDQUOT),
-        "{} failed with {error}, not EDQUOT",
+fn assert_quota_error(error: io::Error, path: &Path, filesystem: &str) {
+    // XFS can report a project's hard space limit as ENOSPC. The peer
+    // write and subsequent resize prove the underlying mount still has space.
+    let code = error.raw_os_error();
+    assert!(
+        code == Some(libc::EDQUOT) || (filesystem == "xfs" && code == Some(libc::ENOSPC)),
+        "{} failed with an unexpected write error: {error}",
         path.display()
     );
 }

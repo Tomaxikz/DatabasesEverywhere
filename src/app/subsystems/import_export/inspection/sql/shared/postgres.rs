@@ -1,8 +1,9 @@
 use super::{
-    SharedObserver, SharedSqlError, SharedSqlIssue, Statement, is_any_keyword, parse_namespace,
+    SharedObserver, SharedSqlError, SharedSqlIssue, SqlToken, Statement, is_any_keyword,
+    parse_namespace,
     words::{
         contains_any, contains_sequence, create_object, is_postgres_system_schema,
-        privileged_object_command, qualified_identifiers, word_at_is,
+        privileged_object_command, qualified_identifiers,
     },
 };
 
@@ -21,6 +22,9 @@ impl SharedObserver<'_> {
                 );
             }
             self.namespaces.insert(namespace);
+        }
+        if is_pg_dump_search_path_reset(&statement.tokens) {
+            return Ok(());
         }
         self.reject_system_postgres_object(statement)?;
         if contains_any(words, &["SUPERUSER", "CREATEROLE", "CREATEDB", "BYPASSRLS"])
@@ -67,16 +71,6 @@ impl SharedObserver<'_> {
 
         match command {
             value if value.eq_ignore_ascii_case("SET") => Ok(()),
-            value if value.eq_ignore_ascii_case("SELECT") => {
-                if word_at_is(words, 1, "PG_CATALOG") && word_at_is(words, 2, "SET_CONFIG") {
-                    Ok(())
-                } else {
-                    self.reject(
-                        SharedSqlIssue::UnsupportedStatement,
-                        "only pg_catalog.set_config setup SELECTs are accepted in shared PostgreSQL dumps",
-                    )
-                }
-            }
             value if value.eq_ignore_ascii_case("COPY") => {
                 if !statement.copy_from_stdin || contains_any(words, &["TO", "PROGRAM"]) {
                     self.reject(
@@ -157,4 +151,13 @@ impl SharedObserver<'_> {
             Ok(())
         }
     }
+}
+
+// pg_dump clears search_path before it emits qualified object names.
+fn is_pg_dump_search_path_reset(tokens: &[SqlToken]) -> bool {
+    use SqlToken::{CloseParen, Comma, Dot, EmptyString, Identifier, OpenParen, SearchPathString};
+    matches!(tokens, [Identifier(select), Identifier(catalog), Dot, Identifier(function), OpenParen,
+        SearchPathString, Comma, EmptyString, Comma, Identifier(local), CloseParen]
+        if select.eq_ignore_ascii_case("select") && catalog == "pg_catalog"
+            && function == "set_config" && local.eq_ignore_ascii_case("false"))
 }

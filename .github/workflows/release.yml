@@ -148,7 +148,7 @@ jobs:
   release-quality:
     name: Release lint and tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 55
     needs: release-gate
     permissions:
       contents: read
@@ -172,6 +172,15 @@ jobs:
 
       - name: Run locked release checks
         run: bash .github/ci/check.sh pre-push
+
+      - name: Verify shared MariaDB hard quotas before publication
+        env:
+          DBE_PROJECT_QUOTA_TEST_TIMEOUT: 12m
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs quota xfsprogs
+          bash .github/ci/project-quota-smoke.sh xfs mariadb
+          bash .github/ci/project-quota-smoke.sh ext4 mariadb
 
   build:
     name: dbev-${{ matrix.asset_arch }}-linux

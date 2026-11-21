@@ -222,7 +222,7 @@ mod linux {
             });
         }
 
-        quota_state(target.filesystem, &target.mountpoint, project_id)
+        quota_state(target.filesystem, &target.mountpoint, project_id, false)
             .map(|state| state.usage_bytes)
     }
 
@@ -232,7 +232,7 @@ mod linux {
         project_id: u32,
         expected_bytes: u64,
     ) -> Result<(), DiskLimitError> {
-        let state = quota_state(filesystem, mountpoint, project_id)?;
+        let state = quota_state(filesystem, mountpoint, project_id, expected_bytes == 0)?;
         validate_hard_limit(state.hard_limit_bytes, expected_bytes)
             .map_err(|error| invalid(project_id, mountpoint, error))
     }
@@ -242,7 +242,7 @@ mod linux {
         mountpoint: &Path,
         project_id: u32,
     ) -> Result<(), DiskLimitError> {
-        let state = quota_state(filesystem, mountpoint, project_id)?;
+        let state = quota_state(filesystem, mountpoint, project_id, true)?;
         validate_unused(state.usage_bytes).map_err(|used_bytes| {
             DiskLimitError::ProjectQuotaStillUsed {
                 project_id,
@@ -262,10 +262,13 @@ mod linux {
         filesystem: NativeProjectQuotaFs,
         mountpoint: &Path,
         project_id: u32,
+        allow_absent: bool,
     ) -> Result<QuotaState, DiskLimitError> {
         let mount = open_dir(mountpoint, project_id)?;
         match filesystem {
-            NativeProjectQuotaFs::Xfs => xfs_quota_state(mount.as_raw_fd(), mountpoint, project_id),
+            NativeProjectQuotaFs::Xfs => {
+                xfs_quota_state(mount.as_raw_fd(), mountpoint, project_id, allow_absent)
+            }
             NativeProjectQuotaFs::Ext4 | NativeProjectQuotaFs::F2fs => {
                 vfs_quota_state(mount.as_raw_fd(), mountpoint, project_id)
             }
@@ -276,6 +279,7 @@ mod linux {
         mount_fd: libc::c_int,
         mountpoint: &Path,
         project_id: u32,
+        allow_absent: bool,
     ) -> Result<QuotaState, DiskLimitError> {
         let mut state = XfsQuotaState {
             version: XFS_QUOTA_STATE_VERSION,
@@ -285,8 +289,18 @@ mod linux {
             .map_err(|source| io_error(project_id, mountpoint, source))?;
         validate_xfs_enforcement(&state).map_err(|error| invalid(project_id, mountpoint, error))?;
         let mut quota = XfsDiskQuota::default();
-        query(mount_fd, project_id, QuotaBuffer::Xfs(&mut quota))
-            .map_err(|source| io_error(project_id, mountpoint, source))?;
+        // Once both usage and limits are zero, XFS may discard the record.
+        // The live mount's project enforcement was verified above.
+        match query(mount_fd, project_id, QuotaBuffer::Xfs(&mut quota)) {
+            Ok(()) => {}
+            Err(error) if allow_absent && error.raw_os_error() == Some(libc::ENOENT) => {
+                return Ok(QuotaState {
+                    usage_bytes: 0,
+                    hard_limit_bytes: 0,
+                });
+            }
+            Err(error) => return Err(io_error(project_id, mountpoint, error)),
+        }
         xfs_state(&quota, project_id).map_err(|error| invalid(project_id, mountpoint, error))
     }
 

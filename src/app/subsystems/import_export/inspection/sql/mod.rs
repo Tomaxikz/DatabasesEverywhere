@@ -17,6 +17,9 @@ enum SqlToken {
     Identifier(String),
     QuotedIdentifier(String),
     OversizedIdentifier,
+    EmptyString,
+    SearchPathString,
+    Comma,
     Dot,
     Backslash,
     OpenParen,
@@ -79,6 +82,7 @@ fn scan_sql<I: SqlInput, O: SqlObserver>(
     let mut lexer = SqlLexer {
         input,
         backslash_strings: protocol.engine().sql_backslash_strings(),
+        postgres: protocol == Protocol::Postgres,
     };
     let mut statement = Statement::default();
     while let Some(event) = lexer.next_event()? {
@@ -130,6 +134,7 @@ struct SqlComment {
 struct SqlLexer<I> {
     input: I,
     backslash_strings: bool,
+    postgres: bool,
 }
 
 impl<I: SqlInput> SqlLexer<I> {
@@ -150,7 +155,7 @@ impl<I: SqlInput> SqlLexer<I> {
                 self.input.next()?;
                 return Ok(Some(LexEvent::Comment(self.read_line_comment()?)));
             }
-            if byte == b'#' {
+            if byte == b'#' && !self.postgres {
                 return Ok(Some(LexEvent::Comment(self.read_line_comment()?)));
             }
             if byte == b'/' && self.input.peek()? == Some(b'*') {
@@ -158,8 +163,27 @@ impl<I: SqlInput> SqlLexer<I> {
                 return Ok(Some(LexEvent::Comment(self.read_block_comment()?)));
             }
             if byte == b'\'' {
-                self.skip_string(self.backslash_strings)?;
-                return Ok(Some(LexEvent::Token(SqlToken::Other)));
+                if !self.postgres {
+                    self.skip_string(self.backslash_strings)?;
+                    return Ok(Some(LexEvent::Token(SqlToken::Other)));
+                }
+                // Keep only the two literals needed to recognize pg_dump's
+                // search_path preamble. Long data values stay streaming.
+                let literal = if self.input.peek()? == Some(b'\'') {
+                    SqlToken::EmptyString
+                } else if self.input.peek()? == Some(b's')
+                    && self.input.starts_with(b"search_path'")?
+                {
+                    SqlToken::SearchPathString
+                } else {
+                    SqlToken::Other
+                };
+                let escaped = self.skip_string(self.backslash_strings)?;
+                return Ok(Some(LexEvent::Token(if escaped {
+                    SqlToken::Other
+                } else {
+                    literal
+                })));
             }
             if matches!(byte, b'"' | b'`') {
                 let identifier = self.read_quoted_identifier(byte)?;
@@ -190,6 +214,7 @@ impl<I: SqlInput> SqlLexer<I> {
                 )));
             }
             return Ok(Some(LexEvent::Token(match byte {
+                b',' => SqlToken::Comma,
                 b'.' => SqlToken::Dot,
                 b'\\' => SqlToken::Backslash,
                 b'(' => SqlToken::OpenParen,
@@ -247,16 +272,19 @@ impl<I: SqlInput> SqlLexer<I> {
         ))
     }
 
-    fn skip_string(&mut self, backslash_escapes: bool) -> Result<(), InspectionError> {
+    fn skip_string(&mut self, backslash_escapes: bool) -> Result<bool, InspectionError> {
+        let mut escaped = false;
         while let Some(byte) = self.input.next()? {
             match byte {
                 b'\\' if backslash_escapes => {
+                    escaped = true;
                     self.input.next()?;
                 }
                 b'\'' if self.input.peek()? == Some(b'\'') => {
+                    escaped = true;
                     self.input.next()?;
                 }
-                b'\'' => return Ok(()),
+                b'\'' => return Ok(escaped),
                 _ => {}
             }
         }
@@ -399,6 +427,15 @@ fn is_word_byte(byte: u8) -> bool {
 }
 
 trait SqlInput {
+    fn starts_with(&mut self, prefix: &[u8]) -> Result<bool, InspectionError> {
+        for (index, byte) in prefix.iter().enumerate() {
+            if self.peek_n(index)? != Some(*byte) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn next(&mut self) -> Result<Option<u8>, InspectionError>;
     fn peek_n(&mut self, index: usize) -> Result<Option<u8>, InspectionError>;
 

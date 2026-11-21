@@ -72,12 +72,19 @@ fn tenant_roles_script(
     roles: &[&str],
 ) -> Result<String, MongodbProvisionError> {
     validate_tenant_identifiers(database, username)?;
+    // Revoking roles alone still permits SCRAM login. Shared mongod binds
+    // only to loopback, so a TEST-NET server address matches no connection.
+    let restrictions = if roles.is_empty() {
+        r#"[{serverAddress: ["192.0.2.1"]}]"#
+    } else {
+        "[]"
+    };
     let roles = roles
         .iter()
         .map(|role| serde_json::json!({ "role": role, "db": database }))
         .collect::<Vec<_>>();
     Ok(format!(
-        "const database = {};\nconst username = {};\ndb = db.getSiblingDB(database);\ndb.updateUser(username, {{ roles: {} }});\n",
+        "const database = {};\nconst username = {};\ndb = db.getSiblingDB(database);\ndb.updateUser(username, {{ roles: {}, authenticationRestrictions: {restrictions} }});\n",
         serde_json::to_string(database)?,
         serde_json::to_string(username)?,
         serde_json::to_string(&roles)?,
@@ -284,6 +291,8 @@ mod tests {
 
             assert!(fence.contains("roles: []"));
             assert!(unfence.contains("readWrite"));
+            assert!(fence.contains("serverAddress"));
+            assert!(unfence.contains("authenticationRestrictions: []"));
             assert!(terminate.contains("killAllSessions"));
             assert!(terminate.contains(username));
             assert!(terminate.contains(database));

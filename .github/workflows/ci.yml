@@ -477,45 +477,36 @@ jobs:
       - documentation
       - codeql
       - release_build
+      - shared_pool_isolation
+      - project_quota
+      - project_quota_engines
     steps:
       - name: Require every CI stage
         env:
-          GLOBAL_LINT_RESULT: ${{ needs.global_lint.result }}
-          SECURITY_AUDIT_RESULT: ${{ needs.security_audit.result }}
-          TESTS_RESULT: ${{ needs.tests.result }}
-          MYSQL_DRIVER_MATRIX_RESULT: ${{ needs.mysql_driver_matrix.result }}
-          PODMAN_SMOKE_RESULT: ${{ needs.podman_smoke.result }}
-          DOCUMENTATION_RESULT: ${{ needs.documentation.result }}
-          CODEQL_RESULT: ${{ needs.codeql.result }}
-          RELEASE_BUILD_RESULT: ${{ needs.release_build.result }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
-          failed=0
           {
-            echo "## CI gate"
+            echo '## CI gate'
             echo
-            echo "| Stage | Result |"
-            echo "| --- | --- |"
+            echo '| Job | Result |'
+            echo '| --- | --- |'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          for stage in \
-            "global lint=$GLOBAL_LINT_RESULT" \
-            "dependency security=$SECURITY_AUDIT_RESULT" \
-            "Linux tests=$TESTS_RESULT" \
-            "real MySQL/MariaDB clients and versions=$MYSQL_DRIVER_MATRIX_RESULT" \
-            "rootless Podman compatibility=$PODMAN_SMOKE_RESULT" \
-            "Rust documentation=$DOCUMENTATION_RESULT" \
-            "CodeQL=$CODEQL_RESULT" \
-            "release build=$RELEASE_BUILD_RESULT"
-          do
-            label="${stage%%=*}"
-            result="${stage##*=}"
-            if [ "$result" = "success" ]; then
-              printf 'PASS  %s\n' "$stage"
-              printf '| %s | PASS (%s) |\n' "$label" "$result" >> "$GITHUB_STEP_SUMMARY"
-            else
-              printf 'FAIL  %s\n' "$stage" >&2
-              printf '| %s | FAIL (%s) |\n' "$label" "$result" >> "$GITHUB_STEP_SUMMARY"
-              failed=1
+          failed=0
+          results=$(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<< "$JOB_RESULTS")
+          while IFS=$'\t' read -r job result; do
+            printf '| %s | %s |\n' "$job" "$result" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$result" == success ]]; then
+              continue
             fi
-          done
+            case "$job" in
+              shared_pool_isolation|project_quota|project_quota_engines)
+                if [[ "$result" == skipped && "$GITHUB_EVENT_NAME" != schedule && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
+                  continue
+                fi
+                ;;
+            esac
+            echo "::error::CI job $job ended with $result"
+            failed=1
+          done <<< "$results"
           exit "$failed"

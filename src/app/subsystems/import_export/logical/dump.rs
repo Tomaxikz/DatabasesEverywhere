@@ -160,6 +160,9 @@ pub(super) async fn prepare_logical_import(
     protocol
         .engine()
         .validate_artifact_selection(&options.selection)?;
+    if metadata.deployment_mode == DeploymentMode::Shared {
+        super::super::shared_restore::check_loopback_access(state, metadata).await?;
+    }
     let extension = dump_extension(protocol);
     let temp_name = format!(".dbe-import-{}.{}", uuid::Uuid::new_v4(), extension);
     let staging_root = logical_staging_root(state).await?;
