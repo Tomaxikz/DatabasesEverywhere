@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     task::Context,
     time::Duration,
@@ -14,7 +14,6 @@ use tokio::sync::Notify;
 
 #[derive(Debug, Default)]
 struct SessionState {
-    authenticated: AtomicBool,
     cancelled: AtomicBool,
     waker: AtomicWaker,
 }
@@ -35,21 +34,23 @@ impl SessionState {
 }
 
 #[derive(Debug)]
+struct RegisteredSession {
+    state: Arc<SessionState>,
+    authenticated: bool,
+}
+
+#[derive(Debug)]
 struct TenantEntry {
-    sessions: HashMap<u64, Weak<SessionState>>,
+    // TenantSession::drop unregisters its id while it still owns the session state.
+    sessions: HashMap<u64, RegisteredSession>,
+    authenticated_count: usize,
     drained: Arc<Notify>,
     buffers: super::buffers::QueryBudget,
 }
 
-impl TenantEntry {
-    fn prune_dropped_sessions(&mut self) {
-        self.sessions
-            .retain(|_, session| session.strong_count() > 0);
-    }
-}
-
 #[derive(Debug, Default)]
 struct RegistryState {
+    next_id: u64,
     tenants: HashMap<String, TenantEntry>,
 }
 
@@ -61,7 +62,6 @@ struct RegistryState {
 #[derive(Debug, Clone, Default)]
 pub struct TenantSessions {
     state: Arc<Mutex<RegistryState>>,
-    next_id: Arc<AtomicU64>,
     config: Arc<crate::config::RuntimeConfig>,
 }
 
@@ -73,7 +73,6 @@ impl TenantSessions {
     pub(crate) fn with_config(config: Arc<crate::config::RuntimeConfig>) -> Self {
         Self {
             state: Arc::default(),
-            next_id: Arc::default(),
             config,
         }
     }
@@ -103,30 +102,39 @@ impl TenantSessions {
         limit: Option<usize>,
         authenticated: bool,
     ) -> Result<TenantSession, TenantSessionLimit> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let session = Arc::new(SessionState::default());
         let mut state = self.state.lock();
-        let entry = state
-            .tenants
-            .entry(instance_id.to_string())
-            .or_insert_with(|| TenantEntry {
-                sessions: HashMap::new(),
-                drained: Arc::default(),
-                buffers: super::buffers::QueryBudget::new(&self.config),
-            });
-        entry.prune_dropped_sessions();
         if let Some(limit) = limit
-            && authenticated_count(entry) >= limit
+            && state
+                .tenants
+                .get(instance_id)
+                .map_or(0, |entry| entry.authenticated_count)
+                >= limit
         {
             return Err(TenantSessionLimit {
                 instance_id: instance_id.to_string(),
                 limit,
             });
         }
-        entry.sessions.insert(id, Arc::downgrade(&session));
-        session
-            .authenticated
-            .store(authenticated, Ordering::Release);
+        let id = state.next_id;
+        state.next_id = id.wrapping_add(1);
+        let entry = state
+            .tenants
+            .entry(instance_id.to_string())
+            .or_insert_with(|| TenantEntry {
+                sessions: HashMap::new(),
+                authenticated_count: 0,
+                drained: Arc::default(),
+                buffers: super::buffers::QueryBudget::new(&self.config),
+            });
+        let session = Arc::new(SessionState::default());
+        entry.sessions.insert(
+            id,
+            RegisteredSession {
+                state: Arc::clone(&session),
+                authenticated,
+            },
+        );
+        entry.authenticated_count += usize::from(authenticated);
         Ok(TenantSession {
             instance_id: instance_id.to_string(),
             id,
@@ -140,15 +148,14 @@ impl TenantSessions {
     /// affected; callers must fence the tenant route before invoking this.
     pub fn cancel(&self, instance_id: &str) -> usize {
         let sessions = {
-            let mut state = self.state.lock();
-            let Some(entry) = state.tenants.get_mut(instance_id) else {
+            let state = self.state.lock();
+            let Some(entry) = state.tenants.get(instance_id) else {
                 return 0;
             };
-            entry.prune_dropped_sessions();
             entry
                 .sessions
                 .values()
-                .filter_map(Weak::upgrade)
+                .map(|session| Arc::clone(&session.state))
                 .collect::<Vec<_>>()
         };
         for session in &sessions {
@@ -158,12 +165,11 @@ impl TenantSessions {
     }
 
     pub fn active(&self, instance_id: &str) -> usize {
-        let mut state = self.state.lock();
-        let Some(entry) = state.tenants.get_mut(instance_id) else {
-            return 0;
-        };
-        entry.prune_dropped_sessions();
-        entry.sessions.len()
+        self.state
+            .lock()
+            .tenants
+            .get(instance_id)
+            .map_or(0, |entry| entry.sessions.len())
     }
 
     pub async fn cancel_and_wait(&self, instance_id: &str, timeout: Duration) -> bool {
@@ -208,15 +214,6 @@ pub(crate) struct TenantSession {
     buffers: super::buffers::QueryBudget,
 }
 
-fn authenticated_count(entry: &TenantEntry) -> usize {
-    entry
-        .sessions
-        .values()
-        .filter_map(Weak::upgrade)
-        .filter(|session| session.authenticated.load(Ordering::Acquire))
-        .count()
-}
-
 impl TenantSession {
     pub(crate) fn query_budget(&self) -> super::buffers::QueryBudget {
         self.buffers.clone()
@@ -230,15 +227,19 @@ impl TenantSession {
             )
         };
         let registry = self.registry.upgrade().ok_or_else(aborted)?;
-        let state = registry.lock();
-        let entry = state.tenants.get(&self.instance_id).ok_or_else(aborted)?;
+        let mut state = registry.lock();
+        let entry = state
+            .tenants
+            .get_mut(&self.instance_id)
+            .ok_or_else(aborted)?;
+        let registered = entry.sessions.get_mut(&self.id).ok_or_else(aborted)?;
         if self.session.cancelled.load(Ordering::Acquire) {
             return Err(aborted());
         }
-        if self.session.authenticated.load(Ordering::Acquire) {
+        if registered.authenticated {
             return Ok(());
         }
-        if let Some(limit) = limit.filter(|limit| authenticated_count(entry) >= *limit) {
+        if let Some(limit) = limit.filter(|limit| entry.authenticated_count >= *limit) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 TenantSessionLimit {
@@ -247,7 +248,8 @@ impl TenantSession {
                 },
             ));
         }
-        self.session.authenticated.store(true, Ordering::Release);
+        registered.authenticated = true;
+        entry.authenticated_count += 1;
         Ok(())
     }
 
@@ -265,7 +267,9 @@ impl Drop for TenantSession {
         let Some(entry) = state.tenants.get_mut(&self.instance_id) else {
             return;
         };
-        entry.sessions.remove(&self.id);
+        if let Some(session) = entry.sessions.remove(&self.id) {
+            entry.authenticated_count -= usize::from(session.authenticated);
+        }
         entry.drained.notify_waiters();
         if entry.sessions.is_empty() {
             state.tenants.remove(&self.instance_id);
@@ -356,6 +360,37 @@ mod tests {
                 .cancel_and_wait("tenant", Duration::from_millis(1))
                 .await
         );
+    }
+
+    #[test]
+    fn quota_counts_each_authenticated_session_until_its_drop() {
+        let registry = TenantSessions::default();
+        assert!(registry.try_open("tenant", Some(0)).is_err());
+        assert!(registry.state.lock().tenants.is_empty());
+
+        let pending = registry.open_pending("tenant");
+        let rejected = registry.open_pending("tenant");
+        pending.authenticate(Some(1)).unwrap();
+        pending.authenticate(Some(1)).unwrap();
+        assert_eq!(
+            rejected.authenticate(Some(1)).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        assert_eq!(registry.active("tenant"), 2);
+        drop(rejected);
+        assert!(registry.try_open("tenant", Some(1)).is_err());
+
+        assert_eq!(registry.cancel("tenant"), 1);
+        assert_eq!(
+            pending.authenticate(Some(1)).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+        assert!(registry.try_open("tenant", Some(1)).is_err());
+        let waiting = registry.open_pending("tenant");
+        drop(pending);
+        waiting.authenticate(Some(1)).unwrap();
+        drop(waiting);
+        assert!(registry.state.lock().tenants.is_empty());
     }
 
     #[test]

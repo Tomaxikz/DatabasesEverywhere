@@ -15,7 +15,8 @@ use super::reports::NodeInstanceSummary;
 use super::{
     ApiError, AppState, CachedRuntimeStats, InstanceMetadata, InstancePaths, InstanceStatus,
     Protocol, RESOURCE_FANOUT_LIMIT, RUNTIME_STATS_POLL_INTERVAL, RUNTIME_STATS_STALE_AFTER,
-    ResourceCache, ResourceReport, container_cpu_total, cpu_percent_over_wall_time, mib_to_bytes,
+    ResourceCache, ResourceReport, container_cpu_total, container_memory_usage,
+    cpu_percent_over_wall_time, mib_to_bytes,
 };
 use crate::{
     runtime::docker::DockerRuntime,
@@ -581,7 +582,7 @@ pub(super) fn start(state: AppState) {
         let mut ticker = tokio::time::interval(RUNTIME_STATS_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         tracing::info!(
-            sample_source = "docker_one_shot_wall_clock_delta",
+            sample_source = "local_cgroup_or_engine_one_shot_wall_clock_delta",
             sample_interval_ms = 1_000_u64,
             websocket_publish_interval_ms = 1_000_u64,
             "container resource monitoring started with Calagopus wings-rs sampling semantics"
@@ -682,7 +683,7 @@ async fn run_runtime_stats_worker(
     runtime_id: String,
     worker: u64,
 ) {
-    let sampler = match docker.stats_sampler(protocol, &runtime_id).await {
+    let mut sampler = match docker.stats_sampler(protocol, &runtime_id).await {
         Ok(sampler) => sampler,
         Err(error) => {
             tracing::debug!(
@@ -708,7 +709,7 @@ async fn run_runtime_stats_worker(
                     runtime_id = %runtime_id,
                     %protocol,
                     %error,
-                    "one-shot container resource sample failed; rebinding the sampler"
+                    "container resource sample failed; rebinding the sampler"
                 );
                 break;
             }
@@ -726,7 +727,12 @@ async fn run_runtime_stats_worker(
         });
         previous_cpu = current_cpu.map(|total| (total, sampled_at));
         let still_current = cache
-            .store_runtime_stats(&runtime_id, worker, cpu_usage_percent, &stats)
+            .store_runtime_stats(
+                &runtime_id,
+                worker,
+                cpu_usage_percent,
+                container_memory_usage(&stats),
+            )
             .await;
         if !still_current {
             break;

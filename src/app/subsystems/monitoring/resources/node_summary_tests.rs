@@ -1,4 +1,4 @@
-use super::disk::disk_sample_instance_ids;
+use super::disk::is_disk_sample_target;
 use super::handlers::disk_enforcement_strength;
 use super::reports::PoolUsageReport;
 use super::runtime_metrics::docker_compatible_memory_usage;
@@ -9,6 +9,7 @@ use super::{
     shared_disk::reported_disk_used_bytes,
 };
 use crate::config::Config;
+use crate::runtime::docker::{CgroupCounters, ContainerStatsSample};
 use crate::utils::{backend::BackendEndpoint, limits::InstanceLimits};
 use bollard::models::{
     ContainerCpuStats, ContainerCpuUsage, ContainerMemoryStats, ContainerStatsResponse,
@@ -41,12 +42,9 @@ fn generic_disk_sampler_excludes_shared_pool_roots() {
     shared.runtime_id = "pool-a".to_string();
     let stopped = metadata_with_limits("stopped", InstanceStatus::Stopped, limits);
 
-    let selected = disk_sample_instance_ids(vec![dedicated, shared, stopped]);
-
-    assert_eq!(selected.len(), 1);
-    assert!(selected.contains("dedicated"));
-    assert!(!selected.contains("pool-a"));
-    assert!(!selected.contains("tenant"));
+    assert!(is_disk_sample_target(&dedicated));
+    assert!(!is_disk_sample_target(&shared));
+    assert!(!is_disk_sample_target(&stopped));
 }
 
 #[test]
@@ -93,6 +91,61 @@ fn memory_usage_matches_docker_cli_working_set_on_cgroup_v1_and_v2() {
     }
 }
 
+#[test]
+fn local_cgroup_samples_match_the_engine_api_metrics() {
+    // Docker's compat stats carry memory.stat, so inactive_file is subtracted on both paths.
+    let docker_engine = ContainerStatsSample::Engine(Box::new(ContainerStatsResponse {
+        os_type: Some("linux".to_string()),
+        cpu_stats: Some(ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                total_usage: Some(1_500_000),
+                ..ContainerCpuUsage::default()
+            }),
+            ..ContainerCpuStats::default()
+        }),
+        memory_stats: Some(ContainerMemoryStats {
+            usage: Some(4096),
+            stats: Some(HashMap::from([("inactive_file".to_string(), 1024)])),
+            ..ContainerMemoryStats::default()
+        }),
+        ..ContainerStatsResponse::default()
+    }));
+    let docker_cgroup = ContainerStatsSample::Cgroup(CgroupCounters {
+        cpu_total_usage_ns: 1_500_000,
+        memory_usage_bytes: 4096,
+        memory_inactive_file_bytes: Some(1024),
+    });
+    assert_eq!(container_cpu_total(&docker_engine), Some(1_500_000));
+    assert_eq!(container_cpu_total(&docker_cgroup), Some(1_500_000));
+    assert_eq!(container_memory_usage(&docker_engine), Some(3072));
+    assert_eq!(container_memory_usage(&docker_cgroup), Some(3072));
+
+    // Podman's compat stats report memory.current with a nil stats map.
+    let podman_engine = ContainerStatsSample::Engine(Box::new(ContainerStatsResponse {
+        os_type: Some("linux".to_string()),
+        memory_stats: Some(ContainerMemoryStats {
+            usage: Some(4096),
+            ..ContainerMemoryStats::default()
+        }),
+        ..ContainerStatsResponse::default()
+    }));
+    let podman_cgroup = ContainerStatsSample::Cgroup(CgroupCounters {
+        cpu_total_usage_ns: 1_500_000,
+        memory_usage_bytes: 4096,
+        memory_inactive_file_bytes: None,
+    });
+    assert_eq!(container_memory_usage(&podman_engine), Some(4096));
+    assert_eq!(container_memory_usage(&podman_cgroup), Some(4096));
+
+    // Inactive file pages larger than usage clamp to zero on both paths.
+    let clamped = ContainerStatsSample::Cgroup(CgroupCounters {
+        cpu_total_usage_ns: 0,
+        memory_usage_bytes: 100,
+        memory_inactive_file_bytes: Some(200),
+    });
+    assert_eq!(container_memory_usage(&clamped), Some(0));
+}
+
 #[tokio::test]
 async fn polling_stats_workers_ignore_superseded_samples() {
     let cache = ResourceCache::default();
@@ -116,14 +169,17 @@ async fn polling_stats_workers_ignore_superseded_samples() {
         ..ContainerStatsResponse::default()
     };
 
+    let sample = ContainerStatsSample::Engine(Box::new(stats));
+    let memory_usage_bytes = container_memory_usage(&sample);
+
     assert!(
         !cache
-            .store_runtime_stats("inst_stats", first_worker, Some(99.0), &stats)
+            .store_runtime_stats("inst_stats", first_worker, Some(99.0), memory_usage_bytes)
             .await
     );
     assert!(
         cache
-            .store_runtime_stats("inst_stats", second_worker, Some(11.0), &stats)
+            .store_runtime_stats("inst_stats", second_worker, Some(11.0), memory_usage_bytes)
             .await
     );
     let sample = cache.runtime_stats("inst_stats").await.unwrap();

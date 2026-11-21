@@ -2,12 +2,15 @@
 /// bodies. Only complete Query and Execute messages affect activity counters.
 use std::sync::Arc;
 
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::{
     gateway::listeners::{
         ListenerError,
-        listener_io::{ActivitySession, SQL_PREFIX_BYTES, classify::classify_sql, copy_exact},
+        listener_io::{
+            ActivitySession, FRAME_READ_AHEAD, FrameBuffers, SQL_PREFIX_BYTES,
+            classify::classify_sql,
+        },
     },
     server::monitoring::{ActivityCounter, OperationKind},
 };
@@ -22,9 +25,11 @@ where
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let _activity_session = ActivitySession::open(Arc::clone(&activity));
-    let (mut client_read, mut client_write) = io::split(client);
+    let (client_read, mut client_write) = io::split(client);
     let (mut backend_read, mut backend_write) = io::split(backend);
+    let mut client_read = BufReader::with_capacity(FRAME_READ_AHEAD, client_read);
     let upload = async {
+        let mut frame = FrameBuffers::default();
         loop {
             let mut header = [0_u8; 5];
             if client_read.read(&mut header[..1]).await? == 0 {
@@ -40,21 +45,20 @@ where
                 )
                 .into());
             }
-            backend_write.write_all(&header).await?;
             let remaining = len - 4;
-            let prefix_len = remaining.min(SQL_PREFIX_BYTES);
-            let mut prefix = [0_u8; SQL_PREFIX_BYTES];
-            client_read.read_exact(&mut prefix[..prefix_len]).await?;
-            backend_write.write_all(&prefix[..prefix_len]).await?;
-            copy_exact(
-                &mut client_read,
-                &mut backend_write,
-                remaining - prefix_len,
-                "postgres frontend message ended before its declared length",
-            )
-            .await?;
+            frame.prefix.clear();
+            frame.prefix.extend_from_slice(&header);
+            let prefix = frame
+                .forward(
+                    &mut client_read,
+                    &mut backend_write,
+                    remaining,
+                    SQL_PREFIX_BYTES,
+                    "postgres frontend message ended before its declared length",
+                )
+                .await?;
             match header[0] {
-                b'Q' => activity.accept(classify_sql(&prefix[..prefix_len])),
+                b'Q' => activity.accept(classify_sql(prefix)),
                 b'E' => activity.accept(OperationKind::Other),
                 _ => {}
             }

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bollard::{
     container::LogOutput,
@@ -14,8 +14,9 @@ use crate::{
     databases::protocol::Protocol,
     runtime::docker::helpers::verify_managed_instance_labels,
     runtime::docker::{
-        CommandOutput, DockerContainerStatus, DockerError, DockerInstanceInspection, DockerRuntime,
-        ManagedContainerCompatibilityIdentity, ManagedContainerIdentity, ManagedStatsSampler,
+        CommandOutput, ContainerStatsSample, DockerContainerStatus, DockerError,
+        DockerInstanceInspection, DockerRuntime, ManagedContainerCompatibilityIdentity,
+        ManagedContainerIdentity, ManagedStatsSampler, cgroup_stats::CgroupStatsReader,
     },
     utils::constants::docker::PROJECT_LABEL,
 };
@@ -657,10 +658,10 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<ContainerStatsResponse, DockerError> {
-        self.stats_sampler(protocol, instance_id)
-            .await?
-            .sample()
-            .await
+        let container_id = self
+            .required_managed_container_id(protocol, instance_id)
+            .await?;
+        engine_one_shot_stats(&self.docker, &container_id).await
     }
 
     pub(crate) async fn stats_sampler(
@@ -668,14 +669,62 @@ impl DockerRuntime {
         protocol: Protocol,
         instance_id: &str,
     ) -> Result<ManagedStatsSampler, DockerError> {
-        let container_id = self
-            .required_managed_container_id(protocol, instance_id)
-            .await?;
-        Ok(ManagedStatsSampler {
+        let response = self
+            .inspect_verified_container(protocol, instance_id)
+            .await?
+            .ok_or_else(|| DockerError::ManagedContainerNotFound {
+                instance_id: instance_id.to_string(),
+                protocol: protocol.as_str().to_string(),
+            })?;
+        let container = self.container_name(protocol, instance_id)?;
+        let container_id = container_id(&response, &container)?;
+        let pid = running_pid(&response);
+        let mut sampler = ManagedStatsSampler {
             docker: self.docker.clone(),
+            engine: self.engine(),
             container_id,
-        })
+            cgroup: None,
+            retry_cgroup_at: Instant::now() + CGROUP_REBIND_INTERVAL,
+        };
+        if let Some(pid) = pid {
+            sampler.cgroup = sampler.bind_cgroup(pid).await;
+        }
+        Ok(sampler)
     }
+}
+
+/// How long the engine fallback runs before the sampler retries the direct cgroup path, for
+/// example after a stop/start moved the container into a new cgroup.
+const CGROUP_REBIND_INTERVAL: Duration = Duration::from_secs(30);
+
+fn running_pid(response: &ContainerInspectResponse) -> Option<u32> {
+    let state = response.state.as_ref()?;
+    if state.running != Some(true) {
+        return None;
+    }
+    state
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
+async fn engine_one_shot_stats(
+    docker: &bollard::Docker,
+    container_id: &str,
+) -> Result<ContainerStatsResponse, DockerError> {
+    let mut stream = docker.stats(
+        container_id,
+        Some(
+            StatsOptionsBuilder::default()
+                .stream(false)
+                // Match wings-rs: take a non-streaming counter snapshot.
+                // Callers calculate CPU from consecutive samples and real
+                // wall-clock time rather than Docker's system CPU counter.
+                .one_shot(true)
+                .build(),
+        ),
+    );
+    Ok(stream.next().await.ok_or(DockerError::EmptyStatsStream)??)
 }
 
 fn log_policy_matches(
@@ -730,20 +779,76 @@ fn has_legacy_log_bind_mount(inspection: &ContainerInspectResponse) -> bool {
 }
 
 impl ManagedStatsSampler {
-    pub(crate) async fn sample(&self) -> Result<ContainerStatsResponse, DockerError> {
-        let mut stream = self.docker.stats(
-            &self.container_id,
-            Some(
-                StatsOptionsBuilder::default()
-                    .stream(false)
-                    // Match wings-rs: take a non-streaming counter snapshot.
-                    // Callers calculate CPU from consecutive samples and real
-                    // wall-clock time rather than Docker's system CPU counter.
-                    .one_shot(true)
-                    .build(),
-            ),
-        );
-        Ok(stream.next().await.ok_or(DockerError::EmptyStatsStream)??)
+    pub(crate) async fn sample(&mut self) -> Result<ContainerStatsSample, DockerError> {
+        if self.cgroup.is_none() && Instant::now() >= self.retry_cgroup_at {
+            self.retry_cgroup_at = Instant::now() + CGROUP_REBIND_INTERVAL;
+            if let Ok(response) = self
+                .docker
+                .inspect_container(&self.container_id, None)
+                .await
+                && let Some(pid) = running_pid(&response)
+            {
+                self.cgroup = self.bind_cgroup(pid).await;
+            }
+        }
+        if let Some(reader) = self.cgroup.clone() {
+            match tokio::task::spawn_blocking(move || reader.read()).await {
+                Ok(Ok(counters)) => return Ok(ContainerStatsSample::Cgroup(counters)),
+                Ok(Err(error)) => tracing::debug!(
+                    container_id = %self.container_id,
+                    %error,
+                    "local cgroup stats read failed; using the engine stats API"
+                ),
+                Err(error) => tracing::debug!(
+                    container_id = %self.container_id,
+                    %error,
+                    "local cgroup stats worker failed; using the engine stats API"
+                ),
+            }
+            // A stopped or replaced container loses its cgroup; the engine reports that state
+            // (or a 404 that makes the caller rebind) exactly as it did before direct reads.
+            self.cgroup = None;
+            self.retry_cgroup_at = Instant::now() + CGROUP_REBIND_INTERVAL;
+        }
+        engine_one_shot_stats(&self.docker, &self.container_id)
+            .await
+            .map(|stats| ContainerStatsSample::Engine(Box::new(stats)))
+    }
+
+    async fn bind_cgroup(&self, pid: u32) -> Option<Arc<CgroupStatsReader>> {
+        let container_id = self.container_id.clone();
+        let engine = self.engine;
+        let bound = tokio::task::spawn_blocking(move || {
+            CgroupStatsReader::bind(pid, &container_id, engine)
+        })
+        .await;
+        match bound {
+            Ok(Ok(reader)) => {
+                tracing::debug!(
+                    container_id = %self.container_id,
+                    pid,
+                    "container resource sampler reads the local cgroup directly"
+                );
+                Some(Arc::new(reader))
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    container_id = %self.container_id,
+                    pid,
+                    %error,
+                    "local cgroup stats unavailable; using the engine stats API"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::debug!(
+                    container_id = %self.container_id,
+                    %error,
+                    "local cgroup bind worker failed; using the engine stats API"
+                );
+                None
+            }
+        }
     }
 }
 

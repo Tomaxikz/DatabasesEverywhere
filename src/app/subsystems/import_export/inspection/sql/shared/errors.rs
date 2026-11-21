@@ -10,7 +10,7 @@ pub(crate) enum SharedSqlIssue {
     AmbiguousStatement,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum MysqlCommandPolicyError {
     #[error("shared MySQL-family tenants cannot change database or physical storage layout")]
     StorageEscape,

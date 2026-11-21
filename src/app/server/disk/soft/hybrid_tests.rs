@@ -598,6 +598,7 @@ fn growth_tracker(sampled_at: Instant, growth: f64) -> TrackerState {
             blocked: false,
             sampled_at,
         },
+        measured: true,
         warned: false,
     }
 }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use futures::{StreamExt, stream};
 use tokio::time::{Instant, MissedTickBehavior};
@@ -53,7 +53,7 @@ pub(super) async fn usage(state: &AppState, metadata: &InstanceMetadata) -> Resu
         let runtime = load_runtime(state, metadata.runtime_id(), metadata.protocol).await?;
         refresh_hard_usage(state, &runtime, metadata, SAMPLE_STALE_AFTER).await?;
     } else {
-        sample_runtime(state, vec![metadata.clone()], false).await?;
+        sample_soft_runtime(state, metadata.runtime_id(), metadata.protocol).await?;
     }
     match state
         .resource_cache
@@ -90,13 +90,11 @@ pub(super) fn start(state: AppState) {
 
 async fn sample_all(state: &AppState) {
     let groups = tenant_groups(state).await;
-    stream::iter(groups.into_values())
-        .for_each_concurrent(SAMPLE_CONCURRENCY, |tenants| async move {
-            if let Err(error) = sample_runtime(state, tenants.clone(), true).await {
+    stream::iter(groups)
+        .for_each_concurrent(SAMPLE_CONCURRENCY, |(runtime_id, tenants)| async move {
+            if let Err(error) = sample_runtime(state, &runtime_id, &tenants, true).await {
                 tracing::warn!(%error, "failed to sample shared tenant storage");
-                if let Some(runtime_id) = sample_group_runtime(&tenants) {
-                    fence_unmeasured_runtime(state, &runtime_id, &error).await;
-                }
+                fence_unmeasured_runtime(state, &runtime_id, &error).await;
             }
         })
         .await;
@@ -104,20 +102,17 @@ async fn sample_all(state: &AppState) {
 
 pub(super) async fn prime(state: &AppState) -> usize {
     let groups = tenant_groups(state).await;
-    let outcomes = stream::iter(groups.into_values())
-        .map(|tenants| async move {
+    let outcomes = stream::iter(groups)
+        .map(|(runtime_id, tenants)| async move {
             // Native hard quotas already reject writes in the kernel and do not need telemetry
             // before a route can open.
-            let Err(error) = sample_runtime(state, tenants.clone(), false).await else {
+            let Err(error) = sample_runtime(state, &runtime_id, &tenants, false).await else {
                 return false;
             };
             tracing::error!(
                 %error,
                 "shared tenant storage could not be measured before gateway startup"
             );
-            let Some(runtime_id) = sample_group_runtime(&tenants) else {
-                return false;
-            };
             fence_unmeasured_runtime(state, &runtime_id, &error).await > 0
         })
         .buffer_unordered(SAMPLE_CONCURRENCY)
@@ -126,12 +121,16 @@ pub(super) async fn prime(state: &AppState) -> usize {
     outcomes.into_iter().filter(|failed| *failed).count()
 }
 
-async fn tenant_groups(state: &AppState) -> HashMap<String, Vec<InstanceMetadata>> {
-    let mut groups = HashMap::<String, Vec<InstanceMetadata>>::new();
-    for metadata in state.instances.list().await.into_iter().filter(|metadata| {
-        metadata.deployment_mode == DeploymentMode::Shared
-            && metadata.status != InstanceStatus::Deleting
-    }) {
+async fn tenant_groups(state: &AppState) -> HashMap<String, Vec<Arc<InstanceMetadata>>> {
+    let mut groups = HashMap::<String, Vec<Arc<InstanceMetadata>>>::new();
+    for metadata in state
+        .instances
+        .snapshots_matching(|metadata| {
+            metadata.deployment_mode == DeploymentMode::Shared
+                && metadata.status != InstanceStatus::Deleting
+        })
+        .await
+    {
         groups
             .entry(metadata.runtime_id().to_string())
             .or_default()
@@ -142,13 +141,13 @@ async fn tenant_groups(state: &AppState) -> HashMap<String, Vec<InstanceMetadata
 
 async fn sample_runtime(
     state: &AppState,
-    tenants: Vec<InstanceMetadata>,
+    runtime_id: &str,
+    tenants: &[Arc<InstanceMetadata>],
     include_hard: bool,
 ) -> Result<(), String> {
     let Some(first) = tenants.first() else {
         return Ok(());
     };
-    let runtime_id = first.runtime_id().to_string();
     if tenants
         .iter()
         .any(|metadata| metadata.runtime_id() != runtime_id || metadata.protocol != first.protocol)
@@ -160,7 +159,7 @@ async fn sample_runtime(
     let protocol = first.protocol;
 
     if include_hard {
-        let runtime = load_runtime(state, &runtime_id, protocol).await?;
+        let runtime = load_runtime(state, runtime_id, protocol).await?;
         stream::iter(
             tenants
                 .iter()
@@ -168,7 +167,6 @@ async fn sample_runtime(
         )
         .for_each_concurrent(HARD_SAMPLE_CONCURRENCY, |metadata| {
             let runtime = &runtime;
-            let runtime_id = &runtime_id;
             async move {
                 if let Err(error) =
                     refresh_hard_usage(state, runtime, metadata, SAMPLE_INTERVAL).await
@@ -185,24 +183,30 @@ async fn sample_runtime(
         .await;
     }
 
-    // Soft enforcement is a measurement-and-fence transaction.
-    let _runtime_operation = state.instance_locks.lock(&runtime_id).await;
+    sample_soft_runtime(state, runtime_id, protocol).await
+}
+
+async fn sample_soft_runtime(
+    state: &AppState,
+    runtime_id: &str,
+    protocol: crate::databases::protocol::Protocol,
+) -> Result<(), String> {
+    // Membership may have changed since grouping. Hold the lifecycle lock from
+    // this fresh pool lookup through measurement and enforcement.
+    let _runtime_operation = state.instance_locks.lock(runtime_id).await;
     let tenants = state
         .instances
-        .list()
+        .shared_runtime_members(runtime_id)
         .await
         .into_iter()
         .filter(|metadata| {
-            metadata.deployment_mode == DeploymentMode::Shared
-                && metadata.runtime_id() == runtime_id
-                && metadata.protocol == protocol
-                && metadata.status != InstanceStatus::Deleting
+            metadata.protocol == protocol && metadata.status != InstanceStatus::Deleting
         })
         .collect::<Vec<_>>();
     if tenants.is_empty() {
         return Ok(());
     }
-    let runtime = load_runtime(state, &runtime_id, protocol).await?;
+    let runtime = load_runtime(state, runtime_id, protocol).await?;
     if runtime.status != EngineRuntimeStatus::Running {
         return Ok(());
     }
@@ -229,11 +233,11 @@ async fn sample_runtime(
     .await
     .map_err(|_| format!("shared runtime {runtime_id} storage query timed out"))?
     .map_err(|error| format!("shared runtime {runtime_id} storage query failed: {error}"))?;
-    check_sample_count(&runtime_id, soft.len(), values.len())?;
+    check_sample_count(runtime_id, soft.len(), values.len())?;
 
     for (metadata, used_bytes) in soft.into_iter().zip(values) {
         store_sample(state, &metadata, used_bytes).await;
-        enforce_quota_locked(state, metadata, used_bytes).await;
+        enforce_quota_locked(state, &metadata, used_bytes).await;
     }
     Ok(())
 }
@@ -292,7 +296,7 @@ async fn refresh_hard_usage(
     .await
     .map_err(|error| error.to_string())?;
 
-    let current = state.instances.get(&snapshot.instance_id).await;
+    let current = state.instances.snapshot(&snapshot.instance_id).await;
     let current_runtime = state
         .placements
         .get(runtime.runtime_id.as_str())
@@ -368,14 +372,15 @@ fn check_sample_count(runtime_id: &str, expected: usize, actual: usize) -> Resul
 
 /// The caller holds the physical runtime lock from measurement through the fence/unfence decision,
 /// so this usage sample cannot race an import or a stale recovery decision.
-async fn enforce_quota_locked(state: &AppState, snapshot: InstanceMetadata, used_bytes: u64) {
+async fn enforce_quota_locked(state: &AppState, snapshot: &InstanceMetadata, used_bytes: u64) {
     let runtime_id = snapshot.runtime_id().to_string();
-    let Some(metadata) = state.instances.get(&snapshot.instance_id).await else {
+    let Some(metadata) = state.instances.snapshot(&snapshot.instance_id).await else {
         return;
     };
     if metadata.deployment_mode != DeploymentMode::Shared
         || !uses_soft_guard(metadata.deployment_mode, metadata.limits.disk_enforced)
         || metadata.runtime_id() != runtime_id
+        || metadata.protocol != snapshot.protocol
         || metadata.created_at != snapshot.created_at
         || metadata.database.name != snapshot.database.name
         || metadata.database.username != snapshot.database.username
@@ -405,6 +410,7 @@ async fn enforce_quota_locked(state: &AppState, snapshot: InstanceMetadata, used
         return;
     };
 
+    let metadata = Arc::unwrap_or_clone(metadata);
     if should_block {
         block_over_quota_tenant(state, &runtime, metadata, used_bytes, limit_bytes).await;
     } else {
@@ -515,24 +521,16 @@ async fn recover_under_quota_tenant(
     );
 }
 
-fn sample_group_runtime(tenants: &[InstanceMetadata]) -> Option<String> {
-    tenants
-        .first()
-        .map(|tenant| tenant.runtime_id().to_string())
-}
-
-/// using the stale input snapshot here could otherwise leave a newly soft tenant reachable without
-/// a measurable limit.
+/// Reread current membership under the lifecycle lock to include newly soft tenants.
 async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &str) -> usize {
     let _runtime_operation = state.instance_locks.lock(runtime_id).await;
     let tenants = state
         .instances
-        .list()
+        .shared_runtime_members(runtime_id)
         .await
         .into_iter()
         .filter(|metadata| {
-            metadata.runtime_id() == runtime_id
-                && uses_soft_guard(metadata.deployment_mode, metadata.limits.disk_enforced)
+            !metadata.limits.disk_enforced
                 && metadata.status == InstanceStatus::Running
                 && metadata.desired_state == DesiredInstanceState::Running
         })
@@ -565,7 +563,9 @@ async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &s
         );
         return tenants.len();
     }
-    for mut metadata in tenants.iter().cloned() {
+    let count = tenants.len();
+    for metadata in tenants {
+        let mut metadata = Arc::unwrap_or_clone(metadata);
         crate::subsystems::instances::route_fence::fence(state, &metadata.instance_id).await;
         if let Some(runtime) = &runtime {
             let target = TenantTarget {
@@ -602,7 +602,7 @@ async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &s
             "tenant remained fail-closed because its storage quota could not be initialized before gateway startup"
         );
     }
-    tenants.len()
+    count
 }
 
 #[cfg(test)]

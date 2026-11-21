@@ -8,7 +8,11 @@ fn validate(protocol: Protocol, sql: &str) -> Result<SharedSqlReport, SharedSqlE
 }
 
 fn validate_live(protocol: Protocol, sql: &str) -> Result<(), MysqlCommandPolicyError> {
-    validate_shared_mysql_command(sql.as_bytes(), protocol)
+    let slice = validate_shared_mysql_command(sql.as_bytes(), protocol);
+    let reader = super::super::ByteInput::new(Cursor::new(sql.as_bytes()));
+    let streamed = mysql_command::check_shared_mysql_command(reader, protocol, false);
+    assert_eq!(slice, streamed, "{protocol}: {sql}");
+    slice
 }
 
 #[test]

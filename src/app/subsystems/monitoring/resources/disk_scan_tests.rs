@@ -3,6 +3,62 @@ use std::{fs, os::unix::fs::symlink, time::Duration};
 use super::ResourceCache;
 
 #[tokio::test]
+async fn background_refresh_skips_only_a_matching_scanner_measurement() {
+    use crate::{
+        config::{Config, DiskLimitMode},
+        databases::protocol::Protocol,
+        server::{paths::InstancePaths, test_support::metadata},
+    };
+
+    let volumes = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.paths.volumes = volumes.path().display().to_string();
+    config.disk.mode = DiskLimitMode::SoftScanner;
+    let (state, _db) = crate::subsystems::test_support::database(config).await;
+    let mut instance = metadata("inst_monitor", Protocol::Qdrant);
+    instance.limits.disk_enforcement_method = "fuse_quota".to_owned();
+    instance.limits.disk_mib = 128;
+    let data = InstancePaths::new(&state.config.paths, &instance.instance_id)
+        .unwrap()
+        .data;
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("data.bin"), b"1234567").unwrap();
+    let target = super::disk::scanner_target(&instance, data);
+    state
+        .soft_disk_limiter
+        .ensure_start_allowed(&target)
+        .await
+        .unwrap();
+    let cache = &state.resource_cache;
+
+    // Both legacy Qdrant and explicitly scanner-backed reports use physical usage.
+    for method in ["fuse_quota", "soft_scanner"] {
+        instance.limits.disk_enforcement_method = method.to_owned();
+        state.instances.upsert(instance.clone()).await;
+        cache.refresh_all_disk_usage(&state).await;
+        assert!(
+            cache
+                .cached_disk_usage(&instance.instance_id)
+                .await
+                .is_none()
+        );
+    }
+
+    // The same ID with a new generation must take the logical-byte fallback.
+    instance.created_at = "2026-02-01T00:00:00Z".to_owned();
+    state.instances.upsert(instance.clone()).await;
+    cache.refresh_all_disk_usage(&state).await;
+    assert_eq!(
+        cache
+            .cached_disk_usage(&instance.instance_id)
+            .await
+            .unwrap()
+            .used_bytes,
+        7
+    );
+}
+
+#[tokio::test]
 async fn disk_scan_counts_regular_files_without_following_symlinks() {
     let temporary = tempfile::tempdir().unwrap();
     let data = temporary.path().join("data");

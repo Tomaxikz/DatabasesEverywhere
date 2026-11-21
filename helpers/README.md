@@ -18,6 +18,14 @@ rustc +1.95.0 --edition=2024 --target x86_64-unknown-linux-musl \
 zstd -19 --force /tmp/dbev-socket-bridge -o helpers/payloads/socket-bridge.zst
 ```
 
+The helper proxies every bridge connection on one edge-triggered epoll thread
+with fixed per-direction buffers. Its unit tests run without Cargo:
+
+```bash
+rustc +1.95.0 --edition=2024 -D warnings --test helpers/socket_bridge.rs \
+  -o /tmp/dbev-socket-bridge-tests && /tmp/dbev-socket-bridge-tests
+```
+
 On a development host without the `zstd` CLI, the checked-in packer produces
 the same zstd payload format:
 

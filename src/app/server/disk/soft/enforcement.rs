@@ -82,6 +82,7 @@ impl SoftDiskLimiter {
             TrackerState {
                 target: fingerprint,
                 snapshot: snapshot.clone(),
+                measured: true,
                 warned,
             },
         );
@@ -212,6 +213,7 @@ impl SoftDiskLimiter {
             TrackerState {
                 target: fingerprint,
                 snapshot: snapshot.clone(),
+                measured: false,
                 warned: false,
             },
         );

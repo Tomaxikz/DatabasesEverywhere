@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -7,6 +7,7 @@ use secrecy::SecretString;
 use tokio::sync::RwLock;
 
 use super::metadata::{DesiredInstanceState, InstanceMetadata, InstanceStatus};
+use super::placement::DeploymentMode;
 use crate::{databases::protocol::Protocol, utils::backend::BackendEndpoint};
 
 #[derive(Debug, Clone)]
@@ -119,12 +120,44 @@ impl InstanceStore {
             .await
             .instances
             .values()
-            .cloned()
+            .map(|metadata| metadata.as_ref().clone())
             .collect()
     }
 
     pub async fn get(&self, instance_id: &str) -> Option<InstanceMetadata> {
+        self.snapshot(instance_id).await.map(Arc::unwrap_or_clone)
+    }
+
+    pub(crate) async fn snapshot(&self, instance_id: &str) -> Option<Arc<InstanceMetadata>> {
         self.inner.read().await.instances.get(instance_id).cloned()
+    }
+
+    pub(crate) async fn snapshots_matching(
+        &self,
+        matches: impl Fn(&InstanceMetadata) -> bool,
+    ) -> Vec<Arc<InstanceMetadata>> {
+        self.inner
+            .read()
+            .await
+            .instances
+            .values()
+            .filter(|metadata| matches(metadata))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) async fn shared_runtime_members(
+        &self,
+        runtime_id: &str,
+    ) -> Vec<Arc<InstanceMetadata>> {
+        let state = self.inner.read().await;
+        state
+            .shared_members
+            .get(runtime_id)
+            .into_iter()
+            .flatten()
+            .map(|id| Arc::clone(&state.instances[id]))
+            .collect()
     }
 
     pub async fn resolve_postgres(
@@ -196,7 +229,9 @@ impl InstanceStore {
         let state = self.inner.read().await;
         let instance_id = state
             .mongodb_routes
-            .get(&(username.to_string(), database.to_string()))?;
+            .by_username
+            .get(username)?
+            .get(database)?;
         state.route_target_for(instance_id)
     }
 
@@ -224,40 +259,55 @@ enum RouteKeyResolution<'a> {
     Ambiguous,
 }
 
-fn resolve_database_route<'a>(
-    routes: &'a HashMap<(String, String), String>,
-    username: &str,
-    database: Option<&str>,
-) -> RouteKeyResolution<'a> {
-    if let Some(database) = database.filter(|database| !database.is_empty()) {
-        let lookup = (username.to_string(), database.to_string());
-        return routes.get_key_value(&lookup).map_or(
-            RouteKeyResolution::NotFound,
-            |((_, database), instance_id)| RouteKeyResolution::Found {
+#[derive(Default)]
+struct DatabaseRoutes {
+    by_username: HashMap<String, BTreeMap<String, String>>,
+}
+
+impl DatabaseRoutes {
+    fn insert(&mut self, metadata: &InstanceMetadata) {
+        self.by_username
+            .entry(metadata.database.username.clone())
+            .or_default()
+            .insert(metadata.database.name.clone(), metadata.instance_id.clone());
+    }
+
+    fn remove(&mut self, metadata: &InstanceMetadata) {
+        let username = &metadata.database.username;
+        let Some(databases) = self.by_username.get_mut(username) else {
+            return;
+        };
+        let database = &metadata.database.name;
+        if databases.get(database) == Some(&metadata.instance_id) {
+            databases.remove(database);
+            if databases.is_empty() {
+                self.by_username.remove(username);
+            }
+        }
+    }
+
+    fn resolve(&self, username: &str, database: Option<&str>) -> RouteKeyResolution<'_> {
+        let Some(databases) = self.by_username.get(username) else {
+            return RouteKeyResolution::NotFound;
+        };
+        let route = match database.filter(|name| !name.is_empty()) {
+            Some(name) => databases.get_key_value(name),
+            None if databases.len() > 1 => return RouteKeyResolution::Ambiguous,
+            None => databases.first_key_value(),
+        };
+        match route {
+            Some((database, instance_id)) => RouteKeyResolution::Found {
                 database,
                 instance_id,
             },
-        );
-    }
-
-    let mut matches = routes
-        .iter()
-        .filter(|((route_username, _), _)| route_username == username);
-    let Some(((_, database), instance_id)) = matches.next() else {
-        return RouteKeyResolution::NotFound;
-    };
-    if matches.next().is_some() {
-        return RouteKeyResolution::Ambiguous;
-    }
-    RouteKeyResolution::Found {
-        database,
-        instance_id,
+            None => RouteKeyResolution::NotFound,
+        }
     }
 }
 
 fn resolve_mariadb_route(
     state: &InstanceState,
-    routes: &HashMap<(String, String), String>,
+    routes: &DatabaseRoutes,
     username: &str,
     database: Option<&str>,
     verifier: impl FnOnce(&InstanceMetadata) -> Option<String>,
@@ -285,7 +335,7 @@ fn resolve_mariadb_route(
 
 fn resolve_plain_route(
     state: &InstanceState,
-    routes: &HashMap<(String, String), String>,
+    routes: &DatabaseRoutes,
     username: &str,
     database: Option<&str>,
 ) -> DatabaseRouteResolution<RouteTarget> {
@@ -300,12 +350,12 @@ fn resolve_plain_route(
 
 fn resolve_database_target<T>(
     state: &InstanceState,
-    routes: &HashMap<(String, String), String>,
+    routes: &DatabaseRoutes,
     username: &str,
     database: Option<&str>,
     build_target: impl FnOnce(&str, &InstanceMetadata) -> T,
 ) -> DatabaseRouteResolution<T> {
-    match resolve_database_route(routes, username, database) {
+    match routes.resolve(username, database) {
         RouteKeyResolution::Found {
             database,
             instance_id,
@@ -323,16 +373,17 @@ fn resolve_database_target<T>(
 
 #[derive(Default)]
 struct InstanceState {
-    instances: HashMap<String, InstanceMetadata>,
+    instances: HashMap<String, Arc<InstanceMetadata>>,
+    shared_members: HashMap<String, HashSet<String>>,
     fenced_instances: HashSet<String>,
     pinned_fences: HashSet<String>,
     route_revisions: HashMap<String, u64>,
     next_route_revision: u64,
-    postgres_routes: HashMap<(String, String), String>,
-    mariadb_routes: HashMap<(String, String), String>,
-    mysql_routes: HashMap<(String, String), String>,
-    mongodb_routes: HashMap<(String, String), String>,
-    clickhouse_routes: HashMap<(String, String), String>,
+    postgres_routes: DatabaseRoutes,
+    mariadb_routes: DatabaseRoutes,
+    mysql_routes: DatabaseRoutes,
+    mongodb_routes: DatabaseRoutes,
+    clickhouse_routes: DatabaseRoutes,
     qdrant_routes: HashMap<String, String>,
     redis_routes: HashMap<String, String>,
     valkey_routes: HashMap<String, String>,
@@ -360,68 +411,91 @@ impl InstanceState {
         self.remove_routes_for(&metadata.instance_id);
         if self.pinned_fences.contains(&metadata.instance_id) {
             self.fenced_instances.insert(metadata.instance_id.clone());
-            self.instances
-                .insert(metadata.instance_id.clone(), metadata);
+            self.store_metadata(metadata);
             return;
         }
         self.fenced_instances.remove(&metadata.instance_id);
         if route_eligible(&metadata) {
             self.publish_routes(&metadata);
         }
-        self.instances
-            .insert(metadata.instance_id.clone(), metadata);
+        self.store_metadata(metadata);
+    }
+
+    fn store_metadata(&mut self, metadata: InstanceMetadata) {
+        let metadata = Arc::new(metadata);
+        let previous = self
+            .instances
+            .insert(metadata.instance_id.clone(), Arc::clone(&metadata));
+        if let Some(previous) = previous {
+            if previous.deployment_mode == metadata.deployment_mode
+                && previous.runtime_id() == metadata.runtime_id()
+            {
+                return;
+            }
+            self.remove_shared_member(&previous);
+        }
+        if metadata.deployment_mode == DeploymentMode::Shared {
+            self.shared_members
+                .entry(metadata.runtime_id().to_owned())
+                .or_default()
+                .insert(metadata.instance_id.clone());
+        }
+    }
+
+    fn remove_shared_member(&mut self, metadata: &InstanceMetadata) {
+        if metadata.deployment_mode == DeploymentMode::Shared
+            && let Some(members) = self.shared_members.get_mut(metadata.runtime_id())
+        {
+            members.remove(&metadata.instance_id);
+            if members.is_empty() {
+                self.shared_members.remove(metadata.runtime_id());
+            }
+        }
     }
 
     fn publish_routes(&mut self, metadata: &InstanceMetadata) {
-        let instance_id = metadata.instance_id.clone();
-        let username = metadata.database.username.clone();
-        let username_and_database = || {
-            (
-                metadata.database.username.clone(),
-                metadata.database.name.clone(),
-            )
-        };
         match metadata.protocol {
             Protocol::Postgres => {
-                self.postgres_routes
-                    .insert(username_and_database(), instance_id);
+                self.postgres_routes.insert(metadata);
             }
             Protocol::Redis => {
-                self.redis_routes.insert(username, instance_id.clone());
+                self.redis_routes.insert(
+                    metadata.database.username.clone(),
+                    metadata.instance_id.clone(),
+                );
                 add_password_route(
                     &mut self.redis_password_routes,
                     metadata.tenant_password.as_deref(),
-                    instance_id,
+                    metadata.instance_id.clone(),
                 );
             }
             Protocol::Valkey => {
-                self.valkey_routes.insert(username, instance_id.clone());
+                self.valkey_routes.insert(
+                    metadata.database.username.clone(),
+                    metadata.instance_id.clone(),
+                );
                 add_password_route(
                     &mut self.valkey_password_routes,
                     metadata.tenant_password.as_deref(),
-                    instance_id,
+                    metadata.instance_id.clone(),
                 );
             }
             Protocol::Mariadb => {
-                self.mariadb_routes
-                    .insert(username_and_database(), instance_id);
+                self.mariadb_routes.insert(metadata);
             }
             Protocol::Mysql => {
-                self.mysql_routes
-                    .insert(username_and_database(), instance_id);
+                self.mysql_routes.insert(metadata);
             }
             Protocol::Mongodb => {
-                self.mongodb_routes
-                    .insert(username_and_database(), instance_id);
+                self.mongodb_routes.insert(metadata);
             }
             Protocol::Clickhouse => {
-                self.clickhouse_routes
-                    .insert(username_and_database(), instance_id);
+                self.clickhouse_routes.insert(metadata);
             }
             Protocol::Qdrant => {
                 if let Some(route_key_sha256) = &metadata.route_key_sha256 {
                     self.qdrant_routes
-                        .insert(route_key_sha256.clone(), instance_id);
+                        .insert(route_key_sha256.clone(), metadata.instance_id.clone());
                 }
             }
         }
@@ -457,15 +531,14 @@ impl InstanceState {
         self.bump_route_revision(&metadata.instance_id);
         self.remove_routes_for(&metadata.instance_id);
         self.fenced_instances.insert(metadata.instance_id.clone());
-        self.instances
-            .insert(metadata.instance_id.clone(), metadata);
+        self.store_metadata(metadata);
     }
 
     fn upsert_preserving_fence(&mut self, metadata: InstanceMetadata) {
         let was_open = self
             .instances
             .get(&metadata.instance_id)
-            .is_some_and(route_eligible)
+            .is_some_and(|metadata| route_eligible(metadata))
             && !self.fenced_instances.contains(&metadata.instance_id);
         if was_open {
             self.upsert(metadata);
@@ -475,24 +548,30 @@ impl InstanceState {
     }
 
     fn remove_routes_for(&mut self, instance_id: &str) {
-        self.postgres_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.mariadb_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.mysql_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.mongodb_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.clickhouse_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.qdrant_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.redis_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        self.valkey_routes
-            .retain(|_, routed_instance_id| routed_instance_id != instance_id);
-        remove_password_route(&mut self.redis_password_routes, instance_id);
-        remove_password_route(&mut self.valkey_password_routes, instance_id);
+        let Some(old) = self.instances.get(instance_id) else {
+            return;
+        };
+        // Another instance can have replaced this one at the same route key.
+        match old.protocol {
+            Protocol::Postgres => self.postgres_routes.remove(old),
+            Protocol::Mariadb => self.mariadb_routes.remove(old),
+            Protocol::Mysql => self.mysql_routes.remove(old),
+            Protocol::Mongodb => self.mongodb_routes.remove(old),
+            Protocol::Clickhouse => self.clickhouse_routes.remove(old),
+            Protocol::Redis => {
+                remove_owned_route(&mut self.redis_routes, &old.database.username, instance_id);
+                remove_password_route(&mut self.redis_password_routes, old);
+            }
+            Protocol::Valkey => {
+                remove_owned_route(&mut self.valkey_routes, &old.database.username, instance_id);
+                remove_password_route(&mut self.valkey_password_routes, old);
+            }
+            Protocol::Qdrant => {
+                if let Some(key) = &old.route_key_sha256 {
+                    remove_owned_route(&mut self.qdrant_routes, key, instance_id);
+                }
+            }
+        }
     }
 
     fn remove(&mut self, instance_id: &str) -> Option<InstanceMetadata> {
@@ -501,7 +580,9 @@ impl InstanceState {
         self.fenced_instances.remove(instance_id);
         self.pinned_fences.remove(instance_id);
         self.route_revisions.remove(instance_id);
-        self.instances.remove(instance_id)
+        let previous = self.instances.remove(instance_id)?;
+        self.remove_shared_member(&previous);
+        Some(Arc::unwrap_or_clone(previous))
     }
 
     fn bump_route_revision(&mut self, instance_id: &str) {
@@ -552,11 +633,23 @@ fn add_password_route(
         .insert(instance_id);
 }
 
-fn remove_password_route(routes: &mut HashMap<String, HashSet<String>>, instance_id: &str) {
-    routes.retain(|_, instance_ids| {
-        instance_ids.remove(instance_id);
-        !instance_ids.is_empty()
-    });
+fn remove_owned_route(routes: &mut HashMap<String, String>, key: &str, instance_id: &str) {
+    if routes.get(key).is_some_and(|owner| owner == instance_id) {
+        routes.remove(key);
+    }
+}
+
+fn remove_password_route(routes: &mut HashMap<String, HashSet<String>>, old: &InstanceMetadata) {
+    let Some(password) = &old.tenant_password else {
+        return;
+    };
+    let hash = crate::gateway::protocols::redis::password_route_sha256(password.as_bytes());
+    if let Some(owners) = routes.get_mut(&hash) {
+        owners.remove(&old.instance_id);
+        if owners.is_empty() {
+            routes.remove(&hash);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -564,39 +657,190 @@ mod tests {
     use super::*;
     use crate::{server::test_support, utils::backend::BackendEndpoint};
 
-    #[test]
-    fn database_route_prefers_exact_names_and_infers_only_unique_usernames() {
-        let mut routes = HashMap::new();
-        routes.insert(
-            ("app".to_string(), "primary".to_string()),
-            "instance-primary".to_string(),
-        );
-
-        assert!(matches!(
-            resolve_database_route(&routes, "app", Some("primary")),
-            RouteKeyResolution::Found { database, .. } if database == "primary"
-        ));
-        assert!(matches!(
-            resolve_database_route(&routes, "app", None),
-            RouteKeyResolution::Found { database, .. } if database == "primary"
+    #[tokio::test]
+    async fn shared_members_follow_inventory_replacement_migration_and_removal() {
+        let store = InstanceStore::default();
+        let mut tenant = test_support::shared_metadata();
+        store.replace_all(vec![tenant.clone()]).await;
+        let original = store.shared_runtime_members("pool-a").await.pop().unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &store.snapshot(&tenant.instance_id).await.unwrap()
         ));
 
-        routes.insert(
-            ("app".to_string(), "secondary".to_string()),
-            "instance-secondary".to_string(),
+        tenant.runtime_id = "pool-b".to_owned();
+        store.upsert_fenced(tenant.clone()).await;
+        assert!(store.shared_runtime_members("pool-a").await.is_empty());
+        assert_eq!(store.shared_runtime_members("pool-b").await.len(), 1);
+        assert_eq!(original.runtime_id(), "pool-a");
+
+        tenant.deployment_mode = DeploymentMode::Dedicated;
+        store.upsert_preserving_fence(tenant.clone()).await;
+        assert!(store.shared_runtime_members("pool-b").await.is_empty());
+
+        tenant.deployment_mode = DeploymentMode::Shared;
+        tenant.runtime_id.clear();
+        store.open_routes(tenant.clone()).await;
+        assert_eq!(
+            store
+                .shared_runtime_members(&tenant.instance_id)
+                .await
+                .len(),
+            1
+        );
+        store.remove(&tenant.instance_id).await.unwrap();
+        assert!(
+            store
+                .shared_runtime_members(&tenant.instance_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn database_inference_tracks_current_owners_across_route_changes() {
+        use DatabaseRouteResolution::{Ambiguous, Found, NotFound};
+
+        let store = InstanceStore::default();
+        let first = test_support::metadata("first", Protocol::Postgres);
+        let mut replacement = test_support::metadata("replacement", Protocol::Postgres);
+        let mut second = test_support::metadata("second", Protocol::Postgres);
+        second.database.name = "second_db".into();
+        store
+            .replace_all(vec![first, replacement.clone(), second.clone()])
+            .await;
+
+        store.remove("first").await;
+        for database in [None, Some("")] {
+            assert!(matches!(
+                store.resolve_postgres("user", database).await,
+                Ambiguous
+            ));
+        }
+        assert!(
+            matches!(store.resolve_postgres("user", Some("database")).await,
+            Found { database, target } if database == "database" && target.instance_id == "replacement")
         );
         assert!(matches!(
-            resolve_database_route(&routes, "app", None),
-            RouteKeyResolution::Ambiguous
+            store.resolve_postgres("user", Some("missing")).await,
+            NotFound
         ));
+
+        store.pin_routes_fenced("second").await;
+        store.upsert(second.clone()).await;
+        assert!(matches!(store.resolve_postgres("user", Some("")).await,
+            Found { database, target } if database == "database" && target.instance_id == "replacement"));
+        store.open_routes(second).await;
         assert!(matches!(
-            resolve_database_route(&routes, "app", Some("primary")),
-            RouteKeyResolution::Found { database, .. } if database == "primary"
+            store.resolve_postgres("user", None).await,
+            Ambiguous
         ));
+
+        replacement.protocol = Protocol::Clickhouse;
+        replacement.database.username = "renamed".into();
+        store.upsert(replacement).await;
         assert!(matches!(
-            resolve_database_route(&routes, "unknown", None),
-            RouteKeyResolution::NotFound
+            store.resolve_postgres("user", Some("database")).await,
+            NotFound
         ));
+        assert!(matches!(store.resolve_postgres("user", None).await,
+            Found { database, target } if database == "second_db" && target.instance_id == "second"));
+        assert!(matches!(store.resolve_clickhouse("renamed", None).await,
+            Found { target, .. } if target.instance_id == "replacement"));
+        store.remove("second").await;
+        assert!(matches!(
+            store.resolve_postgres("user", None).await,
+            NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn mysql_and_mariadb_infer_only_their_own_published_identity() {
+        use DatabaseRouteResolution::{Found, NotFound};
+
+        let store = InstanceStore::default();
+        let first = test_support::metadata("first", Protocol::Mysql);
+        let replacement = test_support::metadata("replacement", Protocol::Mysql);
+        let mut mariadb = test_support::metadata("maria", Protocol::Mariadb);
+        mariadb.database.name = "other_db".into();
+        store.replace_all(vec![first, replacement, mariadb]).await;
+
+        assert!(matches!(store.resolve_mysql("user", None).await,
+            Found { database, target } if database == "database" && target.instance_id == "replacement"));
+        store.remove("replacement").await;
+        assert!(matches!(store.resolve_mysql("user", None).await, NotFound));
+        assert!(matches!(
+            store.resolve_mysql("user", Some("database")).await,
+            NotFound
+        ));
+        assert!(matches!(store.resolve_mariadb("user", None).await,
+            Found { database, target } if database == "other_db" && target.instance_id == "maria"));
+    }
+
+    #[tokio::test]
+    async fn removing_displaced_owners_preserves_resp_password_sets_and_qdrant_keys() {
+        let store = InstanceStore::default();
+        let hash = crate::gateway::protocols::redis::password_route_sha256(b"secret");
+        for protocol in [Protocol::Redis, Protocol::Valkey, Protocol::Qdrant] {
+            let mut first = resp_metadata("first", "user", "secret");
+            first.protocol = protocol;
+            first.route_key_sha256 = Some("fingerprint".into());
+            let mut last = first.clone();
+            last.instance_id = "last".into();
+            store.replace_all(vec![first, last]).await;
+            assert!(store.resolve_redis_password(&hash).await.is_none());
+            assert!(store.resolve_valkey_password(&hash).await.is_none());
+            store.fence_routes("first").await;
+            store.remove("first").await;
+            let target = match protocol {
+                Protocol::Redis => {
+                    assert_eq!(
+                        store
+                            .resolve_redis_password(&hash)
+                            .await
+                            .unwrap()
+                            .1
+                            .instance_id,
+                        "last"
+                    );
+                    store.resolve_redis("user").await
+                }
+                Protocol::Valkey => {
+                    assert_eq!(
+                        store
+                            .resolve_valkey_password(&hash)
+                            .await
+                            .unwrap()
+                            .1
+                            .instance_id,
+                        "last"
+                    );
+                    store.resolve_valkey("user").await
+                }
+                Protocol::Qdrant => store.resolve_qdrant("fingerprint").await,
+                _ => unreachable!(),
+            };
+            assert_eq!(target.unwrap().instance_id, "last");
+            store.remove("last").await;
+            assert!(store.resolve_redis_password(&hash).await.is_none());
+            assert!(store.resolve_valkey_password(&hash).await.is_none());
+            assert!(store.resolve_qdrant("fingerprint").await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mongodb_uses_the_exact_database_even_when_it_is_empty() {
+        let store = InstanceStore::default();
+        let mut metadata = test_support::metadata("mongo", Protocol::Mongodb);
+        store.upsert(metadata.clone()).await;
+        assert!(store.resolve_mongodb("user", "").await.is_none());
+        metadata.database.name.clear();
+        store.upsert(metadata).await;
+        assert!(store.resolve_mongodb("user", "database").await.is_none());
+        assert_eq!(
+            store.resolve_mongodb("user", "").await.unwrap().instance_id,
+            "mongo"
+        );
     }
 
     #[tokio::test]

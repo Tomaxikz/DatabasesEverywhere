@@ -1,12 +1,10 @@
 use super::disk::invalidate_disk_locked;
 use super::network::NetworkCounter;
-use super::runtime_metrics::docker_compatible_memory_usage;
 use super::{
     CachedDiskUsage, CachedRuntimeStats, DISK_REFRESH_INTERVAL, INITIAL_DISK_SCAN_TIMEOUT,
     ResourceCache, ResourceMonitorGuard,
 };
 use crate::config::Config;
-use bollard::models::ContainerStatsResponse;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -162,11 +160,11 @@ impl ResourceCache {
         runtime_id: &str,
         worker: u64,
         cpu_usage_percent: Option<f64>,
-        stats: &ContainerStatsResponse,
+        memory_usage_bytes: Option<u64>,
     ) -> bool {
         let sample = CachedRuntimeStats {
             cpu_usage_percent,
-            memory_usage_bytes: docker_compatible_memory_usage(stats),
+            memory_usage_bytes,
             sampled_at: Instant::now(),
         };
         let mut inner = self.inner.lock().await;

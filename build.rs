@@ -12,11 +12,11 @@ const FUSEQUOTA_RISCV64_EXECUTABLE_SHA256: &str =
 // Pin the reviewed source and both artifact forms. Rust/LLD output is not
 // guaranteed to be byte-identical when the compiler host OS changes.
 const SOCKET_BRIDGE_SOURCE_SHA256: &str =
-    "b417cd389b473f2fc443b76cc1e3a3863627dbaeaaf014899b47efa394c8c90c";
+    "fbaa5a2222d6fb3ff70c9931d3370f7beba5bc25d606cb65cc6b123905eee668";
 const SOCKET_BRIDGE_COMPRESSED_SHA256: &str =
-    "e7734795cb6f43c79427d05b430220752b00a0b16f6bb3a9e4d45d2cef589429";
+    "cd351642cfa603eae85925d2180345024fcd2ae406da0e40c0765ec90aa3e093";
 const SOCKET_BRIDGE_EXECUTABLE_SHA256: &str =
-    "05cacb3929262b443151411f882f00a6d6d07a5347a780ec0e77dc43a8e0fd2d";
+    "0432a7ed8d5498645643dc2eee1b0e435097a1748619cf811cb8b2e6e1c154c8";
 
 const FUSEQUOTA_PAYLOAD: &str = "helpers/payloads/fusequota.zst";
 const FUSEQUOTA_VERSION_FILE: &str = "helpers/payloads/fusequota.version";

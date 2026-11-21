@@ -1,4 +1,5 @@
 mod backup_helper;
+mod cgroup_stats;
 mod command;
 mod container_config;
 mod cpu_burst;
@@ -28,6 +29,7 @@ pub use error::DockerError;
 use helpers::is_rootless_security_option;
 use transfer::CappedExecOutput;
 
+pub(crate) use cgroup_stats::CgroupCounters;
 pub use command::{CommandOutput, ExecRecovery};
 pub(crate) use cpu_burst::CpuBurstPolicyStatus;
 pub use engine::{DaemonEngineConnection, rootless_uid_from_socket};
@@ -80,10 +82,23 @@ pub(crate) struct ManagedContainerCompatibilityIdentity {
 }
 
 /// Recreated after an engine error so a restart cannot leave the sampler polling a stale container ID.
-#[derive(Debug, Clone)]
+///
+/// Reads the container's local cgroup directly when the engine runs on this host and falls back
+/// to the engine's one-shot stats API otherwise, retrying the direct path periodically.
+#[derive(Debug)]
 pub(crate) struct ManagedStatsSampler {
     docker: Docker,
+    engine: DaemonEngine,
     container_id: String,
+    cgroup: Option<std::sync::Arc<cgroup_stats::CgroupStatsReader>>,
+    retry_cgroup_at: tokio::time::Instant,
+}
+
+/// Both variants carry the counters the engine's compat stats endpoint would report.
+#[derive(Debug, Clone)]
+pub(crate) enum ContainerStatsSample {
+    Cgroup(CgroupCounters),
+    Engine(Box<bollard::models::ContainerStatsResponse>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

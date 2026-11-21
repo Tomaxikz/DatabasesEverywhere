@@ -163,6 +163,8 @@ impl From<&SoftDiskTarget> for TargetFingerprint {
 pub(super) struct TrackerState {
     pub(super) target: TargetFingerprint,
     pub(super) snapshot: SoftDiskSnapshot,
+    // Fail-closed snapshots can contain an older measurement or a synthetic zero.
+    pub(super) measured: bool,
     pub(super) warned: bool,
 }
 

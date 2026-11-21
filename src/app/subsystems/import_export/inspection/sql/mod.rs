@@ -68,7 +68,18 @@ fn scan_sql_reader<R: Read, O: SqlObserver>(
     protocol: Protocol,
     observer: &mut O,
 ) -> Result<(), O::Error> {
-    let mut lexer = SqlLexer::new(reader, protocol);
+    scan_sql(ByteInput::new(reader), protocol, observer)
+}
+
+fn scan_sql<I: SqlInput, O: SqlObserver>(
+    input: I,
+    protocol: Protocol,
+    observer: &mut O,
+) -> Result<(), O::Error> {
+    let mut lexer = SqlLexer {
+        input,
+        backslash_strings: protocol.engine().sql_backslash_strings(),
+    };
     let mut statement = Statement::default();
     while let Some(event) = lexer.next_event()? {
         match event {
@@ -116,19 +127,12 @@ struct SqlComment {
     truncated: bool,
 }
 
-struct SqlLexer<R> {
-    input: ByteInput<R>,
+struct SqlLexer<I> {
+    input: I,
     backslash_strings: bool,
 }
 
-impl<R: Read> SqlLexer<R> {
-    fn new(reader: R, protocol: Protocol) -> Self {
-        Self {
-            input: ByteInput::new(reader),
-            backslash_strings: protocol.engine().sql_backslash_strings(),
-        }
-    }
-
+impl<I: SqlInput> SqlLexer<I> {
     fn next_event(&mut self) -> Result<Option<LexEvent>, InspectionError> {
         loop {
             let Some(byte) = self.input.next()? else {
@@ -387,6 +391,25 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'-')
 }
 
+trait SqlInput {
+    fn next(&mut self) -> Result<Option<u8>, InspectionError>;
+    fn peek_n(&mut self, index: usize) -> Result<Option<u8>, InspectionError>;
+
+    fn peek(&mut self) -> Result<Option<u8>, InspectionError> {
+        self.peek_n(0)
+    }
+}
+
+impl SqlInput for &[u8] {
+    fn next(&mut self) -> Result<Option<u8>, InspectionError> {
+        Ok(self.split_off_first().copied())
+    }
+
+    fn peek_n(&mut self, index: usize) -> Result<Option<u8>, InspectionError> {
+        Ok(self.get(index).copied())
+    }
+}
+
 struct ByteInput<R> {
     reader: R,
     buffer: Box<[u8]>,
@@ -406,27 +429,6 @@ impl<R: Read> ByteInput<R> {
         }
     }
 
-    fn next(&mut self) -> Result<Option<u8>, InspectionError> {
-        if let Some(byte) = self.lookahead.pop_front() {
-            return Ok(Some(byte));
-        }
-        self.next_buffer_byte()
-    }
-
-    fn peek(&mut self) -> Result<Option<u8>, InspectionError> {
-        self.peek_n(0)
-    }
-
-    fn peek_n(&mut self, index: usize) -> Result<Option<u8>, InspectionError> {
-        while self.lookahead.len() <= index {
-            let Some(byte) = self.next_buffer_byte()? else {
-                return Ok(None);
-            };
-            self.lookahead.push_back(byte);
-        }
-        Ok(self.lookahead.get(index).copied())
-    }
-
     fn next_buffer_byte(&mut self) -> Result<Option<u8>, InspectionError> {
         if self.start == self.end {
             self.start = 0;
@@ -438,6 +440,25 @@ impl<R: Read> ByteInput<R> {
         let byte = self.buffer[self.start];
         self.start += 1;
         Ok(Some(byte))
+    }
+}
+
+impl<R: Read> SqlInput for ByteInput<R> {
+    fn next(&mut self) -> Result<Option<u8>, InspectionError> {
+        if let Some(byte) = self.lookahead.pop_front() {
+            return Ok(Some(byte));
+        }
+        self.next_buffer_byte()
+    }
+
+    fn peek_n(&mut self, index: usize) -> Result<Option<u8>, InspectionError> {
+        while self.lookahead.len() <= index {
+            let Some(byte) = self.next_buffer_byte()? else {
+                return Ok(None);
+            };
+            self.lookahead.push_back(byte);
+        }
+        Ok(self.lookahead.get(index).copied())
     }
 }
 

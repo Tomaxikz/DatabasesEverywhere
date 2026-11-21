@@ -7,6 +7,7 @@ use crate::server::jobs::import_export::ImportExportAction;
 use crate::server::jobs::import_export::ImportExportJob;
 use crate::server::jobs::import_export::ImportExportStatus;
 use crate::server::metadata::InstanceMetadata;
+use crate::subsystems::instances::progress::InstallProgress;
 use crate::subsystems::monitoring::resources::ResourceScope;
 use crate::subsystems::monitoring::{
     activity::ActivitySources,
@@ -204,10 +205,7 @@ fn hundreds_of_instances_are_sent_as_bounded_ordered_batches() {
             )
         })
         .collect();
-    let snapshot = MonitoringSnapshotData {
-        instances,
-        install_progress: Vec::new(),
-    };
+    let snapshot = MonitoringSnapshotData::new(instances, Vec::new()).unwrap();
     let batches = snapshot
         .filtered(&InstanceAuthorization::All)
         .batches(42, 1_788_220_800, &mut wire::ProgressCursor::default())
@@ -356,8 +354,8 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
     assert!(authorized.allows("tenant_one", "generation-a"));
     assert!(!authorized.allows("tenant_one", "generation-b"));
 
-    let mut snapshot = MonitoringSnapshotData {
-        instances: vec![
+    let instances = || {
+        vec![
             monitoring_instance(
                 "tenant_one",
                 crate::server::placement::DeploymentMode::Dedicated,
@@ -368,9 +366,9 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
                 crate::server::placement::DeploymentMode::Dedicated,
                 None,
             ),
-        ],
-        install_progress: Vec::new(),
+        ]
     };
+    let snapshot = MonitoringSnapshotData::new(instances(), Vec::new()).unwrap();
     assert_eq!(
         snapshot
             .filtered(&authorized)
@@ -380,7 +378,9 @@ fn selected_authorization_is_bound_to_the_instance_generation() {
             .collect::<Vec<_>>(),
         ["tenant_one"]
     );
-    snapshot.instances[0].instance_generation = "generation-b".to_string();
+    let mut replaced = instances();
+    replaced[0].instance_generation = "generation-b".to_string();
+    let snapshot = MonitoringSnapshotData::new(replaced, Vec::new()).unwrap();
     assert!(snapshot.filtered(&authorized).instances.is_empty());
 
     assert!(
@@ -532,34 +532,36 @@ fn progress_changes_reset_reconnect_and_remove_evicted_records() {
             .len(),
         1
     );
-    let removed = cursor.select(&[]);
+    let removed = cursor.select::<InstallProgress>(&[]);
     assert_eq!(removed.removed, ["tenant"]);
-    assert!(cursor.select(&[]).removed.is_empty());
+    assert!(cursor.select::<InstallProgress>(&[]).removed.is_empty());
     assert_eq!(cursor.select(&[&first]).updates.len(), 1);
 }
 
 #[test]
 fn progress_delta_batches_are_bounded_and_authorized() {
     let store = crate::subsystems::instances::progress::InstallProgressStore::default();
-    let mut instances = Vec::new();
-    for index in 0..300 {
-        let id = format!("tenant-{index:04}");
-        store.begin(
-            &id,
-            crate::databases::protocol::Protocol::Mysql,
-            "mysql:8.4",
-        );
-        store.complete(&id, "finished");
-        instances.push(monitoring_instance(
-            id,
-            crate::server::placement::DeploymentMode::Shared,
-            None,
-        ));
+    let ids = (0..300)
+        .map(|index| format!("tenant-{index:04}"))
+        .collect::<Vec<_>>();
+    for id in &ids {
+        store.begin(id, crate::databases::protocol::Protocol::Mysql, "mysql:8.4");
+        store.complete(id, "finished");
     }
-    let mut snapshot = MonitoringSnapshotData {
-        instances,
-        install_progress: store.list(),
+    let snapshot_with = |progress| {
+        let instances = ids
+            .iter()
+            .map(|id| {
+                monitoring_instance(
+                    id.clone(),
+                    crate::server::placement::DeploymentMode::Shared,
+                    None,
+                )
+            })
+            .collect();
+        MonitoringSnapshotData::new(instances, progress).unwrap()
     };
+    let snapshot = snapshot_with(store.list());
     let mut cursor = wire::ProgressCursor::default();
     let first = snapshot
         .filtered(&InstanceAuthorization::All)
@@ -592,7 +594,7 @@ fn progress_delta_batches_are_bounded_and_authorized() {
             .sum::<usize>(),
         300
     );
-    snapshot.install_progress.clear();
+    let snapshot = snapshot_with(Vec::new());
     let removed = snapshot
         .filtered(&InstanceAuthorization::All)
         .batches(3, 3, &mut cursor)
@@ -609,7 +611,7 @@ fn progress_delta_batches_are_bounded_and_authorized() {
         assert_eq!(batch.batch_count, removed.len() as u32);
         assert!(serde_json::to_vec(batch).unwrap().len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
     }
-    snapshot.install_progress = store.list();
+    let snapshot = snapshot_with(store.list());
     let authorization = InstanceAuthorization::Selected(HashMap::from([(
         "tenant-0000".into(),
         "generation-a".into(),
@@ -675,7 +677,9 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
     let authorization = resolve_instance_authorization(&state, &claims)
         .await
         .unwrap();
-    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await;
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization)
+        .await
+        .unwrap();
     let filtered = snapshot.filtered(&authorization);
     assert!(filtered.instances.is_empty());
     assert_eq!(filtered.install_progress.len(), 1);
@@ -695,7 +699,9 @@ async fn creation_tokens_follow_their_attempt_through_completion() {
     let authorization = resolve_instance_authorization(&state, &claims)
         .await
         .unwrap();
-    let snapshot = monitoring::monitoring_snapshot(&state, &authorization).await;
+    let snapshot = monitoring::monitoring_snapshot(&state, &authorization)
+        .await
+        .unwrap();
     let filtered = snapshot.filtered(&authorization);
     assert!(filtered.instances.is_empty());
     assert_eq!(
@@ -789,4 +795,65 @@ async fn creation_log_targets_need_a_dedicated_attempt_the_token_binds() {
         creating_log_target("shared_new", Some(shared), &shared_authorization),
         Err(ApiError::Conflict(_))
     ));
+}
+
+#[test]
+fn pre_encoded_batches_are_byte_identical_to_direct_serialization() {
+    #[derive(serde::Serialize)]
+    struct DirectBatch<'a> {
+        progress_reset: bool,
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        install_progress_removed: &'a [String],
+        r#type: &'static str,
+        sequence: u64,
+        sampled_at_unix: i64,
+        batch_index: u32,
+        batch_count: u32,
+        instances: Vec<&'a MonitoringInstance>,
+        install_progress: Vec<&'a InstallProgress>,
+    }
+
+    let store = crate::subsystems::instances::progress::InstallProgressStore::default();
+    let instances = (0..120)
+        .map(|index| {
+            let id = format!("tenant-{index:04}");
+            store.begin(
+                &id,
+                crate::databases::protocol::Protocol::Mysql,
+                "mysql:8.4",
+            );
+            monitoring_instance(
+                id,
+                if index % 2 == 0 {
+                    crate::server::placement::DeploymentMode::Shared
+                } else {
+                    crate::server::placement::DeploymentMode::Dedicated
+                },
+                Some(index as f64 / 3.0),
+            )
+        })
+        .collect();
+    let snapshot = MonitoringSnapshotData::new(instances, store.list()).unwrap();
+    let mut cursor = wire::ProgressCursor::default();
+    let batches = snapshot
+        .filtered(&InstanceAuthorization::All)
+        .batches(7, 1_788_220_800, &mut cursor)
+        .unwrap();
+    assert!(batches.len() > 2);
+    for batch in &batches {
+        let direct = DirectBatch {
+            progress_reset: batch.progress_reset,
+            install_progress_removed: &batch.install_progress_removed,
+            r#type: "stats",
+            sequence: batch.sequence,
+            sampled_at_unix: batch.sampled_at_unix,
+            batch_index: batch.batch_index,
+            batch_count: batch.batch_count,
+            instances: batch.instances.iter().map(|row| &***row).collect(),
+            install_progress: batch.install_progress.iter().map(|row| &***row).collect(),
+        };
+        let encoded = serde_json::to_string(batch).unwrap();
+        assert_eq!(encoded, serde_json::to_string(&direct).unwrap());
+        assert!(encoded.len() <= WEBSOCKET_MAX_MESSAGE_BYTES);
+    }
 }

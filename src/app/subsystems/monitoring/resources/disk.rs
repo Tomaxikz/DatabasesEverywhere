@@ -4,7 +4,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::routes::http::router::AppState;
-use crate::server::disk::DiskLimiter;
+use crate::server::disk::{DiskLimiter, soft::SoftDiskTarget};
 use crate::server::metadata::{InstanceMetadata, InstanceStatus};
 use crate::server::paths::InstancePaths;
 use crate::server::placement::DeploymentMode;
@@ -254,16 +254,17 @@ impl ResourceCache {
     }
 
     pub async fn refresh_all_disk_usage(&self, state: &AppState) {
-        let instances = state.instances.list().await;
-        // Walking a shared runtime root here duplicates that work, cannot be attributed to a
-        // tenant, and turns one active monitor into a full-pool scan every five seconds.
-        let instance_ids = disk_sample_instance_ids(instances);
-        futures::stream::iter(instance_ids)
-            .map(|instance_id| {
-                let cache = self.clone();
-                let config = state.config.snapshot();
+        let instances = state
+            .instances
+            .snapshots_matching(is_disk_sample_target)
+            .await;
+        let config = state.config.snapshot();
+        futures::stream::iter(instances)
+            .for_each_concurrent(RESOURCE_FANOUT_LIMIT, |metadata| {
+                let config = Arc::clone(&config);
                 async move {
-                    let paths = match InstancePaths::new(&config.paths, &instance_id) {
+                    let instance_id = &metadata.instance_id;
+                    let paths = match InstancePaths::new(&config.paths, instance_id) {
                         Ok(paths) => paths,
                         Err(error) => {
                             tracing::debug!(
@@ -274,13 +275,20 @@ impl ResourceCache {
                             return;
                         }
                     };
-                    cache
-                        .refresh_disk_usage_now(config, instance_id, paths.data)
+                    if uses_dedicated_scanner(&metadata)
+                        && state
+                            .soft_disk_limiter
+                            .has_fresh_measurement(&scanner_target(&metadata, paths.data.clone()))
+                            .await
+                    {
+                        // Reports already use the scanner's physical bytes. Keep the
+                        // logical-byte cache independent for callers such as export sizing.
+                        return;
+                    }
+                    self.refresh_disk_usage_now(config, instance_id.clone(), paths.data)
                         .await;
                 }
             })
-            .buffer_unordered(RESOURCE_FANOUT_LIMIT)
-            .collect::<Vec<_>>()
             .await;
     }
 
@@ -348,15 +356,25 @@ pub(super) fn invalidate_disk_locked(inner: &mut ResourceCacheInner, instance_id
     inner.disk_refresh_locks.remove(instance_id);
 }
 
-pub(super) fn disk_sample_instance_ids(
-    instances: Vec<InstanceMetadata>,
-) -> std::collections::HashSet<String> {
-    instances
-        .into_iter()
-        .filter(|metadata| {
-            metadata.deployment_mode == DeploymentMode::Dedicated
-                && metadata.status == InstanceStatus::Running
-        })
-        .map(|metadata| metadata.instance_id)
-        .collect()
+pub(super) fn is_disk_sample_target(metadata: &InstanceMetadata) -> bool {
+    metadata.deployment_mode == DeploymentMode::Dedicated
+        && metadata.status == InstanceStatus::Running
+}
+
+pub(super) fn uses_dedicated_scanner(metadata: &InstanceMetadata) -> bool {
+    metadata.deployment_mode == DeploymentMode::Dedicated
+        && (metadata.limits.disk_enforcement_method == "soft_scanner"
+            || (metadata.protocol == crate::databases::protocol::Protocol::Qdrant
+                && metadata.limits.disk_enforcement_method == "fuse_quota"))
+}
+
+pub(super) fn scanner_target(metadata: &InstanceMetadata, data_path: PathBuf) -> SoftDiskTarget {
+    SoftDiskTarget {
+        instance_id: metadata.instance_id.clone(),
+        created_at: metadata.created_at.clone(),
+        protocol: metadata.protocol,
+        data_path,
+        limit_bytes: crate::utils::limits::mib_to_bytes(metadata.limits.disk_mib),
+        durable_blocked: metadata.disk_limit_blocked,
+    }
 }

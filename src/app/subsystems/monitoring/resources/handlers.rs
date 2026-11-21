@@ -6,11 +6,10 @@ use super::reports::{NodeCpuSummary, NodeDiskSummary, NodeMemorySummary, NodeRes
 use super::sampler::{read_host_disk, read_host_memory};
 use super::{pools, sampler, shared_disk};
 use crate::auth::scopes;
-use crate::databases::protocol::Protocol;
 use crate::routes::http::policy::ApiRequestContext;
 use crate::routes::http::response::{ApiError, ApiPath, ApiResponse, ApiResult};
 use crate::routes::http::router::AppState;
-use crate::server::disk::soft::{SoftDiskSnapshot, SoftDiskTarget};
+use crate::server::disk::soft::SoftDiskSnapshot;
 use crate::server::metadata::InstanceMetadata;
 use crate::server::paths::InstancePaths;
 use crate::server::placement::DeploymentMode;
@@ -174,9 +173,7 @@ pub(crate) async fn resource_report(
     let soft_enforcement = metadata.limits.disk_enforcement_method == "soft_scanner";
     let shared_soft_guard =
         shared_disk::uses_soft_guard(metadata.deployment_mode, metadata.limits.disk_enforced);
-    let legacy_qdrant_safety_monitor = metadata.protocol == Protocol::Qdrant
-        && metadata.limits.disk_enforcement_method == "fuse_quota";
-    let scanner_active = !shared && (soft_enforcement || legacy_qdrant_safety_monitor);
+    let scanner_active = super::disk::uses_dedicated_scanner(metadata);
     let (scanner, disk_used) = if shared {
         // Telemetry must not make a stopped/unmeasurable tenant unlistable.
         // Enforcement and admission still use the strict measurement paths.
@@ -264,16 +261,9 @@ pub(super) async fn dedicated_disk_usage(
 ) -> Result<(Option<SoftDiskSnapshot>, Option<u64>), ApiError> {
     let paths = InstancePaths::new(&state.config.paths, &metadata.instance_id)
         .map_err(ApiError::bad_request)?;
-    let scanner_target = SoftDiskTarget {
-        instance_id: metadata.instance_id.clone(),
-        created_at: metadata.created_at.clone(),
-        protocol: metadata.protocol,
-        data_path: paths.data.clone(),
-        limit_bytes: mib_to_bytes(metadata.limits.disk_mib),
-        durable_blocked: metadata.disk_limit_blocked,
-    };
     let scanner = if scanner_active {
-        state.soft_disk_limiter.snapshot(&scanner_target).await
+        let target = super::disk::scanner_target(metadata, paths.data.clone());
+        state.soft_disk_limiter.snapshot(&target).await
     } else {
         None
     };

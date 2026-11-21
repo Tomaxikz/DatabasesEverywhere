@@ -1,6 +1,7 @@
 use tokio::io::AsyncWriteExt;
 
 use super::*;
+use crate::gateway::listeners::ListenerError;
 use crate::{
     databases::protocol::Protocol,
     gateway::{
@@ -14,6 +15,8 @@ use crate::{
     },
     server::monitoring::OperationKind,
 };
+
+mod frames;
 
 #[tokio::test(start_paused = true)]
 async fn shared_query_deadline_releases_buffer_without_timing_out_idle_clients() {
@@ -52,16 +55,21 @@ async fn mongodb_wire_limit_matches_advertised_limit_without_large_allocations()
     let limit = crate::gateway::protocols::mongodb::MAX_WIRE_MESSAGE_BYTES;
     for size in [16 * 1024 * 1024 + 128, limit] {
         message[..4].copy_from_slice(&(size as i32).to_le_bytes());
-        let (prefix, declared, command) = read_mongodb_prefix(&mut message.as_slice())
+        let mut prefix = Vec::new();
+        let (declared, kind) = read_mongodb_prefix(&mut message.as_slice(), &mut prefix)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(declared, size);
         assert!(prefix.len() < 64);
-        assert_eq!(command.as_deref(), Some(b"insert".as_slice()));
+        assert_eq!(kind, Some(OperationKind::Write));
     }
     message[..4].copy_from_slice(&((limit + 1) as i32).to_le_bytes());
-    assert!(read_mongodb_prefix(&mut message.as_slice()).await.is_err());
+    assert!(
+        read_mongodb_prefix(&mut message.as_slice(), &mut Vec::new())
+            .await
+            .is_err()
+    );
 }
 
 fn activity() -> Arc<ActivityCounter> {

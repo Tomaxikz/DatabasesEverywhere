@@ -222,6 +222,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/20261121120000_optimize_activity_retention.sql"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
         (pool.clone(), ActivityRepository::new(pool))
     }
 
@@ -284,6 +291,28 @@ mod tests {
         assert_eq!(history[1].bucket_start_unix, 120);
         assert_eq!(history[0].cpu_time_micros, None);
         assert_eq!(history[0].peak_query_memory_bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn late_buckets_use_the_newest_stored_timestamp_for_retention() {
+        let (pool, repository) = repository().await;
+        seed(&pool, "tenant-a", "generation-a").await;
+        repository
+            .save(&[
+                bucket("tenant-a", 90_000),
+                bucket("tenant-a", 3_599),
+                bucket("tenant-a", 3_600),
+            ])
+            .await
+            .unwrap();
+
+        let starts: Vec<i64> = sqlx::query_scalar(
+            "SELECT bucket_start_unix FROM tenant_activity_buckets ORDER BY bucket_start_unix",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(starts, [3_600, 90_000]);
     }
 
     #[tokio::test]

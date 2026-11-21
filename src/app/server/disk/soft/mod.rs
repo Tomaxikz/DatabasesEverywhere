@@ -134,6 +134,22 @@ impl SoftDiskLimiter {
             .map(|state| state.snapshot.clone())
     }
 
+    pub(crate) async fn has_fresh_measurement(&self, target: &SoftDiskTarget) -> bool {
+        let fingerprint = TargetFingerprint::from(target);
+        let max_age = Duration::from_secs(
+            thresholds::full_scan_interval_secs(&self.config, target.protocol).max(1),
+        );
+        self.states
+            .lock()
+            .await
+            .get(&target.instance_id)
+            .is_some_and(|state| {
+                state.target == fingerprint
+                    && state.measured
+                    && state.snapshot.sampled_at.elapsed() < max_age
+            })
+    }
+
     pub async fn remove(&self, instance_id: &str) {
         self.states.lock().await.remove(instance_id);
         self.scan_failures.lock().await.remove(instance_id);

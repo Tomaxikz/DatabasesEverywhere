@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
 use super::{
+    super::{SqlInput, scan_sql},
     Protocol, SharedObserver, SharedSqlError, SharedSqlIssue, SqlComment, SqlObserver, SqlToken,
     Statement,
     errors::{ExecutableCommentTooLarge, MysqlCommandPolicyError},
-    scan_sql_reader,
     words::{create_object, has_keyword, has_keyword_sequence, statement_words},
 };
 
@@ -18,7 +18,7 @@ pub(crate) fn validate_shared_mysql_command(
 }
 
 pub(super) fn check_shared_mysql_command(
-    sql: &[u8],
+    sql: impl SqlInput,
     protocol: Protocol,
     executable_fragment: bool,
 ) -> Result<(), MysqlCommandPolicyError> {
@@ -31,7 +31,7 @@ pub(super) fn check_shared_mysql_command(
         keywords: VecDeque::with_capacity(4),
         violation: None,
     };
-    scan_sql_reader(std::io::Cursor::new(sql), protocol, &mut observer)
+    scan_sql(sql, protocol, &mut observer)
 }
 
 pub(super) struct MysqlCommandObserver {

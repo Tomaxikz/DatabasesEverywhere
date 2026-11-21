@@ -275,6 +275,32 @@ async fn recreated_target_does_not_inherit_blocked_hysteresis_or_growth() {
 }
 
 #[tokio::test]
+async fn monitoring_stops_reusing_a_measurement_at_its_full_scan_deadline() {
+    let limiter = SoftDiskLimiter::new(test_config());
+    let target = SoftDiskTarget {
+        instance_id: "inst_freshness".to_owned(),
+        created_at: "generation".to_owned(),
+        protocol: Protocol::Qdrant,
+        data_path: PathBuf::from("/data"),
+        limit_bytes: 1_000,
+        durable_blocked: false,
+    };
+    limiter
+        .record_sample(&target, DirectoryUsage::default())
+        .await;
+    assert!(limiter.has_fresh_measurement(&target).await);
+    limiter
+        .states
+        .lock()
+        .await
+        .get_mut(&target.instance_id)
+        .unwrap()
+        .snapshot
+        .sampled_at = Instant::now() - limiter.scan_interval();
+    assert!(!limiter.has_fresh_measurement(&target).await);
+}
+
+#[tokio::test]
 async fn durable_restart_block_survives_a_fresh_limiter_until_recovery() {
     let temporary = tempfile::tempdir().unwrap();
     let data = temporary.path().join("data");
@@ -324,6 +350,7 @@ async fn repeated_unmeasurable_scans_fail_closed() {
             ..
         }
     ));
+    assert!(!limiter.has_fresh_measurement(&target).await);
     assert_eq!(runtime.blocked.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.killed.load(Ordering::SeqCst), 1);
 }

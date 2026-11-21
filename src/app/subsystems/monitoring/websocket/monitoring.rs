@@ -95,7 +95,7 @@ pub(super) async fn stream_monitoring(
                 }
             }
             _ = ticker.tick() => {
-                let Ok(message) = complete_before(
+                let Ok(snapshot) = complete_before(
                     expiration_deadline,
                     state.monitoring_cache.snapshot(&state, &authorization),
                 )
@@ -103,6 +103,13 @@ pub(super) async fn stream_monitoring(
                 else {
                     close_expired_socket(&mut socket).await;
                     break;
+                };
+                let message = match snapshot {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to serialize monitoring batch");
+                        break;
+                    }
                 };
                 sequence = sequence.saturating_add(1);
                 let batches = match message
@@ -149,23 +156,25 @@ impl MonitoringSnapshotCache {
         &self,
         state: &AppState,
         authorization: &InstanceAuthorization,
-    ) -> Arc<MonitoringSnapshotData> {
+    ) -> Result<Arc<MonitoringSnapshotData>, serde_json::Error> {
         if matches!(authorization, InstanceAuthorization::Selected(_)) {
-            return Arc::new(monitoring_snapshot(state, authorization).await);
+            return monitoring_snapshot(state, authorization)
+                .await
+                .map(Arc::new);
         }
         if let Some(snapshot) = self.fresh().await {
-            return snapshot;
+            return Ok(snapshot);
         }
         let _refresh = self.refresh_lock.lock().await;
         if let Some(snapshot) = self.fresh().await {
-            return snapshot;
+            return Ok(snapshot);
         }
-        let snapshot = Arc::new(monitoring_snapshot(state, authorization).await);
+        let snapshot = Arc::new(monitoring_snapshot(state, authorization).await?);
         *self.inner.lock().await = Some(CachedMonitoringSnapshot {
             snapshot: Arc::clone(&snapshot),
             sampled_at: Instant::now(),
         });
-        snapshot
+        Ok(snapshot)
     }
 
     pub(super) async fn fresh(&self) -> Option<Arc<MonitoringSnapshotData>> {
@@ -178,10 +187,13 @@ impl MonitoringSnapshotCache {
     }
 }
 
+/// Samples every instance the authorization can see and encodes each row once. The node-wide
+/// snapshot is shared by all viewers through [`MonitoringSnapshotCache`], so per-connection work
+/// is limited to filtering rows and concatenating their pre-encoded JSON.
 pub(super) async fn monitoring_snapshot(
     state: &AppState,
     authorization: &InstanceAuthorization,
-) -> MonitoringSnapshotData {
+) -> Result<MonitoringSnapshotData, serde_json::Error> {
     use futures::StreamExt;
 
     let metadata = authorization.metadata(&state.instances).await;
@@ -224,10 +236,7 @@ pub(super) async fn monitoring_snapshot(
     };
     install_progress.sort_unstable_by(|left, right| left.instance_id.cmp(&right.instance_id));
 
-    MonitoringSnapshotData {
-        instances,
-        install_progress,
-    }
+    MonitoringSnapshotData::new(instances, install_progress)
 }
 
 pub(super) async fn monitoring_instance(
@@ -279,11 +288,27 @@ pub(super) async fn monitoring_instance(
 
 #[derive(Debug)]
 pub(super) struct MonitoringSnapshotData {
-    pub(super) instances: Vec<MonitoringInstance>,
-    pub(super) install_progress: Vec<InstallProgress>,
+    pub(super) instances: Vec<wire::EncodedRow<MonitoringInstance>>,
+    pub(super) install_progress: Vec<wire::EncodedRow<InstallProgress>>,
 }
 
 impl MonitoringSnapshotData {
+    pub(super) fn new(
+        instances: Vec<MonitoringInstance>,
+        install_progress: Vec<InstallProgress>,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            instances: instances
+                .into_iter()
+                .map(wire::EncodedRow::new)
+                .collect::<Result<_, _>>()?,
+            install_progress: install_progress
+                .into_iter()
+                .map(wire::EncodedRow::new)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
     pub(super) fn filtered<'a>(
         &'a self,
         authorization: &'a InstanceAuthorization,
@@ -323,8 +348,8 @@ impl MonitoringSnapshotData {
 }
 
 pub(super) struct AuthorizedMonitoring<'a> {
-    pub(super) instances: Vec<&'a MonitoringInstance>,
-    pub(super) install_progress: Vec<&'a InstallProgress>,
+    pub(super) instances: Vec<&'a wire::EncodedRow<MonitoringInstance>>,
+    pub(super) install_progress: Vec<&'a wire::EncodedRow<InstallProgress>>,
 }
 
 impl<'a> AuthorizedMonitoring<'a> {
@@ -334,20 +359,19 @@ impl<'a> AuthorizedMonitoring<'a> {
         sampled_at_unix: i64,
         cursor: &mut wire::ProgressCursor,
     ) -> Result<Vec<MonitoringBatch<'a>>, serde_json::Error> {
-        let instance_batches = chunk_serialized(self.instances)?;
+        let instance_batches = chunk_by_bytes(self.instances, |row| Ok(row.encoded_len()))?;
         let progress = cursor.select(&self.install_progress);
-        let progress_batches = chunk_serialized(progress.updates)?;
-        let removed_batches = chunk_serialized(progress.removed.iter().collect())?
-            .into_iter()
-            .map(|batch| batch.into_iter().cloned().collect::<Vec<_>>())
-            .collect::<Vec<_>>();
+        let progress_batches = chunk_by_bytes(progress.updates, |row| Ok(row.encoded_len()))?;
+        let removed_batches = chunk_by_bytes(progress.removed, |id| {
+            serde_json::to_vec(id).map(|encoded| encoded.len())
+        })?;
         let batch_count =
             (instance_batches.len() + progress_batches.len() + removed_batches.len()).max(1) as u32;
         let progress_reset = progress.reset;
         let new_batch =
             |batch_index: usize,
-             instances: Vec<&'a MonitoringInstance>,
-             install_progress: Vec<&'a InstallProgress>,
+             instances: Vec<&'a wire::EncodedRow<MonitoringInstance>>,
+             install_progress: Vec<&'a wire::EncodedRow<InstallProgress>>,
              install_progress_removed: Vec<String>| MonitoringBatch {
                 r#type: "stats",
                 progress_reset,
@@ -382,14 +406,17 @@ impl<'a> AuthorizedMonitoring<'a> {
     }
 }
 
-pub(super) fn chunk_serialized<T: Serialize>(
-    items: Vec<&T>,
-) -> Result<Vec<Vec<&T>>, serde_json::Error> {
+/// Splits items into chunks whose encoded size (plus one separator byte each and the batch
+/// envelope) stays under the batch target. `encoded_len` must return the item's compact JSON size.
+pub(super) fn chunk_by_bytes<T>(
+    items: Vec<T>,
+    encoded_len: impl Fn(&T) -> Result<usize, serde_json::Error>,
+) -> Result<Vec<Vec<T>>, serde_json::Error> {
     let mut chunks = Vec::new();
     let mut chunk = Vec::new();
     let mut bytes = BATCH_ENVELOPE_BYTES;
     for item in items {
-        let item_bytes = serde_json::to_vec(item)?.len().saturating_add(1);
+        let item_bytes = encoded_len(&item)?.saturating_add(1);
         if !chunk.is_empty() && bytes.saturating_add(item_bytes) > MONITORING_BATCH_TARGET_BYTES {
             chunks.push(std::mem::take(&mut chunk));
             bytes = BATCH_ENVELOPE_BYTES;
@@ -416,8 +443,10 @@ pub(crate) struct MonitoringBatch<'a> {
     pub(super) batch_index: u32,
     #[schema(minimum = 1)]
     pub(super) batch_count: u32,
-    pub(super) instances: Vec<&'a MonitoringInstance>,
-    pub(super) install_progress: Vec<&'a InstallProgress>,
+    #[schema(value_type = Vec<MonitoringInstance>)]
+    pub(super) instances: Vec<&'a wire::EncodedRow<MonitoringInstance>>,
+    #[schema(value_type = Vec<InstallProgress>)]
+    pub(super) install_progress: Vec<&'a wire::EncodedRow<InstallProgress>>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -461,8 +490,13 @@ pub(super) async fn send_monitoring_batch(
     batch: &MonitoringBatch<'_>,
     deadline: Instant,
 ) -> Result<(), ()> {
-    let payload = serde_json::to_string(batch).map_err(|error| {
+    // Rows are already encoded; this only writes the envelope and copies row bytes.
+    let mut payload = Vec::with_capacity(MONITORING_BATCH_TARGET_BYTES);
+    serde_json::to_writer(&mut payload, batch).map_err(|error| {
         tracing::warn!(%error, "failed to serialize monitoring batch");
+    })?;
+    let payload = String::from_utf8(payload).map_err(|error| {
+        tracing::warn!(%error, "monitoring batch was not valid UTF-8");
     })?;
     if payload.len() > WEBSOCKET_MAX_MESSAGE_BYTES {
         tracing::warn!(

@@ -41,7 +41,7 @@ pub(crate) mod pools;
 
 mod shared_disk;
 
-use runtime_metrics::{container_cpu_total, cpu_percent_over_wall_time};
+use runtime_metrics::{container_cpu_total, container_memory_usage, cpu_percent_over_wall_time};
 use sampler::{CachedHostCpuUsage, HostCpuSample};
 #[cfg(test)]
 use sampler::{SharedRuntimeUsage, aggregate_managed_usage, summarize_allocations};

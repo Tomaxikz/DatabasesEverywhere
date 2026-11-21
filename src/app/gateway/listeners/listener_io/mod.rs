@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{
+    self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 
 const MYSQL_COM_CHANGE_USER: u8 = 0x11;
 const MYSQL_COM_CREATE_DB: u8 = 0x05;
@@ -14,7 +16,7 @@ const MONGODB_OP_COMPRESSED: i32 = 2012;
 const MONGODB_OP_MSG: i32 = 2013;
 const MONGODB_MAX_CSTRING_BYTES: usize = 1024;
 
-use super::{GatewayStream, ListenerError};
+use super::GatewayStream;
 use crate::{gateway::tunnel, server::monitoring::ActivityCounter};
 
 const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
@@ -48,17 +50,51 @@ impl Drop for ActivitySession {
     }
 }
 
-async fn copy_exact(
-    reader: &mut (impl AsyncRead + Unpin),
-    writer: &mut (impl AsyncWrite + Unpin),
-    bytes: usize,
-    eof: &'static str,
-) -> Result<(), ListenerError> {
-    let mut payload = reader.take(bytes as u64);
-    if io::copy(&mut payload, writer).await? != bytes as u64 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, eof).into());
+const FRAME_READ_AHEAD: usize = 1024;
+const TAIL_CHUNK_BYTES: usize = 8 * 1024;
+
+#[derive(Default)]
+struct FrameBuffers {
+    prefix: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl FrameBuffers {
+    /// Forward the validated prefix immediately, including any bytes of this frame
+    /// already in the reader. Retain the requested body prefix for classification.
+    async fn forward(
+        &mut self,
+        reader: &mut BufReader<impl AsyncRead + Unpin>,
+        writer: &mut (impl AsyncWrite + Unpin),
+        mut remaining: usize,
+        capture: usize,
+        eof: &'static str,
+    ) -> io::Result<&[u8]> {
+        let body_start = self.prefix.len();
+        let capture_end = body_start + capture.min(remaining);
+        let ready = remaining.min(reader.buffer().len());
+        self.prefix.extend_from_slice(&reader.buffer()[..ready]);
+        reader.consume(ready);
+        writer.write_all(&self.prefix).await?;
+        remaining -= ready;
+
+        while remaining > 0 {
+            let chunk = remaining.min(TAIL_CHUNK_BYTES);
+            if self.tail.len() < chunk {
+                self.tail.resize(chunk, 0);
+            }
+            let n = reader.read(&mut self.tail[..chunk]).await?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, eof));
+            }
+            let keep = capture_end.saturating_sub(self.prefix.len()).min(n);
+            self.prefix.extend_from_slice(&self.tail[..keep]);
+            writer.write_all(&self.tail[..n]).await?;
+            remaining -= n;
+        }
+        writer.flush().await?;
+        Ok(&self.prefix[body_start..capture_end])
     }
-    Ok(())
 }
 
 mod classify;
