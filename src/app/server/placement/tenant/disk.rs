@@ -18,6 +18,7 @@ use crate::{
     },
 };
 
+pub(crate) const POOL_ONLY_METHOD: &str = "shared_pool";
 const SOFT_METHOD: &str = "shared_catalog_guard";
 const POSTGRES_TENANT_ROOT: &str = "dbev-tenants";
 const MYSQL_BOUNDARY_MARKER: &str = ".dbev-quota-boundary";
@@ -33,7 +34,8 @@ pub(crate) fn update_state(
     enforcement: &DiskEnforcement,
 ) -> Result<bool, TenantDiskError> {
     check_transition(limits.disk_enforced, enforcement)?;
-    let blocked = *disk_limit_blocked && !enforcement.enforced;
+    let blocked =
+        *disk_limit_blocked && !enforcement.enforced && enforcement.method != POOL_ONLY_METHOD;
     let changed = limits.disk_enforced != enforcement.enforced
         || limits.disk_enforcement_method != enforcement.method
         || *disk_limit_blocked != blocked;
@@ -41,6 +43,10 @@ pub(crate) fn update_state(
     limits.disk_enforcement_method = enforcement.method.clone();
     *disk_limit_blocked = blocked;
     Ok(changed)
+}
+
+pub(crate) fn uses_catalog_guard(limits: &InstanceLimits) -> bool {
+    !limits.disk_enforced && limits.disk_enforcement_method != POOL_ONLY_METHOD
 }
 
 pub(crate) fn check_transition(
@@ -105,7 +111,7 @@ pub(crate) async fn prepare(
     if live.path != boundary.path {
         require_dir_chain(&boundary.root, &boundary.path).await?;
     }
-    set_boundary_limit(config, &boundary, disk_mib).await?;
+    set_boundary_limit(config, runtime.protocol, &boundary, disk_mib).await?;
 
     let output = postgres_sql(
         docker,
@@ -170,7 +176,7 @@ pub(crate) async fn set_limit(
         }
         None => return Err(TenantDiskError::Unsupported(runtime.protocol)),
     };
-    set_boundary_limit(config, &boundary, disk_mib).await
+    set_boundary_limit(config, runtime.protocol, &boundary, disk_mib).await
 }
 
 /// Kernel project-quota counter for a hard-enforced tenant, without traversing files; soft/catalog-only layouts are rejected.
@@ -318,17 +324,28 @@ fn live_boundary_for_method(
 
 async fn set_boundary_limit(
     config: &Config,
+    protocol: Protocol,
     boundary: &Boundary,
     disk_mib: u64,
 ) -> Result<DiskEnforcement, TenantDiskError> {
-    create_real_dir(&project_registry_root(config)).await?;
-    let enforcement = limiter(config)
-        .apply_path_quota(
-            &boundary.owner,
-            &boundary.path,
-            &project_registry_root(config),
-            disk_mib,
-        )
+    let registry = project_registry_root(config);
+    create_real_dir(&registry).await?;
+    let limiter = limiter(config);
+    // Keep existing and interrupted project assignments until the tenant is migrated.
+    // New MariaDB schemas inherit the pool's project ID.
+    if protocol == Protocol::Mariadb
+        && !limiter
+            .has_path_quota_claim(&boundary.owner, &registry)
+            .await?
+    {
+        return Ok(DiskEnforcement {
+            enforced: false,
+            method: POOL_ONLY_METHOD.into(),
+            container_data_path: None,
+        });
+    }
+    let enforcement = limiter
+        .apply_path_quota(&boundary.owner, &boundary.path, &registry, disk_mib)
         .await?;
     if !enforcement.enforced {
         return Ok(soft_enforcement());

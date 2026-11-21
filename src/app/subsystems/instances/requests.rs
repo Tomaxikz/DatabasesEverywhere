@@ -58,7 +58,7 @@ pub struct CreateInstanceRequest {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[schema(
-    description = "Dedicated requests require positive CPU and memory. Shared create/resize accepts disk_mib only; CPU and memory are configured on the parent pool."
+    description = "Dedicated requests require positive CPU and memory. Shared requests accept disk_mib only. The parent pool supplies CPU and memory. For new shared MariaDB tenants, disk_mib reserves capacity and writes can grow up to the pool limit."
 )]
 pub struct LimitsRequest {
     #[serde(default)]

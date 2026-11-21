@@ -426,7 +426,7 @@ jobs:
         run: bash .github/ci/project-quota-smoke.sh all
 
   project_quota_engines:
-    name: ${{ matrix.protocol }} on real XFS + ext4 tenant quotas
+    name: ${{ matrix.protocol }} disk quotas on XFS and ext4
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     needs: global_lint

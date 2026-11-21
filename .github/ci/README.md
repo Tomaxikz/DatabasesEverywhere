@@ -168,6 +168,8 @@ adoption, isolation, accounting, exhaustion, resize, and cleanup, temporarily
 backing up/restoring XFS project files. Optional `f2fs` needs kernel support
 and `f2fs-tools`; use `all` for every backend.
 
+Shared MariaDB uses the pool disk budget. Tenant disk sizes reserve capacity for placement. New tenants can grow beyond their reservation, and a full pool affects every tenant. Existing native tenant quotas keep their enforcement and separate allocation until the tenant is migrated to a fresh pool. The MariaDB engine checks verify that tenant growth is charged to the pool on both XFS and ext4.
+
 ## Rootless Podman smoke
 
 The `podman_smoke` job in [CI](../workflows/ci.yml) (named "Rootless Podman

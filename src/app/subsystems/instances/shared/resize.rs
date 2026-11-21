@@ -59,7 +59,8 @@ pub(in super::super) async fn resize(
             "the shared database runtime is not available".to_string(),
         ));
     }
-    let disk_shrinks = requested.disk_mib < previous_limits.disk_mib;
+    let disk_shrinks = requested.disk_mib < previous_limits.disk_mib
+        && previous_limits.disk_enforcement_method != tenant::disk::POOL_ONLY_METHOD;
     let disk_mutation = requested.disk_mib != previous_limits.disk_mib;
     let was_open = route_was_open(
         &metadata,
@@ -151,7 +152,7 @@ pub(in super::super) async fn resize(
                 )));
             }
         }
-        if !requested.disk_enforced
+        if tenant::disk::uses_catalog_guard(&requested)
             && measured_usage.is_some_and(|used| used >= mib_to_bytes(requested.disk_mib))
         {
             let restored = restore_access(state, &previous_runtime, &metadata, was_open).await;
@@ -270,7 +271,7 @@ pub(in super::super) async fn resize(
         }
     };
     updated.limits = requested;
-    if updated.limits.disk_enforced {
+    if !tenant::disk::uses_catalog_guard(&updated.limits) {
         updated.disk_limit_blocked = false;
     }
     updated.updated_at = now_rfc3339();
@@ -355,7 +356,7 @@ pub(super) async fn rollback_resize(
         }
     };
     restored_metadata.limits = restored_limits.clone();
-    if restored_metadata.limits.disk_enforced {
+    if !tenant::disk::uses_catalog_guard(&restored_metadata.limits) {
         restored_metadata.disk_limit_blocked = false;
     }
     restored_metadata.updated_at = now_rfc3339();

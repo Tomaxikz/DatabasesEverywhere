@@ -80,9 +80,7 @@ async fn clickhouse_shared_pool_enforces_two_tenant_lifecycle_isolation() {
     }
 }
 
-/// Runs a real shared SQL engine with its tenant directories on a native
-/// project-quota filesystem. The privileged quota workflow selects one of the
-/// three hard-capable protocols through `DBE_PROJECT_QUOTA_ENGINE_PROTOCOL`.
+/// Verifies native tenant quotas for PostgreSQL/MySQL and pool accounting for MariaDB.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires root, Docker, and an XFS/ext4 project-quota test root"]
 async fn real_shared_engine_project_quota_enforces_tenant_writes() {
@@ -115,7 +113,7 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
 
     let pool = SharedPool::start_on_project_quota(protocol, root).await;
     let limits = InstanceLimits {
-        disk_mib: 48,
+        disk_mib: if protocol == Protocol::Mariadb { 4 } else { 48 },
         ..InstanceLimits::default()
     };
     let tenant_a = TenantTarget {
@@ -130,10 +128,15 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
         let enforcement = create_managed_tenant(&pool, target, password, &limits)
             .await
             .expect("provision a tenant with the production quota path");
-        assert!(
-            enforcement.enforced,
-            "{protocol} unexpectedly fell back to soft tenant enforcement"
-        );
+        if protocol == Protocol::Mariadb {
+            assert!(!enforcement.enforced);
+            assert_eq!(enforcement.method, disk::POOL_ONLY_METHOD);
+        } else {
+            assert!(
+                enforcement.enforced,
+                "{protocol} unexpectedly fell back to soft tenant enforcement"
+            );
+        }
     }
 
     assert_ok(
@@ -147,75 +150,13 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
         .await,
         "create tenant A quota probe table",
     );
-    let mut committed_rows = 0;
-    let mut quota_hit = false;
-    for _ in 0..96 {
-        match run_as(
-            &pool,
-            tenant_a,
-            PASSWORD_A,
-            DATABASE_A,
-            quota_insert_sql(protocol),
-        )
-        .await
-        {
-            Ok(_) => committed_rows += 1,
-            Err(DockerError::ExecFailed {
-                exit_code,
-                failure_output,
-                ..
-            }) => {
-                assert!(
-                    !matches!(exit_code, 126 | 127),
-                    "the tenant client command was unavailable"
-                );
-                if protocol == Protocol::Mariadb {
-                    assert!(
-                        failure_output.lines().any(|line| {
-                            line.starts_with("ERROR 1114 ") || line.starts_with("ERROR 1021 ")
-                        }),
-                        "expected a MariaDB table-full or disk-full error: {failure_output}"
-                    );
-                }
-                quota_hit = true;
-                break;
-            }
-            Err(error) => panic!("tenant A quota write failed outside the engine: {error}"),
-        }
+    if protocol == Protocol::Mariadb {
+        verify_mariadb_pool_accounting(&pool, tenant_a, limits.disk_mib).await;
+    } else {
+        verify_tenant_hard_cap(&pool, tenant_a).await;
     }
-    assert!(
-        quota_hit,
-        "{protocol} accepted writes beyond the 48 MiB tenant quota"
-    );
-    let used = disk::quota_usage_bytes(&pool.config, &pool.runtime, tenant_a)
-        .await
-        .expect("read the hard tenant quota counter");
-    assert!(
-        used >= 32 * 1024 * 1024,
-        "{protocol} reported only {used} bytes when the engine hit its quota"
-    );
-    let rows = assert_ok(
-        run_as(
-            &pool,
-            tenant_a,
-            PASSWORD_A,
-            DATABASE_A,
-            "SELECT COUNT(*) FROM quota_fill",
-        )
-        .await,
-        "read tenant A after the failed write",
-    );
-    assert!(
-        committed_rows > 0,
-        "expected a committed row before reaching quota"
-    );
-    assert_eq!(
-        rows.stdout.trim(),
-        committed_rows.to_string(),
-        "quota rollback changed committed rows"
-    );
 
-    // A full tenant must not consume another tenant's independent project.
+    // The second tenant must stay writable throughout the first tenant’s lifecycle.
     assert_ok(
         run_as(
             &pool,
@@ -236,12 +177,12 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
             quota_insert_sql(protocol),
         )
         .await,
-        "tenant B write after tenant A reached quota",
+        "tenant B write after tenant A quota check",
     );
 
     drop_managed_tenant(&pool, tenant_a)
         .await
-        .expect("remove a full tenant through the production teardown path");
+        .expect("remove tenant A through the production teardown path");
     assert_ok(
         run_as(
             &pool,
@@ -256,6 +197,115 @@ async fn real_shared_engine_project_quota_enforces_tenant_writes() {
     drop_managed_tenant(&pool, tenant_b)
         .await
         .expect("remove tenant B during test cleanup");
+}
+
+async fn verify_mariadb_pool_accounting(
+    pool: &SharedPool,
+    tenant: TenantTarget<'_>,
+    reservation_mib: u64,
+) {
+    let root = PathBuf::from(pool.config.paths.volumes_root());
+    let owner = &pool.runtime.runtime_id;
+    let data = root.join(owner);
+    let limiter = crate::server::disk::DiskLimiter::new(pool.config.disk.clone());
+    let before = limiter
+        .path_quota_usage_bytes(owner, &data, &root)
+        .await
+        .expect("read pool usage");
+    for _ in 0..8 {
+        assert_ok(
+            run_as(
+                pool,
+                tenant,
+                PASSWORD_A,
+                DATABASE_A,
+                quota_insert_sql(Protocol::Mariadb),
+            )
+            .await,
+            "write beyond tenant reservation",
+        );
+    }
+    let rows = assert_ok(
+        run_as(
+            pool,
+            tenant,
+            PASSWORD_A,
+            DATABASE_A,
+            "SELECT SUM(OCTET_LENGTH(payload)) FROM quota_fill",
+        )
+        .await,
+        "read committed tenant payloads",
+    );
+    assert!(
+        rows.stdout.trim().parse::<u64>().expect("payload bytes") > reservation_mib * 1024 * 1024
+    );
+    let after = limiter
+        .path_quota_usage_bytes(owner, &data, &root)
+        .await
+        .expect("read pool usage after writes");
+    assert!(
+        after > before + reservation_mib * 1024 * 1024,
+        "tenant growth must be charged to the pool: {before} -> {after}"
+    );
+}
+
+async fn verify_tenant_hard_cap(pool: &SharedPool, tenant_a: TenantTarget<'_>) {
+    let protocol = pool.runtime.protocol;
+    let mut committed_rows = 0;
+    let mut quota_hit = false;
+    for _ in 0..96 {
+        match run_as(
+            pool,
+            tenant_a,
+            PASSWORD_A,
+            DATABASE_A,
+            quota_insert_sql(protocol),
+        )
+        .await
+        {
+            Ok(_) => committed_rows += 1,
+            Err(DockerError::ExecFailed { exit_code, .. }) => {
+                assert!(
+                    !matches!(exit_code, 126 | 127),
+                    "the tenant client command was unavailable"
+                );
+                quota_hit = true;
+                break;
+            }
+            Err(error) => panic!("tenant A quota write failed outside the engine: {error}"),
+        }
+    }
+    assert!(
+        quota_hit,
+        "{protocol} accepted writes beyond the 48 MiB tenant quota"
+    );
+    let used = disk::quota_usage_bytes(&pool.config, &pool.runtime, tenant_a)
+        .await
+        .expect("read the hard tenant quota counter");
+    assert!(
+        used >= 32 * 1024 * 1024,
+        "{protocol} reported only {used} bytes when the engine hit its quota"
+    );
+    let rows = assert_ok(
+        run_as(
+            pool,
+            tenant_a,
+            PASSWORD_A,
+            DATABASE_A,
+            "SELECT COUNT(*) FROM quota_fill",
+        )
+        .await,
+        "read tenant A after the failed write",
+    );
+    assert!(
+        committed_rows > 0,
+        "expected a committed row before reaching quota"
+    );
+    assert_eq!(
+        rows.stdout.trim(),
+        committed_rows.to_string(),
+        "quota rollback changed committed rows"
+    );
 }
 
 async fn exercise_two_tenant_pool(protocol: Protocol) {
@@ -1022,15 +1072,27 @@ impl SharedPool {
             disk,
             ..Config::default()
         };
+        let container_name = docker
+            .container_name(protocol, &runtime_id)
+            .expect("derive the managed test container name");
+        let mut runtime = runtime(protocol, &runtime_id, image, &container_name, &paths);
+        if protocol == Protocol::Mariadb && config.disk.mode == DiskLimitMode::ProjectQuota {
+            runtime.limits.disk_mib = 1024;
+            let limiter = crate::server::disk::DiskLimiter::new(config.disk.clone());
+            assert!(
+                limiter
+                    .apply_instance_limit(&runtime_id, &paths.data, runtime.limits.disk_mib)
+                    .await
+                    .expect("apply real MariaDB pool quota")
+                    .enforced
+            );
+        }
         let mut spec = shared_spec(protocol, &runtime_id, image, &paths, &root).await;
         spec.user = Some(
             prepare_instance_container_user(&docker, &paths, protocol)
                 .await
                 .expect("prepare shared-pool bind-mount ownership"),
         );
-        let container_name = docker
-            .container_name(protocol, &runtime_id)
-            .expect("derive the managed test container name");
         docker
             .create(&spec)
             .await
@@ -1038,7 +1100,7 @@ impl SharedPool {
 
         let pool = Self {
             config,
-            runtime: runtime(protocol, &runtime_id, image, &container_name, &paths),
+            runtime,
             docker,
             container_name,
             _temp_root: temp_root,

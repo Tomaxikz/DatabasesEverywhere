@@ -294,7 +294,7 @@ paths:
       tags:
       - instances
       summary: Update CPU, memory, and disk limits for an instance.
-      description: Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. They never resize pool CPU/RAM/disk. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.
+      description: Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. For shared MariaDB tenants using shared_pool, the reservation can be reduced below current usage. For tenants with individual limits, a decrease briefly fences and drains the tenant and returns 409 if existing data exceeds the requested limit.
       operationId: update_instance_limits
       parameters:
       - name: instance_id
@@ -3551,7 +3551,7 @@ components:
       additionalProperties: false
     LimitsRequest:
       type: object
-      description: Dedicated requests require positive CPU and memory. Shared create/resize accepts disk_mib only; CPU and memory are configured on the parent pool.
+      description: Dedicated requests require positive CPU and memory. Shared requests accept disk_mib only. The parent pool supplies CPU and memory. For new shared MariaDB tenants, disk_mib reserves capacity and writes can grow up to the pool limit.
       required:
       - disk_mib
       properties:

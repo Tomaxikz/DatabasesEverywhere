@@ -173,7 +173,7 @@ jobs:
       - name: Run locked release checks
         run: bash .github/ci/check.sh pre-push
 
-      - name: Verify shared MariaDB hard quotas before publication
+      - name: Verify MariaDB pool disk accounting on XFS and ext4
         env:
           DBE_PROJECT_QUOTA_TEST_TIMEOUT: 12m
         run: |

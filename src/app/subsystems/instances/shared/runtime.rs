@@ -123,7 +123,7 @@ pub(super) async fn ensure_soft_start_allowed(
     runtime: &EngineRuntime,
     metadata: &mut InstanceMetadata,
 ) -> Result<(), SharedLifecycleError> {
-    if metadata.limits.disk_enforced {
+    if !tenant::disk::uses_catalog_guard(&metadata.limits) {
         return Ok(());
     }
     let used_bytes = measure_tenant_usage(state, runtime, metadata).await?;

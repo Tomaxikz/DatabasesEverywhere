@@ -319,7 +319,7 @@ async fn admit_soft_tenants(
 ) -> anyhow::Result<Vec<InstanceMetadata>> {
     let (mut ready, soft): (Vec<_>, Vec<_>) = tenants
         .into_iter()
-        .partition(|metadata| metadata.limits.disk_enforced);
+        .partition(|metadata| !tenant::disk::uses_catalog_guard(&metadata.limits));
     if soft.is_empty() {
         return Ok(ready);
     }

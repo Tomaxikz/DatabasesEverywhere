@@ -172,7 +172,7 @@ pub(crate) async fn resource_report(
         .await;
     let soft_enforcement = metadata.limits.disk_enforcement_method == "soft_scanner";
     let shared_soft_guard =
-        shared_disk::uses_soft_guard(metadata.deployment_mode, metadata.limits.disk_enforced);
+        shared_disk::uses_soft_guard(metadata.deployment_mode, &metadata.limits);
     let scanner_active = super::disk::uses_dedicated_scanner(metadata);
     let (scanner, disk_used) = if shared {
         // Telemetry must not make a stopped/unmeasurable tenant unlistable.

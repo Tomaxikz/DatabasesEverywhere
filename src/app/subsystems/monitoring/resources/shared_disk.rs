@@ -19,8 +19,11 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 const SAMPLE_CONCURRENCY: usize = 4;
 const HARD_SAMPLE_CONCURRENCY: usize = 16;
 
-pub(super) fn uses_soft_guard(deployment_mode: DeploymentMode, disk_enforced: bool) -> bool {
-    deployment_mode == DeploymentMode::Shared && !disk_enforced
+pub(super) fn uses_soft_guard(
+    deployment_mode: DeploymentMode,
+    limits: &crate::utils::limits::InstanceLimits,
+) -> bool {
+    deployment_mode == DeploymentMode::Shared && tenant::disk::uses_catalog_guard(limits)
 }
 
 pub(super) async fn reported_disk_used_bytes<F, Fut>(
@@ -378,7 +381,7 @@ async fn enforce_quota_locked(state: &AppState, snapshot: &InstanceMetadata, use
         return;
     };
     if metadata.deployment_mode != DeploymentMode::Shared
-        || !uses_soft_guard(metadata.deployment_mode, metadata.limits.disk_enforced)
+        || !uses_soft_guard(metadata.deployment_mode, &metadata.limits)
         || metadata.runtime_id() != runtime_id
         || metadata.protocol != snapshot.protocol
         || metadata.created_at != snapshot.created_at
@@ -530,7 +533,7 @@ async fn fence_unmeasured_runtime(state: &AppState, runtime_id: &str, reason: &s
         .await
         .into_iter()
         .filter(|metadata| {
-            !metadata.limits.disk_enforced
+            tenant::disk::uses_catalog_guard(&metadata.limits)
                 && metadata.status == InstanceStatus::Running
                 && metadata.desired_state == DesiredInstanceState::Running
         })
@@ -671,9 +674,16 @@ mod tests {
 
     #[test]
     fn hard_shared_quotas_do_not_use_the_soft_guard() {
-        assert!(uses_soft_guard(DeploymentMode::Shared, false));
-        assert!(!uses_soft_guard(DeploymentMode::Shared, true));
-        assert!(!uses_soft_guard(DeploymentMode::Dedicated, false));
+        let mut limits = crate::utils::limits::InstanceLimits {
+            disk_enforced: false,
+            ..Default::default()
+        };
+        assert!(uses_soft_guard(DeploymentMode::Shared, &limits));
+        limits.disk_enforcement_method = tenant::disk::POOL_ONLY_METHOD.into();
+        assert!(!uses_soft_guard(DeploymentMode::Shared, &limits));
+        limits.disk_enforced = true;
+        assert!(!uses_soft_guard(DeploymentMode::Shared, &limits));
+        assert!(!uses_soft_guard(DeploymentMode::Dedicated, &limits));
     }
 
     #[test]

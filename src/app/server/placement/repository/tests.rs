@@ -229,6 +229,42 @@ async fn root_disk_capacity_counts_only_soft_and_unattached_tenants() -> anyhow:
 }
 
 #[tokio::test]
+async fn mariadb_root_uses_full_pool_except_for_legacy_child_projects() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = sqlite::connect(dir.path()).await?;
+    let placements = PlacementRepository::new(db.clone());
+    let instances = InstanceRepository::new(db);
+    let id = "maria_pool";
+    let mut runtime = shared_runtime(id, 4);
+    runtime.protocol = Protocol::Mariadb;
+    runtime.image = "mariadb:12.3.2".into();
+    placements.save(&runtime).await?;
+    let capacity = runtime.limits.disk_mib;
+    assert_eq!(placements.root_charged_disk_mib(id).await?, capacity);
+
+    let mut tenant = shared_instance("tenant_a", id, "db_a", "user_a", 13306);
+    tenant.protocol = Protocol::Mariadb;
+    placements
+        .reserve(metadata_reservation(id, &tenant))
+        .await?;
+    placements.mark_provisioned(&tenant.instance_id).await?;
+    tenant.limits.disk_enforced = false;
+    tenant.limits.disk_enforcement_method =
+        crate::server::placement::tenant::disk::POOL_ONLY_METHOD.into();
+    instances.upsert(&tenant).await?;
+    assert_eq!(placements.root_charged_disk_mib(id).await?, capacity);
+
+    tenant.limits.disk_enforced = true;
+    tenant.limits.disk_enforcement_method = "host_xfs_project_quota".into();
+    instances.upsert(&tenant).await?;
+    assert_eq!(
+        placements.root_charged_disk_mib(id).await?,
+        capacity - tenant.limits.disk_mib
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn spill_cap_survives_provision_resize_recovery_and_delete() -> anyhow::Result<()> {
     use anyhow::Context as _;
 

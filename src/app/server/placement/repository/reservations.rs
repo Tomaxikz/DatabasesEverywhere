@@ -102,15 +102,15 @@ impl PlacementRepository {
         }
     }
 
-    /// Shared-pool capacity still charged to the pool root: hard-quota tenants contribute only the pooled spill reserve,
-    /// while missing or soft tenant metadata counts in full.
+    /// Computes the root project's limit after accounting for separate tenant projects.
+    /// MariaDB shares the entire remaining pool capacity across its schemas.
     pub async fn root_charged_disk_mib(
         &self,
         runtime_id: &str,
     ) -> Result<u64, PlacementRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT runtime.protocol,
+            SELECT runtime.protocol, runtime.limit_disk_mib,
                    COALESCE(SUM(reservation.disk_mib), 0) AS tenant_disk_mib,
                    COALESCE(SUM(
                        CASE
@@ -149,6 +149,19 @@ impl PlacementRepository {
             "root_charged_disk_mib",
         )?;
         let all_tenant_disk = i64_to_u64(row.try_get("tenant_disk_mib")?, "tenant_disk_mib")?;
+        if protocol == crate::databases::protocol::Protocol::Mariadb {
+            // Older tenants can still own separate filesystem projects. Keep their
+            // reservations outside the root project until explicitly migrated.
+            let capacity = i64_to_u64(row.try_get("limit_disk_mib")?, "limit_disk_mib")?;
+            return capacity
+                .checked_sub(all_tenant_disk - root_charged_tenant_disk)
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| {
+                    PlacementRepositoryError::InvalidReservation(
+                        "legacy tenant quotas exceed MariaDB pool capacity".into(),
+                    )
+                });
+        }
         let overhead = crate::server::placement::policy::engine_disk_overhead(protocol)
             .ok_or(PlacementError::UnsupportedSharedProtocol(protocol))?;
         let spill = crate::server::placement::policy::root_spill_mib(protocol, all_tenant_disk)

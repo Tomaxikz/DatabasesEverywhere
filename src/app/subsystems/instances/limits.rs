@@ -23,7 +23,7 @@ use axum::extract::State;
     path = "/api/instances/{instance_id}/limits",
     tag = "instances",
     summary = "Update CPU, memory, and disk limits for an instance.",
-    description = "Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. They never resize pool CPU/RAM/disk. A shared disk decrease briefly fences and drains the tenant, measures its physical usage, and returns 409 without changing the limit when existing data does not fit.",
+    description = "Dedicated limits apply to the owned runtime. Shared requests accept disk_mib only and update the tenant's disk reservation within the existing fixed pool budget. For shared MariaDB tenants using shared_pool, the reservation can be reduced below current usage. For tenants with individual limits, a decrease briefly fences and drains the tenant and returns 409 if existing data exceeds the requested limit.",
     extensions(("x-required-scope" = json!(scopes::INSTANCES_WRITE))),
     params(("instance_id" = String, Path)),
     request_body = LimitsRequest,

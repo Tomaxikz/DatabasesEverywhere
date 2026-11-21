@@ -13,6 +13,18 @@ use super::{
 };
 
 impl DiskLimiter {
+    pub(crate) async fn has_path_quota_claim(
+        &self,
+        owner: &str,
+        registry: &Path,
+    ) -> Result<bool, DiskLimitError> {
+        Ok(
+            project_id::find_claim_in(owner, registry, self.config.project_id_base)
+                .await?
+                .is_some_and(|claim| claim.state != project_id::ProjectIdState::Released),
+        )
+    }
+
     /// Adopts a shared tenant directory into a native project and applies its hard limit.
     /// ext4/F2FS reject symlinks, special files and nested mounts rather than leave uncharged data.
     pub(crate) async fn apply_path_quota(
