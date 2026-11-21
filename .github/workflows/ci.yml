@@ -221,6 +221,16 @@ jobs:
             }
           done
 
+      # The JDBC smoke test resolves its drivers with Maven. Without this cache
+      # every job downloads them from Maven Central, which throttles runners.
+      - name: Cache Maven artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-jdbc-${{ hashFiles('tests/real_drivers/mysql/pom.xml') }}-${{ matrix.connector }}
+          restore-keys: |
+            maven-jdbc-${{ hashFiles('tests/real_drivers/mysql/pom.xml') }}-
+
       - name: Compile the compatibility test
         run: cargo test --locked --lib --no-run
 

@@ -33,6 +33,7 @@ async fn auth(state: &crate::routes::http::router::AppState) -> ApiRequestContex
 async fn issued_pool_tokens_bind_owner_generation_and_scope() {
     let (state, _dir) = test_support::database(Config {
         token_id: "test-panel".into(),
+        jwt_signing_key: "test-jwt-signing-key-0123456789abcdef-02".into(),
         ..Default::default()
     })
     .await;
