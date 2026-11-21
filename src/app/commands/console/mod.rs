@@ -98,9 +98,18 @@ async fn event_loop(
     config: Arc<Config>,
     client: ApiClient,
     system: api::SystemInfo,
-    settings: ConsoleSettings,
+    (settings, ignored): (ConsoleSettings, Vec<String>),
 ) -> anyhow::Result<()> {
     let mut app = App::new(client.base_url().to_string());
+    if !ignored.is_empty() {
+        app.say(
+            app::Level::Info,
+            format!(
+                "Ignored unknown console.yml settings: {}",
+                ignored.join(", ")
+            ),
+        );
+    }
     app.public_host = settings.public_host;
     app.gateway_ports = app::standalone_gateway_ports(&config);
     let (sender, mut outcomes) = mpsc::unbounded_channel();

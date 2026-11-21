@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 const FILE_NAME: &str = "console.yml";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(super) struct ConsoleSettings {
     pub public_host: String,
 }
@@ -22,11 +22,16 @@ impl ConsoleSettings {
     }
 
     /// Only a convenience: a missing or unreadable file means no defaults.
-    pub(super) fn load(config_path: &Path) -> Self {
-        std::fs::read_to_string(Self::path(config_path))
-            .ok()
-            .and_then(|text| yaml_serde::from_str(&text).ok())
-            .unwrap_or_default()
+    pub(super) fn load(config_path: &Path) -> (Self, Vec<String>) {
+        let Ok(text) = std::fs::read_to_string(Self::path(config_path)) else {
+            return Default::default();
+        };
+        let mut ignored = Vec::new();
+        let settings =
+            serde_ignored::deserialize(yaml_serde::Deserializer::from_str(&text), |key| {
+                ignored.push(key.to_string());
+            });
+        (settings.unwrap_or_default(), ignored)
     }
 
     pub(super) fn to_yaml(&self) -> anyhow::Result<String> {
@@ -45,15 +50,29 @@ mod tests {
     fn settings_roundtrip_next_to_the_config_and_tolerate_absence() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.yml");
-        assert_eq!(ConsoleSettings::load(&config), ConsoleSettings::default());
+        assert_eq!(ConsoleSettings::load(&config), Default::default());
         let settings = ConsoleSettings {
             public_host: "db.example.com".to_string(),
         };
         std::fs::write(ConsoleSettings::path(&config), settings.to_yaml().unwrap()).unwrap();
-        assert_eq!(ConsoleSettings::load(&config), settings);
+        assert_eq!(ConsoleSettings::load(&config), (settings, vec![]));
         assert_eq!(
             ConsoleSettings::path(&config),
             directory.path().join("console.yml")
         );
+    }
+
+    #[test]
+    fn unknown_console_fields_report_only_keys_and_preserve_known_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yml");
+        std::fs::write(
+            ConsoleSettings::path(&path),
+            "public_host: db.example.com\npubic_host: example-secret\n",
+        )
+        .unwrap();
+        let (settings, ignored) = ConsoleSettings::load(&path);
+        assert_eq!(settings.public_host, "db.example.com");
+        assert_eq!(ignored, ["pubic_host"]);
     }
 }

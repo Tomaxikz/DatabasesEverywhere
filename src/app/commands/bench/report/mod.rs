@@ -117,14 +117,16 @@ pub(super) async fn write_reports(
     };
     let json = serde_json::to_vec_pretty(report).context("failed to serialize benchmark report")?;
     let markdown = markdown_report(report);
-    let request_csv = request_samples_csv(request_samples);
-    let resource_csv = resource_samples_csv(resource_samples);
+    let request_csv =
+        request_samples_csv(request_samples).context("failed to encode request samples")?;
+    let resource_csv =
+        resource_samples_csv(resource_samples).context("failed to encode resource samples")?;
     let diagnostics = diagnostics_log(report);
 
     write_private(&paths.json, &json).await?;
     write_private(&paths.markdown, markdown.as_bytes()).await?;
-    write_private(&paths.request_samples, request_csv.as_bytes()).await?;
-    write_private(&paths.resource_samples, resource_csv.as_bytes()).await?;
+    write_private(&paths.request_samples, &request_csv).await?;
+    write_private(&paths.resource_samples, &resource_csv).await?;
     write_private(&paths.diagnostics, diagnostics.as_bytes()).await?;
     Ok(paths)
 }

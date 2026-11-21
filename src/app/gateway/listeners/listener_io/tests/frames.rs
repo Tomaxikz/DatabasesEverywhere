@@ -4,6 +4,9 @@ use std::{
     time::Duration,
 };
 
+use proptest::prelude::*;
+use tokio_util::io::StreamReader;
+
 use super::*;
 use crate::gateway::{
     listeners::listener_io::mysql::{INLINE_SQL_BYTES, MAX_SQL_SCANS, SQL_SCAN_SLOTS},
@@ -53,6 +56,72 @@ impl AsyncWrite for Writes {
     }
 }
 
+async fn forward_frames(
+    protocol: Protocol,
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    backend: impl AsyncRead + AsyncWrite + Unpin,
+    activity: Arc<ActivityCounter>,
+) -> Result<(), ListenerError> {
+    match protocol {
+        Protocol::Postgres => proxy_postgres_session(client, backend, activity).await,
+        Protocol::Mongodb => proxy_mongodb_session(client, backend, activity).await,
+        Protocol::Mysql | Protocol::Mariadb => {
+            proxy_mysql_session(
+                client,
+                backend,
+                protocol,
+                protocol == Protocol::Mariadb,
+                activity,
+                Default::default(),
+            )
+            .await
+        }
+        _ => unreachable!("test only exercises framed protocols"),
+    }
+}
+
+fn read_query_frame(protocol: Protocol, value: u16) -> Vec<u8> {
+    match protocol {
+        Protocol::Postgres => postgres_frame(b'Q', format!("SELECT {value}\0").as_bytes()),
+        Protocol::Mysql | Protocol::Mariadb => {
+            mysql_packet(0, format!("\x03SELECT {value}").as_bytes())
+        }
+        Protocol::Mongodb => {
+            mongodb_message(bson::doc! { "find": "items", "limit": i32::from(value) })
+        }
+        _ => unreachable!("test only exercises framed protocols"),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn fragmented_frames_preserve_payload_and_order(
+        values in prop::collection::vec(any::<u16>(), 1..6),
+        chunk_sizes in prop::collection::vec(1usize..32, 1..16),
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        for protocol in [Protocol::Postgres, Protocol::Mysql, Protocol::Mariadb, Protocol::Mongodb] {
+            let frames: Vec<u8> = values.iter().flat_map(|&v| read_query_frame(protocol, v)).collect();
+            let mut remaining = frames.as_slice();
+            let chunks = chunk_sizes.iter().cycle().map_while(|&size| {
+                if remaining.is_empty() {
+                    return None;
+                }
+                let (chunk, rest) = remaining.split_at(size.min(remaining.len()));
+                remaining = rest;
+                Some(Ok::<_, io::Error>(chunk))
+            });
+            let client = io::join(StreamReader::new(futures::stream::iter(chunks)), io::sink());
+            let mut backend = io::join(io::empty(), Vec::new());
+            let activity = activity();
+            runtime.block_on(forward_frames(protocol, client, &mut backend, activity.clone())).unwrap();
+            prop_assert_eq!(backend.writer(), &frames, "protocol {}", protocol);
+            prop_assert_eq!(activity.snapshot().accepted.read, values.len() as u64);
+        }
+    }
+}
+
 #[tokio::test]
 async fn small_pipelined_frames_share_a_read_and_each_use_one_backend_write() {
     for (protocol, frame) in [
@@ -74,26 +143,9 @@ async fn small_pipelined_frames_share_a_read_and_each_use_one_backend_write() {
         );
         let mut backend = io::join(io::empty(), Writes::default());
         let activity = activity();
-        match protocol {
-            Protocol::Postgres => {
-                proxy_postgres_session(&mut client, &mut backend, activity.clone()).await
-            }
-            Protocol::Mongodb => {
-                proxy_mongodb_session(&mut client, &mut backend, activity.clone()).await
-            }
-            _ => {
-                proxy_mysql_session(
-                    &mut client,
-                    &mut backend,
-                    protocol,
-                    protocol == Protocol::Mariadb,
-                    activity.clone(),
-                    Default::default(),
-                )
-                .await
-            }
-        }
-        .unwrap();
+        forward_frames(protocol, &mut client, &mut backend, activity.clone())
+            .await
+            .unwrap();
         assert_eq!(client.reader().reads, 1, "{protocol}");
         assert_eq!(backend.writer().0, [frame.clone(), frame], "{protocol}");
         assert_eq!(activity.snapshot().accepted.read, 2);

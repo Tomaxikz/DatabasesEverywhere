@@ -272,7 +272,7 @@ impl App {
         }
     }
 
-    fn say(&mut self, level: Level, text: impl Into<String>) {
+    pub(super) fn say(&mut self, level: Level, text: impl Into<String>) {
         self.message = Some(Message {
             level,
             text: text.into(),

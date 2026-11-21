@@ -1,5 +1,5 @@
 use super::{
-    csv::csv_field,
+    csv::{request_samples_csv, resource_samples_csv},
     markdown::write_recommendation_row,
     reserve_report_directory,
     terminal::{
@@ -10,10 +10,45 @@ use super::{
 };
 
 #[test]
-fn csv_fields_escape_delimiters_and_quotes() {
-    assert_eq!(csv_field("plain"), "plain");
-    assert_eq!(csv_field("a,b"), "\"a,b\"");
-    assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+fn request_csv_preserves_quoting_precision_and_empty_fields() {
+    let sample = crate::commands::bench::metrics::RequestSample {
+        phase: "test".into(),
+        target: "a,b".into(),
+        index: 7,
+        duration_micros: 1234,
+        status_code: None,
+        success: false,
+        error: Some("a\"b\r\nc".into()),
+    };
+    let header = "phase,target,index,duration_micros,duration_ms,status_code,success,error\n";
+    assert_eq!(request_samples_csv(&[]).unwrap(), header.as_bytes());
+    assert_eq!(
+        request_samples_csv(&[sample]).unwrap(),
+        format!("{header}test,\"a,b\",7,1234,1.234,,false,\"a\"\"b\r\nc\"\n").as_bytes()
+    );
+}
+
+#[test]
+fn resource_csv_preserves_decimal_precision_and_optional_columns() {
+    let sample = crate::commands::bench::metrics::ResourceSample {
+        elapsed_ms: 17,
+        phase: "steady".into(),
+        daemon_cpu_percent: Some(1.25),
+        daemon_rss_bytes: Some(4096),
+        benchmark_cpu_percent: None,
+        benchmark_rss_bytes: None,
+        instance_id: Some("db,1".into()),
+        instance_protocol: Some("mysql".into()),
+        instance_sample_failed: false,
+        instance_cpu_percent: Some(0.0),
+        instance_memory_bytes: None,
+    };
+    let header = "elapsed_ms,phase,daemon_cpu_percent,daemon_rss_bytes,benchmark_cpu_percent,benchmark_rss_bytes,instance_id,instance_protocol,instance_sample_failed,instance_cpu_percent,instance_memory_bytes\n";
+    assert_eq!(resource_samples_csv(&[]).unwrap(), header.as_bytes());
+    assert_eq!(
+        resource_samples_csv(&[sample]).unwrap(),
+        format!("{header}17,steady,1.250000,4096,,,\"db,1\",mysql,false,0.000000,\n").as_bytes()
+    );
 }
 
 #[test]
